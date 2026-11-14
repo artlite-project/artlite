@@ -11,6 +11,10 @@ cores of every column, their GEMV phases) with the qwen35 cores:
 Metadata words of the model cores (``M_MODEL`` on): ``words.py``.
 """
 
+import functools
+from collections.abc import Callable
+from typing import Any, NamedTuple
+
 import numpy as np
 from aie.ir import Module
 from aie.iron import Buffer, Kernel, Lock, ObjectFifo, Worker
@@ -27,6 +31,32 @@ from artlite.operators.design import COLS, range32
 from . import attn as AT
 from . import gdn as GD
 from .words import ATT, F_GDN, FLAGS, GDN_IN, M_HPAN
+
+
+class _ChunkwiseKit(NamedTuple):
+    """What a chunkwise GDN core's worker is built from: ``gdn``'s workspace (``gw``), its types, the first state word's
+    index in it and the makers of its X kernels and D kernels."""
+
+    gw: dict[str, int]
+    gws_ty: Any
+    d_ty: Any
+    i_g: int
+    kx: Callable[[str], Kernel]
+    kd: Callable[[str], Kernel]
+
+
+def _take(x_f: ObjectFifo, ws: Buffer, k: Kernel) -> None:
+    """An X object into the workspace."""
+    x = x_f.acquire(1)
+    k(x, ws)
+    x_f.release(1)
+
+
+def _emit(d_f: ObjectFifo, ws: Buffer, k: Kernel) -> None:
+    """A D object out of the workspace."""
+    d = d_f.acquire(1)
+    k(ws, d)
+    d_f.release(1)
 
 
 class QwenDecodeOperator(DecodeOverlayOperator):
@@ -83,186 +113,198 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         return list(range(COLS)) if self.gdn is not None else []
 
     def _extra_workers(self, s: _Streams) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
-        p, P, gdn, attn = s.p, self.PREFIX, self.gdn, self.attn
-        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
-        x_ty, c_ty, a_ty = s.x_ty, s.c_ty, s.a_ty
-        gr = self.GDN_ROW
         workers: list[Worker] = []
         d_fifos: list[tuple[int, ObjectFifo]] = []
-        if gdn is not None and gdn.slots == 8:
+        if self.gdn is not None and self.gdn.slots == 8:
             self._gdn8_workers(s, workers, d_fifos)
-        elif gdn is not None and gdn.chunk:
+        elif self.gdn is not None and self.gdn.chunk:
             self._gdn4_workers(s, workers, d_fifos)
-        elif gdn is not None:
-            G = GD
-            GW = gdn.workspace()
-            gws_ty = np.ndarray[(GW["size"] // 4,), i32]
-            d_ty = np.ndarray[(G.D_BYTES // 2,), bf]
-            i_g = GW["st"] // 4
-            k_gbegin = Kernel(f"{p}_gbegin", "kernel.o", [x_ty, gws_ty])
-            k_gmsg = Kernel(f"{p}_gmsg", "kernel.o", [c_ty, gws_ty])
-            k_gconv = Kernel(f"{p}_gconv", "kernel.o", [x_ty, gws_ty, d_ty])
-            k_gkold = Kernel(f"{p}_gkold", "kernel.o", [x_ty, gws_ty])
-            k_gknew = Kernel(f"{p}_gknew", "kernel.o", [gws_ty, d_ty])
-            k_gdl = Kernel(f"{p}_gdl", "kernel.o", [x_ty, gws_ty])
-            k_gpanel = Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty])
-            k_gdlout = Kernel(f"{p}_gdlout", "kernel.o", [gws_ty, d_ty])
-            k_gout = Kernel(f"{p}_gout", "kernel.o", [gws_ty, d_ty])
-
-            def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gconv, gkold, gknew, gdl, gpanel, gdlout, gout, ws):
-                def conv2() -> None:  # two conv objects, their histories in one D object
-                    d = d_f.acquire(1)
-                    for _ in range_(2):
-                        x = x_f.acquire(1)
-                        gconv(x, ws, d)
-                        x_f.release(1)
-                    d_f.release(1)
-
-                for _ in forever_():
-                    x = x_f.acquire(1)
-                    gbegin(x, ws)
-                    x_f.release(1)
-                    for _ in range_(ws[i_g + G.G_NSKIP]):
-                        x_f.acquire(1)
-                        x_f.release(1)
-                    for _ in range_(ws[i_g + G.G_NMSG]):
-                        m = m_f.acquire(1)
-                        gmsg(m, ws)
-                        m_f.release(1)
-                    for _ in range_(ws[i_g + G.G_ON]):
-                        for _ in range_(ws[i_g + G.G_NCP]):  # conv pairs: q, k, then each pair of v heads
-                            conv2()
-                            for _ in range_(ws[i_g + G.G_KO]):  # (after k)
-                                x = x_f.acquire(1)
-                                gkold(x, ws)
-                                x_f.release(1)
-                                d = d_f.acquire(1)
-                                gknew(ws, d)
-                                d_f.release(1)
-                            for _ in range_(ws[i_g + G.G_PO]):  # (after a pair's v)
-                                x = x_f.acquire(1)
-                                gdl(x, ws)
-                                x_f.release(1)
-                                for _ in range32(32, unroll=False):
-                                    x = x_f.acquire(1)
-                                    d = d_f.acquire(1)
-                                    gpanel(x, ws, d)
-                                    d_f.release(1)
-                                    x_f.release(1)
-                                d = d_f.acquire(1)
-                                gdlout(ws, d)
-                                d_f.release(1)
-                                d = d_f.acquire(1)
-                                gout(ws, d)
-                                d_f.release(1)
-
-            for c in range(COLS):
-                d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
-                gws = Buffer(gws_ty, name=f"{P}_gws{c}", initial_value=np.zeros(GW["size"] // 4, np.int32))
-                workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), s.m_fifos[c].cons(), d_fifos[c][1].prod(), k_gbegin,
-                                               k_gmsg, k_gconv, k_gkold, k_gknew, k_gdl, k_gpanel, k_gdlout, k_gout,
-                                               gws],
-                                      tile=Tile(c, gr), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
-                                      while_true=False))
-        if attn is not None:
-            AWs = attn.workspace()
-            aws_ty = np.ndarray[(AWs["size"] // 4,), i32]
-            i_a = AWs["st"] // 4
-            mws_ty = np.ndarray[(self.workspace()["size"] // 4,), i32]
-            mxs_ty = np.ndarray[(self.xs_bytes,), np.dtype[np.uint8]]
-            k_abegin = Kernel(f"{p}_abegin", "kernel.o", [x_ty, aws_ty, np.int32, mws_ty, mxs_ty])
-            k_anb = Kernel(f"{p}_anb", "kernel.o", [aws_ty])
-            gt = kmath.SIGMOID.table_words()
-            gt_ty = np.ndarray[(gt.size,), np.dtype[np.uint32]]
-            k_aq = Kernel(f"{p}_aq", "kernel.o", [x_ty, aws_ty, *[gt_ty] * (2 * attn.gate_tab)])
-            k_aqpan = Kernel(f"{p}_aqpan", "kernel.o", [aws_ty])
-            k_akv = Kernel(f"{p}_akv", "kernel.o", [x_ty, aws_ty, np.int32])
-            k_aobj = Kernel(f"{p}_aobj", "kernel.o", [a_ty, aws_ty])
-            k_asoft = Kernel(f"{p}_asoft", "kernel.o", [aws_ty])
-            k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
-            tok_ty = np.ndarray[(16,), i32]
-            k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, s.r_ty])
-
-            def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, mws, mxs,
-                        col, tabs):
-                # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
-                # attention step: a core produces its east token around its scores (a split step's partial stays in its
-                # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
-                # of the west partial, pw); mws, mxs: the main core's workspace and sum panels (attn.AttnShape.ext)
-                for _ in forever_():
-                    x = x_f.acquire(1)
-                    abegin(x, ws, col, mws, mxs)
-                    x_f.release(1)
-                    for _ in range_(ws[i_a + AT.A_NNO]):  # (a main core's normed phase: as it consumes them)
-                        a_f.acquire(1)
-                        anb(ws)
-                        for _ in range_(ws[i_a + AT.A_NXN]):
-                            x_f.acquire(1)
-                            x_f.release(1)
-                        a_f.release(1)
-                    for _ in range_(ws[i_a + AT.A_NXSKIP]):
-                        x_f.acquire(1)
-                        x_f.release(1)
-                    for _ in range_(ws[i_a + AT.A_NASKIP]):
-                        a_f.acquire(1)
-                        a_f.release(1)
-                    for _ in range_(ws[i_a + AT.A_NQP]):  # (an attention step)
-                        for t in t_out:
-                            t.acquire(1)
-                        for _ in range_(ws[i_a + AT.A_NQ]):
-                            x = x_f.acquire(1)
-                            aq(x, ws, *tabs)
-                            x_f.release(1)
-                        aqpan(ws)
-                        for _ in range_(ws[i_a + AT.A_NKV]):
-                            x = x_f.acquire(1)
-                            akv(x, ws, col)
-                            x_f.release(1)
-                        for _ in range_(ws[i_a + AT.A_NOBJ]):
-                            a = a_f.acquire(1)
-                            aobj(a, ws)
-                            a_f.release(1)
-                            asoft(ws)  # (a group's softmax after its K objects)
-                        h = a_f.acquire(AT.HOLD)  # (the last two: held until the emission, which reads records from them)
-                        aobj(h[0], ws)
-                        if not attn.one:
-                            asoft(ws)
-                        aobj(h[1], ws)
-                        if not attn.one:
-                            asoft(ws)
-                        if t_in:
-                            t_in[0].acquire(1)
-                            aend(ws, pw)
-                            t_in[0].release(1)
-                            for t in t_out:
-                                t.release(1)
-                        elif t_out:
-                            t_out[0].release(1)
-                            aend(ws, pw)
-                        else:
-                            aend(ws, pw)
-                        for _ in range_(ws[i_a + AT.A_NE]):
-                            r = r_f.acquire(1)
-                            aemit(ws, r)
-                            r_f.release(1)
-                        a_f.release(AT.HOLD)
-
-            aws = [self._aws_of(c) for c in range(COLS)]
-            tabs = {c: [Buffer(gt_ty, name=f"{P}_agt{c}", tile=Tile(c, self.ATTN_ROW), initial_value=gt)] * 2 if attn.gate_tab else []
-                    for c in range(COLS)}
-            n = attn.nph
-            toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS)
-                    if c % n < n - 1 and not attn.one}  # (c -> c + 1)
-            for c in range(COLS):
-                t_in = [toks[c - 1].cons()] if c % n and not attn.one else []
-                t_out = [toks[c].prod()] if c in toks else []
-                workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1, **s.x_kw),
-                                                s.r_fifos[c].prod(),
-                                                t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
-                                                k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c, tabs[c]],
-                                      tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
-                                      dynamic_objfifo_lowering=True, while_true=False))
+        elif self.gdn is not None:
+            self._gdn_token_workers(s, workers, d_fifos)
+        if self.attn is not None:
+            self._attn_workers(s, workers)
         return workers, d_fifos
+
+    def _gdn_token_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
+        """The token-by-token GDN cores (``gdn``): the step's message on M, per conv pair its objects, its k history, per
+        pair of v heads its 32 state panels."""
+        p, P, gdn = s.p, self.PREFIX, self.gdn
+        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
+        x_ty, c_ty = s.x_ty, s.c_ty
+        gr = self.GDN_ROW
+        GW = gdn.workspace()
+        gws_ty = np.ndarray[(GW["size"] // 4,), i32]
+        d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
+        i_g = GW["st"] // 4
+        k_gbegin = Kernel(f"{p}_gbegin", "kernel.o", [x_ty, gws_ty])
+        k_gmsg = Kernel(f"{p}_gmsg", "kernel.o", [c_ty, gws_ty])
+        k_gconv = Kernel(f"{p}_gconv", "kernel.o", [x_ty, gws_ty, d_ty])
+        k_gkold = Kernel(f"{p}_gkold", "kernel.o", [x_ty, gws_ty])
+        k_gknew = Kernel(f"{p}_gknew", "kernel.o", [gws_ty, d_ty])
+        k_gdl = Kernel(f"{p}_gdl", "kernel.o", [x_ty, gws_ty])
+        k_gpanel = Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty])
+        k_gdlout = Kernel(f"{p}_gdlout", "kernel.o", [gws_ty, d_ty])
+        k_gout = Kernel(f"{p}_gout", "kernel.o", [gws_ty, d_ty])
+
+        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gconv, gkold, gknew, gdl, gpanel, gdlout, gout, ws):
+            def conv2() -> None:  # two conv objects, their histories in one D object
+                d = d_f.acquire(1)
+                for _ in range_(2):
+                    x = x_f.acquire(1)
+                    gconv(x, ws, d)
+                    x_f.release(1)
+                d_f.release(1)
+
+            for _ in forever_():
+                x = x_f.acquire(1)
+                gbegin(x, ws)
+                x_f.release(1)
+                for _ in range_(ws[i_g + GD.G_NSKIP]):
+                    x_f.acquire(1)
+                    x_f.release(1)
+                for _ in range_(ws[i_g + GD.G_NMSG]):
+                    m = m_f.acquire(1)
+                    gmsg(m, ws)
+                    m_f.release(1)
+                for _ in range_(ws[i_g + GD.G_ON]):
+                    for _ in range_(ws[i_g + GD.G_NCP]):  # conv pairs: q, k, then each pair of v heads
+                        conv2()
+                        for _ in range_(ws[i_g + GD.G_KO]):  # (after k)
+                            x = x_f.acquire(1)
+                            gkold(x, ws)
+                            x_f.release(1)
+                            d = d_f.acquire(1)
+                            gknew(ws, d)
+                            d_f.release(1)
+                        for _ in range_(ws[i_g + GD.G_PO]):  # (after a pair's v)
+                            x = x_f.acquire(1)
+                            gdl(x, ws)
+                            x_f.release(1)
+                            for _ in range32(32, unroll=False):
+                                x = x_f.acquire(1)
+                                d = d_f.acquire(1)
+                                gpanel(x, ws, d)
+                                d_f.release(1)
+                                x_f.release(1)
+                            d = d_f.acquire(1)
+                            gdlout(ws, d)
+                            d_f.release(1)
+                            d = d_f.acquire(1)
+                            gout(ws, d)
+                            d_f.release(1)
+
+        for c in range(COLS):
+            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=2)))
+            gws = Buffer(gws_ty, name=f"{P}_gws{c}", initial_value=np.zeros(GW["size"] // 4, np.int32))
+            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), s.m_fifos[c].cons(), d_fifos[c][1].prod(), k_gbegin,
+                                           k_gmsg, k_gconv, k_gkold, k_gknew, k_gdl, k_gpanel, k_gdlout, k_gout,
+                                           gws],
+                                  tile=Tile(c, gr), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
+                                  while_true=False))
+
+    def _attn_workers(self, s: _Streams, workers: list[Worker]) -> None:
+        """The attention cores (``attn``): per step the q and K / V rows, the cache's objects and their softmax, the end
+        (the merge of the west neighbour's partial), the records' emission."""
+        p, P, attn = s.p, self.PREFIX, self.attn
+        i32 = np.dtype[np.int32]
+        x_ty, a_ty = s.x_ty, s.a_ty
+        AWs = attn.workspace()
+        aws_ty = np.ndarray[(AWs["size"] // 4,), i32]
+        i_a = AWs["st"] // 4
+        mws_ty = np.ndarray[(self.workspace()["size"] // 4,), i32]
+        mxs_ty = np.ndarray[(self.xs_bytes,), np.dtype[np.uint8]]
+        k_abegin = Kernel(f"{p}_abegin", "kernel.o", [x_ty, aws_ty, np.int32, mws_ty, mxs_ty])
+        k_anb = Kernel(f"{p}_anb", "kernel.o", [aws_ty])
+        gt = kmath.SIGMOID.table_words()
+        gt_ty = np.ndarray[(gt.size,), np.dtype[np.uint32]]
+        k_aq = Kernel(f"{p}_aq", "kernel.o", [x_ty, aws_ty, *[gt_ty] * (2 * attn.gate_tab)])
+        k_aqpan = Kernel(f"{p}_aqpan", "kernel.o", [aws_ty])
+        k_akv = Kernel(f"{p}_akv", "kernel.o", [x_ty, aws_ty, np.int32])
+        k_aobj = Kernel(f"{p}_aobj", "kernel.o", [a_ty, aws_ty])
+        k_asoft = Kernel(f"{p}_asoft", "kernel.o", [aws_ty])
+        k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
+        tok_ty = np.ndarray[(16,), i32]
+        k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, s.r_ty])
+
+        def attn_fn(a_f, x_f, r_f, t_in, t_out, abegin, anb, aq, aqpan, akv, aobj, asoft, aend, aemit, ws, pw, mws, mxs,
+                    col, tabs):
+            # t_in, t_out: the tokens from the west and to the east neighbour of the chain (none at its ends), every
+            # attention step: a core produces its east token around its scores (a split step's partial stays in its
+            # workspace until the east neighbour has merged it), consumes its west token around its end (the merge
+            # of the west partial, pw); mws, mxs: the main core's workspace and sum panels (attn.AttnShape.ext)
+            for _ in forever_():
+                x = x_f.acquire(1)
+                abegin(x, ws, col, mws, mxs)
+                x_f.release(1)
+                for _ in range_(ws[i_a + AT.A_NNO]):  # (a main core's normed phase: as it consumes them)
+                    a_f.acquire(1)
+                    anb(ws)
+                    for _ in range_(ws[i_a + AT.A_NXN]):
+                        x_f.acquire(1)
+                        x_f.release(1)
+                    a_f.release(1)
+                for _ in range_(ws[i_a + AT.A_NXSKIP]):
+                    x_f.acquire(1)
+                    x_f.release(1)
+                for _ in range_(ws[i_a + AT.A_NASKIP]):
+                    a_f.acquire(1)
+                    a_f.release(1)
+                for _ in range_(ws[i_a + AT.A_NQP]):  # (an attention step)
+                    for t in t_out:
+                        t.acquire(1)
+                    for _ in range_(ws[i_a + AT.A_NQ]):
+                        x = x_f.acquire(1)
+                        aq(x, ws, *tabs)
+                        x_f.release(1)
+                    aqpan(ws)
+                    for _ in range_(ws[i_a + AT.A_NKV]):
+                        x = x_f.acquire(1)
+                        akv(x, ws, col)
+                        x_f.release(1)
+                    for _ in range_(ws[i_a + AT.A_NOBJ]):
+                        a = a_f.acquire(1)
+                        aobj(a, ws)
+                        a_f.release(1)
+                        asoft(ws)  # (a group's softmax after its K objects)
+                    h = a_f.acquire(AT.HOLD)  # (the last two: held until the emission, which reads records from them)
+                    aobj(h[0], ws)
+                    if not attn.one:
+                        asoft(ws)
+                    aobj(h[1], ws)
+                    if not attn.one:
+                        asoft(ws)
+                    if t_in:
+                        t_in[0].acquire(1)
+                        aend(ws, pw)
+                        t_in[0].release(1)
+                        for t in t_out:
+                            t.release(1)
+                    elif t_out:
+                        t_out[0].release(1)
+                        aend(ws, pw)
+                    else:
+                        aend(ws, pw)
+                    for _ in range_(ws[i_a + AT.A_NE]):
+                        r = r_f.acquire(1)
+                        aemit(ws, r)
+                        r_f.release(1)
+                    a_f.release(AT.HOLD)
+
+        aws = [self._aws_of(c) for c in range(COLS)]
+        tabs = {c: [Buffer(gt_ty, name=f"{P}_agt{c}", tile=Tile(c, self.ATTN_ROW), initial_value=gt)] * 2 if attn.gate_tab else []
+                for c in range(COLS)}
+        n = attn.nph
+        toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS)
+                if c % n < n - 1 and not attn.one}  # (c -> c + 1)
+        for c in range(COLS):
+            t_in = [toks[c - 1].cons()] if c % n and not attn.one else []
+            t_out = [toks[c].prod()] if c in toks else []
+            workers.append(Worker(attn_fn, [s.a_l1[c - c % n if attn.one else c].cons(depth=AT.HOLD), s.x_l1[c].cons(depth=1, **s.x_kw),
+                                            s.r_fifos[c].prod(),
+                                            t_in, t_out, k_abegin, k_anb, k_aq, k_aqpan, k_akv, k_aobj, k_asoft, k_aend,
+                                            k_aemit, aws[c], aws[c - 1 if c % n else c], s.ws[c], s.xs[c], c, tabs[c]],
+                                  tile=Tile(c, self.ATTN_ROW), stack_size=self.ATTN_STACK,
+                                  dynamic_objfifo_lowering=True, while_true=False))
 
     def get_mlir_artifact(self) -> Module:
         self._gws, self._aws, self._tabs = {}, {}, []  # (made per program: ``_gws_of``, ``_aws_of``, ``_gdn8_workers``)
@@ -319,35 +361,48 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                                                     np.ndarray[(self.xp_bytes,), np.dtype[np.uint8]]])
         return k, self._gws_of(c)
 
+    def _chunkwise_kit(self, s: _Streams) -> _ChunkwiseKit:
+        """The types and kernel makers a chunkwise GDN core shares (``gdn``'s workspace, its D object, the X kernels'
+        and D kernels' signatures)."""
+        gw = self.gdn.workspace()
+        gws_ty = np.ndarray[(gw["size"] // 4,), np.dtype[np.int32]]
+        d_ty = np.ndarray[(GD.D_BYTES // 2,), np.dtype[bfloat16]]
+        x_ty, p = s.x_ty, s.p
+        return _ChunkwiseKit(gw, gws_ty, d_ty, gw["st"] // 4,
+                             lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty]),
+                             lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty]))
+
+    def _add_chunkwise_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]],
+                               fn: Callable, ks: list[Kernel], kit: _ChunkwiseKit, *, msg: bool) -> None:
+        """A chunkwise design's GDN core per column: its D fifo (and, of 8 slots, the locks of the helper's work: ``msg``
+        False; of 4: the message fifo M), the worker ``fn`` over ``ks`` and the column's workspace and tables."""
+        P = self.PREFIX
+        for c in range(COLS):
+            d_fifos.append((c, ObjectFifo(kit.d_ty, name=f"{P}_D{c}", depth=1)))
+            if not msg:
+                self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
+                                Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
+            args = [s.x_l1[c].cons(depth=1, **s.x_kw), *([s.m_fifos[c].cons()] if msg else []), d_fifos[c][1].prod(), *ks,
+                    self._gws_of(c), *self._gtabs(c)]
+            workers.append(Worker(fn, args, tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK,
+                                  dynamic_objfifo_lowering=True, while_true=False))
+
     def _gdn8_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
         """The GDN cores of an 8-slot design (``gdn``'s "8 slots"): per step (after the header) per k head its q block (its
         history out), its k block and K object (its history out), then its v heads (a block and its R object, 16 state
         panels; the history and the gated outputs out); the helper computes the Gram blocks and the chunks' constants."""
-        p, P, gdn = s.p, self.PREFIX, self.gdn
-        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
-        x_ty = s.x_ty
-        GW = gdn.workspace()
-        assert self.GWS8_AT + GW["size"] <= GD.HS8_AT and GD.HS8_AT + self.hs_bytes <= GD.SILU_TAB[1] - 0x70000, GW
+        p, gdn = s.p, self.gdn
+        kit = self._chunkwise_kit(s)
+        x_ty, i_g, kx, kd, gws_ty = s.x_ty, kit.i_g, kit.kx, kit.kd, kit.gws_ty
+        assert self.GWS8_AT + kit.gw["size"] <= GD.HS8_AT and GD.HS8_AT + self.hs_bytes <= GD.SILU_TAB[1] - 0x70000, kit.gw
         assert GD.HB_R + 5 * 2 * GD.D <= self.hs_bytes
-        gws_ty = np.ndarray[(GW["size"] // 4,), i32]
-        d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
-        i_g = GW["st"] // 4
-        kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
-        kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
         ks = [kx("gbegin"), kx("gw"), kx("gconv"), kx("gk"), kx("gvr"), Kernel(f"{p}_gwait", "kernel.o", [gws_ty]),
-              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kx("gpanel0"), kd("ghq"), kd("ghv"), kd("ghv2"), kd("gout")]
+              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, kit.d_ty]), kx("gpanel0"), kd("ghq"), kd("ghv"), kd("ghv2"),
+              kd("gout")]
         nv = gdn.hc // 2
 
         def gdn_fn(x_f, d_f, gbegin, gw, gconv, gk, gvr, gwait, gpanel, gpanel0, ghq, ghv, ghv2, gout, ws, *_tabs):
-            def take(k: Kernel) -> None:  # an X object into the workspace
-                x = x_f.acquire(1)
-                k(x, ws)
-                x_f.release(1)
-
-            def emit(k: Kernel) -> None:  # a D object from the workspace
-                d = d_f.acquire(1)
-                k(ws, d)
-                d_f.release(1)
+            take, emit = functools.partial(_take, x_f, ws), functools.partial(_emit, d_f, ws)  # (a D object from the workspace)
 
             for _ in forever_():
                 take(gbegin)
@@ -381,13 +436,7 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             emit(ghv2)
                             emit(gout)
 
-        for c in range(COLS):
-            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))
-            self._locks += [Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HRDY, init=0, name=f"{P}_hrdy{c}"),
-                            Lock(Tile(c, self.GDN_ROW), lock_id=GD.L_HDONE, init=0, name=f"{P}_hdone{c}")]
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), d_fifos[c][1].prod(), *ks, self._gws_of(c), *self._gtabs(c)],
-                                  tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
-                                  while_true=False))
+        self._add_chunkwise_workers(s, workers, d_fifos, gdn_fn, ks, kit, msg=False)
 
     def _gtabs(self, c: int) -> list[Buffer]:
         """Column c's SiLU table copies in the GDN core's memory (used through their addresses only)."""
@@ -400,30 +449,16 @@ class QwenDecodeOperator(DecodeOverlayOperator):
         """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "Chunkwise", "4 slots"): the step's message on M, then per k
         head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, H] objects, 16 state
         panels, its outputs and history out."""
-        p, P, gdn = s.p, self.PREFIX, self.gdn
-        bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
-        x_ty = s.x_ty
-        GW = gdn.workspace()
-        assert self.GWS8_AT + GW["size"] <= GD.SILU_TAB[1] - 0x70000, GW
-        gws_ty = np.ndarray[(GW["size"] // 4,), i32]
-        d_ty = np.ndarray[(GD.D_BYTES // 2,), bf]
-        i_g = GW["st"] // 4
-        kx = lambda n: Kernel(f"{p}_{n}", "kernel.o", [x_ty, gws_ty])
-        kd = lambda n: Kernel(f"{p}_{n}", "kernel.o", [gws_ty, d_ty])
+        p, gdn = s.p, self.gdn
+        kit = self._chunkwise_kit(s)
+        x_ty, i_g, kx, kd, gws_ty = s.x_ty, kit.i_g, kit.kx, kit.kd, kit.gws_ty
+        assert self.GWS8_AT + kit.gw["size"] <= GD.SILU_TAB[1] - 0x70000, kit.gw
         ks = [kx("gbegin"), Kernel(f"{p}_gmsg", "kernel.o", [s.c_ty, gws_ty]), kx("gq"), kx("gqw"), kx("gk"), kx("gv"), kx("gvh"),
-              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, d_ty]), kd("ghq"), kd("ghk"), kd("gvhout"), kd("gout")]
+              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, kit.d_ty]), kd("ghq"), kd("ghk"), kd("gvhout"), kd("gout")]
         nv = gdn.hc // 2
 
         def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gvh, gpanel, ghq, ghk, gvhout, gout, ws, *_tabs):
-            def take(k: Kernel) -> None:  # an X object into the workspace
-                x = x_f.acquire(1)
-                k(x, ws)
-                x_f.release(1)
-
-            def emit(k: Kernel) -> None:  # a D object from the workspace
-                d = d_f.acquire(1)
-                k(ws, d)
-                d_f.release(1)
+            take, emit = functools.partial(_take, x_f, ws), functools.partial(_emit, d_f, ws)  # (a D object from the workspace)
 
             for _ in forever_():
                 take(gbegin)
@@ -453,9 +488,4 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             emit(gout)  # (its outputs and its history's first rows, then the rest: one drain for the two)
                             emit(gvhout)
 
-        for c in range(COLS):
-            d_fifos.append((c, ObjectFifo(d_ty, name=f"{P}_D{c}", depth=1)))
-            workers.append(Worker(gdn_fn, [s.x_l1[c].cons(depth=1, **s.x_kw), s.m_fifos[c].cons(), d_fifos[c][1].prod(), *ks, self._gws_of(c),
-                                           *self._gtabs(c)],
-                                  tile=Tile(c, self.GDN_ROW), stack_size=self.GDN_STACK, dynamic_objfifo_lowering=True,
-                                  while_true=False))
+        self._add_chunkwise_workers(s, workers, d_fifos, gdn_fn, ks, kit, msg=True)
