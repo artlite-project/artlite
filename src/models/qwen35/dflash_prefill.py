@@ -17,6 +17,7 @@ rows, the exact K and V of a record the chunk's last token leaves incomplete, co
 Buffers of the drafter's device by "F" + their name (``buffers``): its weight image FW, its cache FKV.
 """
 
+import itertools
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,6 +38,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
+from artlite import txn
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import block_values
@@ -48,7 +50,9 @@ from artlite.prefill import gemm as PG
 from artlite.prefill.norm import PrefillNormOperator
 
 from .dflash import DFlashOverlay
-from .dflash_core import HD, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
+from .dflash_core import HD, MAX_CHUNK, MAX_PADDING, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
+from .dflash_host import angles
+from .drafter_prefill import DrafterPrefill
 
 QD_KV = "qd_kv"  # bf16 offset of the chunk's first object in a layer's ring
 
@@ -160,7 +164,7 @@ class DFlashPrepOperator(ArtcOperator):
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
 
-class DFlashPrefill:
+class DFlashPrefill(DrafterPrefill):
     """The records of ``draft``'s cache for chunks of the model's ``prefill`` (its GEMM objects)."""
 
     def __init__(self, draft: DFlashOverlay, prefill: object):
@@ -173,7 +177,21 @@ class DFlashPrefill:
         self.pitch = PG.phase_pitch(ikv, "ikv", prefill.SUB)
         self.fc_pitch = PG.d_pitch(SimpleNamespace(regions=[img.region(-2, "fc")]), prefill.SUB)
         assert self.fc_pitch == self.H // COLS, "fc's rows dense (the residual norm's deltas)"
+        self._check_sizes()
         self.ops = {t: self._ops(t) for t in sorted({prefill._t(T) for T in prefill.sizes})}
+
+    def _check_sizes(self) -> None:
+        """The prefill's chunk sizes against the rings' room: a chunk's writes run on past its end by at most ``shape.over``
+        objects, and its padding rows (the gap to the next smaller size at most) overwrite the ring's oldest slots, which
+        ``shape.ring`` keeps out of the window; beyond them a chunk writes over the next layer's rings."""
+        shape, sizes = self.d.shape, self.pf.sizes
+        if sizes[-1] // POS_PER_GROUP > shape.over:
+            raise txn.HardwareLimitError(f"a chunk of {sizes[-1]} tokens writes {sizes[-1] // POS_PER_GROUP} cache objects past the "
+                                     f"DFlash2 ring, which holds {shape.over} (dflash_core.MAX_CHUNK {MAX_CHUNK})")
+        gap = max(b - a for a, b in itertools.pairwise((0, *sizes)))
+        if gap > MAX_PADDING:
+            raise txn.HardwareLimitError(f"chunk sizes {sizes} leave up to {gap} padding rows, the DFlash2 ring keeps "
+                                     f"{MAX_PADDING} out of its window (dflash_core.MAX_PADDING)")
 
     def _ops(self, t: int) -> SimpleNamespace:
         d, H = self.d, self.H
@@ -245,7 +263,7 @@ class DFlashPrefill:
         o = 2 * self.H + self.d.cfg.layers * 8 * 4 * HD
         return f"FNR[{o}:{o + 2 * self.H}]"
 
-    def static(self, dev: object) -> None:
+    def static(self, dev: object, ov: object) -> None:
         """FNR's weights."""
         d, n = self.d, 2 * self.H
         fnr = dev.view("FNR")
@@ -264,12 +282,11 @@ class DFlashPrefill:
 
     def before(self, dev: object, p0: int, T: int) -> None:
         """The cos / sin of a chunk's positions (FCS: [position][cos | sin] fp32)."""
-        th = self.d.cfg.rope_theta(np.arange(p0, p0 + T)).astype(np.float64)
-        cs = np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+        cs = angles(self.d.cfg, np.arange(p0, p0 + T))
         dev.view("FCS")[:cs.nbytes] = cs.view(np.uint8).reshape(-1)
         dev.flush("FCS", 0, cs.nbytes)
 
-    def after(self, p0: int, n: int, T: int) -> None:
+    def after(self, dev: object, p0: int, n: int, T: int) -> None:
         """After a chunk of n valid tokens of T at p0: what it wrote past the rings' end into their first slots, the open rows of a record
         its last token leaves incomplete."""
         d, dev, G, Tb = self.d, self.d.dev, self.d.shape.ring, self.d.T

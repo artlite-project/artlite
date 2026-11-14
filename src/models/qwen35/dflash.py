@@ -31,19 +31,21 @@ ring keeps a window and a chunk's padding, so a position a few hundred back is a
 prompt cache's usual one, goes back over a whole answer.
 """
 
+import dataclasses
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
-from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
+from artlite.decode.image import Region
 from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.decode.protocol import (
     BC_COL,
     BC_ID,
     C_LEN,
+    DIMS_OBJ,
     F_EMITR,
     F_GU,
     F_NORM,
@@ -66,8 +68,6 @@ from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
 
-from ..sampling import top_logits
-from .attn import OBJ_BYTES
 from .dflash_core import (
     CV_IN,
     CV_LOAD,
@@ -75,7 +75,6 @@ from .dflash_core import (
     D_BYTES,
     DYN_ROWS,
     F_CV,
-    GROUPS,
     H8,
     HD,
     M_ANOBJ,
@@ -97,130 +96,50 @@ from .dflash_core import (
     DFlashOperator,
     DFlashShape,
 )
+from .dflash_host import Selector, angles
+from .dflash_image import DFlashImage
 from .draft import HeadTable
-from .image import KC, payload
-from .overlay import KV_PAD
+from .image import tensor_f32
+from .overlay import KV_PAD, QwenOverlay
 from .words import F_ATT
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}
-DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # X objects of XB bytes, XPAY apart (the overlapping regions)
 SCATTER = (18, ND, 36, 36 * ND)  # a record's drain into its pair (words): ND panels 144 B apart
 NE = XK * 2 * 8 * 8 // D_BYTES  # D objects of a column's x
 Y_OBJS = -(-XK * 128 // XPAY)  # X objects of a column's y
 NOBJ_R = 5  # X objects of a column's res
 
 
-def conv_rows(c: int) -> np.ndarray:
-    """A conv projection's rows of column c: [side 2][tap 2] the column's GROUPS conv groups."""
-    return np.concatenate([q * COLS * GROUPS + GROUPS * c + np.arange(GROUPS) for q in range(4)])
+class Run(NamedTuple):
+    """A ring fill: its BD word index, the layer, the column and which of the block's two runs."""
+
+    at: int
+    layer: int
+    column: int
+    run: int
 
 
-class DFlashImage(TileImage):
-    """The drafter's weights, its matrices' tiles (the selector's tables stay in the file, read by row): fc, per layer ain,
-    aqkv ([q | K | V] of the column's 4 query heads and KV head), aout, fin, gu, down, then gate (``selector_hidden``). An injection's K and V
-    are aqkv's rows (``ikv``: a view of its tiles)."""
+class Rec(NamedTuple):
+    """An injection's record drain: its BD word index, the layer, the column and 0: K, 1: V."""
 
-    def __init__(self, gguf: GGUFFile, cfg: DFlashConfig):
-        self.cfg = cfg
-        H, I, d = cfg.hidden, cfg.ffn, cfg.head_dim
-        super().__init__(gguf, kc=KC, payload=payload(H), tile_bytes=OBJ_BYTES, vocab=0)
-        self._add(-2, "fc", [("fc", ("fc.weight",), column_rows(H))], len(cfg.taps) * H)
-        q = np.stack([QC * d * c + np.arange(QC * d) for c in range(COLS)])
-        kv = np.stack([d * c + np.arange(d) for c in range(COLS)])
-        conv = np.stack([conv_rows(c) for c in range(COLS)])
-        for L in range(cfg.layers):
-            b = f"blk.{L}."
-            self._add(L, "ain", [("dyn", (b + "attn_conv_proj.weight",), conv)], H)
-            self._add(L, "aqkv", [("q", (b + "attn_q.weight",), q), ("k", (b + "attn_k.weight",), kv), ("v", (b + "attn_v.weight",), kv)], H)
-            self._add(L, "aout", [("out", (b + "attn_output.weight",), column_rows(H))], cfg.heads * d)
-            self._add(L, "fin", [("dyn", (b + "ffn_conv_proj.weight",), conv)], H)
-            R = self.R[self.fmt(b + "ffn_gate.weight")]
-            self._add(L, "gu", [("gu", (b + "ffn_gate.weight", b + "ffn_up.weight"), gate_up_rows(I, R))], H)
-            self._add(L, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
-        self._add(-1, "gate", [("gate", ("selector_hidden.weight",), column_rows(cfg.rank))], H)
-        self._place()
-        self.ikv: dict[int, Region] = {}
-        for L in range(cfg.layers):
-            r = self.region(L, "aqkv")
-            blocks = r.blocks[1:]
-            rt = r.blocks[0].tiles
-            self.ikv[L] = Region(L, "ikv", blocks, r.n_kc, r.kc_group, r.tile_bytes, r.kc,
-                                 offset=r.offset + rt * r.n_kc * r.tile_bytes, col_stride=r.col_stride)
-
-    def formats(self) -> set[str]:
-        return {b.fmt for r in self.regions for b in r.blocks}
+    at: int
+    layer: int
+    column: int
+    kv: int
 
 
-class Selector:
-    """DFlash2's selector on the host (llama.cpp's ``build_dflash2_selector`` and its greedy walk): the drafts of a block from its logits and
-    gates. Of the candidates' scores only the chosen predecessor's row is needed: per position the rows of its top_k candidates in
-    ``selector_successor`` and of the predecessor in ``selector_predecessor``, read for all positions at once (the predecessors': the
-    anchor's and every candidate's but the last position's)."""
+@dataclasses.dataclass(eq=False)
+class Step:
+    """A dispatch's transaction and its words that follow the positions: the ring's fills and an injection's record
+    drains."""
 
-    TABLES = ("selector_successor.weight", "selector_predecessor.weight")
-    SIBLING = 2.0  # a sibling's probability against this times its chain's (``walk``)
-
-    def __init__(self, gguf: GGUFFile, cfg: DFlashConfig):
-        self.gguf, self.top_k = gguf, cfg.top_k
-        self.sibling: list[int] | None = None
-
-    def resident(self) -> None:
-        """The tables' pages read ahead (after the drafter's load released the file's): ~200 scattered rows a round."""
-        for name in self.TABLES:
-            self.gguf.willneed(name)
-
-    def walk(self, logits: np.ndarray, gates: np.ndarray, anchor: int, ids: np.ndarray, n: int, stop: set[int], *,
-             sibling: int = 0) -> list[int]:
-        """Up to n drafts after the anchor token (logits (block, vocab): rows of the tokens ``ids``), ending with a token of ``stop``.
-        ``sibling`` > 0: also ``self.sibling``, a branch of that many tokens from the first position's second candidate on (its
-        walk) when that candidate's probability exceeds ``SIBLING`` times the n drafts' (the probabilities: the lattice's softmax
-        over a position's candidates), else None: the drafts that a step gives their slots are the last ones, kept with the
-        chain's probability, the branch where the first draft is not (prose: a third of first drafts at 32K, of which the
-        second candidate is right in a third to a half)."""
-        self.sibling = None
-        if n <= 0:
-            return []
-        k = self.top_k
-        top = [top_logits(logits[i], k, rows=ids) for i in range(1, n + 1)]
-        c = np.stack([c for _, c in top])
-        succ = self.gguf.rows(self.TABLES[0], c.reshape(-1), prefetch=False).reshape(n, k, -1)
-        pred = self.gguf.rows(self.TABLES[1], np.concatenate([[anchor], c[:-1].reshape(-1)]), prefetch=False)
-        out: list[int] = []
-        j = 0  # (the predecessor's row)
-        chain, p2, b = 1.0, 0.0, 0
-        for i in range(n):
-            sc = succ[i] @ (pred[j] * gates[i + 1]) + top[i][0]
-            a = int(np.argmax(sc))
-            if sibling:
-                e = np.exp(sc - sc[a])
-                chain /= e.sum()
-                if i == 0:
-                    e[a] = 0.0
-                    b = int(np.argmax(e))
-                    p2 = e[b] * chain
-            out.append(int(c[i, a]))
-            if out[-1] in stop:
-                break
-            j = 1 + i * k + a
-        if sibling and len(out) == n and p2 > self.SIBLING * chain:
-            self.sibling, j = [int(c[0, b])], 1 + b
-            for i in range(1, sibling):
-                a = int(np.argmax(succ[i] @ (pred[j] * gates[i + 1]) + top[i][0]))
-                self.sibling.append(int(c[i, a]))
-                j = 1 + i * k + a
-        return out
-
-
-class _Step:
-    """A dispatch's transaction and its words that follow the positions: the ring's fills (BD word index, layer, column, run) and an
-    injection's record drains (BD word index, layer, column, 0: K, 1: V)."""
-
-    def __init__(self, S: int, block: bool):
-        self.S, self.block = S, block
-        self.tr: Transaction | None = None
-        self.runs: list[tuple[int, int, int, int]] = []
-        self.recs: list[tuple[int, int, int, int]] = []
+    S: int
+    block: bool
+    tr: Transaction | None = None
+    runs: list[Run] = dataclasses.field(default_factory=list)
+    recs: list[Rec] = dataclasses.field(default_factory=list)
+    patch: dict[str, np.ndarray] | None = None  # (``_tables``)
 
 
 class DFlashOverlay(ModelOverlay):
@@ -231,7 +150,7 @@ class DFlashOverlay(ModelOverlay):
     IMAGE = DFlashImage
     SLOTS_OF = 8  # (the model's step: the drafter's injections read its slots' x)
 
-    def __init__(self, target: object, gguf: GGUFFile):
+    def __init__(self, target: QwenOverlay, gguf: GGUFFile):
         self.target = target
         self.cfg = cfg = DFlashConfig.from_gguf(gguf)
         tc = target.cfg
@@ -259,9 +178,6 @@ class DFlashOverlay(ModelOverlay):
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
-
-    def _flags(self, L: int, name: str) -> int:
-        return self.flags[name]
 
     def region(self, L: int, name: str) -> Region:
         if name == "ikv":
@@ -370,7 +286,7 @@ class DFlashOverlay(ModelOverlay):
         self.reset()
 
     def _f32(self, name: str) -> np.ndarray:
-        return np.asarray(self.gguf.tensor(name).raw, np.float32).reshape(-1).copy()
+        return tensor_f32(self.gguf, name)
 
     def _base(self, name: str) -> np.ndarray:
         """A conv's base (2 side, 2 tap, hidden) bf16 bits."""
@@ -468,7 +384,7 @@ class DFlashOverlay(ModelOverlay):
         """Column c's residual out of the main core (F_EMITR) -> a phase's x."""
         self._values_to(seq, c, phase, e0=H8 * c, n=H8, S=S, whole=True)
 
-    def _inject(self, seq: Sequence, st: _Step) -> None:
+    def _inject(self, seq: Sequence, st: Step) -> None:
         """fc over the rows' taps, g normed, per layer K and V, the attention core's records."""
         dev, S, cfg, tgt = self.dev, st.S, self.cfg, self.target
         sp = self._sp(S)
@@ -478,7 +394,7 @@ class DFlashOverlay(ModelOverlay):
         for gi, rg in enumerate(self.inp[phase]):
             self._weights(seq, phase, gi)
             nbytes, dims = input_fill(rg.K, sp, self.SLOTS)
-            tap = tgt.inp[tgt._input(cfg.taps[gi])][0].off + XB - 4 * META
+            tap = tgt.tap_x(cfg.taps[gi]) - 4 * META
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", rg.off), XB)
                 seq.fill("X", c, dev.address("MACT", tap), nbytes - XB, dims)
@@ -501,8 +417,8 @@ class DFlashOverlay(ModelOverlay):
                 seq.fill("X", c, dev.address("ACT", self._kv(L, c)), S * XB)
             for c in range(COLS):
                 seq.drain("C", c, dev.address("KV", self._open(L, c)), OPEN_BYTES)
-                st.recs.append((seq.drain("C", c, dev.address("KV", self.sink), REC_K, SCATTER)[0], L, c, 0))
-                st.recs.append((seq.drain("C", c, dev.address("KV", self.sink + PAIR), REC_K, SCATTER)[0], L, c, 1))
+                st.recs.append(Rec(seq.drain("C", c, dev.address("KV", self.sink), REC_K, SCATTER)[0], L, c, 0))
+                st.recs.append(Rec(seq.drain("C", c, dev.address("KV", self.sink + PAIR), REC_K, SCATTER)[0], L, c, 1))
 
     def _conv_in(self, seq: Sequence, L: int, b: int, to: tuple[int, str]) -> None:
         """After a phase's rows: the conv core's objects; its x -> ``to``."""
@@ -536,7 +452,7 @@ class DFlashOverlay(ModelOverlay):
         for c in range(COLS):
             seq.drain("C", c, self.dev.address("ACT", self._cvy(L, b, c) + XB), 2 * self.SLOTS * H8)
 
-    def _block(self, seq: Sequence, st: _Step) -> None:
+    def _block(self, seq: Sequence, st: Step) -> None:
         dev, cfg, S = self.dev, self.cfg, self.SLOTS
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.cload + c * (XB + NOBJ_R * XPAY)), (1 + NOBJ_R) * XB, DIMS_OBJ)
@@ -552,7 +468,7 @@ class DFlashOverlay(ModelOverlay):
             for c in range(COLS):
                 seq.fill("A", c, dev.address("KV", self._open(L, c)), self.T)
                 for run in range(2):
-                    st.runs.append((seq.fill("A", c, dev.address("KV", self._ring(L, c)), self.T), L, c, run))
+                    st.runs.append(Run(seq.fill("A", c, dev.address("KV", self._ring(L, c)), self.T), L, c, run))
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", self.loadr + c * S * XB), S * XB)  # (aout's sum: zero first)
                 seq.fill("X", c, dev.address("ACT", self.fatt), 2 * XB)
@@ -588,10 +504,10 @@ class DFlashOverlay(ModelOverlay):
         for c in range(COLS):
             self._logits_out(seq, c, S)
 
-    def _build(self, S: int, block: bool, subs: tuple = ()) -> _Step:
+    def _build(self, S: int, block: bool) -> Step:
         """The transaction of a dispatch: an injection of a verify's S rows (0: none), the block."""
         seq = Sequence(self.op, inputs=("X",))
-        st = _Step(S, block)
+        st = Step(S, block)
         if S:
             self._inject(seq, st)
         if block:
@@ -601,7 +517,7 @@ class DFlashOverlay(ModelOverlay):
         st.patch = self._tables(st)
         return st
 
-    def _tables(self, st: _Step) -> dict[str, np.ndarray]:
+    def _tables(self, st: Step) -> dict[str, np.ndarray]:
         r = np.array(st.runs, np.int64).reshape(-1, 4)
         k = np.array(st.recs, np.int64).reshape(-1, 4)
         at = np.concatenate([r[:, 0], k[:, 0], r[:, 0] + 2, k[:, 0] + 2])
@@ -632,8 +548,7 @@ class DFlashOverlay(ModelOverlay):
             if c not in self._cs:
                 if len(self._cs) > 8:
                     self._cs.clear()
-                th = self.cfg.rope_theta(np.arange(64 * c, 64 * c + 64)).astype(np.float64)
-                self._cs[c] = np.concatenate([np.cos(th), np.sin(th)], 1).astype(np.float32)
+                self._cs[c] = angles(self.cfg, np.arange(64 * c, 64 * c + 64))
             out.append(self._cs[c])
         return np.concatenate(out)[p & 63:(p & 63) + S]
 
@@ -647,7 +562,7 @@ class DFlashOverlay(ModelOverlay):
         n1 = min(n, G - a)
         return [(a, n1), (0, n - n1) if n > n1 else (G, 1)], first
 
-    def _patch(self, st: _Step, *, p: int | None, rec: tuple[int, int] | None) -> int:
+    def _patch(self, st: Step, *, p: int | None, rec: tuple[int, int] | None) -> int:
         """The ring's fills of a block at p; an injection's record drains (rec: (record, its object in the ring), or None: into the sink).
         Returns the ring's objects."""
         words = st.tr.words
@@ -673,7 +588,7 @@ class DFlashOverlay(ModelOverlay):
         st.tr.flush_lines(t["lines"])
         return nobj
 
-    def _transaction_of(self, S: int, block: bool) -> _Step:
+    def _transaction_of(self, S: int, block: bool) -> Step:
         key = (S, block)
         if key not in self._steps:
             self._steps[key] = self._build(S, block)
@@ -767,4 +682,4 @@ class DFlashOverlay(ModelOverlay):
         return g[:, :, :per].astype(np.uint16).view(bfloat16).astype(np.float32).transpose(1, 0, 2).reshape(8, -1)
 
 
-__all__ = ["DFlashImage", "DFlashOverlay", "Selector", "conv_rows"]
+__all__ = ["DFlashOverlay"]

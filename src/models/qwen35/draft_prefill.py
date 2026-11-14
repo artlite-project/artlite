@@ -30,9 +30,10 @@ from artlite.prefill.norm import PrefillNormOperator
 
 from . import attn_prefill as AP
 from .draft import QwenDraft
+from .drafter_prefill import DrafterPrefill
 
 
-class DraftPrefill:
+class DraftPrefill(DrafterPrefill):
     """The records of ``draft``'s cache for chunks of ``sizes`` (sub-chunks of at most ``sub``) of the prefill of the
     model ``prefill`` (its GEMM objects, its prep operators)."""
 
@@ -134,7 +135,7 @@ class DraftPrefill:
         dev.view("PQN")[o:o + qn.nbytes] = qn.view(np.uint8)
         dev.flush("PQN")
 
-    def before(self, dev: object, p0: int) -> None:
+    def before(self, dev: object, p0: int, T: int) -> None:
         """The carry (row 0 of DY's second region) of a chunk at p0: the last chunk's, zeros at 0."""
         if p0 == 0:
             self.carry[:] = 0
@@ -154,9 +155,9 @@ class DraftPrefill:
             f"blk.{self.L}.nextn.hnorm.weight")
         self.carry[:] = (self._w_h @ x).astype(bfloat16).view(np.uint8)
 
-    def after(self, dev: object, n: int) -> None:
+    def after(self, dev: object, p0: int, n: int, T: int) -> None:
         """The next chunk's carry: this one's projection of its last valid row's h; the drafter's cache records of the
-        chunk's last record are its (the next step's ring from its V panels: ``QwenOverlay._rings_from_prefill``)."""
+        chunk's last record are its (the next step's ring from its V panels: ``attn_steps.AttentionSteps``'s ``_rings_from_prefill``)."""
         o = 2 * self.H * (self.R0 + n)
         dev.fetch("DY", o, self.carry.size)
         self.carry[:] = dev.view("DY")[o:o + self.carry.size]

@@ -90,6 +90,11 @@ def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) 
     return np.union1d(special, other[:n]), other[n:n + table]
 
 
+def tensor_f32(gguf: GGUFFile, name: str) -> np.ndarray:
+    """A tensor of the file as a flat fp32 copy."""
+    return np.asarray(gguf.tensor(name).raw, np.float32).reshape(-1).copy()
+
+
 def payload(hidden: int, moe: bool = False) -> int:
     """bf16 elements of an activation object's payload: the hidden state, rounded up to whole 4 KB panels (the
     GDN state objects carry whole panels), at least 4096 (an MoE model's: the hidden state's, module docstring)."""

@@ -55,6 +55,7 @@ SLOTS = MMV_SLOTS  # token slots of a design (4; ``DecodeOverlayOperator(slots=8
 META = 64  # int32 metadata words at the start of an X object
 XB = 4352  # bytes of an X object
 XPAY = XB - 4 * META  # payload bytes of an X object
+DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # shim BD dims of X objects of XB bytes, XPAY apart (the overlapping regions)
 OBJ_K = XPAY // (2 * SLOTS)  # k of an input object (512: 64 k blocks of the slots' 8 values; 8 slots: 256, ``obj_k``)
 NX_PER_NORM = 8  # input objects per norm-weight object (8 x 512 bf16 weights; 8 slots: 16 x 256, ``nx_per_norm``)
 NORM_K = NX_PER_NORM * OBJ_K  # weights of a norm-weight object
@@ -234,7 +235,7 @@ def input_fill(K: int, sp: int = SLOTS, slots: int = SLOTS) -> tuple[int, tuple[
     """(bytes, shim BD dims) of the X fill of a phase's input from the start of its region: the metadata object, then
     object i = the XB bytes that end with x's i-th XPAY bytes (strides of XPAY, extents of XB); x of sp slots per k
     block (``packed_slots``) of a design of ``slots``."""
-    return (1 + -(-n_inputs(K, slots) * sp // slots)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
+    return (1 + -(-n_inputs(K, slots) * sp // slots)) * XB, DIMS_OBJ
 
 
 def post_region_bytes(K: int) -> int:

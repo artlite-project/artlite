@@ -288,7 +288,7 @@ def _qwen_steps(ov: object, log: _Log, rng: np.random.Generator) -> None:
     # start or inside one), the states carried to a second prompt chunk and back, a snapshot restored later
     dev = ov.dev
     for p0 in (40, 45):
-        ov.conv_fresh()
+        ov.conv.fresh()
         for name in ("GHDR", "GSTATE"):
             if name in dev.buffers:
                 dev.view(name)[:] = rng.integers(0, 256, dev.view(name).size, np.uint8)
@@ -317,11 +317,11 @@ def _qwen_steps(ov: object, log: _Log, rng: np.random.Generator) -> None:
             ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
             ov.accept(S if commit else n)
             p += S if commit else n
-        while p % 8 or ov.nrep:  # (a prefill continues from a block's start: the states fully accepted)
+        while p % 8 or ov.cur.nrep:  # (a prefill continues from a block's start: the states fully accepted)
             ov.step(_x(rng, 1, ov.H), p, logits=False, commit=True)
             ov.accept(1)
             p += 1
-        ov.conv_for_prefill()
+        ov.conv.for_prefill()
         log.label = f"after a prompt chunk p={p}"
         ov.step(_x(rng, min(4, ov.SLOTS), ov.H), p, logits=True, commit=True)
         ov.accept(min(4, ov.SLOTS))
@@ -404,17 +404,17 @@ def _qwen_mtp(ov: object, drafter: object, log: _Log, rng: np.random.Generator) 
 
 def _qwen_dflash(ov: object, drafter: object, log: _Log, rng: np.random.Generator) -> None:
     """The DFlash2 drafter's dispatches: the injection of the kept rows of a model's step (S slots, ``keep`` of them,
-    from the slots ``src`` where they are not the first: ``NpuQwen._move_taps``) with the block, an injection alone,
+    from the slots ``src`` where they are not the first: ``DFlashDrafting.move_taps``) with the block, an injection alone,
     a block alone, rings wrapping past their window."""
     from types import SimpleNamespace
 
-    from models.qwen35.qwen import NpuQwen
+    from models.qwen35.drafting import DFlashDrafting, Injection
 
     H = ov.H
     for rnd in range(2):
         p = 0
         if rnd:  # (a prompt's end at 2300: the ring's slots wrap within the rounds)
-            ov.conv_fresh()
+            ov.conv.fresh()
             ov.vring.from_prefill.update(ov.fatt)
             p = drafter.next = 2300
         # (S, keep, whether a block follows, the slots of the kept rows when not the first ones)
@@ -426,8 +426,9 @@ def _qwen_dflash(ov: object, drafter: object, log: _Log, rng: np.random.Generato
             ov.step(_x(rng, S, H), p, logits=False, commit=S == 1)
             ov.accept(keep)
             if src is not None:
-                inj = SimpleNamespace(_inj=(S, keep, p, src), overlay=ov, dflash=drafter, cfg=ov.cfg)
-                NpuQwen._move_taps(inj)
+                fd = DFlashDrafting(SimpleNamespace(overlay=ov, dflash=drafter, cfg=ov.cfg))
+                fd.inj = Injection(S, keep, p, src)
+                fd.move_taps()
             log.label = f"dflash S={S} keep={keep} q={p} block={block} p={p + keep}"
             drafter.step(S, keep, p, _x(rng, 8, H) if block else None, p + keep)
             p += keep

@@ -29,7 +29,7 @@ its position does. P = 2^(s - m), m the row's maximum in the first group,
 held for the whole pass (scores span less than P's 2^63.5: no rescale; QK starts from the baseline 192 - m), y += P V over the V object's records. A step may cross a group: the first group's open record keeps its scores in ``sc`` past the
 second group's (its slot is the group's last, the second group's open record its first). The tail objects are the open
 records' rows (the ring: ``decode.vring``; after a prefill the host decodes the record's V panels into it,
-``QwenOverlay._rings_from_prefill``): the core puts the slots' V in and per slot encodes the record's V panels up to the
+``attn_steps.AttentionSteps``'s ``_rings_from_prefill``): the core puts the slots' V in and per slot encodes the record's V panels up to the
 slot's position and adds the P V of its rows (a V block spans the record's positions: what a position sees of its record
 does not depend on the step's later slots).
 

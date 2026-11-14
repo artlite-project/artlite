@@ -335,7 +335,7 @@ class _Gdn:
         self.gcol = 256 + 4096 * (sh.n_slots if sh.chunk else 5 + 3 * self.npair)  # a column's GDN objects [header | payloads]
         gobj = dev.alloc("GOBJ", COLS * self.gcol)
         self.ps = sh.hc * 16 * GD.PANEL  # a column's state panels
-        self.half = COLS * self.ps if sh.chunk else 0  # (a chunkwise core's: two halves, ``overlay._half``)
+        self.half = COLS * self.ps if sh.chunk else 0  # (a chunkwise core's: two halves, ``GdnCursor.half``)
         dev.alloc("GSTATE", 256 + COLS * self.ps + self.half)
         dev.alloc("GO", COLS * sh.hc * GD.D_BYTES // 2)  # (per v head 2 KB; a chunkwise core's: its 1 KB, 1 KB of padding)
         blk = r.block("qkv")
@@ -378,7 +378,7 @@ class _Gdn:
         return c * self.gcol + 256 + 4096 * k
 
     def _chunk_units(self, seq: Sequence, h: int) -> None:
-        """A chunkwise core's objects and drains (``overlay._gdn4``; its state from half h, into the other), its outputs
+        """A chunkwise core's objects and drains (``gdn_steps.GdnTransfers``; its state from half h, into the other), its outputs
         into GO."""
         dev, MG, sh = self.dev, self.MG, self.sh
         dims4 = (PR.XB // 8, 2, PR.XB // 8, PR.XPAY // 4)
@@ -450,7 +450,7 @@ class _Gdn:
 
     def step(self, x: np.ndarray, *, nrep: int = 0, cshift: int = 0, commit: bool = False, kshift: int = 0, half: int = 0
              ) -> tuple[list[list[dict]], np.ndarray]:
-        """x (S, hidden): the slots' gdn_in inputs (the words: ``QwenOverlay._set_gdn``'s; a chunkwise core's state from
+        """x (S, hidden): the slots' gdn_in inputs (the words: ``GdnTransfers.set_words``'s; a chunkwise core's state from
         ``half``). Returns (per column per slot the message as the GDN core got it, the gated outputs (S, v heads of the
         columns in column order, 128))."""
         dev, hc, ch, S = self.dev, self.sh.hc, self.sh.ch, x.shape[0]
@@ -545,7 +545,7 @@ def test_gdn_steps(setup: tuple) -> None:
 
 
 class _Blocks:
-    """The host's words of a chunkwise core of 4 (``QwenOverlay``'s ``_advance``, ``_half``): blocks of 8 positions from 0."""
+    """The host's words of a chunkwise core of 4 (``GdnCursor``'s ``advance``, ``half``): blocks of 8 positions from 0."""
 
     def __init__(self):
         self.pos = self.cshift = self.kshift = 0
@@ -665,7 +665,7 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     """A sub-step of S slots at positions p .. p + S - 1 over a cache of p positions on random inputs: per column and
     slot o within bfp16 / bf16 rounding of ref.core_attention over what the slot sees (closed records as the cache
     holds them, the open ones encoded from their exact rows up to the slot's position: the ring slot's rows before p,
-    with ``rec`` the V panels' values a prefill left, as ``QwenOverlay._rings_from_prefill`` puts them in the ring, and
+    with ``rec`` the V panels' values a prefill left, as ``AttentionSteps._rings_from_prefill`` puts them in the ring, and
     the new ones); the relayed records (a chain's first column: the K records of the new positions; its last: their
     records' V panels up to the last one and rows). split: the chain of a
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
@@ -1082,7 +1082,8 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     (``moe_ffn`` + ``shared_expert`` on x; Occamy's layer 10: 1.5%, its shared expert's output 2.6x the routed experts'
     and x small: 1.1% from the oracle, 0.8% from one with the cores' bf16 gate and h = silu(gate) up)."""
     from artlite.moe import route as MR
-    from models.qwen35.overlay import CP_BYTES, QwenOverlay
+    from models.qwen35.moe_steps import CP_BYTES
+    from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
     require(path)

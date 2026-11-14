@@ -37,7 +37,7 @@ of one, bit for bit). The state is materialized only at a block's end: a step re
 block up to its own (the lanes before it from the k / v histories and the gates of the block, [the 3 rows before the block
 | its lanes' rows], which run on in the objects, read from row M_KSHIFT: 8 after a block's end); a lane's U by forward
 substitution in lane order (``solve``), O from it and Y; the products along the lanes are per lane in fp32 (bfp16 blocks run
-along i, a lane's own), so no lane's rounding depends on another's. The states are double-buffered (``QwenOverlay._half``:
+along i, a lane's own), so no lane's rounding depends on another's. The states are double-buffered (``GdnCursor.half``:
 the half a position's block starts from): a step reads its block's half and writes the other, the block's update
 (S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else nothing that is read (the other half is
 read only after a block's end wrote it); a step past the block's end then runs

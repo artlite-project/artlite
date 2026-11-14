@@ -38,14 +38,12 @@ the designs (found through the render manifest) and the overlay's other buffers 
 """
 
 import os
-import time
 from collections import abc
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from artlite.decode.protocol import XB
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
@@ -58,12 +56,13 @@ from ..overlay_model import OverlayModel, Readout
 from ..qwen3vl import host as qwen3vl_host
 from ..qwen3vl import npu as qwen3vl_npu
 from ..readouts import readout_model
-from ..sampling import Mask, Penalties, Probs, Sampling, max_prob
+from ..sampling import Mask, Penalties, Probs, Sampling
 from ..sequence import Sequence, token_ids
 from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
+from .drafting import DFlashDrafting, MtpDrafting
 from .image import QwenImage
 from .overlay import QwenOverlay
 from .prefill import QwenPrefill
@@ -84,8 +83,6 @@ class NpuQwen(OverlayModel):
     DFlash2 drafter's file, in the place of any of those (``dflash.DFlashOverlay``)."""
 
     recurrent = True  # (the GDN layers' states hold the whole sequence)
-    BRANCH = 2  # the tokens of a sibling branch that rounds of the DFlash2 drafter may run (``_sibling``; 0: none)
-    siblings = siblings_won = 0  # sibling branches run and kept (their first token)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = "",
@@ -114,10 +111,8 @@ class NpuQwen(OverlayModel):
         else:  # (27B at 1K: the weights stream once)
             self.STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)[:self.overlay.SLOTS]
         self.dflash = DFlashOverlay(self.overlay, GGUFFile(dflash)) if dflash else None
-        # (the slots, kept rows and position of a step the drafter has not injected, and the rows' slots when not the first ones:
-        # ``_move_taps``)
-        self._inj: tuple[int, int, int, list[int] | None] | None = None
-        self._sib: list[int] | None = None  # (the round's sibling branch: ``_sibling``)
+        self.mtp = MtpDrafting(self) if self.drafter is not None else None  # (the drafters' bookkeeping: ``drafting``)
+        self.flash = DFlashDrafting(self) if self.dflash is not None else None
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
                                    dflash=self.dflash, precise=readout, pack=readout) if prefill else None
         with ThreadPoolExecutor(1) as pool:
@@ -139,7 +134,6 @@ class NpuQwen(OverlayModel):
         self.position = 0
         self.rope_next = 0  # (the M-RoPE position of the next text token)
         self._prompting = False
-        self._records()
 
     @property
     def capacity(self) -> int:
@@ -153,6 +147,11 @@ class NpuQwen(OverlayModel):
     def _table(self) -> HeadTable:
         """The drafter's head."""
         return (self.drafter if self.dflash is None else self.dflash).table
+
+    @property
+    def siblings(self) -> int:
+        """Sibling branches the DFlash2 drafter's rounds ran."""
+        return self.flash.siblings if self.flash is not None else 0
 
     def prepare(self, prompt_len: int) -> None:
         """(also, with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
@@ -171,7 +170,7 @@ class NpuQwen(OverlayModel):
     def stats(self) -> str:
         """(and the rounds' siblings)"""
         out = super().stats()
-        return out + (f"; {self.siblings} siblings, {self.siblings_won} kept" if self.siblings else "")
+        return out + (f"; {self.siblings} siblings, {self.flash.siblings_won} kept" if self.siblings else "")
 
     def describe(self) -> str:
         ov, f = self.overlay, self.dflash
@@ -190,9 +189,10 @@ class NpuQwen(OverlayModel):
             self.drafter.reset()
         if self.dflash is not None:
             self.dflash.reset()
-            self._inj = None
+            self.flash.reset()
         self.position = self.rope_next = 0
-        self._records()
+        if self.mtp is not None:
+            self.mtp.reset()
 
     def stale(self) -> None:
         super().stale()
@@ -212,20 +212,16 @@ class NpuQwen(OverlayModel):
     def _state(self) -> dict[str, object]:
         """(the text's next M-RoPE position; with the drafter its rows and the prefill's carry)"""
         out: dict[str, object] = {"rope_next": self.rope_next}
-        if self.drafter is not None:
-            out |= {"pend": list(self._pend), "dpos": self._dpos, "h": self._h, "carry_at": self._carry_at}
-            if self.prefill is not None and self.prefill.dp is not None:
-                out["carry"] = self.prefill.dp.carry.copy()
+        if self.mtp is not None:
+            out |= self.mtp.state()
         return out
 
     def _set_state(self, state: dict[str, object]) -> None:
         self.rope_next = state["rope_next"]
-        self._inj = None
-        if self.drafter is not None:
-            self._pend, self._dpos, self._h, self._carry_at = list(state["pend"]), state["dpos"], state["h"], \
-                state["carry_at"]
-            if self.prefill is not None and self.prefill.dp is not None:
-                self.prefill.dp.carry[:] = state["carry"]
+        if self.flash is not None:
+            self.flash.reset()
+        if self.mtp is not None:
+            self.mtp.set_state(state)
 
     def _rows(self, tokens: list[int] | Sequence) -> np.ndarray:
         """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
@@ -274,46 +270,25 @@ class NpuQwen(OverlayModel):
             out = super().steps(tokens, logits=logits, commit=commit, branch=branch)
             self.rope_next += n
         if commit and self._drafting:
-            if self.dflash is not None:
-                self._inj = (n, n, p, None)
+            if self.flash is not None:
+                self.flash.after_step(n, p)
             else:
-                self._follow(n)
+                self.mtp.follow(n, self._x)
         return out
 
     def _inject(self) -> None:
         """The drafter's rows of the model's last step, while its taps are in place."""
-        if self._inj is not None:
-            self._move_taps()
-            self._dispatch(lambda: self.dflash.step(*self._inj[:3], None, 0))
-            self._inj = None
-            self.stale()
-
-    def _move_taps(self) -> None:
-        """A pending injection's rows from other slots than its first ones (a won sibling's, the slots past a carry): their taps
-        moved to the first slots of the tap layers' x in the model's ACT, where the drafter's injection reads them."""
-        S, _, _, src = self._inj
-        if src is None:
-            return
-        ov = self.overlay
-        H, sp = self.cfg.hidden_size, ov._sp(S)
-        act = ov.dev.view("ACT")
-        for L in self.dflash.cfg.taps:
-            off, n = ov.inp[ov._input(L)][0].off + XB, H * sp * 2
-            ov.dev.fetch("ACT", off, n)
-            x = act[off:off + n].view(np.uint16).reshape(H // 8, sp, 8)
-            x[:, :len(src)] = x[:, src].copy()
-            ov.dev.flush("ACT", off, n)
+        if self.flash is not None:
+            self.flash.inject()
 
     def _drop_carry(self) -> None:
         """(the pending injection without the sibling branch's rows)"""
-        n = len(self.carry)
-        if self._inj is not None and self._inj[3]:
-            S, keep, q, src = self._inj
-            self._inj = (S, keep - n, q, src[:-n]) if keep > n else None
+        if self.flash is not None:
+            self.flash.drop_carry()
 
     def _chunk(self, left: int, position: int | None = None, *, steps: bool = True) -> int:
         """(after a generation's step: a decode step first, which replays its accepted tokens into the GDN states)"""
-        if self.overlay.nrep and position in (None, self.position):
+        if self.overlay.cur.nrep and position in (None, self.position):
             return 0
         return super()._chunk(left, position, steps=steps)
 
@@ -323,105 +298,26 @@ class NpuQwen(OverlayModel):
         return self._dispatch(lambda: self.overlay.logits_of(x))
 
     # ------------------------------------------------------------------
-    # Multi-token prediction
+    # Drafts (``drafting``)
     # ------------------------------------------------------------------
-    #
-    # The drafter's row at position q takes token q and the model's output-normed hidden state of q - 1, writes its
-    # cache record at q and guesses token q + 1. Its records follow the model's positions: a prompt chunk writes its
-    # rows' (``QwenPrefill(draft=)``); after the model's steps their rows wait in ``_pend`` (records from ``_dpos`` on,
-    # at most SLOTS - 1 of them) until a drafter step runs them with the next ones; ``_h`` is the model's hidden state
-    # of the last cached position. A drafter's round (``OverlayModel.generate``): one drafter step of the pending rows
-    # and the sampled token's (its first draft), one-row steps for the next drafts, the model's step of the token and
-    # the drafts (``commit=False``), then the accepted tokens' rows pending (they rewrite the draft rows' records); a
-    # round of the context's drafts leaves the token's row pending with the accepted ones'.
-
-    def _records(self) -> None:
-        """No drafter rows pending, nothing cached."""
-        self._pend: list[tuple[np.ndarray, np.ndarray]] = []  # (embedding, h) per row
-        self._dpos = 0
-        self._h = np.zeros(self.cfg.hidden_size, np.float32)  # (zeros before position 0)
-        self._carry_at = 0  # (the position after the last chunk: the prefill's carry is its)
-
-    def _hidden(self, n: int) -> np.ndarray:
-        """The model's output-normed hidden states (n, hidden) fp32 of the last step's first n slots."""
-        return self._normed(np.stack([self.overlay.hidden(-1, s) for s in range(n)]))
 
     def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
         self._x = self._rows(tokens)
         return (self._x,)
 
-    def _follow(self, n: int) -> None:
-        """After the model's step: the drafter rows of its first n tokens (cached) pending."""
-        hs = self._hidden(n)
-        h = np.concatenate([self._h[None], hs[:-1]])
-        self._pend += list(zip(self._x[:n], h, strict=True))
-        self._h = hs[-1]
-        while len(self._pend) >= self.overlay.SLOTS:
-            self._run_pending(self.overlay.SLOTS)
-
-    def _draft_step(self, rows: list[tuple[np.ndarray, np.ndarray]], logits: bool) -> np.ndarray | None:
-        """A drafter step of rows at ``_dpos`` on (their records; the drafter's logits (n, vocab) bf16, or None)."""
-        p, n = self._dpos, len(rows)
-        q = np.arange(p, p + n)
-        old = q < self.position  # (the model's positions; text from ``rope_next`` after them)
-        rope = self.drafter.rope
-        rope[q[old]] = self.overlay.rope[q[old]]
-        rope[q[~old]] = self.rope_next + (q[~old] - self.position)[:, None]
-        emb, h = (np.stack(v) for v in zip(*rows, strict=True))
-        out = self.drafter.step(emb, h, p, logits=logits)
-        self._dpos += n
-        return out
-
-    def _run_pending(self, n: int) -> None:
-        """Records of the first n pending rows."""
-        rows, self._pend = self._pend[:n], self._pend[n:]
-        self._draft_step(rows, logits=False)
-
     def _prefill_run(self, args: tuple, T: int, n: int, sets: abc.Sequence[int] | None = None) -> None:
         """(the drafter's records of the rows before the chunk first; the chunk's carry after decode steps)"""
         self._inject()
-        mtp = self._drafting and self.dflash is None
-        if mtp:
-            while self._pend:
-                self._run_pending(self.overlay.SLOTS)
-            if self.position and self._carry_at != self.position:
-                self.prefill.dp.carry_of(self._h)
+        mtp = self.mtp if self._drafting else None
+        if mtp is not None:
+            mtp.before_prefill()
         super()._prefill_run(args, T, n, sets)
-        if mtp:
-            x = self.prefill.hidden(n - 1)
-            self._h = self._normed(x)[0]
-            self._dpos = self._carry_at = self.position + n
+        if mtp is not None:
+            mtp.after_prefill(n)
 
     def draft(self, token: int, n: int) -> list[int]:
-        """The drafter's guesses of up to n tokens after ``token`` (the token of the next position, not run yet; its
-        row runs with the pending ones): the most likely one, the most likely one after it, ... while their chain's
-        probability pays for the round's slot of each and the drafter's step of the next (``_worth``, ``_more``) (ends
-        with an end-of-sequence token)."""
-        t0 = time.perf_counter()
-        rows = [*self._pend, (self._rows([token])[0], self._h)]
-        assert self._dpos + len(rows) == self.position + 1 and len(rows) <= self.overlay.SLOTS
-        self._pend = []
-        raw = self._draft_step(rows, logits=n > 0)
-        out: list[int] = []
-        chains: list[float] = []
-        chain, slot = 1.0, len(rows) - 1
-        while len(out) < n:
-            i, p = max_prob(raw[slot])
-            chain *= p
-            if not self._keep(chain, len(out)):
-                break
-            out.append(int(self.drafter.table.ids[i]))
-            chains.append(chain)
-            if out[-1] in self.eos_token_ids or len(out) == n or not self._more(chain, p, len(out)):
-                break
-            h = self.drafter.hidden_state(slot)
-            t = time.perf_counter()
-            raw, slot = self._draft_step([(self._rows(out[-1:])[0], h)], logits=True), 0
-            self._row_time(time.perf_counter() - t)
-        self.t_draft += time.perf_counter() - t0
-        self.drafted += len(out)
-        self._chains = tuple(chains)
-        return out
+        """The MTP drafter's guesses of up to n tokens after ``token`` (``MtpDrafting.draft``)."""
+        return self.mtp.draft(token, n)
 
     def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
@@ -442,51 +338,18 @@ class NpuQwen(OverlayModel):
         return super().forced_drafts(tokens, first, turns=turns, prefill=prefill)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
-        return self.draft(token, k) if self.dflash is None else self._block(token, k)
-
-    def _block(self, token: int, k: int) -> list[int]:
-        """A DFlash2 round's drafts after ``token`` (the next position's after ``carry``, not run yet): the kept rows of the last step
-        injected and the block at the position, in one dispatch; while it runs, the round's step of the carry, the token and n
-        drafts patched (``steps``' rope rows, ``patch_ahead``: a block ends at an end-of-sequence token alone). In a generation's
-        rounds whose step has 8 slots, the selector's sibling branch in the last drafts' places where it is worth more (``_sibling``)."""
-        t0 = time.perf_counter()
-        d = self.dflash
-        c = len(self.carry)
-        x = np.stack([self._rows([token])[0], *[self._mask] * (d.cfg.block - 1)])
-        if self._inj is not None:
-            self._move_taps()
-        S, keep, q, _ = self._inj if self._inj is not None else (0, 0, 0, None)
-        self._inj = None
-        n, p = min(k, d.cfg.block - 1), self.position
-
-        def ahead() -> None:
-            if p + c + n + 1 <= self.capacity:
-                self.overlay.rope[p:p + c + n + 1] = self.rope_next + np.arange(c + n + 1)[:, None]
-                self.overlay.patch_ahead(c + n + 1, p)
-
-        self._dispatch(lambda: d.step(S, keep, q, x, p + c, meanwhile=ahead))
-        self.stale()
-        L = self.BRANCH if (self.rounds and n > self.BRANCH and c + n + 1 == self.overlay.SLOTS and self.overlay.can_branch
-                            and p % 8 + c + self.BRANCH <= 7) else 0  # (a branch inside its parent's 8 positions: ``QwenOverlay.step``)
-        out = d.selector.walk(d.logits(), d.gates(), token, d.table.ids, n, set(self.eos_token_ids), sibling=L)
-        self._sib = d.selector.sibling if L else None
-        if self._sib is not None:
-            out = out[:n - L]
-            self.siblings += 1
-        self.t_draft += time.perf_counter() - t0
-        self.drafted += len(out) + len(self._sib or ())
-        self.blocks += 1
-        return out
+        return self.draft(token, k) if self.flash is None else self.flash.block(token, k)
 
     def _sibling(self) -> list[int] | None:
-        return self._sib
+        return self.flash.sibling if self.flash is not None else None
 
     def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
         """(a step of drafts, or a drafter's round, commits no GDN state: ``_kept`` accepts its kept tokens, which the
         next step replays, ``QwenOverlay.accept``; a sibling in the last slot, after the round's token: ``QwenOverlay.step``'s
         branch)"""
-        if self._sib is not None:
-            return self.steps([*tokens, *self._sib], commit=False, branch=(len(self.carry), len(self._sib)))
+        sibling = self._sibling()
+        if sibling is not None:
+            return self.steps([*tokens, *sibling], commit=False, branch=(len(self.carry), len(sibling)))
         return self.steps(tokens, commit=len(tokens) == 1 and not mtp)
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
@@ -494,23 +357,21 @@ class NpuQwen(OverlayModel):
         slots, the carry's not: injected after the step that kept it; another lazy step: its kept tokens' rows pending)"""
         if len(tokens) == 1 and not mtp:  # (a committed step: its row pending, ``steps``)
             return
-        L = len(self._sib or ())
+        fd = self.flash
+        L = len(self._sibling() or ())
         S = len(tokens) + L
-        self._sib = None
-        self.siblings_won += won > 0
+        if fd is not None:
+            fd.sibling = None
+            fd.siblings_won += won > 0
         self.overlay.accept(m)
         self.position = p + m
         self.rope_next -= S - m
-        if self.dflash is not None:
-            c = len(self.carry)
-            src = [*range(c, m), *range(S - L, S - L + won)]
-            self._inj = (S, len(src), p + c, src if c or won else None) if self._drafting else None
+        if fd is not None:
+            fd.kept(p, m, won, S, L)
         elif mtp:
-            hs = self._hidden(m)
-            self._pend = [(self._rows([t])[0], hs[i]) for i, t in enumerate(tokens[1:m])]
-            self._dpos, self._h = p + 1, hs[m - 1]
+            self.mtp.kept(p, tokens, m)
         elif self._drafting:
-            self._follow(m)
+            self.mtp.follow(m, self._x)
 
 
 class Qwen(Model):
