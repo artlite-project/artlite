@@ -1,5 +1,5 @@
 """SD 1.x's VAE decoder (AutoencoderKL): one image on the vision overlay, as the UNet, its left and right halves as the
-design's two images (``build.Level`` half; the convs' joined shift masks carry the pixels across the seam).
+design's two images (``levels.ImageLevel`` half; the convs' joined shift masks carry the pixels across the seam).
 
 Levels (``LEVELS``): 64 px (a row = one tile of 4 groups: ``ops.Gemm`` rc; bands of 2 rows), 128 (two tiles a row,
 its even and odd groups: il; bands of a row), 256 and 512 ("wide": tiles of 4 consecutive groups, bands of half a
@@ -22,9 +22,10 @@ from artlite.overlay import Transaction
 from artlite.vision import core as K
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
+from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import Apply, ConvSpec, Gemm
 from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
@@ -32,22 +33,22 @@ from artlite.vision.weights import Wt, computed, flat, take, values
 
 from .level64 import IL
 
-L64, L128, L256, L512 = Level(64, 4, True), Level(128, 16, True), Level(256, 64, True), Level(512, 128, True)
+L64, L128, L256, L512 = ImageLevel(64, 4, True), ImageLevel(128, 16, True), ImageLevel(256, 64, True), ImageLevel(512, 128, True)
 LEVELS = {lv.H: lv for lv in (L64, L128, L256, L512)}
 APPLY_ROWS = (0, 1, 2, 3)
 EPS = 1e-6  # (the decoder's GroupNorm epsilon: diffusers' AutoencoderKL)
 
 
-def kind(lv: Level) -> str:
+def kind(lv: ImageLevel) -> str:
     return "rc" if lv.Lg == 4 else "il" if lv.Lg == 8 else "wide"
 
 
-def order(lv: Level) -> list[int]:
+def order(lv: ImageLevel) -> list[int]:
     """A row's groups in their storage order."""
     return list(IL) if lv.Lg == 8 else list(range(lv.Lg))
 
 
-def tokens(x: np.ndarray, lv: Level) -> np.ndarray:
+def tokens(x: np.ndarray, lv: ImageLevel) -> np.ndarray:
     """(1, C, H, H) -> per column its tokens (COLS, R 16 Lg, C): column c's rows c R .., token panel (row, group in the
     storage order, half), lane j = pixel half H / 2 + g + Lg j."""
     x = np.asarray(x, np.float32)
@@ -56,7 +57,7 @@ def tokens(x: np.ndarray, lv: Level) -> np.ndarray:
     return v.transpose(1, 2, 5, 3, 4, 0).reshape(COLS, lv.R * lv.Lg * 16, C)
 
 
-def from_tokens(y: np.ndarray, lv: Level) -> np.ndarray:
+def from_tokens(y: np.ndarray, lv: ImageLevel) -> np.ndarray:
     C = y.shape[-1]
     v = y.reshape(COLS, lv.R, lv.Lg, 2, 8, C).transpose(5, 0, 1, 3, 4, 2)  # C c row half j g
     return v[..., [order(lv).index(g) for g in range(lv.Lg)]].reshape(1, C, lv.H, lv.H)
@@ -125,7 +126,7 @@ class VImage:
 
     C: int
     name: str
-    lv: Level
+    lv: ImageLevel
 
     @property
     def rowp(self) -> int:  # (a row's panels of a kb)
@@ -173,7 +174,7 @@ class VImage:
             cols[c] = ColOps(drains=drains)
         bd.defer(cols, release=[(t.addr, t.size or t.nbytes)])
 
-    def store_up(self, bd: Builder, b: int, t: Tensor, src: Level, ch: Chans | None = None) -> None:
+    def store_up(self, bd: Builder, b: int, t: Tensor, src: ImageLevel, ch: Chans | None = None) -> None:
         """Nearest 2x of band b of level src's panels t into this level's rows: src row y -> rows 2 y, 2 y + 1, group g ->
         groups 2 g, 2 g + 1 (the storage orders: rc -> il, il -> wide, wide -> wide; wide: the edge positions too),
         drained with the next op (t's bytes released after it)."""

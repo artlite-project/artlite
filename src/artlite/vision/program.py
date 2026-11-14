@@ -16,7 +16,7 @@ from typing import Self
 import numpy as np
 
 from ..overlay import Transaction
-from .build import Builder
+from .builder import Builder
 from .device import VisionDevice
 
 

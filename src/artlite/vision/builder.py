@@ -1,9 +1,9 @@
 """Building the vision overlay's programs: a dispatch's ops (``seq.Seq``) with their DDR images (commands, weights,
 tables), the memtile allocation (the same addresses in every column) and the GroupNorm records' routes.
 
-Tensors of a level (``Level``): C tiles (bf16, ``layout.ct_bytes`` per 80 channels: a residual stream, a norm's
+Tensors of a level (``levels.Level``): C tiles (bf16, ``layout.ct_bytes`` per 80 channels: a residual stream, a norm's
 input) or panels (bfp16 [kb][token panel]: a GEMM's / conv's input); in the memtile at an address of every column, or
-in DDR as the columns' images of that memtile region (``spill`` / ``load``: one contiguous transfer per column).
+in DDR as the columns' images of that memtile region (``Builder.drain`` / ``fill``: one contiguous transfer per column).
 
 GroupNorm records (``Records``): a producer op's per-core records ([core][OCH] in the memtile) drained to DDR [col][core]
 [256 B]; an apply's core sums those of the producer rows whose 16-group window is its own (``ops.gn_window``), read from
@@ -23,9 +23,10 @@ from ..operators.design import COLS, ROWS
 from ..overlay import Transaction
 from . import core as K
 from . import design as D
-from . import layout as L
 from .device import VisionDevice
+from .memtile import Mem
 from .ops import ZERO_BYTES, Apply, Gemm, gn_window
+from .ops.common import limit
 from .roles import SPECS
 from .seq import B_BDS, ColOps, MemTask, RowOps
 from .weights import Slots, Wt, as_wt
@@ -33,85 +34,22 @@ from .weights import Slots, Wt, as_wt
 TBIAS, TBIAS_BYTES = "_tbias", 64 * 1024  # (the time-biased convs' command biases: [op][row][passes 80 bf16])
 
 
+def _transfer(base: int, col: int, image_bytes: int, off: int, mem: int, nbytes: int, mdims: list | None,
+              sdims: tuple | None) -> MemTask:
+    """One column's DDR <-> memtile task: ``nbytes`` of the memtile at ``mem`` (walk ``mdims``) and of the DDR image at
+    ``base`` ([col][image_bytes]) from ``off`` in the column's (shim dims ``sdims``)."""
+    bd = {"addr": mem, "nwords": nbytes // 4} | ({"dims": mdims} if mdims else {})
+    return MemTask([bd], ddr=(base + col * image_bytes + off, nbytes, sdims))
+
+
 @dataclass(frozen=True)
-class Level:
-    """A level's geometry per column: R image rows of Lg groups of 8 lanes, both images; its tokens in ``nb`` bands (the
-    memtile holds one band's tensors: 32x32 two of 2 rows, 64x64 four), a band's in tiles of m tokens (64: 4 groups of a
-    row; 8x8: 16). half: one image of H x H, its left and right halves as the two images (``vae``): Lg groups of a half
-    row."""
+class TimeBias:
+    """A resnet's time-biased conv: the offset of its biases in TBIAS and its weight rows [row][passes 80] (the host
+    rewrites them per step: ``models.sd15.model.UNet.set_time``)."""
 
-    H: int
-    nb: int = 1
-    half: bool = False
-
-    @property
-    def R(self) -> int:
-        return self.H // COLS
-
-    @property
-    def Lg(self) -> int:
-        return self.H // (16 if self.half else 8)
-
-    @property
-    def T(self) -> int:  # (a band's tokens per column)
-        return 16 * self.R * self.Lg // self.nb
-
-    @property
-    def m(self) -> int:
-        return min(self.T, 64)
-
-    @property
-    def ntile(self) -> int:
-        return self.T // self.m
-
-    @property
-    def np(self) -> int:  # (token panels per kb)
-        return self.T // 8
-
-    def ct(self, C: int) -> int:
-        """Bytes of a C-tile tensor of C channels (one band)."""
-        return C // 80 * self.ntile * L.ct_bytes(self.m)
-
-    def pn(self, C: int) -> int:
-        """Bytes of a panel tensor of C channels (one band)."""
-        return C // 8 * self.np * L.PANEL
-
-
-class Mem:
-    """First-fit allocation of the columns' memtile bytes [0, size) (64-byte aligned)."""
-
-    def __init__(self, size: int = D.HEAP):
-        self.free = [(0, size)]
-        self.size = size
-
-    def alloc(self, n: int, *, top: bool = False) -> int:
-        """n bytes from the first free range that holds them (top: the end of the last one: small buffers that live
-        across ops, away from the large tensors)."""
-        n = -(-n // 64) * 64
-        for i in (reversed(range(len(self.free))) if top else range(len(self.free))):
-            a, s = self.free[i]
-            if s >= n:
-                if top:
-                    self.free[i] = (a, s - n)
-                    a += s - n
-                else:
-                    self.free[i] = (a + n, s - n)
-                if self.free[i][1] == 0:
-                    del self.free[i]
-                return a
-        raise MemoryError(f"memtile: {n} B not free ({self.free})")
-
-    def release(self, a: int, n: int) -> None:
-        n = -(-n // 64) * 64
-        self.free.append((a, n))
-        self.free.sort()
-        merged = []
-        for b, s in self.free:
-            if merged and merged[-1][0] + merged[-1][1] == b:
-                merged[-1] = (merged[-1][0], merged[-1][1] + s)
-            else:
-                merged.append((b, s))
-        self.free = merged
+    resnet: str
+    offset: int
+    rows: np.ndarray
 
 
 @dataclass
@@ -158,7 +96,7 @@ class Builder:
         self.tab: dict[int, str | None] = dict.fromkeys(range(ROWS))
         self.tables: dict[str, np.ndarray] = {}
         self.zero = self.mem.alloc(ZERO_BYTES)  # (zeros: a conv's halo rows at the image's edges)
-        self.tb_hooks: list = []  # (time biases: (resnet prefix, offset in TBIAS, the bias rows [row][passes 80]))
+        self.tb_hooks: list[TimeBias] = []  # (the time-biased convs: ``TimeBias``)
         self.tb_used = 0
         self._zfill = False
         self._tab_runs: dict[int, tuple] = {}  # (row -> a table's B run, taken before the row's next op: ``table``)
@@ -279,19 +217,30 @@ class Builder:
                 self.op({}, {})
             self.ddr_sync()
 
+    def fill(self, name: str, image_bytes: int, *, mem: int, nbytes: int, off: int = 0, mdims: list | None = None,
+             sdims: tuple | None = None) -> dict[int, ColOps]:
+        """Per column a fill of ``nbytes`` of DDR image ``name`` ([col][image_bytes], from ``off`` in the column's) into
+        the memtile at ``mem`` (merge into an op): the memtile walk ``mdims`` (``ops.dims`` form), the shim's ``sdims``
+        (``txn.shim_bd``)."""
+        base = self.ddr(name, COLS * image_bytes)
+        self.reading(name)
+        return {c: ColOps(fills=[_transfer(base, c, image_bytes, off, mem, nbytes, mdims, sdims)]) for c in range(COLS)}
+
+    def drain(self, name: str, image_bytes: int, *, mem: int, nbytes: int, off: int = 0, mdims: list | None = None,
+              sdims: tuple | None = None) -> dict[int, ColOps]:
+        """Per column a drain of the memtile bytes [mem, mem + nbytes) into DDR image ``name`` ([col][image_bytes], at
+        ``off`` in the column's); ``mdims``, ``sdims``: ``fill``'s."""
+        base = self.ddr(name, COLS * image_bytes)
+        self.written(name)
+        return {c: ColOps(drains=[_transfer(base, c, image_bytes, off, mem, nbytes, mdims, sdims)]) for c in range(COLS)}
+
     def load(self, name: str, addr: int, nbytes: int) -> dict[int, ColOps]:
         """Fills of DDR image ``name`` ([col][nbytes]) into the memtile at addr (merge into an op)."""
-        self.reading(name)
-        base = self.npu.address(name)
-        return {c: ColOps(fills=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * nbytes, nbytes, None))])
-                for c in range(COLS)}
+        return self.fill(name, nbytes, mem=addr, nbytes=nbytes)
 
     def spill(self, name: str, addr: int, nbytes: int) -> dict[int, ColOps]:
         """Drains of the memtile bytes [addr, addr + nbytes) into DDR image ``name`` ([col][nbytes])."""
-        base = self.ddr(name, COLS * nbytes)
-        self.written(name)
-        return {c: ColOps(drains=[MemTask([{"addr": addr, "nwords": nbytes // 4}], ddr=(base + c * nbytes, nbytes, None))])
-                for c in range(COLS)}
+        return self.drain(name, nbytes, mem=addr, nbytes=nbytes)
 
     @staticmethod
     def merge(*ops: dict[int, ColOps]) -> dict[int, ColOps]:
@@ -331,13 +280,30 @@ class Builder:
         command variants). A conv is a barrier (its halo rows: the neighbours'), unless inputs_ready (complete before an
         earlier op: its later passes); it clobbers the activation tables. tbias: the resnet whose time bias b includes:
         the commands' biases on the B streams from TBIAS (rewritten per step: ``tb_hooks``)."""
+        assert not (wname and tbias)
         cmds = [g.command(b, r) for r in range(ROWS)]
         assert w is not None or not g.nkt, f"{name}: a GEMM of {g.nkt} k-tiles without weights"
         w = None if w is None or not g.nkt else as_wt(w)
-        key = (hash(b"".join(c.tobytes() for c in cmds)), None if w is None else w.key)
+        rows = self._weight_image(g, w, cmds, name, wname, key=(hash(b"".join(c.tobytes() for c in cmds)),
+                                                                 None if w is None else w.key))
+        if tbias:
+            self._time_bias(g, b, rows, tbias)
+        co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
+        cols = {c: co or g.col_ops(c) for c in range(COLS)}
+        if extra:
+            cols = self.merge(cols, extra)
+        self.op(cols, rows, barrier=barrier or (g.conv is not None and not inputs_ready), nolock=inputs_ready)
+        if g.conv is not None:
+            self.tab = dict.fromkeys(range(ROWS))
+
+    def _weight_image(self, g: Gemm, w: Wt | None, cmds: list[np.ndarray], name: str, wname: str, *, key: tuple
+                      ) -> dict[int, RowOps]:
+        """The DDR images of a GEMM's commands and weights (jobs, packed by ``finish``) and its rows' B streams: the
+        weights in the image ``wname`` (shared by a layer's command variants: ``name`` holds the commands), or per row
+        its command then its weights in ``name`` (a layer's bands: its image again, not converted again; a restored
+        model's: as it is)."""
         wb = g.npo * g.nkt * D.Q  # (a row's weight bytes: its passes' k-tiles of B slots)
         if wname:
-            assert not tbias
             addr = self.image(name, np.concatenate(cmds))
             if wname not in self._gemm_images:
                 wa = self.ddr(wname, ROWS * wb)
@@ -345,42 +311,37 @@ class Builder:
                 self._gemm_images[wname] = (key[1], wa, wb)
             assert self._gemm_images[wname][0] == key[1], f"weights image {wname!r} of other weights"
             wa, wb = self._gemm_images[wname][1:]
-            rows = {r: g.row_ops(addr + r * D.Q, wa + r * wb) for r in range(ROWS)}
+            return {r: g.row_ops(addr + r * D.Q, wa + r * wb) for r in range(ROWS)}
+        per = D.Q + wb  # (per row its command, then its weights: one B run)
+        if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
+            addr = self._gemm_images[name][1]
+        elif self.reuse and self.npu.has(name):
+            addr = self.npu.address(name)
         else:
-            per = D.Q + wb  # (per row its command, then its weights: one B run)
-            if self._gemm_images.get(name, (None,))[0] == key:  # (a layer's bands: its image again, not converted again)
-                addr = self._gemm_images[name][1]
-            elif self.reuse and self.npu.has(name):
-                addr = self.npu.address(name)
-            else:
-                assert name not in self._gemm_images, f"DDR image {name!r} written again with other data"
-                addr = self.ddr(name, ROWS * per)
-                for r in range(ROWS):
-                    self.put(name, cmds[r], r * per)
-                if w is not None:
-                    self.slots.add(g, w, {r: (name, r * per + D.Q) for r in range(ROWS)})
-                self._gemm_images[name] = (key, addr, per)
-            rows = {r: g.row_ops(addr + r * per) for r in range(ROWS)}
-        if tbias:  # (the first run in three: the header, the biases from TBIAS, the rest)
-            nb, hb = 160 * g.npo, 4 * K.C_BIAS
-            if not self.tb_used:
-                self.ddr(TBIAS, TBIAS_BYTES)
-            off = self.tb_used
-            self.tb_used += ROWS * nb
-            assert self.tb_used <= TBIAS_BYTES
-            tb = self.npu.address(TBIAS)
-            for r, ro in rows.items():
-                (a, n), *more = ro.runs  # (more: the weights again per further tile)
-                self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
-                ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
-            self.tb_hooks.append((tbias, off, np.concatenate([g.weight_rows(r) for r in range(ROWS)])))
-        co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
-        cols = {c: co or g.col_ops(c) for c in range(COLS)}
-        if extra:
-            cols = self.merge(cols, extra)
-        self.op(cols, rows, barrier=barrier or (bool(g.conv) and not inputs_ready), nolock=inputs_ready)
-        if g.conv:
-            self.tab = dict.fromkeys(range(ROWS))
+            assert name not in self._gemm_images, f"DDR image {name!r} written again with other data"
+            addr = self.ddr(name, ROWS * per)
+            for r in range(ROWS):
+                self.put(name, cmds[r], r * per)
+            if w is not None:
+                self.slots.add(g, w, {r: (name, r * per + D.Q) for r in range(ROWS)})
+            self._gemm_images[name] = (key, addr, per)
+        return {r: g.row_ops(addr + r * per) for r in range(ROWS)}
+
+    def _time_bias(self, g: Gemm, b: np.ndarray, rows: dict[int, RowOps], resnet: str) -> None:
+        """The rows' first run in three: the command's header, the biases from TBIAS (rewritten per step), the rest
+        (``tb_hooks``)."""
+        nb, hb = 160 * g.npo, 4 * K.C_BIAS
+        if not self.tb_used:
+            self.ddr(TBIAS, TBIAS_BYTES)
+        off = self.tb_used
+        self.tb_used += ROWS * nb
+        limit("the time-biased convs' biases", self.tb_used, TBIAS_BYTES, "the TBIAS image")
+        tb = self.npu.address(TBIAS)
+        for r, ro in rows.items():
+            (a, n), *more = ro.runs  # (more: the weights again per further tile)
+            self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
+            ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
+        self.tb_hooks.append(TimeBias(resnet, off, np.concatenate([g.weight_rows(r) for r in range(ROWS)])))
 
     def records(self, rec: int, *, name: str, ch_off: int, nr: int, gsize: int, band: int = 0, nbands: int = 1) -> Records:
         """Drain a producer's GroupNorm records (memtile ``rec`` [core][OCH], 4 OCH bytes: released by the drain's op)
@@ -395,8 +356,8 @@ class Builder:
         held.add(band)
         self._rec_img[name] = img, held
         base = img + band * COLS * ROWS * 256
-        cols = {c: ColOps(drains=[MemTask([{"addr": rec, "nwords": 256, "dims": [(64, 1), (ROWS, D.OCH // 4)]}],
-                                          ddr=(base + c * 1024, 1024, None))]) for c in range(COLS)}
+        cols = {c: ColOps(drains=[_transfer(base, c, 1024, 0, rec, 1024, [(64, 1), (ROWS, D.OCH // 4)], None)])
+                for c in range(COLS)}
         self._drains.append((cols, [(rec, 4 * D.OCH)], True))
         return Records(base, ch_off, nr, gsize)
 

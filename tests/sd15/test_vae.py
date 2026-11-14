@@ -8,9 +8,10 @@ import torch.nn.functional as F
 
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
+from artlite.vision.levels import ImageLevel
 from models.sd15 import vae
 
 from ..model_files import require
@@ -64,7 +65,7 @@ def _rand_resnet(p: str, cin: int, cout: int) -> dict:
     return w
 
 
-def _input(bd: Builder, x: torch.Tensor, lv: Level, name: str) -> DTensor:
+def _input(bd: Builder, x: torch.Tensor, lv: ImageLevel, name: str) -> DTensor:
     ch = vae.chans(x.shape[1])
     t = DTensor(lv, ch.P, name)
     vae.write_dtensor(bd, t, x, ch)

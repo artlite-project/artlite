@@ -9,9 +9,10 @@ import torch.nn.functional as F
 from artlite.operators.design import COLS
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor
+from artlite.vision.levels import ImageLevel
 
 from ..numerics import rel_native
 from ..vision.ops_ref import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
@@ -44,7 +45,7 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     w = _rand_resnet(p, cin, cout)
     tb = 0.3 * torch.randn(cout)
     x = torch.randn(2, cin, H, H)
-    lv = Level(H)
+    lv = ImageLevel(H)
     bd = Builder(npu)
     xt = Tensor(lv, cin, bd.mem.alloc(lv.ct(cin)))
     xt_cols = level_tokens(x, lv.R, lv.Lg)
@@ -75,7 +76,7 @@ def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
     w = _rand_resnet(p, cin, cout)
     tb = 0.3 * torch.randn(cout)
     x = torch.randn(2, cin, H, H)
-    lv = Level(H, 2)
+    lv = ImageLevel(H, 2)
     bd = Builder(npu)
     xc = level_tokens(x, lv.R, lv.Lg)
     xd = DTensor(lv, cin, "x_in", rec=[])
@@ -157,7 +158,7 @@ def test_resnet_cat_bands(npu: VisionDevice, ch: int, cs: int) -> None:
     w = _rand_resnet(p, ch + cs, cout)
     tb = 0.3 * torch.randn(cout)
     hx, sk = torch.randn(2, ch, H, H), torch.randn(2, cs, H, H)
-    lv = Level(H, 2)
+    lv = ImageLevel(H, 2)
     bd = Builder(npu)
 
     def ddr(x: torch.Tensor, name: str) -> DTensor:
@@ -190,7 +191,7 @@ def test_downsample_bands(npu: VisionDevice) -> None:
     C, p, H = 640, "s.", 32
     x = torch.randn(2, C, H, H)
     w = {p + "conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, p + "conv.bias": 0.1 * torch.randn(C)}
-    lv = Level(H, 2)
+    lv = ImageLevel(H, 2)
     bd = Builder(npu)
     xc = level_tokens(x, lv.R, lv.Lg)
     xd = DTensor(lv, C, "x_in")
@@ -213,7 +214,7 @@ def test_upsample_bands(npu: VisionDevice) -> None:
     x = torch.randn(2, C, 16, 16)
     w = {p + "conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, p + "conv.bias": 0.1 * torch.randn(C)}
     bd = Builder(npu)
-    xt = _level_input(bd, Level(16), x, "x_in")
+    xt = _level_input(bd, ImageLevel(16), x, "x_in")
     out = upsample_bands(bd, w, p, xt, stats=None, name="u")
     bd.op({}, {})
     npu.run(bd.transaction())
@@ -267,7 +268,7 @@ def test_transformer(npu: VisionDevice, H: int) -> None:
     x = torch.randn(2, C, H, H)
     ctx = torch.randn(2, 77, 768)
     q = p + "transformer_blocks.0.attn2."
-    lv = Level(H)
+    lv = ImageLevel(H)
     bd = Builder(npu)
     xt = Tensor(lv, C, bd.mem.alloc(lv.ct(C)))
     xc = level_tokens(x, lv.R, lv.Lg)
@@ -302,7 +303,7 @@ def test_transformer_bands(npu: VisionDevice) -> None:
     x = torch.randn(2, C, H, H)
     ctx = torch.randn(2, 77, 768)
     q = p + "transformer_blocks.0.attn2."
-    lv = Level(H, 2)
+    lv = ImageLevel(H, 2)
     bd = Builder(npu)
     xc = level_tokens(x, lv.R, lv.Lg)  # (COLS, 2 T, C): band b = tokens [T b, T (b + 1))
     xd = DTensor(lv, C, "x_in")
@@ -331,7 +332,7 @@ def test_transformer_bands(npu: VisionDevice) -> None:
 def _b32_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> DTensor:
     """A 32x32 DTensor of x (2, C, 32, 32) in DDR per band (``Level(32, 2)``), with GroupNorm records for st."""
     from artlite.vision.layers import copy_stats
-    lv, C = Level(32, 2), x.shape[1]
+    lv, C = ImageLevel(32, 2), x.shape[1]
     xc = level_tokens(x, lv.R, lv.Lg)
     xd = DTensor(lv, C, name, rec=[])
     for b in range(lv.nb):
@@ -443,7 +444,7 @@ def test_transformer64(npu: VisionDevice) -> None:
     assert err < 2e-2
 
 
-def _level_input(bd: Builder, lv: Level, x: torch.Tensor, name: str) -> Tensor:
+def _level_input(bd: Builder, lv: ImageLevel, x: torch.Tensor, name: str) -> Tensor:
     """x (2, C, H, H) as the level's C tiles: a DDR image, loaded into the memtile; the Tensor (no records)."""
     C = x.shape[1]
     t = Tensor(lv, C, bd.mem.alloc(lv.ct(C)))
@@ -474,7 +475,7 @@ def test_resnet_cat(npu: VisionDevice, H: int, ch: int, cs: int) -> None:
     w = _rand_resnet(p, ch + cs, cout)
     tb = 0.3 * torch.randn(cout)
     h, sk = torch.randn(2, ch, H, H), torch.randn(2, cs, H, H)
-    lv = Level(H)
+    lv = ImageLevel(H)
     bd = Builder(npu)
     st = _level_input(bd, lv, sk, "s_in")
     skip = make_skip(bd, st, name="skip", st=((ch + cs) // 32, ch))
@@ -498,7 +499,7 @@ def test_resample(npu: VisionDevice, kind: str) -> None:
     x = torch.randn(2, C, H, H)
     w = {p + "conv.weight": torch.randn(C, C, 3, 3) / (9 * C) ** 0.5, p + "conv.bias": 0.1 * torch.randn(C)}
     bd = Builder(npu)
-    xt = _level_input(bd, Level(H), x, "x_in")
+    xt = _level_input(bd, ImageLevel(H), x, "x_in")
     out = (downsample if kind == "down" else upsample)(bd, w, p, xt, stats=None)
     y = _level_output(npu, bd, out, "y_out")
     xq = q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)

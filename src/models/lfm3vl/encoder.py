@@ -47,16 +47,16 @@ from artlite.operators.design import COLS, ROWS
 from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision import windows as W
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm
+from artlite.vision.levels import TokenLevel
 from artlite.vision.ops import DwConv, Gemm
 from artlite.vision.program import ProgramStore
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.vit import (
     Bands,
     Keys,
-    VitLevel,
     attend,
     blocks4,
     folded_patch,
@@ -147,7 +147,7 @@ def weights(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...], proj:
     return w
 
 
-def level(nb: int) -> VitLevel:
+def level(nb: int) -> TokenLevel:
     return vit_level(nb)
 
 
@@ -178,7 +178,7 @@ class Net:
     def keys(self, nb: int) -> Keys:
         return Keys(self.nm.attn(nb), joint=True, dense=True, kv_heads=KVH)
 
-    def rope(self, bd: Builder, lv: VitLevel, band: int) -> Tensor:
+    def rope(self, bd: Builder, lv: TokenLevel, band: int) -> Tensor:
         """Band b's cos | sin tile (``windows.rope_table``) in the memtile."""
         t = alloc(bd, lv, HP)
         rt = lv.ct(HP)

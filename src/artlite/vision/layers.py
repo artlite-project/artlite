@@ -1,4 +1,4 @@
-"""A network's tensors and layers on a ``build.Builder``: the vision overlay's ops (``ops``) as the networks call
+"""A network's tensors and layers on a ``builder.Builder``: the vision overlay's ops (``ops``) as the networks call
 them (``models.sd15``'s UNet and VAE decoder, ``models.minicpmv``'s encoder).
 
 Tensors: ``Tensor`` (C tiles or panels of a level in the memtile, at an address of every column: ``alloc``, ``free``)
@@ -18,7 +18,8 @@ from ..operators import kmath
 from ..operators.design import COLS, ROWS
 from . import design as D
 from . import layout as L
-from .build import Builder, Level, Records
+from .builder import Builder, Records
+from .levels import Level
 from .ops import Apply, Attention, ConvSpec, Gemm
 from .seq import ColOps, MemTask
 from .weights import flat

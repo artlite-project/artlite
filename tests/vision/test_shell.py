@@ -112,7 +112,7 @@ def test_state_key_covers_the_loaders_imports(root: str) -> None:
     inits = [m for m in closure if sources.module_path(m).endswith("__init__.py")]
     known = closure | set(sources.import_closure(*inits))
     assert _loaded(root) <= known
-    assert {"artlite.vision.build", "artlite.vision.device", "artlite.vision.program", "artlite.txn", "artlite.overlay",
+    assert {"artlite.vision.builder", "artlite.vision.device", "artlite.vision.program", "artlite.txn", "artlite.overlay",
             "artlite.operators.kmath", root} <= closure
     files = sources.source_files(root)
     assert any(f.endswith("artlite/vision/core.cc.jinja") for f in files)  # (the kernel templates ride with their module)

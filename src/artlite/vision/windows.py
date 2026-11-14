@@ -47,12 +47,12 @@ from ..operators import kmath
 from ..operators.design import COLS
 from ..overlay import Transaction
 from . import layout as L
-from .build import Builder
+from .builder import Builder
 from .device import VisionDevice
 from .layers import Tensor, alloc, free, gelu_table, gemm
 from .ops import dims
 from .program import Program, ProgramStore
-from .vit import ln, vit_level, xfer
+from .vit import ln, vit_level
 
 WIN = 128  # (windows of a band: 8 columns x 2 halves x 8 lanes)
 GW_MAX = 1024  # (an image's windows per row at most: 4096 merged tokens at transformers' aspect bound of 200)
@@ -225,34 +225,34 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
         n = alloc(bd, lv, C, "pn")
         ln(bd, xb, n, w["post_g"], w["post_b"], name=f"{nm.p}.post", rec=rec, C=C, H=md.H, eps=md.eps)
         free(bd, xb)
-        bd.op(xfer(bd, f"{nm.p}.mg.{b // 4}", mgb, fill=False, mem=n.addr, nbytes=pn, off=2 * (b % 4) * L.PANEL,
+        bd.op(bd.drain(f"{nm.p}.mg.{b // 4}", mgb, mem=n.addr, nbytes=pn, off=2 * (b % 4) * L.PANEL,
                    mdims=walk, sdims=(36, MERGED // 8, 144, 144 * MERGED // 8)), {})
         free(bd, n)
     for qd in range(-(-nb // 4)):
         mg = alloc(bd, l1, MERGED, "pn")
         spare = bd.mem.alloc(9216)  # (the GEMM's A walk reads past its panels' end)
-        bd.op(xfer(bd, f"{nm.p}.mg.{qd}", mgb, fill=True, mem=mg.addr, nbytes=mgb), {})
+        bd.op(bd.fill(f"{nm.p}.mg.{qd}", mgb, mem=mg.addr, nbytes=mgb), {})
         bd.table("gelu_erf", gelu_table(kmath.GELU_ERF))
         g = alloc(bd, l1, max(md.up), "pn")
         u0 = 0
         for k, u in enumerate(md.up):
             gk = Tensor(l1, u, g.addr, "pn")
             gemm(bd, mg, w["up"][u0:u0 + u], w["up_b"][u0:u0 + u], name=f"{nm.p}.up{k}", out=gk, kind="gelu", hilo=True)
-            bd.op(xfer(bd, f"{nm.p}.hid.{qd}", hid, fill=False, mem=g.addr, nbytes=gk.nbytes, off=l1.pn(u0)), {})
+            bd.op(bd.drain(f"{nm.p}.hid.{qd}", hid, mem=g.addr, nbytes=gk.nbytes, off=l1.pn(u0)), {})
             u0 += u
         free(bd, g)
         bd.mem.release(spare, 9216)
         free(bd, mg)
         h = alloc(bd, l1, FUP, "pn")
         spare = bd.mem.alloc(9216)
-        bd.op(xfer(bd, f"{nm.p}.hid.{qd}", hid, fill=True, mem=h.addr, nbytes=hid), {})
+        bd.op(bd.fill(f"{nm.p}.hid.{qd}", hid, mem=h.addr, nbytes=hid), {})
         y = alloc(bd, l1, md.dn)
         for k in range(outw // md.dn + (outw % md.dn > 0)):
             n = min(md.dn, outw - md.dn * k)
             yk = Tensor(l1, n, y.addr)
             gemm(bd, h, w["down"][md.dn * k:md.dn * k + n], w["down_b"][md.dn * k:md.dn * k + n], name=f"{nm.p}.down{k}",
                  out=yk, hilo=True)
-            bd.op(xfer(bd, f"{nm.p}.out.{qd}", l1.ct(outw), fill=False, mem=y.addr, nbytes=yk.nbytes,
+            bd.op(bd.drain(f"{nm.p}.out.{qd}", l1.ct(outw), mem=y.addr, nbytes=yk.nbytes,
                        off=k * l1.ct(md.dn)), {})
         free(bd, y)
         bd.mem.release(spare, 9216)

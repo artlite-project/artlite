@@ -42,7 +42,7 @@ from artlite.operators import kmath
 from artlite.operators.design import COLS, ROWS
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gelu_table, gemm
 from artlite.vision.ops import ROPE2_TAB, Gemm, StripConv, WinAttention

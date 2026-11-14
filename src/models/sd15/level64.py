@@ -1,4 +1,4 @@
-"""The UNet's 64x64 level (``build.Level(64, 4)``): bands of 2 rows per column, a row's tokens as two tiles (its even
+"""The UNet's 64x64 level (``levels.ImageLevel(64, 4)``): bands of 2 rows per column, a row's tokens as two tiles (its even
 groups, its odd: ``ops.Gemm`` il). The residual stream and the blocks' C tiles in DDR per band (``layers.DTensor``); a
 conv's input panels in DDR as the whole level's (``PImage``), from which each band's conv fills its rows and their halo
 rows (the neighbour bands' and columns', zeros past the image)."""
@@ -11,13 +11,14 @@ from ml_dtypes import bfloat16
 from artlite.operators.design import COLS
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level
+from artlite.vision.builder import Builder
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm, gn_apply, plain
+from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import flat, pad_index, take
 
-LV64 = Level(64, 4)
+LV64 = ImageLevel(64, 4)
 ROW = 16 * L.PANEL  # (a row's token panels per kb, bytes)
 IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (a row's groups in their order: even, then odd)
 OUT = 4 * 8 * 128  # (conv_out's bytes per band and column: [tile][row block][64] of output channels 0..7)
@@ -58,7 +59,7 @@ class PImage:
 
     C: int
     name: str
-    lv: Level = LV64
+    lv: ImageLevel = LV64
 
     @property
     def colbytes(self) -> int:
@@ -243,7 +244,7 @@ def down64(bd: Builder, w: dict, p: str, x: DTensor, *, stats: tuple[int, int], 
         plain(bd, xb, t, name=p + "xpn")
         free(bd, xb)
         img.store(bd, b, t)
-    lv2 = Level(32, 2)
+    lv2 = ImageLevel(32, 2)
     wc, N = w[p + "conv.weight"], w[p + "conv.weight"].shape[0]
     out = DTensor(lv2, N, name, rec=[])
     for b in range(lv2.nb):

@@ -14,7 +14,7 @@ import numpy as np
 
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
-from artlite.vision.build import Builder, Level, Records
+from artlite.vision.builder import Builder, Records
 from artlite.vision.layers import (
     LOG2E,
     DTensor,
@@ -31,6 +31,7 @@ from artlite.vision.layers import (
     ln_apply,
     plain,
 )
+from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import Attention, ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import cat, flat
@@ -239,7 +240,7 @@ def downsample_bands(bd: Builder, w: dict, p: str, x: DTensor) -> Tensor:
     even ones (groups 0 and 2: the next level's groups 0 and 1) are output (``ops.Gemm`` "ds")."""
     lv, npw = x.lv, x.lv.np * x.lv.nb
     N = w[p + "conv.weight"].shape[0]
-    y = alloc(bd, Level(lv.H // 2), N)  # (first: the next level's tensors start at the memtile's bottom)
+    y = alloc(bd, ImageLevel(lv.H // 2), N)  # (first: the next level's tensors start at the memtile's bottom)
     px = alloc(bd, lv, x.C, "pn", pnp=npw)
     for b in range(lv.nb):
         xb = x.load(bd, b)
@@ -257,7 +258,7 @@ def upsample_bands(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int,
     whole column's panels of the level (a 16x16 column's 2 rows are the 32x32 column's 4: row 2 r + f, group 2 g + e
     of panel (r, g): 4 fills), in K parts of 640 channels; per band the conv's halves of 640 outputs (+ the earlier
     part's partial sums, parked in DDR) -> the output's band (records for ``stats`` in the last part)."""
-    lv = Level(2 * x.lv.H, 2)
+    lv = ImageLevel(2 * x.lv.H, 2)
     npw = lv.np * lv.nb
     px = alloc(bd, x.lv, x.C, "pn")
     plain(bd, x, px, name=p + "xpn")
@@ -364,7 +365,7 @@ class Skip:
     panels, ``pb``: the concatenation's GroupNorm + SiLU of the skip's channels, applied when the skip is made: no group
     straddles the concatenation, so its records suffice)."""
 
-    lv: Level
+    lv: ImageLevel
     C: int
     ct: str = ""
     pn: str = ""
@@ -454,7 +455,7 @@ def downsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int
     """The stride-2 conv of the C tiles x (16x16) to the next level's C tiles (x kept)."""
     px = alloc(bd, x.lv, x.C, "pn")
     plain(bd, x, px, name=p + "xpn")
-    y = alloc(bd, Level(x.lv.H // 2), w[p + "conv.weight"].shape[0])
+    y = alloc(bd, ImageLevel(x.lv.H // 2), w[p + "conv.weight"].shape[0])
     conv(bd, px, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv", out=y, stride=2, stats=stats)
     free(bd, px)
     return y
@@ -463,7 +464,7 @@ def downsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int
 def upsample(bd: Builder, w: dict, p: str, x: Tensor, *, stats: tuple[int, int] | None) -> Tensor:
     """Nearest 2x of the C tiles x, then the conv (x freed): the upsampled panels via DDR (16x16 column c's rows are
     8x8 row c: each panel (row, group, image) is the 8x8 panel (image), x = g + 2 lane), the conv on the next level."""
-    lv2 = Level(2 * x.lv.H)
+    lv2 = ImageLevel(2 * x.lv.H)
     px = alloc(bd, x.lv, x.C, "pn")
     plain(bd, x, px, name=p + "xpn")
     free(bd, x)

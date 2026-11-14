@@ -14,9 +14,10 @@ from artlite.operators.design import COLS
 from artlite.overlay import Transaction
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import TBIAS, Builder, Level
+from artlite.vision.builder import TBIAS, Builder, TimeBias
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor
+from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import Attention
 from artlite.vision.program import Program
 
@@ -63,7 +64,7 @@ class UNet:
         [f"up_blocks.{i}.attentions.{j}." for i in (1, 2, 3) for j in range(3)]
 
     def __init__(self, npu: VisionDevice, runtime: dict, *, program: Program, lat: PImage, tb_used: int,
-                 tb_hooks: list, bd: Builder | None = None):
+                 tb_hooks: list[TimeBias], bd: Builder | None = None):
         """runtime: the host's weights (``RUNTIME``, tensors); program, lat, tb_used, tb_hooks: ``build``'s, or a
         ``state()``'s on a device whose images were restored (``VisionDevice.restore``); bd: the build's builder."""
         self.npu, self.w, self.bd = npu, runtime, bd
@@ -78,8 +79,8 @@ class UNet:
         rt = w if runtime is None else runtime
         lat = PImage(64, "lat")
         bd.ddr(lat.name, COLS * lat.colbytes)  # (zeros: per step only its first kb written)
-        lv32 = Level(32, 2)
-        kv = {16: bd.ddr("kv_self", 16 * Level(16).np * 2 * D.Q),
+        lv32 = ImageLevel(32, 2)
+        kv = {16: bd.ddr("kv_self", 16 * ImageLevel(16).np * 2 * D.Q),
               32: bd.ddr("kv_self32", Attention(np=lv32.np, q=0, o=0, kv=0, d=80, nbands=lv32.nb).kv_bytes()),
               64: bd.ddr("kv_self64", Attention(np=LV64.np, q=0, o=0, kv=0, d=40, nbands=LV64.nb).kv_bytes())}
         zeros = np.zeros((2, CTX_KEYS, 768), np.float32)
@@ -109,8 +110,8 @@ class UNet:
         """The resnets' time biases (by prefix): their conv1 commands' biases (the conv bias + the time bias, bf16) in
         TBIAS, one write."""
         buf = np.empty(self.tb_used // 2, bfloat16)
-        for p, off, rows in self.tb_hooks:
-            buf[off // 2:off // 2 + rows.size] = (self.w[p + "conv1.bias"] + biases[p])[rows]
+        for tb in self.tb_hooks:
+            buf[tb.offset // 2:tb.offset // 2 + tb.rows.size] = (self.w[tb.resnet + "conv1.bias"] + biases[tb.resnet])[tb.rows]
         self.npu.write(TBIAS, buf)
 
     def set_context(self, ctx: np.ndarray, pool: Executor | None = None) -> None:

@@ -42,7 +42,7 @@ import numpy as np
 
 from artlite.operators.design import COLS
 from artlite.vision import windows as W
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm
 from artlite.vision.program import ProgramStore

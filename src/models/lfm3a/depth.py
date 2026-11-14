@@ -43,7 +43,7 @@ from artlite.operators.design import COLS
 from artlite.overlay import Transaction
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor, alloc, free, gemm, ln_rec, silu_table
 from artlite.vision.ops import ROPE40_TAB, Apply, DepthAttention, Gemm

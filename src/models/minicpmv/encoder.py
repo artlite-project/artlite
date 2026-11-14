@@ -31,7 +31,7 @@ from artlite.overlay import Transaction
 from artlite.vision import core as K
 from artlite.vision import design as D
 from artlite.vision import layout as L
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 from artlite.vision.ops import Apply, Gemm, dims
@@ -56,7 +56,6 @@ from artlite.vision.vit import (
 )
 from artlite.vision.vit import pad as _pad
 from artlite.vision.vit import pad_heads as _heads
-from artlite.vision.vit import xfer as _xfer
 from artlite.vision.weights import Wt, cat, computed, eye, f32, take, values
 
 GROUPS = 64  # final groups (4 x 4 patches) of one image of a band: a tile's 8 columns x 8 lanes
@@ -360,17 +359,17 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         for role, kind in (("q", "bfp16"), ("k", "bfp16"), ("v", "vt")):
             o = alloc(bd, lv, C, "pn")
             gemm(bd, n, w[role], w[role + "_b"], name=f"{name}.{role}", out=o, kind=kind)
-            bd.defer(_xfer(bd, f"{name}.{role}.{s}", pn, fill=False, mem=o.addr, nbytes=pn), release=[(o.addr, o.size)])
+            bd.defer(bd.drain(f"{name}.{role}.{s}", pn, mem=o.addr, nbytes=pn), release=[(o.addr, o.size)])
         free(bd, n)
     for j in range(4):  # (the window attention of merged tile j: token panels 2 j, 2 j + 1 of the sources)
         base = {r: bd.mem.alloc(4 * (src + pad)) for r in ("q", "k", "v", "o")}
         sd = (36, C // 8, 144, C // 8 * 36)  # (per kb its two panels' 36 words, 576 B apart)
         for r in ("q", "k", "v"):  # (an op per role: a memtile channel's pool holds 8 BDs)
-            bd.op(bd.merge(*[_xfer(bd, f"{name}.{r}.{s}", pn, fill=True, mem=base[r] + s * (src + pad), nbytes=src,
+            bd.op(bd.merge(*[bd.fill(f"{name}.{r}.{s}", pn, mem=base[r] + s * (src + pad), nbytes=src,
                                    off=2 * j * 72, sdims=sd) for s in range(4)]), {})
         wa = WindowAttention(q=base["q"], k=base["k"], vt=base["v"], o=base["o"], stride=src + pad)
         bd.op({c: wa.col_ops() for c in range(COLS)}, wa.row_ops(bd.image(name + ".wcmd", wa.command())))
-        drains = [_xfer(bd, f"{name}.o.{s}", pn, fill=False, mem=base["o"] + s * (src + pad), nbytes=src,
+        drains = [bd.drain(f"{name}.o.{s}", pn, mem=base["o"] + s * (src + pad), nbytes=src,
                         off=2 * j * 72, sdims=sd) for s in range(4)]
         bd.op(bd.merge(*drains), {})
         for a in base.values():
@@ -379,7 +378,7 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         xb, rec = x.load(bd, s)
         bd.mem.release(rec, ln_rec(lv))
         o = alloc(bd, lv, C, "pn")
-        bd.op(_xfer(bd, f"{name}.o.{s}", pn, fill=True, mem=o.addr, nbytes=pn), {})
+        bd.op(bd.fill(f"{name}.o.{s}", pn, mem=o.addr, nbytes=pn), {})
         gemm(bd, o, w["o"], w["o_b"], name=name + ".o", out=xb, res=xb)
         free(bd, o)
         x2.store(bd, s, xb, defer=False)
@@ -400,9 +399,9 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
             bd.apply(a, w["ds_g"], w["ds_b"], name=f"{name}.ds_ln{h}")
         bd.mem.release(rec, ln_rec(l16))
         free(bd, mc)
-        bd.op(bd.merge(_xfer(bd, name + ".nl", pn64, fill=False, mem=nl.addr, nbytes=pn16, off=2 * j * 72,
+        bd.op(bd.merge(bd.drain(name + ".nl", pn64, mem=nl.addr, nbytes=pn16, off=2 * j * 72,
                              sdims=(36, MERGED // 8, 144, MERGED // 8 * 144)),
-                       _xfer(bd, name + ".xp", 4 * pn16, fill=False, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
+                       bd.drain(name + ".xp", 4 * pn16, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
         free(bd, nl)
         free(bd, xp)
     # up + GELU on the band's 64 merged tokens a column (its weights streamed once), the hidden to DDR in chunks of 960
@@ -410,13 +409,13 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
     bd.table("gelu", gelu_table())
     nl = alloc(bd, lp, MERGED, "pn")
     spare = bd.mem.alloc(D.A_OBJ)  # (the GEMM's A walk reads past its panels' end)
-    bd.op(_xfer(bd, name + ".nl", pn64, fill=True, mem=nl.addr, nbytes=pn64), {})
+    bd.op(bd.fill(name + ".nl", pn64, mem=nl.addr, nbytes=pn64), {})
     nc = 960  # (3 passes a row)
     g = alloc(bd, lp, nc, "pn")
     for c in range(HID // nc):
         gemm(bd, nl, w["up"][nc * c:nc * (c + 1)], w["up_b"][nc * c:nc * (c + 1)], name=f"{name}.up{c}", out=g,
              kind="gelu")
-        bd.op(_xfer(bd, name + ".hid", hb, fill=False, mem=g.addr, nbytes=g.nbytes, off=c * g.nbytes), {})
+        bd.op(bd.drain(name + ".hid", hb, mem=g.addr, nbytes=g.nbytes, off=c * g.nbytes), {})
     free(bd, g)
     bd.mem.release(spare, D.A_OBJ)
     free(bd, nl)
@@ -425,20 +424,20 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         xp = alloc(bd, l16, MERGED, "pn", top=True)
         hid = alloc(bd, l16, HID, "pn", top=True)  # (directly below xp: the down GEMM's K is [hidden | xp])
         assert hid.addr + hid.size == xp.addr, (hid.addr, hid.size, xp.addr)
-        bd.op(bd.merge(_xfer(bd, name + ".hid", hb, fill=True, mem=hid.addr, nbytes=hid.nbytes, off=2 * j * 72,
+        bd.op(bd.merge(bd.fill(name + ".hid", hb, mem=hid.addr, nbytes=hid.nbytes, off=2 * j * 72,
                              sdims=(36, HID // 24, 144, HID // 24 * 144)),
-                       _xfer(bd, name + ".xp", 4 * pn16, fill=True, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
+                       bd.fill(name + ".xp", 4 * pn16, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
         y = alloc(bd, l16, C)
         gemm(bd, Tensor(l16, HID + MERGED, hid.addr, "pn"), w["down"], w["down_b"], name=name + ".down", out=y)
         free(bd, hid)
         free(bd, xp)
         bd.mem.release(spare, 4096)
         ct16 = l16.ct(80)
-        bd.op(_xfer(bd, y2.band(0), ct, fill=False, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
+        bd.op(bd.drain(y2.band(0), ct, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
                     mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
         free(bd, y)
     xt = alloc(bd, lp, C)
-    bd.op(_xfer(bd, y2.band(0), ct, fill=True, mem=xt.addr, nbytes=ct), {})
+    bd.op(bd.fill(y2.band(0), ct, mem=xt.addr, nbytes=ct), {})
     return xt, ln_records(bd, xt, name=name + ".rec")
 
 
@@ -476,7 +475,7 @@ def _merged(bd: Builder, src: list[tuple[str, int]], name: str) -> Tensor:
     l16, ct, ob = vit_level(1, 16), POST.ct(C), L.ct_bytes(64)
     ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
     mc = alloc(bd, l16, MERGED)
-    bd.op(bd.merge(*[_xfer(bd, img, ct, fill=True, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=tp * 1280,
+    bd.op(bd.merge(*[bd.fill(img, ct, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=tp * 1280,
                            mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
                      for s, (img, tp) in enumerate(src)]), {})
     return mc
@@ -521,11 +520,11 @@ def final(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int)
     (``_final_mlp``) -> the embeddings: DDR image ``name.out`` ([col][16 x 1280 channels as C tiles of 16];
     ``embeddings`` reads it)."""
     y = _post(bd, w, name, x, rec)
-    bd.op(_xfer(bd, f"{name}.p", y.nbytes, fill=False, mem=y.addr, nbytes=y.nbytes), {})
+    bd.op(bd.drain(f"{name}.p", y.nbytes, mem=y.addr, nbytes=y.nbytes), {})
     free(bd, y)
     e = _final_mlp(bd, w, name, _merged(bd, [(f"{name}.p", 2 * k) for k in range(4)], name))
     l16 = e.lv
-    bd.op(_xfer(bd, out_name(name), l16.ct(C), fill=False, mem=e.addr, nbytes=l16.ct(C)), {})
+    bd.op(bd.drain(out_name(name), l16.ct(C), mem=e.addr, nbytes=l16.ct(C)), {})
     free(bd, e)
     return out_name(name)
 
@@ -542,7 +541,7 @@ def final_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> s
     t16 = vit_level(1, 16).ct(C)
     for k in range(4):
         e = _final_mlp(bd, w, name, _merged(bd, [(p.band(s), 2 * k) for s in range(4)], name))
-        bd.op(_xfer(bd, out_name(name), 4 * t16, fill=False, mem=e.addr, nbytes=t16, off=k * t16), {})
+        bd.op(bd.drain(out_name(name), 4 * t16, mem=e.addr, nbytes=t16, off=k * t16), {})
         free(bd, e)
     return out_name(name)
 

@@ -27,7 +27,7 @@ from .sources import SRC, source_files
 from .weights import Slots, Source
 
 if TYPE_CHECKING:
-    from .build import Built
+    from .builder import Built
 
 
 def role_pages(work_dir: str) -> paging.Pager:

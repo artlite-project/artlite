@@ -11,9 +11,10 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, minicpmv_mmproj
 from artlite.vision import layout as L
 from artlite.vision import vit
-from artlite.vision.build import Builder, Level
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor
+from artlite.vision.levels import ImageLevel, TokenLevel
 from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
@@ -83,7 +84,7 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
     sim = V.NpuEncoder(MMPROJ)
     want = [sim.layer(x, il) for x in xs]
     w = M.layer_weights(lambda n: sim.w(n).float(), il)
-    lv = Level(16)
+    lv = ImageLevel(16)
     bd = Builder(npu)
     xc = _level_in(xs)
     xt = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
@@ -117,7 +118,7 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
     for il in range(7, 27):
         want = [sim.layer(x, il) for x in want]
         exact = [enc._layer(x, il) for x in exact]
-    lv = Level(16)
+    lv = ImageLevel(16)
     bd = Builder(npu)
     xc = _level_in(xs)
     x = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
@@ -144,7 +145,7 @@ def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
         assert npu_err < 1.1 * cpu_err
 
 
-def _bands_in(bd: Builder, x: list[torch.Tensor], lv: Level, name: str) -> M.Bands:
+def _bands_in(bd: Builder, x: list[torch.Tensor], lv: ImageLevel, name: str) -> M.Bands:
     """Two entries (1024 tokens, 1152) as a banded 32 x 32 level's residual in DDR (their records by a copy op per
     band)."""
     img = torch.stack([torch.nn.functional.pad(e.float(), (0, M.C - M.H)).T.reshape(M.C, 32, 32) for e in x])
@@ -179,7 +180,7 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
         xs.append(bf16_like(tr[f"layer_out-{il - 1}"]))
     sim = V.NpuEncoder(MMPROJ)
     want = [sim.layer(x, il) for x in xs]
-    lv = Level(32, 4)
+    lv = ImageLevel(32, 4)
     bd = Builder(npu)
     x = _bands_in(bd, xs, lv, "x")
     out = M.Bands(lv, "y")
@@ -293,7 +294,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     assert err < 1.2e-2
 
 
-def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: vit.VitLevel, name: str) -> M.Bands:
+def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: TokenLevel, name: str) -> M.Bands:
     """Two entries' rows (n_i, 1152) at their slots as a banded level's residual in DDR (records by a copy op per
     band)."""
     tiles = M.pack([torch.nn.functional.pad(r.float(), (0, M.C - M.H)) for r in rows], slots, lv.nb)

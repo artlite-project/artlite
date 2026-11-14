@@ -35,10 +35,10 @@ import numpy as np
 
 from ..operators.design import COLS
 from . import design as D
-from .build import Builder, Level
+from .builder import Builder
 from .layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
+from .levels import Level, TokenLevel
 from .ops import Apply, Attention, Gemm
-from .seq import ColOps, MemTask
 from .weights import Wt, pad_index, take, values
 
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
@@ -84,32 +84,8 @@ class Vit:
 VIT = Vit()
 
 
-@dataclass(frozen=True)
-class VitLevel(Level):
-    """A ViT level: ``nb`` bands of one tile per column of ``tm`` tokens (64; 16: the merges' tiles of merged tokens;
-    both images: token panel tp of image tp % 2)."""
-
-    tm: int = 64
-
-    @property
-    def T(self) -> int:
-        return self.tm
-
-    @property
-    def m(self) -> int:
-        return self.tm
-
-    @property
-    def ntile(self) -> int:
-        return 1
-
-    @property
-    def np(self) -> int:
-        return self.tm // 8
-
-
-def vit_level(nb: int, tm: int = 64) -> VitLevel:
-    return VitLevel(0, nb, False, tm)
+def vit_level(nb: int, tm: int = 64) -> TokenLevel:
+    return TokenLevel(nb, tm)
 
 
 @dataclass(frozen=True)
@@ -375,14 +351,3 @@ def layer_bands(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands, out:
 def kv_bytes(lv: Level, keys: Keys | None = None) -> int:
     """Bytes of a level's K / V^T slots (``layer``'s kv_ddr; of its ``keys``, default: two images apart)."""
     return (keys or Keys("")).attention(lv).kv_bytes()
-
-
-def xfer(bd: Builder, name: str, image_bytes: int, *, fill: bool, mem: int, nbytes: int, off: int = 0,
-         mdims: list | None = None, sdims: tuple | None = None) -> dict[int, ColOps]:
-    """Per column a fill (DDR image ``name`` -> memtile at mem) or drain of nbytes: column c's bytes of the image
-    ([col][image_bytes]) from off, the memtile walk mdims (``ops.dims`` form), the shim's sdims (``txn.shim_bd``)."""
-    base = bd.ddr(name, COLS * image_bytes)
-    (bd.reading if fill else bd.written)(name)
-    bd_ = {"addr": mem, "nwords": nbytes // 4} | ({"dims": mdims} if mdims else {})
-    t = lambda c: MemTask([bd_], ddr=(base + c * image_bytes + off, nbytes, sdims))
-    return {c: ColOps(fills=[t(c)]) if fill else ColOps(drains=[t(c)]) for c in range(COLS)}

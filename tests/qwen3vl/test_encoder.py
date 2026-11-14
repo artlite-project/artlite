@@ -14,7 +14,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, decision_mmproj
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
-from artlite.vision.build import Builder
+from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import alloc
 from artlite.vision.vit import VIT, Bands, C, H, Keys, kv_bytes, ln_records, vit_level
