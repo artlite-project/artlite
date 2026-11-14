@@ -15,8 +15,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
-from artlite.vision.device import VisionDevice, state_dir
+from artlite.vision.device import VisionDevice
 from artlite.vision.shell import attach
+from artlite.vision.state import state_dir
 from artlite.vision.weights import Source, safetensors, sources
 
 from .host import resnet_time_biases
@@ -78,7 +79,7 @@ class NpuVae:
         return np.concatenate([self.dec(latents[i:i + 1]) for i in range(latents.shape[0])])
 
 
-MODULES = ("models.sd15.npu",)  # (the modules whose code and imports build the cached state: ``device.state_dir``)
+MODULES = ("models.sd15.npu",)  # (the modules whose code and imports build the cached state: ``state.state_dir``)
 
 
 def vae_weights(directory: str) -> tuple[dict, float]:

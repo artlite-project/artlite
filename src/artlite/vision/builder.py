@@ -11,7 +11,7 @@ DDR by its B stream (a shim gather of every column's).
 
 A GEMM's weights go into its DDR image as jobs (``weights.Slots``), packed by the native packer when the dispatch is
 finished; what the host wrote besides them (commands, norm parameters, tables) is ``Built.writes``: a model's cached
-build keeps both (``device.save_state``), never the weights.
+build keeps both (``state.save_state``), never the weights.
 """
 
 import dataclasses

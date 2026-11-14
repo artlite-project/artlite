@@ -296,7 +296,7 @@ class WindowEncoder:
         # (programs by nb; a video's pairs' by ("pair", nb))
         self.programs: dict[int | tuple[str, int], list[Piece]] = {} if state is None else dict(state["programs"])
         self.store = store
-        self._kept: set[str] | None = set(npu._images) if state is not None else None  # (the cached state's images)
+        self._kept: set[str] | None = set(npu.names()) if state is not None else None  # (the cached state's images)
         self.tr: dict[tuple, Transaction] = {}  # (by (program key, piece): a pair's shared pieces the image's)
         self._inputs: OrderedDict[Layout, dict[str, np.ndarray]] = OrderedDict()
         self._at: dict[tuple, tuple] = {}  # (a transaction's last (layer, size) its words are set for)
@@ -331,7 +331,7 @@ class WindowEncoder:
         device's images as they are now are the cached state's: a program built later is cached (``built``) only where
         it takes none but these (a restored device has them where they were; an image allocated after the state, a
         pair's pixels say, is not there)."""
-        self._kept = set(self.npu._images)
+        self._kept = set(self.npu.names())
         return {"programs": dict(self.programs)}
 
     def _runs(self, nb: int) -> list[tuple[int, int]]:

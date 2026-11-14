@@ -72,7 +72,7 @@ class Program:
 
 
 class ProgramStore:
-    """The programs a network builds after its state was cached (``device.save_state``: the first ones), as pickles in
+    """The programs a network builds after its state was cached (``state.save_state``: the first ones), as pickles in
     the state's directory (``program_<key>.pkl``): the next load takes them with the state (``restore``)."""
 
     def __init__(self, cache: str):

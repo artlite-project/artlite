@@ -120,15 +120,15 @@ def test_state_key_covers_the_loaders_imports(root: str) -> None:
 
 
 def test_state_key_changes_with_a_source(tmp_path: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from artlite.vision import device
+    from artlite.vision import state
 
     files = [str(tmp_path / "model.gguf")]
     with open(files[0], "wb") as f:
         f.write(b"x")
-    monkeypatch.setattr(device, "CACHE_DIR", str(tmp_path))
-    key = device.state_dir("k", files[0], ("models.sd15.npu",), files)
-    assert key == device.state_dir("k", files[0], ("models.sd15.npu",), files)
-    assert key != device.state_dir("k", files[0], ("models.qwen3vl.npu",), files)  # (other modules: other sources)
+    monkeypatch.setattr(state, "CACHE_DIR", str(tmp_path))
+    key = state.state_dir("k", files[0], ("models.sd15.npu",), files)
+    assert key == state.state_dir("k", files[0], ("models.sd15.npu",), files)
+    assert key != state.state_dir("k", files[0], ("models.qwen3vl.npu",), files)  # (other modules: other sources)
     with open(files[0], "wb") as f:
         f.write(b"xy")
-    assert key != device.state_dir("k", files[0], ("models.sd15.npu",), files)  # (the model's file counts)
+    assert key != state.state_dir("k", files[0], ("models.sd15.npu",), files)  # (the model's file counts)

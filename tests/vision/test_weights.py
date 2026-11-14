@@ -16,6 +16,8 @@ from artlite.vision import design as D
 from artlite.vision import weights as W
 from artlite.vision.ops import ConvSpec, Gemm
 
+from .ops_ref import pack_to
+
 ROWS = 4
 
 
@@ -47,7 +49,7 @@ def packed(g: Gemm, w: W.Wt | np.ndarray) -> list[np.ndarray]:
     s = W.Slots()
     s.add(g, W.as_wt(w), {r: ("w", r * per) for r in range(ROWS)})
     out = np.zeros(ROWS * per, np.uint8)
-    s.pack_to({"w": out})
+    pack_to(s, {"w": out})
     return [out[r * per:(r + 1) * per] for r in range(ROWS)]
 
 

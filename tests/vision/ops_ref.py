@@ -6,6 +6,7 @@ import torch
 
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
+from artlite.vision.weights import Slots, job_arrays, pack_arrays
 
 IL = (0, 2, 4, 6, 1, 3, 5, 7)  # (64x64: a row's groups in their storage order, even then odd)
 
@@ -44,3 +45,9 @@ def il_tokens(x: torch.Tensor, rows: int) -> torch.Tensor:
 def from_il_tokens(y: torch.Tensor, rows: int) -> torch.Tensor:
     inv = [IL.index(g) for g in range(8)]
     return from_level_tokens(y.reshape(COLS, rows, 8, 16, -1)[:, :, inv].reshape(y.shape), rows, 8)
+
+
+def pack_to(slots: Slots, out: dict[str, np.ndarray]) -> None:
+    """The pending weight jobs of ``slots`` packed into host arrays (uint8) by image name."""
+    jobs, slots.pending = slots.pending, []
+    pack_arrays(job_arrays(jobs, lambda im: (im, 0, out[im].size)), out.__getitem__)

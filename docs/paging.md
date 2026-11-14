@@ -202,7 +202,7 @@ UNet. The other models' decode overlays fit their cores without pages.
 | File | What |
 |---|---|
 | `src/artlite/operators/paging.py` | the page linker and its checks, `Pager` (page streams, slots), the pager's C++ (`pg_self`, `pg_request`), the routes (`loop_flow`, `page_flow`, `request_flow`), the memory tile's `Store` |
-| `src/artlite/vision/` | `core.py` (the roles, the main loop's page branch), `design.py` (the loop routes, MM2S 1's chain, locks 7-9), `seq.py` (pages in the B runs), `device.py` (the roles' page images) |
+| `src/artlite/vision/` | `core.py` (the main loop's page branch), `roles.py` (the roles and their pages' entries), `design.py` (the loop routes, MM2S 1's chain, locks 7-9), `seq.py` (pages in the B runs), `device.py` (the roles' page images) |
 | `src/artlite/decode/` | `design.py` (`paged=`, the page store and prologue), `gemv.py` (the paged formats' entries); `src/artlite/overlay.py` (`OverlayDevice.set_prologue`) |
 | `src/models/llama/overlay.py` | `paged_formats`: which formats are pages |
 | `tests/operators/test_paging.py` | the linker's refusals; every core of the array paging by self-DMA and from its memory tile |

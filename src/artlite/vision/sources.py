@@ -1,7 +1,7 @@
 """The code a cached state depends on, derived from the import graph (``import_closure``): the modules a network's
 loader imports within ``artlite`` and ``models`` (statically: every ``import`` of a module's source outside
 ``if TYPE_CHECKING:``, function-local ones included), their packages' ``__init__`` modules (not what those import), and
-each module's kernel templates (``x.py``'s ``x.*.jinja``). A state's key (``device.state_dir``) hashes these files, so
+each module's kernel templates (``x.py``'s ``x.*.jinja``). A state's key (``state.state_dir``) hashes these files, so
 that a change to anything that builds the state's programs and images makes its cache miss; nothing lists them by
 hand."""
 

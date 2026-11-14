@@ -163,7 +163,7 @@ def fake_vision(cache: str | None = None) -> Iterator[_Log]:
     caches neither restore nor save (every run builds its programs; ``cache``: a directory they use, the run restores
     what an earlier one saved there); their weights pack as usual."""
     from artlite.vision import device as vision_device
-    from artlite.vision import shell
+    from artlite.vision import shell, state
 
     real = vision_device.OverlayDevice
     dev, log = _Device(), _Log()
@@ -182,7 +182,7 @@ def fake_vision(cache: str | None = None) -> Iterator[_Log]:
             for name in ("load_state", "save_state"):
                 stack.enter_context(mock.patch.object(shell, name, lambda *a, **kw: None))
         else:
-            stack.enter_context(mock.patch.object(vision_device, "CACHE_DIR", cache))
+            stack.enter_context(mock.patch.object(state, "CACHE_DIR", cache))
         yield log
 
 

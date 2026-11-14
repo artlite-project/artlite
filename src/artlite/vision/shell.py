@@ -6,7 +6,7 @@ An encoder is the mmproj's networks split as ``weights`` (views of the file's te
 state has what this load needs), ``build`` (the networks on a device, restored from a cached state or built; their programs'
 store: ``program.ProgramStore``) and ``state`` (what a build caches). ``load`` runs them as ``shared_device`` does for
 one or several encoders (LFM3-Omni's vision tower and speech networks on one device: one hardware context): the device
-restored from the state cache (``device.state_dir``: the modules the encoders name, their imports derived:
+restored from the state cache (``state.state_dir``: the modules the encoders name, their imports derived:
 ``sources``) with its weights packed from the file, else built and cached (``attach``).
 
 Loading is the layers' framework side: ``artlite.vision`` imports no ``models``; a model's ``npu.py`` subclasses
@@ -25,8 +25,9 @@ import numpy as np
 
 from ..gguf_model import GGUFFile
 from ..model_config import ClipConfig
-from .device import VisionDevice, load_state, save_state, state_dir
+from .device import VisionDevice
 from .program import ProgramStore
+from .state import load_state, save_state, state_dir
 from .weights import Source, sources
 
 TOKENS_LIMIT = 16384  # (an image's merged tokens at most: transformers' default bound)

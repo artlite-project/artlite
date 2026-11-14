@@ -120,7 +120,7 @@ def test_program_cache() -> None:
     for nb in (2, 1, 3):
         enc.program(nb, pair=True)
     pairs = {k: v for k, v in cached.items() if isinstance(k, tuple)}  # (an image program a pair's took: cached)
-    assert any(".pixp." in n for n in enc.npu._images) and pairs == dict.fromkeys([("pair", 2), ("pair", 1),
+    assert any(".pixp." in n for n in enc.npu.names()) and pairs == dict.fromkeys([("pair", 2), ("pair", 1),
                                                                                   ("pair", 3)], False)
 
 

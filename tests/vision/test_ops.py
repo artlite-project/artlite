@@ -16,7 +16,7 @@ from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Slots, as_wt
 
 from ..numerics import rel_native
-from .ops_ref import from_il_tokens, from_level_tokens, il_tokens, level_tokens, q, qconv_w
+from .ops_ref import from_il_tokens, from_level_tokens, il_tokens, level_tokens, pack_to, q, qconv_w
 
 COLS, ROWS = 8, 4
 
@@ -55,7 +55,7 @@ def gemm_rows(npu: VisionDevice, name: str, g: Gemm, w: torch.Tensor, b: torch.T
         img[r * per:r * per + D.Q] = g.command(b, r)
     s = Slots()
     s.add(g, as_wt(w), {r: ("w", r * per + D.Q) for r in range(ROWS)})
-    s.pack_to({"w": img})
+    pack_to(s, {"w": img})
     npu.alloc(name, ROWS * per)
     npu.write(name, img)
     return {r: g.row_ops(npu.address(name, r * per)) for r in range(ROWS)}
