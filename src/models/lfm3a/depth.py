@@ -58,8 +58,7 @@ NCB, NCODES, NLOG = 12, 2017, 2240  # (codebooks, codes a codebook, its logits p
 PROJ, PROJ_OP = NCB * C, 3840  # (proj_in's outputs: a slot's 1280; per GEMM)
 NPICK = 4  # (codebooks a pass scores)
 EPS, THETA = 1e-5, 1e6
-LOG2E = 1.4426950408889634
-QSCALE = LOG2E / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
+QSCALE = L.LOG2E / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
 TM = 16  # (a column's tile)
 LOG_BYTES = NLOG // 80 * 5760  # (a head's fp32 tiles of a column: [pass][rb][cb][64] in 5760 B each)
 
@@ -78,7 +77,7 @@ def layer_weights(get: Callable[[str], Wt | np.ndarray], il: int) -> dict:
     w["q"] = take(get(p + "attn_q.weight"), plain_index(order, HD, HP))
     w["k"] = take(get(p + "attn_k.weight"), plain_index(np.arange(KVH), HD, HP))
     w["v"] = take(get(p + "attn_v.weight"), plain_index(np.arange(KVH), HD, HP))
-    w["g"] = pad(take(get(p + "attn_gate.weight"), order), 320) * -LOG2E
+    w["g"] = pad(take(get(p + "attn_gate.weight"), order), 320) * -L.LOG2E
     w["o"] = pad(take(get(p + "attn_out.weight"), plain_index(order, HD, HP), 1), C)
     for n, s in (("qn", QSCALE), ("kn", 1.0)):
         nw = np.zeros(HP, np.float32)

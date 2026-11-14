@@ -12,11 +12,13 @@ from artlite.operators.design import COLS
 from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.builder import Builder
-from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm, gn_apply, plain
+from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm
 from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import flat, pad_index, take
+
+from .layers import gn_apply, plain
 
 LV64 = ImageLevel(64, 4)
 ROW = 16 * L.PANEL  # (a row's token panels per kb, bytes)

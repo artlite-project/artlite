@@ -42,7 +42,6 @@ from artlite.vision.vit import (
     FFN,
     HD,
     HEADS,
-    LOG2E,
     Bands,
     C,
     H,
@@ -168,7 +167,7 @@ def key_valid(entries: list[Entry], nb: int, slots: str) -> tuple[np.ndarray, np
 
 def _attn_weights(get: Callable[[str], np.ndarray], p: str) -> dict[str, np.ndarray]:
     """The padded q, k, v (rows by head; q x log2 e / sqrt 72), o (columns by head) of prefix p, their biases."""
-    s = LOG2E / math.sqrt(HD)
+    s = L.LOG2E / math.sqrt(HD)
     w = {}
     for r in ("q", "k", "v"):
         wt, b = f32(get(p + f"attn_{r}.weight")), f32(get(p + f"attn_{r}.bias")).reshape(-1)

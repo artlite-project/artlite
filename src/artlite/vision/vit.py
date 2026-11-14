@@ -35,6 +35,7 @@ import numpy as np
 
 from ..operators.design import COLS
 from . import design as D
+from . import layout as L
 from .builder import Builder
 from .layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
 from .levels import Level, TokenLevel
@@ -44,8 +45,7 @@ from .weights import Wt, pad_index, take, values
 H, C, HD, HP, HEADS = 1152, 1280, 72, 80, 16
 FFN_REAL, FFN = 4304, 4480
 EPS = 1e-6
-LOG2E = 1.4426950408889634
-QSCALE = LOG2E / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
+QSCALE = L.LOG2E / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,7 @@ class Vit:
     @property
     def qscale(self) -> float:
         """(the queries' scale: the softmax in log2 units)"""
-        return LOG2E / math.sqrt(self.HD)
+        return L.LOG2E / math.sqrt(self.HD)
 
     def head_rows(self) -> np.ndarray:
         """``pad_heads``' rows: per head its HD dims, then zeros to HP."""

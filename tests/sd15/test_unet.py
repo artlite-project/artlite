@@ -36,7 +36,7 @@ def _rand_resnet(p: str, cin: int, cout: int) -> dict:
 def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     """diffusers' ResnetBlock2D on the level (GN1 + SiLU, conv1 + time bias, GN2 + SiLU, conv2 + x or the 1x1
     shortcut; the input's GroupNorm records by a copy op): within 1.5e-2 of the fp32 reference."""
-    from artlite.vision.layers import copy_stats
+    from models.sd15.layers import copy_stats
     from models.sd15.unet import resnet
 
     from . import ref as reference
@@ -67,7 +67,8 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
 def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
     """ResnetBlock2D on the banded 32x32 level (x and the output in DDR per band, h parked; the shortcut where cin !=
     cout): within 1.5e-2 of the fp32 reference."""
-    from artlite.vision.layers import DTensor, copy_stats
+    from artlite.vision.layers import DTensor
+    from models.sd15.layers import copy_stats
     from models.sd15.unet import resnet_bands
 
     from . import ref as reference
@@ -100,7 +101,7 @@ def test_resnet_bands(npu: VisionDevice, cin: int, cout: int) -> None:
 
 def _il_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> DTensor:
     """A 64x64 DTensor of x (2, C, 64, 64) in DDR per band, with GroupNorm records for st (copy ops)."""
-    from artlite.vision.layers import copy_stats
+    from models.sd15.layers import copy_stats
     from models.sd15.level64 import LV64
     lv, C = LV64, x.shape[1]
     xc = il_tokens(x, lv.R)
@@ -258,7 +259,7 @@ def test_transformer(npu: VisionDevice, H: int) -> None:
     fp32 reference."""
     import types
 
-    from artlite.vision.layers import copy_stats
+    from models.sd15.layers import copy_stats
     from models.sd15.unet import transformer
 
     from . import ref as reference
@@ -293,7 +294,8 @@ def test_transformer_bands(npu: VisionDevice) -> None:
     parked): within 2e-2 of the fp32 reference."""
     import types
 
-    from artlite.vision.layers import DTensor, copy_stats
+    from artlite.vision.layers import DTensor
+    from models.sd15.layers import copy_stats
     from models.sd15.unet import transformer_bands
 
     from . import ref as reference
@@ -331,7 +333,7 @@ def test_transformer_bands(npu: VisionDevice) -> None:
 
 def _b32_input(bd: Builder, x: torch.Tensor, name: str, st: tuple[int, int]) -> DTensor:
     """A 32x32 DTensor of x (2, C, 32, 32) in DDR per band (``Level(32, 2)``), with GroupNorm records for st."""
-    from artlite.vision.layers import copy_stats
+    from models.sd15.layers import copy_stats
     lv, C = ImageLevel(32, 2), x.shape[1]
     xc = level_tokens(x, lv.R, lv.Lg)
     xd = DTensor(lv, C, name, rec=[])
@@ -466,7 +468,7 @@ def _level_output(npu: VisionDevice, bd: Builder, t: Tensor, name: str) -> torch
 def test_resnet_cat(npu: VisionDevice, H: int, ch: int, cs: int) -> None:
     """The up path's resnet on the concatenation [h | skip] (the skip from DDR; GN over both, conv1 and the shortcut in
     two K-chunks): within 1.5e-2 of the fp32 reference."""
-    from artlite.vision.layers import copy_stats, free
+    from models.sd15.layers import copy_stats, free
     from models.sd15.unet import make_skip, resnet_cat
 
     from . import ref as reference

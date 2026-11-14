@@ -24,13 +24,14 @@ from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
-from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
+from artlite.vision.layers import DTensor, Tensor, alloc, free, silu_words
 from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import Apply, ConvSpec, Gemm
 from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Wt, computed, flat, take, values
 
+from .layers import plain
 from .level64 import IL
 
 L64, L128, L256, L512 = ImageLevel(64, 4, True), ImageLevel(128, 16, True), ImageLevel(256, 64, True), ImageLevel(512, 128, True)
@@ -346,7 +347,7 @@ def norm(bd: Builder, x: DTensor, gamma: np.ndarray, beta: np.ndarray, *, ch: Ch
         xb, _, t = nxt if nxt else (load(bd, x, b), None, None)
         t = t or alloc(bd, lv, ch.P, "pn")
         if silu:
-            bd.table("silu", _silu(), rows=APPLY_ROWS)
+            bd.table("silu", silu_words(), rows=APPLY_ROWS)
         nxt = prefetch(bd, lambda b=b: inputs(b + 1)) if b + 1 < lv.nb else None
         ap = Apply(m=64, nblk=ch.pslice // 80, mode="gnsilu" if silu else "gn", x=xb.addr, y=t.addr, ntile=lv.ntile,
                    y_np=t.np, gsize=ch.gsize, ch_step=ch.stride, tokens=lv.H ** 2, eps=eps, rows=APPLY_ROWS[:ch.slices],
@@ -695,7 +696,7 @@ def mid_attention(bd: Builder, w: dict, p: str, x: DTensor, *, eps: float, name:
     lv, ch = x.lv, chans(512)
     ns = ("query.", "key.", "value.", "proj_attn.") if p + "query.weight" in w else ("to_q.", "to_k.", "to_v.", "to_out.0.")
     (wq, bq), (wk, bk), (wv, bv), (wo, bo) = ((flat(w[p + n + "weight"]), w[p + n + "bias"]) for n in ns)
-    c = LOG2E / ch.C ** 0.5
+    c = L.LOG2E / ch.C ** 0.5
     gn = norm(bd, x, w[p + "group_norm.weight"], w[p + "group_norm.bias"], ch=ch, name=name + ".n", eps=eps, silu=False)
     at0 = Attention512(np=lv.np, q=0, o=0, kv=0, nkeys=lv.H ** 2, padded=True)
     at0.kv = bd.ddr(name + ".kv", at0.kv_bytes())

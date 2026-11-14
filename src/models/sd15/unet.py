@@ -15,26 +15,13 @@ import numpy as np
 from artlite.operators.design import COLS
 from artlite.vision import layout as L
 from artlite.vision.builder import Builder, Records
-from artlite.vision.layers import (
-    LOG2E,
-    DTensor,
-    Tensor,
-    alloc,
-    attend,
-    band_view,
-    conv,
-    copy_stats,
-    free,
-    gelu_table,
-    gemm,
-    gn_apply,
-    ln_apply,
-    plain,
-)
+from artlite.vision.layers import DTensor, Tensor, alloc, free, gelu_table, gemm
 from artlite.vision.levels import ImageLevel
 from artlite.vision.ops import Attention, ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import cat, flat
+
+from .layers import attend, band_view, conv, copy_stats, gn_apply, ln_apply, plain
 
 
 def resnet(bd: Builder, w: dict, p: str, x: Tensor, *, cout: int, time_bias: np.ndarray, eps: float,
@@ -92,7 +79,7 @@ def _block_in(bd: Builder, w: dict, p: str, x: Tensor, *, kv: int, band: int = 0
          extra={c: at.kv_drains(kt.addr, vt.addr, c, part="k", band=band) for c in range(COLS)})
     free(bd, kt)
     qt = alloc(bd, lv, C, "pn")
-    gemm(bd, n, w[a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=a + ".to_q", out=qt, kind="bfp16",
+    gemm(bd, n, w[a + ".to_q.weight"] * (L.LOG2E / (C // 8) ** 0.5), None, name=a + ".to_q", out=qt, kind="bfp16",
          extra={c: at.kv_drains(kt.addr, vt.addr, c, part="v", band=band) for c in range(COLS)})
     bd.ddr_sync()
     free(bd, vt)
@@ -112,7 +99,7 @@ def _block_out(bd: Builder, w: dict, p: str, h: Tensor, qt: Tensor, *, kv: int, 
             n = alloc(bd, lv, C, "pn")
             ln_apply(bd, h, n, w[q + "norm2.weight"], w[q + "norm2.bias"], name=q + "norm2", rec=rec)
             qt = alloc(bd, lv, C, "pn")
-            gemm(bd, n, w[q + a + ".to_q.weight"] * (LOG2E / (C // 8) ** 0.5), None, name=q + a + ".to_q", out=qt,
+            gemm(bd, n, w[q + a + ".to_q.weight"] * (L.LOG2E / (C // 8) ** 0.5), None, name=q + a + ".to_q", out=qt,
                  kind="bfp16")
             free(bd, n)
         o = attend(bd, qt, kv if a == "attn1" else ctx_kv, name=q + a + ".attn", nkeys=0 if a == "attn1" else nctx)

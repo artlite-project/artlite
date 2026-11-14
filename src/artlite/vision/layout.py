@@ -17,6 +17,7 @@ from ..operators import bfp16 as _bfp16
 from . import design as D
 
 PANEL = 72
+LOG2E = 1.4426950408889634  # (the softmax in log2 units: queries scaled by LOG2E / sqrt(d))
 
 
 blocks = _bfp16.block_bytes  # float (..., 8) -> bfp16ebs8 bytes (..., 9) [E, m0..m7] (round to nearest even)
