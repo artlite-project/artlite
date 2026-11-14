@@ -20,6 +20,8 @@ from typing import Any
 
 import uvicorn
 
+from artlite import settings
+
 from .. import open_model
 from ..hostenv import performance_mode, stale_install
 from ..model import Model
@@ -28,7 +30,7 @@ from ..sampling import Sampling
 from ..spec_options import spec_options
 from ..templating import TEMPLATE_RESERVED, check_chat_template, template_option
 from .api import create_app
-from .cli_options import MODELS, SHARE, api_keys, arg_parser, capacity, given, web_ui
+from .cli_options import MODELS, api_keys, arg_parser, capacity, given, web_ui
 from .engine import Engine
 from .process import Server, listen, setup_logging
 from .router import serve
@@ -121,7 +123,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
 
     engine = Engine(load, warmup=args.warmup, on_ready=ready, on_exit=failed,
                     cache_ram=None if args.cache_ram is None else args.cache_ram << 20 if args.cache_ram >= 0 else -1,
-                    share=int(os.environ.get(SHARE) or 1), checkpoints=args.ctx_checkpoints)
+                    share=settings.ROUTER_MODELS.get(), checkpoints=args.ctx_checkpoints)
     config = uvicorn.Config(create_app(engine, options, info), host=args.host, port=args.port, log_config=None,
                             access_log=args.verbose, timeout_keep_alive=int(args.timeout), lifespan="off")
     server = Server(config, engine.stop)

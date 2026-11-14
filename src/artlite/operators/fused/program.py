@@ -29,14 +29,13 @@ configuration only where the previous item is of another design:
 from __future__ import annotations
 
 import itertools
-import os
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ... import txn
+from ... import settings, txn
 from ...npu_regs import CORE_CONTROL_RESET, CORE_TILE, MEM_TILE, tile_map
 from . import ctrlpkt, quiet
 from .bdelide import Run
@@ -54,7 +53,7 @@ PIECE_BYTES = 24 << 20
 def quiet_enabled() -> bool:
     """Whether a configuration may go without the array reset (``Quiet``): not with ``ARTLITE_PDI_RESET=1``; read at
     each use. It also needs the control packets (``ctrlpkt.enabled``): the quiet configuration is built on them."""
-    return os.environ.get("ARTLITE_PDI_RESET", "0") != "1" and ctrlpkt.enabled()
+    return not settings.PDI_RESET.get() and ctrlpkt.enabled()
 
 
 Item = tuple[int, Sequence[int]]  # (entry, the device addresses of its arguments)

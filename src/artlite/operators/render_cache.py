@@ -16,8 +16,8 @@ build directory it produced:
 A hit attaches the build directory (when its artifacts are there: a fused ELF's ``artifacts``).
 Rendered every time (no key): an argument the key cannot describe (a function, an object without plain data, an
 array above 16 MB), a method replaced on the instance or on a class by a function from another module (variant
-builds, experiments), profiling, ``ARTLITE_IGNORE_CACHE``, ``ARTLITE_MEASURE_II`` and ``ARTLITE_GENERATE_ASM`` (their
-reports come from a build). Not seen: a module global changed at runtime (``fused.layout.SEGMENT_BYTES`` is part of the
+builds, experiments), profiling, a switch that changes what a build gives (``settings.BUILD_SWITCHES``:
+``ARTLITE_IGNORE_CACHE``, ``ARTLITE_MEASURE_II``, ``ARTLITE_GENERATE_ASM``; their reports come from a build). Not seen: a module global changed at runtime (``fused.layout.SEGMENT_BYTES`` is part of the
 key): a test that monkeypatches one gives its operators or ELF their own names, so that their keys differ.
 """
 
@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .. import profiling
+from .. import profiling, settings
 from . import toolchain
 from .base import ArtcOperator
 from .toolchain import CACHE_DIR
@@ -50,7 +50,6 @@ _TOP = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 _PKGS = tuple(os.path.join(_TOP, p) for p in ("artlite", "models"))  # (the packages whose sources a render reads)
 _IN_PKGS = tuple(p + os.sep for p in _PKGS)
 _MAX_ARRAY = 16 << 20
-_ENV = ("ARTLITE_IGNORE_CACHE", "ARTLITE_MEASURE_II", "ARTLITE_GENERATE_ASM")
 
 
 class _NoKey(Exception):
@@ -199,7 +198,7 @@ def _fused_key(f: FusedElf) -> str | None:
 
 def _key(op: ArtcOperator | FusedElf) -> str | None:
     """The manifest key of a render, None: render it."""
-    if profiling.get_config() is not None or any(os.environ.get(v, "0") == "1" for v in _ENV):
+    if profiling.get_config() is not None or any(s.get() for s in settings.BUILD_SWITCHES):
         return None
     k = _op_key(op) if isinstance(op, ArtcOperator) else _fused_key(op)
     if k is None:

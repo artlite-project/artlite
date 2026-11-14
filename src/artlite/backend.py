@@ -19,18 +19,20 @@ import os
 import shutil
 import sys
 
+from . import settings
+
 _DEFAULT = "xrt" if sys.platform == "win32" else "xdna"
 
 
 def _select() -> object:
     """``artlite._native`` of the backend ``ARTLITE_BACKEND`` names."""
-    name = os.environ.get("ARTLITE_BACKEND") or _DEFAULT
+    name = settings.BACKEND.get() or _DEFAULT
     if name == _DEFAULT:
         return importlib.import_module("artlite._native")
     try:
         module = importlib.import_module(f"artlite._native_{name}")
     except ModuleNotFoundError:
-        raise ImportError(f"ARTLITE_BACKEND={name}: this build has no such backend (Linux builds artlite._native_xrt "
+        raise ImportError(f"{settings.BACKEND.name}={name}: this build has no such backend (Linux builds artlite._native_xrt "
                           f"where XRT is installed; the platform's own: {_DEFAULT})") from None
     sys.modules["artlite._native"] = module
     return module

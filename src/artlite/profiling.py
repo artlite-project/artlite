@@ -65,12 +65,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from . import settings
 from .npu_regs import MEMTILE_ROW, MODULES, SHIM_ROW
 
 if TYPE_CHECKING:
     from . import _native
-
-ENV_PREFIX = "ARTLITE_PROFILE"  # the mode's variable; the others are ARTLITE_PROFILE_<NAME>
 
 # AIE2P core event IDs (aie-rt xaie_events_aie2p.h); used for labels only —
 # full name resolution goes through aie.utils.trace.events.
@@ -100,16 +99,16 @@ class CounterSpec(NamedTuple):
 def validate_counter_specs(specs: Sequence[CounterSpec]) -> None:
     """At most each module's counters (a read past them wedges the hardware context), at least one."""
     if not specs:
-        raise ValueError(f"{ENV_PREFIX}_COUNTERS: empty spec")
+        raise ValueError(f"{settings.PROFILE_COUNTERS.name}: empty spec")
     counts: dict[str, int] = {}
     for spec in specs:
         if spec.module not in MODULES:
-            raise ValueError(f"{ENV_PREFIX}_COUNTERS: unknown counter module {spec.module!r}")
+            raise ValueError(f"{settings.PROFILE_COUNTERS.name}: unknown counter module {spec.module!r}")
         counts[spec.module] = counts.get(spec.module, 0) + 1
     for name, count in counts.items():
         if count > MODULES[name].max_counters:
             raise ValueError(
-                f"{ENV_PREFIX}_COUNTERS: at most {MODULES[name].max_counters} {name}-module pairs (got {count})"
+                f"{settings.PROFILE_COUNTERS.name}: at most {MODULES[name].max_counters} {name}-module pairs (got {count})"
             )
 
 
@@ -123,7 +122,7 @@ class TileSelection:
 
     @classmethod
     def parse(cls, text: str) -> TileSelection:
-        name = f"{ENV_PREFIX}_TILES"
+        name = settings.PROFILE_TILES.name
         if text == "all":
             return cls(text)
         try:
@@ -148,7 +147,7 @@ class TileSelection:
         picked = [w for w in workers if (w.tile.col, w.tile.row) in self.tiles]
         if not picked:
             raise ValueError(
-                f"{ENV_PREFIX}_TILES={self.text}: no pinned worker tiles match; "
+                f"{settings.PROFILE_TILES.name}={self.text}: no pinned worker tiles match; "
                 "use 'all', 'first:N', or ';'-separated 'col,row' of pinned tiles"
             )
         return picked
@@ -182,35 +181,24 @@ class ProfileConfig:
     def from_env(cls, environ: Mapping[str, str]) -> ProfileConfig | None:
         """The configuration the environment selects (module docstring), None when profiling is off. A malformed
         value raises a ValueError naming its variable."""
-        raw = environ.get(ENV_PREFIX, "0").lower()
+        raw = settings.PROFILE.get(environ)
         if raw in ("0", "off", "", "false", "no"):
             return None
-
-        def number(name: str, default: int) -> int:
-            text = environ.get(f"{ENV_PREFIX}_{name}", str(default))
-            try:
-                return int(text)
-            except ValueError:
-                raise ValueError(f"{ENV_PREFIX}_{name}: expected an integer, got {text!r}") from None
-
-        def flag(name: str, default: str) -> bool:
-            return environ.get(f"{ENV_PREFIX}_{name}", default) == "1"
-
         counter_specs = [CounterSpec("core", s, e) for s, e in _DEFAULT_COUNTER_PAIRS]
-        if spec := environ.get(f"{ENV_PREFIX}_COUNTERS"):
+        if spec := settings.PROFILE_COUNTERS.get(environ):
             counter_specs = _parse_counter_specs(spec)
-        trace_events = _parse_events(spec) if (spec := environ.get(f"{ENV_PREFIX}_EVENTS")) else None
+        trace_events = _parse_events(spec) if (spec := settings.PROFILE_EVENTS.get(environ)) else None
         return cls(
             mode=raw if raw in ("counters", "trace") else "counters",
-            out_dir=environ.get(f"{ENV_PREFIX}_DIR", "artlite_profile"),
+            out_dir=settings.PROFILE_DIR.get(environ),
             counter_specs=counter_specs,
-            trace_size=number("TRACE_SIZE", 4 * 1024 * 1024),
+            trace_size=settings.PROFILE_TRACE_SIZE.get(environ),
             trace_events=trace_events,
-            trace_tiles=TileSelection.parse(environ.get(f"{ENV_PREFIX}_TILES", "all")),
-            trace_lateral=flag("LATERAL", "0"),
-            trace_distribute=flag("DISTRIBUTE", "0"),
-            convert=flag("CONVERT", "1"),
-            sample_every=max(1, number("SAMPLE_EVERY", 1)),
+            trace_tiles=TileSelection.parse(settings.PROFILE_TILES.get(environ)),
+            trace_lateral=settings.PROFILE_LATERAL.get(environ),
+            trace_distribute=settings.PROFILE_DISTRIBUTE.get(environ),
+            convert=settings.PROFILE_CONVERT.get(environ),
+            sample_every=max(1, settings.PROFILE_SAMPLE_EVERY.get(environ)),
         )
 
     def cache_key(self) -> tuple:

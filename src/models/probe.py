@@ -22,7 +22,7 @@ from typing import NamedTuple
 import numpy as np
 
 import artlite
-from artlite import backend, portable
+from artlite import backend, portable, settings
 from artlite.overlay import OverlayDevice, Transaction, irq_cpu
 from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
@@ -359,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
         from . import diagnose
         from .diagnose import model as diagnose_model
 
-        if platform.system() == "Linux" and os.geteuid() != 0 and not os.environ.get(diagnose.ROOT_ENV):
+        if platform.system() == "Linux" and os.geteuid() != 0 and not settings.DIAGNOSE_ROOT.get():
             raise SystemExit("artlite-probe --diagnose reads what only root can (memory devices, the data fabric, "
                              "the kernel log): run sudo $(which artlite-probe) --diagnose")
         if platform.system() == "Linux" and os.geteuid() == 0:

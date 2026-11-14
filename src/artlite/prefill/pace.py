@@ -34,7 +34,7 @@ from typing import Any
 
 import numpy as np
 
-from .. import _native
+from .. import _native, settings
 from ..gemm.pacing import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
 from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
@@ -65,7 +65,7 @@ def parse(spec: str) -> dict[int, int] | None:
     for part in spec.split(","):
         name, _, level = part.partition("=")
         if name.strip() not in PACE_CLASSES or not level.strip().isdigit():
-            raise ValueError(f"ARTLITE_PACE: {part!r} is not <class>=<level> ({', '.join(PACE_CLASSES)})")
+            raise ValueError(f"{settings.PACE.name}: {part!r} is not <class>=<level> ({', '.join(PACE_CLASSES)})")
         out[PACE_CLASSES.index(name.strip())] = min(int(level), top)
     return out
 
@@ -221,7 +221,7 @@ def calibrate(pf: Any) -> tuple[int, dict]:
 
 def resolve(pf: Any) -> int:
     """The PACE word of the prefill ``pf`` (``ARTLITE_PACE``; auto: cached, else calibrated and cached)."""
-    spec = os.environ.get("ARTLITE_PACE", "auto")
+    spec = settings.PACE.get()
     fixed = parse(spec)
     if fixed is not None:
         return pace_word(fixed)

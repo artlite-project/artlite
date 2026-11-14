@@ -15,9 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .. import parallel_compile
+from .. import parallel_compile, settings
 from ..measure_ii import KernelReport, call_cycles
-from ..profiling import ENV_PREFIX
 from .search import NpuResult, RegionResult, SearchResult, VariantResult, function_symbols
 from .variants import Variant, render_variant
 
@@ -112,11 +111,10 @@ class _Build:
 
 
 def _worker_env(build: _Build) -> dict[str, str]:
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(ENV_PREFIX) and key != "ARTLITE_MEASURE_II"}
+    env = settings.without(os.environ, settings.PROFILE_FAMILY, settings.MEASURE_II)
     if build.region is not None:
-        env.update({ENV_PREFIX: "counters", f"{ENV_PREFIX}_DIR": str(build.directory / "profile"),
-                    f"{ENV_PREFIX}_COUNTERS": COUNTERS, f"{ENV_PREFIX}_SAMPLE_EVERY": "1"})
+        env.update({settings.PROFILE.name: "counters", settings.PROFILE_DIR.name: str(build.directory / "profile"),
+                    settings.PROFILE_COUNTERS.name: COUNTERS, settings.PROFILE_SAMPLE_EVERY.name: "1"})
     return env
 
 

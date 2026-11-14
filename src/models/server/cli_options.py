@@ -7,11 +7,11 @@ model's server), ``router`` (router mode) and ``catalog`` (a model's options as 
 import argparse
 import json
 import logging
-import os
 from collections.abc import Callable
 
 from fastapi import FastAPI
 
+from artlite import settings
 from artlite.model_config import MODELS_DIR, model_path
 
 from ..readouts import POOLING
@@ -20,8 +20,6 @@ from . import ui
 
 log = logging.getLogger("artlite.server")
 
-ENV = "ARTLITE_ARG_"
-SHARE = "ARTLITE_ROUTER_MODELS"  # (a router's model server: --models-max, its default prompt cache's part of the RAM)
 DEFAULT_CTX = 32768  # -c 0 (capped at the model's context)
 # the router's own options (in router mode each model's server gets its own: ``router``)
 ROUTER = frozenset({"host", "port", "api_key", "api_key_file", "cors_origins", "path", "no_ui", "timeout", "log_file",
@@ -157,7 +155,7 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
 def env_name(a: argparse.Action) -> str | None:
     """An option's ``ARTLITE_ARG_<NAME>`` (None: help)."""
     longs = sorted((s for s in a.option_strings if s.startswith("--")), key=lambda s: s.startswith("--no-"))
-    return None if not longs or a.dest == "help" else ENV + longs[0][2:].upper().replace("-", "_")
+    return None if not longs or a.dest == "help" else settings.arg_name(longs[0][2:].upper().replace("-", "_"))
 
 
 def with_env(p: argparse.ArgumentParser) -> None:
@@ -167,11 +165,10 @@ def with_env(p: argparse.ArgumentParser) -> None:
         if name is None:
             continue
         a.help = f"{a.help} (env: {name})" if a.help else f"(env: {name})"
-        if name not in os.environ:
+        if (value := settings.arg_read(name)) is None:
             continue
-        value = os.environ[name]
         if a.nargs == 0:  # (a switch)
-            a.default = value.lower() in ("1", "true", "on", "yes", "enabled")
+            a.default = settings.arg_flag(value)
         else:
             if a.choices is not None and value not in a.choices:
                 p.error(f"{name}: {value!r} (one of {', '.join(a.choices)})")

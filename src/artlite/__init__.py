@@ -36,9 +36,11 @@ import ml_dtypes
 import numpy as np
 from numpy.typing import DTypeLike
 
-from . import profiling, txn
+from . import profiling, settings, txn
 from .backend import _native  # (first: the backend ARTLITE_BACKEND selects is artlite._native)
 from .operators.base import ArgDirection, ArgSpec
+
+settings.warn_unknown()
 
 # Re-export low-level C++ bindings for advanced usage
 Kernel = _native.Kernel

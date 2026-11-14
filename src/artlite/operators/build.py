@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import version
 
-from .. import portable, profiling
+from .. import portable, profiling, settings
 from . import checks, toolchain
 from .toolchain import AIE_TARGET, CACHE_DIR, CORE_LLC_FLAGS, INCLUDE_DIR, OPERATORS_H
 
@@ -151,7 +151,7 @@ def compile_kernel(
     with open(src_path, "w") as f:
         f.write(source_code)
 
-    if measure and os.environ.get("ARTLITE_MEASURE_II", "0") == "1":
+    if measure and settings.MEASURE_II.get():
         from artlite import measure_ii
 
         measure_ii.measure(src_path, clang_cmd=clang_cmd, verbose=True)
@@ -174,7 +174,7 @@ def compile_kernel(
             if os.path.exists(stem + ext):
                 os.remove(stem + ext)
 
-    if os.environ.get("ARTLITE_GENERATE_ASM", "0") == "1":
+    if settings.GENERATE_ASM.get():
         asm_path = f"{src_path}.s"
         toolchain.run([*clang_cmd, "-S", src_path, "-o", asm_path])
 
@@ -236,7 +236,7 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
     """Build ``spec`` into its cache directory (skipped when cached) and return the directory.
     aiecc_jobs: aiecc's compile threads (default: its own choice);
     measure: print the ARTLITE_MEASURE_II report."""
-    ignore_cache = os.environ.get("ARTLITE_IGNORE_CACHE", "0") == "1"
+    ignore_cache = settings.IGNORE_CACHE.get()
     clang_cmd = spec.clang_cmd
     pch_path = compile_pch(clang_cmd=clang_cmd)
     if not buildable(spec):

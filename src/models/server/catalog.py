@@ -38,12 +38,13 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from artlite import settings
 from artlite.formats import has_tile_format
 from artlite.gguf_model import GGUFFile
 from artlite.operators.toolchain import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
-from .cli_options import ENV, FILES, MODEL, ROUTER, env_name
+from .cli_options import FILES, MODEL, ROUTER, env_name
 
 log = logging.getLogger("artlite.server")
 
@@ -177,10 +178,10 @@ def read_preset(path: str, parser: argparse.ArgumentParser) -> dict[str, dict[st
                                                [n.strip() for n in text.split(",") if n.strip()] if key == "alias" else
                                                text.strip())
                 continue
-            if key in routers or key.startswith(ENV) and key[len(ENV):].lower() in ROUTER:
+            if key in routers or settings.ARG.owns(key) and settings.arg_option(key) in ROUTER:
                 raise ValueError(f"{where}: the router's option, not a model's")
             if key not in keys:
-                names = sorted({k for k in keys if not k.startswith(ENV) and "_" not in k})
+                names = sorted({k for k in keys if not settings.ARG.owns(k) and "_" not in k})
                 raise ValueError(f"{where}: no such option (a model's: {', '.join(names)})")
             action, negated = keys[key]
             try:

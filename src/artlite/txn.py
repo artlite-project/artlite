@@ -34,11 +34,11 @@ Memory-tile DMA (AM029 MEMORY_TILE_MODULE; the words aiecc writes for its runtim
 - every memory tile's task-complete tokens go to controller ``MEM_CONTROLLER_ID`` (as aiecc routes them).
 """
 
-import os
 from collections.abc import Mapping
 
 import numpy as np
 
+from . import settings
 from .npu_regs import CORE_TILE, MEM_TILE
 
 DDR_AIE_ADDR_OFFSET = 0x80000000  # device address of a host buffer = its paddr + this
@@ -468,7 +468,7 @@ def hang_note(words: np.ndarray, health: Mapping[str, int] | None, *, what: str)
 
 def verify_if_enabled(words: np.ndarray, *, queues: bool = True) -> None:
     """``verify`` when ``ARTLITE_VERIFY_TXN=1`` (never per dispatch: where a transaction is created or loaded)."""
-    if os.environ.get("ARTLITE_VERIFY_TXN") == "1":
+    if settings.VERIFY_TXN.get():
         verify(words, queues=queues)
 
 

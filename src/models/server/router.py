@@ -26,7 +26,7 @@ out the models whose props say they have none); a client that goes away closes t
 cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the server of the conversation's last
 request (``X-Conversation-Id``), or cancels the request still waiting for its model.
 Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
-and with --models-max above 1 its default prompt cache takes its part of the RAM (``cli_options.SHARE``). Models loaded
+and with --models-max above 1 its default prompt cache takes its part of the RAM (``settings.ROUTER_MODELS``). Models loaded
 together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
 the NPU, and none is queued ahead of its requests: ``prefill.chunks.PEER_PIECE_S``, ``Library.run``)."""
 
@@ -55,7 +55,7 @@ import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from artlite import portable
+from artlite import portable, settings
 
 from . import cli_options
 from .app_base import NO_CACHE, CancellingResponse, add_ui, add_unsupported, key_check, new_app, sse
@@ -102,7 +102,7 @@ class Child:
         self.on_message: Callable[[dict[str, Any]], None] | None = None
         self.on_exit: Callable[[int], None] | None = None
         self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     env={**env, cli_options.ENV + "API_KEY": self.key}, encoding="utf-8",
+                                     env={**env, settings.arg_name("API_KEY"): self.key}, encoding="utf-8",
                                      errors="replace", bufsize=1, **portable.group_options())
         threading.Thread(target=self._messages, name="child-messages", daemon=True).start()
         threading.Thread(target=self._log, name="child-log", daemon=True).start()
@@ -190,9 +190,9 @@ class Router:
         self.command = command or [sys.executable, "-m", "models.server.child"]
         hidden = cli_options.ROUTER | cli_options.MODEL  # (the children's env: none of the router's own, nor a model's)
         self.env = {k: v for k, v in os.environ.items()
-                    if not (k.startswith(cli_options.ENV) and k[len(cli_options.ENV):].lower() in hidden)}
+                    if not (settings.ARG.owns(k) and settings.arg_option(k) in hidden)}
         if models_max > 1:  # (each model's default prompt cache: its part of the RAM)
-            self.env[cli_options.SHARE] = str(models_max)
+            self.env[settings.ROUTER_MODELS.name] = str(models_max)
         self.instances: dict[str, Instance] = {}
         self.failures: dict[str, dict[str, Any]] = {}  # id -> exit_code, error of its last failed load
         self.queue: list[str] = []  # the models requests wait to load, in the order they asked

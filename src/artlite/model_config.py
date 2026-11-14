@@ -18,9 +18,11 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-MODELS_DIR = os.environ.get("ARTLITE_MODELS_DIR", os.path.join(os.path.expanduser("~"), ".artlite", "models"))
+from . import settings
+
+MODELS_DIR = settings.MODELS_DIR.get()
 # a llama.cpp source tree with a CPU build (build/bin/libllama.so): the golden tensors of the qwen35 models
-LLAMA_CPP_DIR = os.environ.get("ARTLITE_LLAMA_CPP_DIR", "/src/llama.cpp")
+LLAMA_CPP_DIR = settings.LLAMA_CPP_DIR.get()
 # uploaders of Llama GGUF files, in order of preference (file names: <repo name>-<quant>.gguf, MaziyarPanahi's
 # <repo name>.<quant>.gguf)
 LLAMA_ORGS = ("lmstudio-community", "bartowski", "MaziyarPanahi")

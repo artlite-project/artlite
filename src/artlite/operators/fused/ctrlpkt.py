@@ -34,13 +34,12 @@ range (no port the previous design enabled fans the packets out), and the slots 
 packet mode are zeroed.
 """
 
-import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from ... import txn
+from ... import settings, txn
 from ...npu_regs import (
     CORE_CONTROL_RESET,
     CORE_TILE,
@@ -80,7 +79,7 @@ LOCK_FLUSH = 63  # (a lock value that grants any pending acquire)
 def enabled() -> bool:
     """Whether a library configuration's writes may go as control packets (``ARTLITE_PM_PACKETS=0``: none), read at each
     assembly."""
-    return os.environ.get("ARTLITE_PM_PACKETS", "1") != "0"
+    return settings.PM_PACKETS.get()
 
 
 Writes = dict[tuple[int, int], list[tuple[int, np.ndarray]]]  # ((col, row) -> [(tile-local address, words)])

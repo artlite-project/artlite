@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 
-ROOT_ENV = "ARTLITE_DIAGNOSE_ROOT"
+from artlite import settings
 
 
 def become_user(argv: list[str]) -> None:
@@ -44,8 +44,8 @@ def become_user(argv: list[str]) -> None:
     user = system.drop_privileges()
     env = {k: v for k, v in os.environ.items() if not k.startswith("SUDO_")}
     # (the user's PATH (their aiecc first, as without sudo) and settings: ARTLITE_MODELS_DIR, ARTLITE_CACHE_DIR, ...)
-    env.update({k: v for k, v in invoking.items() if k == "PATH" or k.startswith("ARTLITE_")})
-    env[ROOT_ENV] = path
+    env.update({k: v for k, v in invoking.items() if k == "PATH" or settings.is_artlite(k)})
+    env[settings.DIAGNOSE_ROOT.name] = path
     sys.stderr.write(f"artlite-probe --diagnose: root readings taken; continuing as {user}\n")
     os.execve(sys.executable, [sys.executable, "-m", "models.probe", *argv], env)
 
@@ -87,7 +87,7 @@ def run(*, model_file: str, seconds: float, out_dir: str) -> str:
 
     data: dict[str, object] = {"version": 1, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                                "platform": platform.system()}
-    root_file = os.environ.pop(ROOT_ENV, "")
+    root_file = settings.DIAGNOSE_ROOT.take()
     if root_file:
         with open(root_file) as f:
             data["root"] = json.load(f)

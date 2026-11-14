@@ -11,10 +11,10 @@ import pytest
 # already set stays): spinning, torch's pool keeps ~1.2 CPUs busy while the NPU works (Llama 1B prefill: 1.16 vs 0.11
 # CPUs)
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-# every host-built transaction is verified where it is built or loaded (``txn.verify``)
-os.environ.setdefault("ARTLITE_VERIFY_TXN", "1")
+from artlite import parallel_compile, settings
 
-from artlite import parallel_compile
+# every host-built transaction is verified where it is built or loaded (``txn.verify``)
+os.environ.setdefault(settings.VERIFY_TXN.name, "1")
 
 # A module or package of tests/ named like a package of src/ would shadow it for a script run from tests/ (``python
 # tests/txn_dump.py``: the script's directory comes first on sys.path) and wherever the editable install's finder is not
@@ -136,7 +136,7 @@ _precompiler: list[parallel_compile.Precompiler] = []
 def pytest_collection_finish(session: pytest.Session) -> None:
     config = session.config
     if (parallel_compile.planning_active() or config.getoption("--dump-designs") or config.option.collectonly
-            or parallel_compile.jobs() == 1 or os.environ.get("ARTLITE_IGNORE_CACHE", "0") == "1"):
+            or parallel_compile.jobs() == 1 or settings.IGNORE_CACHE.get()):
         return
     from _pytest.skipping import evaluate_skip_marks
 
@@ -158,7 +158,7 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     for pre in _precompiler:
         terminalreporter.write_line(
             f"artlite.parallel_compile: {pre.queue.submitted} design(s) of the selected tests compiled in the "
-            f"background ({parallel_compile.JOBS_ENV}={parallel_compile.jobs()}; {pre.queue.failed} failed)")
+            f"background ({settings.COMPILE_JOBS.name}={parallel_compile.jobs()}; {pre.queue.failed} failed)")
 
 
 # --dump-designs ---------------------------------------------------------------------------------

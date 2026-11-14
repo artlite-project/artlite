@@ -9,6 +9,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import settings
+
 POSTPIPELINER_MAX_II = 60  # llvm-aie's -aie-postpipeliner-maxii default: no larger II is tried
 POSTPIPELINER_MAX_TRY_II = 20  # -aie-postpipeliner-maxtry-ii default: IIs tried from ResMII up
 
@@ -16,7 +18,7 @@ POSTPIPELINER_MAX_TRY_II = 20  # -aie-postpipeliner-maxtry-ii default: IIs tried
 def debug_compiler() -> str | None:
     """An assertions build of llvm-aie's clang++ (-debug-only works): $ARTLITE_DEBUG_CLANG, else the build
     directory of the llvm-aie checkout next to Artlite's."""
-    path = os.environ.get("ARTLITE_DEBUG_CLANG") or str(
+    path = settings.DEBUG_CLANG.get() or str(
         Path(__file__).resolve().parents[3] / "llvm-aie" / "build" / "bin" / "clang++"
     )
     return path if os.path.isfile(path) and os.access(path, os.X_OK) else None

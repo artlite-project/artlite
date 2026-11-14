@@ -36,6 +36,7 @@ from typing import TextIO
 import gguf
 import numpy as np
 
+from artlite import settings
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import MODELS_DIR, model_path
 from artlite.prefill import pace
@@ -363,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
                 p.test(r)
                 p.out.flush()
         if (pf := npu.prefill) is not None and pf.pace:
-            why = ("ARTLITE_PACE" if pace.parse(os.environ.get("ARTLITE_PACE", "")) is not None else
+            why = (settings.PACE.name if pace.parse(settings.PACE.get()) is not None else
                    "calibrated: this machine throttles them at full rate")
             sys.stderr.write(f"artlite-bench: {name}: the prefill's dense GEMMs ran paced ({pace.describe(pf.pace)}; "
                              f"{why}; docs/probe.md, PROCHOT)\n")

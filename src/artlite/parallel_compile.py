@@ -44,7 +44,7 @@ from multiprocessing import AuthenticationError
 from multiprocessing.connection import Client, Connection, Listener
 from typing import TYPE_CHECKING, Any
 
-from . import portable
+from . import portable, settings
 from .operators.build import BuildSpec, build, buildable
 
 if TYPE_CHECKING:
@@ -52,20 +52,12 @@ if TYPE_CHECKING:
     from .operators.base import ArtcOperator
     from .operators.fused.elf import FusedElf
 
-JOBS_ENV = "ARTLITE_COMPILE_JOBS"
-PLANNING_ENV = "ARTLITE_PLANNING"
-PLAN_SINK_ENV = "ARTLITE_PLAN_SINK"  # "<key>:<address>": the Precompiler's listener that its planning processes send to
 FOREGROUND, BACKGROUND = 0, 1  # pool priorities
 
 
 def jobs() -> int:
     """Concurrent builds: ``ARTLITE_COMPILE_JOBS``, default the CPU count."""
-    value = os.environ.get(JOBS_ENV)
-    if value is None:
-        return os.cpu_count() or 1
-    if not value.isdigit() or int(value) < 1:
-        raise ValueError(f"{JOBS_ENV}={value!r}: expected a positive integer")
-    return int(value)
+    return settings.COMPILE_JOBS.get() or os.cpu_count() or 1
 
 
 def aiecc_jobs(concurrent: int) -> int:
@@ -250,9 +242,9 @@ PLANNED: Any = _Planned()
 def _sink_from_env() -> Callable[[BuildSpec], None] | None:
     """A process started in planning mode (or a subprocess of one): the specs go to its Precompiler's listener (an
     authenticated connection, opened at the first), else nowhere."""
-    if os.environ.get(PLANNING_ENV) != "1":
+    if not settings.PLANNING.get():
         return None
-    key, _, address = os.environ.get(PLAN_SINK_ENV, "").partition(":")
+    key, _, address = settings.PLAN_SINK.get().partition(":")
     if not address:
         return lambda spec: None
     lock = threading.Lock()
@@ -302,7 +294,8 @@ class Precompiler:
         self._listener = Listener(authkey=key)
         self._stopping = False
         self._readers: list[threading.Thread] = []
-        env = {**os.environ, PLANNING_ENV: "1", PLAN_SINK_ENV: f"{key.hex()}:{self._listener.address}"}
+        env = {**os.environ, settings.PLANNING.name: "1",
+               settings.PLAN_SINK.name: f"{key.hex()}:{self._listener.address}"}
         self._proc = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       **portable.group_options())

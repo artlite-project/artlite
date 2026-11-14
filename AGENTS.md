@@ -100,6 +100,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | path | what |
 |---|---|
 | `csrc/` | the C++ runtime (device, buffers, HW contexts, ELF dispatch, the NPU's turn between processes, profiler) and the host's hot code (weight packers, dequantization, sampling, the MoE prefill's host step); API and errors: `docs/design.md`; the Python module `bindings/` (`module.cpp` and a file per domain: device and buffers, dispatch, scratchpad, profiler, GGUF, sampling, packers, MoE, errors); the XRT backend: `shim_xrt/` (the shim over XRT, contexts from in-memory xclbins) and `artlite/kernel_xrt.cpp` (dispatch as XRT runs) |
+| `src/artlite/settings.py` | the `ARTLITE_*` environment switches, each declared once (kind, default, doc, how it is read); the only reader of them; `import artlite` warns about an undeclared one |
 | `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
 | `src/artlite/{txn,elf_parser}.py`, `overlay.py` | control programs: transactions built on the host (the `insts.bin` format), full ELFs and the patching of their control code; the host runtime of the overlays, designs run by host-built transactions (`Sequence`, `OverlayDevice`, `Transaction`, `WeightBuffer`) |
 | `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, dispatch; `ArgSpec`), `toolchain.py` (where Peano and aiecc are, resolved at the first build, and their command lines), `build.py` (`BuildSpec`, its one cache key, `build`: artifacts published whole), `templating.py` (the kernel template files, `JINJA_ENV`), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py` (the build-time checks, over `objdump.py`'s one parse of a kernel object), `render_cache.py`, `chain.py` (one shim task from a chain of BDs: `chained_fill`), `words.py` (the host-core word layouts: an X object's metadata, a core's state words, a command, declared by name and checked at import; what the kernel templates take), and the pieces operators share (How an operator works) |
@@ -174,8 +175,10 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   on one device.
 - NPU2: 8 columns of compute rows 2-5, a memtile (row 1, 512 KB) and a shim (row 0). A core has 64 KB of data
   memory in four 16 KB regions (budget ~63 KB with the stack) and 16 KB of program memory.
-- Compile-time switches: `ARTLITE_MEASURE_II=1` (per-loop II, bounds, stack frames), `ARTLITE_GENERATE_ASM=1` (keep
-  `kernel.cc.s`), `ARTLITE_LOG_COMMANDS=1`, `ARTLITE_PROFILE=...` (the `profiling` skill).
+- Environment switches (`ARTLITE_MEASURE_II=1`: per-loop II, bounds, stack frames; `ARTLITE_GENERATE_ASM=1`: keep
+  `kernel.cc.s`; `ARTLITE_LOG_COMMANDS=1`; `ARTLITE_PROFILE=...`: the `profiling` skill; the rest in
+  `docs/development.md`) are declared in `artlite/settings.py`: read one only through its object
+  (`settings.PACE.get()`), never `os.environ`; a new one is declared there and in the table.
 
 ## Models
 

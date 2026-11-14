@@ -30,6 +30,7 @@ import re
 import sys
 from collections.abc import Iterable
 
+from .. import settings
 from . import kernel_source, objdump
 
 DEFAULT_STACK = 1024  # an ``aie.core`` without ``stack_size``: the target's default (mlir-aie's default core stack)
@@ -49,7 +50,7 @@ class DesignCheckError(RuntimeError):
 
 
 def enabled() -> bool:
-    return os.environ.get("ARTLITE_SKIP_CHECKS", "0") != "1"
+    return not settings.SKIP_CHECKS.get()
 
 
 def _callees(fn: str, f: objdump.Function) -> set[str]:

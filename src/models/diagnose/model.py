@@ -4,7 +4,7 @@ from 2 MB on) or of 4 KB pages (the driver's BOs below 64 MB), packed C drains i
 two rounds, with each run's state: the chunk's time per operator kind (each kind alone, in a telemetry step of its own:
 which kinds the platform throttles), the largest kind at each pace level, the calibration, a design switch's cost inside
 its program, the host's row lookups, the huge pages the process got, how much of the file the page cache holds. V0-V4
-run unpaced (``ARTLITE_PACE=off`` for the whole diagnosis: comparable with Strix Halo's reference)."""
+run unpaced (the library's pace set to none for the whole diagnosis: comparable with Strix Halo's reference)."""
 
 from __future__ import annotations
 
@@ -256,62 +256,56 @@ def run(path: str, *, step: Callable[[str], None], end: Callable[[str], None], i
     ``step`` / ``end``: the telemetry sampler's (``Sampler.step``, ``Sampler.end``)."""
     out: dict[str, object] = {"file": path, "resident_before": resident(path), "runs": []}
     rng = np.random.default_rng(0)
-    spec = os.environ.get("ARTLITE_PACE")
-    os.environ["ARTLITE_PACE"] = "off"  # (the paces the variants run at are set here: none, or V5's calibrated ones)
-    try:
-        step("compile")  # (each design set once before anything is timed: whole-line drains and not)
-        for lines in (True, False):
-            with variant("2 MB", lines):
-                npu = open_model(path).load(capacity=4096)
-                npu.prepare(1024)
-            del npu
+    step("compile")  # (each design set once before anything is timed: whole-line drains and not)
+    for lines in (True, False):
+        with variant("2 MB", lines):
+            npu = open_model(path).load(capacity=4096)
+            if npu.prefill is not None:
+                npu.prefill.pace = 0  # (the paces the variants run at are set here: none, or V5's calibrated ones)
+            npu.prepare(1024)
+        del npu
+        gc.collect()
+    end("compile")
+    word = 0
+    for r in range(rounds):
+        for name, pages, lines, busy, paced in VARIANTS:
+            tag = f"{name}, round {r + 1}"
+            step(f"{tag}: load")
+            with variant(pages, lines):
+                t0 = time.perf_counter()
+                model = open_model(path)
+                npu = model.load(capacity=4096)
+                load_s = time.perf_counter() - t0
+            npu.prefill.pace = word if paced else 0
+            tokens = token_source(file_info(path)[1], model.encode("")[:1], rng)
+            end(f"{tag}: load")
+            step(tag)
+            lookups: list[float] = []
+            with timed_lookups(lookups), busy_cpu(busy, irq_cpu):
+                samples = measure(npu, Test(path, 1024, 0, 0), tokens, reps=reps, warmup=True, progress=None)
+            entry: dict[str, object] = {"variant": name, "round": r + 1, "load_s": load_s,
+                                        "pp1024_ms": [s / 1e6 for s in samples],
+                                        "lookups_ms_per_prompt": sum(lookups) * 1e3 / (reps + 1),
+                                        "anon_huge_mb": anon_huge_kb() / 1024, "holds": npu.describe(),
+                                        "pace_word": npu.prefill.pace}
+            end(tag)
+            if r == 0 and lines and not busy and not paced:  # (V0 and V1: what the page size moves, per kind)
+                entry["kinds"] = kinds(npu, step=step, end=end, tag=tag)
+                step(f"{tag}: design switch")
+                entry["design_switch_us"] = design_switch_us(npu)
+                end(f"{tag}: design switch")
+                if pages == "2 MB":  # (V0: the largest paced kind at each level, then the calibration)
+                    pk = paced_kinds(npu)
+                    gemm = max((kv for kv in entry["kinds"]["kinds"].items() if kv[0] in pk),
+                               key=lambda kv: kv[1]["ms"])[0]
+                    entry["pace_sweep"] = pace_sweep(npu, gemm, step=step, end=end, tag=tag)
+                    time.sleep(IDLE_SECONDS)
+                    step(f"{tag}: calibration")
+                    word, table = pacing.calibrate(npu.prefill)
+                    end(f"{tag}: calibration")
+                    entry["calibration"] = {"word": word, "levels": pacing.describe(word), "table": table}
+            out["runs"].append(entry)
+            del model, npu, tokens
             gc.collect()
-        end("compile")
-        word = 0
-        for r in range(rounds):
-            for name, pages, lines, busy, paced in VARIANTS:
-                tag = f"{name}, round {r + 1}"
-                step(f"{tag}: load")
-                with variant(pages, lines):
-                    t0 = time.perf_counter()
-                    model = open_model(path)
-                    npu = model.load(capacity=4096)
-                    load_s = time.perf_counter() - t0
-                npu.prefill.pace = word if paced else 0
-                tokens = token_source(file_info(path)[1], model.encode("")[:1], rng)
-                end(f"{tag}: load")
-                step(tag)
-                lookups: list[float] = []
-                with timed_lookups(lookups), busy_cpu(busy, irq_cpu):
-                    samples = measure(npu, Test(path, 1024, 0, 0), tokens, reps=reps, warmup=True, progress=None)
-                entry: dict[str, object] = {"variant": name, "round": r + 1, "load_s": load_s,
-                                            "pp1024_ms": [s / 1e6 for s in samples],
-                                            "lookups_ms_per_prompt": sum(lookups) * 1e3 / (reps + 1),
-                                            "anon_huge_mb": anon_huge_kb() / 1024, "holds": npu.describe(),
-                                            "pace_word": npu.prefill.pace}
-                end(tag)
-                if r == 0 and lines and not busy and not paced:  # (V0 and V1: what the page size moves, per kind)
-                    entry["kinds"] = kinds(npu, step=step, end=end, tag=tag)
-                    step(f"{tag}: design switch")
-                    entry["design_switch_us"] = design_switch_us(npu)
-                    end(f"{tag}: design switch")
-                    if pages == "2 MB":  # (V0: the largest paced kind at each level, then the calibration)
-                        pk = paced_kinds(npu)
-                        gemm = max((kv for kv in entry["kinds"]["kinds"].items() if kv[0] in pk),
-                                   key=lambda kv: kv[1]["ms"])[0]
-                        entry["pace_sweep"] = pace_sweep(npu, gemm, step=step, end=end, tag=tag)
-                        time.sleep(IDLE_SECONDS)
-                        step(f"{tag}: calibration")
-                        word, table = pacing.calibrate(npu.prefill)
-                        end(f"{tag}: calibration")
-                        entry["calibration"] = {"word": word, "levels": pacing.describe(word), "table": table}
-                out["runs"].append(entry)
-                del model, npu, tokens
-                gc.collect()
-    finally:
-        if spec is None:
-            os.environ.pop("ARTLITE_PACE", None)
-        else:
-            os.environ["ARTLITE_PACE"] = spec
     out["resident_after"] = resident(path)
     return out

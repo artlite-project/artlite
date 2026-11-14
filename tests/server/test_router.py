@@ -22,10 +22,11 @@ import pytest
 import uvicorn
 from gguf import GGMLQuantizationType, GGUFWriter
 
+from artlite import settings
 from models.server import catalog as catalog_module
 from models.server import ui
 from models.server.catalog import Catalog, read_preset, render
-from models.server.cli_options import SHARE, arg_parser
+from models.server.cli_options import arg_parser
 from models.server.process import listen
 from models.server.router import Router, RouterOptions, create_router_app
 
@@ -468,7 +469,7 @@ def test_router_several(models_dir: str, tmp_path: object) -> None:
             return reply(r)
 
         assert ask_(A) == "a-Q4_0" and ask_(B) == "a-Q8_0" and sorted(router.instances) == [A, B]
-        assert router.env[SHARE] == "2"  # (each model server's default prompt cache: half of its own)
+        assert router.env[settings.ROUTER_MODELS.name] == "2"  # (each model server's default prompt cache: half of its own)
         port = router.instances[A].port
         assert httpx.get(f"http://127.0.0.1:{port}/props", headers=auth).status_code == 401  # (its own key)
         assert ask_(A) == "a-Q4_0"  # (B is now the least recently used)
