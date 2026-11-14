@@ -78,10 +78,6 @@ class DraftImage(QwenImage):
         return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
 
 
-def _formats(img: QwenImage) -> set[str]:
-    return {b.fmt for r in img.regions + img.slabs for b in r.blocks}
-
-
 def _draft_image(gguf: GGUFFile) -> DraftImage:
     cfg = mtp_config(gguf)
     return DraftImage(gguf, cfg, layers=[cfg.num_hidden_layers - 1])
@@ -89,7 +85,7 @@ def _draft_image(gguf: GGUFFile) -> DraftImage:
 
 def draft_formats(gguf: GGUFFile) -> tuple[str, ...]:
     """The tile formats of a drafter file's image: its model's design runs them (``QwenOverlay(formats=)``)."""
-    return tuple(sorted(_formats(_draft_image(gguf))))
+    return tuple(sorted(_draft_image(gguf).formats()))
 
 
 def draft_gate_up(gguf: GGUFFile) -> frozenset[int]:
@@ -177,7 +173,7 @@ class QwenDraft(QwenOverlay):
                          image=target.image.mtp_view(cfg) if own else None, slots=target.SLOTS)
         self.w_of = target if own else None
         assert vars(self.ash) == vars(target.ash), "the drafter's attention: the design's"
-        fmts = _formats(self.image)
+        fmts = self.image.formats()
         if not fmts <= set(target.op.rows):
             raise ValueError(f"the design's formats {sorted(target.op.rows)} lack the drafter's {sorted(fmts)}: "
                              f"QwenOverlay(formats=draft_formats(gguf))")

@@ -66,7 +66,11 @@ class Block:
     ``tensors`` (their rows one after the other; -1: a zero padding row), n a multiple of R G: tile row v holds rows
     v G .. v G + G - 1 of them one after the other along K (G > 1: row groups, ``group_rows``). F32 tensors (an MoE
     router's) are BFP16 tiles of two planes per row: index 2 i + p is plane p of row i (0: hi = bfp16(w), 1: lo =
-    bfp16(w - hi); ``formats.bf16``): ``pairs``, the sum of a pair's outputs is the row's."""
+    bfp16(w - hi); ``formats.bf16``): ``pairs``, the sum of a pair's outputs is the row's.
+
+    A split gate / up block (``fmt2``: gate and up in two tile formats, ``split_rows``): per SiLU group of 64 outputs its
+    gate rows in ``na`` tiles of ``fmt`` (R rows), then its up rows in ``nb`` tiles of ``fmt2`` (R2 rows), each part's
+    last tile ending in padding rows."""
 
     name: str
     tensors: tuple[str, ...]
@@ -75,10 +79,43 @@ class Block:
     R: int
     G: int = 1
     pairs: bool = False
+    fmt2: str = ""
+    R2: int = 0
+
+    @property
+    def formats(self) -> tuple[str, ...]:
+        """Its tile formats (a split block's two)."""
+        return (self.fmt, self.fmt2) if self.fmt2 else (self.fmt,)
+
+    @property
+    def na(self) -> int:
+        """(split) Tiles of a group's gate rows."""
+        return -(-SPLIT_ROWS // self.R)
+
+    @property
+    def nb(self) -> int:
+        """(split) Tiles of a group's up rows."""
+        return -(-SPLIT_ROWS // self.R2)
 
     @property
     def tiles(self) -> int:
+        if self.fmt2:
+            return self.rows.shape[1] // (self.na * self.R + self.nb * self.R2) * (self.na + self.nb)
         return self.rows.shape[1] // (self.R * self.G)
+
+    def parts(self, ffn: int = 0) -> list[tuple[str, int, int, tuple[str, ...], np.ndarray]]:
+        """The block's runs of row tiles of one format: (format, R, first row tile, tensors, rows (cols, n)); a split
+        block's per group and part, each of its own tensor (ffn: the gate's rows, the up rows' index past them)."""
+        if not self.fmt2:
+            return [(self.fmt, self.R, 0, self.tensors, self.rows)]
+        ga, gb = self.na * self.R, self.nb * self.R2
+        out = []
+        for j in range(self.rows.shape[1] // (ga + gb)):
+            r = self.rows[:, j * (ga + gb):(j + 1) * (ga + gb)]
+            up = r[:, ga:]
+            out += [(self.fmt, self.R, j * (self.na + self.nb), self.tensors[:1], r[:, :ga]),
+                    (self.fmt2, self.R2, j * (self.na + self.nb) + self.na, self.tensors[1:], np.where(up >= 0, up - ffn, -1))]
+        return out
 
 
 @dataclass
@@ -211,10 +248,15 @@ class TileImage:
         assert G == 1 or G * K == self.kc, (name, K, G)
         blocks = []
         for bname, tensors, rows in parts:
-            fmts = {self.fmt(t) for t in tensors}
-            if len(fmts) > 1:
-                raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(fmts)}")
-            fmt = fmts.pop()
+            fmts = [self.fmt(t) for t in tensors]
+            if len(set(fmts)) > 1:
+                if bname not in GU_BLOCKS or len(tensors) != 2 or G > 1:
+                    raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(set(fmts))}")
+                ffn, (fa, fb) = self.tensor(tensors[0]).rows, fmts
+                blocks.append(Block(bname, tensors, split_rows(ffn, self.R[fa], self.R[fb], rows.shape[0]), fa,
+                                    self.R[fa], fmt2=fb, R2=self.R[fb]))
+                continue
+            fmt = fmts[0]
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
             pairs = all(self.qtype(t) == "F32" for t in tensors)
@@ -301,6 +343,15 @@ class TileImage:
     def region(self, layer: int, name: str) -> Region:
         return self._index[(layer, name)]
 
+    def formats(self) -> set[str]:
+        """The tile formats of the image's blocks (a split block's both)."""
+        return {f for r in self.regions + self.slabs for b in r.blocks for f in b.formats}
+
+    @property
+    def split(self) -> bool:
+        """Whether a gate / up block is split (``Block.fmt2``: the decode design's B_SPLIT tiles)."""
+        return any(b.fmt2 for r in self.regions + self.slabs for b in r.blocks)
+
     def streamed_bytes(self) -> int:
         """Bytes of tiles a token streams (every region once)."""
         return sum(r.nbytes for r in self.regions)
@@ -309,11 +360,15 @@ class TileImage:
     # Packing
     # ------------------------------------------------------------------
 
-    def _native_block(self, r: Region, b: Block) -> tuple:
-        """A block for ``_native.pack_tiles``."""
-        ts = [self.tensor(t) for t in b.tensors]
-        return (_native_format(b.fmt, ts), b.R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt, r.rt0[b.name],
-                r.offset, r.col_stride, [_raw_bytes(t) for t in ts], b.rows, ts[0].cols // 256, b.G)
+    def _native_blocks(self, r: Region, b: Block) -> list[tuple]:
+        """A block for ``_native.pack_tiles``: its runs of one format (``Block.parts``)."""
+        out = []
+        for fmt, R, rt, names, rows in b.parts(self.tensor(b.tensors[0]).rows):
+            ts = [self.tensor(t) for t in names]
+            out.append((_native_format(fmt, ts), R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt,
+                        r.rt0[b.name] + rt, r.offset, r.col_stride, [_raw_bytes(t) for t in ts], np.ascontiguousarray(rows),
+                        ts[0].cols // 256, b.G))
+        return out
 
     def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
         """Pack every region into ``out`` (uint8, nbytes; the PAD bytes are left as they are): the C++ packer
@@ -324,17 +379,18 @@ class TileImage:
         blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
         own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (memory of their own: never released)
         mapped = [x for x in blocks if x not in own]
-        _native.pack_tiles(out, [self._native_block(r, b) for r, b in mapped], threads=threads, release=release,
-                           file=(self.gguf.path, self.gguf.data))
+        _native.pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
+                           release=release, file=(self.gguf.path, self.gguf.data))
         if own:
-            _native.pack_tiles(out, [self._native_block(r, b) for r, b in own], threads=threads)
+            _native.pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
         self._fill_data(out)
         return any(r.data for r in self.regions)
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
         """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer):
         the (offset, bytes) of its tiles, one per K chunk."""
-        blk = list(self._native_block(r, b))
+        assert not b.fmt2, "a split block's row tiles are of two formats"
+        blk = list(self._native_blocks(r, b)[0])
         n = b.R * b.G
         blk[7] += rt
         blk[8] += col * r.col_stride
@@ -439,6 +495,23 @@ def gate_up_rows(ffn: int, R: int, cols: int = COLS) -> np.ndarray:
     gu[:, :, :128] = (g0[..., None, None, None] + 8 * np.arange(8)[:, None, None] + ffn * np.arange(2)[:, None]
                       + np.arange(8)).reshape(cols, fr // 64, 128)  # 8 x [8 gate | 8 up]
     return gu.reshape(cols, -1)
+
+
+SPLIT_ROWS = 64  # (a split gate / up block) rows of each part of a SiLU group: its 64 outputs' gate rows, then their up rows
+GU_BLOCKS = ("gu",)  # the gate / up blocks a region may split (``Block.fmt2``)
+
+
+def split_rows(ffn: int, ra: int, rb: int, cols: int = COLS) -> np.ndarray:
+    """(cols, n) rows of the stack [gate; up] (ffn rows each) of a split gate / up block (``Block.fmt2``): column c's
+    outputs ffn / cols c .. in groups of 64, each as the 64 gate rows in ceil(64 / ra) tiles of ra rows, then the 64 up
+    rows in ceil(64 / rb) tiles of rb rows (-1: padding rows)."""
+    fr = ffn // cols
+    na, nb = -(-SPLIT_ROWS // ra) * ra, -(-SPLIT_ROWS // rb) * rb
+    out = np.full((cols, fr // 64, na + nb), -1, np.int64)
+    g0 = fr * np.arange(cols)[:, None] + 64 * np.arange(fr // 64)  # (cols, groups): a group's first gate row
+    out[:, :, :64] = g0[..., None] + np.arange(64)
+    out[:, :, na:na + 64] = g0[..., None] + ffn + np.arange(64)
+    return out.reshape(cols, -1)
 
 
 def group_rows(rows: np.ndarray, R: int, G: int) -> np.ndarray:

@@ -143,6 +143,7 @@ class GemmSpec:
     mc_unit: int = 0
     lines: bool = False
     pace: int | None = None
+    pass_step: int = 0
 
     def __post_init__(self) -> None:
         for name in ("out_cols", "blocks", "a_cols", "ablate"):
@@ -204,6 +205,7 @@ class Geometry:
     tiles: int  # decode tiles per pass
     TR: int  # weight rows per pass
     blocks: tuple[tuple[int, int], ...]
+    pass_step: int  # row tiles from a pass's first to the next's in a block (``tiles``, or a split block's group)
     pass_rt: tuple[int, ...]  # first row tile of each pass
     region_rt: int
     n_kc: int
@@ -342,8 +344,10 @@ class Geometry:
         passes, out_cols = spec.passes, spec.out_cols
         blocks = spec.blocks or ((0, passes),)
         assert sum(cnt for _, cnt in blocks) == passes
-        pass_rt = tuple(rt0 + tiles * i for rt0, cnt in blocks for i in range(cnt))
-        rt_end = max(rt0 + tiles * cnt for rt0, cnt in blocks)  # row tiles read
+        step = spec.pass_step or tiles  # (row tiles from a pass to the next: a split gate / up block's parts, a group apart)
+        assert step >= tiles, (step, tiles)
+        pass_rt = tuple(rt0 + step * i for rt0, cnt in blocks for i in range(cnt))
+        rt_end = max(rt0 + step * (cnt - 1) + tiles for rt0, cnt in blocks)  # row tiles read
         region_rt = spec.region_rt or rt_end  # row tiles of a column's region (the chunk group stride)
         n_kc = K // kc
         assert region_rt <= rt_end or (spec.kc_group or n_kc) == 1  # (one chunk per group: any chunk stride)
@@ -437,7 +441,7 @@ class Geometry:
             c_pairs=c_pairs, G=groups, pace=spec.pace, mc_param=spec.mc_param, mc_unit=spec.mc_unit, dq_core=dq_core,
             planar=is_planar, nsb=nsb, units=units, slice=slice_bytes, hdr_units=hdr_units, hdr_skip=hdr_skip, hg=hg,
             us=us, dequant=dequant, ws_planes=FORMATS[fmt].ws_planes, pair=pair, tq=tq, tiles=tiles, TR=TR,
-            blocks=blocks, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
+            blocks=blocks, pass_step=step, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
             KA=KA, a_k0=a_k0, a_K=a_K, overrun=overrun, w_bytes=w_bytes, halves=halves, n_read=n_read, n=n, nm=nm,
             c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1)
         if carry is None and c_parts == 1:

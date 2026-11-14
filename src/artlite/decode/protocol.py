@@ -119,6 +119,10 @@ B_PAIR = PHASE.flag("B_PAIR", 10, of="format")  # its rows are pairs [hi, lo] of
 B_KEEP = PHASE.flag("B_KEEP", 11, of="format")  # (B_PAIR) the block's first value stays in the main core's state (S_SG + slot): the shared expert's gate
 B_G2 = PHASE.flag("B_G2", 12, of="format")  # its tiles hold row groups of 2 / 4 rows (``decode.image.Block.G``)
 B_G4 = PHASE.flag("B_G4", 13, of="format")
+# a split gate / up block (``decode.image.Block.fmt2``: a SiLU group's gate rows in tiles of the format at bits 0 .. 7, then its
+# up rows in tiles of the format at bits 16 .. 23, B_NA and B_NB tiles: F_GU of its own, ``gusplit``)
+B_SPLIT = PHASE.flag("B_SPLIT", 14, of="format")
+B_FMT2, B_NA, B_NB = 16, 24, 28  # (a split block's second format, its gate and up tiles per group: their bits' shifts)
 
 TOKEN = XMETA.kind("token")
 # (``tok`` designs) a token object's index (< N_TOK) and per column its cache objects; an object of another core with
@@ -198,7 +202,8 @@ WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6,
 
 def consts() -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``)."""
-    return XMETA.consts(PHASE, TOKEN, MOE) | STATE.consts(POST_STATE, TOK_STATE, MOE_STATE) | CMD.consts()
+    return XMETA.consts(PHASE, TOKEN, MOE) | STATE.consts(POST_STATE, TOK_STATE, MOE_STATE) | CMD.consts() | \
+        {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
 
 
 # ----------------------------------------------------------------------

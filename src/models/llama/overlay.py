@@ -71,7 +71,7 @@ KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's sli
 
 def check_formats(image: LlamaImage) -> set[str]:
     """The image's tile formats; NotImplementedError for those the decode does not read (yet)."""
-    fmts = {b.fmt for r in image.regions for b in r.blocks}
+    fmts = image.formats()
     missing = sorted(f for f in fmts if not gemv.supported(f, image.nsb))
     if missing:
         raise NotImplementedError(f"{', '.join(missing)} tiles: the decode GEMV has no kernels for them")
@@ -98,9 +98,10 @@ class LlamaOverlay(AttentionOverlay):
         self.q_heads = self.nh
         self.at = at = Attn(hds=(self.hd,), rot=(self.hd // 2,), chain=1, heads=self.nh, kp=self.kp,
                             qk_norm=cfg.qk_norm, qk_weights=cfg.qk_norm, eps=cfg.rms_norm_eps, a_bytes=self.T)
-        gu = {b.R for L in self.layers for b in img.region(L, "gate_up").blocks}
+        gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R}
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
-                                      eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16}, paged=paged_formats(gguf, fmts))
+                                      eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16} or img.split,
+                                      paged=paged_formats(gguf, fmts), split=img.split)
         self.pg = at.pg[self.hd]  # positions per cache group
         groups = -(-max_positions // self.pg)
         self.max_positions = groups * self.pg

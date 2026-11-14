@@ -44,7 +44,7 @@ class LfmDecodeOperator(AttentionDecodeOperator):
     """The LFM3 decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of 1024
     columns (``tile_bytes``); ``attn``: the operator cores' attention (and its conv job: ``Attn.conv``; None: without);
     ``gu_win``: the gate / up tiles hold other than 16 rows (``DecodeOverlayOperator``); ``paged``: formats whose kernels
-    are code pages (``DecodeOverlayOperator``)."""
+    are code pages; ``split``: gate / up blocks of two formats (``DecodeOverlayOperator``)."""
 
     META_KINDS = (ATT, TOKEN_ATT, CONV, CONV_TOKEN)  # (the operator cores': attention and conv)
     PREFIX = "lfd"
@@ -52,14 +52,15 @@ class LfmDecodeOperator(AttentionDecodeOperator):
     ATTN_A_DEPTH = 2  # (the operator cores' cache objects in L1: one arrives while the core works on the other)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float = 1e-5, attn: Attn | None = None,
-                 gu_win: bool = False, paged: tuple[str, ...] = (), win: str = ""):
+                 gu_win: bool = False, paged: tuple[str, ...] = (), win: str = "", split: bool = False):
         assert all(gemv.supported(f, 4) for f in rows), rows
         assert not paged, "the operator cores page: the formats' kernels stay resident"
         if attn is not None:
             hdr, ctl = paging.request(stream_id=OP_REQ_ID, channel=PG_CH)
             attn.pages = paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(hdr,), bd0=(PG_BD,), ctl=(ctl,))
         super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu",
-                         post=True, packed=True, gu_win=gu_win, paged=paged, win=win)
+                         post=True, packed=True, gu_win=gu_win, paged=paged, win=win,
+                         split=split)
 
     def _core_buffers(self) -> dict[int, list]:
         """The pager: per core its state words and wake lock, per column its store and routes."""

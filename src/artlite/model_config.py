@@ -83,6 +83,13 @@ def swift_gguf() -> str:
                         "Swift-1.5-Qwen3.8-27B-Uncensored-VAL-APEX-I-MiniPlus-V3.gguf")
 
 
+def unsloth_qwen_gguf(quant: str = "UD-IQ4_XS") -> str:
+    """unsloth's Qwen3.8-27B in one of its Unsloth Dynamic quantizations (GGUF architecture ``qwen35`` with an MTP block;
+    UD-IQ4_XS: IQ4_XS, Q5_K, Q4_K, IQ3_S, IQ3_XXS, Q6_K, Q3_K, IQ2_S, IQ2_XS, IQ4_NL, Q2_K, Q8_0 and F32 tensors, a layer's
+    gate and up often in two formats)."""
+    return os.path.join(MODELS_DIR, "unsloth", "Qwen3.8-27B-GGUF", f"Qwen3.8-27B-{quant}.gguf")
+
+
 def minicpmv_gguf(quant: str = "Q4_K_M") -> str:
     """A file of openbmb's MiniCPM-V 4.7 1B GGUF repository: the language model of a quantization (GGUF architecture
     ``qwen35``)."""

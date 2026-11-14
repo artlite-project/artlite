@@ -137,7 +137,7 @@ class Dataflow:
         ([sub-unit 4][tile][2 KB] after the header)."""
         geo = self.geo
         tw, (nsl, sw) = geo.tile_bytes // 2, geo.fill_units
-        nt, g, rs, n_rt = geo.tiles, geo.kc_group, geo.rt_stride, geo.region_rt
+        nt, g, rs, n_rt, ps = geo.tiles, geo.kc_group, geo.rt_stride, geo.region_rt, geo.pass_step
         base = c * geo.col_bytes // 2
         w_dims = (1, geo.w_bytes // 2)
         hw = geo.slice // 2 // geo.hg  # (a tile's header, bf16 units)
@@ -150,8 +150,8 @@ class Dataflow:
             for su in range(2):
                 qa, qb = min(2 * su, r - 1), min(2 * su + 1, r - 1)
                 step = at(k0 + qb) - at(k0 + qa) if qb > qa else hw  # (no zero strides in a shim BD)
-                out.append(TensorAccessPattern(w_dims, at(k0 + qa), [np_, nt, 2, hw], [nt * rs * tw, rs * tw, step, 1]))
-            out += [TensorAccessPattern(w_dims, at(k) + hw, [np_, nsl, nt, sw], [nt * rs * tw, sw, rs * tw, 1])
+                out.append(TensorAccessPattern(w_dims, at(k0 + qa), [np_, nt, 2, hw], [ps * rs * tw, rs * tw, step, 1]))
+            out += [TensorAccessPattern(w_dims, at(k) + hw, [np_, nsl, nt, sw], [ps * rs * tw, sw, rs * tw, 1])
                     for k in range(k0, k0 + r)]
         return out
 
@@ -161,7 +161,7 @@ class Dataflow:
         slices of the pass's tiles."""
         geo = self.geo
         tw, (nsl, sw) = geo.tile_bytes // 2, geo.fill_units
-        nt, nk, g, rs = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride
+        nt, nk, g, rs, ps = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride, geo.pass_step
         # units start hdr_skip bytes before each tile (a header shorter than a slice: see __init__); the
         # W argument starts hdr_skip bytes before the matrix
         base = c * geo.col_bytes // 2
@@ -175,10 +175,10 @@ class Dataflow:
                     out += [(p_, t) for t in self._hg_bds(c, geo.pass_rt[p_], 1)]
             elif nk == 1:
                 out.append((p0, TensorAccessPattern(w_dims, base + rt0 * rs * tw, [np_, nsl, nt, sw],
-                                                    [nt * rs * tw, sw, rs * tw, 1])))
+                                                    [ps * rs * tw, sw, rs * tw, 1])))
             elif g == nk and tw == nsl * sw:  # (chunk, unit) as one dimension: tiles of whole slices, no padding
                 out.append((p0, TensorAccessPattern(w_dims, base + rt0 * rs * tw, [np_, nk * nsl, nt, sw],
-                                                    [nt * rs * tw, sw, rs * tw, 1])))
+                                                    [ps * rs * tw, sw, rs * tw, 1])))
             else:  # per pass (more than the 3 dimensions + repeat of a shim BD): tile (j, k) of row tile j and
                 # chunk k is at (k // g) n_rt rs + j rs + k % g
                 for p_ in range(p0, p0 + np_):
@@ -207,13 +207,13 @@ class Dataflow:
         if (len(taps) == len(geo.blocks) and geo.k_rep == 1) or max(n for _, n in geo.blocks) > MAX_BD_ITER:
             return None  # (one fill per block already; a BD iterates at most MAX_BD_ITER times)
         tw, (nsl, sw) = geo.tile_bytes // 2, geo.fill_units
-        nt, nk, g, rs = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride
+        nt, nk, g, rs, ps = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride, geo.pass_step
         base = c * geo.col_bytes // 2
         n_rt = geo.region_rt
         w_dims = (1, geo.w_bytes // 2)
         # chunk k: tile (j, k) at (k // g) n_rt rs + j rs + k % g; pass p's tiles j = rt0 + nt p ..
         return [[TensorAccessPattern(w_dims, base + ((k // g) * n_rt * rs + rt0 * rs + k % g) * tw, [np_, nsl, nt, sw],
-                                     [nt * rs * tw, sw, rs * tw, 1]) for k in list(range(nk)) * geo.k_rep]
+                                     [ps * rs * tw, sw, rs * tw, 1]) for k in list(range(nk)) * geo.k_rep]
                 for rt0, np_ in geo.blocks]
 
     def a_tap(self, ch: int, row: int) -> TensorAccessPattern:

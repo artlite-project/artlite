@@ -105,10 +105,10 @@ class LfmOverlay(AttentionOverlay):
         self.at = at = Attn(hds=(self.hd,), rot=(cfg.rot("swa"), cfg.rot("full")), chain=CHAIN, heads=self.nh,
                             kp=self.kp, qk_norm=True, qk_weights=True, eps=cfg.rms_norm_eps, a_bytes=self.T, gate=True,
                             conv=CV.ConvJob())
-        fmts = {b.fmt for r in img.regions for b in r.blocks}
-        gu = {b.R for L in self.layers for b in img.region(L, "gate_up").blocks}
+        fmts = img.formats()
+        gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R}
         self.op = LfmDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
-                                    eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16})
+                                    eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16} or img.split, split=img.split)
         self.pg = at.pg[self.hd]  # positions per cache group
         assert cfg.sliding_window % self.pg == 0
         self.guard = cfg.sliding_window // self.pg  # (groups before a sliding-window cache's first one)

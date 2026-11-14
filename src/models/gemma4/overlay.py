@@ -104,7 +104,10 @@ class GemmaOverlay(AttentionOverlay):
         assert self.T == TILE_BYTES
         self.at = at = AT.GemmaAttn(cfg, kp=self.kp)
         self.q_heads = AT.QH
-        fmts = {b.fmt for r in img.regions for b in r.blocks}
+        fmts = img.formats()
+        if img.split:
+            raise NotImplementedError("gate / up of two tile formats in a layer: Gemma's decode design (GELU) has no "
+                                      "split gate / up blocks")
         self.op = GemmaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, eps=cfg.rms_norm_eps,
                                       attn=at)
         pg_s, pg_f = at.pg[256], at.pg[512]

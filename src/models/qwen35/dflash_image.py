@@ -49,5 +49,3 @@ class DFlashImage(TileImage):
             self.ikv[L] = Region(L, "ikv", blocks, r.n_kc, r.kc_group, r.tile_bytes, r.kc,
                                  offset=r.offset + rt * r.n_kc * r.tile_bytes, col_stride=r.col_stride)
 
-    def formats(self) -> set[str]:
-        return {b.fmt for r in self.regions for b in r.blocks}

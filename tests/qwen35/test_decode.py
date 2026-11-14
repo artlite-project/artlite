@@ -1044,6 +1044,34 @@ def test_dense_slice(first: int) -> None:
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
 
 
+@pytest.mark.parametrize("first", [0, 12])
+def test_split_slice(first: int) -> None:
+    """unsloth's UD-IQ4_XS layers first .. first + 4, fed llama.cpp's residual stream before them token by token (0 .. 4:
+    gate / up in IQ2_XS + IQ2_S, IQ3_S + Q3_K, IQ3_S + IQ4_XS, IQ4_XS + IQ3_S (attention), IQ4_XS; 12 .. 16: IQ2_XS + IQ3_S,
+    Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (attention), IQ2_S + IQ3_XXS; the split blocks of ``decode.image``): the
+    residual after every layer within the 27B's bounds of ``test_overlay_slice``."""
+    from models.qwen35.overlay import QwenOverlay
+
+    path = size_gguf("ud-iq4xs")
+    require(path)
+    layers, n = list(range(first, first + 5)), 16
+    tokens = llama_tokenize(path, essay("apple.txt"))[:n]
+    G_ = golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
+                names="l_out|model.input_embed", logits="none")
+    ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
+    assert ov.image.split
+    ov.load(release=False)
+    errs = np.zeros((n, len(layers)))
+    for t in range(n):
+        x = G_["model.input_embed"][t] if first == 0 else G_["l_out", first - 1][t]
+        ov.step(torch.from_numpy(np.asarray(x, np.float32).copy()), t, logits=False)
+        for i, L in enumerate(layers):
+            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
+            errs[t, i] = rel_max(got, np.asarray(G_["l_out", L][t], np.float32))
+    print(f"layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.4f}")
+    assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
+
+
 @pytest.mark.parametrize("size", ["35B-A3B", "occamy", "swift"])
 def test_lm_head(size: str) -> None:
     """The LM head alone (``logits_of``: the output norm, every vocabulary row) on llama.cpp's last residual of T

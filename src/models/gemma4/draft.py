@@ -242,7 +242,7 @@ class GemmaDraft:
         self.ov, self.gguf, self.cfg = overlay, gguf, overlay.cfg
         assert overlay.layers == list(range(self.cfg.num_hidden_layers)), "a drafter needs the model's caches"
         self.image = img = DraftImage(gguf, self.cfg)
-        fmts = {b.fmt for r in img.regions for b in r.blocks}
+        fmts = img.formats()
         assert fmts <= set(overlay.op.rows), f"the design's tile formats {set(overlay.op.rows)} lack {fmts}"
         self.d, self.vocab, self.T, self.H = img.d, img.vocab, TILE_BYTES, self.cfg.hidden_size
         self.src = [self.cfg.kv_layers - (2 if s else 1) for s in img.swa]  # (the model's caches the layers attend to)

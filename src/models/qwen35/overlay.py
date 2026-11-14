@@ -148,8 +148,8 @@ class QwenOverlay(ModelOverlay):
         tokens run, default: the file has an MTP layer of its own)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
-        fmts = {b.fmt for r in img.regions + img.slabs for b in r.blocks} | set(formats)
-        gu_win = img.gu_rows() | gu != {16}  # (``decode.design``'s gate / up windows)
+        fmts = img.formats() | set(formats)
+        gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
         slots = slots or slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts)
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
@@ -164,7 +164,7 @@ class QwenOverlay(ModelOverlay):
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
                                       paged=paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16
                                                                                         or gu_win)),
-                                      slots=slots, bcast=slots == 8, gu_win=gu_win,
+                                      slots=slots, bcast=slots == 8, gu_win=gu_win, split=img.split,
                                       pairs=not cfg.moe and any(b.pairs for r in img.regions for b in r.blocks))
         self.g8 = self.gsh is not None and slots == 8  # (the GDN core of 8 slots: ``gdn``'s "8 slots")
         self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "Chunkwise", "4 slots")

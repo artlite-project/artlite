@@ -14,12 +14,16 @@ import numpy as np
 
 from ..formats import FORMATS
 from . import gemv
-from .image import Region
+from .image import Block, Region
 from .protocol import (
     B_F32,
+    B_FMT2,
     B_G2,
     B_G4,
+    B_NA,
+    B_NB,
     B_PAIR,
+    B_SPLIT,
     F_EMITR,
     F_LOADR,
     F_MAIN,
@@ -60,8 +64,17 @@ class Group:
 
 
 def valid_rows(region: Region) -> list[int]:
-    """Valid rows per column of each block (the same in every column)."""
-    return [int((b.rows[0] >= 0).sum()) for b in region.blocks]
+    """Valid rows per column of each block (the same in every column; a split gate / up block's: its outputs)."""
+    return [int((b.rows[0] >= 0).sum()) // (2 if b.fmt2 else 1) for b in region.blocks]
+
+
+def format_word(b: Block) -> int:
+    """A block's format word without its B_* flags but B_SPLIT: the format's id, a split block's second format and its
+    parts' tiles per group (``protocol.B_SPLIT``)."""
+    if not b.fmt2:
+        return FORMATS[b.fmt].fid
+    assert b.na < 16 and b.nb < 16, (b.na, b.nb)
+    return FORMATS[b.fmt].fid | B_SPLIT | FORMATS[b.fmt2].fid << B_FMT2 | b.na << B_NA | b.nb << B_NB
 
 
 def group_chunks(region: Region) -> list[tuple[int, int]]:
@@ -98,7 +111,7 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
         f32 |= B_PAIR if b.name == "alpha" else 0
         assert b.G in (1, 2, 4), b.G
         g = {1: 0, 2: B_G2, 4: B_G4}[b.G]
-        blk += [rt, FORMATS[b.fmt].fid | f32 | g | (block_flags or {}).get(b.name, 0), nv]
+        blk += [rt, format_word(b) | f32 | g | (block_flags or {}).get(b.name, 0), nv]
     parts = group_chunks(region)
     out = []
     for i, (k0, g) in enumerate(parts):
