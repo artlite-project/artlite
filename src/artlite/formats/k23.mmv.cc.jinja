@@ -76,3 +76,25 @@ __attribute__((noinline)) void {{ p }}_k23sc(const bfloat16 *__restrict c, const
     {{ p }}_k23d(y + 96, Y3, dg + 24);
 }
 
+{% if slots == 8 %}
+
+// (8 slots) one row group: y += hilo(yu + sum over the nj sub-blocks j of c[j] sct[j][r]) dg (c: 64 lanes [slot][r] per
+// j, CS bf16 apart; sct[j]: 8 bf16 [r], SS apart; yu: 64 fp32, zeros for none); the products exact, their sums in fp32, d
+// as hi + lo once
+__attribute__((noinline)) void {{ p }}_k23sc8(const bfloat16 *__restrict c, int CS, const bfloat16 *__restrict sct, int SS,
+                                              const float *__restrict yu, const bfloat16 *__restrict dg,
+                                              float *__restrict y, int nj)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 64> Y(aie::load_v<64>(yu));
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < nj; j++) {
+        Y = aie::mac(Y, aie::load_v<64>(pc), aie::load_v<8>(ps).template grow_replicate<64>());
+        pc += CS;
+        ps += SS;
+    }
+    {{ p }}_k23d(y, Y, dg);
+}
+{% endif %}

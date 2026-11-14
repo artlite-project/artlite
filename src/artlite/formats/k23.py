@@ -60,6 +60,9 @@ class PlanarK23:
     def mmv_supports(self, fmt: str, nsb: int) -> bool:
         return nsb == 4  # (two super-blocks per core)
 
+    def mmv_slots(self, fmt: str) -> tuple[int, ...]:
+        return (4, 8)
+
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
         return ("mmv/k23", f"mmv/{fmt}")
 

@@ -259,7 +259,7 @@ def _q6k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 def _q2k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     # (per super-block: hilo(sum c sc + 2 XS16 sc) d - hilo(XS16 mn) dmin, the codes centered against the panels' rows:
-    # c = bf16(sum (q - 2) X_a); sums in fp32)
+    # c = bf16(sum (q - 2) X_a); sums in fp32; 8 slots: per half super-block hilo(...) d, the offsets with the first)
     q = f["q"].astype(np.float64)
     R, K = q.shape
     nsb = K // 256
@@ -268,9 +268,13 @@ def _q2k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     d, dm = _bf64(f["d"]).reshape(R, nsb), _bf64(f["dmin"]).reshape(R, nsb)
     XS = x.xs16.reshape(8, nsb, 16)
     Ms, Mm = np.einsum("abj,rbj->abr", XS, sc), np.einsum("abj,rbj->abr", XS, mn)  # (8, nsb, R)
-    Y = np.einsum("sbjr,rbj->sbr", _csum(C).reshape(SLOTS, nsb, 16, R), sc) + 2 * (Ms[:SLOTS] + Ms[SLOTS:])
-    o = _hilo(Mm) * dm.T[None]
-    return (_hilo(Y) * d.T[None]).sum(1) - (o[:SLOTS] + o[SLOTS:]).sum(1)
+    cs = np.einsum("sbjr,rbj->sbjr", x.csum(C).reshape(x.slots, nsb, 16, R), sc)
+    o = x.fold(_hilo(Mm) * dm.T[None]).sum(1)
+    if x.slots == 4:
+        Y = cs.sum(2) + 2 * x.fold(Ms)
+        return (_hilo(Y) * d.T[None]).sum(1) - o
+    Y0, Y1 = cs[:, :, :8].sum(2) + 2 * x.fold(Ms), cs[:, :, 8:].sum(2)
+    return ((_hilo(Y0) + _hilo(Y1)) * d.T[None]).sum(1) - o
 
 
 def _q3k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
@@ -280,7 +284,7 @@ def _q3k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     R, K = q.shape
     C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 16, 16), q.reshape(R, K // 16, 16))
     nsb = K // 256
-    Y = np.einsum("sbjr,rbj->sbr", _csum(C).reshape(4, nsb, 16, R), f["sc"].astype(np.float64).reshape(R, nsb, 16))
+    Y = np.einsum("sbjr,rbj->sbr", x.csum(C).reshape(x.slots, nsb, 16, R), f["sc"].astype(np.float64).reshape(R, nsb, 16))
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
@@ -349,8 +353,8 @@ _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_
 
 
 # (the formats with kernels of 8 slots)
-GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL",
-                 "IQ4_XS", "BFP16")
+GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS",
+                 "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16")
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:

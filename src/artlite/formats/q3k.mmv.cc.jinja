@@ -3,7 +3,7 @@
 // C = q(t) + 8 bit_t(q(3)) of blocks t = 0 .. 2), word-major. Core H: super-blocks 2 H, 2 H + 1; per super-block u its
 // signed integer scales u - 32 (_tab), the sub-block sums c (_mm: w = d sc (q - 4); a row group per pass), then d sum c
 // sc (_k23sc). Scratch: hw [lo 4 | crumbs, d: 5 words][128 B] (1152 B) | sct [g 4][j 16][r]
-// | yu [g 4][32] (zeros) | dg [g 4][r] | c [j 16][g 4][32] | (6912) the masks [2][4][64]
+// | yu [g 4][32] (zeros) | dg [g 4][r] | c [j 16][g 4][32] (8 slots: a row group's [j 16][64]) | (6912) the masks [2][4][64]
 
 // Super-block u's scales u - 32 of the 16 sub-blocks: I against the low nibbles, the crumbs (j < 8: & 3 at 16, j >= 8:
 // & 12 at 4) and a -32 panel ([s][r]) -> sct [g][j][r]; d -> dg; yu = 0 (both halves per call: their exponents and masks
@@ -108,6 +108,60 @@ __attribute__((noinline)) void {{ p }}_q3k_mm(const uint8_t *__restrict xp, cons
     }
 }
 
+{% if slots == 8 %}
+// (8 slots) c_j = bf16(C) -> c [j 16][64] for the 16 sub-blocks j of row group g (_q3k_mm's arithmetic, one row group per
+// call: its c [j][64] and the scaling, ``_k23sc8``, between the calls)
+__attribute__((noinline)) void {{ p }}_q3k_mm8(const uint8_t *__restrict xp, const uint8_t *w, bfloat16 *__restrict c,
+                                               int8_t *__restrict mt, int g)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% for cp in range(2) %}
+{% for v in (7, 8, 16, 32) %}
+    aie::store_v(mt + {{ 256 * cp + 64 * loop.index0 }}, aie::broadcast<int8, 64>({{ v }}));
+{% endfor %}
+{% endfor %}
+    v64bfp16ebs8 N4, W0, W1, W2, W3;  // (the zero point; blocks 0 .. 3)
+    N4.mantissa = broadcast_to_v64int8(-4);
+    N4.exponent = al::e8(0x85);
+    W0.exponent = W1.exponent = W2.exponent = al::e8(0x85);
+    W3.exponent = al::e8(0x82);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    v128int4 __aie_dm_resource_b *pw = (v128int4 __aie_dm_resource_b *)(w + 32 * g);
+    fifo_state_t fs;
+    fifo_ld_reset(pw, fs);
+    bfloat16 *__restrict pc = c;
+    const int8_t __aie_dm_resource_c *pm = (const int8_t __aie_dm_resource_c *)mt;
+    int cm = 0;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int q = 0; q < 8; q++) {
+        const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
+        fifo_ld_fill(pw, fs);
+        const v64int8 a = unpack(extract_v64int4(fifo_ld_pop_1d_byte(pw, fs, {{ 4 * R3 - 64 }}), 0));
+        fifo_ld_fill(pw, fs);
+        const v64int8 b = unpack(extract_v64int4(fifo_ld_pop_1d_byte(pw, fs, {{ 4 * R3 - 64 }}), 0));
+        fifo_ld_fill(pw, fs);
+        const v64int8 d = unpack(extract_v64int4(fifo_ld_pop_1d_byte(pw, fs, {{ 4 * R3 - 64 }}), 0));
+        const v64int8 m7 = *(const v64int8 __aie_dm_resource_c *)pm;
+        W0.mantissa = band(a, m7);
+        W1.mantissa = band(b, m7);
+        W2.mantissa = band(d, m7);
+        W3.mantissa = bor(bor(band(a, *(const v64int8 __aie_dm_resource_c *)(pm + 64)),
+                              band(b, *(const v64int8 __aie_dm_resource_c *)(pm + 128))),
+                          band(d, *(const v64int8 __aie_dm_resource_c *)(pm + 192)));
+        pm = add_2d_ptr(pm, -256, 1, cm, 256);
+        v64accfloat C0 = mac_8x8_8x8T(x1, 1, N4, 1, mul_8x8_8x8T(x0, 1, N4, 1));
+        v64accfloat C1 = mac_8x8_8x8T(x3, 1, N4, 1, mul_8x8_8x8T(x2, 1, N4, 1));
+        C0 = mac_8x8_8x8T(x0, 1, W0, 0, C0);
+        C1 = mac_8x8_8x8T(x2, 1, W2, 0, C1);
+        C0 = mac_8x8_8x8T(x1, 1, W1, 0, C0);
+        C1 = mac_8x8_8x8T(x3, 1, W3, 0, C1);
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + 64, {{ p }}_c8(C1));
+        pc += 128;
+    }
+}
+
+{% endif %}
 // super-blocks 2 H, 2 H + 1 of a Q3_K tile: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; ys:
 // the second super-block's rows at y + ys (row groups)" if rg else "" }}
 template <int H>
@@ -123,7 +177,15 @@ __attribute__((noinline)) void {{ p }}_q3k(uint8_t *__restrict a, const uint8_t 
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         {{ p }}_q3k_tab(hw, sct, yu, dg, H, u);
+{% if slots == 8 %}
+        AIE_LOOP_NO_UNROLL
+        for (int g = 0; g < 3; g++) {  // (8 slots: a row group's c at a time; yu: zeros)
+            {{ p }}_q3k_mm8(xp + {{ 32 * PANEL }} * u, a + {{ 4 * R3 * NW3 }} + {{ 4 * R3 * 24 }} * (2 * H + u), c, mt, g);
+            {{ p }}_k23sc8(c, 64, sct + 128 * g, 8, yu, dg + 8 * g, y + 64 * g, 16);
+        }
+{% else %}
         {{ p }}_q3k_mm(xp + {{ 32 * PANEL }} * u, a + {{ 4 * R3 * NW3 }} + {{ 4 * R3 * 24 }} * (2 * H + u), c, mt);
         {{ p }}_k23sc(c, sct, yu, dg, y{{ " + u * ys" if rg else "" }});
+{% endif %}
     }
 }

@@ -9,7 +9,8 @@ writes the records (``AttnPrepOperator``) into the drafter's KV cache at the chu
 - after the last layer (PX holds its output x): hnorm(output_norm(x)) = (x w_out) w_h / rms(x w_out) into columns H ..
   (``PrefillNormOperator(pre=)``);
 - eh_proj in two K parts (``prefill.gemm.plan_phase(k_part=)``: the enorm half, the hnorm half) into DY's two regions
-  of R0 rows, the hnorm half's one row later: row q of the second region holds the projection of h_{q - 1} (its row
+  of R0 rows (each of 8 column slices at eh's output pitch: a Q6_K eh_proj's passes end in padding rows), the hnorm half's
+  one row later: row q of the second region holds the projection of h_{q - 1} (its row
   0 the previous chunk's last valid row: ``carry``, zeros at position 0, after decode steps the host's: ``carry_of``);
   the residual norm adds both parts to a zero x (DZ) in fp32 and writes attn_norm(x0)'s panels (DPN);
 - the drafter's attn_in GEMMs (DG), then the attention prep into the drafter's cache (its q / k norms in the prefill's
@@ -43,10 +44,11 @@ class DraftPrefill(DrafterPrefill):
         self.L, self.H, self.eps = draft.L, H, cfg.rms_norm_eps
         self.R0 = max(prefill.sizes) + 64  # (rows of each of DY's regions: a chunk, its GEMMs' padding, the carry)
         self.pitch = PG.phase_pitch(img, "attn_in", prefill.SUB)
-        self.d_pitch = PG.d_pitch(SimpleNamespace(regions=[img.region(self.L, "eh")]), prefill.SUB)  # (eh's own)
-        assert self.d_pitch == H // 8, "eh's rows dense (the residual norm's deltas)"
+        eh = SimpleNamespace(regions=[img.region(self.L, "eh")])  # (eh's own pitch: its widest of the sub-chunk sizes')
+        self.d_pitch = max(PG.d_pitch(eh, prefill._t(T)) for T in prefill.sizes)
+        self.row = 2 * COLS * self.d_pitch  # (bytes of a row of DY)
         self.wbuf = "W" if draft.w_of is not None else "DW"  # (the buffer of the drafter's weights)
-        self.carry = np.zeros(2 * H, np.uint8)  # (DY's second region's row 0: the last chunk's last valid row)
+        self.carry = np.zeros(self.row, np.uint8)  # (DY's second region's row 0: the last chunk's last valid row)
         self._w_h: np.ndarray | None = None  # (eh_proj's hnorm half, fp32: ``carry_of``)
         self.ops = {t: self._ops(t) for t in sorted({prefill._t(T) for T in prefill.sizes})}
 
@@ -59,7 +61,8 @@ class DraftPrefill(DrafterPrefill):
             eh=eh, attn=PG.plan_phase(img, img.region(self.L, "attn_in"), t, pitch=self.pitch, ops=self.pf._gemms),
             ne=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=2 * H, out_col=0),
             nh=PrefillNormOperator(T=t, add=False, E=H, eps=eps, pre=True, out_pitch=2 * H, out_col=H),
-            nx=PrefillNormOperator(T=t, E=H, eps=eps, deltas=2, d_stride=self.R0 * H))
+            nx=PrefillNormOperator(T=t, E=H, eps=eps, deltas=2, d_stride=self.R0 * self.row // 2,
+                                   d_pitch=self.d_pitch if self.d_pitch != H // COLS else 0))
 
     def rows(self) -> dict[str, int]:
         """Bytes per token of the token buffers."""
@@ -88,8 +91,7 @@ class DraftPrefill(DrafterPrefill):
     def end_items(self, T: int, tok: object, sl: object) -> list[tuple]:
         """A chunk's last items (PX: the last layer's output): the records (module docstring)."""
         t = self.pf._t(T)
-        S, o, H = T // t, self.ops[t], self.H
-        row = 2 * H
+        S, o, row = T // t, self.ops[t], self.row
         rl: list[tuple] = [(o.nh, tok("PX", j, o.nh, i=0), self._norm(1, 2), tok("PEH", j, o.nh, i=2))
                            for j in range(S)]
         for g in o.eh.gemms:  # (part 1's rows one later: row q the projection of h_{q - 1})
@@ -139,7 +141,7 @@ class DraftPrefill(DrafterPrefill):
         """The carry (row 0 of DY's second region) of a chunk at p0: the last chunk's, zeros at 0."""
         if p0 == 0:
             self.carry[:] = 0
-        o = 2 * self.H * self.R0
+        o = self.row * self.R0
         dev.view("DY")[o:o + self.carry.size] = self.carry
         dev.flush("DY", o, self.carry.size)
 
@@ -153,12 +155,14 @@ class DraftPrefill(DrafterPrefill):
         x = np.asarray(h, np.float32)
         x = x / np.sqrt((x * x).mean(dtype=np.float32) + np.float32(self.eps)) * self.d._f32(
             f"blk.{self.L}.nextn.hnorm.weight")
-        self.carry[:] = (self._w_h @ x).astype(bfloat16).view(np.uint8)
+        c = np.zeros((COLS, self.d_pitch), bfloat16)  # (the column slices at eh's pitch)
+        c[:, :self.H // COLS] = (self._w_h @ x).astype(bfloat16).reshape(COLS, -1)
+        self.carry[:] = c.view(np.uint8).reshape(-1)
 
     def after(self, dev: object, p0: int, n: int, T: int) -> None:
         """The next chunk's carry: this one's projection of its last valid row's h; the drafter's cache records of the
         chunk's last record are its (the next step's ring from its V panels: ``attn_steps.AttentionSteps``'s ``_rings_from_prefill``)."""
-        o = 2 * self.H * (self.R0 + n)
+        o = self.row * (self.R0 + n)
         dev.fetch("DY", o, self.carry.size)
         self.carry[:] = dev.view("DY")[o:o + self.carry.size]
         self.d.vring.from_prefill.add(self.L)

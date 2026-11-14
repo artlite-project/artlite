@@ -1044,12 +1044,13 @@ def test_dense_slice(first: int) -> None:
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize("first", [0, 12])
-def test_split_slice(first: int) -> None:
+@pytest.mark.parametrize(("first", "slots"), [(0, 8), (12, 8), (0, 4)], ids=["L0-S8", "L12-S8", "L0-S4"])
+def test_split_slice(first: int, slots: int) -> None:
     """unsloth's UD-IQ4_XS layers first .. first + 4, fed llama.cpp's residual stream before them token by token (0 .. 4:
     gate / up in IQ2_XS + IQ2_S, IQ3_S + Q3_K, IQ3_S + IQ4_XS, IQ4_XS + IQ3_S (attention), IQ4_XS; 12 .. 16: IQ2_XS + IQ3_S,
-    Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (attention), IQ2_S + IQ3_XXS; the split blocks of ``decode.image``): the
-    residual after every layer within the 27B's bounds of ``test_overlay_slice``."""
+    Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (attention), IQ2_S + IQ3_XXS; the split blocks of ``decode.image``), on a design
+    of ``slots`` (the model's: 8; ``gusplit``'s 4-slot path: 4): the residual after every layer within the 27B's bounds of
+    ``test_overlay_slice``."""
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf("ud-iq4xs")
@@ -1058,8 +1059,8 @@ def test_split_slice(first: int) -> None:
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
                 names="l_out|model.input_embed", logits="none")
-    ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
-    assert ov.image.split
+    ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64, slots=slots)
+    assert ov.image.split and ov.op.slots == slots
     ov.load(release=False)
     errs = np.zeros((n, len(layers)))
     for t in range(n):

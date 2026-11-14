@@ -51,10 +51,11 @@ of ``obj_k`` 256 k ([k block][slot 8][8] bf16; a strip of the helper's is a supe
 them, a row tile's outputs [g][slot 8][r 8]. The residual goes out as the next input's x lies ([k block][slot SP][8]: a column's
 whole rows in DDR, where a slot's objects scattered 16-byte rows, ~22 us a phase at S 8). L1 (the main core's own regions are its 4-slot design's at twice the
 slots, but the residual): the main core's workspace holds the residual of slots 0 .. 3, the helper's memory that of 4
-.. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums)
-and the sum of squares lie in the core south of it (``HS8_ROW``: the model's core there leaves it room), the main core's SiLU
-table in the helper's memory (``SILU8_AT``): the main core holds a second X object, so that the next object comes in while
-the helper converts this one's strips (at 8 rows per k block the objects double). With gather tables (paged formats, tiles
+.. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums),
+the sum of squares and the B operands of the 16-k sums (``ONEHOT``) lie in the core south of it (``HS8_ROW``: the
+model's core there leaves it room), the main core's SiLU table in the helper's memory (``SILU8_AT``): the main core
+holds a second X object, so that the next object comes in while the helper converts this one's strips (at 8 rows per k
+block the objects double). With gather tables (paged formats, tiles
 of more than 16 rows, gate / up windows) every byte counts: the cores' buffers pinned (``l1_8``), one X object, one SiLU
 copy, smaller stacks (``STACK8``: the pages' frames counted, ``operators.checks``), the residual's pitch 16 past a row.
 Their memtiles' channels leave a side 14 BDs: each core half's pages have a channel of their own (``pg_split``). No moe,
@@ -177,6 +178,12 @@ SILU8_AT = (0x0800, 0xF9C0)
 # helper's in regions 0 and 3 (its scratch is in the core south of it)
 TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
 STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores' stacks (their deepest calls, pages included)
+# paged formats whose pages a memtile channel's free BDs hold: one channel for both core halves next to a dense design of 4
+# slots (BDs 4 .. 23, two per format), a channel per core half in a design of 8 (BDs 10 .. 23, 34 .. 47)
+PG_ONE_CHANNEL, PG_SPLIT = 10, 14
+# (8 slots) the helper's B operands of its 16-k sums ([j][64]: row j ones, ``_hstrip``), in the core south of it
+# (``HS8_ROW``): its own memory has no room left for them as static data
+ONEHOT = (np.arange(64)[None, :] // 8 == np.arange(8)[:, None]).astype(np.int8).reshape(-1)
 
 
 class DecodeOverlayOperator(ArtcOperator):
@@ -371,7 +378,8 @@ class DecodeOverlayOperator(ArtcOperator):
         """Byte offsets of the main core's workspace regions (and "size")."""
         S = self.slots
         sizes = [("st", 4 * S_WORDS), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
-                 ("yt", 4 * self.yt), ("stg", 2 * S * 2 * C_LEN), ("gs", 2 * 16 * S), ("scr", gemv.scr_bytes(S))]
+                 ("yt", 4 * self.yt), ("stg", 2 * S * 2 * C_LEN), ("gs", 2 * 16 * (max(S, 8) if self.split else S)),
+                 ("scr", gemv.scr_bytes(S))]  # (gs: a split design's gate tiles go through 64 floats of it, ``gusplit``)
         if self.post:
             sizes += [("pend", 4 * S * self.res_pitch), ("ivv", 4 * 32)]
         if self.pli:  # ([g 4][slot][r 8] bf16: p, then pli; e; [slot][8] fp32 sums, then the slots' 1 / rms(p) [slot][r 8]
@@ -471,6 +479,9 @@ class DecodeOverlayOperator(ArtcOperator):
         n = len(self.paged)
         if n <= 4 and not self.tables and not self.pg_split:
             return PG_BD, PG_STORE, PG_STORE_BYTES
+        if not self.pg_split and n > PG_ONE_CHANNEL:
+            raise ValueError(f"{n} paged formats: a design of 4 slots holds the pages of {PG_ONE_CHANNEL} (its memtile "
+                             f"channel's BDs; a design of 8 slots, a channel per core half: {PG_SPLIT})")
         size = max(0xC000, 0x2000 * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
         ch = self.pg_channels[0]
         return 24 * (ch % 2) + 24 - (1 if self.pg_split else 2) * n, 0x80000 - size, size
@@ -577,6 +588,7 @@ class DecodeOverlayOperator(ArtcOperator):
         hs_ty = np.ndarray[(self.hs_bytes,), u8]
         sq_ty = np.ndarray[(8 * self.slots,), f32]
         hres_ty = np.ndarray[(max(self.hres_bytes, 4) // 4,), f32]  # (8 slots: slots 4 .. 7's residual)
+        oh_ty = np.ndarray[(ONEHOT.size,), np.dtype[np.int8]]  # (8 slots: the B operands of the helper's 16-k sums)
         s8 = self.slots == 8
         i_st = W["st"] // 4
 
@@ -594,7 +606,7 @@ class DecodeOverlayOperator(ArtcOperator):
                    Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
         k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
         hst_ty = np.ndarray[(4,), i32]  # (help_flag: the helper's count of model work)
-        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty] * s8,
+        k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty, oh_ty] * s8,
                                                     *[hst_ty] * bool(self.help_flag)])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
         if self.moe:  # (acc: the experts' partials of the column, fp32 on the slots' grids, in ``_acc``'s buffer)
@@ -751,8 +763,9 @@ class DecodeOverlayOperator(ArtcOperator):
                         r_f.release(1)
 
         def helper_fn(cmd_f, res_f, htask, hs, sq, xp, *rest):
-            eh = rest[:1] if s8 else ()  # (8 slots: hres; else the pager's state words, the grid tables: placed)
-            hp = rest[1:4] if self.help_flag else ()  # (hst, the model's kernel, its buffer)
+            eh = rest[:2] if s8 else ()  # (8 slots: hres, the one-hot panels; else the pager's state words, the grid
+            # tables: placed)
+            hp = rest[len(eh):len(eh) + 3] if self.help_flag else ()  # (hst, the model's kernel, its buffer)
             for _ in forever_():
                 c = cmd_f.acquire(1)
                 r = res_f.acquire(1)
@@ -811,6 +824,7 @@ class DecodeOverlayOperator(ArtcOperator):
             m_ws.append(ws)
             moe_args = [k_sub, k_lstrip, self._acc(c)] if self.moe else []
             hres = [Buffer(hres_ty, name=f"{P}_hres{c}", tile=Tile(c, hr))] if s8 else []
+            oh = [Buffer(oh_ty, name=f"{P}_oh{c}", tile=Tile(c, self.HS8_ROW), initial_value=ONEHOT)] if s8 else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
             xps.append(xp)
             xs = Buffer(xs_ty, name=f"{P}_xs{c}", tile=Tile(c, mr))
@@ -834,7 +848,7 @@ class DecodeOverlayOperator(ArtcOperator):
                 hk, hb = self._help(c)
                 help_args = [Buffer(hst_ty, name=f"{P}_hst{c}", tile=Tile(c, hr), initial_value=np.zeros(4, np.int32)),
                              hk, hb]
-            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres, *help_args,
+            workers.append(Worker(helper_fn, [cmds[c].cons(), ress[c].prod(), k_htask, hs, sq, xp, *hres, *oh, *help_args,
                                               *pg_help.get(c, []), *grids.get((c, 1), [])],
                                   tile=Tile(c, hr),
                                   stack_size=self.stacks[1], dynamic_objfifo_lowering=True, while_true=False))

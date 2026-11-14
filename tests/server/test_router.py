@@ -66,7 +66,7 @@ def write_gguf(path: str, *, arch: str = "llama", n_embd: int = 64,
         w.add_bos_token_id(0)
         w.add_eos_token_id(1)
         w.add_file_type(2)
-        block, nbytes = {GGMLQuantizationType.Q4_0: (32, 18), GGMLQuantizationType.IQ2_XXS: (256, 66)}[qtype]
+        block, nbytes = {GGMLQuantizationType.Q4_0: (32, 18), GGMLQuantizationType.IQ1_S: (256, 50)}[qtype]
         w.add_tensor("token_embd.weight", np.zeros((n_embd, 256 // block * nbytes), np.uint8), raw_dtype=qtype)
         w.add_tensor("output_norm.weight", np.ones(n_embd, np.float32))
     w.write_header_to_file()
@@ -88,7 +88,7 @@ def models_dir(tmp_path: object) -> str:
     write_gguf(f"{d}/org/vl-GGUF/vl-1B-Q4_K_M.gguf", arch="qwen35", n_embd=96)
     write_gguf(f"{d}/org/vl-GGUF/mmproj-model-f16.gguf", arch="clip", n_embd=96)
     write_gguf(f"{d}/org/vl-GGUF/mmproj-model-f16-4x.gguf", arch="clip", n_embd=96)
-    write_gguf(f"{d}/org/bad-GGUF/bad-IQ2_XXS.gguf", qtype=GGMLQuantizationType.IQ2_XXS)
+    write_gguf(f"{d}/org/bad-GGUF/bad-IQ1_S.gguf", qtype=GGMLQuantizationType.IQ1_S)
     write_gguf(f"{d}/org/bad-GGUF/other-Q4_0.gguf", arch="phi3")
     write_gguf(f"{d}/top.gguf")
     write_gguf(f"{d}/org/split-GGUF/s-Q4_0-00001-of-00002.gguf")
@@ -160,7 +160,7 @@ def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPa
     vl = entries["org/vl-GGUF:Q4_K_M"]
     assert os.path.basename(vl.mmproj) == "mmproj-model-f16.gguf"  # (the shortest name)
     skipped = caplog.text
-    assert "bad-IQ2_XXS.gguf (type16 tensors: no tile format)" in skipped and "architecture 'phi3'" in skipped
+    assert "bad-IQ1_S.gguf (IQ1_S tensors: no tile format)" in skipped and "architecture 'phi3'" in skipped
     assert "s-Q4_0-00001-of-00002.gguf (a split file)" in skipped and "mtp-" not in skipped
     assert c.argv(vl)[:6] == ["-m", vl.path, "-a", vl.id, "--mmproj", vl.mmproj]
     # the header cache: a second catalog reads no header, a changed file again

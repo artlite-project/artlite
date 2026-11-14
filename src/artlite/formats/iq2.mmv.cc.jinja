@@ -2,10 +2,10 @@
 // [LO [p][r 8] index low bytes (panel order p = [i][l 4][g 3]) | SG [i][row 32][l 4] signs | SC [i][g 4][r 8] scales | HB
 // [q][bit][word 12] the indices' bits 8, 9 | D [row] bf16]. Core H: super-blocks 2 H, 2 H + 1; per super-block u the signs
 // as masks and the scales (_iq2_ss), then per half q (groups 4 q .. 4 q + 3, k blocks 16 q ..): the gather offsets
-// (_iq2_off), the weight panels (_iq2_w), the MMUL (_iq2_x: per 16-k half h of a group c), y += hilo(sum c S) D (_iq2_sc).
-// Scratch: w / c [i' 4][l 4][g 3][64 B] (0 .. 3072; c (i', h, g): {{ L }} bf16 at 384 i' + {{ L }} (3 h + g)) | mk [i][l 4][g 4][r 8]
-// (3072) | sct [i][h 2][g 4][r 8] bf16 (4096) | off [i' 4][h 2][64] u16 (5120 .. 7168) | dg [g 4][r 8] bf16 (7168) | the
-// tables' addresses (8000 .. 8008)
+// (_iq2_off), the weight panels (_iq2_w), the MMUL (_iq2_x: per 16-k half h of a group c), y += hilo(sum c S) D (_iq2_sc;
+// 8 slots: _k23sc8 per row group). Scratch: w / c [i' 4][l 4][g 3][64 B] (0 .. 3072; c (i', h, g): {{ L }} bf16 at 384 i' +
+// {{ L }} (3 h + g)) | mk [i][l 4][g 4][r 8] (3072) | sct [i][h 2][g 4][r 8] bf16 (4096) | off [i' 4][h 2][64] u16 (5120 ..
+// 7168) | dg [g 4][r 8] bf16 (7168) | (8 slots) 64 fp32 zeros (7424) | the tables' addresses (8000 .. 8008)
 
 // A super-block's signs as masks mk [i][l][g 4][r 8] (IQ2_XXS, IQ2_XS: c ^ (c << 1) of the sign words' prefix XORs:
 // _iq3_signs; IQ2_S: the bytes) and scales sct [i][h][g 4][r 8] (IQ2_XXS: (2 ls + 1) / 4 of the group, from the words'
@@ -190,6 +190,7 @@ __attribute__((noinline)) void {{ p }}_iq2_x(const uint8_t *__restrict xp, const
     }
 }
 
+{% if slots != 8 %}
 // y[g] += hilo(sum over the half's (i', h) of c (i', h, g) sct[i'][h][g][r]) dg[g] for the 3 row groups (y [g][slot][r])
 __attribute__((noinline)) void {{ p }}_iq2_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
                                               const bfloat16 *__restrict dg, float *__restrict y)
@@ -211,6 +212,7 @@ __attribute__((noinline)) void {{ p }}_iq2_sc(const bfloat16 *__restrict c, cons
     {{ p }}_k23d(y + {{ L }}, Y1, dg + 8);
     {{ p }}_k23d(y + {{ 2 * L }}, Y2, dg + 16);
 }
+{% endif %}
 
 // super-blocks 2 H, 2 H + 1 of an IQ2 tile of format F: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels)
 template <int F, int H>
@@ -226,6 +228,11 @@ __attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t 
     ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
     ta[1] = F == 2 ? (H ? {{ TAB[1][0] }} : {{ TAB[0][0] }}) : (H ? {{ TAB[1][1] }} : {{ TAB[0][1] }});
     const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+{% if slots == 8 %}
+    float *zy = (float *)(scr + 7424);
+    aie::store_v(zy, aie::zeros<float, 32>());
+    aie::store_v(zy + 32, aie::zeros<float, 32>());
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         uint8_t *un = a + {{ UNIT2 }} * (2 * H + u);
@@ -235,7 +242,13 @@ __attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t 
             {{ p }}_iq2_off<F, H>(un, q, off);
             {{ p }}_iq2_w(off, (const uint8_t *)mk + 512 * q, tab_ab, tab_cd, scr);
             {{ p }}_iq2_x(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
+{% if slots == 8 %}
+            AIE_LOOP_NO_UNROLL
+            for (int g = 0; g < 3; g++)  // (c (n = 2 i' + h, g) at 192 n + 64 g, its scales at 32 n + 8 g)
+                {{ p }}_k23sc8((const bfloat16 *)scr + 64 * g, 192, sct + 256 * q + 8 * g, 32, zy, dg + 8 * g, y + 64 * g, 8);
+{% else %}
             {{ p }}_iq2_sc((const bfloat16 *)scr, sct + 256 * q, dg, y);
+{% endif %}
         }
     }
 }

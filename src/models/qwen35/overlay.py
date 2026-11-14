@@ -51,6 +51,7 @@ from ml_dtypes import bfloat16
 from artlite import txn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
+from artlite.decode.design import PG_ONE_CHANNEL
 from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, host_bytes, paged_formats
 from artlite.decode.protocol import (
     B_F32,
@@ -105,12 +106,13 @@ KV_PAD = 4096 - 256  # positions past the caches (the last layer's): the prefill
 def slots_of(cfg: QwenConfig, fmts: set[str], drafts: bool) -> int:
     """A step's token slots at most: 8 for a dense model of a KV head per 2 columns whose formats the decode GEMV runs at
     8 slots (``decode.gemv``), either Q4_K and Q6_K only (no slower at S 1, S 4 3% faster) or with ``drafts`` (a drafter's
-    steps of several tokens): other formats' designs of 8 slots are slower at S 1 (the 9B's Q5_K +1.4%; Swift 1.5's IQ
+    steps of several tokens) or of more formats than a design of 4 slots pages (``decode.design.PG_ONE_CHANNEL``: unsloth's
+    dynamic quantizations, 12): other formats' designs of 8 slots are slower at S 1 (the 9B's Q5_K +1.4%; Swift 1.5's IQ
     formats, their tables' layout with one X object, +2%), which only the drafts pay for (Swift 1.5's MTP layer at 1K:
     +10% on prose). Else 4: an MoE design has no broadcast input, a KV head per 4 columns makes the one-pass attention
     slower at S 1."""
     return 8 if (not cfg.moe and COLS // cfg.num_key_value_heads == 2 and all(gemv.supported(f, 4, 8) for f in fmts)
-                 and (fmts <= {"Q4_K", "Q6_K"} or drafts)) else 4
+                 and (fmts <= {"Q4_K", "Q6_K"} or drafts or len(fmts) > PG_ONE_CHANNEL)) else 4
 
 
 def chunk_of(cfg: QwenConfig) -> bool:

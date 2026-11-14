@@ -154,7 +154,9 @@ _S = STATE.common
     "S_STG S_ESLOT S_EJ S_ESRC S_FMT S_TL", at=0)
 # (``packed`` designs) the slots of an input k block, the strips (helper input commands) of an input object, less one
 S_SP, S_NXS, S_NXS1 = _S.words("S_SP S_NXS S_NXS1")
-S_GN, S_GK = _S.words("S_GN S_GK")  # (``gu_win`` designs) the rows in the gate / up windows, the windows of 16 so far in a SiLU group
+# (``gu_win`` designs) the rows in the gate / up windows (a split block's: its next tile's place in its group, ``gusplit``),
+# the windows of 16 so far in a SiLU group
+S_GN, S_GK = _S.words("S_GN S_GK")
 S_B = _S.block("S_B", 3 * NBLK, at=32)  # the block table, 3 words per block
 S_TEND = _S.word("S_TEND", at=S_WORDS - 1)  # (tile) the window's end
 # (``post`` designs) the partial sums object (a trip count), the scale (bf16 bits), the column, the phase's residual

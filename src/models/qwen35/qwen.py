@@ -64,7 +64,7 @@ from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
 from .drafting import DFlashDrafting, MtpDrafting
 from .image import QwenImage
-from .overlay import QwenOverlay
+from .overlay import QwenOverlay, slots_of
 from .prefill import QwenPrefill
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
@@ -382,7 +382,8 @@ class Qwen(Model):
     ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default 8 .. 4096), MiniCPM-V's for its
     language model (``models.minicpmv.npu.NpuVision``; ``max_slices``: an image's slices at most, default the file's);
     ``spec_type``, ``draft_model``: the drafter (``spec_options.drafter_type``): auto, the model's DFlash2 drafter
-    (``model_config.qwen_dflash_of``; not with images) where its file exists, else its MTP block, else a qwen35moe model's
+    (``model_config.qwen_dflash_of``; not with images) where its file exists and the model's design runs steps of 8 tokens
+    (every tile format's GEMV at 8 slots: ``overlay.slots_of``), else its MTP block, else a qwen35moe model's
     MTP file (``model_config.qwen_mtp_of``); none (the image leaves the MTP block out); draft-mtp, draft-dflash: that
     one, which must exist; ``draft_model``: that file."""
 
@@ -393,6 +394,10 @@ class Qwen(Model):
     turn, user_turn = "<|im_start|>", "<|im_start|>user"
     projectors = minicpmv_npu.PROJECTORS + qwen3vl_npu.PROJECTORS
 
+    def _eight(self) -> bool:
+        """Whether the model's design runs steps of 8 tokens with a drafter (its image's tile formats: ``slots_of``)."""
+        return slots_of(self.cfg, QwenImage(self.gguf, self.cfg, mtp=False).formats(), True) == 8
+
     def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None,
                  image_min_tokens: int | None = None, image_max_tokens: int | None = None, spec_type: str = "auto",
                  draft_model: str | None = None):
@@ -402,7 +407,7 @@ class Qwen(Model):
         if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
         self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
-                       qwen_dflash_of(path) if kind == "auto" and mmproj is None else None)
+                       qwen_dflash_of(path) if kind == "auto" and mmproj is None and self._eight() else None)
         if kind == "draft-dflash" and self.dflash is None:
             raise ValueError(f"{path}: no DFlash2 drafter (a <repository>-DFlash2-GGUF of Q4_K_M) in the models directory")
         # (the MTP drafter, ``NpuQwen``'s: "" the file's own block, else a qwen35moe model's MTP file; a file; None)

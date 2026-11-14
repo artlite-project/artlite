@@ -336,6 +336,9 @@ _GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_
                20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136),
                30: ("BF16", 1, 2)}
 _BLOCKS = {name: (per, nb) for name, per, nb in _GGML_TYPES.values()}
+# the names of ggml's other tensor types (unsupported: their tensors raise, ``tensor``; their files' errors name them)
+_GGML_NAMES = {6: "Q5_0", 7: "Q5_1", 9: "Q8_1", 15: "Q8_K", 19: "IQ1_S", 24: "I8", 25: "I16", 26: "I32", 27: "I64",
+               28: "F64", 29: "IQ1_M", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0"}
 
 
 class GGUFFile:
@@ -396,7 +399,7 @@ class GGUFFile:
         # name -> (dims, type, offset, bytes; None: a type gguf_model does not read, "type<N>")
         self.tensor_info: dict[str, tuple[tuple[int, ...], str, int, int | None]] = {}
         for name, dims, ttype, off in infos:
-            tname, per, nb = _GGML_TYPES.get(ttype, (f"type{ttype}", 1, None))
+            tname, per, nb = _GGML_TYPES.get(ttype, (_GGML_NAMES.get(ttype, f"type{ttype}"), 1, None))
             n = math.prod(dims)
             self.tensor_info[name] = (dims, tname, base + off, None if nb is None else n // per * nb)
 

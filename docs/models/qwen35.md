@@ -42,12 +42,13 @@ the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "
 The NPU path reads Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL tensors,
 Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), in any role, and a dense layer's FFN gate and up in two
 of them (unsloth's dynamic quantizations: below); not yet IQ1_S and IQ1_M (unsloth's UD-IQ3_XXS and smaller files,
-UD-Q2_K_XL). A file whose FFN gate / up is in another
-format than Q4_K (the Q5_K_M, Q6_K and Q8_0 files) decodes up to 4 tokens per dispatch. Qwen3.8's drafter is its
-DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account), else its
-file's own MTP layer; a qwen35moe model's (`model_config.qwen_mtp_of`):
-an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in another account's repository of the
-same name (ggml-org publishes its drafters apart from the models); of several, Q4_0, then Q4_K_M, then Q8_0.
+UD-Q2_K_XL). A dense model with a KV head per 2 columns decodes up to 8 tokens per dispatch where its file
+holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than ten formats; else up to 4
+(`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a
+`<repository>-DFlash2-GGUF` of any account) where the design runs 8 tokens, else its file's own MTP layer; a qwen35moe
+model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else
+in another account's repository of the same name (ggml-org publishes its drafters apart from the models); of several,
+Q4_0, then Q4_K_M, then Q8_0.
 `--spec-draft-model FILE` takes another file, `--spec-type none` none ([artlite-cli](../cli.md)).
 
 ## How the NPU path works
@@ -140,13 +141,15 @@ values each (`formats/iq4.py`, `formats/iq3s.py`). With ten tile formats its dec
 as a code page, each IQ format's page bringing its lookup table. With its MTP drafter a step decodes up to 8 tokens
 (`--spec-type none`: up to 4, a design 2% faster per step).
 
-unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, UD-Q4_K_S, UD-Q3_K_XL) choose a format per tensor: most of a
-layer in IQ4_XS, Q4_K, Q5_K or Q6_K, some FFN tensors in IQ3_S, IQ3_XXS, Q3_K, IQ2_S, IQ2_XS or IQ2_XXS, and in a third
-of the layers the FFN gate and up in two different formats. Such a layer's gate / up tiles hold, per group of 64 outputs,
-its gate rows in tiles of one format, then its up rows in tiles of the other (`decode.image.split_rows`): a decode step
-keeps the gate rows' outputs until the up rows' come (`decode.design`'s `gusplit`), a prompt runs a GEMM per format and
-then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats index grids of 8 values each, from {8, 25, 43}
-(256, 512 and 1024 entries): the cores look an entry up as two 8-bit masks (`formats/iq2.py`), 24 rows per tile.
+unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, tested; UD-Q4_K_S and UD-Q3_K_XL hold the same formats)
+choose a format per tensor: most of a layer in IQ4_XS, Q4_K, Q5_K or Q6_K, some FFN tensors in IQ3_S, IQ3_XXS, Q3_K,
+IQ2_S, IQ2_XS or IQ2_XXS, and in a third of the layers the FFN gate and up in two different formats. Such a layer's
+gate / up tiles hold, per group of 64 outputs, its gate rows in tiles of one format, then its up rows in tiles of the
+other (`decode.image.split_rows`): a decode step keeps the gate rows' outputs until the up rows' come (`decode.design`'s
+`gusplit`), a prompt runs a GEMM per format and then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats
+index grids of 8 values each, from {8, 25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit
+masks (`formats/iq2.py`), 24 rows per tile. Twelve formats are more code pages than a design of 4 slots holds: these
+files decode up to 8 tokens per dispatch.
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
