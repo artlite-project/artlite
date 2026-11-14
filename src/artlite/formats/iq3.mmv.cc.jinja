@@ -9,7 +9,6 @@
 // Scratch: w / c [i 8][l 4][g 3][64 B] (0 .. 6144) | mk [i][l 4][g 4][r 8] (6144) | sct [i][g 4][r 8] bf16 (7168) |
 // dg [g 4][r 8] bf16 (7936) | the tables' addresses (8000 .. 8008)
 
-{% include "artlite/formats/iq3.signs.cc.jinja" %}
 // A super-block's signs and scales (w: its sign / scale words, [i][row] 4 R B per group): per group i rows 0 .. 15 (A)
 // and 16 .. 31 (B; 16 .. R - 1: row group 2, the rest junk) of its words (_k23w2); mk [i][l 4][g 4][r 8] (the 16-byte
 // rows of A's and B's signs interleaved), sct [i][g 4][r 8]

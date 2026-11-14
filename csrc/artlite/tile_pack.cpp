@@ -459,11 +459,11 @@ void tile_iq3s(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// IQ2_XXS / IQ2_XS / IQ2_S (iq2.py): per super-block a unit of 2304 bytes (R <= 24 rows; rows past R zero), in panel
-/// order p = (4 i + l) 3 + g (row 8 g + r's 8-k block 4 i + l): LO [p][r] the grid indices' low bytes, SG [p][r] the
-/// signs (XXS, XS: the prefix XOR of the 7-bit field, XXS with bit l of ls at bit 7; S: the 8 signs), SC [i][g][r] the
-/// scales byte and HB [half 2][bit 2][word 12] the indices' bits 8 and 9 (XS, S: bit n of word m = entry 32 m + n of the
-/// half's panels), D [row] bf16.
+/// IQ2_XXS / IQ2_XS / IQ2_S (iq2.py): per super-block a unit of 2304 bytes (R <= 24 rows; rows past R zero): LO [p][r]
+/// the grid indices' low bytes in panel order p = (4 i + l) 3 + g (row 8 g + r's 8-k block 4 i + l), SG [i][row 32][l]
+/// the signs (XXS, XS: the prefix XOR of the 7-bit field, XXS with bit l of ls at bit 7; S: the 8 signs), SC [i][g 4][r]
+/// the scales byte and HB [half 2][bit 2][word 12] the indices' bits 8 and 9 (XS, S: bit n of word m = entry 32 m + n
+/// of the half's panels), D [row] bf16(d) / 2 (XXS) or / 8.
 constexpr size_t kIq2Unit = 2304;
 enum class Iq2 { XXS, XS, S };
 
@@ -484,14 +484,16 @@ void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
     for (int r = 0; r < R; r++) {
       const uint8_t* b = src[r] + bb * sb;
       const int g = r / 8, rr = r % 8;
-      put16(u + 1920 + 2 * r, bf16_of(b));
+      uint16_t d = bf16_of(b);  // (/ 2 or / 8: the exponent less 1 or 3; d a normal fp16 or zero)
+      if (d & 0x7FFF) d = static_cast<uint16_t>(d - ((F == Iq2::XXS ? 1 : 3) << 7));
+      put16(u + 2240 + 2 * r, d);
       for (int i = 0; i < 8; i++) {
         uint32_t w0 = 0, w1 = 0;  // (IQ2_XXS: the 32-group's index and sign / scale words)
         if constexpr (F == Iq2::XXS) {
           std::memcpy(&w0, b + 2 + 8 * i, 4);
           std::memcpy(&w1, b + 6 + 8 * i, 4);
         } else {
-          u[1536 + (3 * i + g) * 8 + rr] = b[bb - 8 + i];
+          u[1792 + 32 * i + r] = b[bb - 8 + i];
         }
         for (int l = 0; l < 4; l++) {
           const int e = 8 * ((4 * i + l) * 3 + g) + rr;  // (the entry in panel order)
@@ -510,7 +512,7 @@ void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
             s = b[34 + 4 * i + l];
           }
           u[e] = static_cast<uint8_t>(idx);
-          u[768 + e] = s;
+          u[768 + 128 * i + 4 * r + l] = s;
           if constexpr (F != Iq2::XXS) {
             const int q = e / 384, m = e % 384 / 32, n = e % 32;
             hb[q][0][m] |= ((idx >> 8) & 1) << n;
@@ -519,7 +521,7 @@ void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
         }
       }
     }
-    if constexpr (F != Iq2::XXS) std::memcpy(u + 1728, hb, sizeof hb);
+    if constexpr (F != Iq2::XXS) std::memcpy(u + 2048, hb, sizeof hb);
   }
 }
 

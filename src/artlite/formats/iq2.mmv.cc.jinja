@@ -1,0 +1,251 @@
+// ---- IQ2_XXS / IQ2_XS / IQ2_S (formats/iq2.py: 24 rows, 3 row groups; F 0 / 1 / 2): per super-block a unit of {{ UNIT2 }} B,
+// [LO [p][r 8] index low bytes (panel order p = [i][l 4][g 3]) | SG [i][row 32][l 4] signs | SC [i][g 4][r 8] scales | HB
+// [q][bit][word 12] the indices' bits 8, 9 | D [row] bf16]. Core H: super-blocks 2 H, 2 H + 1; per super-block u the signs
+// as masks and the scales (_iq2_ss), then per half q (groups 4 q .. 4 q + 3, k blocks 16 q ..): the gather offsets
+// (_iq2_off), the weight panels (_iq2_w), the MMUL (_iq2_x: per 16-k half h of a group c), y += hilo(sum c S) D (_iq2_sc).
+// Scratch: w / c [i' 4][l 4][g 3][64 B] (0 .. 3072; c (i', h, g): {{ L }} bf16 at 384 i' + {{ L }} (3 h + g)) | mk [i][l 4][g 4][r 8]
+// (3072) | sct [i][h 2][g 4][r 8] bf16 (4096) | off [i' 4][h 2][64] u16 (5120 .. 7168) | dg [g 4][r 8] bf16 (7168) | the
+// tables' addresses (8000 .. 8008)
+
+// A super-block's signs as masks mk [i][l][g 4][r 8] (IQ2_XXS, IQ2_XS: c ^ (c << 1) of the sign words' prefix XORs:
+// _iq3_signs; IQ2_S: the bytes) and scales sct [i][h][g 4][r 8] (IQ2_XXS: (2 ls + 1) / 4 of the group, from the words'
+// bit 7, for both halves; IQ2_XS, IQ2_S: 2 sc + 1 of SC's nibble h, exact as bf16(128 + 2 sc + 1) - 128); d -> dg
+template <int F>
+__attribute__((noinline)) void {{ p }}_iq2_ss(const uint8_t *__restrict u, v16int32 *__restrict mk,
+                                              bfloat16 *__restrict sct, bfloat16 *__restrict dg)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const v16int32 *__restrict pv = (const v16int32 *)(u + 768);
+    if constexpr (F < 2) {
+        v16int32 lw = broadcast_zero_to_v16int32();  // (_iq3_signs' scale panel: rows 0, 1: -1, -2, -4, -8 in k 0 .. 3 / 4 .. 7)
+        lw = upd_elem(lw, 0, (int)0xF8FCFEFF);
+        lw = upd_elem(lw, 3, (int)0xF8FCFEFF);
+        v64bfp16ebs8 LW, LX;
+        LW.mantissa = (v64int8)lw;
+        LW.exponent = al::e8(125);
+        LX.exponent = al::e8(0x85);
+        const v2int32 all = (v2int32)~0ULL;
+        bfloat16 *__restrict ps = sct;
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < 8; i++) {
+            v64int8 ma, mb;
+            v8int32 sa, sb;
+            {{ p }}_iq3_signs((v64int8)pv[0], LX, LW, all, ma, sa);
+            {{ p }}_iq3_signs((v64int8)pv[1], LX, LW, all, mb, sb);
+            pv += 2;
+            mk[0] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_lo);
+            mk[1] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_hi);
+            mk += 2;
+            if constexpr (F == 0) {
+                *(v8int32 *)ps = sa;
+                *(v8int32 *)(ps + 16) = sb;
+                *(v8int32 *)(ps + 32) = sa;
+                *(v8int32 *)(ps + 48) = sb;
+            }
+            ps += 64;
+        }
+    } else {
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < 8; i++) {
+            const v64int8 ma = ::shuffle((v64int8)pv[0], (v64int8)pv[0], T8_16x4);  // ([l 4][r 16])
+            const v64int8 mb = ::shuffle((v64int8)pv[1], (v64int8)pv[1], T8_16x4);
+            pv += 2;
+            mk[0] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_lo);
+            mk[1] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_hi);
+            mk += 2;
+        }
+    }
+    if constexpr (F > 0) {
+        const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4301);
+        const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+        const aie::accum<accfloat, 32> k128(aie::broadcast<float, 32>(-128.0f));
+        AIE_LOOP_UNROLL_FULL
+        for (int v = 0; v < 4; v++) {  // (groups 2 v, 2 v + 1: [i 2][g 4][r 8] bytes)
+            const aie::vector<uint8, 64> b = aie::load_v<64>(u + {{ 1792 }} + 64 * v);
+            const aie::vector<uint8, 64> lo = aie::bit_and(b, aie::broadcast<uint8, 64>(15));
+            const aie::vector<uint8, 64> hi = aie::sub(b, lo);  // (16 x the high nibble)
+            AIE_LOOP_UNROLL_FULL
+            for (int h = 0; h < 2; h++) {
+                const aie::vector<uint8, 64> s = h ? aie::downshift(hi, 3) : aie::add(lo, lo);  // (2 sc)
+                AIE_LOOP_UNROLL_FULL
+                for (int j = 0; j < 2; j++) {
+                    const aie::vector<bfloat16, 32> e = aie::add(aie::unpack(s.template extract<32>(j)), k43).template cast_to<bfloat16>();
+                    aie::store_v(sct + 64 * (2 * v + j) + 32 * h, aie::mac(k128, e, one).template to_vector<bfloat16>());
+                }
+            }
+        }
+    }
+    aie::store_v(dg, aie::load_v<32>((const bfloat16 *)(u + {{ 2240 }})));  // (rows 24 .. 31: the unit's zero padding)
+}
+
+// The gather offsets of half q's 384 entries (u16, [i' 4][h 2][64]: (i', h)'s 48 entries [l' 2][g 3][r 8], 16 unused): 4 lo
+// (IQ2_XS, IQ2_S: + 1024 b8; IQ2_S: + D b9, D the distance of the core half's second table copy from its first: the
+// index's half of the table there)
+template <int F, int H>
+__attribute__((noinline)) void {{ p }}_iq2_off(const uint8_t *__restrict u, int q, uint16_t *__restrict off)
+{
+    const uint8_t *__restrict pl = u + 384 * q;
+    const uint32_t *__restrict pm = (const uint32_t *)(u + {{ 2048 }} + 96 * q);  // ([bit 2][word 12])
+    uint16_t *__restrict po = off;
+    const uint16_t D = H ? {{ TAB[1][1] - TAB[1][0] }} : {{ TAB[0][1] - TAB[0][0] }};
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < 4; j++) {  // (96 entries: two (i', h) records)
+        AIE_LOOP_UNROLL_FULL
+        for (int k = 0; k < 3; k++) {
+            aie::vector<uint16, 32> v = aie::unpack(aie::load_v<32>(pl));
+            pl += 32;
+            v = aie::add(v, v);
+            v = aie::add(v, v);
+            if constexpr (F > 0)
+                v = aie::select(v, aie::add(v, (uint16)1024), aie::mask<32>::from_uint32(pm[3 * j + k]));
+            if constexpr (F == 2)
+                v = aie::select(v, aie::add(v, D), aie::mask<32>::from_uint32(pm[12 + 3 * j + k]));
+            // (entries 32 k .. of the two records' 96: entry e at record e / 48, slot e % 48)
+            aie::store_v(po + (k == 0 ? 0 : k == 1 ? 32 : 80), v.template extract<16>(0));
+            aie::store_v(po + (k == 0 ? 16 : k == 1 ? 64 : 96), v.template extract<16>(1));
+        }
+        po += 128;
+    }
+}
+
+// a weight panel from its 8 entries' addresses a (lane r: row r's) and its signs s (bit 8 r + j: value j of row r negative):
+// two 4x16 gathers (entry r in halfword 0 of 64-bit lane r), the bytes transposed (bytes 0 .. 7: the rows' A, 8 .. 15:
+// their B), g = sel(sel(8, 25, A), 43, B), zero - g where a sign is set
+[[clang::always_inline]] inline v64int8 {{ p }}_iq2_panel(v8int32 a, v2int32 s, v64int8 k8, v64int8 k25, v64int8 k43)
+{
+    const v16int32 c = concat(load_4x16_lo(a), load_4x16_hi(a));
+    const v16int32 t = (v16int32)::shuffle((v64int8)c, T8_8x8);
+    const v64int8 g = __builtin_aie2p_vsel8(__builtin_aie2p_vsel8(k8, k25, ext_v2int32(t, 0)), k43, ext_v2int32(t, 1));
+    return __builtin_aie2p_vaddsub8(broadcast_zero_to_v64int8(), g, s);
+}
+
+// The 48 weight panels of a half (off: their offsets [i' 4][h 2][64]; mk: their masks [i' 4][l 4][g 4][r 8]) -> wp [i'][l][g 3]
+// [64 B]: per (group i', half h) 6 panels (l = 2 h, 2 h + 1; g 0 .. 2), the copies' bases (lanes 0, 1 of a gather from
+// tab_ab, 2, 3 from tab_cd) added to the offsets
+__attribute__((noinline)) void {{ p }}_iq2_w(const uint16_t *__restrict off, const uint8_t *__restrict mk,
+                                             const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
+                                             uint8_t *__restrict wp)
+{
+    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v64int8 k8 = broadcast_to_v64int8(8), k25 = broadcast_to_v64int8(25), k43 = broadcast_to_v64int8(43);
+    const v16uint16 __aie_dm_resource_a *__restrict po = (const v16uint16 __aie_dm_resource_a *)off;
+    const v16int32 __aie_dm_resource_b *__restrict pm = (const v16int32 __aie_dm_resource_b *)mk;
+    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 8; t++) {
+        const v16int32 m = *pm++;  // ([l' 2][g 4][r 8])
+        const v16int32 a0 = add((v16int32)ups_to_v16acc32(po[0], 0, 0), b16);
+        const v16int32 a1 = add((v16int32)ups_to_v16acc32(po[1], 0, 0), b16);
+        const v16int32 a2 = add((v16int32)ups_to_v16acc32(po[2], 0, 0), b16);
+        po += 4;
+        pw[0] = {{ p }}_iq2_panel(extract_v8int32(a0, 0), ext_v2int32(m, 0), k8, k25, k43);  // (l' 0: g 0, 1, 2)
+        pw[1] = {{ p }}_iq2_panel(extract_v8int32(a0, 1), ext_v2int32(m, 1), k8, k25, k43);
+        pw[2] = {{ p }}_iq2_panel(extract_v8int32(a1, 0), ext_v2int32(m, 2), k8, k25, k43);
+        pw[3] = {{ p }}_iq2_panel(extract_v8int32(a1, 1), ext_v2int32(m, 4), k8, k25, k43);  // (l' 1)
+        pw[4] = {{ p }}_iq2_panel(extract_v8int32(a2, 0), ext_v2int32(m, 5), k8, k25, k43);
+        pw[5] = {{ p }}_iq2_panel(extract_v8int32(a2, 1), ext_v2int32(m, 6), k8, k25, k43);
+        pw += 6;
+    }
+}
+
+// Half q's 4 groups against their 16 x panels (each popped once): per 16-k half h and row group g, c = bf16(C[hi rows] +
+// C[lo rows]) of its two panels (8 slots: bf16(C)), in place of the group's panels: c (i', h, g) at 384 i' + {{ L }} (3 h + g)
+__attribute__((noinline)) void {{ p }}_iq2_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
+                                             bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    v64bfp16ebs8 W;
+    W.exponent = al::e8(0x85);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 4; i++) {
+        AIE_LOOP_UNROLL_FULL
+        for (int h = 0; h < 2; h++) {
+            v64accfloat C0, C1, C2;
+            AIE_LOOP_UNROLL_FULL
+            for (int l = 0; l < 2; l++) {
+                const v64bfp16ebs8 X = xs.pop();
+                const int o = 192 * (2 * h + l);
+                W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + o);
+                C0 = l ? mac_8x8_8x8T(X, 1, W, 1, C0) : mul_8x8_8x8T(X, 1, W, 1);
+                W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + o + 64);
+                C1 = l ? mac_8x8_8x8T(X, 1, W, 1, C1) : mul_8x8_8x8T(X, 1, W, 1);
+                W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + o + 128);
+                C2 = l ? mac_8x8_8x8T(X, 1, W, 1, C2) : mul_8x8_8x8T(X, 1, W, 1);
+            }
+{% if slots == 8 %}
+            aie::store_v(pc + {{ 3 * L }} * h, {{ p }}_c8(C0));
+            aie::store_v(pc + {{ 3 * L }} * h + {{ L }}, {{ p }}_c8(C1));
+            aie::store_v(pc + {{ 3 * L }} * h + {{ 2 * L }}, {{ p }}_c8(C2));
+{% else %}
+            aie::store_v(pc + {{ 3 * L }} * h, {{ p }}_sum2(C0));
+            aie::store_v(pc + {{ 3 * L }} * h + {{ L }}, {{ p }}_sum2(C1));
+            aie::store_v(pc + {{ 3 * L }} * h + {{ 2 * L }}, {{ p }}_sum2(C2));
+{% endif %}
+        }
+        pw += 768;
+        pc += 384;
+    }
+}
+
+// y[g] += hilo(sum over the half's (i', h) of c (i', h, g) sct[i'][h][g][r]) dg[g] for the 3 row groups (y [g][slot][r])
+__attribute__((noinline)) void {{ p }}_iq2_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
+                                              const bfloat16 *__restrict dg, float *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, {{ L }}> Y0 = aie::zeros<accfloat, {{ L }}>(), Y1 = aie::zeros<accfloat, {{ L }}>(),
+        Y2 = aie::zeros<accfloat, {{ L }}>();
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
+    AIE_LOOP_UNROLL_FULL
+    for (int n = 0; n < 8; n++) {  // (n = 2 i' + h)
+        const bfloat16 __aie_dm_resource_a *cc = pc + 384 * (n / 2) + {{ 3 * L }} * (n % 2);
+        const bfloat16 __aie_dm_resource_b *ss = ps + 32 * n;
+        Y0 = aie::mac(Y0, aie::load_v<{{ L }}>(cc), aie::load_v<8>(ss).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(Y1, aie::load_v<{{ L }}>(cc + {{ L }}), aie::load_v<8>(ss + 8).template grow_replicate<{{ L }}>());
+        Y2 = aie::mac(Y2, aie::load_v<{{ L }}>(cc + {{ 2 * L }}), aie::load_v<8>(ss + 16).template grow_replicate<{{ L }}>());
+    }
+    {{ p }}_k23d(y, Y0, dg);
+    {{ p }}_k23d(y + {{ L }}, Y1, dg + 8);
+    {{ p }}_k23d(y + {{ 2 * L }}, Y2, dg + 16);
+}
+
+// super-blocks 2 H, 2 H + 1 of an IQ2 tile of format F: y[g][32] (rows 8 g ..) += their rows against xp (their 64 panels)
+template <int F, int H>
+__attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t *__restrict xp, float *__restrict y,
+                                           uint8_t *__restrict scr)
+{
+    v16int32 *mk = (v16int32 *)(scr + 3072);
+    bfloat16 *sct = (bfloat16 *)(scr + 4096), *dg = (bfloat16 *)(scr + 7168);
+    uint16_t *off = (uint16_t *)(scr + 5120);
+    // (the table copies' addresses through a volatile word: constants at the call would specialize _iq2_w, and the
+    // gathers' memory operands need pointers; IQ2_S: every lane at the first copy)
+    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
+    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
+    ta[1] = F == 2 ? (H ? {{ TAB[1][0] }} : {{ TAB[0][0] }}) : (H ? {{ TAB[1][1] }} : {{ TAB[0][1] }});
+    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        uint8_t *un = a + {{ UNIT2 }} * (2 * H + u);
+        {{ p }}_iq2_ss<F>(un, mk, sct, dg);
+        AIE_LOOP_NO_UNROLL
+        for (int q = 0; q < 2; q++) {
+            {{ p }}_iq2_off<F, H>(un, q, off);
+            {{ p }}_iq2_w(off, (const uint8_t *)mk + 512 * q, tab_ab, tab_cd, scr);
+            {{ p }}_iq2_x(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
+            {{ p }}_iq2_sc((const bfloat16 *)scr, sct + 256 * q, dg, y);
+        }
+    }
+}
+{% for f in ("IQ2_XXS", "IQ2_XS", "IQ2_S") %}
+
+// ({{ f }}) the dispatcher's entry
+template <int H>
+__attribute__((noinline)) void {{ p }}_{{ f | lower | replace("_", "") }}(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+{
+    {{ p }}_iq2<{{ loop.index0 }}, H>(a, xp, y, scr);
+}
+{% endfor %}

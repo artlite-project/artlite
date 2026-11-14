@@ -1,0 +1,217 @@
+// IQ2_XXS / IQ2_XS / IQ2_S (GemmQd, super-block units: formats/iq2.py; F {{ F2 }}): the weight object is a unit of the
+// pass's {{ tiles }} tiles (2304 B each, at a pitch of {{ UP }} B: [LO | SG | SC | HB | D]). MMUL row q is tile q / 24's row
+// q % 24: each 8-row half (h8 = q / 8) lies in one tile (h8 / 3, row group h8 % 3), no compaction; rows past the tiles
+// ({{ n }} rows: {{ [n - 24 * tiles, 0] | max }} of them) are junk whose outputs the pass drops (their offsets zero). Per
+// k-tile, on its first call (_prep): the 8 index lists as gather offsets [ks 8][{{ LP }}] (u16: 4 lo + 1024 b8, IQ2_S + D b9
+// of the lower table copy), the signs as masks [16-row block][i'' 2][l 4][r 16], the scales S = bf16(D s) [i'' 2][h 2]
+// [{{ NS }}] (s = (2 ls + 1) / 4 or 2 sc + 1); per call the panels' codes 64 +- g (_iq2g: per panel two 4x16 gathers of
+// [A | B] entries, the masks by a byte transpose, g = sel(sel(8, 25, A), 43, B), 64 - g where a sign is set), then the
+// panels (_iq2s: w = S (128 + u) - 192 S = S (+- g), exact in fp32, rounded once into bfp16).
+// Scratch (ws, bytes): lists at {{ WL }} | masks at {{ WM }} | S at {{ WS }} | codes at {{ WU }} [{{ n_mac // 16 }} blocks][i'' 2]
+// [l 4][rh 2][64]
+{% include "artlite/formats/iq3.signs.cc.jinja" %}
+
+
+// The prep of k-tile kt: the index lists, the masks and the scales (module comment)
+__attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t *__restrict ws, int kt,
+                                            const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    uint16_t *__restrict pl = (uint16_t *)(ws + {{ WL }});
+{% if F2 == 2 %}
+    // (the table's halves in the two copies: the offsets from the lower one)
+    const uintptr_t ta = (uintptr_t)tab_ab, tb = (uintptr_t)tab_cd, base = ta < tb ? ta : tb;
+    const uint16_t D0 = (uint16_t)(ta - base), D1 = (uint16_t)(tb - base);
+{% endif %}
+{% for t in range(tiles) %}
+    {   // (tile {{ t }}: its entries of the k-tile, [ks 8][r 24], as 6 x 32)
+        const uint8_t *lo = b + {{ t * UP }} + 192 * kt;
+{% if F2 > 0 %}
+        const uint32_t *hw = (const uint32_t *)(b + {{ t * UP + 2048 }} + 96 * (kt >> 1)) + 6 * (kt & 1);
+{% endif %}
+        AIE_LOOP_UNROLL_FULL
+        for (int v = 0; v < 6; v++) {
+            aie::vector<uint16, 32> o = aie::unpack(aie::load_v<32>(lo + 32 * v));
+            o = aie::add(o, o);
+            o = aie::add(o, o);
+{% if F2 > 0 %}
+            o = aie::select(o, aie::add(o, (uint16)1024), aie::mask<32>::from_uint32(hw[v]));
+{% endif %}
+{% if F2 == 2 %}
+            o = aie::add(o, aie::select(aie::broadcast<uint16, 32>(D0), aie::broadcast<uint16, 32>(D1),
+                                        aie::mask<32>::from_uint32(hw[12 + v])));
+{% endif %}
+            AIE_LOOP_UNROLL_FULL
+            for (int k = 0; k < 4; k++) {  // (entries 8 c .., c = 4 v + k: list c / 3, rows {{ 24 * t }} + 8 (c % 3) ..)
+                const int c = 4 * v + k;
+                aie::store_v(pl + {{ LP }} * (c / 3) + {{ 24 * t }} + 8 * (c % 3), o.template extract<8>(k));
+            }
+        }
+    }
+{% endfor %}
+{% if n > 24 * tiles %}
+    AIE_LOOP_UNROLL_FULL
+    for (int ks = 0; ks < 8; ks++)  // (the junk rows' offsets: zero)
+        aie::store_v(pl + {{ LP }} * ks + {{ 24 * tiles }}, aie::zeros<uint16, 8>());
+{% endif %}
+    // masks and scales per 16-row block
+    bfloat16 *__restrict ps = (bfloat16 *)(ws + {{ WS }});
+    uint8_t *__restrict pm = ws + {{ WM }};
+{% if F2 < 2 %}
+    v16int32 lw = broadcast_zero_to_v16int32();  // (_iq3_signs' scale panel)
+    lw = upd_elem(lw, 0, (int)0xF8FCFEFF);
+    lw = upd_elem(lw, 3, (int)0xF8FCFEFF);
+    v64bfp16ebs8 LW, LX;
+    LW.mantissa = (v64int8)lw;
+    LW.exponent = al::e8(125);
+    LX.exponent = al::e8(0x85);
+    const v2int32 all = (v2int32)~0ULL;
+{% endif %}
+    AIE_LOOP_UNROLL_FULL
+    for (int i2 = 0; i2 < 2; i2++) {
+        const int i = 2 * kt + i2;
+{% for blk in range(n // 16) %}
+{% set s0, s1 = hsrc[2 * blk], hsrc[2 * blk + 1] %}
+        {   // (rows {{ 16 * blk }} .. {{ 16 * blk + 15 }})
+            const v8int32 w0 = {{ "*(const v8int32 *)(b + %d + 128 * i)" % (s0[0] * UP + 768 + 32 * s0[1]) if s0 else "extract_v8int32(broadcast_zero_to_v16int32(), 0)" }};
+            const v8int32 w1 = {{ "*(const v8int32 *)(b + %d + 128 * i)" % (s1[0] * UP + 768 + 32 * s1[1]) if s1 else "extract_v8int32(broadcast_zero_to_v16int32(), 0)" }};
+{% if F2 < 2 %}
+            v64int8 m;
+            v8int32 sv;
+            {{ p }}_iq3_signs((v64int8)concat(w0, w1), LX, LW, all, m, sv);
+{% else %}
+            const v64int8 m = ::shuffle((v64int8)concat(w0, w1), (v64int8)concat(w0, w1), T8_16x4);
+{% endif %}
+            *(v64int8 *)(pm + {{ 128 * blk }} + 64 * i2) = m;
+{% if F2 == 0 %}
+            const aie::vector<bfloat16, 16> d16 = aie::concat({{ "aie::load_v<8>((const bfloat16 *)(b + %d))" % (s0[0] * UP + 2240 + 16 * s0[1]) if s0 else "aie::zeros<bfloat16, 8>()" }},
+                                                             {{ "aie::load_v<8>((const bfloat16 *)(b + %d))" % (s1[0] * UP + 2240 + 16 * s1[1]) if s1 else "aie::zeros<bfloat16, 8>()" }});
+            const aie::vector<bfloat16, 16> S = aie::mul(aie::vector<bfloat16, 16>((v16bfloat16)sv), d16).template to_vector<bfloat16>();
+            aie::store_v(ps + {{ 2 * NS }} * i2 + {{ 16 * blk }}, S);
+            aie::store_v(ps + {{ 2 * NS }} * i2 + {{ NS + 16 * blk }}, S);
+{% endif %}
+        }
+{% endfor %}
+{% if F2 > 0 %}
+{% for t in range(tiles) %}
+        {   // (tile {{ t }}'s scales: [g 4][r 8] bytes, both nibbles, times D)
+            const aie::vector<uint8, 32> sc = aie::load_v<32>(b + {{ t * UP + 1792 }} + 32 * i);
+            const aie::vector<bfloat16, 32> D = aie::load_v<32>((const bfloat16 *)(b + {{ t * UP + 2240 }}));
+            const aie::vector<uint8, 32> lo = aie::bit_and(sc, aie::broadcast<uint8, 32>(15));
+            AIE_LOOP_UNROLL_FULL
+            for (int h = 0; h < 2; h++) {
+                const aie::vector<uint8, 32> s2 = h ? aie::downshift(aie::sub(sc, lo), 3) : aie::add(lo, lo);  // (2 sc)
+                const aie::vector<bfloat16, 32> e = aie::add(aie::unpack(s2), aie::broadcast<uint16, 32>(0x4301)).template cast_to<bfloat16>();
+                const aie::vector<bfloat16, 32> s = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-128.0f)), e,
+                                                             aie::broadcast<bfloat16, 32>(1.0f)).template to_vector<bfloat16>();
+                const aie::vector<bfloat16, 32> S = aie::mul(s, D).template to_vector<bfloat16>();
+                AIE_LOOP_UNROLL_FULL
+                for (int g = 0; g < 3; g++)
+                    aie::store_v(ps + {{ 2 * NS }} * i2 + {{ NS }} * h + {{ 24 * t }} + 8 * g, S.template extract<8>(g));
+            }
+        }
+{% endfor %}
+{% endif %}
+    }
+}
+
+// a panel's codes 64 +- g (8 rows x 8 k; a: its 8 entries' addresses, row r's in lane r; s: its signs, bit 8 r + j: value
+// j of row r negative)
+[[clang::always_inline]] inline v64int8 {{ p }}_iq2u(v8int32 a, v2int32 s, v64int8 k8, v64int8 k25, v64int8 k43, v64int8 k64)
+{
+    const v16int32 c = concat(load_4x16_lo(a), load_4x16_hi(a));
+    const v16int32 t = (v16int32)::shuffle((v64int8)c, T8_8x8);
+    const v64int8 g = __builtin_aie2p_vsel8(__builtin_aie2p_vsel8(k8, k25, ext_v2int32(t, 0)), k43, ext_v2int32(t, 1));
+    return __builtin_aie2p_vaddsub8(k64, g, s);
+}
+
+// The codes of a call's panels (u [16-row block][i'' 2][l 4][rh 2][64]): per (block, i'') the 4 lists' 16 rows (one load each:
+// upshifted into an accumulator) + the copies' bases (lanes 0, 1: tab_ab, 2, 3: tab_cd), the masks (one 64-byte load), 8
+// panels
+__attribute__((noinline)) void {{ p }}_iq2g(const uint16_t *__restrict li, const uint8_t *__restrict mk,
+                                            const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
+                                            uint8_t *__restrict u)
+{
+    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v64int8 k8 = broadcast_to_v64int8(8), k25 = broadcast_to_v64int8(25), k43 = broadcast_to_v64int8(43),
+        k64 = broadcast_to_v64int8(64);
+    const v16uint16 __aie_dm_resource_a *__restrict pi = (const v16uint16 __aie_dm_resource_a *)li;
+    const v16int32 __aie_dm_resource_b *__restrict pm = (const v16int32 __aie_dm_resource_b *)mk;
+    v64int8 __aie_dm_resource_c *__restrict pu = (v64int8 __aie_dm_resource_c *)u;
+    dims_2d_t wi = dims_2d_from_steps(2, {{ 4 * LP // 16 }}, 1);  // (lists: i'' by 4 lists, then the next block's 16 rows)
+    for (int it = 0; it < {{ n_mac // 8 }}; it++) {  // (16-row block, i'') = (it / 2, it % 2)
+        const v16int32 m = *pm++;  // ([l 4][r 16])
+{% for l in range(4) %}
+        const v16int32 a{{ l }} = add((v16int32)ups_to_v16acc32(pi[{{ l * LP // 16 }}], 0, 0), b16);
+{% endfor %}
+{% for j in range(8) %}
+        pu[{{ j }}] = {{ p }}_iq2u(extract_v8int32(a{{ j // 2 }}, {{ j % 2 }}), ext_v2int32(m, {{ j }}), k8, k25, k43, k64);
+{% endfor %}
+        pi = add_2d_ptr(pi, wi);
+        pu += 8;
+    }
+}
+
+// The panels from their codes u and the scales (S: the call's rows of [i'' 2][h 2]): per (16-row block, i'', h) the two
+// 8-row halves' scales over their rows' lanes; per panel the codes as bf16 128 + u (zero-extended on the load, + 0x4300),
+// w = S (128 + u) - 192 S = S (+- g), exact in fp32, rounded once
+__attribute__((noinline)) void {{ p }}_iq2s(const uint8_t *__restrict u, const bfloat16 *__restrict S,
+                                            uint8_t *__restrict stage)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint8_t __aie_dm_resource_a *__restrict pu = (const uint8_t __aie_dm_resource_a *)u;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)S;
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
+    const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4300);
+    const aie::vector<bfloat16, 64> k192 = aie::broadcast<bfloat16, 64>(-192.0f);
+    dims_3d_t wsc = dims_3d_from_steps(2, {{ NS }}, 2, {{ 2 * NS }}, 16);  // (h, then i'', then the next block)
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (16-row block, i'', h) = (it / 4, it / 2 % 2, it % 2)
+        aie::vector<bfloat16, 64> S0, S1;
+        al::expand16_bc(aie::load_v<16>(ps), S0, S1);
+        const aie::accum<accfloat, 64> C0 = aie::mul(S0, k192), C1 = aie::mul(S1, k192);
+{% for j in range(4) %}
+        out.push(aie::mac(C{{ j % 2 }}, aie::concat(aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j }})), k43).template cast_to<bfloat16>(),
+                                         aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j + 32 }})), k43).template cast_to<bfloat16>()),
+                          S{{ j % 2 }}).template to_vector<bfp16ebs8>());
+{% endfor %}
+        pu += 256;
+        ps = add_3d_ptr(ps, wsc);
+    }
+}
+
+void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
+{
+}
+
+// k-tile kt -> {{ n_mac }} x 64 bfp16 panels (rows {{ n_mac }} half ..) in the MAC pop order [16-row block][k-step ks][8-row
+// half]: on its first call the k-tile's prep, the codes (_iq2g), then the panels (_iq2s)
+void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *__restrict stage,
+                int32_t sb, int32_t kt{{ half_arg }}, const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+{
+{% if "ev_dq" in ablate or "ev_kt" in ablate %}
+    event0();
+{% endif %}
+{% if "dq" in ablate %}
+    return;
+{% endif %}
+{% if halves > 1 %}
+    if (half == 0)
+        {{ p }}_prep(b, (uint8_t *)ws, kt, tab_ab, tab_cd);
+    const int r0 = {{ n_mac }} * half;  // (the half's first row)
+{% else %}
+    {{ p }}_prep(b, (uint8_t *)ws, kt, tab_ab, tab_cd);
+    const int r0 = 0;
+{% endif %}
+    uint8_t *wsb = (uint8_t *)ws;
+{% if F2 == 2 %}
+    const uint32_t *base = (uintptr_t)tab_ab < (uintptr_t)tab_cd ? tab_ab : tab_cd;  // (every lane at the lower copy)
+    {{ p }}_iq2g((const uint16_t *)(wsb + {{ WL }}) + r0, wsb + {{ WM }} + 8 * r0, base, base, wsb + {{ WU }});
+{% else %}
+    {{ p }}_iq2g((const uint16_t *)(wsb + {{ WL }}) + r0, wsb + {{ WM }} + 8 * r0, tab_ab, tab_cd, wsb + {{ WU }});
+{% endif %}
+    {{ p }}_iq2s(wsb + {{ WU }}, (const bfloat16 *)(wsb + {{ WS }}) + r0, stage);
+{% if "ev_dq" in ablate %}
+    event1();
+{% endif %}
+}

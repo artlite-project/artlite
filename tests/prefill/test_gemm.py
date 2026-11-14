@@ -277,8 +277,9 @@ def _ratio(img: object, region: object) -> torch.Tensor:
     return torch.where(bw != 0, w / torch.where(bw != 0, bw, 1), 1)
 
 
-# (format, tiles per pass): super-block unit formats in passes no test file holds (IQ3_S and IQ4 outside gate / up)
-UNIT = [("IQ3_S", 6), ("IQ3_S", 3), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ4_XS", 1)]
+# (format, tiles per pass): super-block unit formats in passes no test file holds (IQ3_S and IQ4 outside gate / up, IQ2)
+UNIT = [("IQ3_S", 6), ("IQ3_S", 3), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ4_XS", 1), ("IQ2_XXS", 6), ("IQ2_XS", 3),
+        ("IQ2_S", 6), ("IQ2_S", 1)]
 
 
 @pytest.mark.parametrize(("fmt", "tiles"), UNIT, ids=[f"{f}-t{t}" for f, t in UNIT])

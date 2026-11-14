@@ -39,6 +39,7 @@ from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
 from ..formats import FORMATS, KC, KT, slot
+from ..formats.common import table_copies
 from ..operators import kmath
 from ..operators.design import COLS
 from ..operators.kernel_source import kernel_prefix
@@ -547,7 +548,8 @@ class GemmQdOperator(GemmQOperator):
             hb = Buffer(hb_ty, name=f"gq_hb_{c}")
             ex_buf = [Buffer(dk.ex_ty, name=f"gq_ex_{c}")] if dk.ex_ty is not None else []
             if dk.tables is not None:  # (a lookup table's two copies: ``_place_plan`` puts them in two regions)
-                ex_buf += [Buffer(dk.tables[0], name=f"gq_{key}_{c}", initial_value=dk.tables[1]) for key in ("tab", "tabb")]
+                ex_buf += [Buffer(dk.tables[0], name=f"gq_{key}_{c}", initial_value=t)
+                           for key, t in zip(("tab", "tabb"), table_copies(dk.tables[1]))]
             if dk.units:
                 workers.append(Worker(units_fn, [pcs.get((c, 2)), prm, b_l1[c].cons(), d_f[c].prod(), dk.sb, dk.dq, ws, hb,
                                                  *ex_buf],

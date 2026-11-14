@@ -110,7 +110,7 @@ class DqKernels:
     the Worker's arguments after ``hb``, in this order. ``units`` (``Slot.unit_bytes``): no header kernel (``hdr``
     None); per unit ``sb(b, ws, hb, sb)`` on the weight object, then ``dq`` per k-tile on the same object. ``tables``:
     (type, words) of a lookup table the core holds twice (buffers "tab", "tabb" of ``Slot.qd_scratch``, in two 16 KB
-    regions: IQ3_XXS's grid for the gathers), passed to ``dq`` after ``ex``."""
+    regions: IQ3_XXS's grid for the gathers; words (2, n): each copy's own), passed to ``dq`` after ``ex``."""
 
     hdr: object
     dq: object
@@ -227,8 +227,13 @@ class Slot:
 
     def mmv_table(self, fmt: str) -> np.ndarray | None:
         """The decode GEMV's gather table of a format (uint32 words, at most ``TAB_BYTES``: each core half holds two
-        copies at ``TAB``), or None."""
+        copies at ``TAB``; (2, words): copy i's own words), or None."""
         return None
+
+
+def table_copies(table: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A gather table's two copies (``Slot.mmv_table``: the same words twice, or each copy's own)."""
+    return (table[0], table[1]) if table.ndim == 2 else (table, table)
 
 
 def dq_kernel(op: object, kernel: KernelFn, B_l1_ty: object, ws_ty: object, D_ty: object,

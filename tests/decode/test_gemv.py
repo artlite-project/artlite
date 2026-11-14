@@ -120,6 +120,10 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         return per(f["d"], 32) * q + per(f["m"], 32)
     if fmt == "Q8_0":
         return per(f["d"], 32) * q
+    if fmt == "IQ2_XXS":
+        return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 8, 32, 1) * q
+    if fmt in ("IQ2_XS", "IQ2_S"):
+        return per(f["d"], 256) * np.repeat((2 * f["sc"].astype(np.float64) + 1) / 8, 16, 1) * q
     if fmt == "IQ3_XXS":
         return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 4, 32, 1) * q
     if fmt == "IQ3_S":
@@ -158,6 +162,9 @@ GEMV = [
     ("IQ4_NL", 9280, 4, ("random",), "IQ4_NL"),  # (16 rows; no file of ours has IQ4_NL tensors)
     ("IQ3_S", 9280, 4, ("swift",), "blk.0.ffn_gate.weight"),  # (20 rows)
     ("IQ3_XXS", 9280, 4, ("swift",), "blk.16.ffn_up.weight"),  # (23 rows: a dense model's)
+    ("IQ2_XXS", 9280, 4, ("random",), "IQ2_XXS"),  # (24 rows)
+    ("IQ2_XS", 9280, 4, ("random",), "IQ2_XS"),
+    ("IQ2_S", 9280, 4, ("random",), "IQ2_S"),
 ]
 
 

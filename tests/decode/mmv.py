@@ -32,6 +32,7 @@ from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
 from artlite.decode.protocol import C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.formats import FORMATS, TAB, slice_fields, slot
+from artlite.formats.common import table_copies
 from artlite.gguf_model import IQ4_VALUES
 from artlite.operators import bfp16
 from artlite.operators.base import ArgSpec, ArtcOperator
@@ -306,6 +307,21 @@ def _iq3s(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
+def _iq2(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (w = D S q, S = (2 ls + 1) / 4 (IQ2_XXS) or 2 sc + 1 per 16-k half, D = bf16(d) / 2 or / 8: per half super-block (4
+    # 32-k groups) hilo(sum c S) D, c = bf16(sum q X_a) per 16-k half; sums in fp32)
+    q = f["q"].astype(np.float64)
+    R, K = q.shape
+    C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 16, 16), q.reshape(R, K // 16, 16))
+    nsb = K // 256
+    if fmt == "IQ2_XXS":
+        S, D = np.repeat((2 * f["ls"].astype(np.float64) + 1) / 4, 2, 1), _bf64(f["d"]) / 2
+    else:
+        S, D = 2 * f["sc"].astype(np.float64) + 1, _bf64(f["d"]) / 8
+    Y = np.einsum("sbjr,rbj->sbr", x.csum(C).reshape(x.slots, 2 * nsb, 8, R), S.reshape(R, 2 * nsb, 8))
+    return (_hilo(Y) * np.repeat(D.reshape(R, nsb), 2, 1).T[None]).sum(1)
+
+
 def _iq4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     # (w = d v[q]: per 32-k group c = bf16(sum v X_a); IQ4_NL: y += sum c d (bf16 d, the products exact); IQ4_XS: per
     # super-block hilo(sum c (ls - 32)) d; sums in fp32)
@@ -328,12 +344,13 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
-         "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
+         "IQ2_XXS": _iq2, "IQ2_XS": _iq2, "IQ2_S": _iq2, "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
          "BFP16": _bfp16}
 
 
 # (the formats with kernels of 8 slots)
-GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16")
+GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL",
+                 "IQ4_XS", "BFP16")
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:
@@ -539,9 +556,10 @@ void mmvh_add(const float *__restrict r, const float *__restrict y, float *__res
         grid = []  # (a format's gather table: per core its two copies, placed, used through their addresses only)
         tab = slot(self.fmt).mmv_table(self.fmt)
         if tab is not None:
-            t_ty = np.ndarray[(tab.size,), np.dtype[np.uint32]]
+            copies = table_copies(tab)
+            t_ty = np.ndarray[(copies[0].size,), np.dtype[np.uint32]]
             grid = [[Buffer(t_ty, tile=Tile(0, 2 + h), name=f"m_grid{h}{i}", address=TAB[h][i] - 0x70000,
-                            initial_value=tab) for i in range(2)] for h in range(2)]
+                            initial_value=copies[i]) for i in range(2)] for h in range(2)]
 
         def core0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka, *tabs):
             body0(af, xf, cf, rf, yf, xb, s, y0, kc, kt, ka)

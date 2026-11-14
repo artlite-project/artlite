@@ -61,6 +61,9 @@ _XSC = templating.source("artlite/formats/iq3.xsc.cc.jinja")
 _PANEL = templating.source("artlite/formats/iq3.panel.cc.jinja")
 
 
+# the signs and scales of 16 rows' sign / scale words (``mmv/iq3signs``: IQ3_XXS's and IQ2's decode, before them)
+SIGNS = templating.source("artlite/formats/iq3.signs.cc.jinja")
+
 # GemmQd (prefill) on super-block units: the pass's rows compacted (``_compact``: tile t's rows from R t on)
 _GEMM = templating.source("artlite/formats/iq3.gemm.cc.jinja")
 
@@ -69,7 +72,7 @@ class Iq3Slot(Slot):
     formats = (TileFormat("IQ3_XXS", 10, 98, 24, 1, 98, 0, planes=3, pad8_row=64, unit_align=16, dq_row_cycles=11.0,
                           mmv="iq3"),)
     sources: ClassVar[dict[str, str]] = {"mmv/IQ3_XXS": _MMV, "mmv/iq3panel": _PANEL, "mmv/iq3c": _XSC,
-                                         "gemm/IQ3_XXS": _GEMM}
+                                         "mmv/iq3signs": SIGNS, "gemm/IQ3_XXS": _GEMM}
 
     @staticmethod
     def unit(R: int) -> tuple[int, int, int, int]:
@@ -156,7 +159,7 @@ class Iq3Slot(Slot):
         return nsb == 4  # (two super-blocks per core)
 
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
-        return ("mmv/k23", "mmv/iq3panel", "mmv/iq3c", f"mmv/{fmt}")
+        return ("mmv/k23", "mmv/iq3signs", "mmv/iq3panel", "mmv/iq3c", f"mmv/{fmt}")
 
     def mmv_table(self, fmt: str) -> np.ndarray:
         return grid_words()

@@ -103,6 +103,7 @@ from ml_dtypes import bfloat16
 
 from .. import txn
 from ..formats import FORMATS, TAB, TAB_BYTES, slot
+from ..formats.common import table_copies
 from ..moe import route as moe_k
 from ..operators import kmath, paging, templating
 from ..operators.base import ArgSpec, ArtcOperator
@@ -502,7 +503,8 @@ class DecodeOverlayOperator(ArtcOperator):
         pagers = []
         for h, (row, stack) in enumerate(zip((self.MAIN_ROW, self.HELPER_ROW), self.stacks)):
             pg = pager(h, row, stack)
-            data = {f: tuple((a - 0x70000, slot(f).mmv_table(f)) for a in self.tab[h]) for f in self.paged if f in self.tables}
+            data = {f: tuple((a - 0x70000, t) for a, t in zip(self.tab[h], table_copies(slot(f).mmv_table(f))))
+                    for f in self.paged if f in self.tables}
             pagers.append(dataclasses.replace(pg, data=data) if data else pg)
         halves = self.pg_halves()
         groups = [tuple(pagers)] if len(halves) == 1 else [(pg,) for pg in pagers]
@@ -780,14 +782,14 @@ class DecodeOverlayOperator(ArtcOperator):
         if self.tables:
             t_ty = np.ndarray[(TAB_BYTES // 4,), np.dtype[np.uint32]]
             res = [f for f in self.tables if f not in self.paged]
-            init = np.zeros(TAB_BYTES // 4, np.uint32)
+            init = [np.zeros(TAB_BYTES // 4, np.uint32) for _ in range(2)]
             if res:  # (a resident table; else every table comes with its format's page)
-                tab = slot(res[0]).mmv_table(res[0])
-                init[:tab.size] = tab
+                for i, tab in enumerate(table_copies(slot(res[0]).mmv_table(res[0]))):
+                    init[i][:tab.size] = tab
             for c in range(COLS):
                 for h, r in enumerate((mr, hr)):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
-                                          address=self.tab[h][i] - 0x70000, initial_value=init)
+                                          address=self.tab[h][i] - 0x70000, initial_value=init[i])
                                    for i in range(2)]
         def silu_tab(c: int) -> list[Buffer]:  # (placed, read through their addresses)
             if not s8:
