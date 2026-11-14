@@ -304,10 +304,10 @@ def _qwen_steps(ov: object, log: _Log, rng: np.random.Generator) -> None:
             p += S if commit else n
             if i == 1:
                 snap, snap_at = ov.snapshot(p), p
-        digest = hashlib.sha256()
-        for k in sorted(snap):
-            if isinstance(snap[k], np.ndarray):
-                digest.update(snap[k].tobytes())
+        digest, arrays = hashlib.sha256(), {**snap.extra, "rings": snap.rings}  # (the snapshot's arrays by name)
+        for k in sorted(arrays):
+            if isinstance(arrays[k], np.ndarray):
+                digest.update(arrays[k].tobytes())
         ov.restore(snap)
         p = snap_at
         for S, commit, n in ((4, True, 4), (4, False, 3)):
