@@ -108,7 +108,8 @@ def validate_counter_specs(specs: Sequence[CounterSpec]) -> None:
     for name, count in counts.items():
         if count > MODULES[name].max_counters:
             raise ValueError(
-                f"{settings.PROFILE_COUNTERS.name}: at most {MODULES[name].max_counters} {name}-module pairs (got {count})"
+                f"{settings.PROFILE_COUNTERS.name}: at most {MODULES[name].max_counters} {name}-module pairs "
+                f"(got {count})"
             )
 
 

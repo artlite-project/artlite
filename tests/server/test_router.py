@@ -469,7 +469,8 @@ def test_router_several(models_dir: str, tmp_path: object) -> None:
             return reply(r)
 
         assert ask_(A) == "a-Q4_0" and ask_(B) == "a-Q8_0" and sorted(router.instances) == [A, B]
-        assert router.env[settings.ROUTER_MODELS.name] == "2"  # (each model server's default prompt cache: half of its own)
+        # (each model server's default prompt cache: half of its own)
+        assert router.env[settings.ROUTER_MODELS.name] == "2"
         port = router.instances[A].port
         assert httpx.get(f"http://127.0.0.1:{port}/props", headers=auth).status_code == 401  # (its own key)
         assert ask_(A) == "a-Q4_0"  # (B is now the least recently used)

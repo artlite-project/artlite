@@ -115,11 +115,13 @@ def test_value_rules(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_without_and_take(monkeypatch: pytest.MonkeyPatch) -> None:
-    env = {"ARTLITE_PROFILE": "1", "ARTLITE_PROFILE_DIR": "d", "ARTLITE_MEASURE_II": "1", "ARTLITE_PACE": "off", "A": "b"}
+    env = {"ARTLITE_PROFILE": "1", "ARTLITE_PROFILE_DIR": "d", "ARTLITE_MEASURE_II": "1", "ARTLITE_PACE": "off",
+           "A": "b"}
     assert settings.without(env, settings.PROFILE_FAMILY, settings.MEASURE_II) == {"ARTLITE_PACE": "off", "A": "b"}
     assert settings.arg_name("CTX_SIZE") == "ARTLITE_ARG_CTX_SIZE"
     assert settings.arg_option("ARTLITE_ARG_CTX_SIZE") == "ctx_size"
-    assert [settings.arg_flag(v) for v in ("1", "TRUE", "on", "Yes", "enabled", "0", "", "no")] == [True] * 5 + [False] * 3
+    values = ("1", "TRUE", "on", "Yes", "enabled", "0", "", "no")
+    assert [settings.arg_flag(v) for v in values] == [True] * 5 + [False] * 3
     monkeypatch.setenv("ARTLITE_DIAGNOSE_ROOT", "/tmp/f")
     assert settings.DIAGNOSE_ROOT.take() == "/tmp/f"
     assert settings.DIAGNOSE_ROOT.take() == "" and "ARTLITE_DIAGNOSE_ROOT" not in os.environ

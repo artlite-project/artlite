@@ -156,7 +156,8 @@ SWITCHES: list[Switch[Any]] = []
 FAMILIES: list[Family] = []
 
 
-def _declare[T](name: str, kind: Kind, default: str, doc: str, parse: Callable[[str | None], T], **fields: Any) -> Switch[T]:
+def _declare[T](name: str, kind: Kind, default: str, doc: str, parse: Callable[[str | None], T],
+                **fields: Any) -> Switch[T]:
     switch = Switch(PREFIX + name, kind, default, doc, parse, **fields)
     SWITCHES.append(switch)
     return switch
@@ -171,13 +172,15 @@ def _family(prefix: str, doc: str, *, open: bool) -> Family:
 # Where files live
 MODELS_DIR = _declare(
     "MODELS_DIR", "path", "~/.artlite/models", "the models directory",
-    _home_path(".artlite", "models"), read="import", why="``model_config.MODELS_DIR`` is a constant of the models' paths")
+    _home_path(".artlite", "models"), read="import",
+    why="``model_config.MODELS_DIR`` is a constant of the models' paths")
 LLAMA_CPP_DIR = _declare(
     "LLAMA_CPP_DIR", "path", "/src/llama.cpp", "the llama.cpp build the Qwen reference tests load",
     _text("/src/llama.cpp"), read="import", why="``model_config.LLAMA_CPP_DIR`` is a constant")
 CACHE_DIR = _declare(
     "CACHE_DIR", "path", "~/.cache/artlite", "the build cache",
-    _home_path(".cache", "artlite"), read="import", why="the cache's paths are module constants (``toolchain.CACHE_DIR``)")
+    _home_path(".cache", "artlite"), read="import",
+    why="the cache's paths are module constants (``toolchain.CACHE_DIR``)")
 BACKEND = _declare(
     "BACKEND", "choice", "the platform's own (xdna on Linux, xrt on Windows)",
     "the NPU backend: ``xdna`` (the amdxdna driver) or ``xrt`` (XRT)",
@@ -211,8 +214,8 @@ PLAN_SINK = _declare(
 
 # Runtime
 VERIFY_TXN = _declare(
-    "VERIFY_TXN", "flag", OFF, "check every host-built transaction where it is built or loaded (``txn.verify``: AxQoS 0, "
-    "valid BDs, token controllers, the shim channels' queues; the tests turn it on)", _on_when_one)
+    "VERIFY_TXN", "flag", OFF, "check every host-built transaction where it is built or loaded (``txn.verify``: "
+    "AxQoS 0, valid BDs, token controllers, the shim channels' queues; the tests turn it on)", _on_when_one)
 PM_PACKETS = _declare(
     "PM_PACKETS", "flag", ON, "a library configuration's tile writes go as control packets where that is cheaper "
     "(off: all in the transaction, and no configuration without the array reset)", _off_when_zero)
@@ -223,8 +226,8 @@ PACE = _declare(
     "PACE", "string", "auto", "the prefill GEMMs' pace levels: ``auto`` (calibrated per machine and cached), ``off``, "
     "``recalibrate``, or levels (``gu=3,qkv=2``, or one level for every class)", _text("auto"))
 NB_LEAK_WARNINGS = _declare(
-    "NB_LEAK_WARNINGS", "flag", "off; any value turns it on", "nanobind's leak warnings at exit (set to anything to show them)",
-    _present, native=True)
+    "NB_LEAK_WARNINGS", "flag", "off; any value turns it on",
+    "nanobind's leak warnings at exit (set to anything to show them)", _present, native=True)
 
 # The server
 ROUTER_MODELS = _declare(

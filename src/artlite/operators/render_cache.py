@@ -17,8 +17,8 @@ A hit attaches the build directory (when its artifacts are there: a fused ELF's 
 Rendered every time (no key): an argument the key cannot describe (a function, an object without plain data, an
 array above 16 MB), a method replaced on the instance or on a class by a function from another module (variant
 builds, experiments), profiling, a switch that changes what a build gives (``settings.BUILD_SWITCHES``:
-``ARTLITE_IGNORE_CACHE``, ``ARTLITE_MEASURE_II``, ``ARTLITE_GENERATE_ASM``; their reports come from a build). Not seen: a module global changed at runtime (``fused.layout.SEGMENT_BYTES`` is part of the
-key): a test that monkeypatches one gives its operators or ELF their own names, so that their keys differ.
+``ARTLITE_IGNORE_CACHE``, ``ARTLITE_MEASURE_II``, ``ARTLITE_GENERATE_ASM``; their reports come from a build). Not
+seen: a module global changed at runtime (``fused.layout.SEGMENT_BYTES`` is part of the key): a test that monkeypatches one gives its operators or ELF their own names, so that their keys differ.
 """
 
 from __future__ import annotations

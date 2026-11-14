@@ -26,8 +26,8 @@ out the models whose props say they have none); a client that goes away closes t
 cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the server of the conversation's last
 request (``X-Conversation-Id``), or cancels the request still waiting for its model.
 Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
-and with --models-max above 1 its default prompt cache takes its part of the RAM (``settings.ROUTER_MODELS``). Models loaded
-together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
+and with --models-max above 1 its default prompt cache takes its part of the RAM (``settings.ROUTER_MODELS``).
+Models loaded together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
 the NPU, and none is queued ahead of its requests: ``prefill.chunks.PEER_PIECE_S``, ``Library.run``)."""
 
 import argparse
