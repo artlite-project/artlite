@@ -37,6 +37,7 @@ from artlite import _native, txn
 from artlite.decode.image import TileImage
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
+    QwenConfig,
     decision_mmproj,
     gemma_gguf,
     lfm3_gguf,
@@ -46,7 +47,9 @@ from artlite.model_config import (
     minicpmv_mmproj,
     occamy_gguf,
     qwen3_gguf,
+    qwen_dflash_of,
     qwen_gguf,
+    qwen_mtp_of,
     swift_gguf,
 )
 from artlite.moe import route as moe_route
@@ -259,34 +262,180 @@ def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
-def _qwen(path: str) -> Callable[[Callable[[object], _Log]], None]:
+def _qwen_steps(ov: object, log: _Log, rng: np.random.Generator) -> None:
+    """A qwen35 overlay's main steps: committing steps, lazy steps accepting some of their tokens, a reset between rounds;
+    then a prompt's hand-off (the conv states in GHDR, the rings from the prefill's caches, a snapshot restored) and,
+    where steps of 8 slots may branch, branching steps."""
+    for rnd in range(2):
+        p = 0
+        # (S, commit, accepted): committing steps, lazy steps accepting some of their tokens
+        for S, commit, n in ((1, True, 1), (4, True, 4), (4, False, 2), (3, False, 3), (2, False, 1), (4, True, 4),
+                             (1, False, 1), (4, False, 4), (4, False, 0), (4, True, 4), (3, False, 2)):
+            S = min(S, ov.SLOTS)
+            n = min(n, S)
+            log.label = f"round {rnd} S={S} p={p} commit={commit} accept={n}"
+            ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
+            ov.accept(S if commit else n)
+            p += S if commit else n
+        while rnd == 0 and p + 4 <= 600:  # (then committing steps of 4, logits every 16th)
+            S = min(4, ov.SLOTS)
+            log.label = f"round {rnd} S={S} p={p} commit=True accept={S}"
+            ov.step(_x(rng, S, ov.H), p, logits=p % 64 == 0, commit=True)
+            ov.accept(S)
+            p += S
+        ov.reset()
+    # a prompt's hand-off: the prefill's conv states and open V records, a decode step after it at p0 (a block's
+    # start or inside one), the states carried to a second prompt chunk and back, a snapshot restored later
+    dev = ov.dev
+    for p0 in (40, 45):
+        ov.conv_fresh()
+        for name in ("GHDR", "GSTATE"):
+            if name in dev.buffers:
+                dev.view(name)[:] = rng.integers(0, 256, dev.view(name).size, np.uint8)
+                dev.flush(name)
+        ov.vring.from_prefill.update(ov.fatt)
+        p = p0
+        for i, (S, commit, n) in enumerate(((3, False, 2), (4, True, 4), (2, False, 2), (4, False, 1), (1, True, 1))):
+            S = min(S, ov.SLOTS)
+            n = min(n, S)
+            log.label = f"prompt {p0} S={S} p={p} commit={commit} accept={n}"
+            ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
+            ov.accept(S if commit else n)
+            p += S if commit else n
+            if i == 1:
+                snap, snap_at = ov.snapshot(p), p
+        digest = hashlib.sha256()
+        for k in sorted(snap):
+            if isinstance(snap[k], np.ndarray):
+                digest.update(snap[k].tobytes())
+        ov.restore(snap)
+        p = snap_at
+        for S, commit, n in ((4, True, 4), (4, False, 3)):
+            S = min(S, ov.SLOTS)
+            n = min(n, S)
+            log.label = f"restored {digest.hexdigest()[:8]} S={S} p={p} commit={commit} accept={n}"
+            ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
+            ov.accept(S if commit else n)
+            p += S if commit else n
+        while p % 8 or ov.nrep:  # (a prefill continues from a block's start: the states fully accepted)
+            ov.step(_x(rng, 1, ov.H), p, logits=False, commit=True)
+            ov.accept(1)
+            p += 1
+        ov.conv_for_prefill()
+        log.label = f"after a prompt chunk p={p}"
+        ov.step(_x(rng, min(4, ov.SLOTS), ov.H), p, logits=True, commit=True)
+        ov.accept(min(4, ov.SLOTS))
+        ov.reset()
+    if getattr(ov, "can_branch", False):  # (steps of 8: chains and trees of two branches inside the slots' 8 positions)
+        p, cands = 0, ((0, 1), (1, 2), (3, 2), (5, 2), (0, 2), (2, 1), (4, 1), (6, 1))
+        for i in range(24):
+            branch = next(((c, L) for c, L in cands[i % len(cands):] + cands[:i % len(cands)]
+                           if p % 8 + c + L <= 7), None) if i % 5 != 4 else None
+            n = (5, 3, 6, 2, 7, 1)[i % 6]
+            log.label = f"branch S=8 p={p} branch={branch} accept={n}"
+            ov.step(_x(rng, 8, ov.H), p, logits=True, commit=False, branch=branch)
+            ov.accept(n)
+            p += n
+        ov.reset()
+
+
+def _qwen(path: str, *, draft: str | None = None, dflash: str | None = None
+          ) -> Callable[[Callable[[object], _Log]], None]:
+    """A qwen35 model's run; ``draft``: its MTP drafter ("": the file's own block, else a drafter file), ``dflash``: a
+    DFlash2 drafter's file (the drafter's steps follow the model's)."""
     def run(attach: Callable[[object], _Log]) -> None:
+        from models.qwen35.dflash import DFlashOverlay
+        from models.qwen35.draft import QwenDraft, draft_formats, draft_gate_up
+        from models.qwen35.image import QwenImage
         from models.qwen35.overlay import QwenOverlay
 
-        ov = QwenOverlay(GGUFFile(path), max_positions=4096)
+        gguf = GGUFFile(path)
+        mtp = GGUFFile(draft) if draft else None
+        if dflash:
+            ov = QwenOverlay(gguf, max_positions=4096, image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False),
+                             drafts=True)
+        elif draft is not None:
+            ov = QwenOverlay(gguf, max_positions=4096, drafts=True, formats=draft_formats(mtp) if mtp else (),
+                             gu=draft_gate_up(mtp) if mtp else frozenset())
+        else:
+            ov = QwenOverlay(gguf, max_positions=4096)
         log = attach(ov.op)
         rng = np.random.default_rng(2)
         ov.load()
-        for rnd in range(2):
-            p = 0
-            # (S, commit, accepted): committing steps, lazy steps accepting some of their tokens
-            for S, commit, n in ((1, True, 1), (4, True, 4), (4, False, 2), (3, False, 3), (2, False, 1), (4, True, 4),
-                                 (1, False, 1), (4, False, 4), (4, False, 0), (4, True, 4), (3, False, 2)):
-                S = min(S, ov.SLOTS)
-                n = min(n, S)
-                log.label = f"round {rnd} S={S} p={p} commit={commit} accept={n}"
-                ov.step(_x(rng, S, ov.H), p, logits=True, commit=commit)
-                ov.accept(S if commit else n)
-                p += S if commit else n
-            while rnd == 0 and p + 4 <= 600:  # (then committing steps of 4, logits every 16th)
-                S = min(4, ov.SLOTS)
-                log.label = f"round {rnd} S={S} p={p} commit=True accept={S}"
-                ov.step(_x(rng, S, ov.H), p, logits=p % 64 == 0, commit=True)
-                ov.accept(S)
-                p += S
-            ov.reset()
+        if draft is not None:
+            drafter = QwenDraft(ov, mtp)
+            drafter.load()
+            _qwen_mtp(ov, drafter, log, rng)
+        elif dflash:
+            drafter = DFlashOverlay(ov, GGUFFile(dflash))
+            attach(drafter.op)
+            drafter.load()
+            _qwen_dflash(ov, drafter, log, rng)
+        else:
+            _qwen_steps(ov, log, rng)
 
     return run
+
+
+def _qwen_mtp(ov: object, drafter: object, log: _Log, rng: np.random.Generator) -> None:
+    """The MTP drafter's steps (its rows: [token embedding | the model's hidden state before]), between the model's: a
+    step of every slot count, with and without logits, then the main steps."""
+    for rnd in range(2):
+        p = 0
+        for S, lg in ((1, True), (2, False), (4, True), (3, True), (ov.SLOTS, True), (1, False), (ov.SLOTS, False),
+                      (2, True), (1, True), (4, False)):
+            S = min(S, ov.SLOTS)
+            log.label = f"draft round {rnd} S={S} p={p} logits={lg}"
+            drafter.step(_x(rng, S, ov.H), _x(rng, S, ov.H), p, logits=lg)
+            p += S
+        p = 0
+        for S, n in ((1, 1), (4, 3), (ov.SLOTS, 5), (2, 2), (4, 1)):
+            S, n = min(S, ov.SLOTS), min(n, S)
+            log.label = f"model round {rnd} S={S} p={p}"
+            ov.step(_x(rng, S, ov.H), p, logits=True, commit=S == 1)
+            ov.accept(S if S == 1 else n)
+            p += n
+            log.label = f"draft after round {rnd} S={n} p={p - n}"
+            drafter.step(_x(rng, n, ov.H), _x(rng, n, ov.H), p - n, logits=True)
+        drafter.reset()
+        ov.reset()
+    _qwen_steps(ov, log, rng)
+
+
+def _qwen_dflash(ov: object, drafter: object, log: _Log, rng: np.random.Generator) -> None:
+    """The DFlash2 drafter's dispatches: the injection of the kept rows of a model's step (S slots, ``keep`` of them,
+    from the slots ``src`` where they are not the first: ``NpuQwen._move_taps``) with the block, an injection alone,
+    a block alone, rings wrapping past their window."""
+    from types import SimpleNamespace
+
+    from models.qwen35.qwen import NpuQwen
+
+    H = ov.H
+    for rnd in range(2):
+        p = 0
+        if rnd:  # (a prompt's end at 2300: the ring's slots wrap within the rounds)
+            ov.conv_fresh()
+            ov.vring.from_prefill.update(ov.fatt)
+            p = drafter.next = 2300
+        # (S, keep, whether a block follows, the slots of the kept rows when not the first ones)
+        rounds = [(1, 1, True, None), (8, 5, True, None), (8, 8, True, None), (8, 3, False, None), (4, 4, True, None),
+                  (8, 6, True, [0, 1, 2, 5, 6, 7]), (8, 7, True, [1, 2, 3, 4, 5, 6, 7]), (2, 2, True, None)]
+        rounds += [(8, 8, True, None)] * (14 if rnd else 20)
+        for S, keep, block, src in rounds:
+            log.label = f"model step S={S} p={p} accept={keep}"
+            ov.step(_x(rng, S, H), p, logits=False, commit=S == 1)
+            ov.accept(keep)
+            if src is not None:
+                inj = SimpleNamespace(_inj=(S, keep, p, src), overlay=ov, dflash=drafter, cfg=ov.cfg)
+                NpuQwen._move_taps(inj)
+            log.label = f"dflash S={S} keep={keep} q={p} block={block} p={p + keep}"
+            drafter.step(S, keep, p, _x(rng, 8, H) if block else None, p + keep)
+            p += keep
+        log.label = f"dflash block alone p={p}"
+        drafter.step(0, 0, 0, _x(rng, 8, H), p)
+        drafter.reset()
+        ov.reset()
+    _qwen_steps(ov, log, rng)
 
 
 def _image(rng: np.random.Generator, w: int, h: int) -> object:
@@ -350,6 +499,9 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
     "occamy-1.0-APEX": (occamy_gguf(), _qwen),
     "swift-1.5-APEX": (swift_gguf(), _qwen),
+    "qwen-35B-A3B-mtp": (qwen_gguf("Q4_K_M", "35B-A3B"), lambda p: _qwen(p, draft=qwen_mtp_of(p))),
+    "swift-1.5-APEX-mtp": (swift_gguf(), lambda p: _qwen(p, draft="")),
+    "qwen-3.8-27B-dflash": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda p: _qwen(p, dflash=qwen_dflash_of(p))),
     "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
 }
