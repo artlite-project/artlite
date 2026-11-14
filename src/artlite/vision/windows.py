@@ -46,6 +46,7 @@ import numpy as np
 from ..operators import kmath
 from ..operators.design import COLS
 from ..overlay import Transaction
+from . import design as D
 from . import layout as L
 from .builder import Builder
 from .device import VisionDevice
@@ -230,7 +231,7 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
         free(bd, n)
     for qd in range(-(-nb // 4)):
         mg = alloc(bd, l1, MERGED, "pn")
-        spare = bd.mem.alloc(9216)  # (the GEMM's A walk reads past its panels' end)
+        spare = bd.mem.alloc(D.A_OBJ)  # (the GEMM's A walk reads past its panels' end)
         bd.op(bd.fill(f"{nm.p}.mg.{qd}", mgb, mem=mg.addr, nbytes=mgb), {})
         bd.table("gelu_erf", gelu_table(kmath.GELU_ERF))
         g = alloc(bd, l1, max(md.up), "pn")
@@ -241,10 +242,10 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
             bd.op(bd.drain(f"{nm.p}.hid.{qd}", hid, mem=g.addr, nbytes=gk.nbytes, off=l1.pn(u0)), {})
             u0 += u
         free(bd, g)
-        bd.mem.release(spare, 9216)
+        bd.mem.release(spare, D.A_OBJ)
         free(bd, mg)
         h = alloc(bd, l1, FUP, "pn")
-        spare = bd.mem.alloc(9216)
+        spare = bd.mem.alloc(D.A_OBJ)
         bd.op(bd.fill(f"{nm.p}.hid.{qd}", hid, mem=h.addr, nbytes=hid), {})
         y = alloc(bd, l1, md.dn)
         for k in range(outw // md.dn + (outw % md.dn > 0)):
@@ -255,7 +256,7 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
             bd.op(bd.drain(f"{nm.p}.out.{qd}", l1.ct(outw), mem=y.addr, nbytes=yk.nbytes,
                        off=k * l1.ct(md.dn)), {})
         free(bd, y)
-        bd.mem.release(spare, 9216)
+        bd.mem.release(spare, D.A_OBJ)
         free(bd, h)
 
 
@@ -292,7 +293,7 @@ class WindowEncoder:
         self.kv = self.bd.ddr(f"{name}.kv", kv_bytes)
         self.max_bands = max_bands
         for nb in range(1, max_bands + 1):  # (every level's attention command, before any program)
-            self.bd.ddr(self.nm.attn(nb), 5760)
+            self.bd.ddr(self.nm.attn(nb), D.Q)
         # (programs by nb; a video's pairs' by ("pair", nb))
         self.programs: dict[int | tuple[str, int], list[Piece]] = {} if state is None else dict(state["programs"])
         self.store = store

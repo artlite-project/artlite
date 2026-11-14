@@ -10,15 +10,24 @@ activation tables of the epilogues (``silu_table``, ``gelu_table``). The convolu
 
 import functools
 from dataclasses import dataclass
+from enum import StrEnum
 
 import numpy as np
 
 from ..operators import kmath
 from . import design as D
+from . import layout as L
 from .builder import Builder, Records
 from .levels import Level
 from .ops import Gemm
 from .weights import flat
+
+
+class Kind(StrEnum):
+    """What a tensor holds: bf16 C tiles or bfp16 panels."""
+
+    CT = "ct"
+    PN = "pn"
 
 
 @dataclass
@@ -29,10 +38,13 @@ class Tensor:
     lv: Level
     C: int
     addr: int
-    kind: str = "ct"
+    kind: Kind = Kind.CT
     rec: list[Records] | None = None
     pnp: int = 0  # (panels: token panels per kb, if not the level's: a GEGLU output's padding)
     size: int = 0  # (the bytes allocated: ``alloc``)
+
+    def __post_init__(self) -> None:
+        self.kind = Kind(self.kind)
 
     @property
     def np(self) -> int:
@@ -40,14 +52,14 @@ class Tensor:
 
     @property
     def nbytes(self) -> int:
-        return self.lv.ct(self.C) if self.kind == "ct" else self.C // 8 * self.np * 72
+        return self.lv.ct(self.C) if self.kind == "ct" else self.C // 8 * self.np * L.PANEL
 
 
-def alloc(bd: Builder, lv: Level, C: int, kind: str = "ct", pnp: int = 0, top: bool = False, exact: bool = False) -> Tensor:
+def alloc(bd: Builder, lv: Level, C: int, kind: Kind = Kind.CT, pnp: int = 0, top: bool = False, exact: bool = False) -> Tensor:
     """A memtile tensor (panels of tiles of 64: room for whole A objects of 2 k-tiles, the GEMMs' walk reads them;
     exact: none, the 64x64 convs' input rows)."""
-    t = Tensor(lv, C, 0, kind, pnp=pnp)
-    t.size = t.nbytes if kind == "ct" or lv.m != 64 or exact else -(-C // 128) * 16 * t.np * 72
+    t = Tensor(lv, C, 0, Kind(kind), pnp=pnp)
+    t.size = t.nbytes if t.kind == Kind.CT or lv.m != 64 or exact else -(-C // 128) * 16 * t.np * L.PANEL
     t.addr = bd.mem.alloc(t.size, top=top)
     return t
 
@@ -118,8 +130,11 @@ class DTensor:
     lv: Level
     C: int
     name: str
-    kind: str = "ct"
+    kind: Kind = Kind.CT
     rec: list[Records] | None = None
+
+    def __post_init__(self) -> None:
+        self.kind = Kind(self.kind)
 
     def band(self, b: int) -> str:
         return f"{self.name}.{b}"
