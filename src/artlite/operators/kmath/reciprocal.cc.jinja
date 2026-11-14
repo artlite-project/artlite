@@ -1,0 +1,26 @@
+// 1 / x of {{ N }} fp32 lanes (kmath.recip: {{ bound }} for x in {{ dom }}): {{ "the mantissa's reciprocal: " if normal else "" }}a linear guess on [1, 2] (6%,
+// its slope a bf16 product), {{ steps }} Newton steps in fp32 products (al::mulff){{ ", the exponent negated in the bits (no scalar division: a\n// soft-float call)" if normal else "" }}
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+{% if normal %}
+    const aie::vector<int32, {{ N }}> b = x.template cast_to<int32>();
+    const aie::vector<int32, {{ N }}> e = aie::sub(aie::bit_and(b, aie::broadcast<int32, {{ N }}>(0x7F800000)),
+                                             aie::broadcast<int32, {{ N }}>(0x3F800000));
+    const aie::vector<float, {{ N }}> m = aie::sub(b, e).template cast_to<float>();  // (in [1, 2))
+{% set m = "m" %}
+{% else %}
+{% set m = "x" %}
+{% endif %}
+    const aie::vector<float, {{ N }}> two = aie::broadcast<float, {{ N }}>(2.0f);
+    aie::vector<float, {{ N }}> r = aie::sub(aie::broadcast<float, {{ N }}>(1.4117647f),
+                                     al::mulc<{{ N }}>({{ m }}, aie::broadcast<bfloat16, {{ N }}>(0.47058824f)).template to_vector<float>());
+{% if unroll %}
+{% for i in range(steps) %}
+    r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>({{ m }}, r)));
+{% endfor %}
+{% else %}
+    for (int i = 0; i < {{ steps }}; i++)
+        r = al::mulff<{{ N }}>(r, aie::sub(two, al::mulff<{{ N }}>({{ m }}, r)));
+{% endif %}
+    return {{ "aie::sub(r.template cast_to<int32>(), e).template cast_to<float>()" if normal else "r" }};
+}

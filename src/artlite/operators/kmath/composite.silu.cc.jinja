@@ -1,0 +1,13 @@
+// silu(x) = x sigmoid(x) of {{ N }} bf16 lanes in fp32 (kmath.silu): t = e^-|x| (2^x to bf16), r = 1 / (1 + t), sigmoid = x
+// >= 0 ? r : t r. Rounded to bf16: 98.7% correctly rounded, max 1.17 ULPs (x < 0, where t's bf16-level error passes
+// through).
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<bfloat16, {{ N }}> x)
+{
+    aie::vector<float, {{ N }}> xf = aie::accum<accfloat, {{ N }}>(x).template to_vector<float>();
+    aie::vector<float, {{ N }}> nax = aie::min(xf, aie::sub(aie::zeros<float, {{ N }}>(), xf));
+    aie::vector<bfloat16, {{ N }}> tb = aie::accum<accfloat, {{ N }}>({{ exp2 }}(al::log2e<{{ N }}>(nax))).template to_vector<bfloat16>();
+    aie::vector<float, {{ N }}> t = aie::accum<accfloat, {{ N }}>(tb).template to_vector<float>();
+    aie::vector<float, {{ N }}> r = {{ recip }}(aie::add(t, aie::broadcast<float, {{ N }}>(1.0f)));
+    aie::vector<float, {{ N }}> sg = aie::select(r, al::mulff<{{ N }}>(t, r), aie::lt(xf, aie::zeros<float, {{ N }}>()));
+    return al::mulff<{{ N }}>(xf, sg);
+}

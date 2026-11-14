@@ -1,0 +1,44 @@
+// silu of N bf16 into y in two passes (kmath.silu_tanh: max 0.92 bf16 ULP from x = 2.5 on, 6.6 (mean 0.04) in (-2.5,
+// 2.5), 7.7 in [-3, -2.5), 38 (mean 8.6) in [-24, -3); kmath.act(SILU): 0.59): A: u (1 + t), t = vtanh(u), u = x / 2,
+// below x = -3 u (1 - t) 2^(x log2e) by one vexp2 chord (the tail factor u (1 - t) formed first: II 10; 14 with the
+// exp2 product first); B: silu_small for |x| < 2.5 in place (II 10; the vtanh LUT alone costs 2.6x the first-token
+// KL of a 1000-token prompt). One loop for A and B does not pipeline. ``zero`` is a runtime 0: B's second loads of x
+// (not merged with the first) keep its lifetimes short.{{ " x: groups of %d vectors of 32, %d apart." % walk if walk != (1, 32) else "" }}
+template <int N>
+{{ attr }} void {{ name }}(const bfloat16 *__restrict x, bfloat16 *__restrict y, int32_t zero)
+{
+    {  // A
+        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)x;
+        bfloat16 __aie_dm_resource_b *__restrict py = (bfloat16 __aie_dm_resource_b *)y;
+        const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
+        const aie::vector<bfloat16, 32> kl = aie::broadcast<bfloat16, 32>(1.44269504f);
+        const aie::vector<bfloat16, 32> kt = aie::broadcast<bfloat16, 32>(-3.0f);
+{{ wg.decl }}
+        for (int j = 0; j < N / 32; j++) {  // (no pragma: post-RA II 10; post-RA only: 25)
+            aie::vector<bfloat16, 32> x = aie::load_v<32>(pg);
+            {{ wg.step }}
+            aie::accum<accfloat, 32> a_acc = aie::mul(x, kh);
+            aie::vector<bfloat16, 32> a = a_acc.template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> t = al::tanh_acc<32>(a_acc);
+            aie::vector<bfloat16, 32> body = aie::mac(a_acc, a, t).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> a1t = aie::msc(a_acc, a, t).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> tail = aie::mul(a1t, {{ chord }}(aie::mul(x, kl))).template to_vector<bfloat16>();
+            aie::store_v(py, aie::select(body, tail, aie::lt(x, kt)));
+            py += 32;
+        }
+    }
+    {  // B
+        const bfloat16 __aie_dm_resource_a *__restrict pg = (const bfloat16 __aie_dm_resource_a *)x;
+        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)y;
+        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *)y;
+{{ wg.decl }}
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < N / 32; j++) {
+            aie::store_v(pw, {{ small }}(aie::load_v<32>(pg), aie::load_v<32>(pg + zero), aie::load_v<32>(pg + zero),
+                                       aie::load_v<32>(py)));
+            {{ wg.step }}
+            py += 32;
+            pw += 32;
+        }
+    }
+}

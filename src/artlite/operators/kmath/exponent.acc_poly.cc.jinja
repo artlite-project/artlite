@@ -1,0 +1,6 @@
+{% from "exponent.acc_steps.cc.jinja" import poly with context %}
+// {{ whole }}'s second step: {{ "P 2^f" if shift else "2^-64 P 2^f" }}
+{{ attr }} aie::accum<accfloat, {{ N }}> {{ name }}(aie::vector<bfloat16, {{ N }}> P, aie::vector<bfloat16, {{ N }}> f)
+{
+    const aie::vector<bfloat16, {{ N }}> one = aie::broadcast<bfloat16, {{ N }}>(1.0f);
+{{ poly(N, "P", "f") }}}

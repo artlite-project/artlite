@@ -1,0 +1,9 @@
+{% from "exponent.acc_steps.cc.jinja" import reduce, poly with context %}
+// 2^{{ "(y + 64)" if shift else "y" }} of {{ N }} lanes, A = y + 192 an fp32 accumulator (kmath.exp2: {{ bound }} for A in [128.5, 255.5)): v =
+// bf16(A) = 192 + round(y) ([128, 256) is the binade of ULP 1), f = bf16(A - v); P = vexp2(v - 128) = 2^(round(y) + 64)
+// exactly (vexp2 is exact at non-negative integers{{ "" if shift else "; the 2^-64 in the constants" }}), 2^f = 1 + c1 f + f^2 (c2 + c3 f) in
+// bf16 products, one rounding at the end. {{ below_doc }}{{ above_doc }}
+{{ attr }} aie::accum<accfloat, {{ N }}> {{ name }}(aie::accum<accfloat, {{ N }}> A)
+{
+    aie::vector<bfloat16, {{ N }}> f;
+{{ reduce(N, "const aie::vector<bfloat16, " ~ N ~ "> P", "f") }}{{ poly(N, "P", "f") }}}

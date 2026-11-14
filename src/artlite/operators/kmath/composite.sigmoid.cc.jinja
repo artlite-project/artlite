@@ -1,0 +1,8 @@
+// sigmoid(x) of {{ N }} fp32 lanes (kmath.sigmoid: {{ bound }} for x in [-80, 80], 2^-15.0 for |x| <= 1: as kmath.expneg's): r
+// or t r (x < 0), t = e^(-|x|), r = 1 / (1 + t)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    const aie::vector<float, {{ N }}> t = {{ expneg }}(x);
+    const aie::vector<float, {{ N }}> r = {{ recip }}(aie::add(aie::broadcast<float, {{ N }}>(1.0f), t));
+    return aie::select(r, al::mulff<{{ N }}>(t, r), aie::lt(x, aie::zeros<float, {{ N }}>()));
+}

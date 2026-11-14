@@ -1,0 +1,30 @@
+// {{ what }} of N bf16 (a multiple of 32) into y (kmath.act: {{ bound }}): t = {{ t_text }} into y,
+// then the table pass in place (sets the rounding mode){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
+{{ "template <int N>" if not n }}
+{{ attr }} void {{ name }}(const bfloat16 *__restrict x, {{ "bfloat16 *__restrict t, float *__restrict y" if f32 else "bfloat16 *__restrict y" }}{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {
+        const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ clamp }}f);
+{% if full %}
+        const aie::vector<bfloat16, 32> lo = aie::broadcast<bfloat16, 32>(-{{ clamp }}f);
+{% endif %}
+        const bfloat16 __aie_dm_resource_a *__restrict px = (const bfloat16 __aie_dm_resource_a *)x;
+        bfloat16 __aie_dm_resource_b *__restrict pw = (bfloat16 __aie_dm_resource_b *){{ "t" if f32 else "y" }};
+{{ wx.decl }}
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < {{ n or "N" }} / 32; j++) {
+{% if full %}
+            aie::store_v(pw, aie::min(aie::max(aie::load_v<32>(px), lo), hi));
+{% elif scale == 2 %}
+            const aie::vector<bfloat16, 32> a = aie::abs(aie::load_v<32>(px));
+            aie::store_v(pw, aie::min(aie::add(a, a), hi));
+{% else %}
+            aie::store_v(pw, aie::min(aie::abs(aie::load_v<32>(px)), hi));
+{% endif %}
+            {{ wx.step }}
+            pw += 32;
+        }
+    }
+    {{ tab }}{{ "<N>" if not n }}(x, {{ "t, t" if f32 else "y, y" }}, y{{ ", tab_ab, tab_cd" if table_arg }});
+}

@@ -1,4 +1,4 @@
-"""kmath's functions on the NPU (operators/kmath.py): every variant over its domain (every bf16 argument there and
+"""kmath's functions on the NPU (operators/kmath/): every variant over its domain (every bf16 argument there and
 fp32 ones between) and the edges its contract covers (masked lanes, clamps): bit-exact against its numpy model
 (kmath_sim.py), within its error bound against the exact function."""
 

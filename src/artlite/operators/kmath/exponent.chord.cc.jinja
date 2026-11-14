@@ -1,0 +1,12 @@
+// {{ "%g " % scale if scale != 1 else "" }}2^x of {{ N }} lanes, x an fp32 accumulator (kmath.exp2: {{ bound }} for x in [-2, 2], {{ wider }}):
+// {{ "the chords of vexp2 at x and x + 1/2, the second times 1 / sqrt 2" if two else "vexp2" }}, Schraudolph's exp: 2^n (1 + f) of x truncated to bf16 (n + f, f
+// to 7 bits; negative x in one's complement), so in steps of 2^-6 .. 1/4 from |x| = 2 .. 32
+{{ attr }} aie::{{ "accum<accfloat" if two else "vector<bfloat16" }}, {{ N }}> {{ name }}(aie::accum<accfloat, {{ N }}> A)
+{
+{% if two %}
+    return aie::mac(aie::mul(al::exp2_acc<{{ N }}>(A), aie::broadcast<bfloat16, {{ N }}>({{ c[0] }}f)),
+                    al::exp2_acc<{{ N }}>(aie::add(A, aie::broadcast<float, {{ N }}>(0.5f))), aie::broadcast<bfloat16, {{ N }}>({{ c[1] }}f));
+{% else %}
+    return al::exp2_acc<{{ N }}>(A);
+{% endif %}
+}

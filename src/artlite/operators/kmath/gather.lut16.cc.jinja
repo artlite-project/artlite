@@ -1,0 +1,8 @@
+// 16 table reads: lanes 0-7 into q0, 8-15 into q1
+{{ attr }} void {{ name }}(v16int32 ptr, v32bfloat16 &q0, v32bfloat16 &q1)
+{
+    q0 = insert(q0, 0, (v16bfloat16)load_4x64_lo(extract_v8int32(ptr, 0)));
+    q0 = insert(q0, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 0)));
+    q1 = insert(q1, 0, (v16bfloat16)load_4x64_lo(extract_v8int32(ptr, 1)));
+    q1 = insert(q1, 1, (v16bfloat16)load_4x64_hi(extract_v8int32(ptr, 1)));
+}

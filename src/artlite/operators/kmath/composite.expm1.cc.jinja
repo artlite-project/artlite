@@ -1,0 +1,12 @@
+// e^g - 1 of {{ N }} fp32 lanes for g <= 0 (kmath.expm1: {{ bound }} for g in [-87, 0]): its Taylor polynomial in fp32
+// products below |g| = 1/2 (no cancellation), else 2^(g log2 e) - 1
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> g)
+{
+    aie::vector<float, {{ N }}> p = aie::broadcast<float, {{ N }}>({{ c[0] }}f);
+{% for k in c[1:] %}
+    p = aie::add(aie::broadcast<float, {{ N }}>({{ k }}f), al::mulff<{{ N }}>(g, p));
+{% endfor %}
+    const aie::vector<float, {{ N }}> small = aie::add(g, al::mulff<{{ N }}>(al::mulff<{{ N }}>(g, g), p));
+    const aie::vector<float, {{ N }}> big = aie::sub({{ exp2 }}(al::log2e<{{ N }}>(g)), aie::broadcast<float, {{ N }}>(1.0f));
+    return aie::select(big, small, aie::gt(g, aie::broadcast<float, {{ N }}>(-0.5f)));
+}

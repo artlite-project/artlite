@@ -56,7 +56,7 @@ A standalone 1-D elementwise operator is a test harness, not an Artlite operator
 ## 2. The kernel
 
 Write the kernel as a template file next to the operator's module (`my_op.py`: `my_op.cc.jinja`), build it from the shared helpers of `kernel_lib.h` (namespace `al`: `inv_rms`,
-bfp16 panels, lane shuffles, `al::div_small`) and the math functions of `kmath.py` (`km` in every template: exp2, recip,
+bfp16 panels, lane shuffles, `al::div_small`) and the math functions of `kmath/` (`km` in every template: exp2, recip,
 SiLU, GELU per contract, `{% set e = km.exp2(32) %}{{ e.src }}` then `{{ e }}(x)`), or copy IRON's kernel and turn
 its runtime sizes into template parameters. Shapes, trip counts and strides rendered as constants let Peano fold, unroll and pipeline (zero
 overhead loops, no runtime trip counts); use `constexpr` for derived values.
@@ -104,7 +104,7 @@ matvec = Kernel(f"my_op_matvec_bf16_{params}", "kernel.o", [np.int32, np.int32, 
 silu_mul = Kernel(f"my_op_silu_mul_bf16_{params}", "kernel.o", [L1_C_ty, np.int32])
 ```
 
-- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `kmath.py` (`km.act`): drop IRON's `lut_based_ops.o`.
+- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `kmath/` (`km.act`): drop IRON's `lut_based_ops.o`.
 
 ## 4. The test
 
@@ -133,7 +133,7 @@ def test_my_op(size: int, tile_size: int):
 ## Patterns
 
 - **Elementwise** (GELU, SiLU, add, mul): fuse it into the kernel that produces or consumes the data (GemmQ / GemmQd's
-  gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kmath.py`;
+  gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kmath/`;
   accuracy over the bf16 domain through a `StreamOperator` harness (`tests/operators/elementwise.py`).
 - **GEMV / GEMM** on the GGUF tile formats (`formats/`, one slot per format): the decode overlay's GEMV kernels
   (`decode/gemv.py`, harness `MmvOperator` in `tests/decode/mmv.py`), the prefill GEMMs `GemmQOperator` /

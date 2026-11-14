@@ -25,7 +25,7 @@ SKILL.md section 5 has the workflow; machine-model.md the load-slot binding the 
 
 ## Gathers (lookup tables)
 
-- `load_4x64_lo / hi` (`vldb.4x64`, kmath's tables) read two copies of a table, ab and cd (the lane mapping: kmath.py
+- `load_4x64_lo / hi` (`vldb.4x64`, kmath's tables) read two copies of a table, ab and cd (the lane mapping: kmath/gather.py
   "Activations through the gather LUT"). The copies belong in two different regions. In one region every gather waits
   a cycle: the SiLU table activation of 4096 values stalls 1099 cycles on memory per call instead of 159, a
   GemmQ gate/up epilogue through the SiLU table 2290 cycles per call against 1753 scheduled (512 gathers).

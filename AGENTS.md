@@ -103,7 +103,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 | `src/artlite/backend.py`, `portable.py` | which backend is `artlite._native` (`ARTLITE_BACKEND`) and what the Python side does differently on XRT; the operating system's part of the Python side (file locks, process groups) |
 | `src/artlite/{txn,elf_parser}.py`, `overlay.py` | control programs: transactions built on the host (the `insts.bin` format), full ELFs and the patching of their control code; the host runtime of the overlays, designs run by host-built transactions (`Sequence`, `OverlayDevice`, `Transaction`, `WeightBuffer`) |
 | `src/artlite/operators/` | the operator framework: `base.py` (`ArtcOperator`: render, compile, dispatch; `ArgSpec`), `toolchain.py` (where Peano and aiecc are, resolved at the first build, and their command lines), `build.py` (`BuildSpec`, its one cache key, `build`: artifacts published whole), `templating.py` (the kernel template files, `JINJA_ENV`), `kernel_source.py` (kernel names by content, `kernel_prefix`; the translation unit `kernel.cc` of one or several operators), `checks.py` (the build-time checks, over `objdump.py`'s one parse of a kernel object), `render_cache.py`, `chain.py` (one shim task from a chain of BDs: `chained_fill`), `words.py` (the host-core word layouts: an X object's metadata, a core's state words, a command, declared by name and checked at import; what the kernel templates take), and the pieces operators share (How an operator works) |
-| `src/artlite/operators/kmath.py` | math functions generated per contract (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu; arrays through the gather LUT: `act`, `table_pass` and the tables; `silu_tanh`), each variant's bit-exact numpy model in `tests/operators/kmath_sim.py` (`tests/operators/test_kmath.py`) |
+| `src/artlite/operators/kmath/` | math functions generated per contract, a module per family and its C++ as `.cc.jinja` files (`km` in every template: exp2, recip, expm1, softplus, sigmoid, silu; arrays through the gather LUT: `act`, `table_pass` and the tables (`acttable.py`: their host fit); `silu_tanh`), each variant's bit-exact numpy model in `tests/operators/kmath_sim.py` (`tests/operators/test_kmath.py`) |
 | `src/artlite/operators/paging.py` | code pages: core programs beyond 16 KB of program memory, loaded by the cores themselves (the page linker and its checks, page streams, the pager's kernel source) |
 | `src/artlite/operators/fused/` | several designs in one ELF: `FusedOperator` (a runlist in one dispatch), `Library` (programs assembled on the host: `program`; their configurations' tile writes as control packets: `ctrlpkt`; fewer configuration operations: `prune`; BD writes the registers hold left out: `bdelide`; after a piece's first, without the array reset: `quiet`, `locks`) |
 | `src/artlite/include/` | the kernels' headers: `operators.h` (loop-pragma macros; the precompiled header of every kernel), `kernel_lib.h` (shared kernel helpers, namespace `al`) |
@@ -144,7 +144,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
     never C++ in Python strings;
   - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
   - `get_arg_spec()`: buffer directions, shapes, dtypes.
-- Reuse the shared pieces instead of copying (`artlite/operators/`, the headers in `artlite/include/`): `kmath.py`
+- Reuse the shared pieces instead of copying (`artlite/operators/`, the headers in `artlite/include/`): `kmath/`
   (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a template; arrays through the gather LUT:
   `km.act(km.SILU)`, `km.table_pass`), `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles, vectors from 128-bit
   pieces: `al::concat`, `al::gather`), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction
@@ -233,7 +233,7 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
 - Refactoring check: `pytest tests --dump-designs DIR` before and after, then
   `python tests/design_diff.py BEFORE AFTER --asm` (identical MLIR; changed kernel sources compile to the same
   asm). The apps' full designs are dumped too (`test_app_designs.py`); the slow tests are not. A change of shared
-  kernel code (`kmath.py`, `include/kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
+  kernel code (`kmath/`, `include/kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
   BEFORE before the change, `--partial --asm` after (`design_diff.py`'s docstring); on the NPU then only the tests of
   the designs whose code changed.
 - Host-side refactoring check (the overlays' step building and patching, metadata and command writes, weight

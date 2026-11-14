@@ -2,7 +2,7 @@
 
 What the vector unit does natively, how to get fp32-level results from bf16 operations, and the
 accuracy traps met in Artlite's models. The helpers live in `include/kernel_lib.h`
-(namespace `al`: exact building blocks) and `operators/kmath.py` (`km.exp2`, `km.recip`, `km.sigmoid`, ...: generated per
+(namespace `al`: exact building blocks) and `operators/kmath/` (`km.exp2`, `km.recip`, `km.sigmoid`, ...: generated per
 contract, each variant tested on the NPU bit-exact against its numpy model, `tests/operators/kmath_sim.py`, which also
 models the fp32 adder, bf16 rounding and the hi / lo products for precision studies).
 
@@ -61,7 +61,7 @@ x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
 |---|---|---|---|
 | `vexp2` | 16 | mv | the chord 2^n (1 + f) between integer powers: up to +6% on bf16 inputs, 15% on fp32 |
 | `vtanh` | 16 | mv | coarse (max 8.5% rel.); returns its argument below |x| = 0.5; bf16 saturation near 1 |
-| gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`km.act`, `kmath.py`) |
+| gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`km.act`, `kmath/`) |
 
 - vexp2 is Schraudolph's exp bit for bit (probed over every bf16 and fp32 accumulators): bits = floor(128 y) +
   16256, for y < 0 16255 - trunc(128 |y|) (one's complement), y the argument truncated to bf16 (steps of 1/4 from

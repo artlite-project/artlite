@@ -1,0 +1,56 @@
+{% if not table_arg %}
+alignas(64) static const uint32_t {{ name }}_ab[{{ words | length }}] __attribute__((section(".aie.bank0.{{ name }}"))) = { {{ words | join(", ") }} };
+{% if copies == 2 %}
+alignas(64) static const uint32_t {{ name }}_cd[{{ words | length }}] __attribute__((section(".aie.bank1.{{ name }}"))) = { {{ words | join(", ") }} };
+{% endif %}
+
+{% endif %}
+// y = c0 + c1 r + c2 r^2{{ " + max(x, 0) of t = min(|x|, %d)" % (t_max | float | int) if not full else " of t = x clamped to +-%d" % (t_max | float | int) }} (kmath.table_pass, {{ table }}'s table; in t_ and t2_: y, read before it
+// is written){{ "; x: groups of %d vectors of 32, %d apart" % walk if walk != (1, 32) }}
+{{ "template <int N>" if not n }}
+{{ attr }} void {{ name }}(const bfloat16 *__restrict x, const bfloat16 *__restrict t_, const bfloat16 *__restrict t2_,
+                {{ T }} *__restrict y{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if table_arg }})
+{
+    const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f);
+    const aie::accum<accfloat, 32> k(aie::broadcast<float, 32>({{ M }}f));
+{% if table_arg %}
+    const v16int32 base = ::sel(broadcast_s32((long)tab_ab - {{ bias }}), broadcast_s32((long)tab_cd - {{ bias }}), 0xCCCC);
+{% elif copies == 2 %}
+    const v16int32 base = ::sel(broadcast_s32((long){{ name }}_ab - {{ bias }}), broadcast_s32((long){{ name }}_cd - {{ bias }}),
+                                0xCCCC);
+{% else %}
+    const v16int32 base = broadcast_s32((long){{ name }}_ab - {{ bias }});
+{% endif %}
+{{ wx.decl }}
+    const bfloat16 __aie_dm_resource_d *__restrict px = (const bfloat16 __aie_dm_resource_d *)x;
+    const bfloat16 __aie_dm_resource_a *__restrict pt = (const bfloat16 __aie_dm_resource_a *)t_;
+    const bfloat16 __aie_dm_resource_c *__restrict pt2 = (const bfloat16 __aie_dm_resource_c *)t2_;
+    {{ T }} __aie_dm_resource_b *__restrict py = ({{ T }} __aie_dm_resource_b *)y;
+    // (a full table's pass post-RA only: II 12, pipelined first 27; the others' II 14, post-RA only 21)
+    {{ "AIE_PREPARE_FOR_POSTPIPELINING " if post }}AIE_LOOP_REG_REWRITE_SWPAWARE
+    for (int j = 0; j < {{ n or "N" }} / 32; j++) {
+        const aie::vector<bfloat16, 32> t = aie::load_v<32>(pt);
+        const aie::vector<bfloat16, 32> t2 = aie::load_v<32>(pt2);
+        const aie::vector<bfloat16, 32> v = aie::mac(k, t, one).template to_vector<bfloat16>();  // t on the grid
+        v32bfloat16 q0, q1, q2, q3;
+        {{ lut16 }}(::add(base, bfloat16_to_int(v.extract<16>(0), {{ shift }})), q0, q1);
+        {{ lut16 }}(::add(base, bfloat16_to_int(v.extract<16>(1), {{ shift }})), q2, q3);
+        const aie::vector<bfloat16, 32> r = aie::mac(aie::msc(k, v, one), t2, one).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 32> r2 = aie::mul(r, r).template to_vector<bfloat16>();
+        const v32bfloat16 s0 = ::shuffle(q0, q1, T16_16x4_lo);  // c2 | c1 of lanes 0-15
+        const v32bfloat16 s1 = ::shuffle(q2, q3, T16_16x4_lo);
+        aie::accum<accfloat, 32> acc;
+        acc.insert(0, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q0, q1, T32_16x2_hi)));  // c0
+        acc.insert(1, aie::accum<accfloat, 16>((v16accfloat)::shuffle(q2, q3, T32_16x2_hi)));
+        acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_hi)), r);
+        acc = aie::mac(acc, aie::vector<bfloat16, 32>(::shuffle(s0, s1, T256_2x2_lo)), r2);
+{% if not full %}
+        acc = aie::mac(acc, aie::max(aie::load_v<32>(px), aie::zeros<bfloat16, 32>()), one);
+{% endif %}
+        aie::store_v(py, acc.template to_vector<{{ T }}>());
+        {{ wx.step }}
+        pt += 32;
+        pt2 += 32;
+        py += 32;
+    }
+}

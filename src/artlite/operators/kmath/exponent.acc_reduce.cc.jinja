@@ -1,0 +1,5 @@
+{% from "exponent.acc_steps.cc.jinja" import reduce with context %}
+// {{ whole }}'s first step: P = 2^(round(y) + 64) (bf16, exact), f = y - round(y) of A = y + 192
+{{ attr }} void {{ name }}(aie::accum<accfloat, {{ N }}> A, aie::vector<bfloat16, {{ N }}> &P, aie::vector<bfloat16, {{ N }}> &f)
+{
+{{ reduce(N, "P", "f") }}}

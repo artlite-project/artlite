@@ -1,0 +1,16 @@
+// silu(x) for |x| < 2.5 as u + s (P0 + P1 s + P2 s^2), s = u^2, u = x / 2 (tanh(u) / u fitted in bf16 arithmetic); x
+// again through xr (a second load of the same data, not merged with x's by the compiler: shorter lifetimes, II 10
+// instead of 14-18) and xm (the select's). Returns y where |x| >= 2.5.
+{{ attr }} aie::vector<bfloat16, 32> {{ name }}(aie::vector<bfloat16, 32> x, aie::vector<bfloat16, 32> xr,
+                                             aie::vector<bfloat16, 32> xm, aie::vector<bfloat16, 32> y)
+{
+    const aie::vector<bfloat16, 32> kh = aie::broadcast<bfloat16, 32>(0.5f);
+    const aie::vector<bfloat16, 32> p0 = aie::broadcast<bfloat16, 32>(0.99609375f);
+    const aie::vector<bfloat16, 32> p2 = aie::broadcast<bfloat16, 32>(0.06298828125f);
+    const aie::accum<accfloat, 32> p1 = aie::accum<accfloat, 32>(aie::broadcast<float, 32>(-0.30078125f));
+    aie::vector<bfloat16, 32> u = aie::mul(x, kh).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> s = aie::mul(u, u).template to_vector<bfloat16>();
+    aie::accum<accfloat, 32> acc = aie::mac(aie::mul(xr, kh), s, p0);
+    acc = aie::mac(acc, aie::mul(s, s).template to_vector<bfloat16>(), aie::mac(p1, s, p2).template to_vector<bfloat16>());
+    return aie::select(y, acc.template to_vector<bfloat16>(), aie::lt(aie::abs(xm), aie::broadcast<bfloat16, 32>(2.5f)));
+}

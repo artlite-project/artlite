@@ -1,0 +1,32 @@
+{% macro reduce(N, out_P, out_f) %}
+    const aie::vector<bfloat16, {{ N }}> one = aie::broadcast<bfloat16, {{ N }}>(1.0f);
+{% if below == "clamp" and above == "none" %}
+    const aie::vector<bfloat16, {{ N }}> v = aie::max(A.template to_vector<bfloat16>(), aie::broadcast<bfloat16, {{ N }}>(129.0f));
+    {{ out_f }} = aie::max(aie::msc(A, v, one).template to_vector<bfloat16>(), aie::broadcast<bfloat16, {{ N }}>(-0.5f));
+{% elif below == "none" and above == "none" %}
+    const aie::vector<bfloat16, {{ N }}> v = A.template to_vector<bfloat16>();
+    {{ out_f }} = aie::msc(A, v, one).template to_vector<bfloat16>();
+{% else %}
+    const aie::vector<bfloat16, {{ N }}> v0 = A.template to_vector<bfloat16>();
+{% if above == "clamp" %}
+    {{ out_f }} = aie::min(aie::max(aie::msc(A, v0, one).template to_vector<bfloat16>(), aie::broadcast<bfloat16, {{ N }}>(-0.5f)),
+                  aie::broadcast<bfloat16, {{ N }}>(0.5f));
+{% else %}
+    {{ out_f }} = aie::msc(A, v0, one).template to_vector<bfloat16>();
+{% endif %}
+{% set v = "aie::max(v0, aie::broadcast<bfloat16, " ~ N ~ ">(128.0f))" if below != "none" else "v0" %}
+    const aie::vector<bfloat16, {{ N }}> v = {{ "aie::min(" ~ v ~ ", aie::broadcast<bfloat16, " ~ N ~ ">(255.0f))" if above == "clamp" else v }};
+{% endif %}
+    {{ out_P }} = al::exp2_acc<{{ N }}>(aie::mac(aie::mul(v, one), aie::broadcast<bfloat16, {{ N }}>(-128.0f), one));
+{% endmacro %}
+{% macro poly(N, P, f) %}
+{% set s = "" if shift else " * 0x1p-64f" %}
+    const aie::vector<bfloat16, {{ N }}> hi = aie::mac(aie::mul({{ f }}, aie::broadcast<bfloat16, {{ N }}>({{ c[2] }}f{{ s }})),
+                                               aie::broadcast<bfloat16, {{ N }}>({{ c[1] }}f{{ s }}), one)
+                                          .template to_vector<bfloat16>();
+    const aie::vector<bfloat16, {{ N }}> pf = aie::mul({{ P }}, {{ f }}).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, {{ N }}> pf2 = aie::mul(pf, {{ f }}).template to_vector<bfloat16>();
+    aie::accum<accfloat, {{ N }}> r = aie::mul({{ P }}, {{ "one" if shift else "aie::broadcast<bfloat16, " ~ N ~ ">(0x1p-64f)" }});
+    r = aie::mac(r, pf, aie::broadcast<bfloat16, {{ N }}>({{ c[0] }}f{{ s }}));
+    return aie::mac(r, pf2, hi);
+{% endmacro %}

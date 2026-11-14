@@ -1,0 +1,7 @@
+// e^(-|x|) of {{ N }} fp32 lanes (kmath.expneg, in (0, 1]: {{ bound }} for x in [-87, 87]; the error of x log2 e, ~2^-16
+// relative, grows with |x|: 2^-15.8 for |x| <= 1)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    const aie::vector<float, {{ N }}> ax = aie::max(x, aie::sub(aie::zeros<float, {{ N }}>(), x));
+    return {{ exp2 }}(al::log2e<{{ N }}>(aie::sub(aie::zeros<float, {{ N }}>(), ax)));
+}
