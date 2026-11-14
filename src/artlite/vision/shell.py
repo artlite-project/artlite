@@ -102,6 +102,10 @@ class EmbeddingCache:
         self.t_encode += seconds
         self.entries += count
 
+    def clear(self) -> None:
+        """Forget the kept embeddings: the next input runs the encoder again."""
+        self._kept.clear()
+
 
 # -- loading
 

@@ -118,6 +118,6 @@ def test_app_image_prompt(case: tuple) -> None:
     got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
     kl, agree = kl_report("the NPU encoder, prefill", want, got, where=" at the official positions")
     assert kl < 0.016 and agree > 0.9
-    app.vision._kept.clear()
+    app.vision.results.clear()
     again, _ = app.vision.embeddings(im)
     assert np.array_equal(first, again)
