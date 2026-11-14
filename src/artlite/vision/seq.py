@@ -170,13 +170,19 @@ class Seq:
         q = self._ch[key].pending
         q[-1] = (q[-1][0], push)
 
+    def _rewrite(self, col: int, bid: int, words: list[int]) -> None:
+        """Writes a memtile BD's words once its last user is complete (raises ``HardwareLimitError`` otherwise)."""
+        mem = self._mem[col]
+        if (u := mem.user[bid]) is not None:
+            self.complete(u)
+            if u >= self.frontier:
+                raise HardwareLimitError(f"memtile column {col} BD {bid}: rewritten while its last user, op {u}, runs")
+        self.t.mem_bd(col, bid, words)
+        mem.held[bid] = words
+
     def check(self) -> None:
-        """The sequencer's invariants (raises ``HardwareLimitError``): no channel has more tasks pending than its queue
-        holds, a memtile BD whose words the transaction rewrote has a complete last user, and the handover locks'
-        counts fit."""
-        for key, ch in self._ch.items():
-            if len(ch.pending) > txn.QUEUE_DEPTH:
-                raise HardwareLimitError(f"channel {key}: {len(ch.pending)} tasks pending, its queue holds {txn.QUEUE_DEPTH}")
+        """The handover locks' counts fit (raises ``HardwareLimitError``): a column's producers since its last gate
+        stay below a lock's count. The queue depth is kept by ``_slot`` and the BDs' rewrites by ``_rewrite``."""
         for c, p in enumerate(self._prod):
             if p >= 64:
                 raise HardwareLimitError(f"column {c}: {p} producers since its last gate, a lock counts to 63")
@@ -210,10 +216,7 @@ class Seq:
             words_l = linked(ids)
             for bid, words in zip(ids, words_l, strict=True):
                 if held[bid] != words:
-                    if (u := users[bid]) is not None:
-                        self.complete(u)
-                    self.t.mem_bd(col, bid, words)
-                    held[bid] = words
+                    self._rewrite(col, bid, words)
             for k in [k for k, (i, _) in cache.items() if not set(i).isdisjoint(ids)]:
                 del cache[k]
             cache[ck] = (ids, words_l)
@@ -231,10 +234,7 @@ class Seq:
         bid = D.GATE_BDS[op % len(D.GATE_BDS)]
         mem = self._mem[col]
         if mem.held[bid] != words:
-            if (u := mem.user[bid]) is not None:
-                self.complete(u)
-            self.t.mem_bd(col, bid, words)
-            mem.held[bid] = words
+            self._rewrite(col, bid, words)
         mem.user[bid] = op
         push = self.t.mem_push(col, txn.MM2S, 5, bid)
         self._pushed(key, push)

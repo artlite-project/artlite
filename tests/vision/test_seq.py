@@ -77,15 +77,23 @@ def test_a_role_page_enters_once() -> None:
     assert [bool(r) for r in runs[:ROWS * 6:ROWS]] == [True, False, True, False, False, False]
 
 
-def test_check_refuses_a_broken_queue() -> None:
-    """A fifth pending task on a channel, or a lock counting past 63, fails the check."""
+def test_check_refuses_a_broken_lock_count() -> None:
+    """A lock counting past 63 fails the check."""
     s = Seq(nop=NOP)
     s.op(op_cols(1), b_rows(None, 2))
-    ch = s._channel((1, 0, txn.MM2S, 0))
-    ch.pending.extend([(s.n, -1)] * txn.QUEUE_DEPTH)
-    with pytest.raises(HardwareLimitError, match="pending"):
-        s.check()
-    ch.pending.clear()
     s._prod[2] = 64
     with pytest.raises(HardwareLimitError, match="counts to 63"):
         s.check()
+
+
+def test_rewrite_completes_the_last_user() -> None:
+    """A memtile BD is rewritten only after its last user is complete."""
+    s = Seq(nop=NOP)
+    for _ in range(3):
+        s.op(op_cols(1), b_rows(None, 2))
+    mem = s._mem[0]
+    bid = min((b for b, u in enumerate(mem.user) if u is not None), key=lambda b: mem.user[b])
+    u = mem.user[bid]
+    assert u is not None and u + 1 < s.n
+    s._rewrite(0, bid, [0] * 8)
+    assert s.frontier > u and mem.held[bid] == [0] * 8

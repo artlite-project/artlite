@@ -73,5 +73,5 @@ def test_win_attention() -> None:
     """A window attention's KV heads' stride comes from its image's units: none is not a zero stride."""
     at = WinAttention(q=0, o=0, mask=0, kv=0, image_units=8)
     assert at.kv_head_bytes == WinAttention.kv_image(8) // 4 > 0
-    with pytest.raises(AssertionError, match="image"):
+    with pytest.raises(ValueError, match="image"):
         WinAttention(q=0, o=0, mask=0, kv=0, image_units=0)

@@ -35,6 +35,7 @@ class DwConv:
     y_np: int = 8
 
     SLOT = D.A_OBJ // 2
+    KB = 10  # k blocks of an 80-channel block's panels
 
     def slot(self, r: int, p: int, q: int) -> int:
         return self.stage + ((r * 2 + p) * 4 + q) * self.SLOT
@@ -43,7 +44,8 @@ class DwConv:
 
     def __post_init__(self) -> None:
         check_memtile(self.stage, self.STAGE_BYTES, "a depthwise conv's staging")
-        check_memtile(self.y, (10 * (4 * (ROWS - 1) + self.k) + 10) * self.y_np * L.PANEL, "a depthwise conv's output panels")
+        panels = self.KB * (4 * (ROWS - 1) + self.k) + self.KB
+        check_memtile(self.y, panels * self.y_np * L.PANEL, "a depthwise conv's output panels")
 
     def command(self) -> np.ndarray:
         return Command(K.K_DW).bytes()

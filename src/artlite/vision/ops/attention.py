@@ -242,7 +242,8 @@ class WinAttention:
     ND, GROUPS = 20, 4
 
     def __post_init__(self) -> None:
-        assert self.image_units >= self.units > 0, f"the layer's image of {self.image_units} units holds {self.units}"
+        if not self.image_units >= self.units > 0:
+            raise ValueError(f"the layer's image of {self.image_units} units holds {self.units}")
         self.kv_head_bytes = self.kv_image(self.image_units) // ROWS  # (a KV head's units in the image)
 
     def command(self) -> np.ndarray:
@@ -269,7 +270,8 @@ class WinAttention:
         image again) and outputs ([qp 2][d-block 20] -> kb 20 (2 r + qp) + db)."""
         co = ColOps()
         kb = self.np * 18  # (words of a kb)
-        assert self.gate is None or self.units <= 2, "the gates of one m-16 tile"
+        if self.gate is not None and self.units > 2:
+            raise ValueError("the gates of one m-16 tile")
         for r in range(ROWS):
             h0 = 2 * r * self.ND * kb
             tail = [{"addr": self.mask, "nwords": D.A_OBJ // 8, "iteration": (32, self.units)}] if self.gate is None else [

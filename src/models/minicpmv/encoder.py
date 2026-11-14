@@ -365,11 +365,11 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         sd = (36, C // 8, 144, C // 8 * 36)  # (per kb its two panels' 36 words, 576 B apart)
         for r in ("q", "k", "v"):  # (an op per role: a memtile channel's pool holds 8 BDs)
             bd.op(bd.merge(*[bd.fill(f"{name}.{r}.{s}", pn, mem=base[r] + s * (src + pad), nbytes=src,
-                                   off=2 * j * 72, sdims=sd) for s in range(4)]), {})
+                                     off=2 * j * 72, sdims=sd) for s in range(4)]), {})
         wa = WindowAttention(q=base["q"], k=base["k"], vt=base["v"], o=base["o"], stride=src + pad)
         bd.op({c: wa.col_ops() for c in range(COLS)}, wa.row_ops(bd.image(name + ".wcmd", wa.command())))
         drains = [bd.drain(f"{name}.o.{s}", pn, mem=base["o"] + s * (src + pad), nbytes=src,
-                        off=2 * j * 72, sdims=sd) for s in range(4)]
+                           off=2 * j * 72, sdims=sd) for s in range(4)]
         bd.op(bd.merge(*drains), {})
         for a in base.values():
             bd.mem.release(a, 4 * (src + pad))
@@ -399,7 +399,7 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         bd.mem.release(rec, ln_rec(l16))
         free(bd, mc)
         bd.op(bd.merge(bd.drain(name + ".nl", pn64, mem=nl.addr, nbytes=pn16, off=2 * j * 72,
-                             sdims=(36, MERGED // 8, 144, MERGED // 8 * 144)),
+                                sdims=(36, MERGED // 8, 144, MERGED // 8 * 144)),
                        bd.drain(name + ".xp", 4 * pn16, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
         free(bd, nl)
         free(bd, xp)
@@ -424,7 +424,7 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         hid = alloc(bd, l16, HID, "pn", top=True)  # (directly below xp: the down GEMM's K is [hidden | xp])
         assert hid.addr + hid.size == xp.addr, (hid.addr, hid.size, xp.addr)
         bd.op(bd.merge(bd.fill(name + ".hid", hb, mem=hid.addr, nbytes=hid.nbytes, off=2 * j * 72,
-                             sdims=(36, HID // 24, 144, HID // 24 * 144)),
+                               sdims=(36, HID // 24, 144, HID // 24 * 144)),
                        bd.fill(name + ".xp", 4 * pn16, mem=xp.addr, nbytes=pn16, off=j * pn16)), {})
         y = alloc(bd, l16, C)
         gemm(bd, Tensor(l16, HID + MERGED, hid.addr, "pn"), w["down"], w["down_b"], name=name + ".down", out=y)
@@ -433,7 +433,7 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         bd.mem.release(spare, 4096)
         ct16 = l16.ct(80)
         bd.op(bd.drain(y2.band(0), ct, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
-                    mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
+                       mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
         free(bd, y)
     xt = alloc(bd, lp, C)
     bd.op(bd.fill(y2.band(0), ct, mem=xt.addr, nbytes=ct), {})
@@ -475,7 +475,7 @@ def _merged(bd: Builder, src: list[tuple[str, int]], name: str) -> Tensor:
     ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
     mc = alloc(bd, l16, MERGED)
     bd.op(bd.merge(*[bd.fill(img, ct, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=tp * 1280,
-                           mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
+                             mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
                      for s, (img, tp) in enumerate(src)]), {})
     return mc
 
