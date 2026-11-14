@@ -36,10 +36,11 @@ def test_parse() -> None:
         P.parse("gate_up=3")
 
 
-def _machine(base: dict[int, float], trip: dict[int, float], slow: float = 2.3
+def _machine(base: dict[int, float], trip: dict[int, float], slow: float = 2.3, bound: dict[int, float] | None = None
              ) -> tuple[Callable[[list[int] | None, int], float], list]:
     """measure() of a machine: class c's items take base[c] / duty, times ``slow`` while the duty is above trip[c]
-    (no throttle: trip 1)."""
+    (no throttle: trip 1); ``bound``: a class's floor (its time when the paced core is not what bounds it, as a planar
+    GemmQd's dequantizing cores: pacing hardly changes it)."""
     calls = []
 
     def measure(classes: list[int] | None, word: int) -> float:
@@ -48,18 +49,43 @@ def _machine(base: dict[int, float], trip: dict[int, float], slow: float = 2.3
         total = 0.0
         for c in classes or sorted(base):
             duty = 16 / (16 + PACE_IDLE[levels.get(c, 0)])
-            total += base[c] / duty * (slow if duty > trip[c] else 1.0)
+            total += max(base[c] / duty, (bound or {}).get(c, 0.0)) * (slow if duty > trip[c] else 1.0)
         return total
 
     return measure, calls
 
 
 def test_search_unthrottled() -> None:
-    """Nothing throttles: the quick check of the heaviest class, every level 0."""
+    """Nothing throttles: each class at level 0 and the probe levels, every level 0, a note that says so."""
     gu, qkv = pace_class("gu", False), pace_class("qkv", False)
     measure, calls = _machine({gu: 36.0, qkv: 9.0}, {gu: 1.0, qkv: 1.0})
-    levels, table = P.search([gu, qkv], measure)
-    assert levels == {} and len(calls) == 1 + len(P.QUICK) and table["quick"]["class"] == "gu"
+    notes: list[str] = []
+    levels, table = P.search([gu, qkv], measure, notes.append)
+    assert levels == {} and len(calls) == 2 * (1 + len(P.PROBE)) and "all" not in table
+    assert all(e["level"] == 0 for e in table["classes"].values())
+    assert len(notes) == 1 and "unthrottled" in notes[0] and "unpaced" in notes[0]
+
+
+def test_search_largest_never_trips() -> None:
+    """A class with as much work as the largest, first, never trips and pacing hardly changes its time (Llama 3.1 8B
+    Q4_K_M's Q6_K down, Qwen3.8 27B Q4_K_M's Q6_K qkv: a planar GemmQd's dequantizing cores bound it); the others trip
+    at full rate: they are found and paced, it stays at 0."""
+    gu, qkv, down6 = pace_class("gu", False), pace_class("qkv", False), pace_class("down", True)
+    measure, _ = _machine({gu: 118.0, qkv: 6.2, down6: 30.0}, {gu: 0.95, qkv: 0.95, down6: 1.0},
+                          bound={down6: 117.0})
+    notes: list[str] = []
+    levels, table = P.search([down6, gu, qkv], measure, notes.append)
+    assert levels == {gu: 1, qkv: 1} and table["classes"]["down.planar"]["level"] == 0
+    assert "throttles" in notes[0] and "down.planar" not in notes[0] and notes[-1] == "paced: qkv 1, gu 1"
+
+
+def test_search_deep_trip() -> None:
+    """A stricter board: level 1 still trips, the probe at level 5 finds the throttle, the scan the fastest level."""
+    gu = pace_class("gu", False)
+    measure, _ = _machine({gu: 36.0}, {gu: 0.7})
+    levels, _ = P.search([gu], measure)
+    duty = [16 / (16 + i) for i in PACE_IDLE]
+    assert levels == {gu: next(L for L, d in enumerate(duty) if d <= 0.7)}
 
 
 def test_search_throttled() -> None:
@@ -101,6 +127,29 @@ def test_search_deeper_together() -> None:
     first = next(L for L, d in enumerate(duty) if d <= 0.9)
     assert duty[first] > 0.85 and levels == {gu: first + 1, qkv: first + 1}
     assert table["all"]["s"]["deeper"] < table["all"]["s"]["levels"]
+
+
+def test_pick() -> None:
+    """A class's items: one of each distinct GEMM first, then round robin, each GEMM's items one after the other."""
+    a, b, c = [("a", i) for i in range(5)], [("b", i) for i in range(3)], [("c", 0)]
+    assert P.pick([a, b, c], 4) == [("a", 0), ("a", 1), ("b", 0), ("c", 0)]
+    assert P.pick([a, b, c], 2) == [("a", 0), ("b", 0), ("c", 0)]  # (every GEMM at least once)
+    assert P.pick([c], 4) == [("c", 0)] and P.pick([a], 4) == a[:4]
+
+
+def test_item_params() -> None:
+    """A whole-chunk GEMM's item reads its token chunks (an MoE layer's router: ``moe_t``), in ``mc_unit`` tokens
+    or the cores' own chunks; other GEMMs' read none."""
+    from types import SimpleNamespace
+
+    from artlite.gemm.gemm_q import GemmQOperator
+    from artlite.moe import gemm as MG
+
+    def op(**kw: object) -> SimpleNamespace:
+        return SimpleNamespace(**{"mc_param": "", "M": 1024, "mc_unit": 0, "nrows": 2, "m": 64, **kw})
+
+    assert GemmQOperator.item_params(op(mc_param=MG.CHUNK_PARAM, mc_unit=MG.CHUNK_UNIT)) == {MG.CHUNK_PARAM: 4}
+    assert GemmQOperator.item_params(op(mc_param="n")) == {"n": 8} and GemmQOperator.item_params(op()) == {}
 
 
 def test_activations() -> None:

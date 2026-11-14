@@ -363,11 +363,14 @@ def main(argv: list[str] | None = None) -> None:
             for p in printers:
                 p.test(r)
                 p.out.flush()
-        if (pf := npu.prefill) is not None and pf.pace:
-            why = (settings.PACE.name if pace.parse(settings.PACE.get()) is not None else
-                   "calibrated: this machine throttles them at full rate")
-            sys.stderr.write(f"artlite-bench: {name}: the prefill's dense GEMMs ran paced ({pace.describe(pf.pace)}; "
-                             f"{why}; docs/probe.md, PROCHOT)\n")
+        if (pf := npu.prefill) is not None and pf.paced and pf.pace is not None:
+            pinned = pace.parse(settings.PACE.get()) is not None
+            if pf.pace:
+                why = settings.PACE.name if pinned else "calibrated: this machine throttles them at full rate"
+                ran = f"paced ({pace.describe(pf.pace)}; {why}; docs/probe.md, PROCHOT)"
+            else:
+                ran = f"unpaced ({settings.PACE.name if pinned else 'calibrated: nothing throttles them here'})"
+            sys.stderr.write(f"artlite-bench: {name}: the prefill's dense GEMMs ran {ran}\n")
         del model, npu, tokens
         gc.collect()  # (the model's NPU buffers and context before the next model's)
     for p in printers:

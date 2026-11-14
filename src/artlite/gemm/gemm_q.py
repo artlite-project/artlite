@@ -262,6 +262,11 @@ class GemmQOperator(ArtcOperator):
         """``mc_param``'s handle for the workers (None without it)."""
         return ScratchpadParameter(self.mc_param, np.int32) if self.mc_param else None
 
+    def item_params(self) -> dict[str, int]:
+        """The scratchpad parameters an item of this GEMM over its M tokens reads besides ``PACE``: ``mc_param``'s
+        token chunks (none without it)."""
+        return {self.mc_param: self.M // (self.mc_unit or self.nrows * self.m)} if self.mc_param else {}
+
     def _pace_vars(self) -> dict[str, object]:
         return {"pace": self.pace, "pace_idle": hex(sum(v << 8 * i for i, v in enumerate(PACE_IDLE))),
                 "pace_cap": PACE_CAP}

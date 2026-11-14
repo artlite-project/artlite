@@ -2,18 +2,25 @@
 laptops asserts PROCHOT while those GEMMs run at full rate, and the whole SoC then runs at its lowest clocks (a Krackan
 Point laptop's Q4_K GEMMs 2.3x slower, on any power source), while at a lower duty they run unthrottled.
 
-``resolve`` finds a prefill's ``PACE`` word by timing, once per machine, power source and library (``CACHE``): the
-heaviest pace class (by its items' MACs) at levels 0 and ``QUICK``; if none of those runs clearly faster than
-level 0 (``GAIN``), nothing throttles and every level stays 0 (two or three runs of the class's items: ~0.1-0.3 s).
-Else each class from level 0 up keeps the fastest level (``MARGIN``: a higher level only when clearly faster; the scan
-stops two levels past a level faster than 0), and the GEMMs of all classes together confirm them: those levels or every
+``resolve`` finds a prefill's ``PACE`` word by timing, once per machine, power source, platform profile and library
+(``CACHE``). Every pace class runs alone at level 0 and at the ``PROBE`` levels: a throttle is a class's own (that
+laptop's Q4_K GEMMs trip it, the Q6_K ones beside them do not, and pacing hardly changes their time), so no class stands
+for the others, not even one with the most work (Llama 3.1 8B Q4_K_M's Q6_K down and Qwen3.8 27B Q4_K_M's Q6_K qkv take
+as long as their Q4_K gate / up). A class with a paced level clearly faster than level 0 (``GAIN``) is throttled: it
+keeps its fastest level from level 1 up (``MARGIN``: a higher level only when clearly faster; the scan stops two levels
+past the fastest), the others stay at 0. The GEMMs of all classes together then confirm them: those levels or every
 class one level deeper (when clearly faster: classes unthrottled alone can still trip it together), against level 0.
-The items are a chunk's GEMMs (``T``) on random activations (``activations``), with their outputs in a scratch buffer:
-calibrating never writes the prefill's or the overlay's buffers. The activations matter: the array's current follows
-its operands' bits (Strix Halo, the 1B's gate/up at the same speed: 26-29 W socket power on zeros, 35-36 on random or a
-prompt's activations), and the prefill's buffers hold zeros until a first chunk, on which a throttling laptop's GEMMs
-run unthrottled. GEMMs that read a parameter of the chunk (``mc_param``: an MoE layer's token chunks) run paced at
-their class's level, not in the calibration.
+Where nothing throttles, the probes are all (three measurements per class: about a second). Timing, not the SMU's
+PROCHOT residency: the pace is for speed, timing works where ``gpu_metrics`` is missing (Windows), and that counter
+advances every ~10 ms, coarse for runs of a few tens of ms.
+
+The items are a chunk's GEMMs (``T``), a few per class (``ITEMS``: each distinct GEMM first; one trips it within about
+a millisecond, and a measurement's runs follow each other), on random activations (``activations``), with their
+outputs in a scratch buffer: calibrating never writes the prefill's or the overlay's buffers. The activations matter:
+the array's current follows its operands' bits (Strix Halo, the 1B's gate/up at the same speed: 26-29 W socket power on
+zeros, 35-36 on random or a prompt's activations), and the prefill's buffers hold zeros until a first chunk, on which a
+throttling laptop's GEMMs run unthrottled. GEMMs that read a parameter of the chunk (``mc_param``: an MoE layer's
+router and shared expert over the whole chunk) run with their item's (``item_params``).
 
 ``ARTLITE_PACE``: unset or ``auto`` (the cached or calibrated levels), ``off`` (level 0), ``recalibrate`` (calibrate
 again), or levels: ``<class>=<level>`` by ``PACE_CLASSES`` name, comma-separated, or one level for every class (e.g.
@@ -40,11 +47,13 @@ from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
 
 CACHE = os.path.join(CACHE_DIR, "pace.json")
-VERSION = 2  # (of the calibration: a cached entry of another version calibrates again)
+VERSION = 3  # (of the calibration: a cached entry of another version calibrates again)
 T_MAX = 1024  # tokens of the chunk whose GEMMs calibrate (the largest size up to it)
-ITEMS = 16  # items of a class at most
-QUICK = (3, 5)  # levels against level 0 of the heaviest class: a throttle shows as a faster paced run
-GAIN = 0.9  # a paced run this much of level 0's time or less: the platform throttles
+ITEMS = 4  # items of a class (more where it has more distinct GEMMs: one of each)
+PROBE = (1, 5)  # levels every class runs at against level 0: a throttle shows as a faster paced run (1: the least
+# idle; 5, duty 0.55: about the deepest that can win, a paced GEMM there takes 1.7-1.8x its unthrottled time, a
+# throttled one 2.2-2.5x)
+GAIN = 0.9  # a paced run this much of level 0's time or less: the platform throttles the class
 MARGIN = 0.03  # a higher level is kept only when this much faster
 IDLE_S = 0.02  # idle before each measurement (a throttle's tail lets go: PROCHOT ~3 ms after a GEMM item)
 RUN_S = 0.03  # seconds of timed runs per measurement at least (3 runs at least)
@@ -84,13 +93,15 @@ def _read(path: str) -> str:
 
 
 def machine_key() -> str:
-    """The machine and its power source (the throttle can follow either)."""
+    """The machine, its power source and platform profile (the throttle can follow each: a laptop's limits follow its
+    profile)."""
     parts = [platform.node(), platform.processor() or platform.machine()]
     if platform.system() == "Linux":
         parts += [_read(f"/sys/class/dmi/id/{k}") for k in ("sys_vendor", "product_name", "bios_version")]
         mains = [_read(os.path.join(p, "online")) for p in glob.glob("/sys/class/power_supply/*")
                  if _read(os.path.join(p, "type")) in ("Mains", "USB")]
         parts.append("ac" if "1" in mains else "battery" if mains else "")
+        parts.append(_read("/sys/firmware/acpi/platform_profile"))
     return "|".join(parts)
 
 
@@ -114,44 +125,45 @@ def _store(key: str, entry: dict[str, Any]) -> None:
 
 def search(classes: list[int], measure: Callable[[list[int] | None, int], float],
            note: Callable[[str], None] = lambda text: None) -> tuple[dict[int, int], dict]:
-    """The levels per class (``classes``: the heaviest first) and the times behind them; ``measure(classes, word)``:
-    seconds per run of those classes' items at that PACE word (None: every class's items together); ``note``: told
-    when the scan starts (a throttle found) and its levels."""
-    table: dict[str, Any] = {}
-    heavy = classes[0]
-    t0 = measure([heavy], 0)
-    quick = {L: measure([heavy], pace_word({heavy: L})) for L in QUICK}
-    table["quick"] = {"class": PACE_CLASSES[heavy], "s": {0: t0, **quick}}
-    if min(quick.values()) > GAIN * t0:
+    """The levels per class and the times behind them; ``measure(classes, word)``: seconds per run of those classes'
+    items at that PACE word (None: every class's items together); ``note``: told what the probes found (a throttle or
+    none) and the levels."""
+    top = len(PACE_IDLE) - 1
+    times = {c: {L: measure([c], pace_word({c: L})) for L in (0, *PROBE)} for c in classes}
+    gain = {c: min(times[c][L] for L in PROBE) / times[c][0] for c in classes}  # (the best paced run / level 0's)
+    table: dict[str, Any] = {"classes": {PACE_CLASSES[c]: {"s": times[c], "level": 0} for c in classes}}
+    throttled = [c for c in classes if gain[c] <= GAIN]
+    if not throttled:
+        c = min(classes, key=gain.__getitem__)
+        note(f"the prefill's GEMMs run unthrottled on this machine: unpaced (no class faster paced; the closest, "
+             f"{PACE_CLASSES[c]}: {gain[c]:.2f} of level 0's time)")
         return {}, table
-    note(f"the platform throttles the prefill's GEMMs at full rate ({PACE_CLASSES[heavy]}: "
-         f"{min(quick.values()) / t0:.2f} of level 0's time paced): calibrating their pace (once, a few seconds)")
+    note("the platform throttles the prefill's GEMMs at full rate ("
+         + ", ".join(f"{PACE_CLASSES[c]} {gain[c]:.2f}" for c in throttled)
+         + " of level 0's time paced): calibrating their pace (once, a few seconds)")
     levels: dict[int, int] = {}
-    table["classes"] = {}
-    for c in classes:
-        times = {0: t0 if c == heavy else measure([c], 0)}
-        best = 0
-        for L in range(1, len(PACE_IDLE)):
-            times[L] = quick[L] if c == heavy and L in quick else measure([c], pace_word({c: L}))
-            if times[L] < times[best] * (1 - MARGIN):
+    for c in throttled:
+        t, best = times[c], 0
+        for L in range(1, top + 1):
+            if L not in t:
+                t[L] = measure([c], pace_word({c: L}))
+            if t[L] < t[best] * (1 - MARGIN):
                 best = L
-            elif best and L - best >= 2 and times[L] > times[best]:  # (past the fastest: the time rises from there,
+            elif best and L - best >= 2 and t[L] > t[best]:  # (past the fastest: the time rises from there,
                 break  # while above a trip point it rises too, then drops below it)
-        table["classes"][PACE_CLASSES[c]] = {"s": times, "level": best}
-        if best:
-            levels[c] = best
-    if levels:
-        deeper = {c: min(levels.get(c, 0) + 1, len(PACE_IDLE) - 1) for c in classes}
-        s = {"level 0": measure(None, 0), "levels": measure(None, pace_word(levels)),
-             "deeper": measure(None, pace_word(deeper))}
-        table["all"] = {"s": s}
-        t = s["levels"]
-        if s["deeper"] < t * (1 - MARGIN):
-            levels, t = deeper, s["deeper"]
-        if t > s["level 0"] * (1 - MARGIN):
-            note("paced, the GEMMs together are not faster: unpaced")
-            return {}, table
-    note(f"paced: {describe(pace_word(levels)) or 'none'}")
+        table["classes"][PACE_CLASSES[c]] = {"s": dict(sorted(t.items())), "level": best}
+        levels[c] = best  # (>= 1: a probe ran in GAIN of level 0's time)
+    deeper = {c: min(levels.get(c, 0) + 1, top) for c in classes}
+    s = {"level 0": measure(None, 0), "levels": measure(None, pace_word(levels)),
+         "deeper": measure(None, pace_word(deeper))}
+    table["all"] = {"s": s}
+    t = s["levels"]
+    if s["deeper"] < t * (1 - MARGIN):
+        levels, t = deeper, s["deeper"]
+    if t > s["level 0"] * (1 - MARGIN):
+        note("paced, the GEMMs together are not faster: unpaced")
+        return {}, table
+    note(f"paced: {describe(pace_word(levels))}")
     return levels, table
 
 
@@ -168,30 +180,47 @@ def activations(n: int, seed: int = 0) -> np.ndarray:
     return np.resize(blocks.reshape(-1), n)
 
 
-def _items(pf: Any) -> tuple[dict[int, list], dict[int, float], dict[str, Any], int]:
-    """Per pace class the calibration items of the prefill ``pf`` (its GEMMs' of chunk size ``T``, A and C in the
-    scratch buffers, A random ``activations``), their MACs, the buffers they address, T."""
+def pick(groups: list[list], n: int) -> list:
+    """Up to n entries of the groups (at least one of each), round robin from each group's first, kept in group order:
+    each group's picked entries one after the other."""
+    take = [0] * len(groups)
+    left = max(n, len(groups))
+    for k in range(max(map(len, groups), default=0)):
+        for g, entries in enumerate(groups):
+            if k < len(entries) and left:
+                take[g] += 1
+                left -= 1
+    return [e for g, entries in enumerate(groups) for e in entries[:take[g]]]
+
+
+def _items(pf: Any) -> tuple[dict[int, list], dict[str, int], dict[str, Any], int]:
+    """Per pace class the calibration items of the prefill ``pf`` (its GEMMs' of chunk size ``T``: ``ITEMS``, each
+    distinct GEMM first, with A in a scratch buffer of random ``activations`` and C in another), the scratchpad
+    parameters they read besides PACE (``item_params``), the buffers they address, T."""
     T = max([t for t in pf.sizes if t <= T_MAX] or [min(pf.sizes)])
-    runlist = [(op, f"PACE_A[0:{arg_bytes(op, 0)}]", w, f"PACE_C[0:{arg_bytes(op, 2)}]")
-               for op, _, w, *_ in pf.runlists[T]
-               if getattr(op, "pace", None) is not None and not op.mc_param]  # (mc_param: a chunk's own parameter)
-    by: dict[int, list] = {}
-    for item in runlist:
-        if len(by.setdefault(item[0].pace, [])) < ITEMS:
-            by[item[0].pace].append(item)
-    macs = {c: float(sum(op.M * op.K * op.N for op, *_ in rl)) for c, rl in by.items()}
+    by: dict[int, dict[int, list]] = {}  # (class -> the GEMM's id -> its items: runlist order)
+    for op, _, w, *_ in pf.runlists[T]:
+        if getattr(op, "pace", None) is not None:
+            item = (op, f"PACE_A[0:{arg_bytes(op, 0)}]", w, f"PACE_C[0:{arg_bytes(op, 2)}]")
+            by.setdefault(op.pace, {}).setdefault(id(op), []).append(item)
+    runlists = {c: pick(list(gemms.values()), ITEMS) for c, gemms in by.items()}
+    ops = [op for rl in runlists.values() for op, *_ in rl]
+    params: dict[str, int] = {}
+    for op in ops:
+        for name, value in op.item_params().items():
+            assert params.setdefault(name, value) == value, (name, value, params[name])
     dev = pf.ov.dev.device
-    pa = dev.alloc_host_buffer(max(arg_bytes(op, 0) for op, *_ in runlist))
+    pa = dev.alloc_host_buffer(max(arg_bytes(op, 0) for op in ops))
     pa.write(activations(pa.size))
     pa.sync_to_device()
-    pc = dev.alloc_host_buffer(max(arg_bytes(op, 2) for op, *_ in runlist))
+    pc = dev.alloc_host_buffer(max(arg_bytes(op, 2) for op in ops))
     buffers = {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}
-    return {c: pf.lib.items(rl, buffers) for c, rl in by.items()}, macs, buffers, T
+    return {c: pf.lib.items(rl, buffers) for c, rl in runlists.items()}, params, buffers, T
 
 
 def calibrate(pf: Any) -> tuple[int, dict]:
     """The PACE word of the prefill ``pf`` (bound, its library loaded) by timing, with its table."""
-    progs, macs, buffers, T = _items(pf)
+    progs, params, buffers, T = _items(pf)
     bufs = list(buffers.values())
 
     def run(items: list) -> None:
@@ -199,7 +228,7 @@ def calibrate(pf: Any) -> tuple[int, dict]:
 
     def measure(classes: list[int] | None, word: int) -> float:
         items = [it for c in (classes or sorted(progs)) for it in progs[c]]
-        pf.lib.set_params({PACE: word})
+        pf.lib.set_params({**params, PACE: word})
         time.sleep(IDLE_S)
         run(items)  # (the cores read the word: a run's first item of each design)
         t = []
@@ -211,8 +240,7 @@ def calibrate(pf: Any) -> tuple[int, dict]:
         return statistics.median(t)
 
     t_start = time.perf_counter()
-    levels, table = search(sorted(progs, key=lambda c: -macs[c]), measure,
-                           note=lambda text: sys.stderr.write(f"artlite: {text}\n"))
+    levels, table = search(sorted(progs), measure, note=lambda text: sys.stderr.write(f"artlite: {text}\n"))
     pf.lib.set_params({PACE: 0})
     pf.ov.dev.stale = True  # (the library ran: a paged overlay's state comes back before its next step)
     table.update(T=T, seconds=time.perf_counter() - t_start)
@@ -231,5 +259,16 @@ def resolve(pf: Any) -> int:
         return int(hit["word"])
     word, table = calibrate(pf)
     _store(key, {"word": word, "levels": describe(word), "version": VERSION,
-                 "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seconds": round(table["seconds"], 3)})
+                 "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seconds": round(table["seconds"], 3),
+                 "ms": _ms(table)})
     return word
+
+
+def _ms(table: dict[str, Any]) -> dict[str, Any]:
+    """The calibration's times in ms (a cache entry's record of what it measured): per class by level, then all
+    classes together."""
+    out: dict[str, Any] = {name: {str(L): round(s * 1e3, 3) for L, s in e["s"].items()}
+                           for name, e in table["classes"].items()}
+    if "all" in table:
+        out["all"] = {k: round(s * 1e3, 3) for k, s in table["all"]["s"].items()}
+    return out

@@ -139,13 +139,18 @@ overclocking commands exist only for overclockable processors.
 
 Artlite paces the prefill's dense GEMMs where that is faster: one core of each GEMM idles a share of its work after
 every weight tile (levels 0-7, duty 1 to 0.38) and the array follows it, at a lower current. The first prefill of a
-model on a machine calibrates the levels by timing (a fraction of a second where nothing throttles, a few seconds
-where something does), on random activations: the array's current follows its operands, and GEMMs on zeros draw too
-little to trip it (Strix Halo: 26-29 W socket power against 35-36 W on a prompt's activations). It keeps them in the
-cache directory (`pace.json`, per machine, power source and model); `artlite-bench` prints the levels it ran at. On
-the laptop above level 1 (duty 0.89) is the fastest for its Q4_K GEMMs: the 1B's 1024-token prompt ~7900-8100 t/s
-against ~4650 unpaced (Strix Halo 8800), PROCHOT held for 7-11% of it. `ARTLITE_PACE`: `off` (level 0),
-`recalibrate`, or levels by GEMM class (`gu=3,qkv=2`; `4` for every class).
+model on a machine calibrates the levels by timing, on random activations (the array's current follows its operands,
+and GEMMs on zeros draw too little to trip it: Strix Halo 26-29 W socket power against 35-36 W on a prompt's
+activations). Every class of GEMM (its role: `qkv`, `o`, `gu`, `down`; its tiles: `.planar` or not) runs alone at
+level 0, 1 and 5: a class that runs faster paced is throttled, keeps its fastest level, and all classes together
+confirm the levels. That takes about a second where nothing throttles, a few seconds where something does, and
+prints one line either way (`artlite: ... unpaced`, or the levels). The levels are kept in the cache directory
+(`pace.json`: per machine, power source, platform profile and model, with the times behind them), so a server
+calibrates once, in its warmup. `artlite-bench` prints the levels it ran at, or that it ran unpaced. On the laptop
+above level 1 (duty 0.89) is the fastest for its Q4_K GEMMs and its Q6_K ones need none: the 1B's 1024-token prompt
+~7900-8100 t/s against ~4650 unpaced (Strix Halo 8800), PROCHOT held for 7-11% of it. `ARTLITE_PACE`: `off` (level
+0), `recalibrate`, or levels by GEMM class (`gu=3,qkv=2`; `4` for every class), which also pins them for a service
+(the router passes it to its model processes).
 
 | option | |
 |---|---|
