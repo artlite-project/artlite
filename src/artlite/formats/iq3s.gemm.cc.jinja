@@ -7,7 +7,7 @@
 // panels' codes (_iq3sg: per 4 panels the gather offsets on the MMUL, 4 gathers per panel of the nibble grid, unpacked, the
 // signs as 64 +- g by vaddsub), then the panels (_iq3s). The compactions' windows have constant blocks and shifts: the
 // weight object and the scratch are 64-byte aligned (pinned).
-// Scratch (ws, bytes): S [i 8][{{ n }}] bf16 | the k-tile's signs [ks 8][{{ n }}] | at {{ WL }} the index lists' low bytes [ks
+// Scratch (ws, bytes): S [i 8][{{ n }}] bf16 | the k-tile's signs [ks 8][{{ SP }}] | at {{ WL }} the index lists' low bytes [ks
 // 8][{{ LS }} B], then their 9th bits [ks 8][{{ LS }} B] (_sb's, before a unit's k-tiles: the scale words [{{ n }}]); hb: d [{{ n }}]
 // bf16; wc: a dq call's codes [{{ n_mac // 16 }} blocks][ks 8][rh 2][64]
 
@@ -39,8 +39,8 @@ __attribute__((noinline)) void {{ p }}_sbs(const uint8_t *__restrict scw, const 
     }
 }
 
-// The signs of k-tile kt's compacted rows: per record (i, l) of B (8 kt ..) its rows' bytes -> pm [ks 8][{{ n }}] (ks = 4 i'
-// + l); every window (tile t's rows of record 8 kt + r at 24 r + UP t - R t from the k-tile's 64-byte aligned 192 B of
+// The signs of k-tile kt's compacted rows: per record (i, l) of B (8 kt ..) its rows' bytes -> pm [ks 8][{{ SP }}] (ks = 4 i'
+// + l: whole 64-byte lines, the stores aligned); every window (tile t's rows of record 8 kt + r at 24 r + UP t - R t from the k-tile's 64-byte aligned 192 B of
 // records) has a constant block and shift
 __attribute__((noinline)) void {{ p }}_sbg(const uint8_t *__restrict b, uint8_t *__restrict pm, int kt)
 {
@@ -60,7 +60,7 @@ __attribute__((noinline)) void {{ p }}_sbg(const uint8_t *__restrict b, uint8_t 
             v = aie::select(v, aie::vector<int8, 64>({{ w }}), aie::mask<64>::from_uint64({{ "0x%016Xull" % mask(lo - q0, 64) }}));
 {% endif %}
 {% endfor %}
-            aie::store_v((int8_t *)(po + {{ n * r8 + q0 }}), v{{ ".template extract<32>(0)" if nq == 32 else "" }});
+            aie::store_v((int8_t *)(po + {{ SP * r8 + q0 }}), v{{ ".template extract<32>(0)" if nq == 32 else "" }});
         }
 {% endfor %}
 {% endfor %}
@@ -190,7 +190,7 @@ __attribute__((noinline)) void {{ p }}_iq3sg(const uint8_t *__restrict lo, const
     // next two blocks' 32)
     dims_2d_t wl = dims_2d_from_steps(8, {{ LS // 64 }}, 1);
     dims_2d_t wh = dims_2d_from_steps(8, {{ LS // 64 }}, 1);
-    dims_2d_t wm = dims_2d_from_steps(8, {{ n // 32 }}, 1);
+    dims_2d_t wm = dims_2d_from_steps(8, {{ SP // 32 }}, 1);
     dims_2d_t wu = dims_2d_from_steps(8, 2, 32);
     for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (pre-RA II 31: qrs 24 = the gathers, unpacks and stores)  // (32 rows bp, list ks) = (it / 8, it % 8)
         const v64acc32 q = mac_elem_64_2(*ph, eight, mul_elem_64_2(*pl, four));

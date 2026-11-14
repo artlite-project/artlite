@@ -250,8 +250,9 @@ class TileImage:
         for bname, tensors, rows in parts:
             fmts = [self.fmt(t) for t in tensors]
             if len(set(fmts)) > 1:
-                if bname not in GU_BLOCKS or len(tensors) != 2 or G > 1:
-                    raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(set(fmts))}")
+                if name not in GU_REGIONS or len(tensors) != 2 or G > 1:
+                    raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(set(fmts))} "
+                                              f"(gate and up of two formats: a dense layer's gate / up only)")
                 ffn, (fa, fb) = self.tensor(tensors[0]).rows, fmts
                 blocks.append(Block(bname, tensors, split_rows(ffn, self.R[fa], self.R[fb], rows.shape[0]), fa,
                                     self.R[fa], fmt2=fb, R2=self.R[fb]))
@@ -498,7 +499,7 @@ def gate_up_rows(ffn: int, R: int, cols: int = COLS) -> np.ndarray:
 
 
 SPLIT_ROWS = 64  # (a split gate / up block) rows of each part of a SiLU group: its 64 outputs' gate rows, then their up rows
-GU_BLOCKS = ("gu",)  # the gate / up blocks a region may split (``Block.fmt2``)
+GU_REGIONS = ("gate_up",)  # the regions whose gate / up block may be split (``Block.fmt2``: dense layers')
 
 
 def split_rows(ffn: int, ra: int, rb: int, cols: int = COLS) -> np.ndarray:

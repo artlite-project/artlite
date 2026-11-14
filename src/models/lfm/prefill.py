@@ -208,6 +208,9 @@ class LfmPrefill(ChunkPrefill):
         self.rb = {"PX": 4 * H, "PXN": 9 * H // 8, "G": 2 * COLS * pitch, "QS": COLS * s.tgu // 8,
                    "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp,
                    "HP": 9 * -(-self.cfg.intermediate_size // self.img.kc) * self.img.kc // 8}
+        split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
+        if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
+            self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         self.np_off = {"in": 0}
         k = 1
         for L in self.layers:
@@ -278,8 +281,11 @@ class LfmPrefill(ChunkPrefill):
                 n = o.norms[nt][0]
                 rl.append((n, self._np((L, "o"), n), tok("PX", a, n, i=1), tok("Y", a, n, i=2, row=ry),
                            tok("PX", a, n, i=3), tok("PXN", a, n, i=4)))
-            rl += [(g.op, tok("PXN", j * t, g.op, i=0), self._w(g), tok("HP", j * t, g.op, i=2))
-                   for g in o.plans[(L, "gate_up")].gemms for j in range(S)]
+            gu = o.plans[(L, "gate_up")]
+            rl += [(g.op, tok("PXN", j * t, g.op, i=0), self._w(g), tok(g.c or "HP", j * t, g.op, i=2))
+                   for g in gu.gemms for j in range(S)]
+            if gu.act is not None:  # (a split block: its GEMMs' rows into the down's panels)
+                rl += [(gu.act, tok("GU", j * t, gu.act, i=0), tok("HP", j * t, gu.act, i=1)) for j in range(S)]
             rl += [(g.op, sl("HP", j * t * rb["HP"] + 2 * g.a_off, g.op, i=0), self._w(g),
                     sl("F", f_at(j * t, g.part), g.op, i=2)) for g in o.plans[(L, "down")].gemms for j in range(S)]
             for (a, nt), base in zip(blocks, f_base, strict=False):

@@ -42,6 +42,7 @@ from ..gemm.geometry import GemmSpec, planar
 from ..gemm.pacing import PACE_ROLES, pace_class
 from ..operators.design import COLS, MAX_BD_ITER, MAX_CHAIN_BDS
 from ..operators.util import arg_bytes
+from .gate_up import GateUpActOperator
 from .planar import choose_planar_plan, gemm_mac_rows, planar_gemm
 
 LINES = True  # packed C drains in whole 64-byte lines (GemmQOperator lines=; artlite-probe --diagnose measures both)
@@ -77,6 +78,7 @@ class Gemm:
     w_off: int  # the W argument: image bytes w_off .. w_off + op.w_bytes
     part: int = 0  # K part (output projections split over K: each into its own C)
     a_off: int = 0  # the A argument from this bf16 element of the panels on (K parts of one design: the part's columns)
+    c: str = ""  # its C buffer when not the phase's (a split gate / up block's parts: "GU")
 
 
 @dataclass
@@ -84,6 +86,7 @@ class PhasePlan:
     gemms: list[Gemm]
     layout: Layout | None  # (input projections)
     parts: int = 1
+    act: GateUpActOperator | None = None  # (a split gate / up block) GU -> the phase's output, after the GEMMs
 
 
 def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOperator] | None = None
@@ -255,6 +258,46 @@ def _part_seconds(plan: PhasePlan) -> float:
     return (a + c) / 56e9 + 50e-6 * plan.parts
 
 
+def split_width(b: Block) -> int:
+    """(a split gate / up block) Columns of a part's slot in GU: the wider part's pass outputs, whole 32-column lines."""
+    return -(-max(b.na * b.R, b.nb * b.R2) // 32) * 32
+
+
+def gu_columns(image: TileImage, region: Region) -> int:
+    """(a split gate / up block) GU's columns (``gate_up.GateUpActOperator.N``)."""
+    return COLS * image.cfg.intermediate_size // COLS // 64 * 2 * split_width(region.blocks[0])
+
+
+def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
+                   act: str) -> PhasePlan:
+    """A split gate / up block (``decode.image.Block.fmt2``): a GEMM per part (passes of its tiles, a group apart: the pass
+    step) of plain bf16 rows into GU ([column][group][gate W | up W], ``gate_up``), then the activation into the phase's
+    output (HP: the down's panels)."""
+    assert act == "silu", act
+    (b,) = region.blocks
+    groups, W = image.cfg.intermediate_size // COLS // 64, split_width(b)
+    P, KC = groups * 2 * W, region.kc
+    gemms = []
+    for part, (fmt, R, tiles, rt0) in enumerate(((b.fmt, b.R, b.na, 0), (b.fmt2, b.R2, b.nb, b.na))):
+        kw = {"fmt": fmt, "rows": R, "M": T, "K": region.K, "N": COLS * P, "tile_bytes": region.tile_bytes,
+              "col_bytes": region.col_stride, "passes": groups,
+              "out_cols": [[P * c + 2 * W * j + W * part for j in range(groups)] for c in range(COLS)], "kc": KC,
+              "kc_group": region.kc_group, "blocks": ((rt0, groups),), "pass_step": b.na + b.nb, "region_rt": region.n_rt}
+        if planar(fmt, R, KC):
+            assert slot(fmt).pass_tiles(fmt, R, tiles), (fmt, R, tiles)
+            kw.update(tiles=tiles, c_pack=True)
+        else:
+            assert tiles * R == ROWS, (fmt, R, tiles)  # (a tile-major pass: one part of 64 rows)
+        op = gemm_op(kw, T, "gu", ops)
+        gemms.append(Gemm(op, region.offset - op.hdr_skip, c="GU"))
+    key = ("act", T, groups, W, image.region(region.layer, "down").K)  # (one object per distinct activation, as the GEMMs)
+    if ops is None or key not in ops:
+        act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-1])
+        if ops is not None:
+            ops[key] = act_op
+    return PhasePlan(gemms, None, act=ops[key] if ops is not None else act_op)
+
+
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
                act: str = "silu", k_part: int = 0, layout_T: int = 0) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
@@ -266,6 +309,8 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     e.g. qwen35's conv states in G's rows; default T)."""
     name, K, S, KC = region.name, region.K, region.tile_bytes, region.kc
     which = WHICH[name]
+    if name == "gate_up" and region.blocks[0].fmt2:
+        return _split_gate_up(image, region, T, ops, act)
     if name == "gate_up":
         (b,) = region.blocks
         pl = planar(b.fmt, b.R, KC)

@@ -338,7 +338,8 @@ class Geometry:
                 assert 64 % rows == 0 and TR % 64 == 0, f"planar SiLU passes: a group of {gt} tiles"
         hdr_direct = bool(units) or slot(fmt).hdr_direct(fmt, nsb)
         n_read = 128 if halves == 2 and hdr_direct else TR
-        n = -(-n_read // 16) * 16
+        q = slot(fmt).mmul_rows(fmt) if is_planar else 16
+        n = -(-n_read // q) * q
         assert n == TR or is_planar, (fmt, tiles)
         nm = 64 if halves == 2 else n
         passes, out_cols = spec.passes, spec.out_cols
@@ -350,7 +351,8 @@ class Geometry:
         rt_end = max(rt0 + step * (cnt - 1) + tiles for rt0, cnt in blocks)  # row tiles read
         region_rt = spec.region_rt or rt_end  # row tiles of a column's region (the chunk group stride)
         n_kc = K // kc
-        assert region_rt <= rt_end or (spec.kc_group or n_kc) == 1  # (one chunk per group: any chunk stride)
+        # (one chunk per group: any chunk stride; the passes' steps: the tiles stepped over after the last pass too)
+        assert region_rt <= max(rt0 + step * cnt for rt0, cnt in blocks) or (spec.kc_group or n_kc) == 1
         # a row tile's K chunks come in groups of kc_group consecutive tiles (row tiles of a group
         # consecutive): the image's groups of a long-K projection (``decode.image.kc_group``: the decode overlay's
         # activation objects)

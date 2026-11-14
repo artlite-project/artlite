@@ -157,6 +157,11 @@ class Slot:
         """GemmQd's planar passes may hold ``tiles`` tiles of ``rows`` rows (the planner's other limits aside)."""
         return True
 
+    def mmul_rows(self, fmt: str) -> int:
+        """GemmQd's MMUL columns of a planar pass are a multiple of this (the pass's rows rounded up: its dequant's
+        blocks of rows; the rows past the tiles' weigh nothing)."""
+        return 16
+
     def unit_bytes(self, fmt: str, rows: int, nsb: int) -> int:
         """Planar tiles of super-block units (a unit holds one super-block's codes and scales of every row, nothing
         else is in the tile): the unit's bytes, else 0. GemmQd's weight object is then one unit of the pass's tiles,

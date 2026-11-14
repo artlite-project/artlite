@@ -1,0 +1,38 @@
+{% set silu_t = km.silu_tanh(walk=(2, 128)) %}
+{{ silu_t.src }}
+
+extern "C" {
+
+// 8 tokens' parts of {{ G }} SiLU groups (x: [token 8][group {{ G }}][gate {{ W }} | up {{ W }}] bf16, each part's first 64 the
+// group's outputs) -> {{ 8 * G }} panels (8 tokens x 8 outputs) of h = bf16(silu(gate) up) as bfp16ebs8 (the gate / up
+// epilogue's of the GEMMs: ``gemm_q``'s times_up): the panels' [gate 64 | up 64] gathered into s, silu_tanh of the gates
+// into y, then times up
+void {{ p }}_act(const bfloat16 *__restrict x, bfloat16 *__restrict s, bfloat16 *__restrict y, bfloat16 *__restrict out,
+                 int32_t zero)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *__restrict ps = s;
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < {{ G }}; j++) {
+        AIE_LOOP_UNROLL_FULL
+        for (int b = 0; b < 8; b++) {  // (panel 8 j + b: outputs 8 b .. of group j)
+            const bfloat16 *__restrict pg = x + {{ 2 * W }} * j + 8 * b;
+            aie::store_v(ps, al::gather<8, 8>(pg, {{ 2 * G * W }}));
+            aie::store_v(ps + 64, al::gather<8, 8>(pg + {{ W }}, {{ 2 * G * W }}));
+            ps += 128;
+        }
+    }
+    {{ silu_t }}<{{ 512 * G }}>(s, y, zero);
+    const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)s + 64;
+    const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)y;
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> o((bfp16ebs8 *)out);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < {{ 8 * G }}; i++) {
+        const aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
+        o.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
+        pu += 128;
+        py += 64;
+    }
+}
+
+}  // extern "C"

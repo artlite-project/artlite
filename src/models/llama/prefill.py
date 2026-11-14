@@ -237,6 +237,9 @@ class LlamaPrefill(ChunkPrefill):
         self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
                    "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp,
                    "HP": 9 * -(-cfg.intermediate_size // kc) * kc // 8}
+        split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
+        if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
+            self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         self.np_off = {"in": 0}  # (the norms' weights: H bf16 each)
         k = 1
         for L in self.layers:
@@ -308,8 +311,11 @@ class LlamaPrefill(ChunkPrefill):
                 rl.append((n, tok("PX", 0, n, i=0, extra=a * rb["PX"]), tok("Y", 0, n, i=1, extra=a * ry),
                            self._np((L, "o")), tok("PX", 0, n, i=3, extra=a * rb["PX"]),
                            tok("PXN", 0, n, i=4, extra=a * rb["PXN"])))
-            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("HP", j, g.op, i=2))
-                   for g in o.plans[(L, "gate_up")].gemms for j in range(S)]
+            gu = o.plans[(L, "gate_up")]
+            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok(g.c or "HP", j, g.op, i=2))
+                   for g in gu.gemms for j in range(S)]
+            if gu.act is not None:  # (a split block: its GEMMs' rows into the down's panels)
+                rl += [(gu.act, tok("GU", j, gu.act, i=0), tok("HP", j, gu.act, i=1)) for j in range(S)]
             rl += [(g.op, tok("HP", j, g.op, i=0, extra=2 * g.a_off), self._w(g),
                     sl("F", f_at(j * t, g.part), g.op, i=2)) for g in o.plans[(L, "down")].gemms for j in range(S)]
             for (a, nt), base in zip(blocks, f_base):

@@ -212,7 +212,7 @@ result = y.numpy()  # one sync at the end
 program and checks that the host initializes every buffer the program reads; ``kmath``, ``bfp16``; the kernels'
 headers in ``include/``), and the runtime of the designs run by host-built transactions (``overlay.py``); the
 subsystems the models share: the GGUF tile formats (``formats/``, one slot per format family: Q4_0, Q4_1, Q8_0, Q4_K,
-Q5_K, Q6_K, Q2_K, Q3_K, IQ3_XXS, IQ3_S, IQ4_NL / IQ4_XS, BFP16 for BF16 / F16 tensors), the GEMMs on the decode tiles (``gemm/``: GemmQ, GemmQd,
+Q5_K, Q6_K, Q2_K, Q3_K, IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL / IQ4_XS, BFP16 for BF16 / F16 tensors), the GEMMs on the decode tiles (``gemm/``: GemmQ, GemmQd,
 their MAC loop), the decode overlay (``decode/``: GEMV cores, the weight image, the KV record format, the attention
 core of Gemma and Llama, the models' shared host side), the prefill's chunk programs, GEMM planner, norms and
 attention (``prefill/``), MoE layers (``moe/``), the vision overlay (``vision/``: an image network per dispatch); then

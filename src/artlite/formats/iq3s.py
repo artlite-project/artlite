@@ -97,16 +97,20 @@ class Iq3sSlot(Slot):
 
     def pass_tiles(self, fmt: str, rows: int, tiles: int) -> bool:
         # (two weight objects of up to 7 units in the dequantizing core's L1: 32 KB, a gate / up pass of a whole SiLU
-        # group of 128 rows; MMUL columns <= 128, in whole 32-row blocks: the dequant's 4-panel iterations)
-        return tiles == 7 or tiles < 7 and -(-rows * tiles // 16) * 16 % 32 == 0
+        # group of 128 rows)
+        return tiles <= 7
+
+    def mmul_rows(self, fmt: str) -> int:
+        return 32  # (the dequant's 4-panel iterations: whole 32-row blocks; the rows past the tiles d = 0)
 
     def _ws(self, op: object) -> dict[str, int]:
-        """Byte offsets in the prefill dequant's scratch (``gemm/IQ3_S``'s): WL the index lists' low bytes, then their 9th
-        bits (LS bytes each: whole 64-byte blocks of 32 rows), at WU = WL between k-tiles the scale words (``_sb``); its
-        size."""
+        """Byte offsets in the prefill dequant's scratch (``gemm/IQ3_S``'s): after S (16 n) a k-tile's signs at a pitch SP
+        (whole 64-byte lines: aligned stores), WL the index lists' low bytes, then their 9th bits (LS bytes each: whole
+        64-byte blocks of 32 rows), at WU = WL between k-tiles the scale words (``_sb``); its size."""
         LS = Iq3Slot.list_bytes(-(-op.n // 32) * 32)
-        WU = WL = 24 * op.n  # (_sb's scratch while no k-tile's lists are live)
-        return {"WU": WU, "WL": WL, "LS": LS, "size": WL + max(16 * LS, 4 * op.n)}
+        SP = -(-op.n // 64) * 64
+        WU = WL = 16 * op.n + 8 * SP  # (_sb's scratch while no k-tile's lists are live)
+        return {"WU": WU, "WL": WL, "LS": LS, "SP": SP, "size": WL + max(16 * LS, 4 * op.n)}
 
     def qd_scratch(self, op: object) -> dict[str, tuple[int, int]]:
         # ws: S, a k-tile's signs, the lists (``_ws``); hb: d; ex: a dq call's codes; the grid's two copies (in two 16 KB

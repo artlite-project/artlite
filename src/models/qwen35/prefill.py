@@ -184,7 +184,7 @@ class QwenPrefill(ChunkPrefill):
         def plan(L: int, name: str) -> PG.PhasePlan:
             region = img.region(L, name)
             pitch = self.pitch.get(name, dpt) if name != "gate_up" else 0
-            key = (name, region.K, region.kc_group, tuple(b.fmt for b in region.blocks), t)
+            key = (name, region.K, region.kc_group, tuple(b.formats for b in region.blocks), t)
             if key not in self._k_parts:
                 self._k_parts[key] = PG.resident_k_part(img, region, t, pitch=pitch)
             plan = PG.plan_phase(img, region, t, pitch=pitch, ops=self._gemms, k_part=self._k_parts[key])
@@ -250,6 +250,9 @@ class QwenPrefill(ChunkPrefill):
             self.rb |= self.moe.rows()
         else:  # (down's K: the ffn padded to whole K chunks)
             self.rb["HP"] = 9 * self.img.region(self.layers[0], "down").K // 8
+            split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
+            if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
+                self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         for d in self.drafters:
             self.rb |= d.rows()
         self.rb_g = {k: 2 * COLS * p for k, p in self.pitch.items()}  # (gdn_in / attn_in rows)
@@ -356,8 +359,11 @@ class QwenPrefill(ChunkPrefill):
                         sl("Y", (P * j + g.part) * fp, g.op, i=2)) for g in out.gemms for j in range(S)]
                 rl += [(pn, tok("PX", j, pn, i=0), sl("Y", P * j * fp, pn, i=1), pan, tok("PX", j, pn, i=3),
                         tok("PXN", j, pn, i=4)) for j in range(S)]
-            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("HP", j, g.op, i=2))
-                   for g in o.plans[(L, "gate_up")].gemms for j in range(S)]
+            gu = o.plans[(L, "gate_up")]
+            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok(g.c or "HP", j, g.op, i=2))
+                   for g in gu.gemms for j in range(S)]
+            if gu.act is not None:  # (a split block: its GEMMs' rows into the down's panels)
+                rl += [(gu.act, tok("GU", j, gu.act, i=0), tok("HP", j, gu.act, i=1)) for j in range(S)]
             down = o.plans[(L, "down")]
             nxt = self._next_norm(L)
             if down.parts == 1:
@@ -627,6 +633,10 @@ class QwenPrefill(ChunkPrefill):
         cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
         wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
+        acts = [p.act for name in self._phases(L) if (p := self.plans[(L, name)]).act is not None]
+        if acts:  # (a split gate / up block: its rows through GU, written and read, like weight bytes; an item more)
+            wbytes += 2 * SUB * self.rb["GU"]
+            gemms += acts
         if self.moe:  # (the router's, the shared expert's weights per sub-chunk; their items: one per chunk)
             wbytes += sum(self.img.region(L, name).nbytes for name in ("moe_in", "sdown"))
         Ss = S if S >= 1 else S + SMALL_S * (1 - S)
@@ -645,4 +655,5 @@ class QwenPrefill(ChunkPrefill):
     def layer_configs(self, L: int) -> int:
         """(its GEMM objects, the GDN or attention ops, the norms; an MoE layer's block: 7)"""
         gemms = {id(g.op) for name in self._phases(L) for g in self.plans[(L, name)].gemms}
+        gemms |= {id(p.act) for name in self._phases(L) if (p := self.plans[(L, name)]).act is not None}
         return len(gemms) + (2 if self.cfg.attention[L] else 3) + 2 + (7 if self.moe else 0)

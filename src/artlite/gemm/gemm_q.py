@@ -144,6 +144,7 @@ class GemmQOperator(ArtcOperator):
         mc_unit: int = 0,
         lines: bool = False,
         pace: int | None = None,
+        pass_step: int = 0,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -171,6 +172,8 @@ class GemmQOperator(ArtcOperator):
         chunks as this scratchpad parameter says, in units of ``mc_unit`` tokens (a multiple of nrows m; default
         nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks). ``pace``: the design's pace
         class (``pacing.PACE_CLASSES``; None: unpaced), its level from the ``PACE`` parameter (``pacing``).
+        ``pass_step``: row tiles from a pass's first to the next's within a block (default ``tiles``; a split gate / up
+        block's part: its group, ``prefill.gemm``).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -181,7 +184,7 @@ class GemmQOperator(ArtcOperator):
             out_cols=out_cols, silu=silu, act=act, nrows=nrows, c_bfp16=c_bfp16, ablate=ablate, kc=kc,
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
-            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace)
+            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()
