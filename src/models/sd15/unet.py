@@ -31,7 +31,7 @@ from artlite.vision.layers import (
     ln_apply,
     plain,
 )
-from artlite.vision.ops import Attention, Gemm
+from artlite.vision.ops import Attention, ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import cat, flat
 
@@ -245,8 +245,8 @@ def downsample_bands(bd: Builder, w: dict, p: str, x: DTensor) -> Tensor:
         xb = x.load(bd, b)
         plain(bd, xb, band_view(px, b), name=p + "xpn")
         free(bd, xb)
-    g = Gemm(m=64, ntile=lv.R // 2, K=x.C, N=N, x=px.addr, y=y.addr, out="ds", conv=1, R=1, Lg=lv.Lg, zero=bd.zero,
-             x_np=npw, rc=lv.R, rstep=2)
+    g = Gemm(m=64, ntile=lv.R // 2, K=x.C, N=N, x=px.addr, y=y.addr, out="ds", x_np=npw,
+             conv=ConvSpec(stride=1, R=1, Lg=lv.Lg, zero=bd.zero, rc=lv.R, rstep=2))
     bd.gemm(g, w[p + "conv.weight"], w[p + "conv.bias"], name=p + "conv")
     free(bd, px)
     return y

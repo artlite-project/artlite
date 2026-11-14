@@ -429,7 +429,7 @@ class Net:
                          res=rt + t * ROPE2_TAB, out="rope2", qkn=w["kn"], qkn_n=HD, qkn_eps=EPS, x_np=n.np, y_np=kt.np),
                     w["k"], None, name=name + ".k")
         gemm(bd, Tensor(lv, KR, n.addr, "pn", pnp=n.np), w["v"], None, name=name + ".v", out=vt, kind="vt")
-        at = WinAttention(q=0, o=0, mask=0, kv=kv, kv_head_bytes=WinAttention.kv_image(8) // ROWS)
+        at = WinAttention(q=0, o=0, mask=0, kv=kv, image_units=8)
         bd.written(kvname)
         bd.defer({col: at.kv_drains(kt.addr, vt.addr, col, 0, kv) for col in range(COLS)},
                  release=[(kt.addr, kt.size), (vt.addr, vt.size)])
@@ -445,7 +445,7 @@ class Net:
         bd.op(self.fill(bd, "mask", MASK_BYTES, mk, MASK_BYTES), {})
         o = alloc(bd, lv, HEADS * HP, "pn")
         assert qt.addr + (HEADS * HP // 8 + 12) * 8 * L.PANEL <= 512 * 1024, "the query objects' walk past the memtile"
-        at = WinAttention(q=qt.addr, o=o.addr, mask=mk, kv=kv, kv_head_bytes=WinAttention.kv_image(8) // ROWS)
+        at = WinAttention(q=qt.addr, o=o.addr, mask=mk, kv=kv, image_units=8)
         bd.flush()
         bd.reading(kvname)
         cmd = bd.image(f"{self.p}.win", at.command())

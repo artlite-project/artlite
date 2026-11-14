@@ -11,7 +11,7 @@ from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import gelu_table
-from artlite.vision.ops import Apply, Attention, Gemm
+from artlite.vision.ops import Apply, Attention, ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Slots, as_wt
 
@@ -400,9 +400,8 @@ def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: boo
     Y = RES + (N // 80 * L.ct_bytes(m) if res else 0)
     r_img = torch.randn(2, N, Ho, Ho)
     rt = level_tokens(r_img, R, Lg)
-    g = Gemm(m=m, ntile=1, K=Cin, N=N, x=X, y=Y, res=RES if res else None, out="bf16", conv=stride, R=R, Lg=Lg, zero=Z,
-             x_np=T_in // 8)
-    assert g.conv_zero_bytes() <= 4096
+    g = Gemm(m=m, ntile=1, K=Cin, N=N, x=X, y=Y, res=RES if res else None, out="bf16",
+             conv=ConvSpec(stride=stride, R=R, Lg=Lg, zero=Z), x_np=T_in // 8)
     s = npu.seq()
     s.op(merge(fills(npu, "x", [L.panels(xt[c]) for c in range(COLS)], X), fills(npu, "z", [np.zeros(4096, np.uint8)] * COLS, Z),
                *([fills(npu, "r", [L.ctiles(rt[c], m) for c in range(COLS)], RES)] if res else [])), {})
@@ -438,8 +437,8 @@ def test_conv_rows(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
                *([fills(npu, f"r{k}", [L.ctiles(rt[c, 128 * k:128 * (k + 1)], 64) for c in range(COLS)], RES[k]) for k in range(2)]
                  if res else [])), {})
     for k in range(2):
-        g = Gemm(m=64, ntile=2, K=Cin, N=N, x=X, y=Y[k], res=RES[k], out="bf16", conv=1, R=1, Lg=4, zero=Z, x_np=32,
-                 rc=rc, r0=2 * k)
+        g = Gemm(m=64, ntile=2, K=Cin, N=N, x=X, y=Y[k], res=RES[k], out="bf16", x_np=32,
+                 conv=ConvSpec(stride=1, R=1, Lg=4, zero=Z, rc=rc, r0=2 * k))
         s.op({c: g.col_ops(c) for c in range(COLS)}, gemm_rows(npu, f"w{k}", g, w, b), barrier=True)
     s.op(merge(*(drains(npu, f"y{k}", yb, Y[k]) for k in range(2))), {})
     npu.run(npu.transaction(s))
@@ -514,8 +513,8 @@ def test_conv_il(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
               for c in range(COLS)]
         s.op(merge(fills(npu, f"x{k}", xs, X), *([fills(npu, f"r{k}", [L.ctiles(rt[c, 256 * k:256 * (k + 1)], 64)
                                                                     for c in range(COLS)], Y)] if res else [])), {})
-        g = Gemm(m=64, ntile=4, K=Cin, N=N, x=X, y=Y, res=Y if res else None, out="bf16", conv=1, R=1, Lg=8, zero=Z,
-                 x_np=64, rc=4, r0=1, il=True)
+        g = Gemm(m=64, ntile=4, K=Cin, N=N, x=X, y=Y, res=Y if res else None, out="bf16", x_np=64,
+                 conv=ConvSpec(stride=1, R=1, Lg=8, zero=Z, rc=4, r0=1, il=True))
         s.op({c: g.col_ops(c) for c in range(COLS)}, gemm_rows(npu, f"w{k}", g, w, b), barrier=True)
         s.op(drains(npu, f"y{k}", yb, Y), {})
     npu.run(npu.transaction(s))
@@ -849,7 +848,7 @@ def test_win_attention(npu: VisionDevice, start: bool) -> None:
     img = WinAttention.kv_image(8)
     npu.alloc("kv", img)
     npu.write("kv", np.zeros(img, np.uint8))
-    at = WinAttention(q=QA, o=OA, mask=MA, kv=npu.address("kv"), kv_head_bytes=img // ROWS)
+    at = WinAttention(q=QA, o=OA, mask=MA, kv=npu.address("kv"), image_units=8)
     st = L.kv_slots(torch.cat([k[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1),
                     torch.cat([v[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1))
     st = st.reshape(2, 8, 2 * D.Q)[0]
@@ -1093,7 +1092,7 @@ def test_win_attention_gated(npu: VisionDevice, start: bool) -> None:
     img = WinAttention.kv_image(2)
     npu.alloc("kv", img)
     npu.write("kv", np.zeros(img, np.uint8))
-    at = WinAttention(q=QA, o=OA, mask=MA, kv=npu.address("kv"), units=2, np=2, gate=GA, kv_head_bytes=img // ROWS)
+    at = WinAttention(q=QA, o=OA, mask=MA, kv=npu.address("kv"), units=2, np=2, gate=GA, image_units=2)
     st = L.kv_slots(torch.cat([k[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1),
                     torch.cat([v[None, :32], torch.zeros(1, 32, 8 - KVH, d)], 2).reshape(1, 32, -1).repeat(2, 1, 1))
     st = st.reshape(2, 8, 2 * D.Q)[0]

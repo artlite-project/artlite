@@ -25,7 +25,8 @@ from . import core as K
 from . import design as D
 from . import layout as L
 from .device import VisionDevice
-from .ops import Apply, Gemm, gn_window
+from .ops import ZERO_BYTES, Apply, Gemm, gn_window
+from .roles import SPECS
 from .seq import B_BDS, ColOps, MemTask, RowOps
 from .weights import Slots, Wt, as_wt
 
@@ -156,7 +157,7 @@ class Builder:
         self.s = self.npu.seq()
         self.tab: dict[int, str | None] = dict.fromkeys(range(ROWS))
         self.tables: dict[str, np.ndarray] = {}
-        self.zero = self.mem.alloc(4096)  # (zeros: a conv's halo rows at the image's edges)
+        self.zero = self.mem.alloc(ZERO_BYTES)  # (zeros: a conv's halo rows at the image's edges)
         self.tb_hooks: list = []  # (time biases: (resnet prefix, offset in TBIAS, the bias rows [row][passes 80]))
         self.tb_used = 0
         self._zfill = False
@@ -215,13 +216,13 @@ class Builder:
            sync: bool = False) -> int:
         """Push an op (``seq.Seq.op``) with the drains pending since the last op (``records``, ``defer``) merged into
         its drains; sync: DDR synced after its memtile tasks, before its B runs (a GroupNorm apply reading them)."""
-        for r, ro in rows.items():  # (role c's attention: its scores in the table buffer)
-            if ro.role == "c":
+        for r, ro in rows.items():  # (a role's ops that use the table buffer: d 40's attention scores)
+            if ro.role and SPECS[ro.role].clobbers_table:
                 self.tab[r] = None
         if not self._zfill:  # (the zero region, once)
             self._zfill = True
-            z = self.image("_zeros", np.zeros(COLS * 4096, np.uint8))
-            zc = {c: ColOps(fills=[MemTask([{"addr": self.zero, "nwords": 1024}], ddr=(z + 4096 * c, 4096, None))])
+            z = self.image("_zeros", np.zeros(COLS * ZERO_BYTES, np.uint8))
+            zc = {c: ColOps(fills=[MemTask([{"addr": self.zero, "nwords": ZERO_BYTES // 4}], ddr=(z + ZERO_BYTES * c, ZERO_BYTES, None))])
                   for c in range(COLS)}
             self.s.op(zc, {})
         if self._tab_runs:  # (tables first: their K_TABLE commands before the op's; an op of their own where a row's
@@ -372,7 +373,7 @@ class Builder:
                 (a, n), *more = ro.runs  # (more: the weights again per further tile)
                 self.npu.write(TBIAS, g.bias_bytes(b, r), off + r * nb)
                 ro.runs[:] = [(a, hb), (tb + off + r * nb, nb), (a + hb + nb, n - hb - nb), *more]
-            self.tb_hooks.append((tbias, off, np.concatenate([g._rows(r) for r in range(ROWS)])))
+            self.tb_hooks.append((tbias, off, np.concatenate([g.weight_rows(r) for r in range(ROWS)])))
         co = g.col_ops(0) if g.col_free else None  # (one ColOps for every column: its tasks' words built once)
         cols = {c: co or g.col_ops(c) for c in range(COLS)}
         if extra:

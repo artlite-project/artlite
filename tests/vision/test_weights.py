@@ -14,20 +14,20 @@ from ml_dtypes import bfloat16
 from artlite.operators import bfp16
 from artlite.vision import design as D
 from artlite.vision import weights as W
-from artlite.vision.ops import Gemm
+from artlite.vision.ops import ConvSpec, Gemm
 
 ROWS = 4
 
 
 def slot_ref(g: Gemm, w: np.ndarray, row: int) -> np.ndarray:
     """Core row ``row``'s weight image of a Gemm (w: its float32 values (N, K) or a conv's (N, K, 3, 3)): its rows
-    (``Gemm._rows``), a conv's k-tiles per chunk of 64 input channels its taps (``tap_order``), K padded to whole
+    (``Gemm.weight_rows``), a conv's k-tiles per chunk of 64 input channels its taps (``ConvSpec.tap_order``), K padded to whole
     k-tiles; per pass its k-tiles [16-row block 5][k-step 8][half 2][row 8][9 B] (hilo: the hi planes' k-tiles, then
     the lo ones: lo = bfp16(w - hi))."""
-    ws = np.asarray(w, np.float32)[g._rows(row)]
+    ws = np.asarray(w, np.float32)[g.weight_rows(row)]
     if g.conv:
         t = ws.reshape(-1, g.nch, 64, 3, 3).transpose(0, 1, 3, 4, 2)  # (n, chunk, dy, dx, k)
-        ws = np.stack([np.stack([t[:, c, dy, dx] for dy, dx in g.tap_order(c)], 1) for c in range(g.nch)],
+        ws = np.stack([np.stack([t[:, c, dy, dx] for dy, dx in g.conv.tap_order(c)], 1) for c in range(g.nch)],
                       1).reshape(ws.shape[0], -1)
     half = (g.nkt // 2 if g.hilo else g.nkt) * D.KT
     wp = np.zeros((ws.shape[0], half), np.float32)
@@ -123,7 +123,8 @@ def test_conv(kw: dict) -> None:
     rng = np.random.default_rng(3)
     w = source("F32", rng.standard_normal((320, 384, 3, 3)).astype(np.float32))
     m = 16 * kw["R"] * kw["Lg"] // (2 if kw.get("il") else 1)
-    g = Gemm(m=m, ntile=kw.get("ntile", 1), K=128, N=320, x=0, y=0, conv=1, **{k: v for k, v in kw.items() if k != "ntile"})
+    g = Gemm(m=m, ntile=kw.get("ntile", 1), K=128, N=320, x=0, y=0,
+             conv=ConvSpec(stride=1, zero=0, **{k: v for k, v in kw.items() if k != "ntile"}))
     check(g, w[:, 64:192])
     check(g, W.take(w, np.array([0, 1, 2, 3] + [-1] * 124), 1))
 
@@ -170,5 +171,5 @@ def test_files(tmp_path: object) -> None:
     assert isinstance(st["c"], np.ndarray) and np.array_equal(st["c"], arrays["c"])
     assert np.array_equal(st["a"].numpy(), arrays["a"]) and np.array_equal(st["b"].numpy(), arrays["b"].astype(np.float32))
     assert st["a"].parts[0].source.file[0] == path
-    check(Gemm(m=64, ntile=1, K=64, N=320, x=0, y=0, conv=1, R=1, Lg=4), st["a"])
+    check(Gemm(m=64, ntile=1, K=64, N=320, x=0, y=0, conv=ConvSpec(stride=1, R=1, Lg=4, zero=0)), st["a"])
     check(_gemm(320, 128), st["b"])

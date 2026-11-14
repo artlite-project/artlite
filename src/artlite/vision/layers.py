@@ -19,7 +19,7 @@ from ..operators.design import COLS, ROWS
 from . import design as D
 from . import layout as L
 from .build import Builder, Level, Records
-from .ops import Apply, Attention, Gemm
+from .ops import Apply, Attention, ConvSpec, Gemm
 from .seq import ColOps, MemTask
 from .weights import flat
 
@@ -123,14 +123,15 @@ def conv(bd: Builder, x: Tensor, w: np.ndarray, b: np.ndarray, *, name: str, out
     out band ``band``'s (row tiles: ``ops.Gemm`` rc)."""
     lv = out.lv
     N = w.shape[0]
-    kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": N, "x": x.addr, "y": out.addr, "out": "bf16", "conv": stride, "R": lv.R, "Lg": lv.Lg,
-              "zero": bd.zero, "x_np": x.np}
+    kw = {"m": lv.m, "ntile": 1, "K": x.C, "N": N, "x": x.addr, "y": out.addr, "out": "bf16", "x_np": x.np}
+    cv = {"stride": stride, "R": lv.R, "Lg": lv.Lg, "zero": bd.zero}
     if band is not None:
-        kw.update(ntile=lv.ntile, R=1, rc=lv.R, r0=band * lv.R // lv.nb)
+        kw.update(ntile=lv.ntile)
+        cv.update(R=1, rc=lv.R, r0=band * lv.R // lv.nb)
     rec = bd.mem.alloc(4 * D.OCH, top=True) if stats else None
     if stats:
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
-    bd.gemm(Gemm(**kw, res=res.addr if res is not None else None), w, b, name=name, tbias=tbias)
+    bd.gemm(Gemm(**kw, conv=ConvSpec(**cv), res=res.addr if res is not None else None), w, b, name=name, tbias=tbias)
     if stats:
         out.rec = [bd.records(rec, name=f"{name}.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0], band=band or 0,
                               nbands=lv.nb)]

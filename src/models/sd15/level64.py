@@ -13,7 +13,7 @@ from artlite.vision import design as D
 from artlite.vision import layout as L
 from artlite.vision.build import Builder, Level
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gemm, gn_apply, plain
-from artlite.vision.ops import Gemm
+from artlite.vision.ops import ConvSpec, Gemm
 from artlite.vision.seq import ColOps, MemTask
 from artlite.vision.weights import flat, pad_index, take
 
@@ -139,8 +139,8 @@ def conv64(bd: Builder, img: PImage, w: np.ndarray, b: np.ndarray | None, *, nam
     x = img.rows(bd, band, c0, w.shape[1])
     out = out or alloc(bd, lv, w.shape[0])
     kw = {"m": lv.m, "ntile": lv.ntile, "K": w.shape[1], "N": w.shape[0], "x": x.addr, "y": out.addr, "out": "bf16",
-          "conv": 1, "R": 1, "Lg": lv.Lg, "zero": bd.zero, "x_np": x.np, "rc": lv.R // lv.nb + 2, "r0": 1, "il": True,
-          "res": res.addr if res is not None else None}
+          "x_np": x.np, "res": res.addr if res is not None else None,
+          "conv": ConvSpec(stride=1, R=1, Lg=lv.Lg, zero=bd.zero, rc=lv.R // lv.nb + 2, r0=1, il=True)}
     rec = bd.mem.alloc(4 * D.OCH, top=True) if stats else None
     if stats:
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])
@@ -250,9 +250,10 @@ def down64(bd: Builder, w: dict, p: str, x: DTensor, *, stats: tuple[int, int], 
         xr = img.span(bd, 4 * b - 1, 4 * b + 4)
         y = alloc(bd, lv2, N)
         rec = bd.mem.alloc(4 * D.OCH, top=True)
-        bd.gemm(Gemm(m=64, ntile=2, K=x.C, N=N, x=xr.addr, y=y.addr, out="bf16", conv=1, R=1, Lg=8, zero=bd.zero,
-                     x_np=xr.np, rc=5, r0=1, rstep=2, il=True, par0=True, stats="gn", rec=rec, gsize=stats[0],
-                     ch_off=stats[1]), wc, w[p + "conv.bias"], name=p + "conv")
+        bd.gemm(Gemm(m=64, ntile=2, K=x.C, N=N, x=xr.addr, y=y.addr, out="bf16", x_np=xr.np, stats="gn", rec=rec,
+                     gsize=stats[0], ch_off=stats[1],
+                     conv=ConvSpec(stride=1, R=1, Lg=8, zero=bd.zero, rc=5, r0=1, rstep=2, il=True, par0=True)),
+                wc, w[p + "conv.bias"], name=p + "conv")
         free(bd, xr)
         y.rec = [bd.records(rec, name=f"{p}conv.rec", ch_off=stats[1], nr=N // 4, gsize=stats[0], band=b, nbands=lv2.nb)]
         out.store(bd, b, y)

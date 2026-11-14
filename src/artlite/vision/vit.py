@@ -380,7 +380,7 @@ def kv_bytes(lv: Level, keys: Keys | None = None) -> int:
 def xfer(bd: Builder, name: str, image_bytes: int, *, fill: bool, mem: int, nbytes: int, off: int = 0,
          mdims: list | None = None, sdims: tuple | None = None) -> dict[int, ColOps]:
     """Per column a fill (DDR image ``name`` -> memtile at mem) or drain of nbytes: column c's bytes of the image
-    ([col][image_bytes]) from off, the memtile walk mdims (``ops._dims`` form), the shim's sdims (``txn.shim_bd``)."""
+    ([col][image_bytes]) from off, the memtile walk mdims (``ops.dims`` form), the shim's sdims (``txn.shim_bd``)."""
     base = bd.ddr(name, COLS * image_bytes)
     (bd.reading if fill else bd.written)(name)
     bd_ = {"addr": mem, "nwords": nbytes // 4} | ({"dims": mdims} if mdims else {})

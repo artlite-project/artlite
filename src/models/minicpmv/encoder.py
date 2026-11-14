@@ -34,7 +34,7 @@ from artlite.vision import layout as L
 from artlite.vision.build import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import DTensor, Tensor, alloc, free, gelu_table, gemm, ln_rec
-from artlite.vision.ops import Apply, Gemm, _dims
+from artlite.vision.ops import Apply, Gemm, dims
 from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.vit import (
@@ -293,13 +293,13 @@ class WindowAttention:
     def col_ops(self) -> ColOps:
         co = ColOps()
         sw = self.stride // 4
-        walk = _dims((18, 1), (4, sw), (16, 36), (2, 18))  # (a panel, the sources, 16 d-blocks, the panels: 9216 B)
+        walk = dims((18, 1), (4, sw), (16, 36), (2, 18))  # (a panel, the sources, 16 d-blocks, the panels: 9216 B)
         head = 10 * 36  # (words: a head's 10 d-blocks)
         for r in range(4):
             h0 = 4 * r * head
             sends = [MemTask([{"addr": a + 4 * h0, "nwords": D.A_OBJ // 4, "dims": walk, "iteration": (head, 4)}
                               for a in (self.q, self.k, self.vt)], repeat=4)]
-            recvs = [MemTask([{"addr": self.o + 4 * h0, "nwords": 1440, "dims": _dims((18, 1), (4, sw), (10, 36), (2, 18)),
+            recvs = [MemTask([{"addr": self.o + 4 * h0, "nwords": 1440, "dims": dims((18, 1), (4, sw), (10, 36), (2, 18)),
                                "iteration": (head, 4)}], repeat=4)]
             co.sends[r], co.recvs[r] = sends, recvs
         return co
@@ -435,7 +435,7 @@ def merger(bd: Builder, w: dict[str, np.ndarray], name: str, x: Bands) -> tuple[
         bd.mem.release(spare, 4096)
         ct16 = l16.ct(80)
         bd.op(_xfer(bd, y2.band(0), ct, fill=False, mem=y.addr, nbytes=16 * 2560, off=2 * j * 1280,
-                    mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
+                    mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4)), {})
         free(bd, y)
     xt = alloc(bd, lp, C)
     bd.op(_xfer(bd, y2.band(0), ct, fill=True, mem=xt.addr, nbytes=ct), {})
@@ -477,7 +477,7 @@ def _merged(bd: Builder, src: list[tuple[str, int]], name: str) -> Tensor:
     ct16 = l16.ct(80)  # (an 80-channel block's object at m 16: 2560 B of 2 rows and padding)
     mc = alloc(bd, l16, MERGED)
     bd.op(bd.merge(*[_xfer(bd, img, ct, fill=True, mem=mc.addr + 16 * s * ct16, nbytes=16 * 2560, off=tp * 1280,
-                           mdims=_dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
+                           mdims=dims((640, 1), (16, ct16 // 4)), sdims=(640, 16, ob // 4, 16 * ob // 4))
                      for s, (img, tp) in enumerate(src)]), {})
     return mc
 

@@ -16,7 +16,7 @@ Per column an op is a set of memtile tasks: receives (S2MM r <- core r's outputs
 - an op's command is in B slot 0, so that its k-tile i is in B slot (i + 1) % 2 (a k-tile of an A object in region 2
   + i % 2: ``design.R23``): per row the host tracks the B objects and puts a NOP command before an op (``RowOps.parity``)
   when they are odd (and at the end: the cores' positions persist across dispatches).
-- core roles (``core.ROLES``): an op whose commands on a row run a role's code (``RowOps.role``) gets that role's
+- core roles (``roles.Role``): an op whose commands on a row run a role's code (``RowOps.role``) gets that role's
   page into the row's B stream before its own B runs where the row's cores hold another one (two B slots from slot 0,
   a NOP first on odd parity: ``device.VisionDevice.pages``); a dispatch starts knowing none (the cores keep theirs).
 """
@@ -28,7 +28,9 @@ import numpy as np
 
 from .. import txn
 from ..operators.design import COLS, ROWS
+from ..txn import HardwareLimitError
 from . import design as D
+from .roles import Role
 
 R_LOCKS = 6  # rotating gate locks G (> ops in flight)
 LOCK_X, LOCK_G0 = 0, 1  # memtile lock ids
@@ -60,25 +62,33 @@ class ColOps:
 
 @dataclass
 class RowOps:
-    """An op's B stream in one row: (device address, bytes[, shim dims]) runs, the B objects each of its cores takes;
+    """An op's B stream in one row: (device address, bytes[, shim dims]) runs, the B objects each of its cores takes
+    (``D.Q`` bytes each: the runs' bytes are exactly those, a count off flips the row's B parity for every later op);
     parity: the op's command must be in B slot 0 (its k-tiles' B slots matter: m-64 GEMMs, convs and attention); role:
-    the role whose code its command runs (None: shared code)."""
+    the role whose code its command runs (``roles.Role``; None: shared code)."""
 
     runs: list[tuple]
     b_objects: int
     parity: bool = True
-    role: str | None = None
+    role: Role | None = None
+
+    def __post_init__(self) -> None:
+        self.role = Role(self.role) if self.role else None
+        nbytes = sum(run[1] for run in self.runs)
+        if nbytes != self.b_objects * D.Q:
+            raise HardwareLimitError(f"a row's B stream of {nbytes} B holds {nbytes / D.Q:.2f} B slots, not the "
+                                     f"{self.b_objects} counted: every later op of the row would read its slots off by one")
 
 
 class Seq:
     """A dispatch's transaction. ``nop``: the device address of a NOP command (one B slot); pages: per role the
     device address of its page (two B slots: ``device.VisionDevice``)."""
 
-    def __init__(self, *, nop: int, pages: dict[str, int] | None = None):
+    def __init__(self, *, nop: int, pages: dict[Role, int] | None = None):
         self.t = txn.Txn()
         self.nop = nop
         self.pages = pages or {}
-        self.role_of: list[str | None] = [None] * ROWS  # (per core row the role its cores hold, as far as known)
+        self.role_of: list[Role | None] = [None] * ROWS  # (per core row the role its cores hold, as far as known)
         self.n = 0  # ops pushed
         self.frontier = 0  # every task of the ops before it is complete
         self._q: dict[tuple, collections.deque] = {}  # (row 0 / 1, col, dir, ch) -> ops of its pending tasks

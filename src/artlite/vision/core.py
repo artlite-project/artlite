@@ -1,5 +1,5 @@
 """The cores' program of the vision overlay (``design``): a C++ main reading commands from the row's B stream. The main
-loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``ROLES``: "a" attention of
+loop (``sd15_run``), GEMMs and convs are resident code; the other kinds are a role's code (``roles.Role``: "a" attention of
 d 80, "s" of d 160, "c" of d 40, "v" the VAE decoder's single-head attention of d 512, "gn" the GroupNorm applies,
 "ln" the LayerNorm / RMSNorm apply and the GEGLU / GELU epilogues of the feed-forward GEMMs that follow it, "w" MiniCPM-V's
 window attention, "r" the RoPE epilogue of the vision encoders' Q and K GEMMs (with LFM3-VL's per-head RMSNorm,
@@ -23,7 +23,7 @@ core copies it into its workspace and releases the slot. Kinds:
   column's tokens: C_R rows of groups, x = g + groups lane): per chunk of 64 input channels (C_NCH) an A object of its
   input band rows (the halo rows included) and per tap a B slot, in the host's tap order: the taps' A are the object's
   groups or lane-shifted copies (``sd15_shift``) of its edge groups, their MAC calls, walks and shift phases host-built
-  (``ops.Gemm.conv_words``, ``sd15_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
+  (``ops.ConvSpec.words``, ``sd15_conv``); then C_NRES A objects of a residual tile (bf16, the C-tile layout) added to
   C; statistics of the result (C_STATS: GroupNorm group sums of the
   op (C_STF: carried over from / to the next op), LayerNorm per-token sums of a tile, each emitted as one output
   chunk after the tile / the op); the output (C_OUT): the bf16 C tile (m x 160 B; O_DS: its groups 0 and 2, a
@@ -126,7 +126,7 @@ ROPE = CMD.kind("rope gemm", extends=(WALKS,))
 ROPE.word("C_BIAS", at=64)
 C_QKW = ROPE.block("C_QKW", 80, at=_PATS_AT - CALL * NCALL)  # (with C_QKN: its heads' norm weights, 80 bf16 (m 16: 160))
 # a conv (K_GEMM with C_CONV: the tile = the column's tokens: C_R rows of groups): the lane shifts' byte masks (1152 B: after
-# the biases of at most 4 passes), the taps' MAC calls (``ops.Gemm.conv_words``), per tap (the order of its calls and shift
+# the biases of at most 4 passes), the taps' MAC calls (``ops.ConvSpec.words``), per tap (the order of its calls and shift
 # phase) a word, the shift phases (per output row a sd15_shift's offsets); the walks of B and C
 CONV = CMD.kind("conv", extends=(PATS,))
 CONV.word("C_BIAS", at=64)
@@ -160,7 +160,6 @@ def consts() -> dict[str, int]:
 
 
 P = kernel_prefix("sd15")  # (the kernels' names: ``kernel_source``)
-ROLES = ("a", "c", "v", "gn", "ln", "w", "r", "d", "s", "e", "g")
 WINS = ("gnc", "mac", "out", "acqa", "acqb", "apply", "aqk", "apv", "afin", "aexp", "aexp2", "nomac", "a40qk")  # (nomac: no GEMM / conv MAC, an ablation)
 
 _SRC = templating.load("artlite/vision/core.cc.jinja")

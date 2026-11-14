@@ -276,7 +276,7 @@ class Net:
         bd.gemm(Gemm(m=TM, ntile=1, K=H, N=ROWS * HP, x=n.addr, y=kt.addr, res=rt, out="rope2", qkn=w["kn"], qkn_n=HD,
                      qkn_eps=EPS, x_np=n.np, y_np=kt.np), w["k"], None, name=name + ".k")
         gemm(bd, nk, w["v"], None, name=name + ".v", out=vt, kind="vt")
-        at = WinAttention(q=0, o=0, mask=0, kv=kv, units=2, np=lv.np, kv_head_bytes=img // ROWS)
+        at = WinAttention(q=0, o=0, mask=0, kv=kv, units=2, np=lv.np, image_units=2)
         bd.written(kvname)
         bd.defer({col: at.kv_drains(kt.addr, vt.addr, col, 0, kv) for col in range(COLS)},
                  release=[(kt.addr, kt.size), (vt.addr, vt.size)])
@@ -288,7 +288,7 @@ class Net:
         gemm(bd, nk, w["g"], None, name=name + ".g", out=gt, kind="isig")
         free(bd, n)
         o = alloc(bd, lv, HEADS * HP, "pn")
-        at = WinAttention(q=qt.addr, o=o.addr, mask=mk, kv=kv, units=2, np=lv.np, gate=gt.addr, kv_head_bytes=img // ROWS)
+        at = WinAttention(q=qt.addr, o=o.addr, mask=mk, kv=kv, units=2, np=lv.np, gate=gt.addr, image_units=2)
         bd.flush()
         bd.reading(kvname)
         cmd = bd.image(f"{self.p}.win", at.command())

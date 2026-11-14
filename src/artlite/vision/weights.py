@@ -425,7 +425,7 @@ def _runs(c: np.ndarray) -> np.ndarray:
 
 def _columns(g: Gemm, w: Wt) -> np.ndarray:
     """The matrix columns of a Gemm's k-tiles in its B slots' order (hilo: of the hi plane), -1 past the matrix: a
-    conv's per chunk of 64 input channels its taps (``Gemm.tap_order``), each the chunk's channels."""
+    conv's per chunk of 64 input channels its taps (``ConvSpec.tap_order``), each the chunk's channels."""
     half = (g.nkt // 2 if g.hilo else g.nkt) * D.KT
     if not g.conv:
         k = w.shape[1] * w.inner
@@ -433,7 +433,7 @@ def _columns(g: Gemm, w: Wt) -> np.ndarray:
         return pad_index(half, k)
     assert w.shape[1:] == (g.K, 3, 3), (w.shape, g.K)
     ch = np.arange(64)
-    return np.concatenate([(64 * c + ch) * 9 + 3 * dy + dx for c in range(g.nch) for dy, dx in g.tap_order(c)])
+    return np.concatenate([(64 * c + ch) * 9 + 3 * dy + dx for c in range(g.nch) for dy, dx in g.conv.tap_order(c)])
 
 
 class Slots:
@@ -445,13 +445,13 @@ class Slots:
         self.done: list[tuple] = []
 
     def add(self, g: Gemm, w: Wt, at: dict[int, tuple[str, int]]) -> None:
-        """Jobs of a Gemm's weights w (its rows ``Gemm._rows``) into its core rows' places (row -> image, byte
+        """Jobs of a Gemm's weights w (its rows ``Gemm.weight_rows``) into its core rows' places (row -> image, byte
         offset)."""
         cols = _columns(g, w)
         parts = [(p, _runs(np.where(cols >= 0, p.cols[np.maximum(cols, 0)], -1))) for p in w.parts]
         parts = [(p, r) for p, r in parts if len(r)]
         for row, (image, offset) in at.items():
-            idx = g._rows(row)
+            idx = g.weight_rows(row)
             assert idx.max() < w.shape[0], (idx.max(), w.shape)
             self.pending.append((image, offset, g.npo, g.nkt, g.hilo,
                                  [(p.source, p.scale, np.where(p.rows[idx] >= 0, p.rows[idx], -1).astype(np.int32), r)

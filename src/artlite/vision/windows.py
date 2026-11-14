@@ -50,7 +50,7 @@ from . import layout as L
 from .build import Builder
 from .device import VisionDevice
 from .layers import Tensor, alloc, free, gelu_table, gemm
-from .ops import _dims
+from .ops import dims
 from .program import Program, ProgramStore
 from .vit import ln, vit_level, xfer
 
@@ -219,7 +219,7 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
     x = Bands(lv, nm.x(nl), C)
     pn, mgb, hid = lv.pn(C), l1.pn(MERGED), l1.pn(FUP)
     outw = w["down"].shape[0]
-    walk = _dims((18, 1), (2, 18), (C // 8, 144), (4, 36))  # (stream order: s, kb, p, a panel's 18 words)
+    walk = dims((18, 1), (2, 18), (C // 8, 144), (4, 36))  # (stream order: s, kb, p, a panel's 18 words)
     for b in range(nb):
         xb, rec = x.load(bd, b)
         n = alloc(bd, lv, C, "pn")

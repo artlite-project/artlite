@@ -25,7 +25,7 @@ from artlite.vision import layout as L
 from artlite.vision.build import Builder, Level
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import LOG2E, DTensor, Tensor, _silu, alloc, free, plain
-from artlite.vision.ops import Apply, Gemm
+from artlite.vision.ops import Apply, ConvSpec, Gemm
 from artlite.vision.program import Program
 from artlite.vision.seq import ColOps, MemTask, RowOps
 from artlite.vision.weights import Wt, computed, flat, take, values
@@ -321,9 +321,9 @@ def conv(bd: Builder, x: Tensor, kw: dict, w: np.ndarray, b: np.ndarray | None, 
     rows stored as ``ch``: the same tensor for a layer's bands) for band ``band`` of nb into out's C tiles (acc: + out,
     a residual or the partial sums); rec: GroupNorm records of the output there (one over the layer's bands:
     ``stf``); extra: fills merged into its op (the next band's inputs)."""
-    g = dict(m=64, ntile=x.lv.ntile, K=w.shape[1], N=ch.P, x=x.addr, y=out.addr, out="bf16", conv=1, R=1, zero=bd.zero,
-             x_np=x.np, joined=True, res=out.addr if acc else None, ch_step=ch.stride, ch_real=ch.per,
-             tsplit=4 // ch.slices, **kw)
+    g = {"m": 64, "ntile": x.lv.ntile, "K": w.shape[1], "N": ch.P, "x": x.addr, "y": out.addr, "out": "bf16", "x_np": x.np,
+         "conv": ConvSpec(stride=1, R=1, zero=bd.zero, joined=True, **kw), "res": out.addr if acc else None,
+         "ch_step": ch.stride, "ch_real": ch.per, "tsplit": 4 // ch.slices}
     if rec:
         g.update(stats="gn", rec=rec, gsize=ch.gsize, stf=stf(band, nb))
     bd.gemm(Gemm(**g), w, b, name=f"{name}.{kw.get('wide', '')}{g.get('stf', '')}", wname=f"{name}.w", extra=extra)

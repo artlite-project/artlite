@@ -21,6 +21,7 @@ from ..operators.toolchain import CACHE_DIR
 from ..overlay import OverlayDevice, Transaction
 from . import core as K
 from . import design as D
+from .roles import ROLES, SPECS
 from .seq import Seq
 from .sources import SRC, source_files
 from .weights import Slots, Source
@@ -30,16 +31,14 @@ if TYPE_CHECKING:
 
 
 def role_pages(work_dir: str) -> paging.Pager:
-    """The roles' pages (``core.ROLES``, entries ``sd15_ext_<role>``, called from the main loop ``sd15_run``; "ln" also
-    ``sd15_geglu`` and ``sd15_gelu``, "d" ``sd15_swiglu`` and ``sd15_prod``, "r" ``sd15_silu_pn`` (both), the GEMM's;
-    "r"'s entry the GEMM's RoPE epilogue) of the compiled design in ``work_dir``, the same on every core."""
+    """The roles' pages (``roles.SPECS``: entries ``sd15_ext_<role>``, then the role's ``more``, called from the main loop
+    ``sd15_run``; the GEMM calls the epilogues named by ``RoleSpec.gemm_calls``) of the compiled design in ``work_dir``,
+    the same on every core."""
     p = K.P
-    more = {"ln": (f"{p}_geglu", f"{p}_gelu"), "d": (f"{p}_swiglu", f"{p}_prod"), "r": (f"{p}_silu_pn", f"{p}_silu_pn")}
-    pages = {r: (f"{p}_ext_{r}",) + more.get(r, ()) for r in K.ROLES}
+    pages = {r: (f"{p}_ext_{r}", *(f"{p}_{e}" for e in SPECS[r].more)) for r in ROLES}
+    gemm_calls = dict.fromkeys(f"{p}_{e}" for r in ROLES for e in SPECS[r].gemm_calls)
     return paging.link(work_dir, pages=pages, pager=f"{p}_pg_self",
-                       calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in K.ROLES),
-                              f"{p}_gemm": (f"{p}_geglu", f"{p}_gelu", f"{p}_ext_r", f"{p}_swiglu", f"{p}_prod",
-                                            f"{p}_silu_pn", f"{p}_ext_e")},
+                       calls={f"{p}_run": tuple(f"{p}_ext_{r}" for r in ROLES), f"{p}_gemm": tuple(gemm_calls)},
                        roots=(f"{p}_main",), stack=D.STACK, cores=[(c, r + 2) for c in range(COLS) for r in range(ROWS)],
                        state=D.L1["ext"], wake=D.L_WAKE)
 
@@ -63,7 +62,7 @@ class VisionDevice:
         self.alloc("_nop", D.Q)
         self.write("_nop", nop.view(np.uint8))
         self.pages = {}
-        for role in K.ROLES:
+        for role in ROLES:
             pg = self.pager.slots(role, words=D.Q // 4, n=2)
             self.alloc(f"_page_{role}", pg.nbytes)
             self.write(f"_page_{role}", pg)

@@ -23,7 +23,7 @@ host's NOP commands, ``seq``) its k-tile i is in B slot (i + 1) % 2, so the MAC 
 
 The cores' program (``core``): a C++ main reading commands from the B stream (lock intrinsics on the pinned core locks:
 0 / 1 A free / full, 2 / 3 B, 4 / 5 the output ring; 6 between an A slot's two BDs; 7 / 8 a page's slots sent / done,
-9 the pager's wake). What does not fit 16 KB of program memory together is split into roles (``core.ROLES``), pages of
+9 the pager's wake). What does not fit 16 KB of program memory together is split into roles (``roles.Role``), pages of
 code the cores load themselves (``paging``): the host puts a role's page into a row's B stream before the first op that
 needs it there (``seq``), so every row runs every role.
 """
