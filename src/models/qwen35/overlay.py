@@ -49,7 +49,7 @@ from ml_dtypes import bfloat16
 from artlite import txn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
-from artlite.decode.model import ModelOverlay, host_bytes, paged_formats
+from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, host_bytes, paged_formats
 from artlite.decode.protocol import (
     AB_ID,
     B_F32,
@@ -825,8 +825,9 @@ class QwenOverlay(ModelOverlay):
         for c in range(COLS):
             self._values_to(seq, c, to, e0=h8 * c, n=h8, S=S)
 
-    def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, int], ...]) -> _Step:
-        """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps)."""
+    def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, int], ...], b: int) -> _Step:
+        """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps; ``b``: its
+        buffer, one: no ``AHEAD``)."""
         dev, cfg = self.dev, self.cfg
         seq = Sequence(self.op, inputs=("X",))
         st = _Step(S, subs)
@@ -1263,37 +1264,38 @@ class QwenOverlay(ModelOverlay):
             self.nrep, self.cshift = n, n
         self._accepted = True
 
-    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
+    def cache_rows(self) -> list[CacheRows]:
         """(per attention layer and KV head: groups of 32 positions, 2 objects each)"""
         if self.ash is None:
             return []
         rows = [self.kv_off[L] + h * self.ash.head_bytes for L in self.kv_off for h in range(self.ash.kvh)]
-        return [(np.array(rows), attn.OBJS * self.T, attn.POS_PER_GROUP)]
+        return [CacheRows(np.array(rows), attn.OBJS * self.T, attn.POS_PER_GROUP)]
 
-    def snapshot(self, position: int) -> dict[str, object]:
+    def snapshot(self, position: int) -> Snapshot:
         """(and the GDN layers' states, conv objects with their replay objects, and conv states of the prefill, the lazy
         commit's fields, ``rope``)"""
         out = super().snapshot(position)
+        extra = out.extra
         if self.gsh is not None:
             for name in ("GSTATE", "GOBJ", "GHDR"):
                 self.dev.fetch(name)
                 v = self.dev.view(name)[self._gspan()] if name == "GSTATE" else self.dev.view(name)
-                out[name] = host_bytes(v.shape)
-                out[name][:] = v
-        out["fields"] = (self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted, self._gp, self._gh,
-                         self._gpos, self._gnext, self._gcur, self.kshift)
-        out["rope"] = self.rope.copy()
+                extra[name] = host_bytes(v.shape)
+                extra[name][:] = v
+        extra["fields"] = (self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted, self._gp, self._gh,
+                           self._gpos, self._gnext, self._gcur, self.kshift)
+        extra["rope"] = self.rope.copy()
         return out
 
-    def restore(self, snapshot: dict[str, object]) -> None:
+    def restore(self, snapshot: Snapshot) -> None:
         super().restore(snapshot)
         (self.nrep, self.cshift, self._conv_in_ghdr, self._committed, self._accepted, self._gp, self._gh, self._gpos,
-         self._gnext, self._gcur, self.kshift) = snapshot["fields"]
+         self._gnext, self._gcur, self.kshift) = snapshot.extra["fields"]
         if self.gsh is not None:
             for name in ("GSTATE", "GOBJ", "GHDR"):
-                self.dev.view(name)[self._gspan() if name == "GSTATE" else slice(None)] = snapshot[name]
+                self.dev.view(name)[self._gspan() if name == "GSTATE" else slice(None)] = snapshot.extra[name]
                 self.dev.flush(name)
-        self.rope[:] = snapshot["rope"]
+        self.rope[:] = snapshot.extra["rope"]
 
     def _gspan(self) -> slice:
         """GSTATE's bytes a snapshot keeps: its states (chunkwise: the half that the next position's block starts

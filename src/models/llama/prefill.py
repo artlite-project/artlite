@@ -133,6 +133,7 @@ class LlamaPrefill(ChunkPrefill):
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and t // pq <= 64))
         self.layers = ov.layers
         self.kv_layers = [0]  # (the overlay's rings: one state for every layer, key 0)
+        self.kv_bytes = ov.kv_bytes(ov.layers[0])  # (a KV head's cache of a layer: the same for every layer)
         self.shape = s
         self.group = s.pg
         # the norms' panel rows: the hidden size padded to whole K chunks (the padding columns never written: zero)
@@ -146,17 +147,17 @@ class LlamaPrefill(ChunkPrefill):
         gemms: dict[str, object] = {}  # (one object per distinct GEMM)
         self.ops = {t: self._ops(t, gemms) for t in sorted({self._t(T) for T in self.sizes})}
         self.plans = self.ops[SUB].plans if SUB in self.ops else self.ops[max(self.ops)].plans
-        self.attn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T))
+        self.attn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes, kv_pad=self.pad, sub=self._pt(T))
                      for T in self.sizes}
         self.pack_sizes = tuple(T for T in PACK_SIZES if T in self.sizes) if pack else ()
         win = PACK_SPAN // s.pg + 1
-        self.pattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
+        self.pattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
                                          window=win) for T in self.pack_sizes}
         # (after a history of up to RING_HOLD groups: the window and the history in the memory tiles, each group read
         # once; hi + lo K and a pass a cache group)
         hold = (min(RING_HOLD, PA.ring_groups(s, win, s.blocks[0]))
                 if s.kp == 2 and s.pg == 32 * s.blocks[0] else 0)
-        self.rattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
+        self.rattn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes, kv_pad=self.pad, sub=self._pt(T),
                                          window=win, ring=hold) for T in self.pack_sizes if T >= RING_MIN} if hold else {}
         self.ring_sizes = tuple(self.rattn)
         self.span = PACK_SPAN if pack else 0
@@ -171,7 +172,7 @@ class LlamaPrefill(ChunkPrefill):
 
     def _ops(self, t: int, gemms: dict[str, object]) -> _Ops:
         """The operators of sub-chunks of t tokens (qkv's of qt: SUB in BIG ones)."""
-        ov, cfg, img, H = self.ov, self.cfg, self.img, self.H
+        cfg, img, H = self.cfg, self.img, self.H
         qt = SUB if t == BIG else t
         pitch, dp = PG.phase_pitch(img, "qkv", qt), PG.d_pitch(img, t)
         plans = {(L, name): plan_gemm(img, img.region(L, name), qt if name == "qkv" else t, ops=gemms,
@@ -187,7 +188,7 @@ class LlamaPrefill(ChunkPrefill):
             lay = plans[(L, "qkv")].layout
             for pt in {self._pt(T) for T in self.sizes if self._t(T) == t}:
                 if (lay.key, pt) not in preps:
-                    preps[(lay.key, pt)] = PA.PrepOperator(T=pt, shape=self.shape, layout=lay, kv_bytes=ov.kv_bytes,
+                    preps[(lay.key, pt)] = PA.PrepOperator(T=pt, shape=self.shape, layout=lay, kv_bytes=self.kv_bytes,
                                                              cs_positions=self.cs_rows, kv_pad=self.pad,
                                                              norm=cfg.qk_norm, eps=cfg.rms_norm_eps)
         o = _Ops(plans, qt, pitch, dp, parts, f_part,

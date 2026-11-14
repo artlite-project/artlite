@@ -22,7 +22,7 @@ import numpy as np
 import uvicorn
 from fastapi.testclient import TestClient
 
-from artlite.decode.model import Records
+from artlite.decode.model import HostRecords
 from models.model import Capabilities, Model
 from models.npu_model import Checkpoint, NpuModel
 from models.readouts import Readouts
@@ -263,11 +263,11 @@ class FakeNpu(NpuModel):
                 "the caches hold another sequence than the checkpoint's"
         self.position, self.seq = position, self.seq[:position]
 
-    def read_records(self, start: int, end: int) -> list[Records]:
+    def read_records(self, start: int, end: int) -> list[HostRecords]:
         self.calls.append(("read", start, end))
-        return [Records(start, end, [(1, np.array(self.seq[start:end], np.int64).view(np.uint8).reshape(1, -1, 8))])]
+        return [HostRecords(start, end, [(1, np.array(self.seq[start:end], np.int64).view(np.uint8).reshape(1, -1, 8))])]
 
-    def write_records(self, records: list[Records], start: int, end: int) -> None:
+    def write_records(self, records: list[HostRecords], start: int, end: int) -> None:
         self.calls.append(("write", start, end))
         r = records[0]
         assert r.start <= start <= len(self.seq) and end <= r.end

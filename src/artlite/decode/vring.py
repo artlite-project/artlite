@@ -13,6 +13,8 @@ side: ``kernel_lib.h``'s V records and ``al::merge``):
 import numpy as np
 from ml_dtypes import bfloat16
 
+PAIR = 16  # positions of a record pair (P V adds two records together): a step's sub-steps repeat with them
+
 
 def substeps(p: int, S: int, pg: int, r: int) -> list[tuple[int, int]]:
     """The sub-steps (first slot, slots) of a layer's attention in a step at positions p .. p + S - 1: the slots of one

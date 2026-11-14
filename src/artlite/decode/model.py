@@ -1,25 +1,26 @@
-"""The host side every model's decode overlay shares (``ModelOverlay``; the models': ``qwen35.overlay``,
-``gemma4.overlay``): the weight image's buffer (a ``WeightBuffer``'s adopted, or packed at ``load``), the buffers'
+"""The host side every model's decode overlay shares (``ModelOverlay``; the attention models' skeleton:
+``decode.attn_overlay``; qwen35's: ``qwen35.overlay``): the weight image's buffer (a ``WeightBuffer``'s adopted, or packed at ``load``), the buffers'
 layout (``_take``), the residual-slice objects (F_LOADR), the phases' K-group input regions (``InputRegion``) and their
 metadata objects, a K group's input fills, the drains of a column's outputs into a phase's x and of the LM head's into
 LOGITS, a column-major image's weight runs, the transaction of a step per slot count, first layer and pattern of
-sub-steps (built at its first use or ahead: ``prepare``) and its vectorized BD patches (``_bd_words``), a step's x and
-logits, the LM head alone (``logits_of``); a sequence's state as host copies (a prompt cache's: ``read_records`` /
-``write_records``, the KV caches' records of positions; ``snapshot`` / ``restore``, the rest).
+sub-steps (``StepKey``; built at its first use or ahead: ``prepare``) and its vectorized BD patches (``_bd_words``), a
+step's x and logits, the LM head alone (``logits_of``); a sequence's state as host copies (a prompt cache's:
+``read_records`` / ``write_records``, the KV caches' records of positions; ``snapshot`` / ``restore``, the rest).
 
 A model's overlay supplies its config and image classes (``CONFIG``, ``IMAGE``), its design (``op``), its phases and
 their flags (``_flags``; the metadata words of its own: ``_meta``), its static objects (``_load``), the layout of its
 buffers (``_plan``: ``_layout``'s buffers, ``loadr``, the phases' input regions, its attention's; then ``_sizes``), a
 step's transaction (``_build``), its sub-steps (``subs``, repeating every ``period`` positions), per-step patches
-(``_set_position``) and ring bookkeeping (``_ran``), the LM head's phase alone (``_lm_phase``), its caches' rows
-(``cache_rows``) and rings (``rings``).
+(``_set_position``: with ``AHEAD`` it takes ``ahead`` and returns whether the step was patched) and ring bookkeeping
+(``_ran``), the LM head's phase alone (``_lm_phase``), its caches' rows (``cache_rows``) and rings (``rings``).
 """
 
+import inspect
 import math
 import mmap
 import time
-from dataclasses import dataclass
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -29,6 +30,7 @@ from ..gguf_model import GGUFFile
 from ..operators.design import COLS
 from ..operators.util import rup
 from ..overlay import OverlayDevice, Sequence, Transaction, WeightBuffer
+from ..txn import HardwareLimitError
 from . import phases as mp
 from .image import TileImage
 from .protocol import (
@@ -89,7 +91,7 @@ def host_bytes(shape: tuple[int, ...]) -> np.ndarray:
 
 
 @dataclass(eq=False)
-class Records:
+class HostRecords:
     """Host copies of an overlay's KV records of positions start .. end - 1 (``ModelOverlay.read_records``): per cache
     kind (``ModelOverlay.cache_rows``) its positions per group and the groups that hold those positions, (rows, groups,
     bytes per group) uint8 from group start // positions per group on."""
@@ -102,7 +104,7 @@ class Records:
     def nbytes(self) -> int:
         return sum(a.nbytes for _, a in self.parts)
 
-    def cut(self, end: int) -> "Records":
+    def cut(self, end: int) -> "HostRecords":
         """The records of positions start .. end - 1 alone (end <= self.end; copies: the rest is freed)."""
         assert self.start <= end <= self.end
         parts = []
@@ -110,7 +112,71 @@ class Records:
             b = host_bytes((a.shape[0], -(-end // pg) - self.start // pg, a.shape[2]))
             b[:] = a[:, :b.shape[1]]
             parts.append((pg, b))
-        return Records(self.start, end, parts)
+        return HostRecords(self.start, end, parts)
+
+
+class CacheRows(NamedTuple):
+    """One kind of KV cache in KV (``ModelOverlay.cache_rows``): the byte offset of each row (a KV head's cache of a layer;
+    a row's groups follow each other from its offset), the bytes of a group, the positions of a group."""
+
+    offsets: np.ndarray
+    group_bytes: int
+    positions: int
+
+
+def nbytes_of(x: object) -> int:
+    """Bytes of the objects with ``nbytes`` (arrays, ``HostRecords``, ``Snapshot``) in nested lists, tuples and dicts."""
+    if isinstance(x, dict):
+        return sum(nbytes_of(v) for v in x.values())
+    if isinstance(x, (list, tuple)):
+        return sum(nbytes_of(v) for v in x)
+    n = getattr(x, "nbytes", 0)
+    return n if isinstance(n, int) else 0
+
+
+@dataclass
+class Snapshot:
+    """What continuing a sequence needs of an overlay besides its caches' records before a position (``ModelOverlay.
+    snapshot``): the open records' rings (their bytes), the ``VRing`` that says which records they hold, the last step's
+    slot count, the records of the groups around the position (``open``: first position, end, their records), and the
+    model's own state (``extra``)."""
+
+    rings: np.ndarray
+    vring: VRing
+    last_s: int
+    open: tuple[int, int, HostRecords]
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def nbytes(self) -> int:
+        return self.rings.nbytes + self.open[2].nbytes + nbytes_of(self.extra)
+
+
+class StepKey(NamedTuple):
+    """What selects a step's transaction: its slots, whether it runs the LM head, the overlay's variant (``_variant``:
+    its first layer, a model's own after it), its attention's sub-steps (``subs``) and which of its two buffers it is
+    (``AHEAD``: the next step's is patched while one runs)."""
+
+    S: int
+    logits: bool
+    variant: tuple
+    subs: tuple
+    b: int = 0
+
+
+@dataclass(frozen=True)
+class AheadStep:
+    """A step patched while the previous one ran (``ModelOverlay._run``): the step runs as it is when it has this key (of
+    buffer 0), position and ring state; ``b``: the buffer it is in."""
+
+    key: StepKey
+    position: int
+    ring_state: tuple
+    st: Any
+    b: int
+
+    def matches(self, key: StepKey, position: int, ring_state: tuple) -> bool:
+        return self.key == key and self.position == position and self.ring_state == ring_state
 
 
 class ModelOverlay:
@@ -120,8 +186,9 @@ class ModelOverlay:
 
     CONFIG: ClassVar[Any]  # the model's config class (``from_gguf``)
     IMAGE: ClassVar[type[TileImage]]  # its image class: (gguf, cfg, layers=, vocab=)
-    # (the next step's position patched into a second transaction while a step runs: ``_run``; the model's
-    # ``_set_position`` takes ``ahead`` and its transactions their buffer, ``_transaction``)
+    # (the next step's position patched into a second transaction while a step runs: ``_run``. The model's ``_set_position``
+    # takes ``ahead`` and returns False when it did not patch the step, its ``_build`` the buffer ``b`` of the two
+    # transactions: checked at construction)
     AHEAD: ClassVar[bool] = False
     # the phases whose input the helper norms (a hidden size of part of a K chunk: their inputs' padding k kept zero,
     # ``_clear_pads``)
@@ -130,6 +197,8 @@ class ModelOverlay:
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None,
                  image: TileImage | None = None):
+        if self.AHEAD and "ahead" not in inspect.signature(self._set_position).parameters:
+            raise TypeError(f"{type(self).__name__}.AHEAD: its _set_position takes no `ahead`")
         self.gguf = gguf
         self.cfg = cfg = weights.image.cfg if weights is not None else self.CONFIG.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
@@ -147,17 +216,17 @@ class ModelOverlay:
         self.dev: OverlayDevice | None = None
         self.vring = VRing()  # (the attention layers' rings: which open records they hold, which caches a prefill wrote)
         self._layout: dict[str, int] = {}  # (buffer -> bytes so far: ``_take``)
-        self._steps: dict[tuple, Any] = {}  # (S, logits, start, sub-steps) -> the step's transaction
+        self._steps: dict[StepKey, Any] = {}  # (a step's transaction, built at its first use)
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
         self._meta_bytes: dict[tuple[int, int], tuple] = {}  # (S, start) -> the objects' ACT bytes (``_metas``)
         self._last_s = 1
         self._tr_lm: Transaction | None = None
-        self._ahead: tuple[tuple, Any] | None = None  # ((the step's key, position), its transaction) patched ahead
+        self._ahead: AheadStep | None = None  # (the next step, patched while one runs)
         # the host seconds of the last step's one-time work: its transaction's first build and patch tables, a prompt's states
         # turned into the decode's (``_once``): not a step's time (``models.drafts``' planner)
         self.once_s = 0.0
         self._once_t = 0.0  # (the one-time work before the step's ``_run``)
-        self._ran_keys: set = set()
+        self._ran_keys: set[StepKey] = set()
         self._pads: list[tuple[int, int, int]] | None = None  # (``_clear_pads``)
         self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
 
@@ -341,9 +410,9 @@ class ModelOverlay:
         seq.drain("C", c, self.dev.address("LOGITS", 2 * per * c), S * 2 * per,
                   (C_LEN // 2, S, self.vocab // 2, C_LEN // 2))
 
-    def _build(self, S: int, lm: bool, subs: tuple) -> Any:
-        """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps): an
-        object with the ``Transaction`` ``tr`` (and what ``_set_position`` patches)."""
+    def _build(self, S: int, lm: bool, subs: tuple, b: int) -> Any:
+        """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps; ``b``: which
+        of its two buffers, ``AHEAD``): an object with the ``Transaction`` ``tr`` (and what ``_set_position`` patches)."""
         raise NotImplementedError
 
     def subs(self, p: int, S: int) -> tuple:
@@ -357,7 +426,7 @@ class ModelOverlay:
     def _set_position(self, st: Any, p: int, ahead: bool = False) -> bool:
         """A step's position-dependent objects and transfers (the patches of its transaction ``st``). ``ahead``: while
         the previous step runs (``AHEAD``), only objects of st's own buffer: False when the step needs more (it is
-        patched again before it runs)."""
+        patched again before it runs); True: patched."""
         raise NotImplementedError
 
     def _ran(self, p: int, S: int) -> None:
@@ -369,14 +438,14 @@ class ModelOverlay:
         return (frozenset(self.vring.from_prefill),
                 tuple(sorted((L, tuple(sorted(d.items()))) for L, d in self.vring.slots.items())))
 
-    def _transaction(self, S: int, logits: bool, subs: tuple, b: int = 0) -> Any:
-        """The transaction of a step (built at its first use); ``b``: which of its two buffers (``AHEAD``: the next
-        step's is patched while one runs; the builder reads ``_b``)."""
-        key = (S, logits, self._variant(), subs, b)
+    def _key(self, S: int, logits: bool, subs: tuple, b: int = 0) -> StepKey:
+        """The key of a step's transaction (buffer ``b``)."""
+        return StepKey(S, logits, self._variant(), subs, b)
+
+    def _transaction(self, key: StepKey) -> Any:
+        """The transaction of a step (built at its first use)."""
         if key not in self._steps:
-            self._b = b
-            self._steps[key] = st = self._build(S, logits, subs)
-            st.b = b
+            self._steps[key] = self._build(key.S, key.logits, key.subs, key.b)
         return self._steps[key]
 
     def _variant(self) -> tuple:
@@ -398,7 +467,7 @@ class ModelOverlay:
         self._meta_of(S)
         for subs in {self.subs(p, S) for p in range(self.period)}:
             for b in range(2 if self.AHEAD else 1):
-                self._transaction(S, logits, subs, b)
+                self._transaction(self._key(S, logits, subs, b))
 
     def patch_ahead(self, S: int, p: int) -> None:
         """Patch the step of S slots at p (with logits) while another hardware context's dispatch runs (a drafter's, before the
@@ -406,16 +475,20 @@ class ModelOverlay:
         if p + S > self.max_positions:
             return
         subs = self.subs(p, S)
-        st, once = self._transaction(S, True, subs), self._once_t
+        key = self._key(S, True, subs)
+        st, once = self._transaction(key), self._once_t
         self._set_position(st, p)
         self._once_t = once  # (while another dispatch runs: none of the step's time)
-        self._ahead = (((S, True, self._variant(), subs), p, self._ring_state()), st)
+        self._ahead = AheadStep(key, p, self._ring_state(), st, 0)
 
     @staticmethod
     def _bd_words(words: np.ndarray, at: np.ndarray, address: np.ndarray, nbytes: np.ndarray) -> None:
         """``txn.bd_words`` of many BDs at once: length in words, address low, high at words[at ..] (the word's packet
         bits stay: a fill on a packet-switched stream keeps its header)."""
         assert np.all(nbytes > 0) and np.all(nbytes % 4 == 0)
+        if at.size and (int(at.max()) + 2 >= words.size or int(address.max()) >> 48):
+            raise HardwareLimitError(f"a BD at word {int(at.max())} of {words.size}, address {int(address.max()):#x}: "
+                                     f"the transaction holds the BD, whose address is 48 bits")
         words[at] = nbytes // 4
         words[at + 1] = address & 0xFFFFFFFF
         words[at + 2] = words[at + 2] & 0xFFFF0000 | address >> 32
@@ -435,6 +508,14 @@ class ModelOverlay:
         """A plain input's x (``protocol.interleave``, as bytes) -> the x of its (first) K group's region."""
         self.dev.view("ACT")[rg.off + XB:rg.off + XB + xi.size] = xi
         self.dev.flush("ACT", rg.off + XB, xi.size)
+
+    def _read_input(self, rg: InputRegion, slot: int, n: int) -> np.ndarray:
+        """The first n input elements of a plain input's region in the last step, of a slot ([k block][slot sp][8] bf16:
+        ``protocol.interleave``): bf16 values as fp32."""
+        sp, off = self._sp(self._last_s), rg.off + XB
+        self.dev.fetch("ACT", off, 2 * sp * n)
+        v = self.dev.view("ACT")[off:off + 2 * sp * n].view(np.uint16).reshape(-1, sp, 8)[:, slot]
+        return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
     def _logits(self, S: int) -> np.ndarray:
         """The last step's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next dispatch): the
@@ -471,13 +552,13 @@ class ModelOverlay:
         at position + S, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or
         None."""
         self._clear_pads(self._sp(S))
-        subs = self.subs(position, S)
-        key = (S, logits, self._variant(), subs)
+        key = self._key(S, logits, self.subs(position, S))
         before, t = self._once_t, time.perf_counter()
-        if self._ahead is not None and self._ahead[0] == (key, position, self._ring_state()):
-            st = self._ahead[1]
+        b = 0  # (the buffer of the step that runs)
+        if self._ahead is not None and self._ahead.matches(key, position, self._ring_state()):
+            st, b = self._ahead.st, self._ahead.b
         else:
-            st = self._transaction(S, logits, subs)
+            st = self._transaction(key)
             self._set_position(st, position)
         self._ahead = None
         # (one-time: the work before the step, and its patch's: all of it at the transaction's first run)
@@ -490,9 +571,10 @@ class ModelOverlay:
             self._ran(position, S)
             p = position + S
             if self.AHEAD and p + S <= self.max_positions:
-                nxt = self._transaction(S, logits, self.subs(p, S), 1 - st.b)
+                nkey = self._key(S, logits, self.subs(p, S), 1 - b)
+                nxt = self._transaction(nkey)
                 if self._set_position(nxt, p, ahead=True):
-                    self._ahead = (((S, logits, self._variant(), self.subs(p, S)), p, self._ring_state()), nxt)
+                    self._ahead = AheadStep(nkey._replace(b=0), p, self._ring_state(), nxt, 1 - b)
                 self._once_t = 0.0  # (while the step runs: none of the next step's time)
         finally:
             self.dev.wait()
@@ -525,12 +607,11 @@ class ModelOverlay:
     # A sequence's state
     # ------------------------------------------------------------------
 
-    def cache_rows(self) -> list[tuple[np.ndarray, int, int]]:
-        """The KV caches in KV, per kind: each row's byte offset (a KV head's cache of a layer), the bytes and the
-        positions of a group (a row's groups follow each other from its offset)."""
+    def cache_rows(self) -> list[CacheRows]:
+        """The KV caches in KV, per kind."""
         return []
 
-    def read_records(self, start: int, end: int) -> Records:
+    def read_records(self, start: int, end: int) -> HostRecords:
         """Host copies of the caches' records of positions start .. end - 1 (the groups that hold them)."""
         dev, kv, parts = self.dev, self.dev.view("KV"), []
         for offs, gb, pg in self.cache_rows():
@@ -540,9 +621,9 @@ class ModelOverlay:
                 dev.fetch("KV", o + g0 * gb, (g1 - g0) * gb)
                 a[i] = kv[o + g0 * gb:o + g1 * gb].reshape(g1 - g0, gb)
             parts.append((pg, a))
-        return Records(start, end, parts)
+        return HostRecords(start, end, parts)
 
-    def write_records(self, records: Records, start: int, end: int) -> None:
+    def write_records(self, records: HostRecords, start: int, end: int) -> None:
         """The caches' records of positions start .. end - 1 from ``records`` (which hold them; whole groups, so the
         positions around them in their groups too)."""
         assert records.start <= start and end <= records.end
@@ -556,7 +637,7 @@ class ModelOverlay:
                 dev.flush("KV", o + g0 * gb, (g1 - g0) * gb)
         self._ahead = None
 
-    def snapshot(self, position: int) -> dict[str, Any]:
+    def snapshot(self, position: int) -> Snapshot:
         """What continuing a sequence from ``position`` needs of the overlay besides its caches' records before it: the
         open records' rings (their bytes, ``vring``), the records of the groups that hold positions position - SLOTS ..
         position (the open records: after a prefill their V panels are the exact values the rings hold otherwise,
@@ -567,15 +648,14 @@ class ModelOverlay:
         lo, hi = max(position - self.SLOTS, 0), min(position + 1, self.max_positions)
         rings = host_bytes((n,))
         rings[:] = self.dev.view("KV")[o:o + n]
-        return {"rings": rings, "vring": self.vring.copy(), "last_s": self._last_s,
-                "open": (lo, hi, self.read_records(lo, hi))}
+        return Snapshot(rings, self.vring.copy(), self._last_s, (lo, hi, self.read_records(lo, hi)))
 
-    def restore(self, snapshot: dict[str, Any]) -> None:
+    def restore(self, snapshot: Snapshot) -> None:
         """Back to a ``snapshot`` (the caches hold the records of the positions before it)."""
         o, n = self.rings
-        self.dev.view("KV")[o:o + n] = snapshot["rings"]
+        self.dev.view("KV")[o:o + n] = snapshot.rings
         self.dev.flush("KV", o, n)
-        lo, hi, records = snapshot["open"]
+        lo, hi, records = snapshot.open
         self.write_records(records, lo, hi)
-        self.vring.assign(snapshot["vring"])
-        self._last_s, self._ahead = snapshot["last_s"], None
+        self.vring.assign(snapshot.vring)
+        self._last_s, self._ahead = snapshot.last_s, None

@@ -86,6 +86,12 @@ def hist_drains(S: int) -> list[tuple[int, int]]:
     return out
 
 
+def history_parts(o: int) -> tuple[tuple[int, int, int], ...]:
+    """The history rows of the conv region at ACT offset o: (offset in ACT, offset in the HIST rows, bytes) of rows 0 .. 7
+    (object 2's payload) and rows 8, 9 (after the taps in object 1's)."""
+    return (o + payload(2), 0, 8 * ROW), (o + payload(1) + 3 * TAP, 8 * ROW, 2 * ROW)
+
+
 def y_bytes(S: int) -> int:
     """Bytes of the column's y in out's packed input."""
     return CH * packed_slots(S) * 2

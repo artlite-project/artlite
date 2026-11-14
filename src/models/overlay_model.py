@@ -7,17 +7,16 @@ import functools
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 
-from .npu_model import Checkpoint, NpuModel, nbytes
+from artlite.decode.model import HostRecords, nbytes_of
+
+from .npu_model import Checkpoint, NpuModel
 from .sampling import Penalties, top_logits
 from .sequence import Sequence as Tokens
 from .speculative import SpeculativeMixin
-
-if TYPE_CHECKING:
-    from artlite.decode.model import Records
 
 R = TypeVar("R")
 
@@ -191,7 +190,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def checkpoint(self) -> Checkpoint:
         self._abandon()
         state = ([ov.snapshot(self.position) for ov in self._overlays()], self._state())
-        return Checkpoint(self.position, state, nbytes(state))
+        return Checkpoint(self.position, state, nbytes_of(state))
 
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
         self._abandon()
@@ -210,10 +209,10 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         self._set_state(state)
         self.position = position
 
-    def read_records(self, start: int, end: int) -> "list[Records]":
+    def read_records(self, start: int, end: int) -> list[HostRecords]:
         return [ov.read_records(start, end) for ov in self._overlays()]
 
-    def write_records(self, records: "list[Records]", start: int, end: int) -> None:
+    def write_records(self, records: list[HostRecords], start: int, end: int) -> None:
         for ov, r in zip(self._overlays(), records, strict=True):
             ov.write_records(r, start, end)
 

@@ -440,7 +440,7 @@ class GemmaDraft:
         fills = {}
         for kind, swa in ((0, True), (1, False)):
             pg = ov.at.pg[256 if swa else 512]
-            r = ov._ranges(swa, pos - 1)
+            r = ov.ranges(kind, pos - 1)
             m = act[self.tok + kind * XB:][:4 * META].view(np.int32)
             m[M_POS] = pos - 1
             for c in range(COLS):
@@ -471,7 +471,7 @@ class GemmaDraft:
         kv0, act = dev.address("KV"), dev.view("DACT")
         for at, L, c in self._tails:  # (the record of pos - 1)
             src, h = self.src[L], c // AT.QH
-            a = ov.kv_base(src, h) + ov._vrec(pos - 1, bool(self.image.swa[L])) if rec[src] else \
+            a = ov.kv_base(src, h) + ov.v_offset(0 if self.image.swa[L] else 1, pos - 1) if rec[src] else \
                 ov.ring(src, h) + ((pos - 1) >> 3 & 1) * T
             ov._bd_words(self._tr.words, np.array([at]), np.array([kv0 + a]), np.array([T]))
         for (L, h), off in self.att.items():

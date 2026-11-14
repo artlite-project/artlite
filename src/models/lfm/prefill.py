@@ -121,7 +121,7 @@ class LfmPrefill(ChunkPrefill):
         # the caches' end; their slices start a block's groups apart, within the rings and KV_PAD past the caches)
         self.prep_pad = SUB // s.pg * s.group
         kinds = sorted({ov.kind(L) for L in self.kv_layers})
-        self.kv_bytes = {ov.kind(L): ov._kv_bytes(L) for L in self.kv_layers}  # (per KV head, a guard included)
+        self.kv_bytes = {ov.kind(L): ov.kv_bytes(L) for L in self.kv_layers}  # (per KV head, a guard included)
         self.kv0 = {"swa": ov.guard * s.group, "full": 0}
         self.win = {"swa": self.cfg.sliding_window, "full": 0}
         self._starts: dict[int, list[int]] = {}  # (per chunk size: its layers' first items, ``_layer_starts``)

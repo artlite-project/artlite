@@ -11,7 +11,7 @@ from .sampling import LogitsLike, Mask, Penalties, Probs, Sampling, top_logits
 from .sequence import Sequence as Tokens
 
 if TYPE_CHECKING:
-    from artlite.decode.model import Records
+    from artlite.decode.model import HostRecords
 
 
 def auto_capacity(tokens: int) -> int:
@@ -21,16 +21,6 @@ def auto_capacity(tokens: int) -> int:
     while cap < need:
         cap *= 2
     return cap
-
-
-def nbytes(x: object) -> int:
-    """Bytes of the objects with ``nbytes`` (arrays, ``Records``) in nested lists, tuples and dicts."""
-    if isinstance(x, dict):
-        return sum(nbytes(v) for v in x.values())
-    if isinstance(x, (list, tuple)):
-        return sum(nbytes(v) for v in x)
-    n = getattr(x, "nbytes", 0)
-    return n if isinstance(n, int) else 0
 
 
 @dataclass(eq=False)
@@ -150,12 +140,12 @@ class NpuModel:
         lands on (a multiple of ``group``; of a recurrent model: 0, a new sequence)."""
         raise NotImplementedError
 
-    def read_records(self, start: int, end: int) -> "list[Records]":
+    def read_records(self, start: int, end: int) -> "list[HostRecords]":
         """Host copies of the KV caches' records of positions start .. end - 1 (whole groups; one per cache: the
         model's, a drafter's)."""
         raise NotImplementedError
 
-    def write_records(self, records: "list[Records]", start: int, end: int) -> None:
+    def write_records(self, records: "list[HostRecords]", start: int, end: int) -> None:
         """The caches' records of positions start .. end - 1 from ``read_records``' copies (which hold them)."""
         raise NotImplementedError
 

@@ -111,7 +111,7 @@ class GemmaPrefill(ChunkPrefill):
         self.hds = sorted({cfg.head_dim(L) for L in own})
         self.kind = {hd: AP.kind_of(cfg, hd, ov.at.kp) for hd in self.hds}
         self.cs_rows = ov.max_positions + MAX_T
-        self.kv_bytes = {cfg.head_dim(L): ov._kv_bytes(L) for L in own}
+        self.kv_bytes = {cfg.head_dim(L): ov.kv_bytes(L) for L in own}
         pad = KV_PAD // 16 * ov.G * AP.OBJ  # (the KV arguments past a layer's caches: the overlay's padding at the end)
         self.prep = {hd: AP.GemmaPrepOperator(T=SUB, cfg=cfg, hd=hd, layout=self.plans[(next(
             L for L in own if cfg.head_dim(L) == hd), "qkv")].layout, kv_bytes=self.kv_bytes[hd],
