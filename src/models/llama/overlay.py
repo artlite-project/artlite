@@ -53,6 +53,7 @@ from artlite.decode.protocol import (
     interleave,
     packed_slots,
 )
+from artlite.decode.screen import Screen
 from artlite.decode.step import StepPlan
 from artlite.decode.vring import PAIR
 from artlite.gguf_model import GGUFFile
@@ -109,6 +110,9 @@ class LlamaOverlay(AttentionOverlay):
         self.uses = {L: CacheUse(kind=0, source=L, ring=0) for L in self.layers}
         self.period = PAIR
         self.inv_freq = cfg.rope_inv_freq()
+        if img.screen:
+            norm = np.asarray(gguf.tensor("output_norm.weight").raw, np.float32).reshape(-1)
+            self.screen = Screen(gguf, img.lm, norm, cfg.rms_norm_eps, min(self.vocab, cfg.vocab_size))
         self._plan()
 
     # ------------------------------------------------------------------

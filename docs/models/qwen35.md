@@ -68,6 +68,14 @@ cores read what to do from their input streams. Per column:
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
   share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step; on the 35B-A3B and Occamy steps of 3 and 4 tokens split a chain of 4 into two halves on shared streams, also one pass).
 
+The LM head is screened where it is Q6_K and the design has room for its tiles (`artlite/decode/screen.py`; not the 27B
+models with an MTP layer: their design of 8 tokens has none, and their drafters read the head's rows in place): the NPU
+reads only the head's scales and the top 2 bits of its codes (39% of its bytes: 7 - 40% of what these models stream per
+token is their head), which gives every token's logit to within ~0.7. The host then computes the logits that can still
+be among the largest exactly, from the head's rows in the model file (a few rows for the most likely token, ~100 for a
+sampler's 20 candidates, 0.2 - 0.3 ms): the choices are those of the exact fp32 head (the cores' own bf16 logits differ
+from it in the most likely token of ~0.5% of the steps). `ARTLITE_LM_SCREEN=0` reads the whole head on the NPU.
+
 The prompt runs in chunks of up to 2048 tokens (the 35B-A3B: 4096, its experts' weights streamed once per chunk;
 layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the prefill (`qwen35/prefill.py`):
 the prefill GEMMs, which read the same weight image, the Gated DeltaNet scan and the flash attention. A chunk's K / V,

@@ -58,8 +58,11 @@ def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tupl
     MoE design with tiles of more than 16 rows (``wide``: Occamy's attention layers alone), all are pages: their dispatch
     and an MoE's wide frame (gate / up windows) leave no room for a resident one next to the slot. A page loads
     when a tile of another paged format comes (Q3_K_M: Q5_K and Q4_K in the first layers, Q4_K for the rest, the LM
-    head's Q6_K, a few per step). By the whole file: the same choice for any layers and vocabulary the overlay runs."""
-    if len(fmts) < 4:
+    head's Q6_K, a few per step). By the whole file: the same choice for any layers and vocabulary the overlay runs.
+    A screened head's Q6_KH (``decode.screen``: tiles of 27 rows, read once a step) is always a page, and with it
+    every format but the largest: three resident ones with its wide frame overflow a main core of 4096 hidden (Qwen3.5
+    9B's layers of Q4_K and Q6_K alone: by 0.4 KB of program and 1.6 KB of data memory)."""
+    if len(fmts) < (2 if "Q6_KH" in fmts else 4):
         return ()
     if len(fmts) > 4 or wide:
         return tuple(sorted(fmts))

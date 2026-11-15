@@ -79,6 +79,7 @@ NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attenti
 HEAD_ROWS = 65536  # a drafter head's fixed rows: the special tokens and the first ids of the vocabulary
 DFLASH_HEAD_ROWS = 80000  # a DFlash2 drafter's: one pass a round, so 1.3 ms for the rare tokens that end a chain of drafts (code, JSON)
 TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``draft.HeadTable.see``), 64 per column
+SCREEN_FORMATS = 3  # a screened LM head: in files of this many tile formats at most (``QwenImage.screen``)
 
 
 def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
@@ -159,8 +160,11 @@ class QwenImage(TileImage):
         self.lm = lm
         # (the LM head as its high plane, the logits that matter exactly on the host: ``decode.screen``. Not a dense
         # model's with an MTP block: its drafters read the head's rows in place (``draft_cols``), and its design of 8
-        # slots has no L1 for tiles of more than 16 rows next to two X objects, ``decode.design``'s "Designs of 8 slots")
-        self.screen = self.SCREEN and settings.LM_SCREEN.get() and screens(self.qtype(lm)) and not self.draft_cols
+        # slots has no L1 for tiles of more than 16 rows next to two X objects, ``decode.design``'s "Designs of 8 slots";
+        # nor a file of more than ``SCREEN_FORMATS`` tile formats: each paged format's dispatch takes 64 B of the main
+        # cores' page slot, and Occamy's seven leave its largest page that short with an eighth)
+        self.screen = self.SCREEN and settings.LM_SCREEN.get() and screens(self.qtype(lm)) and not self.draft_cols \
+            and len(self.formats() | {self.fmt(lm)}) <= SCREEN_FORMATS
         self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *(("Q6_KH",) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()

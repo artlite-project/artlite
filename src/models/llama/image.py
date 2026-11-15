@@ -24,14 +24,17 @@ down's K chunks go in groups of the overlay's K group (``decode.protocol.MAX_K``
 
 import numpy as np
 
+from artlite import settings
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
 from artlite.decode.protocol import C_LEN, MAX_K
+from artlite.decode.screen import screens
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
 
 KC = 1024  # K chunk of a tile
 NORMS = {"qkv": "attn_norm", "gate_up": "ffn_norm"}  # a layer's normed phases: their RMSNorm weights
+SCREEN_FORMATS = 3  # a screened LM head: in files of this many tile formats at most (``LlamaImage.screen``)
 
 
 class LlamaImage(NormedImage):
@@ -49,10 +52,14 @@ class LlamaImage(NormedImage):
         assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
         for L in self.layers:
             self._layer(L)
-        lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
+        self.lm = lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         rows = column_rows(self.vocab)
         self._norm(-1, "lm")
-        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
+        # (a Q6_K head as its high plane, the logits that matter exactly on the host: ``decode.screen``; in files of
+        # up to ``SCREEN_FORMATS`` tile formats: each paged format takes of the main cores' page slot)
+        self.screen = settings.LM_SCREEN.get() and screens(self.qtype(lm)) and \
+            len(self.formats() | {self.fmt(lm)}) <= SCREEN_FORMATS
+        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1), *(("Q6_KH",) if self.screen else ()))], H)
         self._place()
 
     def norms(self, L: int, name: str) -> tuple[str, None]:

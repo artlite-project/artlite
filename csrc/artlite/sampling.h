@@ -40,15 +40,28 @@ std::pair<size_t, float> max_prob(const uint16_t* x, size_t n);
 /// is its (capped) logit minus it (``logprobs``).
 float logsumexp(Logits x, float cap);
 
-/// A screened LM head (``artlite.decode.screen``): the largest lower bound of its screened logits x (n bf16), max(x[i]
-/// - gnorm bound[i]).
-float screen_lower(const uint16_t* x, const float* bound, float gnorm, size_t n);
+/// A screened LM head (``artlite.decode.screen``): what the high plane of row i of a Q6_K matrix (raw: n GGUF rows,
+/// row_bytes apart, of cols columns) says of its logits. With w = q - 32 = p + r (p the plane's part 16 (q >> 4) - 24,
+/// r = (q & 15) - 8) and a = d sc: rho = sum a^2 r w / sum a^2 w^2 (the plane's logit is 1 - rho of the row's, in the
+/// mean), nv = mean a^2 (r - rho w)^2 (what is left: its variance per unit of |g|^2). scale[i] = 1 / (1 - rho),
+/// bound[i] = sqrt(nv) / (1 - rho).
+void screen_stats(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* scale, float* bound);
 
-/// The indices i with x[i] + gnorm bound[i] >= thr, ascending, into ids (the first ``max`` of them). Returns how many
-/// there are.
-size_t screen_above(const uint16_t* x, const float* bound, float gnorm, size_t n, float thr, int32_t* ids, size_t max);
+/// The largest lower bound of the logits of screened ones x (n bf16): max(scale[i] x[i] - gnorm bound[i]).
+float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n);
 
-/// a[i] = min(x[i], floor): the screened logits as fp32, ranked after the exact ones.
-void screen_dense(const uint16_t* x, size_t n, float floor, float* a);
+/// The indices i with scale[i] x[i] + gnorm bound[i] >= thr, ascending, into ids (the first ``max`` of them). Returns
+/// how many there are.
+size_t screen_above(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n, float thr,
+                    int32_t* ids, size_t max);
+
+/// a[i] = min(scale[i] x[i], floor): the screened logits' estimates as fp32, ranked after the exact ones.
+void screen_dense(const uint16_t* x, const float* scale, size_t n, float floor, float* a);
+
+/// The exact logits out[j] = w[ids[j]] . g of m rows of a Q6_K matrix (raw: its GGUF rows, row_bytes apart; cols a
+/// multiple of 256, g (cols) fp32): w = d sc (q - 32) summed in fp32, a sub-block's 16 products in lanes of their own,
+/// the row's blocks one after the other.
+void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
+                  float* out);
 
 }  // namespace artlite

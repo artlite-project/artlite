@@ -112,37 +112,75 @@ void bind_sampling(nb::module_& m) {
       "tanh(l / cap) cap): artlite::logsumexp.");
   // --- A screened LM head (artlite.decode.screen) ---
   m.def(
-      "screen_lower",
-      [](Vector logits, Floats bound, float gnorm) {
-        const artlite::Logits x = logits_arg(logits);
-        if (!x.bf16 || bound.shape(0) != x.n) throw artlite::Error("screen_lower: bf16 logits and a bound per logit");
-        return artlite::screen_lower(static_cast<const uint16_t*>(x.data), bound.data(), gnorm, x.n);
+      "screen_stats",
+      [](nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> raw, size_t cols, FloatsOut scale,
+         FloatsOut bound) {
+        const size_t n = scale.shape(0);
+        if (cols % 256 || cols / 256 * 210 > raw.shape(1) || n > raw.shape(0) || bound.shape(0) != n)
+          throw artlite::Error("screen_stats: Q6_K rows of cols columns, a scale and a bound per row");
+        nb::gil_scoped_release release;
+        artlite::screen_stats(raw.data(), n, raw.shape(1), cols, scale.data(), bound.data());
       },
-      "logits"_a, "bound"_a, "gnorm"_a,
-      nb::sig("def screen_lower(logits: numpy.ndarray | object, bound: numpy.ndarray[numpy.float32], gnorm: float) -> float"),
-      "The largest lower bound of a screened head's logits (bf16), max(x - gnorm bound): artlite::screen_lower.");
+      "raw"_a, "cols"_a, "scale"_a, "bound"_a,
+      nb::sig("def screen_stats(raw: numpy.ndarray[numpy.uint8], cols: int, scale: numpy.ndarray[numpy.float32], "
+              "bound: numpy.ndarray[numpy.float32]) -> None"),
+      "Per row of a Q6_K matrix (raw: (rows, row bytes) of its GGUF blocks; the first len(scale) rows) what its high "
+      "plane says of its logits: scale = 1 / (1 - rho), bound = the left-over deviation per unit of |g|, scaled: "
+      "artlite::screen_stats.");
+  m.def(
+      "screen_lower",
+      [](Vector logits, Floats scale, Floats bound, float gnorm) {
+        const artlite::Logits x = logits_arg(logits);
+        if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
+          throw artlite::Error("screen_lower: bf16 logits, a scale and a bound per logit");
+        return artlite::screen_lower(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n);
+      },
+      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a,
+      nb::sig("def screen_lower(logits: numpy.ndarray | object, scale: numpy.ndarray[numpy.float32], "
+              "bound: numpy.ndarray[numpy.float32], gnorm: float) -> float"),
+      "The largest lower bound of a screened head's logits (bf16), max(scale x - gnorm bound): artlite::screen_lower.");
   m.def(
       "screen_above",
-      [](Vector logits, Floats bound, float gnorm, float thr, IntsOut ids) {
+      [](Vector logits, Floats scale, Floats bound, float gnorm, float thr, IntsOut ids) {
         const artlite::Logits x = logits_arg(logits);
-        if (!x.bf16 || bound.shape(0) != x.n) throw artlite::Error("screen_above: bf16 logits and a bound per logit");
-        return artlite::screen_above(static_cast<const uint16_t*>(x.data), bound.data(), gnorm, x.n, thr, ids.data(), ids.shape(0));
+        if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
+          throw artlite::Error("screen_above: bf16 logits, a scale and a bound per logit");
+        return artlite::screen_above(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n, thr,
+                                     ids.data(), ids.shape(0));
       },
-      "logits"_a, "bound"_a, "gnorm"_a, "thr"_a, "ids"_a,
-      nb::sig("def screen_above(logits: numpy.ndarray | object, bound: numpy.ndarray[numpy.float32], gnorm: float, "
-              "thr: float, ids: numpy.ndarray[numpy.int32]) -> int"),
-      "The indices of a screened head's logits (bf16) with x + gnorm bound >= thr, ascending, into ids (the first "
-      "len(ids)); how many there are: artlite::screen_above.");
+      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a, "thr"_a, "ids"_a,
+      nb::sig("def screen_above(logits: numpy.ndarray | object, scale: numpy.ndarray[numpy.float32], "
+              "bound: numpy.ndarray[numpy.float32], gnorm: float, thr: float, ids: numpy.ndarray[numpy.int32]) -> int"),
+      "The indices of a screened head's logits (bf16) with scale x + gnorm bound >= thr, ascending, into ids (the "
+      "first len(ids)); how many there are: artlite::screen_above.");
   m.def(
       "screen_dense",
-      [](Vector logits, float floor, FloatsOut a) {
+      [](Vector logits, Floats scale, float floor, FloatsOut a) {
         const artlite::Logits x = logits_arg(logits);
-        if (!x.bf16 || a.shape(0) != x.n) throw artlite::Error("screen_dense: bf16 logits and a value per logit");
-        artlite::screen_dense(static_cast<const uint16_t*>(x.data), x.n, floor, a.data());
+        if (!x.bf16 || a.shape(0) != x.n || scale.shape(0) != x.n)
+          throw artlite::Error("screen_dense: bf16 logits, a scale and a value per logit");
+        artlite::screen_dense(static_cast<const uint16_t*>(x.data), scale.data(), x.n, floor, a.data());
       },
-      "logits"_a, "floor"_a, "a"_a,
-      nb::sig("def screen_dense(logits: numpy.ndarray | object, floor: float, a: numpy.ndarray[numpy.float32]) -> None"),
-      "a = min(logits, floor) (bf16 logits as fp32): artlite::screen_dense.");
+      "logits"_a, "scale"_a, "floor"_a, "a"_a,
+      nb::sig("def screen_dense(logits: numpy.ndarray | object, scale: numpy.ndarray[numpy.float32], floor: float, "
+              "a: numpy.ndarray[numpy.float32]) -> None"),
+      "a = min(scale logits, floor) (bf16 logits as fp32): artlite::screen_dense.");
+  m.def(
+      "screen_exact",
+      [](nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> raw, Ints ids, Floats g) {
+        const size_t rows = raw.shape(0), cols = g.shape(0), m = ids.shape(0);
+        if (cols % 256 || cols / 256 * 210 > raw.shape(1)) throw artlite::Error("screen_exact: g's columns in Q6_K rows");
+        for (size_t j = 0; j < m; j++)
+          if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact: a row past the matrix");
+        auto out = std::make_unique<float[]>(m);
+        artlite::screen_exact(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        return owned(std::move(out), m);
+      },
+      "raw"_a, "ids"_a, "g"_a,
+      nb::sig("def screen_exact(raw: numpy.ndarray[numpy.uint8], ids: numpy.ndarray[numpy.int32], "
+              "g: numpy.ndarray[numpy.float32]) -> numpy.ndarray[numpy.float32]"),
+      "The exact logits of rows ids of a Q6_K matrix (raw: (rows, row bytes) of its GGUF blocks) against g (cols,) "
+      "fp32: artlite::screen_exact.");
 }
 
 }  // namespace artlite::bindings

@@ -21,6 +21,7 @@ import json
 import math
 import mmap
 import struct
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -560,6 +561,20 @@ class GGUFFile:
             return
         _, _, off, nbytes = self.tensor_info[name]
         self.data._mmap.madvise(mmap.MADV_WILLNEED, off // mmap.PAGESIZE * mmap.PAGESIZE, off % mmap.PAGESIZE + nbytes)
+
+
+    def populate(self, name: str) -> None:
+        """Map a tensor's pages into this process now (from the page cache, or the file), so that reads of scattered
+        rows find them mapped: after ``release`` each first touch of a page is a fault of ~3 us (a screened LM head's
+        rows of every choice, ``decode.screen``). Linux's MADV_POPULATE_READ; elsewhere, or where the kernel has none,
+        nothing: the reads fault as they come."""
+        if not hasattr(mmap.mmap, "madvise") or not sys.platform.startswith("linux"):
+            return
+        _, _, off, nbytes = self.tensor_info[name]
+        try:
+            self.data._mmap.madvise(22, off // mmap.PAGESIZE * mmap.PAGESIZE, off % mmap.PAGESIZE + nbytes)
+        except OSError:
+            pass
 
 
 def bpe_tokenizer_json(gguf: GGUFFile, pattern: str, *, ignore_merges: bool = False) -> bytes:

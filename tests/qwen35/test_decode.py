@@ -11,6 +11,7 @@ import torch
 from artlite.decode import kv as KV
 from artlite.decode import phases as mp
 from artlite.decode import protocol as PR
+from artlite.decode.model import paged_formats
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, qwen_gguf
@@ -49,8 +50,10 @@ class _Phases:
         self.img = img = QwenImage(self.g, cfg, layers=layers, vocab=COLS * 1024)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
         self.op = MD.QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in fmts}, tile_bytes=img.tile_bytes,
-                                         eps=cfg.rms_norm_eps, slots=slots)
+                                         eps=cfg.rms_norm_eps, slots=slots, paged=paged_formats(self.g, fmts))
         self.dev = dev = OverlayDevice(self.op)
+        if (store := self.op.page_store()) is not None:  # (paged formats: a screened head's, ``ModelOverlay.load``)
+            dev.set_prologue(self.op.page_prologue(store))
         img.pack(dev.alloc("W", img.nbytes), release=False)
         dev.flush("W")
         self.act = 4 << 20
@@ -239,7 +242,9 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
             kern = bf16_round(kmath_sim.emulate(kmath.act(kmath.SILU), bf16_round(y[:, :, 0])).astype(np.float64)
                           * y[:, :, 1]).reshape(S, -1)
             check(from_bf16_bits(out[c, :, :ffn]), kern, sw[:, ffn * c:ffn * (c + 1)])
-    check.done()
+    # (a screened head's phase: its high plane's logits, within ~0.7 of a logit of the model's: ``decode.screen``, whose
+    # exact logits ``test_screened`` holds against llama.cpp's)
+    check.done(0.3 if phase == "lm" and img.screen else 5e-2)
 
 
 @pytest.fixture(scope="module", params=[4, 8])
@@ -1096,6 +1101,42 @@ def test_lm_head(size: str) -> None:
         want = np.asarray(G_.logits[t], np.float32)
         assert got.shape == want.shape and int(got.argmax()) == int(want.argmax()), t
         assert rel_max(got, want) < 2e-2, (t, rel_max(got, want))
+
+
+@pytest.mark.parametrize("size", ["35B-A3B", "9B"])
+def test_screened(size: str) -> None:
+    """A screened LM head (``decode.screen``: the NPU reads the head's high plane) on llama.cpp's last residual of T
+    tokens: the estimates from the cores' screened logits lie within their bounds of the exact ones (the whole head on
+    the host) for the 1000 largest logits (a row of no use, a reserved token's of one constant code, errs with its scales'
+    sum against g: past 6 sigma for the 35B-A3B's last tokens, far below every candidate), a row's 20 largest logits are
+    the exact ones, and the argmax llama.cpp's."""
+    from artlite.decode import screen as SC
+    from models.qwen35.overlay import QwenOverlay
+    from models.sampling import argmax, top_logits
+
+    path = size_gguf(size)
+    require(path)
+    g = GGUFFile(path)
+    L = QwenConfig.from_gguf(g).num_hidden_layers - 1
+    tokens = llama_tokenize(path, essay("apple.txt"))[:T]
+    G_ = golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
+    ov = QwenOverlay(g, layers=[L], max_positions=64)
+    assert ov.screen is not None and "Q6_KH" in ov.op.rows
+    ov.load(release=False)
+    sc, V = ov.screen, ov.screen.n
+    for t in range(T):
+        row = ov.logits_of(np.asarray(G_["l_out", L][t], np.float32))
+        exact = np.asarray(row)
+        want = np.asarray(G_.logits[t], np.float32)
+        assert rel_max(exact, want) < 2e-2 and argmax(row) == int(want.argmax()), (t, rel_max(exact, want))
+        gn = float(np.linalg.norm(row._input()))
+        z = np.abs(row.screened.astype(np.float32) * sc.scale - exact) / (sc.bound * np.float32(gn))
+        largest = np.argpartition(exact, -1000)[-1000:]
+        assert z[largest].max() < 1, (t, float(z[largest].max()) * SC.Z)  # (4.8 of the 6 sigma over a generation)
+        v, i = top_logits(row, 20)
+        order = np.lexsort((np.arange(V), -exact))[:20]
+        m = int((exact[order] >= exact[order[0]] - SC.WINDOW).sum())
+        assert np.array_equal(i[:m], order[:m]) and np.array_equal(v[:m], exact[order[:m]]), t
 
 
 # ----------------------------------------------------------------------

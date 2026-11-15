@@ -137,6 +137,26 @@ bandwidth.
     the attention's Q slots ride the KV stream instead of their own input (the column's output join takes four).
   Further: more queries per pass (fewer re-reads; bounded by L1: the fp32 O of head_dim 512), or cores splitting the
   positions and merging partial softmax results (below).
+- **An LM head's high plane** (`decode.screen`, `formats.q6h`): a decode step's result is a few of the vocabulary's
+  logits, and the head is 7 - 40% of a step's bytes (27B 1.04 of 15.8 GB, 9B 0.83 of 5.0, 35B-A3B 0.42 of 1.96, Llama 1B
+  and MiniCPM-V 1B 27 - 40%). The NPU reads a Q6_K head's scales and its codes' top 2 bits (Q2_K's tile layout and code
+  loops: 27 rows per tile against 11, 39% of the bytes); the host computes the candidates' logits exactly from the file's
+  rows (0.15 us per row and 1024 columns, read in place). 35B-A3B 40.3 -> 36.8 ms a step, 9B 94.1 -> 85.4, MiniCPM-V 1B
+  11.5 -> 9.2. What makes it exact:
+  - bounds per row from its own codes and scales, not one error figure: with w = p + r (the plane's part and the rest
+    of a code), the plane's logit is 1 - rho of the row's in the mean, rho = sum a^2 r w / sum a^2 w^2 (0.083: the
+    largest logits come out 2 - 3 short, 4 - 6 sigma of the left-over noise), so the estimate is the plane's logit / (1 -
+    rho) and the bound a multiple of the deviation of r - rho w. Without rho the best token sat 0.5 sigma inside a
+    6-sigma bound;
+  - refinement by rows on the host, not by blocks on the NPU (a candidate row in a block of 16 - 64 makes the block one:
+    14 - 76% of the blocks): seed with the exact logits of the largest screened ones, then the rows whose upper bound
+    reaches the largest exact one, then a window below it for a sampler's k;
+  - check against the whole exact head on real steps (the estimates' error in sigma, for the largest logits apart:
+    rows of no use, a reserved token's of one constant code, err coherently and do not matter), and at model level (KL
+    against llama.cpp: the exact logits are closer than the cores' bf16 ones).
+  Its tiles of more than 16 rows cost a design its wide frame (an MoE design: gate / up through the windows and every
+  format a page, ~1 ms of the 35B-A3B's step) and do not fit a dense design of 8 slots (the 27B: 1.6 KB of L1 and 0.7 KB
+  of program memory short).
 - **Move only valid rows of a work item**: a fixed-size work unit (an MoE expert GEMM's 192-row chunk, most chunks a
   few dozen valid rows) moved its padding rows through DDR with the valid ones: at 1024 tokens 44% of the expert GEMMs'
   DDR bytes were rows, ~80% of them padding, and the down's Q4_K chunks ran at the combined read + write ceiling (~76

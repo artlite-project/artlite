@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <vector>
 
@@ -277,36 +278,112 @@ inline size_t append(__mmask16 k, size_t i, int32_t* ids, size_t c, size_t max) 
 
 }  // namespace
 
-float screen_lower(const uint16_t* x, const float* bound, float gnorm, size_t n) {
+void screen_stats(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* scale, float* bound) {
+  // (a Q6_K block: screen_exact's layout; the low nibble of value 128 h + 32 j + l: nibble j / 2 of ql[64 h + 32 (j &
+  // 1) + l], its crumb: j of qh[32 h + l])
+  for (size_t i = 0; i < n; i++) {
+    const uint8_t* b = raw + i * row_bytes;
+    double rw = 0.0, ww = 0.0, rr = 0.0;
+    for (size_t k = 0; k < cols / 256; k++, b += 210) {
+      const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192);
+      uint16_t d16;
+      std::memcpy(&d16, b + 208, 2);
+      const double d = double(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+      for (int h = 0; h < 2; h++)
+        for (int j = 0; j < 4; j++) {
+          const uint8_t* ql = b + 64 * h + 32 * (j & 1);
+          const uint8_t* qh = b + 128 + 32 * h;
+          for (int half = 0; half < 2; half++) {  // (a sub-block: 16 values of one scale)
+            int32_t s_rw = 0, s_ww = 0, s_rr = 0;
+            for (int l = 16 * half; l < 16 * half + 16; l++) {
+              const int lo = (ql[l] >> (4 * (j >> 1))) & 15, hi = (qh[l] >> (2 * j)) & 3;
+              const int r = lo - 8, w = 16 * hi + lo - 32;
+              s_rw += r * w;
+              s_ww += w * w;
+              s_rr += r * r;
+            }
+            const double a = d * double(sc[8 * h + 2 * j + half]), a2 = a * a;
+            rw += a2 * s_rw;
+            ww += a2 * s_ww;
+            rr += a2 * s_rr;
+          }
+        }
+    }
+    const double rho = ww > 0 ? rw / ww : 0.0;
+    const double nv = std::max(rr - 2 * rho * rw + rho * rho * ww, 0.0) / double(cols);
+    scale[i] = float(1.0 / (1.0 - rho));
+    bound[i] = float(std::sqrt(nv) / (1.0 - rho));
+  }
+}
+
+float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n) {
   const __m512 g = _mm512_set1_ps(gnorm);
   __m512 lo = _mm512_set1_ps(-INFINITY);
   size_t i = 0;
-  for (; i + 16 <= n; i += 16) lo = _mm512_max_ps(lo, _mm512_fnmadd_ps(_mm512_loadu_ps(bound + i), g, bf16_ps(x + i)));
+  for (; i + 16 <= n; i += 16)
+    lo = _mm512_max_ps(lo, _mm512_fnmadd_ps(_mm512_loadu_ps(bound + i), g, _mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i))));
   float best = _mm512_reduce_max_ps(lo);
-  for (; i < n; i++) best = std::max(best, std::bit_cast<float>(uint32_t(x[i]) << 16) - bound[i] * gnorm);
+  for (; i < n; i++) best = std::max(best, std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] - bound[i] * gnorm);
   return best;
 }
 
-size_t screen_above(const uint16_t* x, const float* bound, float gnorm, size_t n, float thr, int32_t* ids, size_t max) {
+size_t screen_above(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n, float thr,
+                    int32_t* ids, size_t max) {
   const __m512 g = _mm512_set1_ps(gnorm), t = _mm512_set1_ps(thr);
   size_t c = 0, i = 0;
   for (; i + 16 <= n; i += 16) {
-    const __mmask16 k = _mm512_cmp_ps_mask(_mm512_fmadd_ps(_mm512_loadu_ps(bound + i), g, bf16_ps(x + i)), t, _CMP_GE_OQ);
+    const __m512 up = _mm512_fmadd_ps(_mm512_loadu_ps(bound + i), g, _mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i)));
+    const __mmask16 k = _mm512_cmp_ps_mask(up, t, _CMP_GE_OQ);
     if (k) c = append(k, i, ids, c, max);
   }
   for (; i < n; i++)
-    if (std::bit_cast<float>(uint32_t(x[i]) << 16) + bound[i] * gnorm >= thr) {
+    if (std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] + bound[i] * gnorm >= thr) {
       if (c < max) ids[c] = int32_t(i);
       c++;
     }
   return c;
 }
 
-void screen_dense(const uint16_t* x, size_t n, float floor, float* a) {
+void screen_dense(const uint16_t* x, const float* scale, size_t n, float floor, float* a) {
   const __m512 f = _mm512_set1_ps(floor);
   size_t i = 0;
-  for (; i + 16 <= n; i += 16) _mm512_storeu_ps(a + i, _mm512_min_ps(bf16_ps(x + i), f));
-  for (; i < n; i++) a[i] = std::min(std::bit_cast<float>(uint32_t(x[i]) << 16), floor);
+  for (; i + 16 <= n; i += 16)
+    _mm512_storeu_ps(a + i, _mm512_min_ps(_mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i)), f));
+  for (; i < n; i++) a[i] = std::min(std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i], floor);
+}
+
+void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
+                  float* out) {
+  // A Q6_K block (210 B per 256 values): ql 128 B, qh 64 B, 16 int8 scales, fp16 d; value 128 h + 32 j + l: nibble
+  // j / 2 of ql[64 h + 32 (j & 1) + l], crumb j of qh[32 h + l]; its scale: sc[8 h + 2 j + l / 16]
+  const __m256i m15 = _mm256_set1_epi8(15), m3 = _mm256_set1_epi8(3), c32 = _mm256_set1_epi8(32);
+  for (size_t r = 0; r < m; r++) {
+    const uint8_t* b = raw + size_t(ids[r]) * row_bytes;
+    double total = 0.0;
+    for (size_t k = 0; k < cols / 256; k++, b += 210) {
+      const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192);
+      const float* gk = g + 256 * k;
+      __m512 acc = _mm512_setzero_ps();
+      for (int h = 0; h < 2; h++) {
+        const __m256i qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 128 + 32 * h));
+        for (int j = 0; j < 4; j++) {
+          __m256i ql = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 64 * h + 32 * (j & 1)));
+          if (j & 2) ql = _mm256_srli_epi16(ql, 4);
+          const __m256i hi = _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128(2 * j)), m3);
+          const __m256i q = _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(ql, m15), _mm256_slli_epi16(hi, 4)), c32);
+          const __m512 v0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(q)));
+          const __m512 v1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(q, 1)));
+          const float* gj = gk + 128 * h + 32 * j;
+          acc = _mm512_fmadd_ps(_mm512_mul_ps(v0, _mm512_loadu_ps(gj)), _mm512_set1_ps(float(sc[8 * h + 2 * j])), acc);
+          acc = _mm512_fmadd_ps(_mm512_mul_ps(v1, _mm512_loadu_ps(gj + 16)), _mm512_set1_ps(float(sc[8 * h + 2 * j + 1])), acc);
+        }
+      }
+      uint16_t d16;
+      std::memcpy(&d16, b + 208, 2);
+      total += double(_mm512_reduce_add_ps(acc)) * double(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+    }
+    out[r] = float(total);
+  }
 }
 
 }  // namespace artlite

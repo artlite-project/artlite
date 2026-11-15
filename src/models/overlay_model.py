@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 import numpy as np
 
 from artlite.decode.model import HostRecords, nbytes_of
+from artlite.decode.screen import Screened, ScreenedRow
 
 from .npu_model import Checkpoint, NpuModel
 from .sampling import Penalties, top_logits
@@ -55,8 +56,12 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
 
-    def cap(self, logits: np.ndarray) -> np.ndarray:
-        """The model's logits (fp32) of the overlay's (bf16 or fp32): the soft cap, if any."""
+    def cap(self, logits: np.ndarray | Screened | ScreenedRow) -> np.ndarray:
+        """The model's logits (fp32) of the overlay's (bf16 or fp32): the soft cap, if any. A screened head's
+        (``artlite.decode.screen``): its largest logits exact, the others screened (``dense``; every one exact: the
+        logits as an array first)."""
+        if isinstance(logits, (Screened, ScreenedRow)):
+            logits = logits.dense()
         logits = np.asarray(logits, np.float32)
         return np.tanh(logits / self.softcap) * np.float32(self.softcap) if self.softcap else logits
 
@@ -436,4 +441,6 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         per dispatch (quality tooling)."""
         self.reset()
         self.prompt(tokens[:first])
-        return np.concatenate([self.cap(self.steps(tokens[i:i + batch])) for i in range(first, len(tokens), batch)])
+        # (a screened head's rows as arrays: every logit exact)
+        return np.concatenate([self.cap(np.asarray(self.steps(tokens[i:i + batch])))
+                               for i in range(first, len(tokens), batch)])
