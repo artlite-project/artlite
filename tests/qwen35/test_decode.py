@@ -39,6 +39,13 @@ NAMES = ("attn_norm|linear_attn_qkv_mixed|z|alpha|beta|final_output|attn_residua
          "Vcur|attn_gated|model.input_embed")
 
 
+class _PlainImage(QwenImage):
+    """An image whose LM head keeps its own format (no screened head's high plane, a page with tiles of 27 rows): a
+    harness that runs no LM phase, a design of 8 slots (which no model screens its head in)."""
+
+    SCREEN = False
+
+
 class _Phases:
     """One phase per dispatch on the overlay's main and helper cores (inputs shared by the columns)."""
 
@@ -47,7 +54,7 @@ class _Phases:
         self.g = GGUFFile(path)
         self.cfg = cfg = QwenConfig.from_gguf(self.g)
         self.H = cfg.hidden_size
-        self.img = img = QwenImage(self.g, cfg, layers=layers, vocab=COLS * 1024)
+        self.img = img = (QwenImage if slots == PR.SLOTS else _PlainImage)(self.g, cfg, layers=layers, vocab=COLS * 1024)
         fmts = {b.fmt for r in img.regions for b in r.blocks}
         self.op = MD.QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in fmts}, tile_bytes=img.tile_bytes,
                                          eps=cfg.rms_norm_eps, slots=slots, paged=paged_formats(self.g, fmts))
@@ -318,7 +325,7 @@ class _Gdn:
         self.g = g = GGUFFile(path)
         self.cfg = cfg = QwenConfig.from_gguf(g)
         self.H, self.L = cfg.hidden_size, layer
-        img = QwenImage(g, cfg, layers=[layer], vocab=COLS * 64)
+        img = _PlainImage(g, cfg, layers=[layer], vocab=COLS * 64)
         self.sh = sh = GD.GdnShape(cfg, chunk=chunk_of(cfg))
         self.op = op = MD.QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in {b.fmt for r in img.regions
                                                                                         for b in r.blocks}},

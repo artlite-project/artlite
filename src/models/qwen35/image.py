@@ -157,9 +157,10 @@ class QwenImage(TileImage):
             self.vocab = self.n_ids + TABLE_ROWS
         self.lm = lm
         # (the LM head as its high plane, the logits that matter exactly on the host: ``decode.screen``. Not a dense
-        # model's with an MTP block: its drafters read the head's rows in place (``draft_cols``), and its design of 8
-        # slots has no L1 for tiles of more than 16 rows next to two X objects, ``decode.design``'s "Designs of 8 slots")
-        self.screen = self.SCREEN and not self.draft_cols and screened(self.qtype(lm), self.formats())
+        # model's with an MTP block, whatever rows of it the image holds: its drafters read the head's rows in place
+        # (``draft_cols``), and its design of 8 slots has no L1 for tiles of more than 16 rows next to two X objects,
+        # ``decode.design``'s "Designs of 8 slots")
+        self.screen = self.SCREEN and not (cfg.nextn_layers and not cfg.moe) and screened(self.qtype(lm), self.formats())
         self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *(("Q6_KH",) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()
