@@ -6,7 +6,7 @@
 // of the lower table copy), the signs as masks [16-row block][i'' 2][l 4][r 16], the scales S = bf16(D s) [i'' 2][h 2]
 // [{{ NS }}] (s = (2 ls + 1) / 4 or 2 sc + 1); per call the panels' codes 64 +- g (_iq2g: per panel two 4x16 gathers of
 // [A | B] entries, the masks by a byte transpose, g = sel(sel(8, 25, A), 43, B), 64 - g where a sign is set), then the
-// panels (_iq2s: w = S (128 + u) - 192 S = S (+- g), exact in fp32, rounded once into bfp16).
+// panels (_iqs: w = S (128 + u) - 192 S = S (+- g), exact in fp32, rounded once into bfp16).
 // Scratch (ws, bytes): lists at {{ WL }} | masks at {{ WM }} | S at {{ WS }} | codes at {{ WU }} [{{ n_mac // 16 }} blocks][i'' 2]
 // [l 4][rh 2][64]
 {% include "artlite/formats/iq3.signs.cc.jinja" %}
@@ -152,40 +152,14 @@ __attribute__((noinline)) void {{ p }}_iq2g(const uint16_t *__restrict li, const
     }
 }
 
-// The panels from their codes u and the scales (S: the call's rows of [i'' 2][h 2]): per (16-row block, i'', h) the two
-// 8-row halves' scales over their rows' lanes; per panel the codes as bf16 128 + u (zero-extended on the load, + 0x4300),
-// w = S (128 + u) - 192 S = S (+- g), exact in fp32, rounded once
-__attribute__((noinline)) void {{ p }}_iq2s(const uint8_t *__restrict u, const bfloat16 *__restrict S,
-                                            uint8_t *__restrict stage)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const uint8_t __aie_dm_resource_a *__restrict pu = (const uint8_t __aie_dm_resource_a *)u;
-    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)S;
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
-    const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4300);
-    const aie::vector<bfloat16, 64> k192 = aie::broadcast<bfloat16, 64>(-192.0f);
-    dims_3d_t wsc = dims_3d_from_steps(2, {{ NS }}, 2, {{ 2 * NS }}, 16);  // (h, then i'', then the next block)
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (16-row block, i'', h) = (it / 4, it / 2 % 2, it % 2)
-        aie::vector<bfloat16, 64> S0, S1;
-        al::expand16_bc(aie::load_v<16>(ps), S0, S1);
-        const aie::accum<accfloat, 64> C0 = aie::mul(S0, k192), C1 = aie::mul(S1, k192);
-{% for j in range(4) %}
-        out.push(aie::mac(C{{ j % 2 }}, aie::concat(aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j }})), k43).template cast_to<bfloat16>(),
-                                         aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j + 32 }})), k43).template cast_to<bfloat16>()),
-                          S{{ j % 2 }}).template to_vector<bfp16ebs8>());
-{% endfor %}
-        pu += 256;
-        ps = add_3d_ptr(ps, wsc);
-    }
-}
+{% include "artlite/formats/iq2.panels.cc.jinja" %}
 
 void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
 {
 }
 
 // k-tile kt -> {{ n_mac }} x 64 bfp16 panels (rows {{ n_mac }} half ..) in the MAC pop order [16-row block][k-step ks][8-row
-// half]: on its first call the k-tile's prep, the codes (_iq2g), then the panels (_iq2s)
+// half]: on its first call the k-tile's prep, the codes (_iq2g), then the panels (_iqs)
 void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *__restrict stage,
                 int32_t sb, int32_t kt{{ half_arg }}, const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
 {
@@ -210,7 +184,7 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
 {% else %}
     {{ p }}_iq2g((const uint16_t *)(wsb + {{ WL }}) + r0, wsb + {{ WM }} + 8 * r0, tab_ab, tab_cd, wsb + {{ WU }});
 {% endif %}
-    {{ p }}_iq2s(wsb + {{ WU }}, (const bfloat16 *)(wsb + {{ WS }}) + r0, stage);
+    {{ p }}_iqs(wsb + {{ WU }}, (const bfloat16 *)(wsb + {{ WS }}) + r0, stage);
 {% if "ev_dq" in ablate %}
     event1();
 {% endif %}

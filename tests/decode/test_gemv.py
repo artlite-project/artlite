@@ -26,7 +26,8 @@ PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 
         ("Q4_1", 9280, 4), ("Q4_1", 10240, 4), ("Q2_K", 9408, 4), ("Q3_K", 9408, 4), ("Q3_K", 9856, 4), ("BF16", 9216, 4),
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
         ("IQ3_S", 18432, 8), ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
-        ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4)]
+        ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4), ("IQ1_S", 9280, 4), ("IQ1_M", 9280, 4),
+        ("IQ1_S", 9216, 4)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "NSB"), PACK, ids=[f"{f}-{s}-nsb{n}" for f, s, n in PACK])
@@ -124,6 +125,8 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 8, 32, 1) * q
     if fmt in ("IQ2_XS", "IQ2_S"):
         return per(f["d"], 256) * np.repeat((2 * f["sc"].astype(np.float64) + 1) / 8, 16, 1) * q
+    if fmt in ("IQ1_S", "IQ1_M"):
+        return per(f["d"], 256) * np.repeat((2 * f["sc"].astype(np.float64) + 1) / 8, 32 if fmt == "IQ1_S" else 16, 1) * q
     if fmt == "IQ3_XXS":
         return per(f["d"], 256) * np.repeat((2 * f["ls"].astype(np.float64) + 1) / 4, 32, 1) * q
     if fmt == "IQ3_S":
@@ -165,6 +168,8 @@ GEMV = [
     ("IQ2_XXS", 9280, 4, ("random",), "IQ2_XXS"),  # (24 rows)
     ("IQ2_XS", 9280, 4, ("random",), "IQ2_XS"),
     ("IQ2_S", 9280, 4, ("random",), "IQ2_S"),
+    ("IQ1_S", 9280, 4, ("random",), "IQ1_S"),  # (32 rows)
+    ("IQ1_M", 9280, 4, ("random",), "IQ1_M"),
 ]
 
 

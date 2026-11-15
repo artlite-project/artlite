@@ -8,8 +8,8 @@ from artlite.gguf_model import QTensor
 # per GGUF block: (columns, bytes, the offsets of its fp16 fields)
 BLOCK = {"Q4_0": (32, 18, (0,)), "Q4_1": (32, 20, (0, 2)), "Q8_0": (32, 34, (0,)), "Q4_K": (256, 144, (0, 2)),
          "Q5_K": (256, 176, (0, 2)), "Q6_K": (256, 210, (208,)), "Q2_K": (256, 84, (80, 82)), "Q3_K": (256, 110, (108,)),
-         "IQ2_XXS": (256, 66, (0,)), "IQ2_XS": (256, 74, (0,)), "IQ2_S": (256, 82, (0,)), "IQ3_XXS": (256, 98, (0,)),
-         "IQ3_S": (256, 110, (0,)), "IQ4_NL": (32, 18, (0,)), "IQ4_XS": (256, 136, (0,))}
+         "IQ1_S": (256, 50, (0,)), "IQ1_M": (256, 56, ()), "IQ2_XXS": (256, 66, (0,)), "IQ2_XS": (256, 74, (0,)),
+         "IQ2_S": (256, 82, (0,)), "IQ3_XXS": (256, 98, (0,)), "IQ3_S": (256, 110, (0,)), "IQ4_NL": (32, 18, (0,)), "IQ4_XS": (256, 136, (0,))}
 
 
 def random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:
@@ -25,4 +25,9 @@ def random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:
     for o in f16:
         d = (rng.standard_normal((rows, n)) * 0.01).astype(np.float16)
         raw[..., o:o + 2] = d.view(np.uint8).reshape(rows, n, 2)
+    if qtype == "IQ1_M":  # (d's fp16 in the top nibbles of the 4 scale words, word m's at bits 4 m)
+        d = (rng.standard_normal((rows, n)) * 0.01).astype(np.float16).view(np.uint16)
+        sw = raw[..., 48:56].copy().view("<u2") & 0x0FFF
+        sw |= ((d[..., None] >> (4 * np.arange(4, dtype=np.uint16))) & 0xF) << 12
+        raw[..., 48:56] = sw.view(np.uint8)
     return QTensor(name="t", qtype=qtype, rows=rows, cols=cols, raw=raw.reshape(rows, -1))

@@ -1044,16 +1044,20 @@ def test_dense_slice(first: int) -> None:
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize(("first", "slots"), [(0, 8), (12, 8), (0, 4)], ids=["L0-S8", "L12-S8", "L0-S4"])
-def test_split_slice(first: int, slots: int) -> None:
-    """unsloth's UD-IQ4_XS layers first .. first + 4, fed llama.cpp's residual stream before them token by token (0 .. 4:
-    gate / up in IQ2_XS + IQ2_S, IQ3_S + Q3_K, IQ3_S + IQ4_XS, IQ4_XS + IQ3_S (attention), IQ4_XS; 12 .. 16: IQ2_XS + IQ3_S,
-    Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (attention), IQ2_S + IQ3_XXS; the split blocks of ``decode.image``), on a design
-    of ``slots`` (the model's: 8; ``gusplit``'s 4-slot path: 4): the residual after every layer within the 27B's bounds of
-    ``test_overlay_slice``."""
+@pytest.mark.parametrize(("size", "first", "slots"), [("ud-iq4xs", 0, 8), ("ud-iq4xs", 12, 8), ("ud-iq4xs", 0, 4),
+                                                   ("ud-iq3xxs", 12, 8)],
+                         ids=["L0-S8", "L12-S8", "L0-S4", "iq3xxs-L12-S8"])
+def test_split_slice(size: str, first: int, slots: int) -> None:
+    """unsloth's UD-IQ4_XS or UD-IQ3_XXS layers first .. first + 4, fed llama.cpp's residual stream before them token by
+    token (UD-IQ4_XS 0 .. 4: gate / up in IQ2_XS + IQ2_S, IQ3_S + Q3_K, IQ3_S + IQ4_XS, IQ4_XS + IQ3_S (attention), IQ4_XS;
+    12 .. 16: IQ2_XS + IQ3_S, Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (attention), IQ2_S + IQ3_XXS; UD-IQ3_XXS 12 .. 16: up
+    IQ1_S with an IQ2_XS gate, down IQ1_S and gate IQ1_M with an IQ1_S up, down IQ1_M and up IQ1_S with an IQ2_XXS gate,
+    down IQ1_M and gate IQ1_S with an IQ2_XXS up (attention); the split blocks of ``decode.image``), on a design of
+    ``slots`` (the model's: 8; ``gusplit``'s 4-slot path: 4; UD-IQ3_XXS's slice holds 11 formats, more than a 4-slot design
+    pages): the residual after every layer within the 27B's bounds of ``test_overlay_slice``."""
     from models.qwen35.overlay import QwenOverlay
 
-    path = size_gguf("ud-iq4xs")
+    path = size_gguf(size)
     require(path)
     layers, n = list(range(first, first + 5)), 16
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]

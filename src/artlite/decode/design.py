@@ -181,6 +181,7 @@ STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores'
 # paged formats whose pages a memtile channel's free BDs hold: one channel for both core halves next to a dense design of 4
 # slots (BDs 4 .. 23, two per format), a channel per core half in a design of 8 (BDs 10 .. 23, 34 .. 47)
 PG_ONE_CHANNEL, PG_SPLIT = 10, 14
+PG_ROOM = 3968  # (bytes) a page's code at most: a design of 8 slots leaves its main core ~3920 B past the resident code
 # (8 slots) the helper's B operands of its 16-k sums ([j][64]: row j ones, ``_hstrip``), in the core south of it
 # (``HS8_ROW``): its own memory has no room left for them as static data
 ONEHOT = (np.arange(64)[None, :] // 8 == np.arange(8)[:, None]).astype(np.int8).reshape(-1)
@@ -473,16 +474,18 @@ class DecodeOverlayOperator(ArtcOperator):
     def pg_store(self) -> tuple[int, int, int]:
         """(first BD, store address, bytes) of the page store: PG_BD, PG_STORE, PG_STORE_BYTES for up to 4 paged
         formats; of more, a BD per format and core half up to the channel's last (``pg_channels``' parity: 47 or 23), and
-        4 KB per page (pages of ~3-4 KB), 12 KB more per paged format with a gather table (its two copies in the page of
-        each core half: ~6 KB of control packets each), the store ending at the memtile's end (``pg_split``: the first BD
-        of the main cores' pages; the helpers' end at BD 47, their bytes the second half)."""
+        per format and core half its page's stream (control packets: 1.5 B per byte of code and data, the code at most
+        ``PG_ROOM``) plus 6 KB per paged format with a gather table (its two 2 KB copies), the store ending at the
+        memtile's end (``pg_split``: the first BD of the main cores' pages; the helpers' end at BD 47, their bytes the
+        second half)."""
         n = len(self.paged)
         if n <= 4 and not self.tables and not self.pg_split:
             return PG_BD, PG_STORE, PG_STORE_BYTES
         if not self.pg_split and n > PG_ONE_CHANNEL:
             raise ValueError(f"{n} paged formats: a design of 4 slots holds the pages of {PG_ONE_CHANNEL} (its memtile "
                              f"channel's BDs; a design of 8 slots, a channel per core half: {PG_SPLIT})")
-        size = max(0xC000, 0x2000 * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
+        page = -(-(3 * PG_ROOM // 2 + 64) // 64) * 64  # (a page's stream, its state and wake words included)
+        size = max(0xC000, 2 * page * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
         ch = self.pg_channels[0]
         return 24 * (ch % 2) + 24 - (1 if self.pg_split else 2) * n, 0x80000 - size, size
 

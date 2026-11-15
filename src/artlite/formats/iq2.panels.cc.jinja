@@ -1,0 +1,28 @@
+{# GemmQd's panels of the IQ1 / IQ2 dequants (gemm/IQ1_*, gemm/IQ2_*) from their codes 64 +- v and the scales S: w = S v #}
+// The panels from their codes u ([16-row block][i'' 2][l 4][rh 2][64]) and the scales (S: the call's rows of [i'' 2][h 2]):
+// per (16-row block, i'', h) the two 8-row halves' scales over their rows' lanes; per panel the codes as bf16 128 + u
+// (zero-extended on the load, + 0x4300), w = S (128 + u) - 192 S = S (u - 64), exact in fp32, rounded once
+__attribute__((noinline)) void {{ p }}_iqs(const uint8_t *__restrict u, const bfloat16 *__restrict S,
+                                            uint8_t *__restrict stage)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint8_t __aie_dm_resource_a *__restrict pu = (const uint8_t __aie_dm_resource_a *)u;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)S;
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
+    const aie::vector<uint16, 32> k43 = aie::broadcast<uint16, 32>(0x4300);
+    const aie::vector<bfloat16, 64> k192 = aie::broadcast<bfloat16, 64>(-192.0f);
+    dims_3d_t wsc = dims_3d_from_steps(2, {{ NS }}, 2, {{ 2 * NS }}, 16);  // (h, then i'', then the next block)
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n_mac // 4 }}; it++) {  // (16-row block, i'', h) = (it / 4, it / 2 % 2, it % 2)
+        aie::vector<bfloat16, 64> S0, S1;
+        al::expand16_bc(aie::load_v<16>(ps), S0, S1);
+        const aie::accum<accfloat, 64> C0 = aie::mul(S0, k192), C1 = aie::mul(S1, k192);
+{% for j in range(4) %}
+        out.push(aie::mac(C{{ j % 2 }}, aie::concat(aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j }})), k43).template cast_to<bfloat16>(),
+                                         aie::add(aie::unpack(aie::load_v<32>(pu + {{ 64 * j + 32 }})), k43).template cast_to<bfloat16>()),
+                          S{{ j % 2 }}).template to_vector<bfp16ebs8>());
+{% endfor %}
+        pu += 256;
+        ps = add_3d_ptr(ps, wsc);
+    }
+}

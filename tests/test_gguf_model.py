@@ -3,7 +3,7 @@ gguf-py, the native row dequantization against ``QTensor.dequantize``, the draft
 
 import numpy as np
 import pytest
-from gguf.quants import IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
+from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
 
 from artlite import _native
 from artlite.gguf_model import IQ4_VALUES
@@ -44,6 +44,47 @@ def test_iq2_dequantize(qtype: str) -> None:
     s = f["ls"] if qtype == "IQ2_XXS" else f["sc"]
     n = 32 if qtype == "IQ2_XXS" else 16
     d = np.repeat(f["d"], 256 // n, -1) * (2 * s.astype(np.float32) + 1) / 8
+    assert np.array_equal(w, (d[..., None] * c.reshape(t.rows, -1, n)).reshape(w.shape))
+
+
+def _iq1m_ggml(raw: np.ndarray) -> np.ndarray:
+    """ggml's dequantize_row_iq1_m (ggml-quants.c) on (rows, 56 n) blocks, line by line (gguf-py's IQ1_M reads every
+    delta as negative: ``qh & 0x08 == 0`` is ``qh & False``)."""
+    IQ1_S.init_grid()
+    grid = IQ1_S.grid.reshape(2048, 8).astype(np.float32)
+    out = []
+    for blk in raw.reshape(-1, 56):
+        qs, qh, sc = blk[0:32].astype(np.int64), blk[32:48], blk[48:56].view("<u2").astype(np.int64)
+        d = np.uint16((sc[0] >> 12) | ((sc[1] >> 8) & 0xF0) | ((sc[2] >> 4) & 0xF00) | (sc[3] & 0xF000)).view(np.float16)
+        for ib in range(8):
+            dl1 = np.float32(d) * np.float32(2 * ((sc[ib // 2] >> (6 * (ib % 2))) & 7) + 1)
+            dl2 = np.float32(d) * np.float32(2 * ((sc[ib // 2] >> (6 * (ib % 2) + 3)) & 7) + 1)
+            h0, h1 = int(qh[2 * ib]), int(qh[2 * ib + 1])
+            idx = [qs[4 * ib] | ((h0 << 8) & 0x700), qs[4 * ib + 1] | ((h0 << 4) & 0x700),
+                   qs[4 * ib + 2] | ((h1 << 8) & 0x700), qs[4 * ib + 3] | ((h1 << 4) & 0x700)]
+            delta = [np.float32(-0.125 if h & m else 0.125) for h, m in ((h0, 8), (h0, 128), (h1, 8), (h1, 128))]
+            for la in range(4):
+                out.append((dl1 if la < 2 else dl2) * (grid[idx[la]] + delta[la]))
+    return np.concatenate(out).reshape(raw.shape[0], -1)
+
+
+@pytest.mark.parametrize("qtype", ["IQ1_S", "IQ1_M"])
+def test_iq1_dequantize(qtype: str) -> None:
+    """IQ1_S and IQ1_M weights bit-identical to gguf-py's (IQ1_M: ggml's C, ``_iq1m_ggml``) on random blocks (every
+    index, scale and delta sign), their fields consistent: the codes 8 g + delta on the grid ({-1, 0, 1}) and the deltas'
+    signs, times the scales."""
+    t = random_tensor(qtype, 64 if qtype == "IQ1_S" else 8, 2048, 0)
+    w = t.dequantize()
+    raw = np.ascontiguousarray(t.raw)
+    ref = (IQ1_S.dequantize_rows(raw) if qtype == "IQ1_S" else _iq1m_ggml(raw)).reshape(t.rows, t.cols).astype(np.float32)
+    assert np.array_equal(w.view(np.uint32), ref.view(np.uint32))
+    f = t.fields()
+    c = f["q"].astype(np.int32)
+    assert set(np.unique(c)) == {-9, -7, -1, 1, 7, 9} and f["idx"].max() == 2047 and f["sc"].max() == 7
+    n = 32 if qtype == "IQ1_S" else 8  # (k per delta)
+    assert np.array_equal(np.repeat(f["dneg"], n, -1) != 0, (c % 8) == 7)  # (delta -1: q = 8 g - 1)
+    n = 32 if qtype == "IQ1_S" else 16  # (k per scale)
+    d = np.repeat(f["d"], 256 // n, -1) * (2 * f["sc"].astype(np.float32) + 1) / 8
     assert np.array_equal(w, (d[..., None] * c.reshape(t.rows, -1, n)).reshape(w.shape))
 
 

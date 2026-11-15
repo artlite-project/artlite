@@ -1,5 +1,5 @@
-// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq2.py, iq3.py, iq3s.py,
-// iq4.py, bf16.py:
+// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq1.py, iq2.py, iq3.py,
+// iq3s.py, iq4.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
@@ -525,6 +525,67 @@ void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// IQ1_S / IQ1_M (iq1.py): per super-block a unit of 1600 / 1856 bytes (R <= 32 rows; rows past R zero), entries in
+/// panel order e = 128 i + 32 l + 8 g + r (row 8 g + r's 8-k block 4 i + l): LO [e] the grid indices' low bytes, HB
+/// [q 2][bit B][m 16] u32 (bit n of word (q, b, m) = bit 8 + b of the index of entry 512 q + 32 m + n; IQ1_M's b 3: the
+/// block's delta negative), SC (IQ1_S: [g][r][i' 4] the nibbles s | dneg << 3 of groups 2 i', 2 i' + 1; IQ1_M: [g][r][i 8]
+/// the halves' scales s0 | s1 << 4), D [row] bf16(d) (IQ1_M: the fp16 of the scale words' top nibbles).
+template <bool M>
+void tile_iq1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  constexpr size_t bb = M ? 56 : 50, unit = M ? 1856 : 1600, kSC = M ? 1536 : 1408, kD = M ? 1792 : 1536;
+  constexpr int B = M ? 4 : 3;
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* u = t + unit * sb;
+    uint32_t hb[2][B][16] = {};
+    for (int r = 0; r < R; r++) {
+      const uint8_t* b = src[r] + bb * sb;
+      const int g = r / 8, rr = r % 8;
+      uint16_t sw[4] = {};  // (IQ1_M: the scale words)
+      if constexpr (M) {
+        std::memcpy(sw, b + 48, 8);
+        const uint16_t h = static_cast<uint16_t>((sw[0] >> 12) | ((sw[1] >> 8) & 0xF0) | ((sw[2] >> 4) & 0xF00) |
+                                                 (sw[3] & 0xF000));
+        uint8_t hh[2];
+        std::memcpy(hh, &h, 2);
+        put16(u + kD + 2 * r, bf16_of(hh));
+      } else {
+        put16(u + kD + 2 * r, bf16_of(b));
+      }
+      uint8_t nib = 0;  // (IQ1_S: group 2 i''s nibble, until group 2 i' + 1's)
+      for (int i = 0; i < 8; i++) {
+        uint16_t qh = 0;
+        if constexpr (M) {
+          const unsigned w = sw[i / 2] >> (6 * (i % 2));
+          u[kSC + 64 * g + 8 * rr + i] = static_cast<uint8_t>((w & 7) | ((w >> 3) & 7) << 4);
+        } else {
+          std::memcpy(&qh, b + 34 + 2 * i, 2);
+          const uint8_t n = static_cast<uint8_t>(((qh >> 12) & 7) | ((qh >> 15) << 3));
+          if (i % 2)
+            u[kSC + 32 * g + 4 * rr + i / 2] = static_cast<uint8_t>(nib | n << 4);
+          else
+            nib = n;
+        }
+        for (int l = 0; l < 4; l++) {
+          const int e = 128 * i + 32 * l + 8 * g + rr;
+          uint32_t idx, dn = 0;
+          if constexpr (M) {
+            const unsigned h = b[32 + 2 * i + l / 2] >> (4 * (l % 2));
+            idx = b[4 * i + l] | ((h & 7u) << 8);
+            dn = (h >> 3) & 1;
+          } else {
+            idx = b[2 + 4 * i + l] | (((qh >> (3 * l)) & 7u) << 8);
+          }
+          u[e] = static_cast<uint8_t>(idx);
+          const int q = e / 512, m = e % 512 / 32, n = e % 32;
+          for (int k = 0; k < 3; k++) hb[q][k][m] |= ((idx >> (8 + k)) & 1) << n;
+          if constexpr (M) hb[q][3][m] |= dn << n;
+        }
+      }
+    }
+    std::memcpy(u + 1024, hb, sizeof hb);
+  }
+}
+
 /// IQ4_NL / IQ4_XS (iq4.py): per super-block a unit: the codes [32-k group i][step s 4][row group][row 8][4 B] (byte b of
 /// word (i, s) = codes 8 s + 2 b and 8 s + 2 b + 1 of group i, the lower k in the low nibble), then IQ4_NL: d [i][row]
 /// bf16; IQ4_XS: the scales' low nibbles [i][row], their high crumbs [i' 4][row] (nibble = crumb i' | crumb i' + 4 << 2),
@@ -621,6 +682,10 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R; }, plain<tile_q3k>},
     {TileFormat::IQ3_XXS, "IQ3_XXS", 98, true, false, [](int R, int nsb) { return iq3xxs_unit(R) * size_t(nsb); },
      plain<tile_iq3xxs>},
+    {TileFormat::IQ1_S, "IQ1_S", 50, false, false, [](int R, int nsb) { return R <= 32 ? 1600 * size_t(nsb) : ~size_t(0); },
+     plain<tile_iq1<false>>},
+    {TileFormat::IQ1_M, "IQ1_M", 56, false, false, [](int R, int nsb) { return R <= 32 ? 1856 * size_t(nsb) : ~size_t(0); },
+     plain<tile_iq1<true>>},
     {TileFormat::IQ2_XXS, "IQ2_XXS", 66, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
      plain<tile_iq2<Iq2::XXS>>},
     {TileFormat::IQ2_XS, "IQ2_XS", 74, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
