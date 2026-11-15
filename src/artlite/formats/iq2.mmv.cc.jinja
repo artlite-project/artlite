@@ -94,12 +94,15 @@ __attribute__((noinline)) void {{ p }}_iq2_off(const uint8_t *__restrict u, int 
         for (int k = 0; k < 3; k++) {
             aie::vector<uint16, 32> v = aie::unpack(aie::load_v<32>(pl));
             pl += 32;
-            v = aie::add(v, v);
-            v = aie::add(v, v);
             if constexpr (F == 0) {
-                const aie::mask<32> b7 = aie::ge(v, (uint16)512);
-                v = aie::upshift(v, 2);
+                const aie::mask<32> b7 = aie::ge(v, (uint16)128);
+                v = aie::upshift(v, 4);
                 v = aie::select(v, aie::add(v, (uint16)(D - 2048)), b7);
+            } else if constexpr (F == 1) {
+                v = aie::upshift(v, 2);
+            } else {  // (IQ2_S: 89 cycles a call this way, 93 by the upshift)
+                v = aie::add(v, v);
+                v = aie::add(v, v);
             }
             if constexpr (F > 0)
                 v = aie::select(v, aie::add(v, (uint16)1024), aie::mask<32>::from_uint32(pm[3 * j + k]));

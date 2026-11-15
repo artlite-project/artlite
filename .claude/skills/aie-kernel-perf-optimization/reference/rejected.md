@@ -110,6 +110,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | Gather loops unrolled to 8 panels per iteration (any target II) | not pipelined, spills |
 | IQ3_XXS / IQ4 decode panel loops at target IIs | II 39 / 21 unchanged (their QEY_RS 30 / 18) |
 | IQ1 decode: the panels' vsel8 / vaddsub8 masks stored by the gather loop and loaded as scalars (no `vextract.64`) | a `mov` per mask into the mask registers: II 13 vs 9 per two panels |
+| The 8-slot GEMV's scaling inside the MMUL loop (two row groups' sums in accumulators, c = bf16(C) in registers: `_iq1_xs`) | II 16 per n, bound by the qwa port (the conversions leave the store slot's `vst.conv`): 376-406 cycles per half super-block against 98 + 220 in two loops |
 
 ## Data movement
 

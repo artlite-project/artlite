@@ -382,8 +382,17 @@ of 23 rows) 4596 -> ~2300 cycles:
   45); two streams in one loop spill the FIFO state every iteration (136 bytes). Realign in a loop of its own, read
   unaligned words as aligned blocks and `shift_bytes` (`_k23w2`), or store the data aligned (the tile layout is
   ours: the indices in 8-row panels, padded to 24 rows from the tile's spare bytes).
-- **The MMUL in a loop of its own**: built panels to the scratch, multiplied by the next loop (II 17 per 12 panels);
-  fused with the gathers the loop ran out of registers (post-RA) or took 869 instead of 639 + 164 cycles.
+- **The MMUL in a loop of its own** where the panels come from gathers: built panels to the scratch, multiplied by the
+  next loop (II 17 per 12 panels); fused with the gathers the loop ran out of registers (post-RA) or took 869 instead
+  of 639 + 164 cycles (IQ2_XXS's value gathers: 270 against 171 + 87, spilling). Panels built from masks (no address
+  vectors live) go straight into the MMULs: IQ1_S's from the tile, II 32 per n (8 panels, the move slot's 2
+  `vextract.64`, a `vsel8` and a `vaddsub8` each) 283 against 266 + 98..144 cycles per 64 panels; IQ1_M's from its gather
+  loop's masks, II 48 with the deltas. Without the panels in L1 their stores and reloads, in one region, go too.
+- **The values in the table where they fit** (IQ2_XXS, `formats/iq2.py` `value_words`): 256 entries of 8 values are
+  2 KB as bytes, a 4x64 table (each 32-byte group twice) 4 KB: its halves by index bit 7 in the two 2 KB slots, every lane
+  at the first copy, offsets 16 (lo & 127) + D b7. A panel is its two gathers (row r's 8 values in lane r) and the signs'
+  `vaddsub8`, not masks through a byte transpose and two `vsel8`: 430 -> 171 cycles per 48 panels, despite the halves'
+  bank conflicts (a gather's lanes 0, 2 and 1, 3 share a region in 3 of 4 gathers).
 - **Re-encode losslessly**: the 7-bit sign field and its implied parity stored as the prefix XOR c (the 8 signs are
   c ^ (c << 1)): 5 ops per 64 fields instead of a sum of 6 shifts. Write the XOR as (c | t) - (c & t) with the
   subtraction a `vaddsub8` of an all-ones mask: LLVM folds a plain subtraction back into `^`, which AIE2P expands
