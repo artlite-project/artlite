@@ -321,11 +321,12 @@ class DecodeOverlayOperator(ArtcOperator):
         """(moe) The objects of the A stream's memtile FIFO: as many as the memtile's BDs leave it, ``A_DEPTH_MOE`` at most.
         An MoE step has long windows in which the main cores take no weights (a GDN core's step, the round trips at a
         layer's end: the partials, the combine, the next layer's input), and the shim streams the next phase's tiles into
-        this FIFO meanwhile: 14 objects instead of 8 make the 35B-A3B's step 0.6 ms shorter (12: 0.5 ms). Its BDs out of
-        the memtile share the odd half of the memtile's BDs (24 .. 47) with the X stream's and the paged formats' (two per
-        format from the top: ``pg_store``)."""
-        first = self.pg_store[0] if self.paged else 48
-        return max(type(self).A_DEPTH, min(A_DEPTH_MOE, first - 24 - self.X_DEPTH))
+        this FIFO meanwhile: 14 objects instead of 8 make the 35B-A3B's step 0.6 ms shorter (12: 0.5 ms). Its BDs into
+        the memtile share the even half of the memtile's BDs (0 .. 23), those out of it the odd half (24 .. 47), each
+        with the X stream's and the paged formats' from the half's top (``pg_store``: two per format in the odd half, or
+        with ``pg_split`` one in each)."""
+        pages = (len(self.paged) if self.pg_split else 48 - self.pg_store[0]) if self.paged else 0
+        return max(type(self).A_DEPTH, min(A_DEPTH_MOE, 24 - self.X_DEPTH - pages))
 
     @property
     def x_l1_depth(self) -> int:
@@ -470,8 +471,10 @@ class DecodeOverlayOperator(ArtcOperator):
     @property
     def pg_split(self) -> bool:
         """Whether each core half's pages have a memtile channel of their own (``pg_channels``): a design of 8 slots, whose
-        memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves."""
-        return self.slots == 8
+        memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves; an MoE design of more
+        than 4 paged formats, whose page BDs then take both halves of the memtile's BDs alike and leave the A stream's
+        FIFO the more (``moe_a_depth``)."""
+        return self.slots == 8 or (self.moe and len(self.paged) > 4)
 
     @property
     def pg_channels(self) -> tuple[int, int]:
