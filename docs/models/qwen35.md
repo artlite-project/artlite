@@ -41,8 +41,8 @@ the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "
 `model_config.occamy_gguf()`; Swift 1.5's: `model_config.swift_gguf()`; unsloth's: `model_config.unsloth_qwen_gguf(quant)`).
 The NPU path reads Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL tensors,
 Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), in any role, and a dense layer's FFN gate and up in two
-of them (unsloth's dynamic quantizations: below); not yet IQ1_S and IQ1_M (unsloth's UD-IQ3_XXS and smaller files,
-UD-Q2_K_XL). A dense model with a KV head per 2 columns decodes up to 8 tokens per dispatch where its file
+of them (unsloth's dynamic quantizations: below); not yet IQ1_S and IQ1_M (unsloth's UD-IQ3_S and smaller
+files). A dense model with a KV head per 2 columns decodes up to 8 tokens per dispatch where its file
 holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than ten formats; else up to 4
 (`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a
 `<repository>-DFlash2-GGUF` of any account) where the design runs 8 tokens, else its file's own MTP layer; a qwen35moe
@@ -141,7 +141,7 @@ values each (`formats/iq4.py`, `formats/iq3s.py`). With ten tile formats its dec
 as a code page, each IQ format's page bringing its lookup table. With its MTP drafter a step decodes up to 8 tokens
 (`--spec-type none`: up to 4, a design 2% faster per step).
 
-unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, tested; UD-Q4_K_S and UD-Q3_K_XL hold the same formats)
+unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, tested; UD-Q3_K_XL up to UD-Q8_K_L hold only formats it reads)
 choose a format per tensor: most of a layer in IQ4_XS, Q4_K, Q5_K or Q6_K, some FFN tensors in IQ3_S, IQ3_XXS, Q3_K,
 IQ2_S, IQ2_XS or IQ2_XXS, and in a third of the layers the FFN gate and up in two different formats. Such a layer's
 gate / up tiles hold, per group of 64 outputs, its gate rows in tiles of one format, then its up rows in tiles of the

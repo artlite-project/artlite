@@ -24,7 +24,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Gemma 4 31B it | | lmstudio-community QAT Q4_0; HauhauCS QAT Uncensored Balanced Q4_K_M (with MTP); vision |
 | qwen35 | ✅ Qwen3.5 9B | lmstudio-community Q4_K_M | |
 | | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M, its mmproj BF16 (images) | |
-| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images); unsloth UD-IQ4_XS (gate / up in two formats, IQ2 tensors) | unsloth UD-IQ3_XXS and smaller (IQ1_S, IQ1_M) |
+| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images); unsloth UD-IQ4_XS (gate / up in two formats, IQ2 tensors) | unsloth UD-IQ3_S and smaller (IQ1_S, IQ1_M) |
 | | ✅ Swift 1.5 (Qwen3.8 27B fine-tune, uncensored) | IsValorum APEX-I-MiniPlus V3 (IQ4_XS / IQ3_S / IQ3_XXS FFN), with its MTP layer as the drafter | its mmproj Q8_0 |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
 | | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0, their mmproj Q8_0 (images) | |
