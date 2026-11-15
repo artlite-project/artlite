@@ -25,15 +25,15 @@ import math
 import numpy as np
 from jinja2 import ChoiceLoader, FunctionLoader, Template
 
-from . import bf16, common, iq1, iq2, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6k, q8
+from . import bf16, common, iq1, iq2, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6h, q6k, q8
 from .common import KC, KT, SB, TAB, TAB_BYTES, DqKernels, Slot, TileFormat
 
 __all__ = ["FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
-           "has_tile_format", "kernel_template", "pack_tile", "slice_fields", "slot", "tile_format"]
+           "has_tile_format", "kernel_template", "pack_tile", "packs_from", "slice_fields", "slot", "tile_format"]
 
 # the slots
 SLOTS: tuple[Slot, ...] = (q4.SLOT, bf16.SLOT, q4k.SLOT, q5k.SLOT, q6k.SLOT, k23.SLOT, q2k.SLOT, q3k.SLOT, q8.SLOT,
-                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT)
+                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT, q6h.SLOT)
 
 FORMATS: dict[str, TileFormat] = {f.name: f for f in sorted((f for s in SLOTS for f in s.formats), key=lambda f: f.fid)}
 _SLOT_OF = {f.name: s for s in SLOTS for f in s.formats}
@@ -56,6 +56,14 @@ def tile_format(qtype: str) -> str:
     if fmt not in FORMATS:
         raise NotImplementedError(f"GGUF tensor type {qtype} has no tile format (supported: {sorted(FORMATS)})")
     return fmt
+
+
+def packs_from(fmt: str, qtype: str) -> bool:
+    """Whether tiles of ``fmt`` are packed from tensors of the GGUF type ``qtype``: its own format (``tile_format``), or
+    a plane of it (Q6_KH: of Q6_K tensors, ``q6h``)."""
+    if fmt == "Q6_KH":
+        return qtype == q6h.SOURCE
+    return fmt == "BFP16" if qtype == "F32" else has_tile_format(qtype) and tile_format(qtype) == fmt
 
 
 def has_tile_format(qtype: str) -> bool:

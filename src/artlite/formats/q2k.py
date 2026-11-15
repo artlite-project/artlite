@@ -22,14 +22,19 @@ def header_words(nsb: int) -> int:
 _GEMM = templating.source("artlite/formats/q2k.gemm.cc.jinja")
 
 
-# the decode GEMV (``decode.gemv``; the realignment and the scaling: ``mmv/k23``)
+# the decode GEMV (``decode.gemv``; the realignment and the scaling: ``mmv/k23``; the sub-block sums of the 2-bit code
+# words, ``mmv/q2mm``: also ``q6h``'s)
 _MMV = templating.source("artlite/formats/q2k.mmv.cc.jinja")
+_MM = templating.source("artlite/formats/q2k.mm.cc.jinja")
 
 class Q2KSlot(k23.PlanarK23, Slot):
     formats = (TileFormat("Q2_K", 7, 84, 32, 1, 64, 20, planes=2,
                           word_major=True, dq_row_cycles=9.0, mmv="q2k"),)
-    sources: ClassVar[dict[str, str]] = {"gemm/Q2_K": _GEMM, "mmv/Q2_K": _MMV}
+    sources: ClassVar[dict[str, str]] = {"gemm/Q2_K": _GEMM, "mmv/Q2_K": _MMV, "mmv/q2mm": _MM}
     ws_bytes = 512  # (per 8-row block: A, B of 16 sub-blocks)
+
+    def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
+        return ("mmv/k23", "mmv/q2mm", f"mmv/{fmt}")
 
     def pack(self, fmt: str, f: dict[str, np.ndarray], R: int, nsb: int) -> list[np.ndarray]:
         hw = np.zeros((R, header_words(nsb)), np.uint32)

@@ -1,0 +1,72 @@
+// ---- the sub-block sums of 2-bit code words (Q2_K's, and Q6_K's high plane: ``q6h``): codes [sb][word j 16] of
+// {{ R2 }} rows (word j = sub-block j: nibble b = c(16 j + b) + 4 c(16 j + 8 + b)), word-major
+
+// c_j,g = bf16(C[hi rows] + C[lo rows]) -> c [j][g 4][32] for the 16 sub-blocks j of a super-block, every row group:
+// C = x(2 j) (w & 3 - 2) + x(2 j + 1) ((w & 12) / 4 - 2) (w: word j's row group, realigned from the tile: o the super-block's
+// first word; xp: its 32 panels; the -2: x against a constant panel, once per sub-block for the four groups); the panels'
+// exponents set outside the loop (a code panel: one vband)
+__attribute__((noinline)) void {{ p }}_q2k_mm(const uint8_t *__restrict xp, const uint8_t *w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const v64uint8 m3 = broadcast_to_v64uint8((unsigned char)3), m12 = broadcast_to_v64uint8((unsigned char)12);
+    v64bfp16ebs8 N2, A0, A1, A2, A3, B0, B1, B2, B3;  // (the zero point, the codes & 3, the codes & 12 per row group)
+    N2.mantissa = broadcast_to_v64int8(-2);
+    N2.exponent = al::e8(0x85);
+    A0.exponent = A1.exponent = A2.exponent = A3.exponent = al::e8(0x85);
+    B0.exponent = B1.exponent = B2.exponent = B3.exponent = al::e8(0x83);
+    uintptr_t o = (uintptr_t)w;
+    bfloat16 *__restrict pc = c;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int s = 0; s < 16; s++) {
+        const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop();
+        v16int32 lo, hi;
+        {{ p }}_k23w2(o, {{ 4 * R2 }}, lo, hi);
+        const v64accfloat Z = mac_8x8_8x8T(x1, 1, N2, 1, mul_8x8_8x8T(x0, 1, N2, 1));
+{% for g in range(4) %}
+        {
+            const v64uint8 q = unpack(extract_v64uint4((v128uint4){{ "lo" if g < 2 else "hi" }}, {{ g % 2 }}));
+            A{{ g }}.mantissa = (v64int8)band(q, m3);
+            B{{ g }}.mantissa = (v64int8)band(q, m12);
+            aie::store_v(pc + {{ 32 * g }}, {{ p }}_sum2(mac_8x8_8x8T(x1, 1, B{{ g }}, 0, mac_8x8_8x8T(x0, 1, A{{ g }}, 0, Z))));
+        }
+{% endfor %}
+        o += {{ 4 * R2 }};
+        pc += 128;
+    }
+}
+{% if slots == 8 %}
+
+// (8 slots) _q2k_mm's for 8 sub-blocks (half a super-block: xp its 16 panels, w its first word) -> c [s 8][g 4][64] =
+// bf16(C)
+__attribute__((noinline)) void {{ p }}_q2k_mm8(const uint8_t *__restrict xp, const uint8_t *w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const v64uint8 m3 = broadcast_to_v64uint8((unsigned char)3), m12 = broadcast_to_v64uint8((unsigned char)12);
+    v64bfp16ebs8 N2, A0, A1, A2, A3, B0, B1, B2, B3;  // (the zero point, the codes & 3, the codes & 12 per row group)
+    N2.mantissa = broadcast_to_v64int8(-2);
+    N2.exponent = al::e8(0x85);
+    A0.exponent = A1.exponent = A2.exponent = A3.exponent = al::e8(0x85);
+    B0.exponent = B1.exponent = B2.exponent = B3.exponent = al::e8(0x83);
+    uintptr_t o = (uintptr_t)w;
+    bfloat16 *__restrict pc = c;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int s = 0; s < 8; s++) {
+        const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop();
+        v16int32 lo, hi;
+        {{ p }}_k23w2(o, {{ 4 * R2 }}, lo, hi);
+        const v64accfloat Z = mac_8x8_8x8T(x1, 1, N2, 1, mul_8x8_8x8T(x0, 1, N2, 1));
+{% for g in range(4) %}
+        {
+            const v64uint8 q = unpack(extract_v64uint4((v128uint4){{ "lo" if g < 2 else "hi" }}, {{ g % 2 }}));
+            A{{ g }}.mantissa = (v64int8)band(q, m3);
+            B{{ g }}.mantissa = (v64int8)band(q, m12);
+            aie::store_v(pc + {{ 64 * g }}, {{ p }}_c8(mac_8x8_8x8T(x1, 1, B{{ g }}, 0, mac_8x8_8x8T(x0, 1, A{{ g }}, 0, Z))));
+        }
+{% endfor %}
+        o += {{ 4 * R2 }};
+        pc += 256;
+    }
+}
+{% endif %}

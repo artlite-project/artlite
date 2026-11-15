@@ -31,7 +31,7 @@ from artlite.decode.gemv import (
 from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
 from artlite.decode.protocol import C_LEN, F_EMITR, F_GU, F_MSG
-from artlite.formats import FORMATS, TAB, slice_fields, slot
+from artlite.formats import FORMATS, TAB, q6h, slice_fields, slot
 from artlite.formats.common import table_copies
 from artlite.gguf_model import IQ4_VALUES
 from artlite.operators import bfp16
@@ -277,6 +277,25 @@ def _q2k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return ((_hilo(Y0) + _hilo(Y1)) * d.T[None]).sum(1) - o
 
 
+def _q6h(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (Q6_K's high plane, ``formats.q6h``: w = d' sc (c - 1.5) of the Q6_K fields' d' = 16 d and c = q >> 4. Per
+    # super-block hilo(sum c sc + XS16 sc / 2) d', the codes centered at 2 against the panels' rows: Q2_K's arithmetic
+    # without its minima; 8 slots: per half super-block, the offsets with the first)
+    f = q6h.fields(f)
+    q = f["q"].astype(np.float64)
+    R, K = q.shape
+    nsb = K // 256
+    C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 16, 16), q.reshape(R, K // 16, 16) - 2)
+    sc = f["sc"].astype(np.float64).reshape(R, nsb, 16)
+    d = _bf64(f["d"]).reshape(R, nsb)
+    Ms = np.einsum("abj,rbj->abr", x.xs16.reshape(8, nsb, 16), sc)  # (8, nsb, R)
+    cs = np.einsum("sbjr,rbj->sbjr", x.csum(C).reshape(x.slots, nsb, 16, R), sc)
+    if x.slots == 4:
+        return (_hilo(cs.sum(2) + x.fold(Ms) / 2) * d.T[None]).sum(1)
+    Y0, Y1 = cs[:, :, :8].sum(2) + Ms / 2, cs[:, :, 8:].sum(2)
+    return ((_hilo(Y0) + _hilo(Y1)) * d.T[None]).sum(1)
+
+
 def _q3k(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     # (w = d sc (q - 4): per super-block hilo(sum c sc) d, c = bf16(sum (q - 4) X_a): the codes centered against the
     # panels' rows; sums in fp32)
@@ -371,12 +390,12 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
          "IQ1_S": _iq1, "IQ1_M": _iq1, "IQ2_XXS": _iq2, "IQ2_XS": _iq2, "IQ2_S": _iq2, "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
-         "BFP16": _bfp16}
+         "BFP16": _bfp16, "Q6_KH": _q6h}
 
 
 # (the formats with kernels of 8 slots)
 GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
-                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16")
+                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16", "Q6_KH")
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:

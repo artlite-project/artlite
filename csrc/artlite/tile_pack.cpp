@@ -1,5 +1,5 @@
-// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q4.py, q8.py, q2k.py, q3k.py, iq1.py, iq2.py, iq3.py,
-// iq3s.py, iq4.py, bf16.py:
+// The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q6h.py, q4.py, q8.py, q2k.py, q3k.py, iq1.py, iq2.py,
+// iq3.py, iq3s.py, iq4.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
 // (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
 // low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
@@ -111,11 +111,12 @@ inline __m512i nibble_pairs(__m512i w) {
   return _mm512_ternarylogic_epi64(m_keep, w, mid, 0xCA);  // (a ? b : c)
 }
 
-/// bf16 bits of an fp16 value (as fp32, rounded to nearest even), negated first with ``neg``.
-inline uint16_t bf16_of(const uint8_t* f16, bool neg = false) {
+/// bf16 bits of an fp16 value (as fp32, rounded to nearest even), negated first with ``neg``, times ``scale`` (a
+/// power of two: exact).
+inline uint16_t bf16_of(const uint8_t* f16, bool neg = false, float scale = 1.0f) {
   uint16_t h;
   std::memcpy(&h, f16, 2);
-  float f = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));  // (_cvtsh_ss: not in MSVC)
+  float f = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h))) * scale;  // (_cvtsh_ss: not in MSVC)
   if (neg) f = -f;
   uint32_t u;
   std::memcpy(&u, &f, 4);
@@ -350,6 +351,32 @@ void tile_q2k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
       for (int j = 0; j < 16; j++) {
         uint32_t v[8];
         for (int bb = 0; bb < 8; bb++) v[bb] = k23_code(qs, 16 * j + bb) + 4 * k23_code(qs, 16 * j + 8 + bb);
+        cw[(size_t(sb) * 16 + j) * R + r] = nib_word(v);
+      }
+    }
+  }
+}
+
+/// Q6_KH (q6h.py: Q6_K's high plane in Q2_K's layout, from Q6_K blocks): header words [sb][4 words: the int8 scales of
+/// sub-blocks 4 w .., a byte each] | [sb] bf16 (16 d), then per super-block 16 code words of the codes' top 2 bits
+/// (a Q6_K block's qh: Q2_K's qs), word j: nibble b = c(16 j + b) + 4 c(16 j + 8 + b).
+void tile_q6kh(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  const int nw = q2k_header_words(nsb);
+  uint32_t* hw = reinterpret_cast<uint32_t*>(t);
+  uint32_t* cw = hw + size_t(nw) * R;
+  for (int r = 0; r < R; r++) {
+    for (int sb = 0; sb < nsb; sb++) {
+      const uint8_t* b = src[r] + 210 * sb;
+      const uint8_t *qh = b + 128, *sc = b + 192;
+      for (int u = 0; u < 4; u++) {
+        uint32_t w;
+        std::memcpy(&w, sc + 4 * u, 4);
+        hw[size_t(4 * sb + u) * R + r] = w;
+      }
+      hw[size_t(4 * nsb + sb) * R + r] = bf16_of(b + 208, false, 16.0f);
+      for (int j = 0; j < 16; j++) {
+        uint32_t v[8];
+        for (int bb = 0; bb < 8; bb++) v[bb] = k23_code(qh, 16 * j + bb) + 4 * k23_code(qh, 16 * j + 8 + bb);
         cw[(size_t(sb) * 16 + j) * R + r] = nib_word(v);
       }
     }
@@ -713,6 +740,8 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; }, plain<tile_iq4<false>>},
     {TileFormat::IQ4_XS, "IQ4_XS", 136, false, false,
      [](int R, int nsb) { return R % 8 ? ~size_t(0) : 136 * size_t(nsb) * R; }, plain<tile_iq4<true>>},
+    {TileFormat::Q6_KH, "Q6_KH", 210, false, false,
+     [](int R, int nsb) { return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R; }, plain<tile_q6kh>},
     {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<false>>},
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },

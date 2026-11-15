@@ -35,7 +35,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native
-from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, tile_format
+from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, packs_from, tile_format
 from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
 from .protocol import NX_PER_NORM, OBJ_K, POST_K
@@ -475,7 +475,7 @@ def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int
     zero super-blocks): tile (t, k) = ``pack_tile(fmt, fields of rows t R .. of chunk k, S)``; G > 1 (one chunk):
     tile row v = rows v G .. v G + G - 1 along K."""
     t = tensors[0]
-    assert (fmt == "BFP16" if t.qtype == "F32" else tile_format(t.qtype) == fmt) and t.cols * G <= nch * kc
+    assert packs_from(fmt, t.qtype) and t.cols * G <= nch * kc
     assert rows.size % (R * G) == 0
     n = rows.size // (R * G)
     out = np.zeros(n * nch * S, np.uint8)

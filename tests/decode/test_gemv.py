@@ -10,7 +10,7 @@ import torch
 
 from artlite.decode import gemv
 from artlite.decode.image import pack_rows
-from artlite.formats import FORMATS, pack_tile, slice_fields, tile_format
+from artlite.formats import FORMATS, pack_tile, q6h, slice_fields, tile_format
 from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
 from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
@@ -27,14 +27,14 @@ PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
         ("IQ3_S", 18432, 8), ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
         ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4), ("IQ1_S", 9280, 4), ("IQ1_M", 9280, 4),
-        ("IQ1_S", 9216, 4)]
+        ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "NSB"), PACK, ids=[f"{f}-{s}-nsb{n}" for f, s, n in PACK])
 def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
     """The C++ packer (pack_rows) is bit-identical to the slot's pack_tile: two stacked tensors, rows in a random order
-    with padding rows, 3 K chunks."""
-    fmt = tile_format(qtype)
+    with padding rows, 3 K chunks (Q6_KH: tiles of Q6_K tensors, ``formats.q6h``)."""
+    fmt, qtype = (qtype, q6h.SOURCE) if qtype == "Q6_KH" else (tile_format(qtype), qtype)
     KC = 256 * NSB
     R = FORMATS[fmt].rows(S_BYTES, NSB, gemv.row_split(fmt, NSB) if gemv.supported(fmt, NSB) else 0)
     a, b = random_tensor(qtype, 40, 3 * KC, 1), random_tensor(qtype, 9, 3 * KC, 2)
@@ -135,6 +135,9 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         v = IQ4_VALUES[f["q"]].astype(np.float64)
         return per(f["d"], 32) * v if fmt == "IQ4_NL" else \
             per(f["d"], 256) * np.repeat(f["ls"].astype(np.float64) - 32, 32, 1) * v
+    if fmt == "Q6_KH":  # (Q6_K's fields: its high plane's weights, ``formats.q6h``)
+        h = q6h.fields(f)
+        return per(h["d"], 256) * np.repeat(h["sc"].astype(np.float64).reshape(q.shape[0], -1), 16, 1) * ((f["q"] >> 4) - 1.5)
     sub = 32 if fmt in ("Q4_K", "Q5_K") else 16
     sc = np.repeat(f["sc"].astype(np.float64).reshape(q.shape[0], -1), sub, 1)
     if fmt in ("Q4_K", "Q5_K", "Q2_K"):
@@ -151,6 +154,7 @@ GEMV = [
     ("Q5_K", 9280, 4, ("llama", "Q5_K_M", "1B"), "blk.0.ffn_gate.weight"),
     ("Q5_K", 9856, 4, ("llama", "Q3_K_M", "3B"), "blk.0.attn_v.weight"),
     ("Q6_K", 9280, 4, ("llama", "Q4_K_M", "1B"), "blk.0.attn_v.weight"),
+    ("Q6_KH", 9280, 4, ("llama", "Q4_K_M", "1B"), "blk.0.attn_v.weight"),  # (27 rows: the high plane of a Q6_K tensor)
     ("BFP16", 9216, 4, ("llama", "BF16", "1B"), "blk.0.ffn_gate.weight"),
     ("Q4_0", 9280, 4, ("llama", "Q4_0", "1B"), "blk.0.ffn_gate.weight"),
     ("Q4_1", 9280, 4, ("llama", "Q4_0", "1B"), "blk.0.ffn_down.weight"),  # (14 rows)
@@ -203,7 +207,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
         path = _path(key)
         require(path)
         t = GGUFFile(path).tensor(name)
-    assert tile_format(t.qtype) == fmt
+    assert tile_format(t.qtype) == (q6h.SOURCE if fmt == "Q6_KH" else fmt)
     KC = 256 * NSB
     n_tiles = 3
     op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB, slots=slots)
