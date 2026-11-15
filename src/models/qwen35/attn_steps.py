@@ -214,14 +214,14 @@ class AttentionSteps:
         at = np.concatenate([x[:, AT] for x in (f, t, r)] + [x[:, AT] + 2 for x in (f, t, r)])
         return {"f": f, "t": t, "r": r, "lines": np.unique(4 * at & ~63)}
 
-    def set_position(self, st: Step, p: int) -> None:
+    def set_position(self, st: Step, p: int, rope: np.ndarray | None = None) -> None:
         """The F_ATT objects (per sub-step: its positions, cache objects, rotations) and the step's cache and ring
-        transfers."""
+        transfers. ``rope``: its positions' M-RoPE rows (default: ``QwenOverlay.rope``'s)."""
         ov = self.ov
         S = st.S
         assert 0 <= p and p + S <= ov.max_positions, (p, S)
         assert st.subs == ov.subs(p, S), (p, S, st.subs)
-        c0, s0 = attn.rope_cs(ov.cfg, ov.rope[p:p + S])
+        c0, s0 = attn.rope_cs(ov.cfg, ov.rope[p:p + S] if rope is None else rope)
         cs = np.concatenate([c0, s0], 1)
         self._rings_from_prefill(p)
         for L in ov.fatt:

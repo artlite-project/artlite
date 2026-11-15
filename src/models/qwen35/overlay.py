@@ -165,7 +165,8 @@ class QwenOverlay(ModelOverlay):
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.AHEAD = self.STEPS_AHEAD and slots == 4 and self.ash is not None
-        self._rope_used = (0, 0)  # (the positions whose ``rope`` rows the last position patch took: ``_ring_state``)
+        # (the positions whose ``rope`` rows the last position patch took, and the rows it took: ``_ring_state``)
+        self._rope_used = (0, 0, b"")
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
@@ -560,18 +561,19 @@ class QwenOverlay(ModelOverlay):
         """A step's words that follow its position: a chunkwise core's state transfers (``GdnTransfers.patch_panels``),
         the attention's F_ATT objects and cache, ring and record transfers (``AttentionSteps.set_position``). ``ahead``
         (``AHEAD``: while the step before runs, st of the other transaction buffer): not when a prefill's caches still
-        owe the rings their rows (KV, which the running step reads); its positions' ``rope`` rows are text's that follows
-        the row before them (what a model writes before its step: the step is patched again if it wrote others,
-        ``_ring_state``)."""
+        owe the rings their rows (KV, which the running step reads); its positions' ``rope`` rows are taken as text's that
+        follows the row before them (what a model writes before a generation's step; ``rope`` itself may hold a prompt's
+        rows already and is left alone): the step is patched again when ``rope`` holds others then (``_ahead_state``)."""
+        rope = self.rope[p:p + st.S]
         if ahead:
             if self.vring.from_prefill & set(self.fatt):
                 return False
-            self.rope[p:p + st.S] = int(self.rope[p - 1].max()) + 1 + np.arange(st.S)[:, None]
+            rope = np.repeat(int(self.rope[p - 1].max()) + 1 + np.arange(st.S, dtype=self.rope.dtype)[:, None], 3, 1)
         if self.blocks:
             self.gdn_steps.patch_panels(st, p)
         if self.ash is not None:
-            self.attn_steps.set_position(st, p)
-        self._rope_used = (p, p + st.S)
+            self.attn_steps.set_position(st, p, rope)
+        self._rope_used = (p, p + st.S, rope.tobytes())
         return True
 
     @property
@@ -674,8 +676,12 @@ class QwenOverlay(ModelOverlay):
     def _ring_state(self) -> tuple:
         """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``; the GSTATE halves of the
         blocks, ``GdnCursor.half``; the ``rope`` rows the last position patch took)"""
-        a, b = self._rope_used
+        a, b, _ = self._rope_used
         return (*super()._ring_state(), self.cur.conv_in_ghdr, self.cur.gh, self.cur.gp, self.rope[a:b].tobytes())
+
+    def _ahead_state(self) -> tuple:
+        """(the ``rope`` rows the patch took in place of those ``rope`` holds now)"""
+        return (*self._ring_state()[:-1], self._rope_used[2])
 
     @staticmethod
     def _id_runs(order: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, int]]]:

@@ -445,6 +445,11 @@ class ModelOverlay:
         return (frozenset(self.vring.from_prefill),
                 tuple(sorted((L, tuple(sorted(d.items()))) for L, d in self.vring.slots.items())))
 
+    def _ahead_state(self) -> tuple:
+        """``_ring_state`` as the step just patched ahead assumed it (``AHEAD``: what the patch took for values the model
+        writes only before the step): the step runs as patched when ``_ring_state`` is this then."""
+        return self._ring_state()
+
     def _key(self, S: int, logits: bool, subs: tuple, b: int = 0) -> StepKey:
         """The key of a step's transaction (buffer ``b``)."""
         return StepKey(S, logits, self._variant(), subs, b)
@@ -603,7 +608,7 @@ class ModelOverlay:
                 nkey = StepKey(S, logits, self._variant_ahead(p, S), self.subs(p, S), 1 - b)
                 nxt = self._transaction(nkey)
                 if self._set_position(nxt, p, ahead=True):
-                    self._ahead = AheadStep(nkey._replace(b=0), p, self._ring_state(), nxt, 1 - b)
+                    self._ahead = AheadStep(nkey._replace(b=0), p, self._ahead_state(), nxt, 1 - b)
                 self._once_t = 0.0  # (while the step runs: none of the next step's time)
         finally:
             self.dev.wait()

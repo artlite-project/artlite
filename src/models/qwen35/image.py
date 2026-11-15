@@ -331,6 +331,7 @@ class MtpView:
 
     order = None
     column_major = False
+    screen = False  # (the drafter reads its head's rows as they are)
 
     def __init__(self, image: QwenImage, cfg: QwenConfig):
         self.model, self.cfg, self.gguf = image, cfg, image.gguf
