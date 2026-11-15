@@ -38,7 +38,7 @@ copy's distance from its first, each twice; ``_iq1_g``: per two panels 8 4x16 ga
 ``T16_16x4_lo``, the masks [Ae | Be | Ao | Bo] of the 16 rows by one ``T8_16x4``, b9 picking a row's half by one select;
 ``_iq1_p``: the panel = sel(0, 8, A) signed by B plus the deltas +-1, 8 g + delta at exponent 130: (8 g + delta) / 8),
 the MMUL (``_iq1_x``: per 16-k half h of a group c = bf16 of its two panels' sums) and y += hilo(yu + sum c (2 s + 1)) d
-(``_iq1_sc``; 8 slots: IQ1_S ``_k23scg``, IQ1_M ``_k23sc8`` per row group).
+(``_iq1_sc``; 8 slots: ``_k23scg``).
 
 Prefill (``gemm/IQ1_*``): GemmQd on super-block units, IQ2's structure (``iq2``): per k-tile the scales S = bf16(d (2 s +
 1) / 8) (IQ1_M: and the offsets), per panel the codes (IQ1_S: from MK; IQ1_M: by the decode's gathers and pick), w = S (8

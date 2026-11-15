@@ -4,7 +4,7 @@
 // deltas' signs | SC the scales | D]. Core H: super-blocks 2 H, 2 H + 1; per super-block u the scales and d (_iq1_ss; IQ1_S:
 // the deltas' term yu), then per half q (groups 4 q .. 4 q + 3, k blocks 16 q ..) the weight panels (IQ1_S: _iq1_pm from
 // MK; IQ1_M: the gather offsets _iq1_off, the entries _iq1_g, the panels _iq1_p), the MMUL (_iq1_x: per 16-k half h of a
-// group c), y += hilo(yu + sum c S) d (_iq1_sc; 8 slots: IQ1_S _k23scg, IQ1_M _k23sc8 per row group). Scratch: w / c [i' 4][l
+// group c), y += hilo(yu + sum c S) d (_iq1_sc; 8 slots: _k23scg). Scratch: w / c [i' 4][l
 // 4][g 4][64 B] (0 .. 4096; c (n = 2 i' + h, g): {{ L }} bf16 at {{ L }} (4 n + g); IQ1_M: the offsets [panel][16] u16, then the
 // entries' masks [pair][64 B] at 2048 .. 4096 until the panels overwrite them) | sct [g 4][n 16][r 8] bf16 (4096) | yu [g
 // 4][{{ L }}] fp32 (5120) | {{ L }} fp32 zeros (6144) | dg [g 4][r 8] bf16 (6400) | the tables' addresses (8000 .. 8008)
@@ -73,8 +73,8 @@ __attribute__((noinline)) void {{ p }}_iq1_ss(const uint8_t *__restrict un, cons
             o[3] = ::shuffle((v16int32)v1.to_native(), (v16int32)v1.to_native(), T128_2x4_hi);
         }
     } else {
-        AIE_LOOP_UNROLL_FULL
-        for (int g = 0; g < 4; g++) {
+        AIE_LOOP_NO_UNROLL
+        for (int g = 0; g < 4; g++) {  // (rolled: the IQ1_M page's room for _k23scg)
             // ([r 8][i 8] bytes s0 | s1 << 4 -> [i][r]: the halves' scales h 0, 1)
             const aie::vector<uint8, 64> b(::shuffle(aie::load_v<64>(un + {{ SC1["IQ1_M"] }} + 64 * g).to_native(), T8_8x8));
             aie::vector<bfloat16, 32> a0, a1, b0, b1;
@@ -302,14 +302,8 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
             {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
             const float *yq = F == 0 && q == 0 ? yu : zy;  // (IQ1_S: the deltas' term with the first half)
 {% if slots == 8 %}
-            // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n; IQ1_M: a call per row group, its page has no
-            // room for _k23scg)
-            if constexpr (F == 0)
-                {{ p }}_k23scg<4, 8, 256, 64, 8, 128>((const bfloat16 *)scr, sct + 64 * q, yq, q == 0 ? 64 : 0, dg, y);
-            else
-                AIE_LOOP_NO_UNROLL
-                for (int g = 0; g < 4; g++)
-                    {{ p }}_k23sc8<8, 256, 8>((const bfloat16 *)scr + 64 * g, sct + 128 * g + 64 * q, yq, dg + 8 * g, y + 64 * g);
+            // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n)
+            {{ p }}_k23scg<4, 8, 256, 64, 8, 128>((const bfloat16 *)scr, sct + 64 * q, yq, F == 0 && q == 0 ? 64 : 0, dg, y);
 {% else %}
             {{ p }}_iq1_sc((const bfloat16 *)scr, sct + 64 * q, yq, F == 0 && q == 0 ? 32 : 0, dg, y);
 {% endif %}
