@@ -24,10 +24,12 @@ drafter's round (a context round also leaves the drafter the rows of its kept to
 after a match of ``DRAFTER_MATCH`` tokens
 (shorter ones' estimates are too noisy to beat a drafter round by round), and for up to ``MARGIN`` times a step of
 one's (as their bucket's rounds are counted, less); where nothing pays, the round is a step of one token. A bucket's
-drafter rounds more than ``MARGIN`` below a step of one's tokens per second stop the drafter there, until ``RETRY``
-rounds later (a text it cannot guess: a block drafter's dispatch costs ~10% of a round, and a round keeps nothing of
-it; inside the margin two rounds that kept nothing would stop a drafter that gives a quarter more tokens per second on
-average, for a ``RETRY`` of rounds: Qwen3.6-35B-A3B at 1K 34.4 -> 36.2 tokens/s, Occamy at 32K 23 -> 26)."""
+drafter rounds below a step of one's tokens per second stop the drafter there (a text it cannot guess: a block
+drafter's dispatch costs ~10% of a round, and a round keeps nothing of it), for ``PAUSE`` rounds at first and twice as
+long each time it comes back no better, up to ``RETRY``; a bucket's rate is a slow average (``EWMA_RATE``): at the
+step times' weight the rate of a drafter that gives a quarter more tokens per second fell below a step of one's after
+two or three rounds that kept nothing, and stops of ``RETRY`` rounds cost Qwen3.6-35B-A3B and Occamy 5 - 13% of a
+generation."""
 
 from collections.abc import Sequence
 
@@ -44,10 +46,16 @@ PRIOR = np.pad(np.array([(0.23, 0.46, 0.55), (0.36, 0.54, 0.62), (0.44, 0.59, 0.
                          (0.72, 0.78, 0.82), (0.81, 0.82, 0.83), (0.89, 0.91, 0.92)]), ((0, 0), (0, 4)), mode="edge")
 PRIOR_N = 8  # the prior's weight in rounds
 EWMA = 0.2  # a new measurement's weight in a running average
+# ... of a drafter's round in its bucket's tokens and seconds while it drafts, after its first 1 / EWMA_RATE rounds' plain
+# mean: a round's tokens vary by more (1 .. S) than the edge the drafter is judged on (15 - 25% over a step of one), which
+# a rate of few rounds loses to two rounds that keep nothing. A round after a stop counts with EWMA: a text the drafter
+# guesses again brings it back at once (Gemma 4 E4B at 32K: its first rounds keep little, the later ones pay 14%)
+EWMA_RATE = 0.05
 SPAN = 2048  # the step times' spans of positions: [0, SPAN), then [SPAN 2^(i - 1), SPAN 2^i) (a step's attention runs
 # per cached position: at 32K a step of 4 costs ~2x one of 1, at 1K a few percent)
 WARM = 4  # a drafter's rounds before its rate competes (its drafts until then)
 RETRY = 32  # rounds without the drafter after which it drafts again (its rate is measured again)
+PAUSE = 4  # ... the first time its rounds fall below a step of one's rate (doubled each time it returns no better)
 DRAFTER_MATCH = 6  # with a drafter, the context's drafts compete after matches of this many tokens (agent sessions:
 # their first draft accepted 23-62% after shorter ones, 72-89% from 6 on)
 MARGIN = 1.1  # the context's drafts take a round for this many times the tokens per second of a drafter's round, and of
@@ -123,6 +131,8 @@ class Planner:
         # seconds as running averages; the rounds since its last)
         self.mtp_rounds, self.mtp_tokens, self.mtp_s = np.zeros(n, np.int64), np.zeros(n), np.zeros(n)
         self.since_mtp = np.zeros(n, np.int64)
+        # (the rounds a bucket's drafter stays out, and whether its last rounds were below a step of one's rate)
+        self.wait, self.lost = np.full(n, RETRY, np.int64), np.zeros(n, bool)
         self.rate_n, self.rate_tokens, self.rate_s = 0, 0.0, 0.0  # (every drafter round's, running averages)
 
     def place(self, position: int) -> None:
@@ -178,11 +188,18 @@ class Planner:
                 best_k, best = j, r
         if drafter:
             b = _mtp_bucket(m)
-            if self.mtp_rounds[b] < WARM or self.since_mtp[b] >= RETRY:
+            if self.mtp_rounds[b] < WARM or self.since_mtp[b] >= self.wait[b]:
                 return None
             rate = self.mtp_tokens[b] / self.mtp_s[b]
-            if MARGIN * rate * self.step_time(1) >= 1 and (m < DRAFTER_MATCH or MARGIN * rate >= best):
+            pays = rate * self.step_time(1) >= 1
+            if pays and (m < DRAFTER_MATCH or MARGIN * rate >= best):
+                self.lost[b] = False
                 return None
+            if pays:  # (the context's drafts are worth more)
+                self.wait[b], self.lost[b] = RETRY, False
+            elif not self.since_mtp[b]:  # (its last round left it below a step of one: out, longer if it was out before)
+                self.wait[b] = min(2 * self.wait[b], RETRY) if self.lost[b] else PAUSE
+                self.lost[b] = True
             self.since_mtp[b] += 1
         margin = 1 + (MARGIN - 1) * PRIOR_N / self.tried[bucket(m), 0] if m else 1.0
         return best_k if best >= margin / self.step_time(1) else 0
@@ -214,7 +231,7 @@ class Planner:
         self.rate_tokens = (1 - w) * self.rate_tokens + w * tokens
         self.rate_s = (1 - w) * self.rate_s + w * seconds
         b = _mtp_bucket(m)
-        w = 1.0 if not self.mtp_rounds[b] else EWMA
+        w = EWMA if self.lost[b] else max(EWMA_RATE, 1.0 / (self.mtp_rounds[b] + 1))
         self.mtp_rounds[b] += 1
         self.since_mtp[b] = 0
         self.mtp_tokens[b] = (1 - w) * self.mtp_tokens[b] + w * tokens

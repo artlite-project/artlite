@@ -14,7 +14,7 @@ from ml_dtypes import bfloat16
 import models
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.drafts import DRAFTER_MATCH, NMAX, PRIOR, RETRY, WARM, Lookup, Planner, bucket
+from models.drafts import DRAFTER_MATCH, NMAX, PAUSE, PRIOR, RETRY, WARM, Lookup, Planner, bucket
 from models.overlay_model import OverlayModel
 from models.sampling import Penalties, Sampling
 from models.spec_options import add_spec_options, drafter_type, spec_options
@@ -83,14 +83,25 @@ def test_planner() -> None:
 
 def test_planner_stop() -> None:
     """A text the drafter cannot guess: rounds under a step of one's tokens per second stop it in that bucket, a step of one or the
-    context's drafts run instead, and every ``RETRY`` rounds it drafts again; a drafter that pays stays however few it keeps."""
+    context's drafts run instead, and it drafts again after ``PAUSE`` rounds, then after twice as many each time it comes
+    back no better, up to ``RETRY``; back above a step of one's rate it stays, and its next stop is a short one again; a
+    drafter that pays stays however few it keeps."""
     p = Planner((1.0, 1.002, 1.006, 1.008))
     p.ran(1, 0.300)
     for _ in range(WARM):
         p.drafted(0, 1, 0.330)  # (a block's 30 ms for nothing)
-    assert [p.choose(0, 0, drafter=True) for _ in range(RETRY + 1)] == [0] * RETRY + [None]
-    p.drafted(0, 1, 0.330)
+    for wait in (PAUSE, 2 * PAUSE, 4 * PAUSE, RETRY, RETRY):
+        assert [p.choose(0, 0, drafter=True) for _ in range(wait + 1)] == [0] * wait + [None]
+        p.drafted(0, 1, 0.330)
     assert p.choose(0, 0, drafter=True) == 0
+    for _ in range(RETRY):
+        p.choose(0, 0, drafter=True)
+    for _ in range(3 * WARM):  # (a text it guesses again)
+        assert p.choose(0, 0, drafter=True) is None
+        p.drafted(0, 3, 0.330)
+    for _ in range(64):  # (its running average back under a step of one's: a slow one)
+        p.drafted(0, 1, 0.330)
+    assert [p.choose(0, 0, drafter=True) for _ in range(PAUSE + 1)] == [0] * PAUSE + [None]
     q = Planner((1.0, 1.002, 1.006, 1.008))
     q.ran(1, 0.340)
     for _ in range(3 * WARM):
