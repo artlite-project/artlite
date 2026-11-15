@@ -174,7 +174,7 @@ class QwenOverlay(ModelOverlay):
         self.blocks = self.g4 or self.g8  # (a chunkwise core: the states at the ends of blocks of 8 positions, ``GdnCursor.half``)
         self.flags = FLAGS | ({"gdn_in": F_NORM | F_GIN} if slots == 8 else {})
         self.cur = GdnCursor()  # (the GDN layers' lazy commit and blocks)
-        self.ends = True  # (8 slots) whether the step's chain ends its block: its state panels drain (``_variant``)
+        self.ends = True  # (chunkwise) whether the step's chain ends its block: its state panels drain (``_variant``)
         self.gdn_steps, self.attn_steps, self.moe_steps = GdnTransfers(self), AttentionSteps(self), MoeTransfers(self)
         self.conv = ConvHandoff(self)  # (the conv states between the decode and the prefill)
         self._order = None if img.order is None else self._id_runs(img.order)  # (``_logits``)
@@ -503,19 +503,19 @@ class QwenOverlay(ModelOverlay):
         """Phases before the first layer's (a drafter's eh: ``draft``)."""
 
     def _variant(self) -> tuple:
-        """(a step of an 8-slot design: whether its chain ends its block, ``ends``: only then its state panels drain)"""
+        """(a step of a chunkwise GDN core: whether its chain ends its block, ``ends``: only then its state panels drain)"""
         return (self.start, self.ends)
 
     def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
-        """(8 slots: the steps that end their block and those that do not)"""
-        for ends in (True, False) if self.g8 else (True,):
+        """(chunkwise: the steps that end their block and those that do not)"""
+        for ends in (True, False) if self.blocks else (True,):
             self.ends = ends
             super().prepare(S, logits, start)
         self.ends = True
 
     def patch_ahead(self, S: int, p: int) -> None:
         """(a step of a chain)"""
-        if self.g8:
+        if self.blocks:
             self.ends = p % 8 + S >= 8
         super().patch_ahead(S, p)
 
@@ -616,7 +616,7 @@ class QwenOverlay(ModelOverlay):
         self._set_branch(branch, position, S)
         if self.blocks:  # (the block's lanes before the step; the step's words do not depend on commit)
             assert position == cur.gnext, (position, cur.gnext)
-            self.ends = not self.g8 or position % 8 + S - (branch[1] if branch else 0) >= 8
+            self.ends = position % 8 + S - (branch[1] if branch else 0) >= 8
             cur.gpos = position
             self.gdn_steps.set_words(nrep=position % 8, cshift=cur.cshift, commit=False)
         else:

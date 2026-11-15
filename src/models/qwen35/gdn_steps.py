@@ -135,7 +135,7 @@ class GdnTransfers:
             o = ov.gstate[L] + c * ov.ps + 16 * h * gdn.PANEL - 256
             st.panels.append(StatePanel(seq.fill("X", c, dev.address("GSTATE", o), 16 * XB, DIMS_OBJ), o, 16 * XB, False))
 
-        def v_dp(h: int, c: int) -> None:  # (into the other half; 8 slots: a step that ends its block)
+        def v_dp(h: int, c: int) -> None:  # (into the other half; of a step that ends its block)
             o = ov.gstate[L] + c * ov.ps + 16 * h * gdn.PANEL
             st.panels.append(StatePanel(seq.drain("D", c, dev.address("GSTATE", o), 16 * gdn.PANEL), o,
                                         16 * gdn.PANEL, True))
@@ -166,7 +166,7 @@ class GdnTransfers:
         if wide:
             units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_dh, v_do)))
         else:
-            units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp, v_do, v_dh)))
+            units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_do, v_dh)))
 
     def _rows_wide(self, seq: Sequence, L: int, S: int, pay: Callable[[int, int], int]) -> None:
         """An 8-slot core's rows of gdn_in: per slot into the q blocks' second objects, the k heads' K objects and the v

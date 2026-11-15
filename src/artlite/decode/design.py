@@ -181,6 +181,7 @@ STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores'
 # paged formats whose pages a memtile channel's free BDs hold: one channel for both core halves next to a dense design of 4
 # slots (BDs 4 .. 23, two per format), a channel per core half in a design of 8 (BDs 10 .. 23, 34 .. 47)
 PG_ONE_CHANNEL, PG_SPLIT = 10, 14
+A_DEPTH_MOE = 14  # an MoE design's A objects in its memtile at most (``moe_a_depth``)
 PG_ROOM = 3968  # (bytes) a page's code at most: a design of 8 slots leaves its main core ~3920 B past the resident code
 # (8 slots) the helper's B operands of its 16-k sums ([j][64]: row j ones, ``_hstrip``), in the core south of it
 # (``HS8_ROW``): its own memory has no room left for them as static data
@@ -305,6 +306,8 @@ class DecodeOverlayOperator(ArtcOperator):
         self.a_bcast = a_bcast
         if a_bcast:
             self.PACKET, self.AIECC_FLAGS = getattr(self, "PACKET", {}) | {"A": AID}, ("--allow-deadlock-prone-routing",)
+        if self.moe:
+            self.A_DEPTH = self.moe_a_depth()
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips)
         self.h8 = hidden // COLS
@@ -313,6 +316,16 @@ class DecodeOverlayOperator(ArtcOperator):
         self.res_pitch = -(-(self.h8 + (16 if slots == 8 and self.tables else 32)) // 16) * 16
         self.res_slots = min(slots, 4)  # (the slots of the residual in the main core's workspace; the others' in hres)
         super().__init__()
+
+    def moe_a_depth(self) -> int:
+        """(moe) The objects of the A stream's memtile FIFO: as many as the memtile's BDs leave it, ``A_DEPTH_MOE`` at most.
+        An MoE step has long windows in which the main cores take no weights (a GDN core's step, the round trips at a
+        layer's end: the partials, the combine, the next layer's input), and the shim streams the next phase's tiles into
+        this FIFO meanwhile: 14 objects instead of 8 make the 35B-A3B's step 0.6 ms shorter (12: 0.5 ms). Its BDs out of
+        the memtile share the odd half of the memtile's BDs (24 .. 47) with the X stream's and the paged formats' (two per
+        format from the top: ``pg_store``)."""
+        first = self.pg_store[0] if self.paged else 48
+        return max(type(self).A_DEPTH, min(A_DEPTH_MOE, first - 24 - self.X_DEPTH))
 
     @property
     def x_l1_depth(self) -> int:

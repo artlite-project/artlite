@@ -448,16 +448,17 @@ class QwenDecodeOperator(DecodeOverlayOperator):
     def _gdn4_workers(self, s: _Streams, workers: list[Worker], d_fifos: list[tuple[int, ObjectFifo]]) -> None:
         """The GDN cores of a chunkwise design of 4 slots (``gdn``'s "Chunkwise", "4 slots"): the step's message on M, then per k
         head its [P, W, K] objects (its q and k blocks, their histories out), per v head its [A, H] objects, 16 state
-        panels, its outputs and history out."""
+        panels (a step that ends its block: their update out), its outputs and history out."""
         p, gdn = s.p, self.gdn
         kit = self._chunkwise_kit(s)
         x_ty, i_g, kx, kd, gws_ty = s.x_ty, kit.i_g, kit.kx, kit.kd, kit.gws_ty
         assert self.GWS8_AT + kit.gw["size"] <= GD.SILU_TAB[1] - 0x70000, kit.gw
         ks = [kx("gbegin"), Kernel(f"{p}_gmsg", "kernel.o", [s.c_ty, gws_ty]), kx("gq"), kx("gqw"), kx("gk"), kx("gv"), kx("gvh"),
-              Kernel(f"{p}_gpanel", "kernel.o", [x_ty, gws_ty, kit.d_ty]), kd("ghq"), kd("ghk"), kd("gvhout"), kd("gout")]
+              kx("gpanel"), Kernel(f"{p}_gupd", "kernel.o", [x_ty, gws_ty, kit.d_ty]), kd("ghq"), kd("ghk"), kd("gvhout"),
+              kd("gout")]
         nv = gdn.hc // 2
 
-        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gvh, gpanel, ghq, ghk, gvhout, gout, ws, *_tabs):
+        def gdn_fn(x_f, m_f, d_f, gbegin, gmsg, gq, gqw, gk, gv, gvh, gpanel, gupd, ghq, ghk, gvhout, gout, ws, *_tabs):
             take, emit = functools.partial(_take, x_f, ws), functools.partial(_emit, d_f, ws)  # (a D object from the workspace)
 
             for _ in forever_():
@@ -481,9 +482,11 @@ class QwenDecodeOperator(DecodeOverlayOperator):
                             take(gvh)
                             for _ in range32(16, unroll=False):
                                 x = x_f.acquire(1)
-                                d = d_f.acquire(1)
-                                gpanel(x, ws, d)
-                                d_f.release(1)
+                                gpanel(x, ws)
+                                for _ in range_(ws[i_g + GD.G_NPD]):  # (1: the step ends its block, the panel's update out)
+                                    d = d_f.acquire(1)
+                                    gupd(x, ws, d)
+                                    d_f.release(1)
                                 x_f.release(1)
                             emit(gout)  # (its outputs and its history's first rows, then the rest: one drain for the two)
                             emit(gvhout)

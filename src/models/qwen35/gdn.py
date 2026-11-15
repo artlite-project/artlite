@@ -39,8 +39,8 @@ block up to its own (the lanes before it from the k / v histories and the gates 
 substitution in lane order (``solve``), O from it and Y; the products along the lanes are per lane in fp32 (bfp16 blocks run
 along i, a lane's own), so no lane's rounding depends on another's. The states are double-buffered (``GdnCursor.half``:
 the half a position's block starts from): a step reads its block's half and writes the other, the block's update
-(S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else nothing that is read (the other half is
-read only after a block's end wrote it); a step past the block's end then runs
+(S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else nothing (no D object, no drain: the other
+half is read only after a block's end wrote it); a step past the block's end then runs
 the next block's lanes from that update in L1 (their V in o's rows the outputs do not take, their K panels in k2). A
 prefill ends anywhere: the decode's first block after it has no lanes before the prefill's end, whose zero gates leave the
 state as it is, so that blocks start at multiples of 8 and a prefill (at a multiple of 32) at a block's start, the state
@@ -54,9 +54,12 @@ at P_D ([lane 12][d 8 | beta 8] fp32) | dt, A, ssm_norm at P_PRM (the first k he
 k block's history (16 rows), A = [the v block's weights | its history's rows 0 .. 7], H = [rows 8 .. 15 | 2 KB]. Per step,
 after the message: per k head P (the gates), W (its q block at the step's lanes, Q's panels), the P object out, K (its k
 block over the block's lanes: K's panels, the Gram blocks, K^T's panels), the K object out, then per v head A, H (its V, the
-lanes' constants: decays, L and M's columns, ``vhead``), 16 state panels and out: 16 state panels, [its gated outputs (1 KB)
-| 1 KB | its history's rows 0 .. 7], [rows 8 .. 15 | 2 KB]. Conv outputs come out in panel layout ([panel 16][lane 8][8]:
-``pconv``). Program memory is what bounds this core: cold functions are ``minsize`` where that measured smaller, vectors go by
+lanes' constants: decays, L and M's columns, ``vhead``), 16 state panels (``gpanel``; a step that ends its block: each
+panel's update out, ``gupd``, a D object per panel; else none: 63 MB of drains and 960 tasks a step of the 35B-A3B less,
+0.6 ms) and out: [its gated outputs (1 KB) | 1 KB | its history's rows 0 .. 7], [rows 8 .. 15 | 2 KB]. Conv outputs come
+out in panel layout ([panel 16][lane 8][8]: ``pconv``). Program memory is what bounds this core: cold functions are
+``minsize`` where that measured smaller, its line copies a branch loop (``cp4k``: a hardware loop's set-up distance cost
+144 B), vectors go by
 value through no call (a 64-lane argument costs more at its call sites than an inlined product).
 
 8 slots (``GdnShape(slots=8)``): the message of 8 slots (34 KB) does not fit the core's L1 (which also holds the helper's
@@ -115,7 +118,8 @@ G_KH, G_VI, G_VH = _G.alias("G_KH", G_PAIR), _G.alias("G_VI", G_MJ), _G.alias("G
 G_HK = _G.alias("G_HK", G_KO)  # (8 slots) the helper's next work: a k head's Gram blocks (1), a v head's constants (0)
 G_KSHIFT = _G.alias("G_KSHIFT", G_PO)  # (chunkwise) the k / v histories' base row (M_KSHIFT)
 G_NPD, G_NPX = _G.alias("G_NPD", G_NCP), _G.alias("G_NPX", G_COMMIT)  # (8 slots) a v head's state panels with a D object (a step
-# that ends its block: its update out), without one (else: nothing of them is read)
+# that ends its block: its update out), without one (else: nothing of them is read); 4 slots, chunkwise: G_NPD 1 or 0, whether
+# a state panel has a D object
 G_BR = _G.word("G_BR")  # (8 slots) a branching step's word (``M_BRANCH``: its parent slot + 1 | its slots << 8, or 0)
 G_WORDS = G_BR + 1
 G_TA = _G.block("G_TA", 2)  # (chunkwise) the SiLU table's addresses

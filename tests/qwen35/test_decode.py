@@ -382,9 +382,9 @@ class _Gdn:
         chunkwise core's: its payload slot)."""
         return c * self.gcol + 256 + 4096 * k
 
-    def _chunk_units(self, seq: Sequence, h: int) -> None:
-        """A chunkwise core's objects and drains (``gdn_steps.GdnTransfers``; its state from half h, into the other), its outputs
-        into GO."""
+    def _chunk_units(self, seq: Sequence, h: int, ends: bool) -> None:
+        """A chunkwise core's objects and drains (``gdn_steps.GdnTransfers``; its state from half h, into the other where the
+        step ``ends`` its block), its outputs into GO."""
         dev, MG, sh = self.dev, self.MG, self.sh
         dims4 = (PR.XB // 8, 2, PR.XB // 8, PR.XPAY // 4)
         units = [u for kh in range(2) for u in [("k", kh)] + [("v", h) for h in range(kh, sh.hc, 2)]]
@@ -400,7 +400,9 @@ class _Gdn:
             if kind == "k":
                 seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.kh_slot(i))), 2 * MG.D_BYTES, (512, 2, 512, 2048))
                 return
-            seq.drain("D", c, dev.address("GSTATE", 256 + (1 - h) * self.half + c * self.ps + 16 * i * MG.PANEL), 16 * MG.PANEL)
+            if ends:
+                seq.drain("D", c, dev.address("GSTATE", 256 + (1 - h) * self.half + c * self.ps + 16 * i * MG.PANEL),
+                          16 * MG.PANEL)
             seq.drain("D", c, dev.address("GO", (c * sh.hc + i) * MG.D_BYTES // 2), MG.D_BYTES // 2)
             seq.drain("D", c, dev.address("GOBJ", self.pay(c, sh.v_slot(i)) + 2048), 3 * MG.D_BYTES // 2)
 
@@ -412,7 +414,7 @@ class _Gdn:
                 for c in range(COLS):
                     drains(*units[n - 1], c)
 
-    def _transaction(self, S: int, msg: bool, h: int = 0) -> Transaction:
+    def _transaction(self, S: int, msg: bool, h: int = 0, ends: bool = True) -> Transaction:
         dev, op, r = self.dev, self.op, self.r
         MG = self.MG
         groups = mp.groups(r, PR.F_NORM | (PR.F_MSG if msg else 0), S, f32_ab=True)
@@ -431,7 +433,7 @@ class _Gdn:
             if msg and not self.sh.chunk:
                 seq.fill("X", c, dev.address("GOBJ", c * self.gcol), 5 * PR.XB, dims4)
         if msg and self.sh.chunk:
-            self._chunk_units(seq, h)
+            self._chunk_units(seq, h, ends)
             seq.sync(fills=True)
             return Transaction(dev, seq.words())
         for c in range(COLS):
@@ -469,7 +471,7 @@ class _Gdn:
             act[:4 * PR.META] = gr.meta.view(np.uint8)
             act[PR.XB:] = PR.interleave(x).view(np.uint8).reshape(-1)
             dev.flush("ACT")
-            dev.dispatch(self._transaction(S, msg, half))
+            dev.dispatch(self._transaction(S, msg, half, nrep + S >= 8))
             if not msg:
                 dev.fetch("OUT")
                 raw = dev.view("OUT").view(np.uint16).reshape(COLS, -1)[:, :S * self.n_c * PR.C_LEN].reshape(COLS, S, -1)

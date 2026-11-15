@@ -24,6 +24,21 @@ __attribute__((noinline)) aie::vector<float, 16> {{ p }}_irms(aie::vector<float,
     return al::inv_sqrt_eps<8>(al::mulc<16>(ss, aie::broadcast<bfloat16, 16>(n == 1 ? 1.0f : {{ 1.0 / D }}f)), {{ eps }}f);
 }
 
+{% if SMAX == 4 %}
+// n >= 1 lines of 64 B (a branch loop: a hardware loop's set-up distance costs this body 140 B of the core's program)
+__attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__restrict src, int n = 64)
+{
+    int32_t *__restrict d = (int32_t *)dst;
+    const int32_t *__restrict s = (const int32_t *)src;
+    AIE_LOOP_NO_UNROLL
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    do {
+        aie::store_v(d, aie::load_v<16>(s));
+        d += 16;
+        s += 16;
+    } while (--n > 0);
+}
+{% else %}
 // n lines of 64 B
 __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__restrict src, int n = 64)
 {
@@ -36,6 +51,7 @@ __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__
         s += 16;
     }
 }
+{% endif %}
 
 // C += A (hi + lo) B (hi + lo)^T: three products
 [[clang::always_inline]] inline void {{ p }}_mm3(al::MM8 &c, const al::BV &ah, const al::BV &al_, const al::BV &bh,

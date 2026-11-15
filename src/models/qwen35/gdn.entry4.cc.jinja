@@ -67,6 +67,7 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
     st[{{ G_NMSG }}] = S * {{ n_msg }};
     st[{{ G_ON }}] = 1;
     st[{{ G_NREP }}] = m[{{ M_NREP }}];
+    st[{{ G_NPD }}] = (m[{{ M_NREP }}] + S) >> 3;  // (1: the step ends its block, its state panels' update goes out)
     st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
     st[{{ G_KSHIFT }}] = m[{{ M_KSHIFT }}];
     st[{{ G_MJ }}] = 0;
@@ -97,7 +98,8 @@ void {{ p }}_gq(const bfloat16 *__restrict x, int32_t *__restrict ws)
     if (!st[{{ G_KH }}]) {
         st[{{ G_VI }}] = 0;
         {{ p }}_cp4k(GW(float, {{ g.prm }}), p + {{ P_PRM // 2 }}, 10);
-        {{ p }}_cp4k(GW(float, {{ g.dn }}), p + {{ P_D // 2 }} + 32 * st[{{ G_KSHIFT }}], st[{{ G_NREP }}]);
+        // (the block's lanes before the step, and one more: ``cp4k`` copies a line at least, ggates writes the step's)
+        {{ p }}_cp4k(GW(float, {{ g.dn }}), p + {{ P_D // 2 }} + 32 * st[{{ G_KSHIFT }}], st[{{ G_NREP }}] + 1);
         {{ p }}_ggates(ws);
     }
     {{ p }}_cp4k(GW(bfloat16, {{ g.hb }}), p + {{ D }} * st[{{ G_CSHIFT }}], {{ 3 * 2 * D // 64 }});
