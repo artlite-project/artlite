@@ -237,10 +237,10 @@ class TileImage:
                     rows[f] = rows.get(f, 0) + dims[1] * n_kc
         return choose_tile_bytes(rows, self.nsb, gu)
 
-    def _add(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int, *,
-             G: int = 1) -> None:
-        """A region of the blocks ``parts`` = (name, tensors, rows (COLS, n)) over an input of K elements; G > 1: K =
-        kc / G, the blocks' rows given as row groups (``group_rows``)."""
+    def _add(self, layer: int, name: str, parts: list[tuple], K: int, *, G: int = 1) -> None:
+        """A region of the blocks ``parts`` = (name, tensors, rows (COLS, n)[, tile format]) over an input of K elements
+        (the format: a plane of the tensors' own, ``formats.packs_from``; default: theirs); G > 1: K = kc / G, the blocks'
+        rows given as row groups (``group_rows``)."""
         self.regions.append(self._region(layer, name, parts, K, G))
 
     def _add_slab(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int, *,
@@ -249,12 +249,14 @@ class TileImage:
         half."""
         self.slabs.append(self._region(layer, name, parts, K, G))
 
-    def _region(self, layer: int, name: str, parts: list[tuple[str, tuple[str, ...], np.ndarray]], K: int,
-                G: int) -> Region:
+    def _region(self, layer: int, name: str, parts: list[tuple], K: int, G: int) -> Region:
         assert G == 1 or G * K == self.kc, (name, K, G)
         blocks = []
-        for bname, tensors, rows in parts:
+        for bname, tensors, rows, *own in parts:  # (own: the block's tile format, a plane of its tensors': ``packs_from``)
             fmts = [self.fmt(t) for t in tensors]
+            if own:
+                assert all(packs_from(own[0], self.qtype(t)) for t in tensors) and G == 1, (bname, own, fmts)
+                fmts = list(own)
             if len(set(fmts)) > 1:
                 if name not in GU_REGIONS or len(tensors) != 2 or G > 1:
                     raise NotImplementedError(f"{', '.join(tensors)}: one tile format per block, not {sorted(set(fmts))} "

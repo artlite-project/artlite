@@ -256,4 +256,57 @@ float logsumexp(Logits x, float cap) {
   return mx + std::log(_mm512_reduce_add_ps(_mm512_add_ps(s0, s1)));
 }
 
+namespace {
+
+// 16 bf16 logits as fp32 (bf16: fp32's top half)
+inline __m512 bf16_ps(const uint16_t* x) {
+  return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x))), 16));
+}
+
+// the indices of mask k's lanes (from i) appended to ids[c ..] (the first max in all); the new count
+inline size_t append(__mmask16 k, size_t i, int32_t* ids, size_t c, size_t max) {
+  if (c + 16 <= max) {
+    const __m512i iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    _mm512_mask_compressstoreu_epi32(ids + c, k, _mm512_add_epi32(iota, _mm512_set1_epi32(int32_t(i))));
+  } else {
+    size_t at = c;
+    for (uint32_t b = k; b && at < max; b &= b - 1) ids[at++] = int32_t(i + size_t(std::countr_zero(b)));
+  }
+  return c + size_t(std::popcount(uint32_t(k)));
+}
+
+}  // namespace
+
+float screen_lower(const uint16_t* x, const float* bound, float gnorm, size_t n) {
+  const __m512 g = _mm512_set1_ps(gnorm);
+  __m512 lo = _mm512_set1_ps(-INFINITY);
+  size_t i = 0;
+  for (; i + 16 <= n; i += 16) lo = _mm512_max_ps(lo, _mm512_fnmadd_ps(_mm512_loadu_ps(bound + i), g, bf16_ps(x + i)));
+  float best = _mm512_reduce_max_ps(lo);
+  for (; i < n; i++) best = std::max(best, std::bit_cast<float>(uint32_t(x[i]) << 16) - bound[i] * gnorm);
+  return best;
+}
+
+size_t screen_above(const uint16_t* x, const float* bound, float gnorm, size_t n, float thr, int32_t* ids, size_t max) {
+  const __m512 g = _mm512_set1_ps(gnorm), t = _mm512_set1_ps(thr);
+  size_t c = 0, i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const __mmask16 k = _mm512_cmp_ps_mask(_mm512_fmadd_ps(_mm512_loadu_ps(bound + i), g, bf16_ps(x + i)), t, _CMP_GE_OQ);
+    if (k) c = append(k, i, ids, c, max);
+  }
+  for (; i < n; i++)
+    if (std::bit_cast<float>(uint32_t(x[i]) << 16) + bound[i] * gnorm >= thr) {
+      if (c < max) ids[c] = int32_t(i);
+      c++;
+    }
+  return c;
+}
+
+void screen_dense(const uint16_t* x, size_t n, float floor, float* a) {
+  const __m512 f = _mm512_set1_ps(floor);
+  size_t i = 0;
+  for (; i + 16 <= n; i += 16) _mm512_storeu_ps(a + i, _mm512_min_ps(bf16_ps(x + i), f));
+  for (; i < n; i++) a[i] = std::min(std::bit_cast<float>(uint32_t(x[i]) << 16), floor);
+}
+
 }  // namespace artlite

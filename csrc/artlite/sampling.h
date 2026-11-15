@@ -40,4 +40,15 @@ std::pair<size_t, float> max_prob(const uint16_t* x, size_t n);
 /// is its (capped) logit minus it (``logprobs``).
 float logsumexp(Logits x, float cap);
 
+/// A screened LM head (``artlite.decode.screen``): the largest lower bound of its screened logits x (n bf16), max(x[i]
+/// - gnorm bound[i]).
+float screen_lower(const uint16_t* x, const float* bound, float gnorm, size_t n);
+
+/// The indices i with x[i] + gnorm bound[i] >= thr, ascending, into ids (the first ``max`` of them). Returns how many
+/// there are.
+size_t screen_above(const uint16_t* x, const float* bound, float gnorm, size_t n, float thr, int32_t* ids, size_t max);
+
+/// a[i] = min(x[i], floor): the screened logits as fp32, ranked after the exact ones.
+void screen_dense(const uint16_t* x, size_t n, float floor, float* a);
+
 }  // namespace artlite

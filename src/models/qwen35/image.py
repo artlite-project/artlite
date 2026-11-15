@@ -62,9 +62,11 @@ import math
 import numpy as np
 from ml_dtypes import bfloat16
 
+from artlite import settings
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
+from artlite.decode.screen import screens
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
@@ -120,6 +122,7 @@ class QwenImage(TileImage):
     order: np.ndarray | None = None  # (the LM row of each token id when they are not in id order)
     draft_cols = 0
     mtp_layer = -1
+    SCREEN = True  # (the model's own LM head may be screened: ``screen``)
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True):
@@ -153,7 +156,12 @@ class QwenImage(TileImage):
             self.fixed, self.table = (head_tokens(gguf, F) if self.n_ids == cfg.vocab_size else
                                       (np.arange(F), np.arange(F, F + TABLE_ROWS)))
             self.vocab = self.n_ids + TABLE_ROWS
-        self._add(-1, "lm", [("lm", (lm,), self.head_rows())], H)
+        self.lm = lm
+        # (the LM head as its high plane, the logits that matter exactly on the host: ``decode.screen``. Not a dense
+        # model's with an MTP block: its drafters read the head's rows in place (``draft_cols``), and its design of 8
+        # slots has no L1 for tiles of more than 16 rows next to two X objects, ``decode.design``'s "Designs of 8 slots")
+        self.screen = self.SCREEN and settings.LM_SCREEN.get() and screens(self.qtype(lm)) and not self.draft_cols
+        self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *(("Q6_KH",) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()
         if self.draft_cols and mtp:

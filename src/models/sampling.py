@@ -14,10 +14,12 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import _native
+from artlite.decode.screen import ROWS, ScreenedRow
 
 from .sequence import MEDIA, token_ids
 
-LogitsLike = np.ndarray  # a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32
+# a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32, or a screened head's row (``taken``)
+LogitsLike = np.ndarray | ScreenedRow
 _rng = random.Random()  # (sampling's draws: ``seed``)
 
 
@@ -84,22 +86,39 @@ def top_logits(logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray
                ) -> tuple[np.ndarray, np.ndarray]:
     """The k largest of a vocabulary's logits after a soft cap (``cap`` > 0: cap tanh(l / cap)), fp32, descending
     (equal ones: the lower index first), and their token ids (int32; ``rows``: the token of each logit, else its index):
-    one pass over the logits (``_native.top_logits``)."""
+    one pass over the logits (``_native.top_logits``); a screened head's row: its own (``ScreenedRow.top``)."""
+    if isinstance(logits, ScreenedRow) and rows is None:
+        values, ids = logits.top(k)
+        return _capped(values, cap), ids
     return _native.top_logits(logit_bits(logits), k, cap, rows=rows)
+
+
+def _capped(values: np.ndarray, cap: float) -> np.ndarray:
+    """Logits after a soft cap (``cap`` > 0: cap tanh(l / cap)), fp32."""
+    return (np.tanh(values / np.float32(cap)) * np.float32(cap)).astype(np.float32) if cap > 0 else values
 
 
 def argmax(logits: LogitsLike) -> int:
     """The index of the largest logit (the first of equal ones)."""
+    if isinstance(logits, ScreenedRow):
+        return int(logits.top(1)[1][0])
     return int(_native.top_logits(logit_bits(logits), 1)[1][0])
 
 
 def logit_bits(logits: LogitsLike) -> np.ndarray:
-    """bf16 logits as their bits (uint16: what the native code takes), fp32 as they are."""
+    """bf16 logits as their bits (uint16: what the native code takes), fp32 as they are (a screened head's row: as
+    an array, ``ScreenedRow.dense``)."""
+    if isinstance(logits, ScreenedRow):
+        return logits.dense()
     return logits.view(np.uint16) if logits.dtype == bfloat16 else logits
 
 
 def max_prob(logits: LogitsLike) -> tuple[int, float]:
-    """The largest of bf16 logits (its index: the first of equal ones) and its probability (softmax)."""
+    """The largest of a vocabulary's logits (its index: the first of equal ones) and its probability (softmax)."""
+    if isinstance(logits, ScreenedRow):
+        x = logits.dense(1)
+        i = int(np.argmax(x))
+        return i, float(1.0 / np.exp(x.astype(np.float64) - float(x[i])).sum())
     return _native.max_prob(logit_bits(logits))
 
 
@@ -190,12 +209,34 @@ class Penalties:
             return top_logits(logits, k, cap, rows=rows)
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
         s, count = self.sampling, np.fromiter(self.counts.values(), np.float32, len(ids))
+        if isinstance(logits, ScreenedRow) and rows is None and where is None:
+            return self._top_screened(logits, k, cap, ids, count)
         return _native.top_logits(logit_bits(logits), k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, rows)
 
+    def _top_screened(self, logits: ScreenedRow, k: int, cap: float, ids: np.ndarray, count: np.ndarray
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        """``_native.top_logits``' candidates of a screened head's row: the k largest logits of the other tokens, then
+        the recent tokens' ``ids`` (``count`` occurrences each) penalized, the k largest of all (equal ones: in that
+        order); every one of them exact."""
+        s = self.sampling
+        v, i = logits.top(k + len(ids))
+        keep = ~np.isin(i, ids)
+        v, i = _capped(v[keep][:k], cap), i[keep][:k]
+        r = _capped(logits.at(ids), cap)
+        r = np.where(r <= 0, r * np.float32(s.repeat_penalty), r / np.float32(s.repeat_penalty)) \
+            - np.float32(s.presence_penalty) - count * np.float32(s.frequency_penalty)
+        v, i = np.concatenate([v, r.astype(np.float32)]), np.concatenate([i, ids])
+        order = np.argsort(-v, kind="stable")[:k]
+        return v[order], i[order]
+
     def _top_of(self, logits: LogitsLike, k: int, cap: float, allowed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """The ``k`` largest penalized logits of the ``allowed`` tokens (sorted ids) and their ids."""
-        sub = logits[allowed]
+        """The ``k`` largest penalized logits of the ``allowed`` tokens (sorted ids) and their ids (a screened row: the
+        allowed tokens' exact logits, or past ``ROWS`` of them its array's)."""
+        if isinstance(logits, ScreenedRow):
+            sub = logits.at(allowed) if len(allowed) <= ROWS else logits.dense()[allowed]
+        else:
+            sub = logits[allowed]
         k = min(k, len(allowed))
         if not self.counts:
             return top_logits(sub, k, cap, rows=allowed)

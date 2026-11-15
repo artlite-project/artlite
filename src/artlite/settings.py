@@ -225,6 +225,9 @@ PDI_RESET = _declare(
 PACE = _declare(
     "PACE", "string", "auto", "the prefill GEMMs' pace levels: ``auto`` (calibrated per machine and cached), ``off``, "
     "``recalibrate``, or levels (``gu=3,qkv=2``, or one level for every class)", _text("auto"))
+LM_SCREEN = _declare(
+    "LM_SCREEN", "flag", OFF, "a Q6_K LM head as its high plane on the NPU (39% of its bytes) and the rows that can "
+    "matter exactly on the host (``decode.screen``)", _on_when_one)
 NB_LEAK_WARNINGS = _declare(
     "NB_LEAK_WARNINGS", "flag", "off; any value turns it on",
     "nanobind's leak warnings at exit (set to anything to show them)", _present, native=True)

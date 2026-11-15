@@ -22,6 +22,8 @@ namespace {
 using Vector = nb::ndarray<nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using Ints = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using Floats = nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using FloatsOut = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using IntsOut = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 artlite::Logits logits_arg(const Vector& x) {
   const nb::dlpack::dtype d = x.dtype();
@@ -108,6 +110,39 @@ void bind_sampling(nb::module_& m) {
       "logits"_a, "cap"_a = 0.0f, nb::sig("def logsumexp(logits: numpy.ndarray | object, cap: float = 0.0) -> float"),
       "log(sum(exp(l))) of a vocabulary's logits (bf16 or fp32, as top_logits takes them) after a soft cap (cap > 0: "
       "tanh(l / cap) cap): artlite::logsumexp.");
+  // --- A screened LM head (artlite.decode.screen) ---
+  m.def(
+      "screen_lower",
+      [](Vector logits, Floats bound, float gnorm) {
+        const artlite::Logits x = logits_arg(logits);
+        if (!x.bf16 || bound.shape(0) != x.n) throw artlite::Error("screen_lower: bf16 logits and a bound per logit");
+        return artlite::screen_lower(static_cast<const uint16_t*>(x.data), bound.data(), gnorm, x.n);
+      },
+      "logits"_a, "bound"_a, "gnorm"_a,
+      nb::sig("def screen_lower(logits: numpy.ndarray | object, bound: numpy.ndarray[numpy.float32], gnorm: float) -> float"),
+      "The largest lower bound of a screened head's logits (bf16), max(x - gnorm bound): artlite::screen_lower.");
+  m.def(
+      "screen_above",
+      [](Vector logits, Floats bound, float gnorm, float thr, IntsOut ids) {
+        const artlite::Logits x = logits_arg(logits);
+        if (!x.bf16 || bound.shape(0) != x.n) throw artlite::Error("screen_above: bf16 logits and a bound per logit");
+        return artlite::screen_above(static_cast<const uint16_t*>(x.data), bound.data(), gnorm, x.n, thr, ids.data(), ids.shape(0));
+      },
+      "logits"_a, "bound"_a, "gnorm"_a, "thr"_a, "ids"_a,
+      nb::sig("def screen_above(logits: numpy.ndarray | object, bound: numpy.ndarray[numpy.float32], gnorm: float, "
+              "thr: float, ids: numpy.ndarray[numpy.int32]) -> int"),
+      "The indices of a screened head's logits (bf16) with x + gnorm bound >= thr, ascending, into ids (the first "
+      "len(ids)); how many there are: artlite::screen_above.");
+  m.def(
+      "screen_dense",
+      [](Vector logits, float floor, FloatsOut a) {
+        const artlite::Logits x = logits_arg(logits);
+        if (!x.bf16 || a.shape(0) != x.n) throw artlite::Error("screen_dense: bf16 logits and a value per logit");
+        artlite::screen_dense(static_cast<const uint16_t*>(x.data), x.n, floor, a.data());
+      },
+      "logits"_a, "floor"_a, "a"_a,
+      nb::sig("def screen_dense(logits: numpy.ndarray | object, floor: float, a: numpy.ndarray[numpy.float32]) -> None"),
+      "a = min(logits, floor) (bf16 logits as fp32): artlite::screen_dense.");
 }
 
 }  // namespace artlite::bindings

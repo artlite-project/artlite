@@ -46,6 +46,7 @@ from .protocol import (
     post_region_bytes,
     region_bytes,
 )
+from .screen import Screen, Screened
 from .vring import VRing
 
 
@@ -220,6 +221,8 @@ class ModelOverlay:
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
         self._meta_bytes: dict[tuple[int, int], tuple] = {}  # (S, start) -> the objects' ACT bytes (``_metas``)
         self._last_s = 1
+        self.screen: Screen | None = None  # (a screened LM head's host side: ``_logits``)
+        self._lm_runs = 0  # (dispatches of logits so far: a ``Screened`` reads the buffers of its own)
         self._tr_lm: Transaction | None = None
         self._ahead: AheadStep | None = None  # (the next step, patched while one runs)
         # the host seconds of the last step's one-time work: its transaction's first build and patch tables, a prompt's states
@@ -517,12 +520,30 @@ class ModelOverlay:
         v = self.dev.view("ACT")[off:off + 2 * sp * n].view(np.uint16).reshape(-1, sp, 8)[:, slot]
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
-    def _logits(self, S: int) -> np.ndarray:
-        """The last step's logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next dispatch): the
-        LM rows of the vocabulary (an image's rows padded to whole C objects per column are cut off)."""
+    def _logits(self, S: int) -> np.ndarray | Screened:
+        """The last step's logits (S, vocab) bf16, the tokens' in id order (a view of the NPU's buffer, valid until the
+        next dispatch). A screened head's (``screen``): fp32, the logits that matter exact (``Screened``: each slot's
+        row computed when it is taken, from the NPU's buffers of this dispatch)."""
+        x = self._npu_logits(S)
+        if self.screen is None:
+            return x
+        self._lm_runs += 1
+        return Screened(self.screen, x, self._lm_x(S), lambda n=self._lm_runs: self._lm_runs == n)
+
+    def _npu_logits(self, S: int) -> np.ndarray:
+        """The cores' logits of the last step (S, vocab) bf16: the LM rows of the vocabulary (an image's rows padded to
+        whole C objects per column are cut off)."""
         self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
         x = self.dev.view("LOGITS")[:2 * S * self.vocab].view(bfloat16).reshape(S, self.vocab)
         return x[:, :min(self.vocab, self.cfg.vocab_size)]
+
+    def _lm_x(self, S: int) -> np.ndarray:
+        """The residuals (S, hidden) the LM head read in the last dispatch of S slots (bf16 values, fp32; a copy)."""
+        rg = self.inp[(-1, "lm")][0]
+        sp, off = self._sp(S, (-1, "lm")), rg.off + XB
+        self.dev.fetch("ACT", off, 2 * sp * self.H)
+        v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, :S]
+        return np.ascontiguousarray(v.transpose(1, 0, 2)).reshape(S, self.H).view(bfloat16).astype(np.float32)
 
     def _clear_pads(self, sp: int) -> None:
         """Before a step whose inputs are laid out for sp slots: zero the padding k of the normed phases' inputs

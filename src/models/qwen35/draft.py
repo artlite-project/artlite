@@ -58,6 +58,8 @@ class DraftImage(QwenImage):
     ``vocab`` rows (default ``HEAD_ROWS`` + ``TABLE_ROWS``), per column its share of the fixed tokens (``head_tokens``)
     then of the table's; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
 
+    SCREEN = False  # (a draft's logits: its head's rows as they are)
+
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None):
         self.fixed, self.table = head_tokens(gguf, (vocab or HEAD_ROWS + TABLE_ROWS) - TABLE_ROWS)
         super().__init__(gguf, cfg, layers=layers, vocab=len(self.fixed) + len(self.table), tile_bytes=OBJ_BYTES)
