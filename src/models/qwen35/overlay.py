@@ -94,7 +94,7 @@ from .decode import QwenDecodeOperator
 from .gdn_steps import GdnTransfers
 from .image import NORMS, QwenImage, gdn_v_heads, tensor_f32
 from .moe_steps import CP_BYTES, MoeTransfers
-from .steps import Step
+from .steps import PanelTable, Step
 from .words import F_ATT, F_GDN, F_GIN, M_ALANE, M_AMASK, M_BRANCH, M_HPAN
 
 FLAGS = {"eh": F_RESID | F_EMITR,  # (a drafter's first phase: ``draft``)
@@ -513,6 +513,12 @@ class QwenOverlay(ModelOverlay):
             self._phase(seq, (-1, "lm"), S, "LOGITS")
         seq.sync(fills=True)
         st.tr = Transaction(dev, seq.words())
+        # (the patch tables with the build, not at the step's first run: a round's first step of a kind would take ~10 ms
+        # longer, and a drafter's planner counts a round's time)
+        if self.ash is not None:
+            st.patch = self.attn_steps.patch_tables(st)
+        if st.panels:
+            st.table = PanelTable.of(st.panels)
         return st
 
     def _head(self, seq: Sequence, S: int) -> None:

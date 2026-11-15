@@ -221,10 +221,11 @@ class SpeculativeMixin:
                 self.carry = tuple(new[:won])
                 # (less the step's one-time host work: a prompt's states turned into the decode's, a transaction's first
                 # run, up to ~200 / ~60 ms, which a running average would carry for ten steps)
-                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - self.overlay.once_s)
+                once = self.overlay.once_s
+                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - once)
                 self.accepted += len(new) - 1
-                if mtp:
-                    plan.drafted(m, len(new), t2 - t0 - (w2 - w0))
+                if mtp:  # (the round's time less that work too: else a first run stops the drafter for RETRY rounds)
+                    plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
                     self._calibrate(len(new) - 1)
                 elif d:
                     plan.accepted(m, len(d), len(new) - 1)
