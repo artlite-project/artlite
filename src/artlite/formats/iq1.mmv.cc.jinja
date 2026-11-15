@@ -274,6 +274,49 @@ __attribute__((noinline)) void {{ p }}_iq1_pmx(const uint8_t *__restrict mk, con
         pc += {{ 4 * L }};
     }
 }
+
+// (IQ1_M, 8 slots) _iq1_p's panels straight into _iq1_x's MMULs: per n = 2 i' + h the masks of panels l = 2 h, 2 h + 1
+// (two pairs each, ``_iq1_g``'s [A | B | delta] of 16 rows), w = sel(0, 8, A) signed by B plus the deltas +-1 at exponent
+// 130, c = bf16(C) of the two (no panels in L1)
+__attribute__((noinline)) void {{ p }}_iq1_px(const uint8_t *__restrict mk, const uint8_t *__restrict xp,
+                                              bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const v16int32 __aie_dm_resource_b *__restrict pk = (const v16int32 __aie_dm_resource_b *)mk;
+    bfloat16 *__restrict pc = c;
+    const v64int8 z = broadcast_zero_to_v64int8(), k8 = broadcast_to_v64int8(8);
+    const v64int8 k1 = broadcast_to_v64int8(1), km1 = broadcast_to_v64int8(-1);
+    v64bfp16ebs8 W;
+    W.exponent = al::e8(0x82);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int n = 0; n < 8; n++) {
+        v64accfloat C0, C1, C2, C3;
+        AIE_LOOP_UNROLL_FULL
+        for (int l = 0; l < 2; l++) {
+            const v64bfp16ebs8 X = xs.pop();
+            const v16int32 s0 = pk[0], s1 = pk[1];  // (rows 0 .. 15: row groups 0, 1; 16 .. 31: 2, 3)
+            pk += 2;
+            W.mantissa = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k1, km1, ext_v2int32(s0, 4)),
+                                                  __builtin_aie2p_vsel8(z, k8, ext_v2int32(s0, 0)), ext_v2int32(s0, 2));
+            C0 = l ? mac_8x8_8x8T(X, 1, W, 1, C0) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k1, km1, ext_v2int32(s0, 5)),
+                                                  __builtin_aie2p_vsel8(z, k8, ext_v2int32(s0, 1)), ext_v2int32(s0, 3));
+            C1 = l ? mac_8x8_8x8T(X, 1, W, 1, C1) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k1, km1, ext_v2int32(s1, 4)),
+                                                  __builtin_aie2p_vsel8(z, k8, ext_v2int32(s1, 0)), ext_v2int32(s1, 2));
+            C2 = l ? mac_8x8_8x8T(X, 1, W, 1, C2) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k1, km1, ext_v2int32(s1, 5)),
+                                                  __builtin_aie2p_vsel8(z, k8, ext_v2int32(s1, 1)), ext_v2int32(s1, 3));
+            C3 = l ? mac_8x8_8x8T(X, 1, W, 1, C3) : mul_8x8_8x8T(X, 1, W, 1);
+        }
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + {{ L }}, {{ p }}_c8(C1));
+        aie::store_v(pc + {{ 2 * L }}, {{ p }}_c8(C2));
+        aie::store_v(pc + {{ 3 * L }}, {{ p }}_c8(C3));
+        pc += {{ 4 * L }};
+    }
+}
 {% endif %}
 
 {% if slots != 8 %}
@@ -339,12 +382,15 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
                 const uint32_t *pm = (const uint32_t *)(un + 1024) + 64 * q;  // (the half's planes: [bit 4][m 16])
                 {{ p }}_iq1_off<H>(un + 512 * q, pm, off);
                 {{ p }}_iq1_g<F>(off, pm + 16, tab_ab, tab_cd, (uint8_t *)off);
-                {{ p }}_iq1_p<F>((const uint8_t *)off, scr);
-            }
 {% if slots == 8 %}
-            if constexpr (F == 1)  // (IQ1_S: _iq1_pmx)
+                {{ p }}_iq1_px((const uint8_t *)off, xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, (bfloat16 *)scr);
+{% else %}
+                {{ p }}_iq1_p<F>((const uint8_t *)off, scr);
 {% endif %}
-                {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
+            }
+{% if slots != 8 %}
+            {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
+{% endif %}
             const float *yq = F == 0 && q == 0 ? yu : zy;  // (IQ1_S: the deltas' term with the first half)
 {% if slots == 8 %}
             // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n)

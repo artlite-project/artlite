@@ -118,11 +118,20 @@ __attribute__((noinline)) void {{ p }}_k23scg(const bfloat16 *__restrict c, cons
     const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int j = 0; j < NJ; j++) {
-        Y0 = aie::mac(Y0, aie::load_v<64>(pc), aie::load_v<8>(ps).template grow_replicate<64>());
-        Y1 = aie::mac(Y1, aie::load_v<64>(pc + CG), aie::load_v<8>(ps + SG).template grow_replicate<64>());
-        Y2 = aie::mac(Y2, aie::load_v<64>(pc + 2 * CG), aie::load_v<8>(ps + 2 * SG).template grow_replicate<64>());
-        if constexpr (G == 4)
-            Y3 = aie::mac(Y3, aie::load_v<64>(pc + 3 * CG), aie::load_v<8>(ps + 3 * SG).template grow_replicate<64>());
+        if constexpr (SG == 8) {  // (the row groups' scales in a row: one load, II 8 against 10 for IQ2's three)
+            const aie::vector<bfloat16, 32> sv = aie::load_v<32>(ps);
+            Y0 = aie::mac(Y0, aie::load_v<64>(pc), sv.template extract<8>(0).template grow_replicate<64>());
+            Y1 = aie::mac(Y1, aie::load_v<64>(pc + CG), sv.template extract<8>(1).template grow_replicate<64>());
+            Y2 = aie::mac(Y2, aie::load_v<64>(pc + 2 * CG), sv.template extract<8>(2).template grow_replicate<64>());
+            if constexpr (G == 4)
+                Y3 = aie::mac(Y3, aie::load_v<64>(pc + 3 * CG), sv.template extract<8>(3).template grow_replicate<64>());
+        } else {
+            Y0 = aie::mac(Y0, aie::load_v<64>(pc), aie::load_v<8>(ps).template grow_replicate<64>());
+            Y1 = aie::mac(Y1, aie::load_v<64>(pc + CG), aie::load_v<8>(ps + SG).template grow_replicate<64>());
+            Y2 = aie::mac(Y2, aie::load_v<64>(pc + 2 * CG), aie::load_v<8>(ps + 2 * SG).template grow_replicate<64>());
+            if constexpr (G == 4)
+                Y3 = aie::mac(Y3, aie::load_v<64>(pc + 3 * CG), aie::load_v<8>(ps + 3 * SG).template grow_replicate<64>());
+        }
         pc += CS;
         ps += SS;
     }
