@@ -238,6 +238,44 @@ __attribute__((noinline)) void {{ p }}_iq1_x(const uint8_t *__restrict xp, const
     }
 }
 
+{% if slots == 8 %}
+// (IQ1_S, 8 slots) _iq1_pm's panels straight into _iq1_x's MMULs: per n = 2 i' + h the masks of panels l = 2 h, 2 h + 1
+// (one 64-byte load each: its 4 row groups' panels, in pop order), c = bf16(C) of the two (no panels in L1)
+__attribute__((noinline)) void {{ p }}_iq1_pmx(const uint8_t *__restrict mk, const uint8_t *__restrict xp,
+                                               bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const v16int32 __aie_dm_resource_b *__restrict pk = (const v16int32 __aie_dm_resource_b *)mk;
+    bfloat16 *__restrict pc = c;
+    const v64int8 z = broadcast_zero_to_v64int8(), k1 = broadcast_to_v64int8(1);
+    v64bfp16ebs8 W;
+    W.exponent = al::e8(0x85);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int n = 0; n < 8; n++) {
+        v64accfloat C0, C1, C2, C3;
+        AIE_LOOP_UNROLL_FULL
+        for (int l = 0; l < 2; l++) {
+            const v64bfp16ebs8 X = xs.pop();
+            const v16int32 m = *pk++;
+            W.mantissa = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(m, 0)), ext_v2int32(m, 2));
+            C0 = l ? mac_8x8_8x8T(X, 1, W, 1, C0) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(m, 1)), ext_v2int32(m, 3));
+            C1 = l ? mac_8x8_8x8T(X, 1, W, 1, C1) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(m, 4)), ext_v2int32(m, 6));
+            C2 = l ? mac_8x8_8x8T(X, 1, W, 1, C2) : mul_8x8_8x8T(X, 1, W, 1);
+            W.mantissa = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(m, 5)), ext_v2int32(m, 7));
+            C3 = l ? mac_8x8_8x8T(X, 1, W, 1, C3) : mul_8x8_8x8T(X, 1, W, 1);
+        }
+        aie::store_v(pc, {{ p }}_c8(C0));
+        aie::store_v(pc + {{ L }}, {{ p }}_c8(C1));
+        aie::store_v(pc + {{ 2 * L }}, {{ p }}_c8(C2));
+        aie::store_v(pc + {{ 3 * L }}, {{ p }}_c8(C3));
+        pc += {{ 4 * L }};
+    }
+}
+{% endif %}
+
 {% if slots != 8 %}
 // y[g] += hilo(yu[g] + sum over the half's n of c (n, g) sct[g][n][r]) dg[g] for the 4 row groups (y [g][slot][r]; yu: ys
 // floats per g)
@@ -292,14 +330,21 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
         AIE_LOOP_NO_UNROLL
         for (int q = 0; q < 2; q++) {
             if constexpr (F == 0) {
+{% if slots == 8 %}
+                {{ p }}_iq1_pmx(un + {{ MK1 }} + 1024 * q, xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, (bfloat16 *)scr);
+{% else %}
                 {{ p }}_iq1_pm(un + {{ MK1 }} + 1024 * q, scr);
+{% endif %}
             } else {
                 const uint32_t *pm = (const uint32_t *)(un + 1024) + 64 * q;  // (the half's planes: [bit 4][m 16])
                 {{ p }}_iq1_off<H>(un + 512 * q, pm, off);
                 {{ p }}_iq1_g<F>(off, pm + 16, tab_ab, tab_cd, (uint8_t *)off);
                 {{ p }}_iq1_p<F>((const uint8_t *)off, scr);
             }
-            {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
+{% if slots == 8 %}
+            if constexpr (F == 1)  // (IQ1_S: _iq1_pmx)
+{% endif %}
+                {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
             const float *yq = F == 0 && q == 0 ? yu : zy;  // (IQ1_S: the deltas' term with the first half)
 {% if slots == 8 %}
             // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n)
