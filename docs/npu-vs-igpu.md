@@ -53,7 +53,7 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
 - **Agents** are decode-bound once a prompt cache keeps their conversations: in recorded sessions of Claude Code,
   Codex and opencode on Qwen3.6 35B-A3B, the turns read 5.5 new prompt tokens per generated token, and 70% of the
   generated tokens were thoughts. From both devices' measured rates (llama.cpp's Vulkan backend on the iGPU), the iGPU
-  would finish those sessions ~1.7x sooner on Strix Halo (the NPU prefills 2.3x faster, decodes 2.4x slower); at a
+  would finish those sessions ~1.7x sooner on Strix Halo (the NPU prefills 2.3x faster, decodes 2.3x slower); at a
   Krackan Point's rates (Gemma 4 E4B's, an estimate) the two finish about together, the NPU ~1.3x sooner without the
   thoughts. On Strix Halo the NPU's case for agents is the free iGPU and the energy.
 - **Both decoding at once** reach ~204 GB/s in total, 7% above the iGPU alone: they compete for the bus.

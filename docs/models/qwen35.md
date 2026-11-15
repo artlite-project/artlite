@@ -63,7 +63,8 @@ cores read what to do from their input streams. Per column:
   in fp32, SiLU(gate) up);
 - the GDN core runs the Gated DeltaNet step: conv, gates, the delta rule on the fp32 state that it
   reads and writes back to DDR every token (in a design of 8 tokens and on the MoE models chunkwise, one pass over the state
-  for a step's tokens, as the prefill; in a design of 8 tokens the main core's helper, idle then, computes the heads' constants);
+  for a step's tokens, as the prefill, the state written back only by the step that ends a block of 8 positions; in a design
+  of 8 tokens the main core's helper, idle then, computes the heads' constants);
 - the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
   the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
   share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step; on the 35B-A3B and Occamy steps of 3 and 4 tokens split a chain of 4 into two halves on shared streams, also one pass).
@@ -128,8 +129,8 @@ Each layer's FFN is 256 experts (8 per token) and a shared expert. A decode step
 on every column, then each column's cores pick every token's top 8 themselves and point the column's weight stream at
 the experts they take (control packets the column writes and its shim reads back); each column computes whole experts
 or halves of them, and the next phase adds the columns' results into the residual stream (`moe/route.py`,
-`decode/design.py`). A step streams 1.96 GB of the image at one token (8 of the 256 experts in every layer; Occamy's
-file 1.79 GB).
+`decode/design.py`). A step streams 1.72 GB of the image at one token (8 of the 256 experts in every layer and the
+screened head's part; Occamy's file, its head whole, 1.83 GB).
 A prompt's chunk routes its tokens on the host: each MoE layer's dispatch ends after the router, the host reads the
 logits back, picks every token's top 8 (AVX-512) and writes each column's work list (chunks of up to 192 pairs of one
 expert, dealt to the columns in turn) as control packets: the gather's while the shared expert runs, the experts'

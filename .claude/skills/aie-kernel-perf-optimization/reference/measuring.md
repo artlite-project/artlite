@@ -9,6 +9,7 @@ Where a design's time goes, measured on the hardware rather than inferred from s
 - Per-core event windows and counters
   - compiled operators (profiling skill)
   - designs driven by host-built transactions (overlays)
+  - the firmware's timeline, and who holds a stream up
   - which counters to program
   - reading the numbers
 - Reading core L1 from the host
@@ -110,6 +111,28 @@ These have no MLIR runtime sequence, so the profiling hook does not apply. Do it
 
 Useful harness switches: a region and position to window, memory stalls instead of lock stalls in counter 1, the
 step without its syncs, and two banks' conflicts (memory-module counters).
+
+### The firmware's timeline, and who holds a stream up
+
+A step's transaction can time itself: a `write32` of a core tile's `Event_Generate` (0x34008) with a user event (124 ..
+127) after a chosen operation, and that tile's counters between the events (0 -> 1, 0 -> 2, ...: cycles from one
+operation to another; any tile's counters serve, the design's cores go on). After every `Sequence.sync`, with a tile per
+kind of segment (the transfers between two syncs of one phase kind), one dispatch gives the step per phase kind: each
+segment's time, the firmware's time issuing its operations, the time in the next sync's waits. Set those against the
+segment's bytes from the transaction (tally fills and drains per stream and buffer on the fake device of
+`tests/txn_dump.py`; the array's own pushes, an MoE's expert slabs, from the image, per layer).
+
+The shim tile's two counters (control 0x31000, values 0x31020 / 0x31024) on a channel's level events tell who holds
+it up: an MM2S channel's `MEMORY_STARVATION` (36 / 37: it waits for DDR, the port binds) and `STREAM_BACKPRESSURE` (32
+/ 33: the array does not take its words); an S2MM channel's `STREAM_STARVATION` (30 / 31) and `MEMORY_BACKPRESSURE`
+(34 / 35). With its transfer (bytes at 8 B per cycle) the two add up to the time the channel has a task (a decode
+step's LM head: 3018 us = 1474 + 1530 + 14). Per phase kind: write the control register 0 at the end of a kind's
+segments and the events at their start (a column per kind: the columns' loads are alike). A column's backpressure is
+not the port's loss: the port serves the other columns meanwhile; the loss is a segment's time less its bytes at the
+port's rate.
+
+Time the same thing on both sides of a comparison: `artlite-cli`'s "dispatches of N ms" is `overlay.step`, the host's
+work inside it included; a `Transaction.durations` entry is the dispatch alone (the 35B-A3B: 37.1 against 36.2 ms).
 
 ### Which counters to program
 

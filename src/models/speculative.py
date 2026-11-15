@@ -224,7 +224,7 @@ class SpeculativeMixin:
                 once = self.overlay.once_s
                 plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - once)
                 self.accepted += len(new) - 1
-                if mtp:  # (the round's time less that work too: else a first run stops the drafter for RETRY rounds)
+                if mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
                     plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
                     self._calibrate(len(new) - 1)
                 elif d:

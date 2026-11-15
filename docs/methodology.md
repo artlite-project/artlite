@@ -94,9 +94,11 @@ runs, with the toolchain pinned then:
 | 2026-11-05 | 1.4.6.dev3+g6a97402 | 22.0.0.2026102001+4f5df13d |
 | 2026-11-10 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026110801+22c4674a |
 | 2026-11-16 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
+| 2026-11-17 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 
 The decode speeds of the files whose LM head is screened (Qwen3 0.6B, the Llama files but the BF16 ones and 3B Q3_K_M,
-Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B) are runs of 2026-11-16.
+Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B) are runs of 2026-11-16; those of Qwen3.6 35B-A3B, Occamy 1.0 and MiniCPM-V 4.7 1B, and
+the drafters' of Qwen3.6 35B-A3B, Occamy 1.0 and Gemma 4 E4B, runs of 2026-11-17 (the same toolchain).
 
 ## FastFlowLM and OpenFlowLM
 

@@ -213,7 +213,11 @@ offsets): aie2p-coding section 8. For speed:
   columns sharing a KV head trade rows per core against groups per core against streams: N streams and all the rows
   (what L1 limits), one stream and N-th of the rows (half the port at 2 heads), or the product in between.
 - **Deeper L1 / memtile FIFOs do not help a DMA-bound operator**, and they cost BD ids (24 per memtile channel
-  parity): the Gemma decode overlay at A depth 20-22 instead of 12 was unchanged (rejected.md).
+  parity): the Gemma decode overlay at A depth 20-22 instead of 12 was unchanged (rejected.md). They do help a weight
+  stream whose consumer pauses: in an MoE step the main cores take no tiles during a GDN core's step (~80 us) and a
+  layer's last round trips (partials, combine, next input), and the shim fills the FIFO meanwhile: 14 objects instead of
+  8 took 0.6 ms off the 35B-A3B's 36 ms (12: 0.5). The BDs bound it: a FIFO object takes one of each half of the
+  memtile's BDs, next to the X stream's and the page stores' (`DecodeOverlayOperator.moe_a_depth`, `pg_split`).
 - **Strided fills**: a pass that needs rows [r0, r0 + n) of every super-block of a tile reads them with one 4-D
   pattern (`(a // 8, 2 n, a // 8, n_sb * a // 4)`-style dims) instead of n_sb tasks.
 - **Runtime-variable lengths cost nothing**: a scratchpad `length_parameter`, applied by the firmware at dispatch (256
@@ -362,6 +366,14 @@ offsets): aie2p-coding section 8. For speed:
   from a phase's last tile to the next phase's input, ~8 us of it the sync's round trip, then ~5-10 us of input
   strips, 295 boundaries per step). Queue the weights that follow a sync before it (they keep streaming). Route
   the weight stream through a memtile FIFO so DDR keeps streaming across the boundary.
+- **Make the ledger before blaming boundaries** (measuring.md, "The firmware's timeline"): the 35B-A3B's step lost
+  4.4 ms of 36 against its bytes at the port's rate, and its 253 boundaries were not it (the FIFO's prefetch hides a
+  boundary of ~13 us): 2.0 ms sat in the expert phases (core-bound row-group tiles, three DDR round trips at a layer's
+  end), 1.6 ms in the GDN cores' steps, which no weights stream under. A model core's step is the time to shorten or to
+  stream under.
+- **Outputs nobody reads still cost tasks and port time**: a chunkwise GDN core drained 16 state panels per v head in
+  every step, though only a step that ends a block of 8 positions writes them (63 MB and 960 tasks a step: 0.6 ms).
+  Tally a step's bytes per stream and buffer from its transaction and ask of each who reads it.
 
 ## Host side of a dispatch
 
@@ -371,6 +383,16 @@ offsets): aie2p-coding section 8. For speed:
   thread let go after each wait (its affinity restored) ran the host work between a library program's pieces ~2.5x
   slower, on whatever core the scheduler woke for it (`Library.run` pins its thread to the interrupts' CPU,
   `portable.on_cpu`).
+- **A step's position patch belongs under the step before it**: the host's patch of a decode step's transaction (the
+  attention layers' words, angles and cache transfers: 0.37 ms of the 35B-A3B's 36 ms) ran between the steps with the
+  NPU idle. `ModelOverlay.AHEAD` patches the next step in a second transaction buffer while a step runs (what the
+  running step reads from shared buffers needs a copy per buffer; what the model writes only before the step is
+  predicted and checked: `_ahead_state`). The second buffer's transactions are copies of the first's (1 ms), never a
+  second build (~100 ms under a running step).
+- **One-time host work must not reach a planner's times**: a transaction's first run (its build, its patch tables),
+  timed as part of a drafter's round, made the draft planner stop a drafter that pays (`models.drafts`): build the
+  tables with the transaction, subtract `overlay.once_s` from every time a running average takes, and compare trees by
+  the drafts taken as well as by tokens per second.
 - **Host work between pieces is on the critical path** where the piece it overlaps is short (an MoE layer's routing
   under its shared expert's ~1.5 ms): time it in the real run (a pieces timeline: dispatch, hook, wait), not alone (it
   ran 2-3x faster alone); split it so that each piece's inputs come first and the rest overlaps the next piece (two

@@ -249,7 +249,8 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
 - **Queue depth, not BD count, limits a shim channel**: at most 4 queued tasks. Rolling retirement
   (`Sequence`) keeps it full. Issue the fills the cores need to make progress before the bulk of a
   phase's weight fills, or the queue deadlocks.
-- **Deep memtile FIFOs run out of BD ids** (24 per channel parity); deeper FIFOs do not help a DMA-bound operator.
+- **Deep memtile FIFOs run out of BD ids** (24 per channel parity); deeper FIFOs do not help a DMA-bound operator, only
+  a weight stream whose consumer pauses (an MoE step: data-movement.md).
 - **Design switches**: every change of design in a library program is a reset and a reconfiguration (~80-90 µs); count
   them per layer, and prefer one design whose workers run every phase where it fits.
 
