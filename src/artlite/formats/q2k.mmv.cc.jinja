@@ -178,7 +178,7 @@ __attribute__((noinline)) void {{ p }}_q2k(uint8_t *__restrict a, const uint8_t 
         for (int h = 0; h < 2; h++) {  // (sub-blocks 8 h ..: the offsets with the first half's)
             {{ p }}_q2k_mm8(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * h,
                             a + {{ 4 * R2 * NW2 }} + {{ 4 * R2 * 16 }} * (2 * H + u) + {{ 4 * R2 * 8 }} * h, c);
-            {{ p }}_k23scg<4, 8, 256, 64, 8, 128>(c, sct + 64 * h, h ? zy : yu, h ? 0 : 64, dg, y, (float *)(scr + 7744));
+            {{ p }}_k23scg<4, 8, 256, 64, 8, 128>(c, sct + 64 * h, h ? zy : yu, h ? 0 : 64, dg, y);
         }
     }
 {% else %}

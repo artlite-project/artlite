@@ -103,12 +103,12 @@ __attribute__((noinline)) void {{ p }}_k23sc8(const bfloat16 *__restrict c, cons
 // (8 slots) G row groups at once, each with _k23sc8's arithmetic in its order: y[g] += hilo(yu[g] + sum over the NJ
 // sub-blocks j of c(j, g) sct(j, g)[r]) dg[g] (c (j, g): 64 lanes [slot][r] at c + CS j + CG g; sct (j, g): 8 bf16 [r]
 // at sct + SS j + SG g; yu[g]: 64 fp32 at yu + YG g, YG 0: one vector for every group, zeros for none; y [g][64], dg
-// [g][r 8]): the G accumulators live through the loop, then go through t (G x 64 fp32, scratch) to one group's hilo at a
-// time (the four epilogues inlined spill: 171 against 220 cycles, 720 against 656 B)
+// [g][r 8]); the G accumulators live through the loop and go straight into their epilogues (G 4: 256 B of spills, 171
+// cycles against 233 through a scratch and a rolled epilogue; G 3: none, 122 against 179)
 template <int G, int NJ, int CS, int CG, int SS, int SG>
 __attribute__((noinline)) void {{ p }}_k23scg(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
                                               const float *__restrict yu, int YG, const bfloat16 *__restrict dg,
-                                              float *__restrict y, float *__restrict t)
+                                              float *__restrict y)
 {
     static_assert(G == 3 || G == 4);
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -126,13 +126,10 @@ __attribute__((noinline)) void {{ p }}_k23scg(const bfloat16 *__restrict c, cons
         pc += CS;
         ps += SS;
     }
-    aie::store_v(t, Y0.template to_vector<float>());
-    aie::store_v(t + 64, Y1.template to_vector<float>());
-    aie::store_v(t + 128, Y2.template to_vector<float>());
+    {{ p }}_k23d(y, Y0, dg);
+    {{ p }}_k23d(y + 64, Y1, dg + 8);
+    {{ p }}_k23d(y + 128, Y2, dg + 16);
     if constexpr (G == 4)
-        aie::store_v(t + 192, Y3.template to_vector<float>());
-    AIE_LOOP_NO_UNROLL
-    for (int g = 0; g < G; g++)
-        {{ p }}_k23d(y + 64 * g, aie::accum<accfloat, 64>(aie::load_v<64>(t + 64 * g)), dg + 8 * g);
+        {{ p }}_k23d(y + 192, Y3, dg + 24);
 }
 {% endif %}
