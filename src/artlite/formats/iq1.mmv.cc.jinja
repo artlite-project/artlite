@@ -1,13 +1,13 @@
 // ---- IQ1_S / IQ1_M (formats/iq1.py: 32 rows, 4 row groups; F 0 / 1): per super-block a unit of {{ UNIT1["IQ1_S"] }} /
-// {{ UNIT1["IQ1_M"] }} B, [LO [e] index low bytes (panel order e = [i 8][l 4][g 4][r 8]) | HB [q][bit][word 16] the indices'
-// bits 8 .. 10 (IQ1_M: and the deltas' signs) | SC the scales (IQ1_S: and the deltas) | D [row] bf16]. Core H: super-blocks
-// 2 H, 2 H + 1; per super-block u the scales and d (_iq1_ss; IQ1_S: the deltas' term yu), then per half q (groups 4 q ..
-// 4 q + 3, k blocks 16 q ..): the gather offsets (_iq1_off), the entries (_iq1_g), the weight panels (_iq1_p), the MMUL
-// (_iq1_x: per 16-k half h
-// of a group c), y += hilo(yu + sum c S) d (_iq1_sc; 8 slots: _k23sc8 per row group). Scratch: w / c [i' 4][l 4][g 4][64 B]
-// (0 .. 4096; c (n = 2 i' + h, g): {{ L }} bf16 at {{ L }} (4 n + g); the offsets [panel][16] u16, then the entries' masks
-// [pair][64 B] at 2048 .. 4096 until the panels overwrite them) | sct [g 4][n 16][r 8] bf16 (4096) | yu [g 4][{{ L }}] fp32 (5120) | {{ L }} fp32 zeros (6144) | dg
-// [g 4][r 8] bf16 (6400) | the tables' addresses (8000 .. 8008)
+// {{ UNIT1["IQ1_M"] }} B, IQ1_S [MK [e // 16][A 16 | B 16] the grid masks (panel order e = [i 8][l 4][g 4][r 8]) | SC the scales
+// and the deltas | D [row] bf16], IQ1_M [LO [e] index low bytes | HB [q][bit][word 16] the indices' bits 8 .. 10 and the
+// deltas' signs | SC the scales | D]. Core H: super-blocks 2 H, 2 H + 1; per super-block u the scales and d (_iq1_ss; IQ1_S:
+// the deltas' term yu), then per half q (groups 4 q .. 4 q + 3, k blocks 16 q ..) the weight panels (IQ1_S: _iq1_pm from
+// MK; IQ1_M: the gather offsets _iq1_off, the entries _iq1_g, the panels _iq1_p), the MMUL (_iq1_x: per 16-k half h of a
+// group c), y += hilo(yu + sum c S) d (_iq1_sc; 8 slots: IQ1_S _k23scg, IQ1_M _k23sc8 per row group). Scratch: w / c [i' 4][l
+// 4][g 4][64 B] (0 .. 4096; c (n = 2 i' + h, g): {{ L }} bf16 at {{ L }} (4 n + g); IQ1_M: the offsets [panel][16] u16, then the
+// entries' masks [pair][64 B] at 2048 .. 4096 until the panels overwrite them) | sct [g 4][n 16][r 8] bf16 (4096) | yu [g
+// 4][{{ L }}] fp32 (5120) | {{ L }} fp32 zeros (6144) | dg [g 4][r 8] bf16 (6400) | the tables' addresses (8000 .. 8008)
 
 // (2 s + 1 of 64 3-bit scales s as bf16, exact: bf16 128 + 2 s + 1 by its bits 0x4301 + 2 s, minus 128) -> 2 x 32 lanes
 [[clang::always_inline]] inline void {{ p }}_iq1_s21(aie::vector<uint8, 64> s, aie::vector<bfloat16, 32> &o0,
@@ -90,7 +90,25 @@ __attribute__((noinline)) void {{ p }}_iq1_ss(const uint8_t *__restrict un, cons
     aie::store_v(dg, aie::load_v<32>((const bfloat16 *)(un + (F ? {{ D1["IQ1_M"] }} : {{ D1["IQ1_S"] }}))));
 }
 
-// The gather offsets of a half's 512 entries (lo: their low bytes; pm: the half's bit planes, bit n of word 16 b + m =
+// (IQ1_S) A half's 64 weight panels from its masks (mk: [e // 16][A 16 | B 16], two pairs of panels per 64 B) -> wp [i'][l][g
+// 4][64 B]: w = sel(0, 1, A) signed by B
+__attribute__((noinline)) void {{ p }}_iq1_pm(const uint8_t *__restrict mk, uint8_t *__restrict wp)
+{
+    const v64int8 z = broadcast_zero_to_v64int8(), k1 = broadcast_to_v64int8(1);
+    const v16int32 __aie_dm_resource_a *__restrict pk = (const v16int32 __aie_dm_resource_a *)mk;
+    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
+    AIE_LOOP_NO_UNROLL
+    for (int it = 0; it < 16; it++) {  // (an 8-k block's 4 panels)
+        const v16int32 s = *pk++;
+        pw[0] = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(s, 0)), ext_v2int32(s, 2));
+        pw[1] = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(s, 1)), ext_v2int32(s, 3));
+        pw[2] = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(s, 4)), ext_v2int32(s, 6));
+        pw[3] = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(s, 5)), ext_v2int32(s, 7));
+        pw += 4;
+    }
+}
+
+// (IQ1_M) The gather offsets of a half's 512 entries (lo: their low bytes; pm: the half's bit planes, bit n of word 16 b + m =
 // bit 8 + b of entry 32 m + n), each twice (u16, [m 16][g 4][r 8][2]: entry 32 m + 8 g + r for an even and an odd lane):
 // 4 lo + 1024 b8 + D b10, D the distance of the core half's second table copy from its first
 template <int H>
@@ -115,7 +133,7 @@ __attribute__((noinline)) void {{ p }}_iq1_off(const uint8_t *__restrict lo, con
     }
 }
 
-// The masks of a half's 64 panels (off: their offsets, each twice; hw: the half's bit-9 words (IQ1_M: its delta words 32
+// (IQ1_M) The masks of a half's 64 panels (off: their offsets, each twice; hw: the half's bit-9 words (IQ1_M: its delta words 32
 // after), bit 8 g + r of word m: entry 32 m + 8 g + r) -> mk [panel pair 32][64 B] = [A | B | (IQ1_M) delta] x the pair's 16
 // rows, 16 B each (a row's byte: bit j of A = value j nonzero, of B = negative; deltas 0xFF where -1): per pair 8 4x16 gathers
 // (a row's even lane reads its entry's line's half 0, the odd one half 1), the 32 candidates in order (T16_16x4_lo),
@@ -155,7 +173,7 @@ __attribute__((noinline)) void {{ p }}_iq1_g(const uint16_t *__restrict off, con
     }
 }
 
-// A half's 64 weight panels from their masks (mk: ``_iq1_g``'s, 64 B per pair) -> wp [i'][l][g 4][64 B]: w = sel(0, k, A)
+// (IQ1_M) A half's 64 weight panels from their masks (mk: ``_iq1_g``'s, 64 B per pair) -> wp [i'][l][g 4][64 B]: w = sel(0, k, A)
 // signed by B, IQ1_S k = 1; IQ1_M k = 8 from the deltas +-1 (8 g + delta)
 template <int F>
 __attribute__((noinline)) void {{ p }}_iq1_p(const uint8_t *__restrict mk, uint8_t *__restrict wp)
@@ -273,10 +291,14 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
         {{ p }}_iq1_ss<F>(un, xs + {{ XS_SLOT }} * H, u, sct, dg, yu);
         AIE_LOOP_NO_UNROLL
         for (int q = 0; q < 2; q++) {
-            const uint32_t *pm = (const uint32_t *)(un + 1024) + (F ? 64 : 48) * q;  // (the half's planes: [bit B][m 16])
-            {{ p }}_iq1_off<H>(un + 512 * q, pm, off);
-            {{ p }}_iq1_g<F>(off, pm + 16, tab_ab, tab_cd, (uint8_t *)off);
-            {{ p }}_iq1_p<F>((const uint8_t *)off, scr);
+            if constexpr (F == 0) {
+                {{ p }}_iq1_pm(un + {{ MK1 }} + 1024 * q, scr);
+            } else {
+                const uint32_t *pm = (const uint32_t *)(un + 1024) + 64 * q;  // (the half's planes: [bit 4][m 16])
+                {{ p }}_iq1_off<H>(un + 512 * q, pm, off);
+                {{ p }}_iq1_g<F>(off, pm + 16, tab_ab, tab_cd, (uint8_t *)off);
+                {{ p }}_iq1_p<F>((const uint8_t *)off, scr);
+            }
             {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
             const float *yq = F == 0 && q == 0 ? yu : zy;  // (IQ1_S: the deltas' term with the first half)
 {% if slots == 8 %}

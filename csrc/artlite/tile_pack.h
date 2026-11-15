@@ -64,6 +64,8 @@ struct PackOptions {
   /// window ahead of the workers (a file not in the page cache streams from the disk while they pack).
   std::string file;
   const uint8_t* map = nullptr;
+  /// IQ1_S tiles' grid masks (``formats.iq1.grid_masks``: 2048 entries A | B << 8): the blocks of IQ1_S need them.
+  const uint16_t* iq1_masks = nullptr;
 };
 
 /// Write the tiles of every block into ``out`` (the PAD bytes and other gaps are left as they are), bit-identical

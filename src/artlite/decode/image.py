@@ -35,7 +35,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native
-from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, tile_format
+from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, tile_format
 from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
 from .protocol import NX_PER_NORM, OBJ_K, POST_K
@@ -59,6 +59,12 @@ def kc_group(n_kc: int, xp: int, kc: int) -> int:
     elements."""
     return max(g for g in range(1, n_kc + 1) if n_kc % g == 0 and g * kc <= xp)
 
+
+
+def _pack_tiles(out: np.ndarray, blocks: list[tuple], **kw: Any) -> None:
+    """``_native.pack_tiles`` with the IQ1_S grid's masks where a block is of IQ1_S tiles (``formats.iq1``'s MK)."""
+    masks = iq1.grid_masks() if any(b[0] == "IQ1_S" for b in blocks) else None
+    _native.pack_tiles(out, blocks, iq1_masks=masks, **kw)
 
 @dataclass(frozen=True)
 class Block:
@@ -380,10 +386,10 @@ class TileImage:
         blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
         own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (memory of their own: never released)
         mapped = [x for x in blocks if x not in own]
-        _native.pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
+        _pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
                            release=release, file=(self.gguf.path, self.gguf.data))
         if own:
-            _native.pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
+            _pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
         self._fill_data(out)
         return any(r.data for r in self.regions)
 
@@ -396,7 +402,7 @@ class TileImage:
         blk[7] += rt
         blk[8] += col * r.col_stride
         blk[11] = np.ascontiguousarray(b.rows[col, rt * n:(rt + 1) * n]).reshape(1, -1)
-        _native.pack_tiles(out, [tuple(blk)], threads=1)
+        _pack_tiles(out, [tuple(blk)], threads=1)
         t = r.rt0[b.name] + rt
         return [(r.offset + col * r.col_stride + r.tile(t, k) * r.tile_bytes, r.tile_bytes) for k in range(r.n_kc)]
 
@@ -473,7 +479,7 @@ def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int
     assert rows.size % (R * G) == 0
     n = rows.size // (R * G)
     out = np.zeros(n * nch * S, np.uint8)
-    _native.pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, n, 0, 0, out.size,
+    _pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, n, 0, 0, out.size,
                               [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1),
                               t.cols // 256, G)],
                        threads=1)

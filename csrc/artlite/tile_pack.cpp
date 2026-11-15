@@ -525,18 +525,18 @@ void tile_iq2(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
-/// IQ1_S / IQ1_M (iq1.py): per super-block a unit of 1600 / 1856 bytes (R <= 32 rows; rows past R zero), entries in
-/// panel order e = 128 i + 32 l + 8 g + r (row 8 g + r's 8-k block 4 i + l): LO [e] the grid indices' low bytes, HB
-/// [q 2][bit B][m 16] u32 (bit n of word (q, b, m) = bit 8 + b of the index of entry 512 q + 32 m + n; IQ1_M's b 3: the
-/// block's delta negative), SC (IQ1_S: [g][r][i' 4] the nibbles s | dneg << 3 of groups 2 i', 2 i' + 1; IQ1_M: [g][r][i 8]
-/// the halves' scales s0 | s1 << 4), D [row] bf16(d) (IQ1_M: the fp16 of the scale words' top nibbles).
+/// IQ1_S / IQ1_M (iq1.py): per super-block a unit of 2240 / 1856 bytes (R <= 32 rows; rows past R zero), entries in
+/// panel order e = 128 i + 32 l + 8 g + r (row 8 g + r's 8-k block 4 i + l). IQ1_S: MK [e / 16][A 16 | B 16] the entries'
+/// grid masks (``masks``: A | B << 8; rows past R: zero), SC [g][r][i' 4] the nibbles s | dneg << 3 of groups 2 i', 2 i' + 1, D [row] bf16(d);
+/// IQ1_M: LO [e] the grid indices' low bytes, HB [q 2][bit 4][m 16] u32 (bit n of word (q, b, m) = bit 8 + b of the index
+/// of entry 512 q + 32 m + n; b 3: the block's delta negative), SC [g][r][i 8] the halves' scales s0 | s1 << 4, D [row]
+/// bf16 of the fp16 of the scale words' top nibbles.
 template <bool M>
-void tile_iq1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
-  constexpr size_t bb = M ? 56 : 50, unit = M ? 1856 : 1600, kSC = M ? 1536 : 1408, kD = M ? 1792 : 1536;
-  constexpr int B = M ? 4 : 3;
+void tile_iq1(uint8_t* t, const uint8_t* const* src, const uint16_t* masks, int R, int nsb) {
+  constexpr size_t bb = M ? 56 : 50, unit = M ? 1856 : 2240, kSC = M ? 1536 : 2048, kD = M ? 1792 : 2176;
   for (int sb = 0; sb < nsb; sb++) {
     uint8_t* u = t + unit * sb;
-    uint32_t hb[2][B][16] = {};
+    uint32_t hb[2][4][16] = {};
     for (int r = 0; r < R; r++) {
       const uint8_t* b = src[r] + bb * sb;
       const int g = r / 8, rr = r % 8;
@@ -567,22 +567,22 @@ void tile_iq1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
         }
         for (int l = 0; l < 4; l++) {
           const int e = 128 * i + 32 * l + 8 * g + rr;
-          uint32_t idx, dn = 0;
           if constexpr (M) {
             const unsigned h = b[32 + 2 * i + l / 2] >> (4 * (l % 2));
-            idx = b[4 * i + l] | ((h & 7u) << 8);
-            dn = (h >> 3) & 1;
+            const uint32_t idx = b[4 * i + l] | ((h & 7u) << 8);
+            u[e] = static_cast<uint8_t>(idx);
+            const int q = e / 512, m = e % 512 / 32, n = e % 32;
+            for (int k = 0; k < 3; k++) hb[q][k][m] |= ((idx >> (8 + k)) & 1) << n;
+            hb[q][3][m] |= ((h >> 3) & 1u) << n;
           } else {
-            idx = b[2 + 4 * i + l] | (((qh >> (3 * l)) & 7u) << 8);
+            const uint16_t k = masks[b[2 + 4 * i + l] | (((qh >> (3 * l)) & 7u) << 8)];
+            u[32 * (e / 16) + e % 16] = static_cast<uint8_t>(k);
+            u[32 * (e / 16) + 16 + e % 16] = static_cast<uint8_t>(k >> 8);
           }
-          u[e] = static_cast<uint8_t>(idx);
-          const int q = e / 512, m = e % 512 / 32, n = e % 32;
-          for (int k = 0; k < 3; k++) hb[q][k][m] |= ((idx >> (8 + k)) & 1) << n;
-          if constexpr (M) hb[q][3][m] |= dn << n;
         }
       }
     }
-    std::memcpy(u + 1024, hb, sizeof hb);
+    if constexpr (M) std::memcpy(u + 1024, hb, sizeof hb);
   }
 }
 
@@ -646,13 +646,28 @@ void tile_bfp16_f32(uint8_t* t, const uint8_t* const* src, const uint8_t* lo, in
     }
 }
 
-/// A format's packer on the tiles' rows: ``src[r]`` the GGUF blocks of row r's nsb super-blocks, ``lo[r]`` (BFP16 of
-/// F32 rows only) the plane of row r.
-using TileFn = void (*)(uint8_t* tile, const uint8_t* const* src, const uint8_t* lo, int R, int nsb);
+/// What a format's packer takes besides the rows: ``lo[r]`` (BFP16 of F32 rows only) the plane of row r; the IQ1_S grid's
+/// masks (``PackOptions::iq1_masks``).
+struct TileAux {
+  const uint8_t* lo;
+  const uint16_t* iq1_masks;
+};
+
+/// A format's packer on the tiles' rows: ``src[r]`` the GGUF blocks of row r's nsb super-blocks.
+using TileFn = void (*)(uint8_t* tile, const uint8_t* const* src, const TileAux& aux, int R, int nsb);
 
 template <void (*F)(uint8_t*, const uint8_t* const*, int, int)>
-void plain(uint8_t* t, const uint8_t* const* src, const uint8_t*, int R, int nsb) {
+void plain(uint8_t* t, const uint8_t* const* src, const TileAux&, int R, int nsb) {
   F(t, src, R, nsb);
+}
+
+template <bool M>
+void iq1(uint8_t* t, const uint8_t* const* src, const TileAux& aux, int R, int nsb) {
+  tile_iq1<M>(t, src, aux.iq1_masks, R, nsb);
+}
+
+void bfp16_f32(uint8_t* t, const uint8_t* const* src, const TileAux& aux, int R, int nsb) {
+  tile_bfp16_f32(t, src, aux.lo, R, nsb);
 }
 
 /// What every tile format is, in the order of ``TileFormat`` (checked below): the name its slot's tensors carry, the
@@ -682,10 +697,10 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return 4 * (q3k_header_words(nsb) + 24 * size_t(nsb)) * R; }, plain<tile_q3k>},
     {TileFormat::IQ3_XXS, "IQ3_XXS", 98, true, false, [](int R, int nsb) { return iq3xxs_unit(R) * size_t(nsb); },
      plain<tile_iq3xxs>},
-    {TileFormat::IQ1_S, "IQ1_S", 50, false, false, [](int R, int nsb) { return R <= 32 ? 1600 * size_t(nsb) : ~size_t(0); },
-     plain<tile_iq1<false>>},
+    {TileFormat::IQ1_S, "IQ1_S", 50, false, false, [](int R, int nsb) { return R <= 32 ? 2240 * size_t(nsb) : ~size_t(0); },
+     iq1<false>},
     {TileFormat::IQ1_M, "IQ1_M", 56, false, false, [](int R, int nsb) { return R <= 32 ? 1856 * size_t(nsb) : ~size_t(0); },
-     plain<tile_iq1<true>>},
+     iq1<true>},
     {TileFormat::IQ2_XXS, "IQ2_XXS", 66, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
      plain<tile_iq2<Iq2::XXS>>},
     {TileFormat::IQ2_XS, "IQ2_XS", 74, false, false, [](int R, int nsb) { return R <= 24 ? kIq2Unit * nsb : ~size_t(0); },
@@ -703,7 +718,7 @@ constexpr FormatInfo kFormats[] = {
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<true>>},
     {TileFormat::BFP16_F32, "BFP16/F32", 1024, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
-     tile_bfp16_f32},
+     bfp16_f32},
 };
 
 constexpr bool formats_in_enum_order() {
@@ -758,6 +773,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
                               "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
                               b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
                               b.cols * b.col_stride, b.offset, out_size));
+    if (b.fmt == TileFormat::IQ1_S && !opt.iq1_masks)
+      throw Error(std::format("pack_tiles: block {}: IQ1_S tiles need the grid's masks (iq1_masks)", bi));
     int64_t total = 0;
     for (auto [data, rows] : b.tensors) {
       total += rows;
@@ -835,7 +852,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
               src[r] = p;
             }
           }
-          fi.pack(tile.get(), src, lo, b.R, b.nsb);
+          fi.pack(tile.get(), src, TileAux{lo, opt.iq1_masks}, b.R, b.nsb);
           const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
           memory::stream_copy(col + idx * b.S, tile.get(), b.S);
         }

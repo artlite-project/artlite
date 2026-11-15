@@ -25,7 +25,8 @@ void bind_pack(nb::module_& m) {
   m.def(
       "pack_tiles",
       [](nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out, nb::list blocks, unsigned threads,
-         bool release, std::optional<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::device::cpu>>> file) {
+         bool release, std::optional<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::device::cpu>>> file,
+         std::optional<nb::ndarray<const uint16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> iq1_masks) {
         using Rows = nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
         using Raw = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
         std::vector<artlite::PackBlock> bs;
@@ -64,12 +65,17 @@ void bind_pack(nb::module_& m) {
           opt.file = file->first;
           opt.map = file->second.data();
         }
+        if (iq1_masks) {
+          if (iq1_masks->shape(0) != 2048) throw artlite::Error("pack_tiles: iq1_masks holds the grid's 2048 entries");
+          opt.iq1_masks = iq1_masks->data();
+        }
         nb::gil_scoped_release release_gil;
         artlite::pack_tiles(out.data(), out.shape(0), bs, opt);
       },
-      "out"_a, "blocks"_a, "threads"_a = 0, "release"_a = false, "file"_a = nb::none(),
+      "out"_a, "blocks"_a, "threads"_a = 0, "release"_a = false, "file"_a = nb::none(), "iq1_masks"_a = nb::none(),
       nb::sig("def pack_tiles(out: numpy.ndarray[numpy.uint8], blocks: list[tuple], threads: int = 0, "
-              "release: bool = False, file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None) -> None"),
+              "release: bool = False, file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None, "
+              "iq1_masks: numpy.ndarray[numpy.uint16] | None = None) -> None"),
       "Pack weight tiles (every tile format: bit-identical to the formats' pack_tile) into out. A block: "
       "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb, G) as "
       "decode.image.TileImage.pack builds it (format: a tile format, BFP16 as \"BFP16/BF16\", \"BFP16/F16\" or "
@@ -78,7 +84,8 @@ void bind_pack(nb::module_& m) {
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
       "consecutive in rows, along K). threads: 0 = one per physical core; release: "
       "MADV_DONTNEED each tensor's pages when done (file mappings only); file: (path, its whole mapping) of the "
-      "tensors: read into the page cache ahead of the workers.");
+      "tensors: read into the page cache ahead of the workers; iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), "
+      "which IQ1_S blocks need.");
 
   m.def(
       "pack_slots",

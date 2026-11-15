@@ -401,13 +401,20 @@ of 23 rows) 4596 -> ~2300 cycles:
   inside the gather loop left it unpipelined (RecMII 48 in the physical mode). The prefill's lists: the index bytes
   zipped with their bits (bytes 0 / 1) into 16-bit indices, one `ups_to_v32acc32(v32int16, 2)` per list (v32acc32 has
   no add).
-- **A table too big to hold twice** (IQ1's 2048 16-bit entries, `formats/iq1.py`): a lane reads only the 32-byte half of
-  its parity, so a 4x16 table needs each half stored twice (4 B per entry and copy); with 4 KB of room each entry is stored
-  once and a row takes an even and an odd lane at the same address (4 gathers per panel), an index bit picking the half:
-  one select per two panels after the byte transpose (`T8_16x4` gives [Ae | Be | Ao | Bo] of 16 rows, the select between
-  the halves 32 bytes apart). Fused with the panels the loop ran at II 24 per pair (post-RA 30: the chain through the
-  gathers, shuffles and extracts); split into a gather loop (II 10, the gathers' DM_ADA) and a panel loop: 685 vs 781
-  cycles per 64 panels, ~10.7 per panel against IQ2's 8.5 with its doubled tables.
+- **A table too big to hold twice** (IQ1_M's 2048 16-bit entries, `formats/iq1.py`): a lane reads only the 32-byte half
+  of its parity, so a 4x16 table needs each half stored twice (4 B per entry and copy); with 4 KB of room each entry is
+  stored once and a row takes an even and an odd lane at the same address (4 gathers per panel), an index bit picking the
+  half: one select per two panels after the byte transpose (`T8_16x4` gives [Ae | Be | Ao | Bo] of 16 rows, the select
+  between the halves 32 bytes apart). Fused with the panels the loop ran at II 24 per pair (post-RA 30: the chain through
+  the gathers, shuffles and extracts); split into a gather loop (II 10, the gathers' DM_ADA) and a panel loop: 685 vs 781
+  cycles per 64 panels, ~10.7 per panel against IQ2's 8.5 with its doubled tables. A gather's lanes 0, 2 read bank 0 and
+  1, 3 bank 1: with the copies split by an index bit, its two rows share a region in half of the gathers, which then
+  wait a cycle (~512 cycles per IQ1 tile and core).
+- **No table where the tile has room** (IQ1_S): its 9280-B tile held 6400 B of indices, scales and d; the packer stores
+  each 8-k block's looked-up [A | B] masks instead (2240 B a super-block, the tile's size unchanged, `iq1.grid_masks`
+  passed to the native packer), and a panel is two `vextract.64`, a `vsel8` and a `vaddsub8` from one 64-byte load per 4
+  panels (II 16): no offsets, gathers, half pick or table page; the decode tile 6309 -> 3411 cycles, the UD-IQ1_M step
+  -20%. Check a format's tile bytes against its unit before building a lookup.
 - **Signs after an unpack** (IQ3_S): with `AIE_TRY_INITIATION_INTERVAL(24)` II 29 per 4 panels (the heuristic search
   stopped at 40), its bound QEY_RS 24 (machine-model.md "Shared ports"); per super-block 976 -> 736 cycles, the decode
   step -3%.

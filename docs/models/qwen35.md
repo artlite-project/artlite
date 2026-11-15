@@ -151,9 +151,9 @@ decode step keeps the gate rows' outputs until the up rows' come (`decode.design
 format and then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats index grids of 8 values each, from {8,
 25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit masks (`formats/iq2.py`), 24 rows per tile.
 The files from UD-IQ3_S down hold IQ1_S and IQ1_M tensors too (UD-IQ3_XXS a few FFN tensors, UD-IQ1_M 42% of its bytes):
-their grid has 2048 entries of 8 values from {-1, 0, 1}, twice what a core's table room holds in the two copies its
-gathers read, so each entry is stored once and read by two lanes, the index picking one (`formats/iq1.py`), 32 rows per
-tile. More formats than a design of 4 slots pages: these files decode up to 8 tokens per dispatch. Their IQ tiles keep
+their grid has 2048 entries of 8 values from {-1, 0, 1}, 32 rows per tile (`formats/iq1.py`). An IQ1_S tile holds each
+block's grid entry itself (its GGUF blocks leave the room in a tile), an IQ1_M tile the indices: the cores look those
+up in a table twice the size of a core's table room, so each entry is stored once and read by two lanes. More formats than a design of 4 slots pages: these files decode up to 8 tokens per dispatch. Their IQ tiles keep
 the cores busier than their bytes keep the DMA, so the smaller files are not faster: without a drafter a step of
 UD-IQ4_XS (14.4 GB of weights on the NPU) takes 311 ms, of UD-IQ3_XXS (11.5 GB) 333 ms, of UD-IQ1_M (8.7 GB) 438 ms.
 

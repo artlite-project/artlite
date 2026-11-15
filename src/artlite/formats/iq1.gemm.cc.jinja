@@ -1,11 +1,11 @@
 // IQ1_S / IQ1_M (GemmQd, super-block units: formats/iq1.py; F {{ F }}): the weight object is a unit of the pass's {{ tiles }}
-// tiles ({{ UNIT }} B each, at a pitch of {{ UP }} B: [LO | HB | SC | D]). MMUL row q is tile q / 32's row q % 32 (no
-// compaction). Per k-tile, on its first call (_prep): the 8 index lists as gather offsets, each twice ([ks 8][{{ 2 * LP }}] u16:
-// 4 lo + 1024 b8 + the table copy of b10 from the lower copy), per (16-row block, ks) the rows' bit 9 (16 bits, twice) and
-// their deltas' signs (u32 each), the scales S = bf16(d (2 s + 1)) / 8 [i'' 2][h 2][{{ NS }}]; per call the panels' codes 64 + 8 g
-// + delta (_iq1g: per two panels the decode's gathers and pick, ``mmv/iq1``'s _iq1_g), then the panels (_iqs: w = S (8 g +
-// delta), exact in fp32, rounded once into bfp16).
-// Scratch (ws, bytes): lists at {{ WL }} | words at {{ WM }} [{{ n // 16 }} blocks][ks 8][2] | S at {{ WS }} | codes at {{ WU }}
+// tiles ({{ UNIT }} B each, at a pitch of {{ UP }} B: IQ1_S [MK | SC | D], IQ1_M [LO | HB | SC | D]). MMUL row q is tile q / 32's
+// row q % 32 (no compaction). Per k-tile, on its first call (_prep): IQ1_M's 8 index lists as gather offsets, each twice
+// ([ks 8][{{ 2 * LP }}] u16: 4 lo + 1024 b8 + the table copy of b10 from the lower copy), per (16-row block, ks) the rows' bit 9
+// (IQ1_M: 16 bits, twice) and their deltas' signs (u32 each), the scales S = bf16(d (2 s + 1)) / 8 [i'' 2][h 2][{{ NS }}]; per
+// call the panels' codes 64 + 8 g + delta (IQ1_S: from MK, _iq1m; IQ1_M: _iq1g, per two panels the decode's gathers and
+// pick, ``mmv/iq1``'s _iq1_g), then the panels (_iqs: w = S (8 g + delta), exact in fp32, rounded once into bfp16).
+// Scratch (ws, bytes): {{ "lists at %d | " % WL if F else "" }}words at {{ WM }} [{{ n // 16 }} blocks][ks 8][2] | S at {{ WS }} | codes at {{ WU }}
 // [{{ n_mac // 16 }} blocks][ks 8][rh 2][64]
 
 // the scales of a group's or half's 32 rows: S = bf16((2 s + 1) d / 8) (s: 3-bit scales; D8: the rows' d / 8) at o, o2
@@ -20,13 +20,15 @@
     aie::store_v(o2, S);
 }
 
-// A tile's part of k-tile kt's prep (u: its unit; pl, pw, ps: its rows' lists, words, scales; D0, D1: the table slots'
-// offsets from the lower copy)
+// A tile's part of k-tile kt's prep (u: its unit; pl, pw, ps: its rows' lists (IQ1_M), words, scales; D0, D1: the
+// table slots' offsets from the lower copy)
 __attribute__((noinline)) void {{ p }}_prep1(const uint8_t *__restrict u, uint16_t *__restrict pl, uint32_t *__restrict pw,
-                                             bfloat16 *__restrict ps, int kt, uint16_t D0, uint16_t D1)
+                                             bfloat16 *__restrict ps, int kt{{ ", uint16_t D0, uint16_t D1" if F else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if F %}
     const uint32_t *pm = (const uint32_t *)(u + 1024) + {{ 16 * B }} * (kt >> 1) + 8 * (kt & 1);  // (the k-tile's words)
+{% endif %}
     const aie::vector<bfloat16, 32> D8 = aie::mul(aie::load_v<32>((const bfloat16 *)(u + {{ DO }})),
                                                   aie::broadcast<bfloat16, 32>(0.125f)).template to_vector<bfloat16>();
 {% if F == 0 %}
@@ -60,6 +62,13 @@ __attribute__((noinline)) void {{ p }}_prep1(const uint8_t *__restrict u, uint16
 {% endif %}
     AIE_LOOP_UNROLL_FULL
     for (int ks = 0; ks < 8; ks++) {
+{% if F == 0 %}
+        const uint32_t d = ks < 4 ? dw0 : dw1;
+        pw[2 * ks + 1] = d & 0xFFFF;  // (block 2 t: rows 0 .. 15)
+        pw[16 + 2 * ks + 1] = d >> 16;  // (block 2 t + 1)
+    }
+}
+{% else %}
         aie::vector<uint16, 32> o = aie::unpack(aie::load_v<32>(u + 256 * kt + 32 * ks));
         o = aie::add(o, o);
         o = aie::add(o, o);
@@ -69,30 +78,61 @@ __attribute__((noinline)) void {{ p }}_prep1(const uint8_t *__restrict u, uint16
         aie::store_v(pl + {{ 2 * LP }} * ks, aie::vector<uint16, 32>(::shuffle(o.to_native(), o.to_native(), T16_2x32_lo)));
         aie::store_v(pl + {{ 2 * LP }} * ks + 32, aie::vector<uint16, 32>(::shuffle(o.to_native(), o.to_native(), T16_2x32_hi)));
         const uint32_t h = pm[16 + ks];  // (bit 9 of rows 0 .. 31)
-{% if F == 0 %}
-        const uint32_t d = ks < 4 ? dw0 : dw1;
-{% else %}
         const uint32_t d = pm[48 + ks];
-{% endif %}
         pw[2 * ks] = (h & 0xFFFF) * 0x10001u;  // (block 2 t: rows 0 .. 15)
         pw[2 * ks + 1] = d & 0xFFFF;
         pw[16 + 2 * ks] = (h >> 16) * 0x10001u;  // (block 2 t + 1)
         pw[16 + 2 * ks + 1] = d >> 16;
     }
 }
+{% endif %}
 
-// The prep of k-tile kt (groups 2 kt, 2 kt + 1): the index lists, the words, the scales (module comment), per tile
-__attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t *__restrict ws, int kt,
-                                            const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+// The prep of k-tile kt (groups 2 kt, 2 kt + 1): the index lists (IQ1_M), the words, the scales (module comment), per tile
+__attribute__((noinline)) void {{ p }}_prep(const uint8_t *__restrict b, uint8_t *__restrict ws, int kt{{ ",\n                                            const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if F else "" }})
 {
+{% if F %}
     // (the table's copies: the slots of index bit 10; the offsets from the lower one)
     const uintptr_t ta = (uintptr_t)tab_ab, tb = (uintptr_t)tab_cd, base = ta < tb ? ta : tb;
     const uint16_t D0 = (uint16_t)(ta - base), D1 = (uint16_t)(tb - base);
+{% endif %}
 {% for t in range(tiles) %}
     {{ p }}_prep1(b + {{ t * UP }}, (uint16_t *)(ws + {{ WL }}) + {{ 64 * t }}, (uint32_t *)(ws + {{ WM }}) + {{ 32 * t }},
-                  (bfloat16 *)(ws + {{ WS }}) + {{ 32 * t }}, kt, D0, D1);
+                  (bfloat16 *)(ws + {{ WS }}) + {{ 32 * t }}, kt{{ ", D0, D1" if F else "" }});
 {% endfor %}
 }
+{% if F == 0 %}
+
+// (IQ1_S) The codes of a call's panels (u [16-row block][ks 8][rh 2][64]) from the masks (MK: per k-tile and tile [ks 8][j 2][A
+// 16 | B 16], rows 16 j .. of the tile: row block 2 t + j) and the deltas' words: 64 + delta + sel(0, 8, A) signed by B, two
+// row blocks (a tile's 32 rows) per 64-byte load
+__attribute__((noinline)) void {{ p }}_iq1m(const uint8_t *__restrict b, int kt, const uint32_t *__restrict wd,
+                                            uint8_t *__restrict u)
+{
+    const v64int8 z = broadcast_zero_to_v64int8(), km1 = broadcast_to_v64int8(-1), k8 = broadcast_to_v64int8(8);
+    const v64int8 k63 = broadcast_to_v64int8(63), k65 = broadcast_to_v64int8(65);
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ n_mac // 32 }}; t++) {
+        const v16int32 __aie_dm_resource_a *__restrict pk = (const v16int32 __aie_dm_resource_a *)(b + {{ UP }} * t + {{ MKO }} + 512 * kt);
+        const uint32_t __aie_dm_resource_d *__restrict pw = (const uint32_t __aie_dm_resource_d *)(wd + 32 * t);
+        v64int8 __aie_dm_resource_c *__restrict pu = (v64int8 __aie_dm_resource_c *)(u + 2048 * t);
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int ks = 0; ks < 8; ks++) {
+            const v16int32 s = *pk++;  // ([j 2][A 16 | B 16])
+            const v16int32 e = (v16int32)::sel(z, km1, (unsigned long long)pw[1] | (unsigned long long)pw[17] << 16);
+            pw += 2;
+            pu[0] = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k65, k63, ext_v2int32(e, 0)),
+                                             __builtin_aie2p_vsel8(z, k8, ext_v2int32(s, 0)), ext_v2int32(s, 2));
+            pu[1] = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k65, k63, ext_v2int32(e, 1)),
+                                             __builtin_aie2p_vsel8(z, k8, ext_v2int32(s, 1)), ext_v2int32(s, 3));
+            pu[16] = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k65, k63, ext_v2int32(e, 2)),
+                                              __builtin_aie2p_vsel8(z, k8, ext_v2int32(s, 4)), ext_v2int32(s, 6));
+            pu[17] = __builtin_aie2p_vaddsub8(__builtin_aie2p_vsel8(k65, k63, ext_v2int32(e, 3)),
+                                              __builtin_aie2p_vsel8(z, k8, ext_v2int32(s, 5)), ext_v2int32(s, 7));
+            pu += 2;
+        }
+    }
+}
+{% else %}
 
 // The codes of a call's panels (u [16-row block][ks 8][rh 2][64]): per (block, ks) two panels as the decode's (8 4x16
 // gathers, the candidates in order, [Ae | Be | Ao | Bo] by one byte transpose, bit 9 picking a row's half), the codes 64 +
@@ -128,6 +168,8 @@ __attribute__((noinline)) void {{ p }}_iq1g(const uint16_t *__restrict li, const
     }
 }
 
+{% endif %}
+
 {% include "artlite/formats/iq2.panels.cc.jinja" %}
 
 void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *__restrict hb, int32_t sb)
@@ -137,7 +179,7 @@ void {{ p }}_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, bfloat16 *
 // k-tile kt -> {{ n_mac }} x 64 bfp16 panels (rows {{ n_mac }} half ..) in the MAC pop order [16-row block][k-step ks][8-row
 // half]: on its first call the k-tile's prep, the codes (_iq1g), then the panels (_iqs)
 void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *__restrict stage,
-                int32_t sb, int32_t kt{{ half_arg }}, const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+                int32_t sb, int32_t kt{{ half_arg }}{{ ", const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" if F else "" }})
 {
 {% if "ev_dq" in ablate or "ev_kt" in ablate %}
     event0();
@@ -147,15 +189,19 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
 {% endif %}
 {% if halves > 1 %}
     if (half == 0)
-        {{ p }}_prep(b, (uint8_t *)ws, kt, tab_ab, tab_cd);
+        {{ p }}_prep(b, (uint8_t *)ws, kt{{ ", tab_ab, tab_cd" if F else "" }});
     const int r0 = {{ n_mac }} * half;  // (the half's first row)
 {% else %}
-    {{ p }}_prep(b, (uint8_t *)ws, kt, tab_ab, tab_cd);
+    {{ p }}_prep(b, (uint8_t *)ws, kt{{ ", tab_ab, tab_cd" if F else "" }});
     const int r0 = 0;
 {% endif %}
     uint8_t *wsb = (uint8_t *)ws;
+{% if F %}
     const uint32_t *base = (uintptr_t)tab_ab < (uintptr_t)tab_cd ? tab_ab : tab_cd;  // (every lane at the lower copy)
     {{ p }}_iq1g((const uint16_t *)(wsb + {{ WL }}) + 2 * r0, (const uint32_t *)(wsb + {{ WM }}) + r0, base, base, wsb + {{ WU }});
+{% else %}
+    {{ p }}_iq1m(b + {{ UP }} * (r0 >> 5), kt, (const uint32_t *)(wsb + {{ WM }}) + r0, wsb + {{ WU }});
+{% endif %}
     {{ p }}_iqs(wsb + {{ WU }}, (const bfloat16 *)(wsb + {{ WS }}) + r0, stage);
 {% if "ev_dq" in ablate %}
     event1();
