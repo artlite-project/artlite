@@ -96,6 +96,7 @@ def test_arrays(head: tuple) -> None:
     """A row as an array: every logit exact; ``dense``: the largest exact, the others screened and below them."""
     for x in _inputs(head):
         row, exact = _row(head, x)
+        assert abs(float(row[77]) - exact[77]) < 1e-5 * np.abs(exact).max() and row._exact is None  # (one row's)
         assert np.abs(np.asarray(row) - exact).max() < 1e-5 * np.abs(exact).max()
         d = row.dense(20)
         order = np.argsort(-exact)[:20]

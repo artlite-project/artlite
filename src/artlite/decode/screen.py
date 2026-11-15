@@ -210,8 +210,11 @@ class ScreenedRow:
     def astype(self, dtype: np.dtype) -> np.ndarray:
         return self.exact().astype(dtype)
 
-    def __getitem__(self, i: int | np.ndarray) -> np.ndarray:
-        return self.exact()[i]
+    def __getitem__(self, i: int | np.ndarray) -> np.ndarray | np.float32:
+        """A token's exact logit (a chosen token's, for its log-probability), or those of an array of tokens."""
+        if self._exact is not None:
+            return self._exact[i]
+        return self.at(np.atleast_1d(i))[0] if np.ndim(i) == 0 else self.at(np.asarray(i))
 
     def __array__(self, dtype: np.dtype | None = None, copy: bool | None = None) -> np.ndarray:
         out = self.exact()

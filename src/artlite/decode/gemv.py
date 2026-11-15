@@ -147,11 +147,13 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     if tab is not None:
         var["TAB"] = tab
     pager = paging.source(p, wake=pg.wake, request=True) if paged else ""
-    # (keep: every format paged, the inline tables of kernel_lib its pages read kept by resident code; keep_nz: a paged
-    # format reads the -z e_i panels and no resident one does: a page writes no data of its own)
+    # (keep: every format paged, the inline tables of kernel_lib its pages read kept by resident code, or a screened
+    # head's pages: with Q6_KH every format but the largest pages whatever their number (``decode.model.paged_formats``),
+    # and a page may read a table that the resident format's kernels do not (Q4_1's al::neg_eye next to Q4_0);
+    # keep_nz: a paged format reads the -z e_i panels and no resident one does: a page writes no data of its own)
     nz = [f for f in fmts if f in NZ_FORMATS]
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
-                            keep=bool(paged) and set(paged) == set(fmts),
+                            keep=bool(paged) and (set(paged) == set(fmts) or "Q6_KH" in paged),
                             keep_nz=bool(nz) and set(nz) <= set(paged),
                             rg=rg,
                             rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4, yb=yb,
