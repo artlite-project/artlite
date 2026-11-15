@@ -2,8 +2,8 @@
 // [LO [p][r 8] index low bytes (panel order p = [i][l 4][g 3]) | SG [i][row 32][l 4] signs | SC [i][g 4][r 8] scales | HB
 // [q][bit][word 12] the indices' bits 8, 9 | D [row] bf16]. Core H: super-blocks 2 H, 2 H + 1; per super-block u the signs
 // as masks and the scales (_iq2_ss), then per half q (groups 4 q .. 4 q + 3, k blocks 16 q ..): the gather offsets
-// (_iq2_off), the weight panels (_iq2_w), the MMUL (_iq2_x: per 16-k half h of a group c), y += hilo(sum c S) D (_iq2_sc;
-// 8 slots: _k23sc8 per row group). Scratch: w / c [i' 4][l 4][g 3][64 B] (0 .. 3072; c (i', h, g): {{ L }} bf16 at 384 i' +
+// (_iq2_off), the weight panels (_iq2_w; IQ2_XXS _iq2_wv), the MMUL (_iq2_x: per 16-k half h of a group c), y += hilo(sum c
+// S) D (_iq2_sc; 8 slots: _k23scg). Scratch: w / c [i' 4][l 4][g 3][64 B] (0 .. 3072; c (i', h, g): {{ L }} bf16 at 384 i' +
 // {{ L }} (3 h + g)) | mk [i][l 4][g 4][r 8] (3072) | sct [i][h 2][g 4][r 8] bf16 (4096) | off [i' 4][h 2][64] u16 (5120 ..
 // 7168) | dg [g 4][r 8] bf16 (7168) | (8 slots) 64 fp32 zeros (7424) | the tables' addresses (8000 .. 8008)
 
@@ -80,7 +80,7 @@ __attribute__((noinline)) void {{ p }}_iq2_ss(const uint8_t *__restrict u, v16in
 
 // The gather offsets of half q's 384 entries (u16, [i' 4][h 2][64]: (i', h)'s 48 entries [l' 2][g 3][r 8], 16 unused): 4 lo
 // (IQ2_XS, IQ2_S: + 1024 b8; IQ2_S: + D b9, D the distance of the core half's second table copy from its first: the
-// index's half of the table there)
+// index's half of the table there); IQ2_XXS (the values table, 4x64 gathers): 16 (lo & 127) + D b7
 template <int F, int H>
 __attribute__((noinline)) void {{ p }}_iq2_off(const uint8_t *__restrict u, int q, uint16_t *__restrict off)
 {
@@ -96,6 +96,11 @@ __attribute__((noinline)) void {{ p }}_iq2_off(const uint8_t *__restrict u, int 
             pl += 32;
             v = aie::add(v, v);
             v = aie::add(v, v);
+            if constexpr (F == 0) {
+                const aie::mask<32> b7 = aie::ge(v, (uint16)512);
+                v = aie::upshift(v, 2);
+                v = aie::select(v, aie::add(v, (uint16)(D - 2048)), b7);
+            }
             if constexpr (F > 0)
                 v = aie::select(v, aie::add(v, (uint16)1024), aie::mask<32>::from_uint32(pm[3 * j + k]));
             if constexpr (F == 2)
@@ -119,7 +124,38 @@ __attribute__((noinline)) void {{ p }}_iq2_off(const uint8_t *__restrict u, int 
     return __builtin_aie2p_vaddsub8(broadcast_zero_to_v64int8(), g, s);
 }
 
-// The 48 weight panels of a half (off: their offsets [i' 4][h 2][64]; mk: their masks [i' 4][l 4][g 4][r 8]) -> wp [i'][l][g 3]
+// (IQ2_XXS) The 48 weight panels of a half from the values table (``iq2.value_words``; off: their offsets [i' 4][h 2][64];
+// mk: their signs [i' 4][l 4][g 4][r 8]) -> wp [i'][l][g 3][64 B]: a panel's 8 rows' values by two 4x64 gathers (row r
+// in lane r: the panel), every lane at the first copy (tab_ab = tab_cd), zero - w where a sign is set
+__attribute__((noinline)) void {{ p }}_iq2_wv(const uint16_t *__restrict off, const uint8_t *__restrict mk,
+                                              const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
+                                              uint8_t *__restrict wp)
+{
+    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v64int8 z = broadcast_zero_to_v64int8();
+    const v16uint16 __aie_dm_resource_a *__restrict po = (const v16uint16 __aie_dm_resource_a *)off;
+    const v16int32 __aie_dm_resource_b *__restrict pm = (const v16int32 __aie_dm_resource_b *)mk;
+    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 8; t++) {
+        const v16int32 m = *pm++;  // ([l' 2][g 4][r 8])
+        const v16int32 a0 = add((v16int32)ups_to_v16acc32(po[0], 0, 0), b16);
+        const v16int32 a1 = add((v16int32)ups_to_v16acc32(po[1], 0, 0), b16);
+        const v16int32 a2 = add((v16int32)ups_to_v16acc32(po[2], 0, 0), b16);
+        po += 4;
+        const v8int32 a00 = extract_v8int32(a0, 0), a01 = extract_v8int32(a0, 1), a10 = extract_v8int32(a1, 0);
+        const v8int32 a11 = extract_v8int32(a1, 1), a20 = extract_v8int32(a2, 0), a21 = extract_v8int32(a2, 1);
+        pw[0] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a00), load_4x64_hi(a00)), ext_v2int32(m, 0));  // (l' 0)
+        pw[1] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a01), load_4x64_hi(a01)), ext_v2int32(m, 1));
+        pw[2] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a10), load_4x64_hi(a10)), ext_v2int32(m, 2));
+        pw[3] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a11), load_4x64_hi(a11)), ext_v2int32(m, 4));  // (l' 1)
+        pw[4] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a20), load_4x64_hi(a20)), ext_v2int32(m, 5));
+        pw[5] = __builtin_aie2p_vaddsub8(z, (v64int8)concat(load_4x64_lo(a21), load_4x64_hi(a21)), ext_v2int32(m, 6));
+        pw += 6;
+    }
+}
+
+// (IQ2_XS, IQ2_S) The 48 weight panels of a half (off: their offsets [i' 4][h 2][64]; mk: their masks [i' 4][l 4][g 4][r 8]) -> wp [i'][l][g 3]
 // [64 B]: per (group i', half h) 6 panels (l = 2 h, 2 h + 1; g 0 .. 2), the copies' bases (lanes 0, 1 of a gather from
 // tab_ab, 2, 3 from tab_cd) added to the offsets
 __attribute__((noinline)) void {{ p }}_iq2_w(const uint16_t *__restrict off, const uint8_t *__restrict mk,
@@ -223,10 +259,10 @@ __attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t 
     bfloat16 *sct = (bfloat16 *)(scr + 4096), *dg = (bfloat16 *)(scr + 7168);
     uint16_t *off = (uint16_t *)(scr + 5120);
     // (the table copies' addresses through a volatile word: constants at the call would specialize _iq2_w, and the
-    // gathers' memory operands need pointers; IQ2_S: every lane at the first copy)
+    // gathers' memory operands need pointers; IQ2_XXS, IQ2_S: every lane at the first copy)
     volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
     ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
-    ta[1] = F == 2 ? (H ? {{ TAB[1][0] }} : {{ TAB[0][0] }}) : (H ? {{ TAB[1][1] }} : {{ TAB[0][1] }});
+    ta[1] = F != 1 ? (H ? {{ TAB[1][0] }} : {{ TAB[0][0] }}) : (H ? {{ TAB[1][1] }} : {{ TAB[0][1] }});
     const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
 {% if slots == 8 %}
     float *zy = (float *)(scr + 7424);
@@ -240,7 +276,10 @@ __attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t 
         AIE_LOOP_NO_UNROLL
         for (int q = 0; q < 2; q++) {
             {{ p }}_iq2_off<F, H>(un, q, off);
-            {{ p }}_iq2_w(off, (const uint8_t *)mk + 512 * q, tab_ab, tab_cd, scr);
+            if constexpr (F == 0)
+                {{ p }}_iq2_wv(off, (const uint8_t *)mk + 512 * q, tab_ab, tab_cd, scr);
+            else
+                {{ p }}_iq2_w(off, (const uint8_t *)mk + 512 * q, tab_ab, tab_cd, scr);
             {{ p }}_iq2_x(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
 {% if slots == 8 %}
             // (c (n = 2 i' + h, g) at 192 n + 64 g, its scales at 32 n + 8 g; t: the offsets' room)

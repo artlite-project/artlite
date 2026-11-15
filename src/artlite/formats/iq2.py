@@ -20,13 +20,16 @@ The grids as gather tables (``grid_words``): entry i = [A | B] (16 bits), A's bi
 value k is 43, so that g = 43 where B, else 25 where A, else 8.
 
 Decode (``mmv/iq2``): per super-block the signs as masks and the scales (``_iq2_ss``; IQ2_XXS and IQ2_XS through
-IQ3_XXS's ``_iq3_signs``), then per half (4 groups) the gather offsets (``_iq2_off``: 4 lo + 1024 b8 + D b9, u16), the
-weight panels (``_iq2_w``: a panel's 8 entries by two 4x16 gathers, its A and B bytes as 64-bit masks by one byte transpose
-``T8_8x8``, g = sel(sel(8, 25, A), 43, B), the signs by a masked subtract), the MMUL (``_iq2_x``: per 16-k half of a group
-c = bf16 of its two panels' sums) and the scaling (``_iq2_sc``: y += hilo(sum c S) D). The tables: IQ2_XXS 1 KB and
-IQ2_XS 2 KB per copy (each core half's two copies at ``common.TAB``, lanes 0, 1 of a gather from one, 2, 3 from the other);
-IQ2_S's 4 KB as its halves (index bit 9), one in each copy slot, every lane at the first copy and D its distance to the
-second."""
+IQ3_XXS's ``_iq3_signs``), then per half (4 groups) the gather offsets (``_iq2_off``: 4 lo + 1024 b8 + D b9, IQ2_XXS 16 (lo
+& 127) + D b7, u16), the weight panels (IQ2_XS, IQ2_S ``_iq2_w``: a panel's 8 entries by two 4x16 gathers, its A and B
+bytes as 64-bit masks by one byte transpose ``T8_8x8``, g = sel(sel(8, 25, A), 43, B); IQ2_XXS ``_iq2_wv``: its 8 rows'
+values by two 4x64 gathers from ``value_words``; the signs by a masked subtract), the MMUL (``_iq2_x``: per 16-k half of a
+group c = bf16 of its two panels' sums) and the scaling (``_iq2_sc``: y += hilo(sum c S) D). The decode's tables: IQ2_XXS's
+values as its halves (index bit 7, 2 KB each), IQ2_S's masks as its halves (index bit 9, 2 KB each), one half in each copy
+slot of the core half (``common.TAB``), every lane at the first copy and D its distance to the second; IQ2_XS's masks 2
+KB per copy (lanes 0, 1 of a gather from one copy, 2, 3 from the other). The prefill's (``grid_words``): the masks, IQ2_XXS
+1 KB.
+"""
 
 from typing import ClassVar
 
@@ -54,6 +57,17 @@ def grid_words(fmt: str) -> np.ndarray:
     tables = e.reshape(-1, 512) if e.size > 512 else e.reshape(1, -1)
     out = np.stack([np.concatenate([t.reshape(-1, 16)] * 2, 1).reshape(-1).view(np.uint32) for t in tables])
     return out if len(out) > 1 else out[0]
+
+
+def value_words() -> np.ndarray:
+    """IQ2_XXS's grid as the decode's 4x64 gather table (``Slot.mmv_table``; the prefill's: ``grid_words``): (2, 512)
+    uint32, slot s holding the entries of index bit 7 = s, entry i's 8 values as bytes at byte 64 G + 8 e of its slot and
+    again 32 further (a 4x64 lane reads the 32-byte half of its parity), G = (i & 127) >> 2, e = i & 3: offset 16 (i &
+    127) + D b7."""
+    from ..gguf_model import iq2_grid
+
+    g = iq2_grid("IQ2_XXS").astype(np.uint8).reshape(2, 32, 1, 4, 8)  # (slot, group, -, entry, values)
+    return np.ascontiguousarray(np.concatenate([g, g], 2)).reshape(2, 2048).view(np.uint32)
 
 
 def prefix_xor7(f: np.ndarray) -> np.ndarray:
@@ -167,7 +181,7 @@ class Iq2Slot(Slot):
         return ("mmv/k23", "mmv/iq3signs", "mmv/iq2")
 
     def mmv_table(self, fmt: str) -> np.ndarray:
-        return grid_words(fmt)
+        return value_words() if fmt == "IQ2_XXS" else grid_words(fmt)
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, object]:
         R = self.format(fmt).rows(tile_bytes, nsb)
