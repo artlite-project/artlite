@@ -37,6 +37,7 @@ file in the page cache: 1.1 s): the buffer allocated and the image packed (C++) 
 the designs (found through the render manifest) and the overlay's other buffers load.
 """
 
+import gc
 import os
 from collections import abc
 from collections.abc import Callable, Iterator
@@ -44,9 +45,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from artlite import backend
+from artlite._native import Device
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
+
+_DEFAULT_WEIGHT_BUFFER = WeightBuffer
 
 from ..minicpmv import host as minicpmv_host
 from ..minicpmv import npu as minicpmv_npu
@@ -115,21 +120,66 @@ class NpuQwen(OverlayModel):
         self.flash = DFlashDrafting(self) if self.dflash is not None else None
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
                                    dflash=self.dflash, precise=readout, pack=readout) if prefill else None
-        with ThreadPoolExecutor(1) as pool:
-            build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
+        # Hint Windows/XRT shared-region capacity to exact <256 MiB buffers + 64 MiB headroom instead of fixed 1 GiB.
+        mods = (self.overlay, self.drafter, self.dflash)
+        small = sum(v for m in mods if m is not None for v in getattr(m, "sizes", {}).values() if v < (256 << 20))
+        small += sum(img.nbytes for m in mods if m is not None
+                     and (img := getattr(m, "image", None)) is not None and img.nbytes < (256 << 20))
+        if self.prefill is not None:
+            small += sum(v for v in self.prefill.own.values() if v < (256 << 20))
+        Device.reserve_shared(small + (64 << 20))
+        if backend.XRT:
+            # Stage memory-heavy steps sequentially on XRT/Windows so prefill compilation heap, GGUF pack views,
+            # target KV/GSTATE allocation, and DFlash loading do not overlap in working set.
+            if self.prefill is not None:
+                self.prefill.compile()
+                gc.collect()
+            if weights is not None:
+                weights.wait()
             self.overlay.load(threads=threads)
+            if weights is None:
+                self.overlay.ready()
+            gguf.release()
+            if self.prefill is not None:
+                self.prefill.bind()
             if self.drafter is not None:
                 self.drafter.load(threads=threads)
             if self.dflash is not None:
                 self.dflash.load(threads=threads)
                 self._mask = self._rows([self.dflash.cfg.mask_token])[0]
+                t_big = (sum(v >= (256 << 20) for v in self.overlay.sizes.values())
+                         + int(self.overlay.image.nbytes >= (256 << 20))
+                         + (sum(v >= (256 << 20) for v in self.prefill.own.values()) if self.prefill is not None else 0))
+                d_big = (sum(v >= (256 << 20) for v in self.dflash.sizes.values())
+                         + int(self.dflash.image.nbytes >= (256 << 20)))
+                if small + (64 << 20) <= (1 << 30) and t_big + d_big + (1 if small > 0 else 0) <= 5:
+                    dt, dd = self.overlay.dev, self.dflash.dev
+                    for name in ("W", "ACT", "KV"):
+                        if name in dd.buffers:
+                            dt.adopt("D" + name, dd.buffers[name])
+                    if "KV" in dt.buffers:
+                        dd.adopt("TKV", dt.buffers["KV"])
+                    if "GSTATE" in dt.buffers:
+                        dd.adopt("TGSTATE", dt.buffers["GSTATE"])
             if mtp is not None:
                 mtp.release()
-            if build is not None:
-                build.result()  # (its error, if any)
-                self.prefill.bind()
-        self.overlay.ready()  # (the weights' thread packs meanwhile)
-        gguf.release()
+            self.overlay.ready()
+        else:
+            with ThreadPoolExecutor(1) as pool:
+                build = pool.submit(self.prefill.compile) if prefill else None  # (while the weights are packed)
+                self.overlay.load(threads=threads)
+                if self.drafter is not None:
+                    self.drafter.load(threads=threads)
+                if self.dflash is not None:
+                    self.dflash.load(threads=threads)
+                    self._mask = self._rows([self.dflash.cfg.mask_token])[0]
+                if mtp is not None:
+                    mtp.release()
+                if build is not None:
+                    build.result()  # (its error, if any)
+                    self.prefill.bind()
+            self.overlay.ready()  # (the weights' thread packs meanwhile)
+            gguf.release()
         self._w_out = self.overlay._f32("output_norm.weight")
         self.position = 0
         self.rope_next = 0  # (the M-RoPE position of the next text token)
@@ -419,7 +469,10 @@ class Qwen(Model):
             if kind == "draft-mtp":
                 raise ValueError(f"{path}: no MTP drafter (no MTP block in the file, no mtp-*.gguf beside it)")
             self.mtp = None
-        self.weights = WeightBuffer(image)
+        if backend.XRT and WeightBuffer is _DEFAULT_WEIGHT_BUFFER:
+            self.weights = WeightBuffer(image, start=False)
+        else:
+            self.weights = WeightBuffer(image)
         self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.minicpmv = self.cfg.rope_section_order == "zyxt"

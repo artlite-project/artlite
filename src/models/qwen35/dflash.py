@@ -276,13 +276,15 @@ class DFlashOverlay(ModelOverlay):
         self.dev = dev = OverlayDevice(self.op, device=dev0.device)
         if img.pack(dev.alloc("W", img.nbytes), threads=threads, release=release):
             dev.flush("W")
-        self.selector.resident()
         dev.adopt("MW", dev0.buffers["W"])
         dev.adopt("MACT", dev0.buffers["ACT"])
         for name, n in self.sizes.items():
             dev.alloc(name, n)
         self._load()
         dev.flush("ACT")
+        if release:
+            self.gguf.release()
+        self.selector.resident()
         self.reset()
 
     def _f32(self, name: str) -> np.ndarray:

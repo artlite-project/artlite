@@ -1,12 +1,17 @@
 """GGUF files on the host (``artlite.gguf_model``, ``artlite.model_config``): the IQ formats' fields and weights against
 gguf-py, the native row dequantization against ``QTensor.dequantize``, the drafter files' names."""
 
+import mmap
+from pathlib import Path
+
+import gguf
 import numpy as np
 import pytest
 from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
 
 from artlite import _native
-from artlite.gguf_model import IQ4_VALUES
+from artlite.formats import FORMATS
+from artlite.gguf_model import IQ4_VALUES, GGUFFile
 from artlite.model_config import qwen_mtp_of
 
 from .tensors import random_tensor
@@ -137,3 +142,37 @@ def test_qwen_mtp_of(tmp_path: object) -> None:
     assert qwen_mtp_of(str(model)) == str(repo / "model-1.0-mtp-Q8_0.gguf")
     (repo / "model-1.0-mtp-Q4_K_M.gguf").touch()
     assert qwen_mtp_of(str(model)) == str(repo / "model-1.0-mtp-Q4_K_M.gguf")
+
+
+def test_gguf_release_and_chunked_pack(tmp_path: Path) -> None:
+    """GGUFFile.release keeps metadata and tensors readable after releasing pages, and chunked release=True packing
+    matches release=False bit-for-bit."""
+    path = tmp_path / "mini.gguf"
+    w = gguf.GGUFWriter(str(path), "test")
+    w.add_array("test.scores", [1, 2, 3, 4])
+    w.add_array("tokenizer.ggml.tokens", ["<a>", "<b>"])
+    raw = random_tensor("Q4_0", 16, 256, 7).raw
+    w.add_tensor("w.weight", raw, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    g = GGUFFile(str(path))
+    want_scores = np.array(g.meta["test.scores"], copy=True)
+    want_raw = np.array(g.tensor("w.weight").raw, copy=True)
+    s_bytes = -(-FORMATS["Q4_0"].used_bytes(16, 1) // 64) * 64
+    rows_idx = np.arange(16, dtype=np.int64).reshape(1, 16)
+    blk = ("Q4_0", 16, s_bytes, 1, 1, 1, 1, 0, 0, s_bytes, [g.tensor("w.weight").raw], rows_idx, 1, 1)
+    out_keep = np.zeros(s_bytes, np.uint8)
+    out_rel = np.zeros(s_bytes, np.uint8)
+    _native.pack_tiles(out_keep, [blk], threads=1, release=False, file=(str(path), g.data))
+    _native.pack_tiles(out_rel, [blk], threads=1, release=True, file=(str(path), g.data))
+    assert np.array_equal(out_keep, out_rel)
+
+    g.release()
+    assert np.array_equal(g.meta["test.scores"], want_scores)
+    if not hasattr(mmap.mmap, "madvise"):
+        assert not np.shares_memory(g.meta["test.scores"], g.data)
+    assert g.strings("tokenizer.ggml.tokens") == ["<a>", "<b>"]
+    assert np.array_equal(g.tensor("w.weight").raw, want_raw)

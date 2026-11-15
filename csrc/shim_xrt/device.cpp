@@ -12,6 +12,7 @@ namespace {
 std::mutex g_mutex;
 std::vector<const hw_ctx*> g_contexts;
 std::weak_ptr<region> g_shared;  // (freed with its last buffer)
+size_t g_shared_bytes = 1ull << 30;
 }  // namespace
 
 void device::add_context(const hw_ctx* ctx) {
@@ -44,13 +45,30 @@ device::device(uint32_t device_index) {
 
 device::~device() = default;
 
+void device::reserve_shared(size_t bytes) {
+  std::lock_guard lock(g_mutex);
+  if (bytes == 0) {
+    g_shared_bytes = kSharedBytes;
+    return;
+  }
+  constexpr size_t kSharedMin = 64ull << 20;
+  constexpr size_t kGran = 16ull << 20;
+  size_t cap = ((bytes + kGran - 1) / kGran) * kGran;
+  if (cap < kSharedMin) cap = kSharedMin;
+  if (cap > kSharedBytes) cap = kSharedBytes;
+  g_shared_bytes = cap;
+}
+
 std::shared_ptr<region> device::take(size_t bytes, size_t& offset) {
   offset = 0;
   if (bytes >= kSharedMax) return std::make_shared<region>(bytes);
   std::lock_guard lock(g_mutex);
   std::shared_ptr<region> shared = g_shared.lock();
   if (!shared || shared->used + bytes > shared->size) {
-    shared = std::make_shared<region>(kSharedBytes);
+    size_t sz = g_shared_bytes;
+    g_shared_bytes = kSharedBytes;
+    if (sz < bytes) sz = bytes;
+    shared = std::make_shared<region>(sz);
     g_shared = shared;
   }
   offset = shared->used;

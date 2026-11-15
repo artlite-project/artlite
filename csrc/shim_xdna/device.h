@@ -129,6 +129,8 @@ struct device {
   // The most recent asynchronous AIE error the firmware reported (device-wide), if any. Uses
   // the management mailbox: only after a clean failure, never while a job may be hung.
   std::optional<amdxdna_async_error> last_async_error() const;
+  // Hint for the next shared host-buffer region size on Windows/XRT (0 resets default 1 GiB; no-op on Linux/XDNA).
+  static void reserve_shared(size_t) {}
 };
 
 }  // namespace shim_xdna

@@ -43,6 +43,7 @@ import numpy as np
 
 from .. import _native, settings
 from ..gemm.pacing import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
+from ..operators.fused.layout import parse_name
 from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
 
@@ -214,7 +215,9 @@ def _items(pf: Any) -> tuple[dict[int, list], dict[str, int], dict[str, Any], in
     pa.write(activations(pa.size))
     pa.sync_to_device()
     pc = dev.alloc_host_buffer(max(arg_bytes(op, 2) for op in ops))
-    buffers = {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}
+    used = {parse_name(ref)[0] for rl in runlists.values() for _, *refs in rl for ref in refs}
+    all_bufs = {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}
+    buffers = {k: all_bufs[k] for k in used}
     return {c: pf.lib.items(rl, buffers) for c, rl in runlists.items()}, params, buffers, T
 
 

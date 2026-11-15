@@ -21,6 +21,73 @@ from ..model_files import require, size_gguf
 from ..numerics import rel_max
 
 
+def test_alias_scratch_unit() -> None:
+    """Non-overlapping dense prefill scratch buffers alias into F and G within bounds; MoE stays untouched."""
+    from types import SimpleNamespace
+
+    from artlite.operators.base import ArgDirection
+    from artlite.operators.fused.layout import parse_name
+    from artlite.operators.util import rup
+    from models.qwen35.prefill import QwenPrefill
+
+    def make_op(sz: tuple[int, ...], dirs: tuple[ArgDirection, ...]) -> SimpleNamespace:
+        specs = [SimpleNamespace(nbytes=n, direction=d) for n, d in zip(sz, dirs)]
+        return SimpleNamespace(get_arg_spec=lambda: specs)
+
+    in_d, out_d = ArgDirection.IN, ArgDirection.OUT
+    op_pr = make_op((4096, 8192), (in_d, out_d))
+    op_sc = make_op((8192, 12288), (in_d, out_d))
+    op_go = make_op((12288, 16384), (in_d, out_d))
+    op_at = make_op((20480, 16384), (in_d, out_d))
+    op_out = make_op((16384, 24576), (in_d, out_d))
+    op_gu = make_op((4096, 32768), (in_d, out_d))
+    op_act = make_op((32768, 8192), (in_d, out_d))
+    op_dn = make_op((8192, 28672), (in_d, out_d))
+    op_fc = make_op((4096, 40960), (in_d, out_d))
+    op_nx = make_op((8192, 40960, 16384, 12288), (in_d, in_d, out_d, out_d))
+    op_fq = make_op((12288, 16384), (in_d, out_d))
+    rl = [
+        (op_pr, "G[0:4096]", "PR[0:8192]"),
+        (op_sc, "PR", "O"),
+        (op_go, "O", "A"),
+        (op_at, "QS", "A"),
+        (op_out, "A", "Y"),
+        (op_gu, "PXN", "GU"),
+        (op_act, "GU", "HP"),
+        (op_dn, "HP", "F"),
+        (op_fc, "FT", "FY"),
+        (op_nx, "FZ", "FY", "FX0", "FPN"),
+        (op_fq, "FPN", "FG"),
+    ]
+    own = {"G": 8192, "PR": 8192, "O": 12288, "QS": 20480, "A": 16384, "Y": 24576, "GU": 32768, "HP": 8192,
+           "F": 28672, "FY": 40960, "FZ": 8192, "FX0": 16384, "FPN": 12288, "FG": 16384, "FT": 4096, "PXN": 4096}
+    fake = SimpleNamespace(moe=False, own=dict(own), runlists={256: list(rl), ("fresh", 64): list(rl)})
+    QwenPrefill._alias_scratch(fake)
+    assert set(fake.own) == {"F", "G", "FZ", "FT", "PXN"}
+    assert fake.own["G"] == rup(max(own["G"], own["HP"]), 4096)
+    expected_f = max(own["GU"], own["F"], max(own["QS"], rup(own["PR"], 4096) + own["O"], own["Y"]) + own["A"],
+                     max(own["FY"], own["FG"]) + own["FPN"] + own["FX0"])
+    assert fake.own["F"] == expected_f
+    for mapped in fake.runlists.values():
+        for op, *refs in mapped:
+            fg = []
+            for i, (spec, ref) in enumerate(zip(op.get_arg_spec(), refs)):
+                base, a, b = parse_name(ref)
+                b = spec.nbytes if b is None else b
+                assert 0 <= a <= b <= fake.own[base]
+                if base in ("F", "G"):
+                    fg.append((spec.direction, a, b, base))
+            for idx1 in range(len(fg)):
+                for idx2 in range(idx1 + 1, len(fg)):
+                    d1, a1, e1, b1 = fg[idx1]
+                    d2, a2, e2, b2 = fg[idx2]
+                    if b1 == b2 and (d1 == out_d or d2 == out_d):
+                        assert e1 <= a2 or e2 <= a1
+    moe_fake = SimpleNamespace(moe=True, own=dict(own), runlists={256: list(rl)})
+    QwenPrefill._alias_scratch(moe_fake)
+    assert moe_fake.own == own and moe_fake.runlists[256] == rl
+
+
 @pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("occamy", 7),
                                          ("kev", 0), ("ud-iq4xs", 15), ("ud-iq3xxs", 15)],
                          ids=["9B", "27B", "1B", "35B-A3B", "occamy", "occamy-7", "kev", "ud-iq4xs", "ud-iq3xxs"])
