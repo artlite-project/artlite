@@ -52,7 +52,7 @@ from artlite import txn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
 from artlite.decode.design import PG_ONE_CHANNEL
-from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, host_bytes, paged_formats
+from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, StepKey, host_bytes, paged_formats
 from artlite.decode.protocol import (
     B_F32,
     B_GU,
@@ -142,6 +142,12 @@ class QwenOverlay(ModelOverlay):
 
     CONFIG, IMAGE = QwenConfig, QwenImage
     NORMED = frozenset(NORMS)
+    # a design of 4 slots patches the next step's position while a step runs (``ModelOverlay.AHEAD``: the attention layers'
+    # words, angles and transfers, 0.37 ms of the 35B-A3B's 36 ms step that the NPU otherwise waits for): each transaction
+    # buffer reads F_ATT objects of its own (``fatt2``), the second buffer's transactions are built at their first use. A
+    # drafter's steps (``draft``) follow no step of their own; a design of 8 slots writes its steps' branch words between them.
+    STEPS_AHEAD = True
+    AHEAD_PREPARED = False
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
@@ -158,6 +164,8 @@ class QwenOverlay(ModelOverlay):
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
+        self.AHEAD = self.STEPS_AHEAD and slots == 4 and self.ash is not None
+        self._rope_used = (0, 0)  # (the positions whose ``rope`` rows the last position patch took: ``_ring_state``)
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
@@ -238,6 +246,7 @@ class QwenOverlay(ModelOverlay):
                 self.norm_off[(L, name)] = take("NORM", nw)
         self.norm_off[(-1, "output_norm")] = take("NORM", nw)
         self.gobj, self.gstate, self.fatt, self.rawkv, self.kv_off, self.ghdr, self.ring_off = {}, {}, {}, {}, {}, {}, {}
+        self.fatt2: dict[int, int] = {}  # (``AHEAD``: per attention layer the second transaction buffer's F_ATT objects)
         self._gobj0: dict[int, np.ndarray] = {}  # (``reset``: a GDN layer's objects as loaded)
         self.hslot = HSLOT
         if self.gsh is not None:
@@ -249,6 +258,8 @@ class QwenOverlay(ModelOverlay):
         for L in self.layers:
             if cfg.attention[L]:  # ([column][F_ATT per sub-step], then [column][q objects SLOTS])
                 self.fatt[L] = take("ACT", COLS * (self.ash.u + self.SLOTS) * XB)
+                if self.AHEAD:
+                    self.fatt2[L] = take("ACT", COLS * self.ash.u * XB)
                 self.rawkv[L] = take("ACT", self.SLOTS * XB)
                 self.kv_off[L] = take("KV", self.ash.kvh * self.ash.head_bytes)
             else:
@@ -264,8 +275,9 @@ class QwenOverlay(ModelOverlay):
                 self.xch[L] = take("ACT", XB)
                 self.cp[L] = take("ACT", COLS * (CP_BYTES + XB))
             self.part = take("ACT", COLS * self.part_col)
-        self.fobj = np.array([[[(self.fatt[L] + (c * self.ash.u + u) * XB) // 4 for u in range(self.ash.u)]
-                                for c in range(COLS)] for L in self.fatt], np.int64)  # ([layer][column][sub-step], words)
+        # (the F_ATT objects' first words: [transaction buffer][layer][column][sub-step])
+        self.fobj = np.array([[[[self.fatt_object(L, c, u, b) // 4 for u in range(self.ash.u)] for c in range(COLS)]
+                               for L in self.fatt] for b in range(2 if self.AHEAD else 1)], np.int64)
         self.gin = np.array([self.inp[(L, "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
         self._branch: tuple | None = None  # (the step words as the metadata objects hold them: ``_set_branch``; None: unknown)
         r0 = self._layout["KV"]
@@ -289,9 +301,9 @@ class QwenOverlay(ModelOverlay):
         record r ([d-block][position 8][8] bf16: ``decode.vring``)."""
         return self.ring_off[L] + 2 * h * self.T
 
-    def fatt_object(self, L: int, c: int, u: int) -> int:
-        """ACT offset of column c's F_ATT object of sub-step u of layer L."""
-        return self.fatt[L] + (c * self.ash.u + u) * XB
+    def fatt_object(self, L: int, c: int, u: int, b: int = 0) -> int:
+        """ACT offset of column c's F_ATT object of sub-step u of layer L (b: of the second transaction buffer, ``AHEAD``)."""
+        return (self.fatt2 if b else self.fatt)[L] + (c * self.ash.u + u) * XB
 
     def q_object(self, L: int, c: int, s: int) -> int:
         """ACT offset of column c's q object of slot s of layer L."""
@@ -325,13 +337,12 @@ class QwenOverlay(ModelOverlay):
         act = self.dev.view("ACT")
         qn = self._f32(f"blk.{L}.attn_q_norm.weight") * np.float32(math.log2(math.e) / 16)
         norms = np.concatenate([qn, self._f32(f"blk.{L}.attn_k_norm.weight")])
-        for c in range(COLS):
-            for u in range(self.ash.u):
-                o = self.fatt_object(L, c, u)
-                m = np.zeros(META, np.int32)
-                m[M_FLAGS] = F_ATT
-                act[o:o + 4 * META] = m.view(np.uint8)
-                act[o + 4 * META:o + 4 * META + norms.nbytes] = norms.view(np.uint8)
+        for b, c, u in itertools.product(range(len(self.fobj)), range(COLS), range(self.ash.u)):
+            o = self.fatt_object(L, c, u, b)
+            m = np.zeros(META, np.int32)
+            m[M_FLAGS] = F_ATT
+            act[o:o + 4 * META] = m.view(np.uint8)
+            act[o + 4 * META:o + 4 * META + norms.nbytes] = norms.view(np.uint8)
 
     def _load_gdn(self, L: int) -> None:
         """Layer L's GOBJ: the header, the conv objects (weights, zero histories, pads), zero K and delta objects."""
@@ -469,7 +480,7 @@ class QwenOverlay(ModelOverlay):
         buffer, one: no ``AHEAD``)."""
         dev, cfg = self.dev, self.cfg
         seq = Sequence(self.op, inputs=("X",))
-        st = Step(S, subs)
+        st = Step(S, subs, b=b)
         if self.moe:  # (the control packets' route; the routing's shim locks)
             self.moe_steps.route(seq)
         for c in range(COLS):
@@ -506,6 +517,18 @@ class QwenOverlay(ModelOverlay):
         """(a step of a chunkwise GDN core: whether its chain ends its block, ``ends``: only then its state panels drain)"""
         return (self.start, self.ends)
 
+    def _variant_ahead(self, p: int, S: int) -> tuple:
+        return (self.start, not self.blocks or p % 8 + S >= 8)
+
+    def _transaction(self, key: StepKey) -> Step:
+        """(built as the key's variant: ``_build`` reads ``ends``, which is the running step's when the next one's is
+        built ahead)"""
+        ends, self.ends = self.ends, key.variant[1]
+        try:
+            return super()._transaction(key)
+        finally:
+            self.ends = ends
+
     def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
         """(chunkwise: the steps that end their block and those that do not)"""
         for ends in (True, False) if self.blocks else (True,):
@@ -533,13 +556,23 @@ class QwenOverlay(ModelOverlay):
         return tuple((a, n, split) for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub)
                      for split in self.ash.split_of((p + a) // attn.POS_PER_GROUP, n))
 
-    def _set_position(self, st: Step, p: int) -> None:
+    def _set_position(self, st: Step, p: int, ahead: bool = False) -> bool:
         """A step's words that follow its position: a chunkwise core's state transfers (``GdnTransfers.patch_panels``),
-        the attention's F_ATT objects and cache, ring and record transfers (``AttentionSteps.set_position``)."""
+        the attention's F_ATT objects and cache, ring and record transfers (``AttentionSteps.set_position``). ``ahead``
+        (``AHEAD``: while the step before runs, st of the other transaction buffer): not when a prefill's caches still
+        owe the rings their rows (KV, which the running step reads); its positions' ``rope`` rows are text's that follows
+        the row before them (what a model writes before its step: the step is patched again if it wrote others,
+        ``_ring_state``)."""
+        if ahead:
+            if self.vring.from_prefill & set(self.fatt):
+                return False
+            self.rope[p:p + st.S] = int(self.rope[p - 1].max()) + 1 + np.arange(st.S)[:, None]
         if self.blocks:
             self.gdn_steps.patch_panels(st, p)
         if self.ash is not None:
             self.attn_steps.set_position(st, p)
+        self._rope_used = (p, p + st.S)
+        return True
 
     @property
     def can_branch(self) -> bool:
@@ -554,7 +587,7 @@ class QwenOverlay(ModelOverlay):
     def _branch_angles(self, p: int, L: int) -> None:
         """The F_ATT objects' angles of a step's last L slots at p (one pass: the step's slots' rows) from ``rope``."""
         c0, s0 = attn.rope_cs(self.cfg, self.rope[p + 8 - L:p + 8])
-        at = self.fobj[:, :, 0, None] + META + 2 * attn.HD + 64 * (8 - L) + np.arange(64 * L)
+        at = self.fobj[0][:, :, 0, None] + META + 2 * attn.HD + 64 * (8 - L) + np.arange(64 * L)
         self.dev.view("ACT").view(np.float32)[at] = np.concatenate([c0, s0], 1).reshape(-1)
         self.dev.flush_at("ACT", np.unique(4 * at.ravel() & ~63))
 
@@ -571,7 +604,7 @@ class QwenOverlay(ModelOverlay):
         lines = []
         if self.ash is not None and self.ash.one:
             aword, w, lanes = attn.step_words(p, S, branch)
-            fo = self.fobj[:, :, 0].ravel()
+            fo = self.fobj[0][:, :, 0].ravel()
             a32[fo + M_BRANCH] = aword
             a32[fo[:, None] + M_AMASK + np.arange(4)] = w.view(np.int32)
             a32[fo + M_ALANE] = lanes
@@ -639,8 +672,10 @@ class QwenOverlay(ModelOverlay):
             self.vring.ran(L, p, S)
 
     def _ring_state(self) -> tuple:
-        """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``)"""
-        return (*super()._ring_state(), self.cur.conv_in_ghdr)
+        """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``; the GSTATE halves of the
+        blocks, ``GdnCursor.half``; the ``rope`` rows the last position patch took)"""
+        a, b = self._rope_used
+        return (*super()._ring_state(), self.cur.conv_in_ghdr, self.cur.gh, self.cur.gp, self.rope[a:b].tobytes())
 
     @staticmethod
     def _id_runs(order: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, int]]]:

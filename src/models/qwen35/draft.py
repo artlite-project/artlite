@@ -159,6 +159,7 @@ class QwenDraft(QwenOverlay):
     (its program and context; the model's own block: its weight buffer). ``table``: its head's tokens."""
 
     CONFIG, IMAGE = _DraftConfig, DraftImage
+    STEPS_AHEAD = False  # (its steps follow the model's rounds, not each other)
 
     def __init__(self, target: QwenOverlay, gguf: GGUFFile | None = None):
         own = gguf is None

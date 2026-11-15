@@ -157,7 +157,7 @@ class AttentionSteps:
         a, n, split = st.subs[u]
         rnd, kh = split & 3 == attn.SPLIT_ROUND, (split & attn.SPLIT_KV) >> 2
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", ov.fatt_object(L, c, u)), XB)
+            seq.fill("X", c, dev.address("ACT", ov.fatt_object(L, c, u, st.b)), XB)
             if split:  # (the q objects of the chain's columns in order; a round: of its half of the KV head's)
                 q0, nc = (kh * nph + 2 * (c // nph), 2) if rnd else (c - c % nph, nph)
                 seq.fill("X", c, dev.address("ACT", ov.q_object(L, q0, a)), nc * n * XB,
@@ -241,7 +241,7 @@ class AttentionSteps:
         ov = self.ov
         U = len(st.subs)
         act = ov.dev.view("ACT")
-        fo = ov.fobj[:, :, :U]  # (the F_ATT objects' first words: [layer][column][sub-step])
+        fo = ov.fobj[st.b][:, :, :U]  # (the F_ATT objects' first words of st's buffer: [layer][column][sub-step])
         a32 = act.view(np.int32)
         a32[fo[..., None] + F_ATT_AT] = w[np.arange(U), np.arange(COLS)[:, None]]
         q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)

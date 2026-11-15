@@ -194,6 +194,7 @@ class ModelOverlay:
     # takes ``ahead`` and returns False when it did not patch the step, its ``_build`` the buffer ``b`` of the two
     # transactions: checked at construction)
     AHEAD: ClassVar[bool] = False
+    AHEAD_PREPARED: ClassVar[bool] = True  # (``prepare`` builds both buffers' transactions; else the second at its first use)
     # the phases whose input the helper norms (a hidden size of part of a K chunk: their inputs' padding k kept zero,
     # ``_clear_pads``)
     NORMED: ClassVar[frozenset[str]] = frozenset()
@@ -459,6 +460,10 @@ class ModelOverlay:
         own variants after it)."""
         return (self.start,)
 
+    def _variant_ahead(self, p: int, S: int) -> tuple:
+        """``_variant`` of the step of S slots at p that follows the running one (``AHEAD``)."""
+        return self._variant()
+
     def _mode(self, start: int | None) -> int:
         """Set the step's first layer (None: the first of ``layers``)."""
         start = self.layers[0] if start is None else start
@@ -472,7 +477,7 @@ class ModelOverlay:
         start = self._mode(start)
         self._meta_of(S)
         for subs in {self.subs(p, S) for p in range(self.period)}:
-            for b in range(2 if self.AHEAD else 1):
+            for b in range(2 if self.AHEAD and self.AHEAD_PREPARED else 1):
                 self._transaction(self._key(S, logits, subs, b))
 
     def patch_ahead(self, S: int, p: int) -> None:
@@ -595,7 +600,7 @@ class ModelOverlay:
             self._ran(position, S)
             p = position + S
             if self.AHEAD and p + S <= self.max_positions:
-                nkey = self._key(S, logits, self.subs(p, S), 1 - b)
+                nkey = StepKey(S, logits, self._variant_ahead(p, S), self.subs(p, S), 1 - b)
                 nxt = self._transaction(nkey)
                 if self._set_position(nxt, p, ahead=True):
                     self._ahead = AheadStep(nkey._replace(b=0), p, self._ring_state(), nxt, 1 - b)
