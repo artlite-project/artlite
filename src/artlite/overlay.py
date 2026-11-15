@@ -21,6 +21,7 @@ import collections
 import contextlib
 import functools
 import os
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -32,6 +33,7 @@ from . import _native, backend, parallel_compile, txn
 from ._native import Buffer, Device, DispatchError
 
 SPIN_MARGIN_US = 1000  # a transaction's spin starts this long before its shortest recent duration
+_IDLE_PROLOGUE_S = 2.5  # Windows: NPU columns/SRAM power-gate after ~4.5-5s idle; re-run prologue twice above this
 
 
 @functools.cache
@@ -234,6 +236,7 @@ class OverlayDevice:
         self._prologue: Transaction | None = None
         self.stale = False  # (``set_prologue``)
         self._turns = -1  # (``turn_foreign`` at the last dispatch)
+        self._last_dispatch: float | None = time.monotonic() if backend.ADDRESSES_NEED_CONTEXT else None
 
     def set_prologue(self, words: np.ndarray) -> None:
         """A transaction run before the next dispatch whenever ``stale``: state the design keeps on the array beyond its
@@ -242,22 +245,30 @@ class OverlayDevice:
         here on."""
         self._prologue = Transaction(self, words)
         self.stale = True
+        self._last_dispatch = time.monotonic()
 
     def open(self) -> None:
         """The hardware context now (else at the first dispatch): before a timed dispatch, as the first context of a
         process wakes the NPU (~40 ms)."""
         self._prog._kernel()
+        self._last_dispatch = time.monotonic()
 
     def _fresh(self) -> None:
         """(In the NPU's turn, before a dispatch.)"""
         turns = _native.turn_foreign()
-        if self._prologue is not None and (self.stale or turns != self._turns):
+        idle = (sys.platform == "win32" and self._last_dispatch is not None
+                and time.monotonic() - self._last_dispatch >= _IDLE_PROLOGUE_S)
+        if self._prologue is not None and (self.stale or turns != self._turns or idle):
             self.stale = False
             try:
-                self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
+                # After NPU power-gating on Windows, the first prologue wakes the hardware while the
+                # second reliably reloads the SRAM code pages onto the awake array.
+                for _ in range(2 if idle else 1):
+                    self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
             except DispatchError as e:
                 self._note(e, self._prologue, what="the prologue's transaction (code pages)")
                 raise
+            self._last_dispatch = time.monotonic()
         self._turns = turns
 
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
@@ -316,6 +327,7 @@ class OverlayDevice:
             try:
                 if transaction is None:
                     self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
+                    self._last_dispatch = time.monotonic()
                     return
                 t0 = time.perf_counter()
                 self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
@@ -323,6 +335,7 @@ class OverlayDevice:
             except DispatchError as e:
                 self._note(e, transaction)
                 raise
+        self._last_dispatch = time.monotonic()
         transaction.durations.append(time.perf_counter() - t0)
 
     def submit(self, transaction: Transaction) -> None:
@@ -339,6 +352,7 @@ class OverlayDevice:
         self._submitted = None
         try:
             self._prog._kernel().dispatch_wait(spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
+            self._last_dispatch = time.monotonic()
             transaction.durations.append(time.perf_counter() - t0)
         except DispatchError as e:
             self._note(e, transaction)
@@ -391,13 +405,21 @@ class WeightBuffer:
     ``threads``: the packer's (default: 3/4 of the physical cores: the 27B's pack still ends before the app's main
     thread, which all 16 slow down by ~0.1 s), ``release``: give back the GGUF's pages of each packed tensor."""
 
-    def __init__(self, image: object, *, threads: int = 0, release: bool = True):
+    def __init__(self, image: object, *, threads: int = 0, release: bool = True, start: bool = True):
         self.image = image
         threads = threads or max(1, (os.cpu_count() or 2) * 3 // 8)
         self._allocated = threading.Event()
         self._out: list = []
         self._thread = threading.Thread(target=self._run, args=(threads, release), name="weights", daemon=True)
-        self._thread.start()
+        self._started = start
+        if start:
+            self._thread.start()
+
+    def start(self) -> None:
+        """Begin background allocation and packing if created with ``start=False``."""
+        if not self._started:
+            self._started = True
+            self._thread.start()
 
     def _run(self, threads: int, release: bool) -> None:
         try:
@@ -414,6 +436,7 @@ class WeightBuffer:
 
     def buffer(self) -> tuple[Device, Buffer]:
         """(the device, the buffer) once allocated (its packing may still run: ``wait``)."""
+        self.start()
         self._allocated.wait()
         if isinstance(self._out[0], BaseException):
             raise self._out[0]
@@ -421,6 +444,7 @@ class WeightBuffer:
 
     def wait(self) -> None:
         """Until the image is packed."""
+        self.start()
         self._thread.join()
         if isinstance(self._out[0], BaseException):
             raise self._out[0]

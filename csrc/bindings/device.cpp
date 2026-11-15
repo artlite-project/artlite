@@ -291,7 +291,9 @@ void bind_device(nb::module_& m) {
           },
           "The most recent asynchronous AIE error (device-wide), or None. A firmware query: only "
           "after a clean failure, never while a job may be hung.",
-          nb::sig("def last_async_error(self) -> dict[str, int] | None"));
+          nb::sig("def last_async_error(self) -> dict[str, int] | None"))
+      .def_static("reserve_shared", &shim_xdna::device::reserve_shared, "bytes"_a,
+                  "Hint the next shared XRT buffer region capacity in bytes (0 resets the 1 GiB default; no-op on Linux).");
 }
 
 }  // namespace artlite::bindings

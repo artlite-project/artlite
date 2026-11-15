@@ -61,10 +61,13 @@ struct PackOptions {
   /// Give back each tensor's pages (MADV_DONTNEED of the whole pages inside it) once its tiles are written: for
   /// tensors of a file mapping only (the pages stay in the page cache), never for anonymous memory.
   bool release = false;
-  /// The file the tensors are mapped from and the start of its mapping: the tensors are read into the page cache a
-  /// window ahead of the workers (a file not in the page cache streams from the disk while they pack).
+  /// The file the tensors are mapped from and the start (and byte size) of its mapping: the tensors are read into
+  /// the page cache a window ahead of the workers (a file not in the page cache streams from the disk while they
+  /// pack); on Windows (where MADV_DONTNEED is unavailable), release packs in ~64 MB chunked file views so the
+  /// caller's large mapping is not faulted into the working set.
   std::string file;
   const uint8_t* map = nullptr;
+  size_t map_size = 0;
   /// IQ1_S tiles' grid masks (``formats.iq1.grid_masks``: 2048 entries A | B << 8): the blocks of IQ1_S need them.
   const uint16_t* iq1_masks = nullptr;
 };

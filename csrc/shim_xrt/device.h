@@ -73,6 +73,7 @@ struct device {
   // full, a region of its own from kSharedMax. (A command lists at most xrt_abi::kMaxBuffers XRT buffers (abi.h): a
   // prefill's dozen buffers besides the weights, Qwen3.8 27B's KV cache and GDN states among them, reach the NPU
   // through one or two regions.)
+  static void reserve_shared(size_t bytes);
   static std::shared_ptr<region> take(size_t bytes, size_t& offset);
 
  private:

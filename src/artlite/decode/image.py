@@ -197,11 +197,18 @@ class TileImage:
         self.regions: list[Region] = []
         self.slabs: list[Region] = []
         self._own: dict[str, QTensor] = {}  # (tensors a model substitutes: re-laid-out copies in memory)
-        self._views: dict[str, QTensor] = {}  # (the file's tensors as rows of another width: ``view``)
+        self._views: dict[str, int] = {}  # (the file's tensors as rows of another width: ``view`` -> row_sb)
 
     def tensor(self, name: str) -> QTensor:
         """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``)."""
-        return self._own.get(name) or self._views.get(name) or self.gguf.tensor(name)
+        if name in self._own:
+            return self._own[name]
+        t = self.gguf.tensor(name)
+        if name in self._views:
+            n = t.cols // (256 * self._views[name])
+            return QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
+                           raw=t.raw.reshape(t.rows * n, -1))
+        return t
 
     def view(self, name: str, row_sb: int) -> None:
         """The blocks read the file's tensor ``name`` as rows of row_sb super-blocks (a row of the file: several rows of
@@ -209,8 +216,7 @@ class TileImage:
         t = self.gguf.tensor(name)
         n = t.cols // (256 * row_sb)
         assert t.cols == n * 256 * row_sb, (name, t.cols, row_sb)
-        self._views[name] = QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
-                                    raw=t.raw.reshape(t.rows * n, -1))
+        self._views[name] = row_sb
 
     def qtype(self, name: str) -> str:
         """A tensor's GGUF type (a substitute's: ``_own``)."""

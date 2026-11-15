@@ -3,9 +3,12 @@ shim BD iteration, the task sequence. No NPU."""
 
 import types
 
-from artlite import txn
+import numpy as np
+import pytest
+
+from artlite import overlay, txn
 from artlite.operators.design import COLS
-from artlite.overlay import Sequence
+from artlite.overlay import _IDLE_PROLOGUE_S, OverlayDevice, Sequence
 
 
 def test_txn_encoding() -> None:
@@ -115,3 +118,47 @@ def test_sequence_inputs() -> None:
             assert not (after_drain_wait and a["direction"] == txn.MM2S and a["channel"] == 1)
         elif name == "write32" and a["addr"] in x_queue:
             after_drain_wait = False
+
+
+def test_overlay_idle_prologue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows, OverlayDevice._fresh re-runs the prologue twice after idling >= _IDLE_PROLOGUE_S so power-gated
+    NPU hardware wakes cleanly before reloading code pages."""
+    dispatches: list[object] = []
+    now = [100.0]
+    turns = [0]
+    kernel = types.SimpleNamespace(dispatch=lambda buf, bufs: dispatches.append((buf, len(bufs))))
+    dev = object.__new__(OverlayDevice)
+    dev._prog = types.SimpleNamespace(_kernel=lambda: kernel)
+    dev.buffers = {"W": object()}
+    dev._prologue = types.SimpleNamespace(buffer="PROLOGUE", words=np.zeros(4, np.uint32))
+    dev.stale = True
+    dev._turns = 0
+    dev._last_dispatch = 100.0
+
+    monkeypatch.setattr(overlay.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(overlay._native, "turn_foreign", lambda: turns[0])
+    monkeypatch.setattr(overlay.sys, "platform", "win32")
+
+    dev._fresh()
+    assert len(dispatches) == 1 and not dev.stale
+    now[0] += 0.2
+    dev._fresh()
+    assert len(dispatches) == 1
+    turns[0] = 1
+    now[0] += 0.2
+    dev._fresh()
+    assert len(dispatches) == 2
+    now[0] += _IDLE_PROLOGUE_S
+    dev._fresh()
+    assert len(dispatches) == 4  # (two back-to-back prologue runs after idle)
+
+    monkeypatch.setattr(overlay.sys, "platform", "linux")
+    now[0] += _IDLE_PROLOGUE_S + 5.0
+    dev._fresh()
+    assert len(dispatches) == 4
+
+
+def test_device_reserve_shared() -> None:
+    """Device.reserve_shared accepts byte hints and resets cleanly with 0."""
+    overlay._native.Device.reserve_shared(200 << 20)
+    overlay._native.Device.reserve_shared(0)

@@ -17,6 +17,8 @@ llama.cpp's converter permutes the rows of a Llama's attn_q / attn_k per head (i
 :func:`unpermute_rows` gives the rotate-half order (the weight images take the rows in that order).
 """
 
+import ctypes
+import gc
 import json
 import math
 import mmap
@@ -542,9 +544,30 @@ class GGUFFile:
     def release(self, name: str | None = None) -> None:
         """Give the mapping's resident pages back (after a loader copied what it needs): they
         leave this process, stay in the system's page cache while it has room, and come back on
-        the next access (Windows: nothing, the mapping has no such hint). ``name``: only the whole pages inside that
-        tensor's data."""
+        the next access (Windows: unmap and reopen the mapping so faulted pages leave the working
+        set). ``name``: only the whole pages inside that tensor's data (no-op on Windows, where
+        :func:`_native.pack_tiles` releases through chunked views)."""
         if not hasattr(mmap.mmap, "madvise"):
+            if name is not None:
+                return
+            mm = getattr(self.data, "_mmap", None)
+            if mm is None:
+                return
+            # Numeric metadata arrays alias ``self.data`` via ``np.frombuffer`` and would pin ``mm``.
+            for k, v in self.meta.items():
+                if isinstance(v, np.ndarray) and (v.base is not None or np.shares_memory(v, self.data)):
+                    self.meta[k] = v.copy()
+            old = self.data
+            self.data = np.memmap(self.path, dtype=np.uint8, mode="r")
+            del old
+            try:
+                mm.close()
+            except BufferError:
+                gc.collect()
+                try:
+                    mm.close()
+                except BufferError:
+                    pass
             return
         if name is None:
             self.data._mmap.madvise(mmap.MADV_DONTNEED)
@@ -557,10 +580,22 @@ class GGUFFile:
     def willneed(self, name: str) -> None:
         """Ask for a tensor's pages at once, read ahead into the page cache (a table read by scattered rows every
         decode step: its first reads would fault each page in from disk, one at a time)."""
-        if not hasattr(mmap.mmap, "madvise"):
-            return
         _, _, off, nbytes = self.tensor_info[name]
-        self.data._mmap.madvise(mmap.MADV_WILLNEED, off // mmap.PAGESIZE * mmap.PAGESIZE, off % mmap.PAGESIZE + nbytes)
+        if hasattr(mmap.mmap, "madvise"):
+            self.data._mmap.madvise(mmap.MADV_WILLNEED, off // mmap.PAGESIZE * mmap.PAGESIZE, off % mmap.PAGESIZE + nbytes)
+            return
+        if sys.platform == "win32" and getattr(self.data, "_mmap", None) is not None and nbytes > 0:
+            class _Range(ctypes.Structure):
+                _fields_ = [("VirtualAddress", ctypes.c_void_p), ("NumberOfBytes", ctypes.c_size_t)]
+
+            kernel32 = ctypes.windll.kernel32
+            prefetch = getattr(kernel32, "PrefetchVirtualMemory", None)
+            if prefetch is not None:
+                prefetch.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(_Range), ctypes.c_uint32]
+                prefetch.restype = ctypes.c_int
+                kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+                entry = _Range(int(self.data.ctypes.data) + off, nbytes)
+                prefetch(kernel32.GetCurrentProcess(), 1, ctypes.byref(entry), 0)
 
 
     def populate(self, name: str) -> None:

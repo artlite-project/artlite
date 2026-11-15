@@ -64,6 +64,7 @@ void bind_pack(nb::module_& m) {
         if (file) {
           opt.file = file->first;
           opt.map = file->second.data();
+          opt.map_size = file->second.shape(0);
         }
         if (iq1_masks) {
           if (iq1_masks->shape(0) != 2048) throw artlite::Error("pack_tiles: iq1_masks holds the grid's 2048 entries");
