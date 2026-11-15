@@ -36,8 +36,8 @@ from collections.abc import Callable
 import numpy as np
 from ml_dtypes import bfloat16
 
-from .. import _native
-from ..formats import q6h
+from .. import _native, settings
+from ..formats import q6h, tile_format
 from ..gguf_model import GGUFFile
 
 Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
@@ -46,11 +46,20 @@ WINDOW = 10.0  # ... down to this far below the largest (e^-10: 5e-5 of its prob
 SEEDS = 16  # step 1's rows
 ROWS = 2048  # the rows of step 2, of step 3 at most
 IDS = 16384  # the rows a native pass collects (past them: numpy's)
+FILE_FORMATS = 3  # a screened head: in files of this many tile formats at most (``screened``)
 
 
 def screens(qtype: str) -> bool:
     """Whether an LM head of this GGUF type can be screened (its high plane has a tile format)."""
     return qtype == q6h.SOURCE
+
+
+def screened(qtype: str, formats: set[str]) -> bool:
+    """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a high
+    plane, in a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices). Each paged
+    format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its largest page that short
+    with an eighth."""
+    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {tile_format(qtype)}) <= FILE_FORMATS
 
 
 class Screen:
