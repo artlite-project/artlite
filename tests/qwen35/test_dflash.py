@@ -13,6 +13,7 @@ the NPU against ``dflash_ref.DFlash`` on the same taps, rounds of a generation.
 """
 
 import itertools
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -104,7 +105,8 @@ def test_ref_window() -> None:
 
 def test_options(monkeypatch: pytest.MonkeyPatch) -> None:
     """The drafter of ``Qwen``'s ``spec_type`` / ``draft_model``: the DFlash2 file by default, the MTP block (the image lays
-    it out), none (the image leaves it out), the file given; one asked for where it cannot run says so."""
+    it out), none (the image leaves it out), the file given; one asked for where it cannot run says so; by default none for
+    a file without an MTP block (unsloth's UD-IQ1_M: the DFlash2 drafter's head is the MTP block's)."""
     model, path = _files()
     monkeypatch.setattr("models.qwen35.qwen.WeightBuffer", lambda image: SimpleNamespace(image=image))  # (no packing)
     for spec, draft, dflash, mtp in [("auto", None, path, None), ("draft-mtp", None, None, ""), ("none", None, None, None),
@@ -115,6 +117,10 @@ def test_options(monkeypatch: pytest.MonkeyPatch) -> None:
         Qwen(model, mmproj="mmproj.gguf", spec_type="draft-dflash")
     with pytest.raises(ValueError, match="a draft-dflash drafter, not draft-mtp"):
         Qwen(model, spec_type="draft-mtp", draft_model=path)
+    iq1m = size_gguf("ud-iq1m")
+    if os.path.exists(iq1m):
+        q = Qwen(iq1m)
+        assert (q.dflash, q.mtp, q.weights.image.mtp_layer) == (None, None, -1)
     monkeypatch.setattr("models.qwen35.qwen.qwen_dflash_of", lambda _: None)
     with pytest.raises(ValueError, match="no DFlash2 drafter"):
         Qwen(model, spec_type="draft-dflash")

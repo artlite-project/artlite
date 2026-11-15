@@ -84,9 +84,10 @@ def swift_gguf() -> str:
 
 
 def unsloth_qwen_gguf(quant: str = "UD-IQ4_XS") -> str:
-    """unsloth's Qwen3.8-27B in one of its Unsloth Dynamic quantizations (GGUF architecture ``qwen35`` with an MTP block;
-    UD-IQ4_XS: IQ4_XS, Q5_K, Q4_K, IQ3_S, IQ3_XXS, Q6_K, Q3_K, IQ2_S, IQ2_XS, IQ4_NL, Q2_K, Q8_0 and F32 tensors, a layer's
-    gate and up often in two formats)."""
+    """unsloth's Qwen3.8-27B in one of its Unsloth Dynamic quantizations (GGUF architecture ``qwen35``, a layer's gate and
+    up often in two formats; UD-IQ4_XS: IQ4_XS, Q5_K, Q4_K, IQ3_S, IQ3_XXS, Q6_K, Q3_K, IQ2_S, IQ2_XS, IQ4_NL, Q2_K, Q8_0 and
+    F32 tensors, an MTP block; UD-IQ3_XXS: 14 formats, IQ1_S and IQ1_M FFN tensors in a few layers, an MTP block; UD-IQ1_M:
+    IQ1_S, IQ2_XXS, IQ1_M and seven other formats, no MTP block)."""
     return os.path.join(MODELS_DIR, "unsloth", "Qwen3.8-27B-GGUF", f"Qwen3.8-27B-{quant}.gguf")
 
 

@@ -20,15 +20,15 @@ def size_gguf(size: str) -> str:
     (``occamy_gguf``: Qwen3.6-35B-A3B's shapes in Q3_K, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0 and F32 tensors), "kev": Kev-4B
     (``decision_gguf``: a hidden size of 2560, part of a K chunk; Q8_0 and Q4_K tensors), or "d3-lite" (``decision_gguf``:
     MiniCPM-V's shapes, every tensor Q8_0: gate / up tiles of 8 rows), "swift": Swift 1.5 (``swift_gguf``: Qwen3.8-27B's
-    shapes in IQ4_XS, IQ3_S, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 and F32 tensors), "ud-iq4xs" / "ud-iq3xxs": unsloth's
-    Qwen3.8-27B UD-IQ4_XS (``unsloth_qwen_gguf``: IQ2_XS and IQ2_S tensors, gate and up of two formats in 24 layers) / UD-IQ3_XXS
-    (14 tile formats, IQ1_S and IQ1_M FFN tensors in layers 0, 12 .. 15, 17)."""
+    shapes in IQ4_XS, IQ3_S, IQ3_XXS, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 and F32 tensors), "ud-iq4xs" / "ud-iq3xxs" / "ud-iq1m":
+    unsloth's Qwen3.8-27B UD-IQ4_XS (``unsloth_qwen_gguf``: IQ2_XS and IQ2_S tensors, gate and up of two formats in 24 layers)
+    / UD-IQ3_XXS (14 tile formats, IQ1_S and IQ1_M FFN tensors in layers 0, 12 .. 15, 17) / UD-IQ1_M (no MTP block)."""
     if size in ("kev", "d3-lite"):
         return decision_gguf(size)
     if size == "swift":
         return swift_gguf()
-    if size in ("ud-iq4xs", "ud-iq3xxs"):
-        return unsloth_qwen_gguf({"ud-iq4xs": "UD-IQ4_XS", "ud-iq3xxs": "UD-IQ3_XXS"}[size])
+    if size in ("ud-iq4xs", "ud-iq3xxs", "ud-iq1m"):
+        return unsloth_qwen_gguf({"ud-iq4xs": "UD-IQ4_XS", "ud-iq3xxs": "UD-IQ3_XXS", "ud-iq1m": "UD-IQ1_M"}[size])
     return occamy_gguf() if size == "occamy" else qwen_gguf("Q4_K_M", size)
 
 

@@ -18,6 +18,8 @@ repetition penalty 1.03).
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf   (the main model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf   (with its MTP layer)
 $ARTLITE_MODELS_DIR/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf           (unsloth's dynamic quantization, with its MTP layer)
+$ARTLITE_MODELS_DIR/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf          (smaller ones, with IQ1_S and IQ1_M tensors;
+$ARTLITE_MODELS_DIR/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_M.gguf             UD-IQ1_M without an MTP layer)
 $ARTLITE_MODELS_DIR/z-lab/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf   (its DFlash2 drafter, optional, the default where it is here)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf     (the development model)
 $ARTLITE_MODELS_DIR/lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf
@@ -39,16 +41,16 @@ $ARTLITE_MODELS_DIR/ggml-org/Kev-4B-GGUF/Kev-4B-Q4_K_M.gguf
 The models directory: [Installation](../install.md#models-directory). `model_config.qwen_gguf(quant, size)` names
 the files (`size` "1B": MiniCPM-V's, also `model_config.minicpmv_gguf(quant)`; "35B-A3B"; Occamy's:
 `model_config.occamy_gguf()`; Swift 1.5's: `model_config.swift_gguf()`; unsloth's: `model_config.unsloth_qwen_gguf(quant)`).
-The NPU path reads Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and IQ4_NL tensors,
-Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), in any role, and a dense layer's FFN gate and up in two
-of them (unsloth's dynamic quantizations: below); not yet IQ1_S and IQ1_M (unsloth's UD-IQ3_S and smaller
-files). A dense model with a KV head per 2 columns decodes up to 8 tokens per dispatch where its file
-holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than ten formats; else up to 4
-(`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`: the Q4_K_M file of a
-`<repository>-DFlash2-GGUF` of any account) where the design runs 8 tokens, else its file's own MTP layer; a qwen35moe
-model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else
-in another account's repository of the same name (ggml-org publishes its drafters apart from the models); of several,
-Q4_0, then Q4_K_M, then Q8_0.
+The NPU path reads Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and
+IQ4_NL tensors, Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), in any role, and a dense layer's FFN
+gate and up in two of them (unsloth's dynamic quantizations: below). A dense model with a KV head per 2 columns decodes
+up to 8 tokens per dispatch where its file holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than
+ten formats; else up to 4 (`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`:
+the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account) where the design runs 8 tokens and the file has its MTP
+layer (the DFlash2 drafter's head), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
+model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in
+another account's repository of the same name (ggml-org publishes its drafters apart from the models); of several, Q4_0,
+then Q4_K_M, then Q8_0.
 `--spec-draft-model FILE` takes another file, `--spec-type none` none ([artlite-cli](../cli.md)).
 
 ## How the NPU path works
@@ -141,15 +143,19 @@ values each (`formats/iq4.py`, `formats/iq3s.py`). With ten tile formats its dec
 as a code page, each IQ format's page bringing its lookup table. With its MTP drafter a step decodes up to 8 tokens
 (`--spec-type none`: up to 4, a design 2% faster per step).
 
-unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, tested; UD-Q3_K_XL up to UD-Q8_K_L hold only formats it reads)
-choose a format per tensor: most of a layer in IQ4_XS, Q4_K, Q5_K or Q6_K, some FFN tensors in IQ3_S, IQ3_XXS, Q3_K,
-IQ2_S, IQ2_XS or IQ2_XXS, and in a third of the layers the FFN gate and up in two different formats. Such a layer's
-gate / up tiles hold, per group of 64 outputs, its gate rows in tiles of one format, then its up rows in tiles of the
-other (`decode.image.split_rows`): a decode step keeps the gate rows' outputs until the up rows' come (`decode.design`'s
-`gusplit`), a prompt runs a GEMM per format and then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats
-index grids of 8 values each, from {8, 25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit
-masks (`formats/iq2.py`), 24 rows per tile. Twelve formats are more code pages than a design of 4 slots holds: these
-files decode up to 8 tokens per dispatch.
+unsloth's dynamic quantizations of Qwen3.8-27B (UD-IQ4_XS, UD-IQ3_XXS and UD-IQ1_M tested) choose a format per tensor:
+most of a layer in IQ4_XS, Q4_K, Q5_K or Q6_K, some FFN tensors in IQ3_S, IQ3_XXS, Q3_K, IQ2_S, IQ2_XS or IQ2_XXS, and
+in a third of the layers the FFN gate and up in two different formats. Such a layer's gate / up tiles hold, per group of
+64 outputs, its gate rows in tiles of one format, then its up rows in tiles of the other (`decode.image.split_rows`): a
+decode step keeps the gate rows' outputs until the up rows' come (`decode.design`'s `gusplit`), a prompt runs a GEMM per
+format and then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats index grids of 8 values each, from {8,
+25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit masks (`formats/iq2.py`), 24 rows per tile.
+The files from UD-IQ3_S down hold IQ1_S and IQ1_M tensors too (UD-IQ3_XXS a few FFN tensors, UD-IQ1_M 42% of its bytes):
+their grid has 2048 entries of 8 values from {-1, 0, 1}, twice what a core's table room holds in the two copies its
+gathers read, so each entry is stored once and read by two lanes, the index picking one (`formats/iq1.py`), 32 rows per
+tile. More formats than a design of 4 slots pages: these files decode up to 8 tokens per dispatch. Their IQ tiles keep
+the cores busier than their bytes keep the DMA, so the smaller files are not faster: without a drafter a step of
+UD-IQ4_XS (14.4 GB of weights on the NPU) takes 311 ms, of UD-IQ3_XXS (11.5 GB) 333 ms, of UD-IQ1_M (8.7 GB) 438 ms.
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 

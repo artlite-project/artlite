@@ -382,8 +382,9 @@ class Qwen(Model):
     ``image_min_tokens`` / ``image_max_tokens``: an image's merged tokens, default 8 .. 4096), MiniCPM-V's for its
     language model (``models.minicpmv.npu.NpuVision``; ``max_slices``: an image's slices at most, default the file's);
     ``spec_type``, ``draft_model``: the drafter (``spec_options.drafter_type``): auto, the model's DFlash2 drafter
-    (``model_config.qwen_dflash_of``; not with images) where its file exists and the model's design runs steps of 8 tokens
-    (every tile format's GEMV at 8 slots: ``overlay.slots_of``), else its MTP block, else a qwen35moe model's
+    (``model_config.qwen_dflash_of``; not with images) where its file exists, the model's has an MTP block (the drafter's
+    head) and its design runs steps of 8 tokens (every tile format's GEMV at 8 slots: ``overlay.slots_of``), else its MTP
+    block, else a qwen35moe model's
     MTP file (``model_config.qwen_mtp_of``); none (the image leaves the MTP block out); draft-mtp, draft-dflash: that
     one, which must exist; ``draft_model``: that file."""
 
@@ -407,7 +408,8 @@ class Qwen(Model):
         if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
         self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
-                       qwen_dflash_of(path) if kind == "auto" and mmproj is None and self._eight() else None)
+                       qwen_dflash_of(path) if kind == "auto" and mmproj is None and self.cfg.nextn_layers and self._eight()
+                       else None)
         if kind == "draft-dflash" and self.dflash is None:
             raise ValueError(f"{path}: no DFlash2 drafter (a <repository>-DFlash2-GGUF of Q4_K_M) in the models directory")
         # (the MTP drafter, ``NpuQwen``'s: "" the file's own block, else a qwen35moe model's MTP file; a file; None)
