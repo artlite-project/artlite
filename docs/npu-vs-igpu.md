@@ -34,14 +34,16 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
 
 | | NPU (Artlite) | iGPU (llama.cpp Vulkan) |
 |---|---|---|
-| 9B decode | 10.4 tokens/s | 37.7 tokens/s |
-| 27B decode | 3.37 tokens/s | 12.6 tokens/s |
+| 9B decode | 11.6 tokens/s | 37.7 tokens/s |
+| 27B decode | 3.53 tokens/s | 12.6 tokens/s |
 | read rate in decode | 52.5-53.3 GB/s | 190-199 GB/s |
 | 9B prefill, 2048 tokens | ~960 tokens/s | 987 tokens/s |
-| power over idle, 9B decode | ~8 W (~0.8 J per token) | ~38 W (~1.0 J per token) |
+| power over idle, 9B decode | ~8 W (~0.7 J per token) | ~38 W (~1.0 J per token) |
 
-- **Decode** reads every weight once per token, so each device decodes at its own read limit and the tokens/s ratio
-  (3.6-3.7x) is the bandwidth ratio. Artlite's decode is close to the NPU's limit already: what remains is more tokens
+- **Decode** reads every weight once per token, so each device decodes at its own read limit: the read rates differ
+  3.6-3.7x, the tokens/s 3.2-3.6x (of a Q6_K LM head Artlite's NPU reads two fifths, and the host the few rows that
+  can hold the largest logits: [Qwen3.5](models/qwen35.md#how-the-npu-path-works)). Artlite's decode is close to the
+  NPU's limit already: what remains is more tokens
   per weight pass (a step of 4 tokens costs ~3-8% more than a step of one, Qwen3.8 27B's step of 8 tokens 4-7%: the draft
   tokens Artlite's generation takes from a drafter or from the context; Qwen3.8 27B with its DFlash2 drafter: 8.6 tokens/s
   after a 1K-token essay prompt and 23.5 on code instead of 3.3) and fewer bytes per token (MoE, lower-bit weights).
@@ -51,7 +53,7 @@ Qwen3.5 9B and Qwen3.6 27B Q4_K_M; Artlite's decode at one token per step, again
 - **Agents** are decode-bound once a prompt cache keeps their conversations: in recorded sessions of Claude Code,
   Codex and opencode on Qwen3.6 35B-A3B, the turns read 5.5 new prompt tokens per generated token, and 70% of the
   generated tokens were thoughts. From both devices' measured rates (llama.cpp's Vulkan backend on the iGPU), the iGPU
-  would finish those sessions ~1.85x sooner on Strix Halo (the NPU prefills 2.3x faster, decodes 2.6x slower); at a
+  would finish those sessions ~1.7x sooner on Strix Halo (the NPU prefills 2.3x faster, decodes 2.4x slower); at a
   Krackan Point's rates (Gemma 4 E4B's, an estimate) the two finish about together, the NPU ~1.3x sooner without the
   thoughts. On Strix Halo the NPU's case for agents is the free iGPU and the energy.
 - **Both decoding at once** reach ~204 GB/s in total, 7% above the iGPU alone: they compete for the bus.

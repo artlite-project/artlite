@@ -141,7 +141,7 @@ thinks can take longer):
   from it ([artlite-cli](cli.md#text)), so on recorded agent sessions Qwen3.6-27B, Qwen3.5-9B and Llama 3.1 8B generate
   1.46-1.52x faster and MiniCPM-V 1.25x (Qwen3.6-35B-A3B and Gemma 4 guess with their drafters: +0-4% more).
 - Models: Qwen3.6-35B-A3B is the one these three clients ran whole tasks on (each fixed a bug in a Python package, its
-  tests run); with its drafter it generates ~30 tokens/s after a 1K-token prompt and ~21 after 32K. Occamy 1.0, a
+  tests run); with its drafter it generates ~33 tokens/s after a 1K-token prompt and ~30 after 32K. Occamy 1.0, a
   fine-tune of it for agentic tool use, takes 15.8 GB instead of 21. On 150 function-calling cases (BFCL's simple,
   multiple and parallel calls) Qwen3.6-35B-A3B, Gemma 4 E4B and Llama 3.1 8B call right in 131, 134 and 129, none
   malformed. Most of a session's time is generation, most of it the model's thoughts: a client's own thinking

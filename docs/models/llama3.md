@@ -35,6 +35,10 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 - Decode runs on the shared decode overlay (`models.llama.overlay`), up to 4 tokens per dispatch (a generation's:
   the next one and draft tokens from the prompt, `models/drafts.py`). The
   weights are re-laid-out at load into a device buffer at their quantization's size; nothing is written to disk.
+- A Q6_K LM head (these files' `token_embd` / `output`: 9 - 27% of what a token streams) is screened
+  (`artlite/decode/screen.py`): the NPU reads its scales and the top 2 bits of its codes, the host computes the logits
+  that can be among the largest exactly from the file's rows (how: [Qwen3.5](qwen35.md#how-the-npu-path-works)).
+  `ARTLITE_LM_SCREEN=0` reads the whole head on the NPU.
 - Prompts run through the prefill (`models.llama.prefill`): chunks of up to 4096 tokens (8B: 2048), layer-major
   programs assembled from one library ELF (GEMMs on the decode's weight image, the bf16 residual stream, a flash
   attention writing the decode's KV caches); short prompts in chunks of 64 / 128 tokens (1B: 128). Tokens where a chunk cannot
@@ -44,9 +48,9 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
   cache and its read time at long contexts, with no measured quality gain for Llama.
 
 Time to first token at 1K / 8K / 32K prompt tokens: 1B Q4_0 0.109 / 1.07 / 8.59 s, 3B Q4_K_M 0.305 / 2.78 / 19.1 s,
-8B Q4_K_M 0.653 / 6.16 / 40.9 s; a 48-token chat prompt: 1B Q4_0 35 ms, 3B 70 ms, 8B 129 ms. Decode per token at 100 /
-32K positions (Q4_K_M): 1B 14.8 / 25.6 ms, 3B 36.7 / 74.2 ms, 8B 83.3 / 125.8 ms (hi + lo K at 32K: 30.7 / 92.6 /
-147.2 ms); at 100 positions 1B Q4_0 14.1, Q4_1 15.1, Q3_K_L 14.2, BF16 25.0 ms, 3B Q2_K 26.3, Q3_K_M 31.9 ms. Quality vs the CPU model
+8B Q4_K_M 0.653 / 6.16 / 40.9 s; a 48-token chat prompt: 1B Q4_0 35 ms, 3B 70 ms, 8B 129 ms. Decode per token after a
+prompt of 1K / 32K tokens (Q4_K_M): 1B 13.0 / 23.8 ms, 3B 35.1 / 70.9 ms, 8B 79.8 / 121.6 ms (hi + lo K at 32K: 29.1 /
+89.7 / 142.5 ms); after 1K 1B Q4_0 12.3, Q4_1 13.3, Q3_K_L 12.1, BF16 25.3 ms, 3B Q2_K 24.3, Q3_K_M 33.0 ms. Quality vs the CPU model
 on the same weights (three chat prompts and three essay windows through the prefill, their continuations
 teacher-forced): KL 0.0016 / 0.0011 / 0.0011 for 1B / 3B / 8B.
 

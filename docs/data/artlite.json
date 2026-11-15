@@ -25,39 +25,37 @@
       "quant": "Q4_1",
       "ttft_s": {"1024": 0.095, "8192": 1.41, "32768": 16.7},
       "prefill_tps": {"1024": 10773, "32768": 1958},
-      "decode_tps": {"1024": 101.5, "32768": 14.2},
-      "notes": {"decode_tps": {"1024": "stopped at an end-of-sequence token after 161 of the 256 tokens"}}
+      "decode_tps": {"1024": 116.3, "32768": 14.5},
+      "notes": {"decode_tps": {"1024": "stopped at an end-of-sequence token after 138 to 159 of the 256 tokens"}}
     },
     {
       "model": "Llama 3.2 1B Instruct",
       "quant": "Q4_0",
       "ttft_s": {"1024": 0.11, "8192": 1.07, "32768": 8.59, "65536": 28.7},
       "prefill_tps": {"1024": 9345, "32768": 3815},
-      "decode_tps": {"1024": 68.0, "32768": 39.9}
+      "decode_tps": {"1024": 81.2, "32768": 43.5}
     },
     {
       "model": "Llama 3.2 1B Instruct",
       "quant": "Q4_1",
       "ttft_s": {"1024": 0.11, "8192": 1.07, "32768": 8.6, "65536": 28.8},
       "prefill_tps": {"1024": 9344, "32768": 3810},
-      "decode_tps": {"1024": 64.7, "32768": 37.0}
+      "decode_tps": {"1024": 75.1, "32768": 40.0}
     },
     {
       "model": "Llama 3.2 1B Instruct",
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.124, "8192": 1.16, "32768": 8.96, "65536": 29.5},
       "prefill_tps": {"1024": 8236, "32768": 3658},
-      "decode_tps": {"1024": 66.1, "32768": 39.0}
+      "decode_tps": {"1024": 77.1, "32768": 42.1}
     },
     {
       "model": "Llama 3.2 1B Instruct",
       "quant": "Q3_K_L",
       "ttft_s": {"1024": 0.137, "8192": 1.28, "32768": 9.44, "65536": 30.5},
       "prefill_tps": {"1024": 7469, "32768": 3471},
-      "decode_tps": {"1024": 68.9, "32768": 38.5},
-      "notes": {
-        "decode_tps": {"1024": "stopped at an end-of-sequence token after 143 of the 256 tokens"}
-      }
+      "decode_tps": {"1024": 82.8, "32768": 42.2},
+      "notes": {"decode_tps": {"1024": "stopped at an end-of-sequence token after 138 to 159 of the 256 tokens"}}
     },
     {
       "model": "Llama 3.2 1B Instruct",
@@ -71,21 +69,21 @@
       "quant": "Q6_K",
       "ttft_s": {"1024": 0.141, "8192": 1.31, "32768": 9.55, "65536": 30.7},
       "prefill_tps": {"1024": 7254, "32768": 3430},
-      "decode_tps": {"1024": 51.9, "32768": 32.6}
+      "decode_tps": {"1024": 58.3, "32768": 34.6}
     },
     {
       "model": "Llama 3.2 1B Instruct",
       "quant": "Q5_K_M",
       "ttft_s": {"1024": 0.141, "8192": 1.29, "32768": 9.49, "65536": 30.6},
       "prefill_tps": {"1024": 7283, "32768": 3452},
-      "decode_tps": {"1024": 53.6, "32768": 34.7}
+      "decode_tps": {"1024": 64.2, "32768": 38.4}
     },
     {
       "model": "Llama 3.2 3B Instruct",
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.296, "8192": 2.77, "32768": 19.1, "65536": 59.5},
       "prefill_tps": {"1024": 3454, "32768": 1719},
-      "decode_tps": {"1024": 26.6, "32768": 13.5}
+      "decode_tps": {"1024": 28.5, "32768": 14.1}
     },
     {
       "model": "Llama 3.2 3B Instruct",
@@ -99,21 +97,21 @@
       "quant": "Q4_0",
       "ttft_s": {"1024": 0.268, "8192": 2.54, "32768": 18.1},
       "prefill_tps": {"1024": 3826, "32768": 1810},
-      "decode_tps": {"1024": 27.9, "32768": 13.8}
+      "decode_tps": {"1024": 29.8, "32768": 14.4}
     },
     {
       "model": "Llama 3.2 3B Instruct",
       "quant": "Q5_K_M",
       "ttft_s": {"1024": 0.339, "8192": 3.1, "32768": 20.4},
       "prefill_tps": {"1024": 3016, "32768": 1607},
-      "decode_tps": {"1024": 21.9, "32768": 12.2}
+      "decode_tps": {"1024": 24.4, "32768": 13.0}
     },
     {
       "model": "Llama 3.2 3B Instruct",
       "quant": "Q2_K",
       "ttft_s": {"1024": 0.35, "8192": 3.16, "32768": 20.6},
       "prefill_tps": {"1024": 2922, "32768": 1590},
-      "decode_tps": {"1024": 36.7, "32768": 15.7}
+      "decode_tps": {"1024": 41.2, "32768": 16.5}
     },
     {
       "model": "Llama 3.2 3B Instruct",
@@ -127,14 +125,14 @@
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.648, "8192": 6.16, "32768": 40.9},
       "prefill_tps": {"1024": 1579, "32768": 802},
-      "decode_tps": {"1024": 11.9, "32768": 7.9}
+      "decode_tps": {"1024": 12.5, "32768": 8.2}
     },
     {
       "model": "Llama 3.1 8B Instruct",
       "quant": "Q4_K_S",
       "ttft_s": {"1024": 0.614, "8192": 5.89, "32768": 39.9},
       "prefill_tps": {"1024": 1668, "32768": 822},
-      "decode_tps": {"1024": 12.4, "32768": 8.2}
+      "decode_tps": {"1024": 13.2, "32768": 8.5}
     },
     {
       "model": "Gemma 4 E4B it",
@@ -160,8 +158,8 @@
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.811, "8192": 4.34, "32768": 21.8, "65536": 55.4},
       "prefill_tps": {"1024": 1263, "32768": 1503},
-      "decode_tps": {"1024": 24.0, "32768": 20.9},
-      "mtp": {"decode_tps": {"1024": 31.2, "32768": 27.6}, "tokens_per_step": {"1024": 4, "32768": 2}}
+      "decode_tps": {"1024": 26.4, "32768": 22.6},
+      "mtp": {"decode_tps": {"1024": 33.5, "32768": 29.7}, "tokens_per_step": {"1024": 3, "32768": 4}}
     },
     {
       "model": "Occamy 1.0 (35B-A3B)",
@@ -176,7 +174,8 @@
       "quant": "Q4_K_M",
       "ttft_s": {"1024": 0.134, "8192": 1.00, "32768": 5.31, "65536": 14.2, "131072": 42.6},
       "prefill_tps": {"1024": 7641, "32768": 6168},
-      "decode_tps": {"1024": 82.9, "32768": 55.4},
+      "decode_tps": {"1024": 98.1, "32768": 69.7},
+      "notes": {"decode_tps": {"32768": "stopped at an end-of-sequence token after 138 to 159 of the 256 tokens"}},
       "image_ttft_s": {
         "16x": {"sd15-astronaut.jpg": 0.290, "airplane.jpeg": 0.517, "test-1.jpeg": 0.240, "hk_OCR.jpg": 0.403},
         "4x": {"sd15-astronaut.jpg": 0.598, "airplane.jpeg": 1.06, "test-1.jpeg": 0.429, "hk_OCR.jpg": 0.814}

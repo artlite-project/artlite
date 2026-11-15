@@ -93,6 +93,10 @@ runs, with the toolchain pinned then:
 | 2026-10-29 | 1.4.5.dev56+g1a647f1 | 22.0.0.2026102001+4f5df13d |
 | 2026-11-05 | 1.4.6.dev3+g6a97402 | 22.0.0.2026102001+4f5df13d |
 | 2026-11-10 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026110801+22c4674a |
+| 2026-11-16 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
+
+The decode speeds of the files whose LM head is screened (Qwen3 0.6B, the Llama files but the BF16 ones and 3B Q3_K_M,
+Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B) are runs of 2026-11-16.
 
 ## FastFlowLM and OpenFlowLM
 

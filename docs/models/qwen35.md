@@ -83,9 +83,10 @@ GDN states and conv states land in the decode's buffers; a chunk runs as dispatc
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
-Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qwen3.8's MTP layer; 5.09 GB of the
-9B's, 0.53 GB of MiniCPM-V's, 21.02 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and
-0.66 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at their quantization's size.
+Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qwen3.8's MTP layer; 4.60 GB of the
+9B's, 0.41 GB of MiniCPM-V's, 20.77 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and
+0.66 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at their quantization's size (of a
+screened LM head only the part the NPU reads, 41% of it: the host reads the rest from the file).
 Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0.12 GB (MiniCPM-V) to 0.97 GB (the
 35B-A3B, 0.66 GB of them its experts' inputs and outputs).
 

@@ -42,8 +42,8 @@ chat template has Qwen3's thinking mode (`--think`); sampling follows the model 
 - Qwen3-Embedding-4B's hidden size (2560) and ffn (9728) are not whole K chunks of 1024: their projections run in
   chunks padded with zero weights.
 
-Qwen3 0.6B Q4_1: time to first token at 1K / 8K / 32K prompt tokens 0.095 / 1.41 / 16.7 s; decode 9.8 ms per token
-after 1K, 70.3 ms after 32K (101.5 / 14.2 tokens/s). Quality vs the CPU model on the same weights, teacher-forced: KL
+Qwen3 0.6B Q4_1: time to first token at 1K / 8K / 32K prompt tokens 0.095 / 1.41 / 16.7 s; decode 8.6 ms per token
+after 1K, 69.0 ms after 32K (116.3 / 14.5 tokens/s). Quality vs the CPU model on the same weights, teacher-forced: KL
 0.0037 on a chat (through the prefill), 0.0037 after a 4800-token essay.
 
 Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 27
