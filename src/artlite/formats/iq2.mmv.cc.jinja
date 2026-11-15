@@ -245,7 +245,7 @@ __attribute__((noinline)) void {{ p }}_iq2(uint8_t *__restrict a, const uint8_t 
 {% if slots == 8 %}
             AIE_LOOP_NO_UNROLL
             for (int g = 0; g < 3; g++)  // (c (n = 2 i' + h, g) at 192 n + 64 g, its scales at 32 n + 8 g)
-                {{ p }}_k23sc8((const bfloat16 *)scr + 64 * g, 192, sct + 256 * q + 8 * g, 32, zy, dg + 8 * g, y + 64 * g, 8);
+                {{ p }}_k23sc8<8, 192, 32>((const bfloat16 *)scr + 64 * g, sct + 256 * q + 8 * g, zy, dg + 8 * g, y + 64 * g);
 {% else %}
             {{ p }}_iq2_sc((const bfloat16 *)scr, sct + 256 * q, dg, y);
 {% endif %}

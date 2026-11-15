@@ -76,6 +76,10 @@ Violating any of these usually costs more than any micro-tuning gains.
 - **Compile-time shapes**: trip counts, strides and offsets rendered as constants (Jinja). A runtime trip count is
   fine on an outer call loop, not on the loop you want pipelined ("The loop structure is not supported"). Pad to a
   fixed trip count and mask the tail. A `const int` initialized from a runtime argument is still a runtime value.
+  So is a constant argument of a `noinline` helper that other callers pass other values: a design's one `kernel.cc`
+  holds every caller (a decode overlay: every tile format's pages), a harness of one caller propagates its constants
+  and runs faster. Make such constants template arguments (`_k23sc8<NJ, CS, SS>`: 156 -> 76 cycles per call in the
+  qwen35 8-slot design, the UD-IQ1_M decode step -11%).
 - **One function per hot loop, its buffers distinct `__restrict` parameters.** Pointers derived from one parameter or
   workspace (`ws + a`, `ws + b`, `ps = buf; po = buf;`) are not noalias even as `__restrict` locals: the pipeliner sees
   a loop-carried store -> load dependence (RecMII = the whole chain). GdnOut's loop over its tables and y in one

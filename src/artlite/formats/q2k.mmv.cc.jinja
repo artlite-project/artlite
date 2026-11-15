@@ -180,7 +180,7 @@ __attribute__((noinline)) void {{ p }}_q2k(uint8_t *__restrict a, const uint8_t 
                             a + {{ 4 * R2 * NW2 }} + {{ 4 * R2 * 16 }} * (2 * H + u) + {{ 4 * R2 * 8 }} * h, c);
             AIE_LOOP_NO_UNROLL
             for (int g = 0; g < 4; g++)
-                {{ p }}_k23sc8(c + 64 * g, 256, sct + 128 * g + 64 * h, 8, h ? zy : yu + 64 * g, dg + 8 * g, y + 64 * g, 8);
+                {{ p }}_k23sc8<8, 256, 8>(c + 64 * g, sct + 128 * g + 64 * h, h ? zy : yu + 64 * g, dg + 8 * g, y + 64 * g);
         }
     }
 {% else %}

@@ -159,7 +159,14 @@ in near-equal pairs (banks 2i and 2i + 1 share 16 KB region i).
   epilogue (the wait for the A object outside), per format and phase kind, against the DMA's time per tile (9280 B
   per column at 3.87 B / cycle: ~2400 cycles). Above it the tiles are compute-bound even when both cores' kernels
   are below it (restructurings.md R9: the MoE frame's epilogue). Ablate one format's compute (its page loads kept)
-  for its share of the step.
+  for its share of the step. Window a paged format in its page entries, not in the resident dispatcher (an event in
+  one of its cases breaks the dispatcher's switch table and grows the resident code past the pages' room), and
+  compare its cycles with the GEMV harness's: above them with no stall to show for it, shared code sees other
+  formats' calls (SKILL.md section 2, compile-time shapes).
+- **Inside page code**: PC_RANGE_0_1 (event 20, PC_Event0 / 1 at 0x32020 / 0x32024 with bit 31 set) over the page slot,
+  and COMBO_EVENT_0 (event 9: Combo_event_inputs 0x34400, control 0x34404, 0 = A and B) of MEMORY_STALL and the range,
+  count a core's cycles and memory stall in its pages; with every other format's page entries emptied the range can
+  cover one format's functions (their addresses: `llvm-nm -n` on the build's `page_<format>.elf`, the helper's).
 - Example: restructurings.md R1 (570 -> 437 cycles per unit, memory stall 7.25 -> 0.24 ms per core and chunk).
 
 ## Reading core L1 from the host

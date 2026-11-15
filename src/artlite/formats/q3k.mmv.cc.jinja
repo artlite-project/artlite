@@ -181,7 +181,7 @@ __attribute__((noinline)) void {{ p }}_q3k(uint8_t *__restrict a, const uint8_t 
         AIE_LOOP_NO_UNROLL
         for (int g = 0; g < 3; g++) {  // (8 slots: a row group's c at a time; yu: zeros)
             {{ p }}_q3k_mm8(xp + {{ 32 * PANEL }} * u, a + {{ 4 * R3 * NW3 }} + {{ 4 * R3 * 24 }} * (2 * H + u), c, mt, g);
-            {{ p }}_k23sc8(c, 64, sct + 128 * g, 8, yu, dg + 8 * g, y + 64 * g, 16);
+            {{ p }}_k23sc8<16, 64, 8>(c, sct + 128 * g, yu, dg + 8 * g, y + 64 * g);
         }
 {% else %}
         {{ p }}_q3k_mm(xp + {{ 32 * PANEL }} * u, a + {{ 4 * R3 * NW3 }} + {{ 4 * R3 * 24 }} * (2 * H + u), c, mt);
