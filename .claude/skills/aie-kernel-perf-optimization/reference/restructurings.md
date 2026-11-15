@@ -401,6 +401,13 @@ of 23 rows) 4596 -> ~2300 cycles:
   inside the gather loop left it unpipelined (RecMII 48 in the physical mode). The prefill's lists: the index bytes
   zipped with their bits (bytes 0 / 1) into 16-bit indices, one `ups_to_v32acc32(v32int16, 2)` per list (v32acc32 has
   no add).
+- **A table too big to hold twice** (IQ1's 2048 16-bit entries, `formats/iq1.py`): a lane reads only the 32-byte half of
+  its parity, so a 4x16 table needs each half stored twice (4 B per entry and copy); with 4 KB of room each entry is stored
+  once and a row takes an even and an odd lane at the same address (4 gathers per panel), an index bit picking the half:
+  one select per two panels after the byte transpose (`T8_16x4` gives [Ae | Be | Ao | Bo] of 16 rows, the select between
+  the halves 32 bytes apart). Fused with the panels the loop ran at II 24 per pair (post-RA 30: the chain through the
+  gathers, shuffles and extracts); split into a gather loop (II 10, the gathers' DM_ADA) and a panel loop: 685 vs 781
+  cycles per 64 panels, ~10.7 per panel against IQ2's 8.5 with its doubled tables.
 - **Signs after an unpack** (IQ3_S): with `AIE_TRY_INITIATION_INTERVAL(24)` II 29 per 4 panels (the heuristic search
   stopped at 40), its bound QEY_RS 24 (machine-model.md "Shared ports"); per super-block 976 -> 736 cycles, the decode
   step -3%.

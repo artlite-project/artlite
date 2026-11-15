@@ -109,6 +109,7 @@ The loop orders of a GEMM unit (y in L1, other nests, an L1 dequant staging): re
 | IQ3_S decode: a word of 9th bits per 4 panels in the records (a re-layout), the loop's own `vsel` instead of `_iq3s_hb` | II 33 instead of 29: 841 vs 736 + 122 per super-block |
 | Gather loops unrolled to 8 panels per iteration (any target II) | not pipelined, spills |
 | IQ3_XXS / IQ4 decode panel loops at target IIs | II 39 / 21 unchanged (their QEY_RS 30 / 18) |
+| IQ1 decode: the panels' vsel8 / vaddsub8 masks stored by the gather loop and loaded as scalars (no `vextract.64`) | a `mov` per mask into the mask registers: II 13 vs 9 per two panels |
 
 ## Data movement
 
