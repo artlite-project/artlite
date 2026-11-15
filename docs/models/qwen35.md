@@ -149,13 +149,15 @@ in a third of the layers the FFN gate and up in two different formats. Such a la
 64 outputs, its gate rows in tiles of one format, then its up rows in tiles of the other (`decode.image.split_rows`): a
 decode step keeps the gate rows' outputs until the up rows' come (`decode.design`'s `gusplit`), a prompt runs a GEMM per
 format and then the SiLU(gate) up step (`prefill/gate_up.py`). The IQ2 formats index grids of 8 values each, from {8,
-25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit masks (`formats/iq2.py`), 24 rows per tile.
-The files from UD-IQ3_S down hold IQ1_S and IQ1_M tensors too (UD-IQ3_XXS a few FFN tensors, UD-IQ1_M 42% of its bytes):
-their grid has 2048 entries of 8 values from {-1, 0, 1}, 32 rows per tile (`formats/iq1.py`). An IQ1_S tile holds each
-block's grid entry itself (its GGUF blocks leave the room in a tile), an IQ1_M tile the indices: the cores look those
-up in a table twice the size of a core's table room, so each entry is stored once and read by two lanes. More formats than a design of 4 slots pages: these files decode up to 8 tokens per dispatch. Their IQ tiles keep
-the cores busier than their bytes keep the DMA, so the smaller files are not faster: without a drafter a step of
-UD-IQ4_XS (14.4 GB of weights on the NPU) takes 311 ms, of UD-IQ3_XXS (11.5 GB) 333 ms, of UD-IQ1_M (8.7 GB) 438 ms.
+25, 43} (256, 512 and 1024 entries): the cores look an entry up as two 8-bit masks (IQ2_XXS's as its 8 values,
+`formats/iq2.py`), 24 rows per tile. The files from UD-IQ3_S down hold IQ1_S and IQ1_M tensors too (UD-IQ3_XXS a few FFN
+tensors, UD-IQ1_M 42% of its bytes): their grid has 2048 entries of 8 values from {-1, 0, 1}, 32 rows per tile
+(`formats/iq1.py`). An IQ1_S tile holds each block's grid entry itself (its GGUF blocks leave the room in a tile), an
+IQ1_M tile the indices: the cores look those up in a table twice the size of a core's table room, so each entry is
+stored once and read by two lanes. More formats than a design of 4 slots pages: these files decode up to 8 tokens per
+dispatch. Their IQ tiles keep the cores busier than their bytes keep the DMA, so the smaller files are not
+proportionally faster: without a drafter a step of UD-IQ4_XS (14.4 GB of weights on the NPU) takes 308 ms, of UD-IQ3_XXS
+(11.5 GB) 296 ms, of UD-IQ1_M (8.7 GB) 253 ms.
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
