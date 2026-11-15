@@ -280,9 +280,15 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
             {{ p }}_iq1_x<F>(xp + {{ 32 * PANEL }} * u + {{ 16 * PANEL }} * q, scr, (bfloat16 *)scr);
             const float *yq = F == 0 && q == 0 ? yu : zy;  // (IQ1_S: the deltas' term with the first half)
 {% if slots == 8 %}
-            AIE_LOOP_NO_UNROLL
-            for (int g = 0; g < 4; g++)  // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n)
-                {{ p }}_k23sc8<8, 256, 8>((const bfloat16 *)scr + 64 * g, sct + 128 * g + 64 * q, yq + (F == 0 && q == 0 ? 64 * g : 0), dg + 8 * g, y + 64 * g);
+            // (c (n, g) at 256 n + 64 g, its scales at 128 g + 64 q + 8 n; IQ1_M: a call per row group, its page has no
+            // room for _k23scg)
+            if constexpr (F == 0)
+                {{ p }}_k23scg<4, 8, 256, 64, 8, 128>((const bfloat16 *)scr, sct + 64 * q, yq, q == 0 ? 64 : 0, dg, y,
+                                                      (float *)(scr + 6464));
+            else
+                AIE_LOOP_NO_UNROLL
+                for (int g = 0; g < 4; g++)
+                    {{ p }}_k23sc8<8, 256, 8>((const bfloat16 *)scr + 64 * g, sct + 128 * g + 64 * q, yq, dg + 8 * g, y + 64 * g);
 {% else %}
             {{ p }}_iq1_sc((const bfloat16 *)scr, sct + 64 * q, yq, F == 0 && q == 0 ? 32 : 0, dg, y);
 {% endif %}
