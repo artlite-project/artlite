@@ -83,12 +83,15 @@ class PanelTable:
 
 @dataclasses.dataclass(eq=False)
 class Step:
-    """The transaction of a step of S slots (``b``: which of its two buffers, set by ``ModelOverlay._transaction``)."""
+    """The transaction of a step of S slots (``b``: which of its two buffers; ``fatt``: its F_ATT objects' fills as (BD
+    word index, layer, column, sub-step): the second buffer's step is a copy that reads that buffer's objects,
+    ``QwenOverlay._transaction``)."""
 
     S: int
     subs: tuple[tuple[int, int, int], ...]
     tr: Transaction | None = None
     b: int = 0
+    fatt: list[tuple[int, int, int, int]] = dataclasses.field(default_factory=list)
     fills: list[Fill] = dataclasses.field(default_factory=list)
     tails: list[Tail] = dataclasses.field(default_factory=list)
     drains: list[Drain] = dataclasses.field(default_factory=list)

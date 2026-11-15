@@ -157,7 +157,7 @@ class AttentionSteps:
         a, n, split = st.subs[u]
         rnd, kh = split & 3 == attn.SPLIT_ROUND, (split & attn.SPLIT_KV) >> 2
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", ov.fatt_object(L, c, u, st.b)), XB)
+            st.fatt.append((seq.fill("X", c, dev.address("ACT", ov.fatt_object(L, c, u, st.b)), XB), L, c, u))
             if split:  # (the q objects of the chain's columns in order; a round: of its half of the KV head's)
                 q0, nc = (kh * nph + 2 * (c // nph), 2) if rnd else (c - c % nph, nph)
                 seq.fill("X", c, dev.address("ACT", ov.q_object(L, q0, a)), nc * n * XB,

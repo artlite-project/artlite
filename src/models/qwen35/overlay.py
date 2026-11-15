@@ -41,6 +41,7 @@ column's weights between two attentions (their caches on A) as one run, its phas
 region-major one per phase and K group (the norm-weight objects from NORM).
 """
 
+import dataclasses
 import itertools
 import math
 import os
@@ -144,8 +145,10 @@ class QwenOverlay(ModelOverlay):
     NORMED = frozenset(NORMS)
     # a design of 4 slots patches the next step's position while a step runs (``ModelOverlay.AHEAD``: the attention layers'
     # words, angles and transfers, 0.37 ms of the 35B-A3B's 36 ms step that the NPU otherwise waits for): each transaction
-    # buffer reads F_ATT objects of its own (``fatt2``), the second buffer's transactions are built at their first use. A
-    # drafter's steps (``draft``) follow no step of their own; a design of 8 slots writes its steps' branch words between them.
+    # buffer reads F_ATT objects of its own (``fatt2``), the second buffer's transactions are copies of the first's, made
+    # at their first use (``_transaction``). Not after a step that ``patch_ahead`` patched (a drafter's round: the next
+    # step is the next round's, of other slots); a drafter's own steps (``draft``) follow none of their own; a design of
+    # 8 slots writes its steps' branch words between them.
     STEPS_AHEAD = True
     AHEAD_PREPARED = False
 
@@ -167,6 +170,7 @@ class QwenOverlay(ModelOverlay):
         self.AHEAD = self.STEPS_AHEAD and slots == 4 and self.ash is not None
         # (the positions whose ``rope`` rows the last position patch took, and the rows it took: ``_ring_state``)
         self._rope_used = (0, 0, b"")
+        self._round = False  # (``patch_ahead`` patched the next step: ``_run``)
         self.rope = _text_rope(self.max_positions)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
@@ -523,7 +527,17 @@ class QwenOverlay(ModelOverlay):
 
     def _transaction(self, key: StepKey) -> Step:
         """(built as the key's variant: ``_build`` reads ``ends``, which is the running step's when the next one's is
-        built ahead)"""
+        made ahead; the second buffer's: a copy of the first's whose F_ATT fills read that buffer's objects, 1 ms instead
+        of a build's ~100)"""
+        if key.b and key not in self._steps:
+            st = self._transaction(key._replace(b=0))
+            words = np.array(st.tr.words)
+            if st.fatt:
+                at = np.array([f[0] for f in st.fatt])
+                objs = np.array([self.fatt_object(L, c, u, 1) for _, L, c, u in st.fatt])
+                self._bd_words(words, at, self.dev.address("ACT") + objs, np.full(len(at), XB, np.int64))
+            self._steps[key] = dataclasses.replace(st, tr=Transaction(self.dev, words), b=1)
+            return self._steps[key]
         ends, self.ends = self.ends, key.variant[1]
         try:
             return super()._transaction(key)
@@ -542,6 +556,7 @@ class QwenOverlay(ModelOverlay):
         if self.blocks:
             self.ends = p % 8 + S >= 8
         super().patch_ahead(S, p)
+        self._round = True
 
     def passes(self, p: int, S: int) -> int:
         """The passes over the KV caches of a step at p .. p + S - 1 (a sub-step's two rounds: one, a KV head each)."""
@@ -668,6 +683,15 @@ class QwenOverlay(ModelOverlay):
             else:
                 cur.nrep, cur.cshift = 0, S
         return out
+
+    def _run(self, S: int, position: int, logits: bool) -> np.ndarray | None:
+        """(a step that ``patch_ahead`` patched patches none ahead itself: ``STEPS_AHEAD``)"""
+        ahead, self.AHEAD = self.AHEAD, self.AHEAD and not self._round
+        self._round = False
+        try:
+            return super()._run(S, position, logits)
+        finally:
+            self.AHEAD = ahead
 
     def _ran(self, p: int, S: int) -> None:
         for L in self.fatt:

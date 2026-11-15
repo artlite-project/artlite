@@ -23,6 +23,7 @@ Pipeline usage (batch dispatch, explicit sync)::
     result = y.numpy()  # one sync at the end
 """
 
+import gc
 import math
 import os
 import time
@@ -206,7 +207,13 @@ class Program:
             return self._kern
         self._ensure_loaded()
         dev = self._device
-        self._ctx = dev.create_context(self._exe)
+        try:
+            self._ctx = dev.create_context(self._exe)
+        except RuntimeError:
+            # (the device has 16 hardware contexts for all processes, and a dropped program keeps its own until the
+            # cycle collector runs: its operator's design objects are reference cycles)
+            gc.collect()
+            self._ctx = dev.create_context(self._exe)
         self._kern = _native.Kernel(dev, self._ctx)
 
         cfg = self._prof_cfg
