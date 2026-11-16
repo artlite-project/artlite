@@ -7,7 +7,7 @@ from contextlib import nullcontext
 import numpy as np
 import pytest
 
-from artlite import _native, overlay, txn
+from artlite import _native, overlay, portable, txn
 from artlite.operators import l1_layout
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence
@@ -239,6 +239,7 @@ def _fake_device(monkeypatch: pytest.MonkeyPatch, kernel: object, *, prologue: b
     dev._loaded = _transaction_words(9)
     dev._prologue = types.SimpleNamespace(buffer=None, words=_transaction_words(3)) if prologue else None
     dev.stale = prologue
+    dev._last = portable.uptime()  # (a dispatch just ended: the NPU is awake, the prologue runs when stale)
     return dev
 
 
