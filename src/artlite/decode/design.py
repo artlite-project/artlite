@@ -83,7 +83,8 @@ Paged formats (``paged``: a model whose formats' kernels do not fit the cores to
 before a tile of it (``gemv.render(paged=)``) from a store in their memtile (``PG_*``: its channel, BDs, bytes, or a store
 per core half: ``pg_split``; the pager's state words and wake lock on both cores), which ``page_store`` links and the device
 loads before a dispatch
-whenever it is stale (``artlite.overlay.OverlayDevice.set_prologue``: first, then after another hardware context ran).
+whenever it is stale (``artlite.overlay.OverlayDevice.set_prologue``: first, then after another hardware context ran or
+the NPU may have powered down).
 """
 
 from __future__ import annotations

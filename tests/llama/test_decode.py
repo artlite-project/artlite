@@ -16,6 +16,8 @@ Q4_K_M (hidden 2560 and ffn 9728 in K chunks padded with zero super-blocks; 4 qu
 """
 
 
+import time
+
 import numpy as np
 import pytest
 import torch
@@ -100,6 +102,37 @@ def test_llama_decode_steps(case: str, kv_k: str) -> None:
         keep(f"ring.{L}", torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < TOL for v in worst.values()), worst
+
+
+def test_llama_decode_after_suspend() -> None:
+    """A paged overlay's step after the NPU powered down (Linux: the driver's runtime suspend, 5 s after the device's
+    last job) gives the logits it gave before: the array lost the formats' code pages, and the overlay's prologue loads
+    them again (``OverlayDevice.set_prologue``). Skipped where the device does not suspend (``power/control`` on,
+    another process on the NPU, no such files)."""
+    pm = "/sys/class/accel/accel0/device/power/"
+
+    def read(name: str) -> str:
+        try:
+            with open(pm + name) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    if read("control") != "auto":
+        pytest.skip(f"the NPU does not runtime-suspend here ({pm}control: {read('control') or 'no such file'})")
+    quant, size, layers = CASES["1B_Q4_K_M"]
+    g = _gguf(quant, size)
+    x = ref.LlamaNpuRef(g, layers, VOCAB).embed(_tokens(4))
+    ov = LlamaOverlay(g, layers=layers, vocab=VOCAB, max_positions=256)
+    assert ov.op.paged, "the slice's formats are code pages"
+    ov.load()
+    before = np.array(ov.step(x, 0))
+    end = time.monotonic() + int(read("autosuspend_delay_ms") or 5000) / 1e3 + 3
+    while read("runtime_status") != "suspended":
+        if time.monotonic() > end:
+            pytest.skip("the NPU stayed awake (another process's work)")
+        time.sleep(0.1)
+    assert np.array_equal(np.array(ov.step(x, 0)), before)
 
 
 @pytest.mark.parametrize("kv_k", list(KV_K))

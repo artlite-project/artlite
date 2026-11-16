@@ -21,7 +21,6 @@ import collections
 import contextlib
 import functools
 import os
-import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -29,11 +28,15 @@ from typing import ClassVar, Protocol
 
 import numpy as np
 
-from . import _native, backend, parallel_compile, txn
+from . import _native, backend, parallel_compile, portable, txn
 from ._native import Buffer, Device, DispatchError
 
 SPIN_MARGIN_US = 1000  # a transaction's spin starts this long before its shortest recent duration
-_IDLE_PROLOGUE_S = 2.5  # Windows: NPU columns/SRAM power-gate after ~4.5-5s idle; re-run prologue twice above this
+# A device's dispatches this far apart: the NPU may have been powered down in between (the driver suspends it 5 s after
+# its last job, Linux's ``power/autosuspend_delay_ms``; Windows gates the array after ~4.5 s; a sleep of the whole
+# system), and with it the array's memories (``OverlayDevice.set_prologue``). Well under those: a prologue on an array
+# that kept its state takes 0.3 ms.
+IDLE_S = 1.0
 
 
 @functools.cache
@@ -236,39 +239,35 @@ class OverlayDevice:
         self._prologue: Transaction | None = None
         self.stale = False  # (``set_prologue``)
         self._turns = -1  # (``turn_foreign`` at the last dispatch)
-        self._last_dispatch: float | None = time.monotonic() if backend.ADDRESSES_NEED_CONTEXT else None
+        self._last = -IDLE_S  # (``portable.uptime`` at the last dispatch's end)
 
     def set_prologue(self, words: np.ndarray) -> None:
-        """A transaction run before the next dispatch whenever ``stale``: state the design keeps on the array beyond its
-        configuration (code pages' stores: ``paging.Store``), lost when another hardware context ran on the device: of
-        this process (its owner then sets ``stale``) or of another (the NPU's turn says so: ``npu_turn``). Stale from
-        here on."""
+        """A transaction run before the next dispatch whenever the array may have lost the state the design keeps on it
+        beyond its configuration (code pages' stores: ``paging.Store``): another hardware context ran on the device, of
+        this process (its owner then sets ``stale``) or of another (the NPU's turn says so: ``npu_turn``), or the
+        device's last dispatch ended ``IDLE_S`` ago (the NPU powered down since: the context comes back with its
+        configuration alone). Stale from here on."""
         self._prologue = Transaction(self, words)
         self.stale = True
-        self._last_dispatch = time.monotonic()
 
     def open(self) -> None:
         """The hardware context now (else at the first dispatch): before a timed dispatch, as the first context of a
         process wakes the NPU (~40 ms)."""
         self._prog._kernel()
-        self._last_dispatch = time.monotonic()
 
     def _fresh(self) -> None:
         """(In the NPU's turn, before a dispatch.)"""
         turns = _native.turn_foreign()
-        idle = (sys.platform == "win32" and self._last_dispatch is not None
-                and time.monotonic() - self._last_dispatch >= _IDLE_PROLOGUE_S)
-        if self._prologue is not None and (self.stale or turns != self._turns or idle):
-            self.stale = False
-            try:
-                # After NPU power-gating on Windows, the first prologue wakes the hardware while the
-                # second reliably reloads the SRAM code pages onto the awake array.
-                for _ in range(2 if idle else 1):
-                    self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
-            except DispatchError as e:
-                self._note(e, self._prologue, what="the prologue's transaction (code pages)")
-                raise
-            self._last_dispatch = time.monotonic()
+        if self._prologue is not None:
+            idle = portable.uptime() - self._last >= IDLE_S
+            if self.stale or idle or turns != self._turns:
+                self.stale = False
+                try:
+                    for _ in range(portable.WAKE_DISPATCHES if idle else 1):
+                        self._prog._kernel().dispatch(self._prologue.buffer, list(self.buffers.values()))
+                except DispatchError as e:
+                    self._note(e, self._prologue, what="the prologue's transaction (code pages)")
+                    raise
         self._turns = turns
 
     def alloc(self, name: str, nbytes: int) -> np.ndarray:
@@ -327,7 +326,6 @@ class OverlayDevice:
             try:
                 if transaction is None:
                     self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
-                    self._last_dispatch = time.monotonic()
                     return
                 t0 = time.perf_counter()
                 self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
@@ -335,7 +333,8 @@ class OverlayDevice:
             except DispatchError as e:
                 self._note(e, transaction)
                 raise
-        self._last_dispatch = time.monotonic()
+            finally:
+                self._last = portable.uptime()
         transaction.durations.append(time.perf_counter() - t0)
 
     def submit(self, transaction: Transaction) -> None:
@@ -352,11 +351,12 @@ class OverlayDevice:
         self._submitted = None
         try:
             self._prog._kernel().dispatch_wait(spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
-            self._last_dispatch = time.monotonic()
             transaction.durations.append(time.perf_counter() - t0)
         except DispatchError as e:
             self._note(e, transaction)
             raise
+        finally:
+            self._last = portable.uptime()
 
     def _note(self, e: DispatchError, transaction: Transaction | None, *, what: str | None = None) -> None:
         """Add where the firmware was to a DispatchError (``txn.hang_note``): the transaction ``transaction`` (None:

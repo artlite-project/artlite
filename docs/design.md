@@ -309,9 +309,13 @@ a clean failure, never while a job may be hung (a mailbox timeout destroys the c
 - In PASID mode the NPU addresses BOs by user VA through MMU notifiers: a `munmap`,
   `mprotect` or `fork` of a BO range while a job runs blocks until the client is idle. Allocate
   BOs before dispatching, and don't free buffers or spawn processes during an async dispatch.
-- The device runtime-suspends 5 s after the last job or ioctl, open contexts or not; a resume
-  re-creates every context in the firmware. `FusedOperator` and `Program` create their context
-  at the first dispatch.
+- The device runtime-suspends 5 s after the last job or ioctl, open contexts or not (the
+  driver's default, `power/control` `auto`); a resume re-creates every context in the firmware,
+  and its next command loads its configuration again. `FusedOperator` and `Program` create
+  their context at the first dispatch. What a design keeps on the array beyond its configuration
+  (a paged decode overlay's code pages) is gone after a suspend: an overlay's prologue writes it
+  again before a dispatch that follows the device's last one by a second or more
+  (`OverlayDevice.set_prologue`; without it the next step ends in `TIMEOUT (state 8)`).
 - Hang detection is device-wide (a hang aborts every context's work: ABORT) and nothing can
   cancel a submitted command.
 

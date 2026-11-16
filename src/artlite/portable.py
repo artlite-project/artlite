@@ -1,5 +1,5 @@
 """The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups, a
-thread's CPU, the memory still available, a pipe's buffer.
+thread's CPU, the memory still available, a pipe's buffer, the time since the system started, how the NPU wakes.
 (``gguf_model``'s page hints test for ``mmap.madvise`` themselves.)"""
 
 import contextlib
@@ -13,6 +13,10 @@ from typing import Any
 
 WINDOWS = sys.platform == "win32"
 EXE = ".exe" if WINDOWS else ""
+# Dispatches of an overlay's prologue after the NPU may have powered down (``overlay.OverlayDevice._fresh``). Linux's
+# driver resumes the device and re-creates the context before the dispatch runs: one. On Windows the dispatch that
+# wakes the array does not reliably leave the stores it writes there, the next one does (Krackan Point, Ryzen AI 1.9).
+WAKE_DISPATCHES = 2 if WINDOWS else 1
 
 if WINDOWS:
     import msvcrt
@@ -86,6 +90,13 @@ def on_cpu(cpu: int) -> Iterator[None]:
         yield
     finally:
         put(0, old)
+
+
+def uptime() -> float:
+    """Seconds since the system started, its sleeps included (Linux: CLOCK_BOOTTIME, as ``time.monotonic`` stands
+    still there while the system sleeps)."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.monotonic() if clock is None else time.clock_gettime(clock)
 
 
 def available_memory() -> int | None:
