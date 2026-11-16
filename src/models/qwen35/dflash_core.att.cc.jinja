@@ -70,7 +70,7 @@ __attribute__((noinline)) void {{ p }}_qk1(const uint8_t *__restrict k, const ui
 {{ e192.parts.reduce.src }}
 {{ e192.parts.poly.src }}
 
-{% include "models/qwen35/attn.pv4.cc.jinja" %}
+{% include "artlite/decode/attn256.pv4.cc.jinja" %}
 // y += P V of the 4 octets (two calls) of pairs v, vb and their P panels (pp: [octet 4][P 4])
 __attribute__((noinline)) void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp, float *__restrict y)
 {
@@ -129,7 +129,7 @@ __attribute__((noinline, minsize)) void {{ p }}_soft4(int32_t *__restrict ws, ui
     }
 }
 
-{% include "models/qwen35/attn.qpan.cc.jinja" %}
+{% include "artlite/decode/attn256.qpan.cc.jinja" %}
 // A row's K (HD fp32) into its row of the open rows ([d-block][position 8][8] bf16: dst its first values)
 __attribute__((noinline)) void {{ p }}_krow(const float *__restrict k, bfloat16 *__restrict dst)
 {

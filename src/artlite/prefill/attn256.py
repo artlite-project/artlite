@@ -1,6 +1,7 @@
-"""The prefill of the qwen35 full-attention layers: a T-token chunk at position p0 (a multiple of 32) from the attn_in
-GEMMs' output G (``prefill.gemm``: per column [q + gate of its QC heads | K part | V part]: KV head h's dims in the NPH
-= 8 / KV heads columns NPH h ..) to the attn_out GEMM's A.
+"""The prefill of the gated attention of head_dim 256 (``decode.attn256``: the qwen35 models' full-attention layers): a
+T-token chunk at position p0 (a multiple of 32) from the attn_in GEMMs' output G (``prefill.gemm``: per column [q + gate
+of its QC heads | K part | V part]: KV head h's dims in the NPH = 8 / KV heads columns NPH h ..) to the attn_out GEMM's
+A.
 
 ``AttnPrepOperator``: per column c, cores 2 .. 1 + QC one per q head (the column's heads QC c ..), core 2 + QC the
 column's KV role. Per 8 tokens a Q core turns its head's rows into the attention's operands: q / rms(q) q_norm, the
@@ -54,7 +55,8 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from artlite.model_config import QwenConfig
+from artlite.decode import attn256 as AT
+from artlite.decode.attn256 import AttnConfig
 from artlite.npu_regs import window_counter_writes
 from artlite.operators import kmath, templating
 from artlite.operators.base import ArgSpec, ArtcOperator
@@ -73,8 +75,6 @@ from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.l1_layout import REGION, pin_l1_buffers
 from artlite.operators.util import Attr, arg_elems, bf16_hilo, cos_sin_rows, mask64, regions
 from artlite.prefill.gemm import Layout
-
-from . import attn as AT
 
 HD = AT.HD
 ND = AT.ND
@@ -96,13 +96,13 @@ QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
 
 
-def pass_groups(cfg: QwenConfig, T: int) -> int:
+def pass_groups(cfg: AttnConfig, T: int) -> int:
     """QG: the token groups per core and head in a 32 QG-token attention pass (2 when a column holds one q head and T
     allows, the L1 of the 9B's two heads: half the history's re-streams); QS holds the slots pass by pass."""
     return 2 if cfg.num_attention_heads == COLS and T % 64 == 0 else 1
 
 
-def two_streams(cfg: QwenConfig, T: int) -> bool:
+def two_streams(cfg: AttnConfig, T: int) -> bool:
     """Whether the prefill attention of a T-token chunk takes each KV head's cache on two streams (two row panels per
     core: one q head per column and QG = 2, or two q heads; a KV head's 4 columns at least, each stream from two
     shims)."""
@@ -118,18 +118,18 @@ def part_walk() -> TensorAccessPattern:
     return stream_walk(SLOT // 4, [(ND // 4, 72), (2, SLOT // 8), (72, 1)])
 
 
-def cs_rows(cfg: QwenConfig, positions: np.ndarray | range) -> np.ndarray:
+def cs_rows(cfg: AttnConfig, positions: np.ndarray | range) -> np.ndarray:
     """(n, 64) fp32: per position (text, or M-RoPE (T, H, W)) [cos 32 | sin 32] of the rotated pairs
-    (``QwenConfig.rope_theta``)."""
+    (``cfg.rope_theta``)."""
     return cos_sin_rows(cfg.rope_theta(positions))
 
 
-def cs_table(cfg: QwenConfig, n: int) -> np.ndarray:
+def cs_table(cfg: AttnConfig, n: int) -> np.ndarray:
     """(n, 64) fp32: ``cs_rows`` of the text positions 0 .. n - 1."""
     return cs_rows(cfg, range(n))
 
 
-_PREP = templating.load("models/qwen35/attn_prefill.prep.cc.jinja")
+_PREP = templating.load("artlite/prefill/attn256.prep.cc.jinja")
 
 
 class AttnPrepOperator(ArtcOperator):
@@ -143,7 +143,7 @@ class AttnPrepOperator(ArtcOperator):
     STACK = 3072
     pfx = kernel_prefix("qap")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, head_bytes: int, cs_positions: int):
+    def __init__(self, *, T: int, cfg: AttnConfig, layout: Layout, head_bytes: int, cs_positions: int):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0, "whole cache groups"
@@ -316,7 +316,7 @@ class AttnPrepOperator(ArtcOperator):
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
 
-_ATTN = templating.load("models/qwen35/attn_prefill.cc.jinja")
+_ATTN = templating.load("artlite/prefill/attn256.cc.jinja")
 
 
 class PrefillAttnOperator(ArtcOperator):
@@ -328,7 +328,7 @@ class PrefillAttnOperator(ArtcOperator):
     panels [T / 8][heads x 32]). Parameters ``QA_N`` = p0 / 32 + 1 (the history groups every pass streams first, and the
     cores' trip count), ``QA_OFF`` (T's): the bf16 offset of the chunk's second group (``params``).
 
-    Non-causal (``causal`` False: ``QwenConfig.causal``, vllm-d3's decision models): a prompt of n tokens in one chunk
+    Non-causal (``causal`` False: a non-causal model's, vllm-d3's decision models): a prompt of n tokens in one chunk
     at position 0, every pass streams the prompt's groups (``QA_N`` of them) and each query sees all of its keys, those
     after the prompt's in its last group masked (``QA_NK``: the prompt's keys there).
 
@@ -341,7 +341,7 @@ class PrefillAttnOperator(ArtcOperator):
     STACK = 3072
     pfx = kernel_prefix("qaa")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
+    def __init__(self, *, T: int, cfg: AttnConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
                  pp: int = 1, pack: bool = False):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
         results); "ev_qk", "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters

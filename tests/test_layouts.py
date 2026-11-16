@@ -11,12 +11,11 @@ import pytest
 from jinja2 import meta
 
 from artlite.decode import attn as decode_attn
-from artlite.decode import protocol
+from artlite.decode import attn256, protocol
 from artlite.operators import templating
 from artlite.operators.words import LayoutError
 from artlite.vision import core as vision_core
 from models.lfm import conv as lfm_conv
-from models.qwen35 import attn as qwen_attn
 from models.qwen35 import dflash_core, gdn, words
 
 # the layout names a template may use: the words, flags and values of the layouts (their prefixes)
@@ -34,8 +33,8 @@ def _templates() -> dict[str, dict[str, int]]:
         "models/lfm/conv.cc.jinja": lfm_conv.STATE.consts() | decode_attn.consts(),
         "artlite/vision/core.cc.jinja": vision_core.consts(),
     }
-    out |= {f"models/qwen35/{t}": qwen_attn.consts() for t in ("attn.cc.jinja", "attn.main.cc.jinja", "attn.main_one.cc.jinja",
-                                                              "attn.one.cc.jinja")}
+    out |= {f"artlite/decode/{t}": attn256.consts() for t in ("attn256.cc.jinja", "attn256.main.cc.jinja",
+                                                              "attn256.main_one.cc.jinja", "attn256.one.cc.jinja")}
     out |= {f"models/qwen35/{t}": dflash_core.consts() for t in ("dflash_core.att.cc.jinja", "dflash_core.conv.cc.jinja")}
     root = os.path.dirname(os.path.dirname(templating.__file__))
     for path in glob.glob(os.path.join(os.path.dirname(root), "models", "qwen35", "gdn*.jinja")):
@@ -65,17 +64,18 @@ def test_decode_design_words() -> None:
     assert [protocol.M_FLAGS, protocol.M_SKIP, protocol.M_SLOT, protocol.M_MODEL] == [0, 20, 23, 24]
     assert c["M_TOK_NG"] == 48 and c["M_RBASE"] == 50 and c["S_SG"] == 48 and c["C_KIND"] == 4
     # (a design takes each flag bit once, whichever model's kinds it composes)
-    for kinds in ((words.GDN_IN, words.ATT, words.FLAGS), (dflash_core.CONV, dflash_core.ATT, words.FLAGS)):
+    for kinds in ((words.GDN_IN, words.FLAGS, attn256.ATT, attn256.FLAGS), (dflash_core.CONV, dflash_core.ATT, attn256.FLAGS)):
         protocol.XMETA.consts(protocol.PHASE, protocol.TOKEN, protocol.MOE, *kinds)
     protocol.XMETA.consts(protocol.PHASE, protocol.TOKEN, protocol.MOE, decode_attn.ATT, decode_attn.TOKEN_ATT,
                           lfm_conv.CONV, lfm_conv.CONV_TOKEN)
 
 
 def test_two_attention_flags_never_meet() -> None:
-    """The attention cores of the shared design (``decode.attn``) and qwen35's name a different bit F_ATT."""
-    assert decode_attn.F_ATT != words.F_ATT
+    """The attention cores of the shared design (``decode.attn``) and the head_dim-256 one (``decode.attn256``) name a
+    different bit F_ATT."""
+    assert decode_attn.F_ATT != attn256.F_ATT
     with pytest.raises(LayoutError, match="F_ATT is"):
-        protocol.XMETA.consts(decode_attn.ATT, words.FLAGS)
+        protocol.XMETA.consts(decode_attn.ATT, attn256.FLAGS)
 
 
 def test_state_words_of_exclusive_features() -> None:
@@ -83,8 +83,8 @@ def test_state_words_of_exclusive_features() -> None:
     with pytest.raises(LayoutError, match="never meet"):
         protocol.STATE.together(protocol.POST_STATE, protocol.MOE_STATE)
     with pytest.raises(LayoutError, match="never meet"):
-        protocol.STATE.together(protocol.TOK_STATE, qwen_attn.GATES)  # (the gates take the token objects' words)
-    protocol.STATE.together(protocol.POST_STATE, qwen_attn.GATES)
+        protocol.STATE.together(protocol.TOK_STATE, attn256.GATES)  # (the gates take the token objects' words)
+    protocol.STATE.together(protocol.POST_STATE, attn256.GATES)
 
 
 def test_vision_command_regions() -> None:

@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 
 import numpy as np
 
+from artlite.decode.attn256 import OBJ_BYTES
 from artlite.decode.image import column_rows
 from artlite.decode.protocol import interleave, norm_objects
 from artlite.gguf_model import GGUFFile
@@ -37,7 +38,6 @@ from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence
 
-from .attn import OBJ_BYTES
 from .image import HEAD_ROWS, TABLE_ROWS, QwenImage, head_tokens
 from .overlay import QwenOverlay
 

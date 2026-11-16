@@ -69,7 +69,7 @@ template <int NO>
 {{ e192.parts.reduce.src }}
 {{ e192.parts.poly.src }}
 
-{% include "models/qwen35/attn.pv4.cc.jinja" %}
+{% include "artlite/decode/attn256.pv4.cc.jinja" %}
 // P V (``pv4``) of the pairs of records v, vb for the octets: two at once, then a third alone
 __attribute__((noinline)) void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, const uint8_t *__restrict pp, float *__restrict y)
 {
@@ -166,7 +166,7 @@ __attribute__((noinline, minsize)) void {{ p }}_kmerge(uint8_t *a, const uint8_t
     }
 }
 
-{% include "models/qwen35/attn.qpan.cc.jinja" %}
+{% include "artlite/decode/attn256.qpan.cc.jinja" %}
 // A slot's K (256 fp32) into its row of the new rows ([d-block][position 8][8] bf16: dst its first values)
 __attribute__((noinline, minsize)) void {{ p }}_krow(const float *__restrict k, bfloat16 *__restrict dst)
 {
@@ -207,7 +207,7 @@ __attribute__((noinline, minsize)) void {{ p }}_venc(const bfloat16 *__restrict 
     }
 }
 
-{% include "models/qwen35/attn.pkeep.cc.jinja" %}
+{% include "artlite/decode/attn256.pkeep.cc.jinja" %}
 // Tail object t of the step (t = 0: the record of its first position; 1: of its last, nothing more when one holds both):
 // the record's rows ([d-block 32][position 8][8] bf16): its ring slot, in place. The step's V rows in; the octets' P panels (rows past
 // their positions: the masked scores of ``aobj``), l += P; then per slot of the step in the record: the record's V panels

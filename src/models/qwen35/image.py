@@ -62,6 +62,7 @@ import math
 import numpy as np
 from ml_dtypes import bfloat16
 
+from artlite.decode.attn256 import OBJ_BYTES
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
@@ -69,8 +70,6 @@ from artlite.decode.screen import screened
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
-
-from .attn import OBJ_BYTES
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",

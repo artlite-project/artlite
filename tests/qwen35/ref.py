@@ -13,8 +13,8 @@ attention column); the GDN state's panel layout: ``state_panels`` and its invers
 
 import numpy as np
 
+from artlite.decode.attn256 import HD, ROT
 from artlite.model_config import QwenConfig
-from models.qwen35.attn import HD, ROT
 from models.qwen35.gdn_math import D
 
 from ..moe.ref import experts, moe_ffn, moe_route, shared_expert, swiglu
@@ -279,7 +279,7 @@ def core_gdn_scan(*, qkv: np.ndarray, ab: np.ndarray, conv_state: np.ndarray, co
 def core_attention(q_gate: np.ndarray, k_new: np.ndarray, v_new: np.ndarray, k_cache: np.ndarray,
                    v_cache: np.ndarray, *, q_norm: np.ndarray, k_norm: np.ndarray, cs: tuple[np.ndarray, np.ndarray],
                    eps: float) -> tuple[np.ndarray, np.ndarray]:
-    """One column's decode attention (``qwen35.attn``) in fp64: q_gate (QC, 512) [q | gate] raw, k_new / v_new (256)
+    """One column's decode attention (``decode.attn256``) in fp64: q_gate (QC, 512) [q | gate] raw, k_new / v_new (256)
     raw of its KV head, the cache before the position (P, 256) (K normed and rotated), cs: the position's cos, sin
     (``attn.rope_cs``). Returns (o * sigmoid(gate) (QC, 256), K of the position (normed, rotated))."""
     c, s = (np.asarray(x, np.float64) for x in cs)

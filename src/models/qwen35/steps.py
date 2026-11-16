@@ -1,16 +1,9 @@
 """A qwen35 step's transaction and the records of the BDs that its position patches.
 
-``Step`` is the built transaction of a step of S slots (its attentions' sub-steps ``subs``: first slot, slots, how the
-chains divide their caches' groups) with the words that follow the position:
-
-- the attentions' KV cache and ring reads (A: their address and length): ``Fill`` (the cache; ``FILLS``: the whole cache,
-  the sub-step's group, a split column's run) and ``Tail`` (a ring's open record);
-- the record drains (C: their address): ``Drain``;
-- a chunkwise GDN core's state panels (their GSTATE half follows the block of the step's position):
-  ``StatePanel``, as arrays in ``PanelTable``.
-
-Each record is written where the transfer is queued (``attn_steps``, ``gdn_steps``) and read where the position patches it,
-by name.
+``Step`` is the built transaction of a step of S slots with the words that follow the position: the attentions' cache and
+ring reads and record drains (``decode.attn256_steps.AttnStep``'s) and a chunkwise GDN core's state panels (their GSTATE
+half follows the block of the step's position): ``StatePanel``, as arrays in ``PanelTable``. Each record is written where
+the transfer is queued (``decode.attn256_steps``, ``gdn_steps``) and read where the position patches it, by name.
 """
 
 import dataclasses
@@ -18,40 +11,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-from artlite.overlay import Transaction
-
-FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
-
-
-class Fill(NamedTuple):
-    """A cache fill: its BD word index, the layer, the column, the sub-step and which groups (``FILLS``)."""
-
-    at: int
-    layer: int
-    column: int
-    sub: int
-    kind: str
-
-
-class Tail(NamedTuple):
-    """A tail fill (a ring's open record): its BD word index, the layer, the column, the sub-step, the tail object."""
-
-    at: int
-    layer: int
-    column: int
-    sub: int
-    tail: int
-
-
-class Drain(NamedTuple):
-    """A record drain: its BD handle, the layer, the column, the sub-step and which of the sub-step's drains it is (a
-    chain's first column's K records 0, 1; its last column's V panels and rows of record 0, then of record 1)."""
-
-    handle: list[int]
-    layer: int
-    column: int
-    sub: int
-    index: int
+from artlite.decode.attn256_steps import AttnStep
 
 
 class StatePanel(NamedTuple):
@@ -82,20 +42,9 @@ class PanelTable:
 
 
 @dataclasses.dataclass(eq=False)
-class Step:
-    """The transaction of a step of S slots (``b``: which of its two buffers; ``fatt``: its F_ATT objects' fills as (BD
-    word index, layer, column, sub-step): the second buffer's step is a copy that reads that buffer's objects,
-    ``QwenOverlay._transaction``)."""
+class Step(AttnStep):
+    """The transaction of a step of S slots (``AttnStep``) and its chunkwise GDN cores' state panels."""
 
-    S: int
-    subs: tuple[tuple[int, int, int], ...]
-    tr: Transaction | None = None
-    b: int = 0
-    fatt: list[tuple[int, int, int, int]] = dataclasses.field(default_factory=list)
-    fills: list[Fill] = dataclasses.field(default_factory=list)
-    tails: list[Tail] = dataclasses.field(default_factory=list)
-    drains: list[Drain] = dataclasses.field(default_factory=list)
-    patch: dict[str, np.ndarray] | None = None  # (``attn_steps.patch_tables``)
     panels: list[StatePanel] = dataclasses.field(default_factory=list)
     table: PanelTable | None = None  # (``panels`` as arrays, at the first patch)
     half: int = -1  # (the GSTATE half the panels are patched for: ``gdn_steps.GdnTransfers.patch_panels``)

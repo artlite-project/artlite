@@ -36,6 +36,11 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
+from artlite.decode.attn256 import (  # (POS_PER_GROUP: an A object of the ring: 4 records [K pairs 2 | V pairs 2])
+    FLAGS,
+    OBJ_BYTES,
+    POS_PER_GROUP,
+)
 from artlite.decode.design import DecodeOverlayOperator, _Streams
 from artlite.decode.kv import Records
 from artlite.decode.protocol import C_LEN, M_MODEL, META, PHASE, XMETA, XPAY
@@ -46,12 +51,6 @@ from artlite.operators.design import COLS
 from artlite.operators.l1_layout import REGION
 from artlite.operators.util import Attr, regions
 from artlite.operators.words import WordMap
-
-from .attn import (  # (POS_PER_GROUP: an A object of the ring: 4 records [K pairs 2 | V pairs 2])
-    OBJ_BYTES,
-    POS_PER_GROUP,
-)
-from .words import FLAGS
 
 HD, QC, QH = 128, 4, 8 * 128  # (a head's dims, the query heads per column, the rows' stride of an octet)
 ND = HD // 8
@@ -70,7 +69,7 @@ H8 = 8 * XK  # a column's channels
 GROUPS = H8 // 16  # conv groups of a column
 DYN_ROWS = 192  # dyn's rows per slot in its object: whole C objects of its 160
 # metadata words: a conv core's object (``CONV``: the flag ``F_CV``, the op and the objects' count) and an attention step's first
-# object (``ATT``: ``words.F_ATT``)
+# object (``ATT``: ``decode.attn256.F_ATT``)
 CONV = XMETA.kind("dflash conv")
 F_CV = CONV.flag("F_CV", 11)  # M_FLAGS of a conv core's object
 M_CVOP, M_CVNE = CONV.words("M_CVOP M_CVNE", at=M_MODEL)

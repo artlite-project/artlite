@@ -2,12 +2,12 @@
 
 import numpy as np
 
+from artlite.decode.attn256 import OBJ_BYTES
 from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
 
-from .attn import OBJ_BYTES
 from .dflash_core import GROUPS, QC
 from .image import KC, payload
 

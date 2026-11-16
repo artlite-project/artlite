@@ -1,30 +1,116 @@
-"""A step's attention layers on the decode overlay: the transfers of attn_in and the attention per sub-step
-(``AttentionSteps.build``) and what the step's position patches into them (``set_position``).
+"""A step's attention layers (``attn256``) on the decode overlay: the transfers of attn_in and the attention per
+sub-step (``AttentionSteps.build``) and what the step's position patches into them (``set_position``).
 
 The position patches three things, each a named part: the F_ATT objects (``att_words``: per sub-step and column the words of
 the attention core, pure arithmetic on the attention's shape; their angles), the cache and ring reads (``patch_fills``, ``patch_tails``:
-the BDs of ``Step.fills`` and ``Step.tails``) and the record drains (``patch_drains``). A sub-step's records are 8 positions;
-four make a group (a K and a V object) of the cache, a ring of two slots holds the open records' V rows
-(``decode.vring``).
+the BDs of ``AttnStep.fills`` and ``AttnStep.tails``) and the record drains (``patch_drains``). A sub-step's records are 8
+positions; four make a group (a K and a V object) of the cache, a ring of two slots holds the open records' V rows
+(``decode.vring``). Each record is written where the transfer is queued and read where the position patches it, by name.
 """
 
+import dataclasses
 import time
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite.decode.protocol import AB_ID, C_LEN, M_NASKIP, M_NREL, M_NS, M_SKIP, META, XB
-from artlite.operators.bfp16 import block_values
-from artlite.operators.design import COLS
-from artlite.overlay import Sequence
+from ..operators.bfp16 import block_values
+from ..operators.design import COLS
+from ..overlay import Sequence, Transaction
+from . import attn256 as attn
+from .attn256 import M_ANA, M_G0, M_GATT, M_GJ, M_NTAIL, M_POS, M_SA, M_SPLIT
+from .protocol import AB_ID, C_LEN, M_NASKIP, M_NREL, M_NS, M_SKIP, META, XB
+from .vring import VRing
 
-from . import attn
-from .steps import FILLS, Drain, Fill, Step, Tail
-from .words import M_ANA, M_G0, M_GATT, M_GJ, M_NTAIL, M_POS, M_SA, M_SPLIT
+FILLS = ("all", "new", "run")  # a step's cache fills: the whole cache, the sub-step's group, a split column's run
 
-if TYPE_CHECKING:
-    from .overlay import QwenOverlay
+
+class Fill(NamedTuple):
+    """A cache fill: its BD word index, the layer, the column, the sub-step and which groups (``FILLS``)."""
+
+    at: int
+    layer: int
+    column: int
+    sub: int
+    kind: str
+
+
+class Tail(NamedTuple):
+    """A tail fill (a ring's open record): its BD word index, the layer, the column, the sub-step, the tail object."""
+
+    at: int
+    layer: int
+    column: int
+    sub: int
+    tail: int
+
+
+class Drain(NamedTuple):
+    """A record drain: its BD handle, the layer, the column, the sub-step and which of the sub-step's drains it is (a
+    chain's first column's K records 0, 1; its last column's V panels and rows of record 0, then of record 1)."""
+
+    handle: list[int]
+    layer: int
+    column: int
+    sub: int
+    index: int
+
+
+@dataclasses.dataclass(eq=False)
+class AttnStep:
+    """The transaction of a step of S slots (its attentions' sub-steps ``subs``: first slot, slots, how the chains divide
+    their caches' groups; ``b``: which of its two buffers; ``fatt``: its F_ATT objects' fills as (BD word index, layer,
+    column, sub-step): the second buffer's step is a copy that reads that buffer's objects) with the records of the BDs
+    that its position patches: ``fills``, ``tails``, ``drains`` and their arrays (``patch``)."""
+
+    S: int
+    subs: tuple[tuple[int, int, int], ...]
+    tr: Transaction | None = None
+    b: int = 0
+    fatt: list[tuple[int, int, int, int]] = dataclasses.field(default_factory=list)
+    fills: list[Fill] = dataclasses.field(default_factory=list)
+    tails: list[Tail] = dataclasses.field(default_factory=list)
+    drains: list[Drain] = dataclasses.field(default_factory=list)
+    patch: dict[str, np.ndarray] | None = None  # (``AttentionSteps.patch_tables``)
+
+
+class AttnOverlay(Protocol):
+    """What ``AttentionSteps`` takes of its decode overlay (``decode.model.ModelOverlay`` with the attention's layout:
+    qwen35's ``QwenOverlay``): per attention layer L its F_ATT objects (``fatt``: L -> ACT offset, ``fatt_object``,
+    ``fobj``: their first words [buffer][layer][column][sub-step]), q objects (``q_object``), the slots' raw K, V objects
+    (``rawkv``), KV caches (``kv_off``, ``ash.head_bytes`` per KV head) and rings (``ring``)."""
+
+    dev: Any
+    ash: attn.AttnShape
+    T: int
+    SLOTS: int
+    max_positions: int
+    a_bds: int
+    inp: dict
+    fatt: dict[int, int]
+    rawkv: dict[int, int]
+    kv_off: dict[int, int]
+    fobj: np.ndarray
+    vring: VRing
+    _weights: Callable[..., None]
+    _inputs: Callable[..., None]
+    _weight_run: Callable[..., None]
+    _sp: Callable[..., int]
+    _bd_words: Callable[..., None]
+    _once: Callable[[float], None]
+
+    def x_slot(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int, int]: ...
+
+    def ring(self, L: int, h: int) -> int: ...
+
+    def fatt_object(self, L: int, c: int, u: int, b: int = 0) -> int: ...
+
+    def q_object(self, L: int, c: int, s: int) -> int: ...
+
+    def subs(self, p: int, S: int) -> tuple[tuple[int, int, int], ...]: ...
+
 
 F_WORDS = {"pos": M_POS, "ns": M_NS, "sa": M_SA, "skip": M_SKIP, "split": M_SPLIT, "nrel": M_NREL, "ntail": M_NTAIL,
            "naskip": M_NASKIP, "g0": M_G0, "gatt": M_GATT, "gj": M_GJ, "ana": M_ANA}  # (an F_ATT object's words, by name)
@@ -76,14 +162,14 @@ def att_words(ash: attn.AttnShape, subs: tuple[tuple[int, int, int], ...], p: in
 class AttentionSteps:
     """The attention layers' transfers and patches of the decode overlay ``ov``."""
 
-    def __init__(self, ov: "QwenOverlay"):
+    def __init__(self, ov: AttnOverlay):
         self.ov = ov
 
     # ------------------------------------------------------------------
     # The transfers
     # ------------------------------------------------------------------
 
-    def build(self, seq: Sequence, st: Step, L: int, S: int, run: list[tuple[int, str]] | None = None) -> None:
+    def build(self, seq: Sequence, st: AttnStep, L: int, S: int, run: list[tuple[int, str]] | None = None) -> None:
         """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them);
         ``run``: the weights after it (a column-major image), after the last sub-step's cache reads."""
         ov = self.ov
@@ -127,7 +213,7 @@ class AttentionSteps:
                 if run:
                     ov._weight_run(seq, run)
 
-    def _cache(self, seq: Sequence, st: Step, L: int, u: int) -> None:
+    def _cache(self, seq: Sequence, st: AttnStep, L: int, u: int) -> None:
         """The cache of the column's KV head (address, length: ``set_position``), its ring (one pass: the chain's first
         column's stream, to both cores; a round: the first chain's streams, the round's KV head, cc its column in that
         head's chain)."""
@@ -150,7 +236,7 @@ class AttentionSteps:
             if not ash.one and not split and c % nph == 0:  # (then the new positions' group again, for their records)
                 st.fills.append(Fill(seq.fill("A", c, head, attn.OBJS * T), L, c, u, "new"))
 
-    def _inputs(self, seq: Sequence, st: Step, L: int, u: int) -> None:
+    def _inputs(self, seq: Sequence, st: AttnStep, L: int, u: int) -> None:
         """The F_ATT object, the q objects, the slots' raw K, V objects."""
         ov = self.ov
         dev, nph = ov.dev, ov.ash.nph
@@ -166,7 +252,7 @@ class AttentionSteps:
                 seq.fill("X", c, dev.address("ACT", ov.q_object(L, c, a)), n * XB)
             seq.fill("X", c, dev.address("ACT", ov.rawkv[L] + a * XB), n * XB)
 
-    def _outputs(self, seq: Sequence, st: Step, L: int, S: int, u: int) -> None:
+    def _outputs(self, seq: Sequence, st: AttnStep, L: int, S: int, u: int) -> None:
         """o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's last column's of the chain's, a
         round's of its half), then the records (addresses: ``set_position``)."""
         ov = self.ov
@@ -196,7 +282,7 @@ class AttentionSteps:
     # The patches of a step's position
     # ------------------------------------------------------------------
 
-    def patch_tables(self, st: Step) -> dict[str, np.ndarray]:
+    def patch_tables(self, st: AttnStep) -> dict[str, np.ndarray]:
         """A step's cache fills, tail fills and record drains as arrays (columns ``AT`` .. ``ARG``), and the cache lines of
         their BDs."""
         ov, ash = self.ov, self.ov.ash
@@ -214,15 +300,13 @@ class AttentionSteps:
         at = np.concatenate([x[:, AT] for x in (f, t, r)] + [x[:, AT] + 2 for x in (f, t, r)])
         return {"f": f, "t": t, "r": r, "lines": np.unique(4 * at & ~63)}
 
-    def set_position(self, st: Step, p: int, rope: np.ndarray | None = None) -> None:
+    def set_position(self, st: AttnStep, p: int, cs: np.ndarray) -> None:
         """The F_ATT objects (per sub-step: its positions, cache objects, rotations) and the step's cache and ring
-        transfers. ``rope``: its positions' M-RoPE rows (default: ``QwenOverlay.rope``'s)."""
+        transfers. ``cs``: its positions' angles (S, 64) [cos 32 | sin 32] fp32 (``attn256.rope_cs``)."""
         ov = self.ov
         S = st.S
         assert 0 <= p and p + S <= ov.max_positions, (p, S)
         assert st.subs == ov.subs(p, S), (p, S, st.subs)
-        c0, s0 = attn.rope_cs(ov.cfg, ov.rope[p:p + S] if rope is None else rope)
-        cs = np.concatenate([c0, s0], 1)
         self._rings_from_prefill(p)
         for L in ov.fatt:
             ov.vring.check(L, p, p)
@@ -236,7 +320,7 @@ class AttentionSteps:
         self.patch_drains(words, t["r"], su, kv0)
         st.tr.flush_lines(t["lines"])
 
-    def _write_words(self, st: Step, w: np.ndarray, cs: np.ndarray) -> None:
+    def _write_words(self, st: AttnStep, w: np.ndarray, cs: np.ndarray) -> None:
         """The F_ATT objects' words ``w`` (per sub-step and column) and the sub-steps' slots' angles ``cs``, flushed."""
         ov = self.ov
         U = len(st.subs)

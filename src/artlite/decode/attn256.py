@@ -1,6 +1,6 @@
-"""The attention core of the multi-slot decode overlay (``qwen35/decode.py``): the full-attention layers (head_dim 256,
-NeoX RoPE on the first 64 dims, q / k RMS-normed per head, a sigmoid output gate) for the token slots of a step at
-positions p .. p + S - 1.
+"""The gated attention of head_dim 256 on the multi-slot decode overlay (a design with the core: ``attn256_design``; its
+host side: ``attn256_steps``): full-attention layers (head_dim 256, NeoX RoPE on the first 64 dims, q / k RMS-normed per
+head, a sigmoid output gate: the qwen35 models') for the token slots of a step at positions p .. p + S - 1.
 
 The KV heads' columns form chains of NPH = 8 / KV heads (9B / 27B NPH 2, MiniCPM-V 4): column c attends with its QC
 query heads (27B 3, 9B 2, MiniCPM-V 1) to KV head c // NPH over the whole cache (``decode.kv``'s d-block-major layout with
@@ -29,7 +29,7 @@ its position does. P = 2^(s - m), m the row's maximum in the first group,
 held for the whole pass (scores span less than P's 2^63.5: no rescale; QK starts from the baseline 192 - m), y += P V over the V object's records. A step may cross a group: the first group's open record keeps its scores in ``sc`` past the
 second group's (its slot is the group's last, the second group's open record its first). The tail objects are the open
 records' rows (the ring: ``decode.vring``; after a prefill the host decodes the record's V panels into it,
-``attn_steps.AttentionSteps``'s ``_rings_from_prefill``): the core puts the slots' V in and per slot encodes the record's V panels up to the
+``attn256_steps.AttentionSteps``'s ``_rings_from_prefill``): the core puts the slots' V in and per slot encodes the record's V panels up to the
 slot's position and adds the P V of its rows (a V block spans the record's positions: what a position sees of its record
 does not depend on the step's later slots).
 
@@ -93,23 +93,53 @@ step's V, ...: ``AttnShape.ext``) lie in the main core's memory: its workspace p
 panels (``mx_bytes``), idle in a sub-step.
 """
 
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Protocol
 
 import numpy as np
 
-from artlite.decode.kv import Records
-from artlite.decode.protocol import META, PHASE, SLOTS, TOK_STATE, XB, XMETA
-from artlite.decode.protocol import STATE as MAIN_STATE
-from artlite.model_config import QwenConfig
-from artlite.operators import templating
-from artlite.operators.bfp16 import PANEL_BYTES, PANEL_ELEMS
-from artlite.operators.design import COLS
-from artlite.operators.kmath import SIGMOID
-from artlite.operators.l1_layout import L1_BYTES
-from artlite.operators.util import Attr, cos_sin_rows, regions, rup
-from artlite.operators.words import WordMap
+from ..operators import templating
+from ..operators.bfp16 import PANEL_BYTES, PANEL_ELEMS
+from ..operators.design import COLS
+from ..operators.kmath import SIGMOID
+from ..operators.l1_layout import L1_BYTES
+from ..operators.util import Attr, cos_sin_rows, regions, rup
+from ..operators.words import WordMap
+from .kv import Records
+from .protocol import M_MODEL, META, PHASE, SLOTS, TOK_STATE, XB, XMETA
+from .protocol import STATE as MAIN_STATE
 
-from .words import ATT, FLAGS
+
+class AttnConfig(Protocol):
+    """What the attention takes of a model's config (``model_config.QwenConfig``)."""
+
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    rope_dims: int
+    rms_norm_eps: float
+    moe: bool
+
+    def rope_theta(self, positions: np.ndarray) -> np.ndarray:
+        """The rotation angles (n, rope_dims / 2) of positions."""
+
+
+# X metadata (``decode.protocol.XMETA``) of the attention core's objects. An F_ATT object's words (``ATT``) past the
+# protocol's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A objects and the tail objects), M_NREL (R
+# objects to relay): the sub-step's first position; split: the KV head's chain divides the cache's groups (1); the core's
+# first group, the end of its attention groups, the first group past them (a chain's first core's: the sub-step's group,
+# for its records only); its first slot's row of angles (M_SA: 0, each sub-step's object holds its own slots'); the tail
+# objects; (one pass) the core's A objects through its held ones, the rows' masks of the step's first two records and the
+# slots' K lanes. A step whose last slots branch off an earlier one: the word ``M_BRANCH`` (its parent slot + 1 | its
+# slots << 8, or 0), a kind of its own that a model's objects of the step may extend too (qwen35's gdn_in).
+FLAGS = XMETA.kind("attn256 flags")  # (a kind of its own: a model's other attention cores take the flag, qwen35's DFlash2)
+F_ATT = FLAGS.flag("F_ATT", 10)  # M_FLAGS of an attention core's object
+BRANCH = XMETA.kind("attn256 branch")
+M_BRANCH = BRANCH.word("M_BRANCH", at=37)
+ATT = XMETA.kind("attn256", extends=(BRANCH,))
+M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = ATT.words("M_POS M_SPLIT M_G0 M_GATT M_GJ M_SA M_NTAIL", at=M_MODEL + 3)
+M_ANA = ATT.word("M_ANA", at=36)  # (one pass) the core's A objects through its held ones
+M_AMASK = ATT.block("M_AMASK", 4, at=38)  # (one pass) the rows' masks of the step's first two records (A_MK)
+M_ALANE = ATT.word("M_ALANE", at=42)  # (one pass) the slots' K lanes (A_LN)
 
 HD = 256  # head_dim
 ND = HD // 8  # d-blocks (panels per record part)
@@ -134,16 +164,12 @@ PO = 288  # bytes of an octet's P panels of a group (4 panels)
 # state words of the main core for the gates (main_gates: its workspace's words past decode.protocol's of a dense design,
 # where the token objects' words are not: ``GATES``): the q objects to gate, those seen, the slots, the query rows per slot,
 # the R objects of o, those relayed
-GATES = MAIN_STATE.kind("qwen35 gates", exclusive_with=(TOK_STATE,))
+GATES = MAIN_STATE.kind("attn256 gates", exclusive_with=(TOK_STATE,))
 MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = GATES.words("MG_Q MG_I MG_S MG_QR MG_NO MG_E MG_SI", at=56)
 # M_SPLIT, bits 1:0: the chain divides the cache (0: each column over all of it), a round's chains do; bit 2 (a round):
 # its KV head; bit 3: no records (a round's other chain)
 SPLIT_CHAIN, SPLIT_ROUND, SPLIT_KV, SPLIT_NOREC = 1, 2, 4, 8
 
-
-# metadata words of an F_ATT object (``words.ATT``): the protocol's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the
-# cache's A objects and the tail objects), M_NREL (R objects to relay), M_POS (the first slot's position), M_SA (the first
-# slot's row of angles in the object: 0, each sub-step's object holds its own slots'), M_NTAIL (tail objects)
 
 # state words of the attention core (the first ones are trip counts of its program). A_NOBJ: the A objects before the
 # held ones; A_NKH: the sub-step group's K objects after the tails (a chain's first column, not split); A_NRM, A_VN, A_GS,
@@ -180,17 +206,17 @@ def consts() -> dict[str, int]:
     return XMETA.consts(PHASE, ATT, FLAGS) | STATE.consts(ONE) | GATES.consts()
 
 
-_SRC = templating.load("models/qwen35/attn.cc.jinja")
+_SRC = templating.load("artlite/decode/attn256.cc.jinja")
 
-_ONE = templating.load("models/qwen35/attn.one.cc.jinja")
+_ONE = templating.load("artlite/decode/attn256.one.cc.jinja")
 
 # The main core's part of the gates (``AttnShape.main_gates``; decode.design's ``gate`` designs): the attention core's L1
 # holds none. Rendered after the attention core's source (its helpers).
-_MAIN_SRC = templating.load("models/qwen35/attn.main.cc.jinja")
+_MAIN_SRC = templating.load("artlite/decode/attn256.main.cc.jinja")
 
 
 # The main core's part of one pass: the gates of the query rows, per step (the attention core's L1 holds none)
-_MAIN_ONE = templating.load("models/qwen35/attn.main_one.cc.jinja")
+_MAIN_ONE = templating.load("artlite/decode/attn256.main_one.cc.jinja")
 
 
 class Addr(NamedTuple):
@@ -206,7 +232,7 @@ class AttnShape:
     slots of a sub-step and their query-row sets, the cache's capacity, the workspace and its regions in the main core's
     memory."""
 
-    def __init__(self, cfg: QwenConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
+    def __init__(self, cfg: AttnConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
                  slots: int = SLOTS):
         """slots: a step's slots at most (a design of 8: ``one``)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
@@ -403,7 +429,8 @@ def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[i
 # ----------------------------------------------------------------------
 
 
-def rope_cs(cfg: QwenConfig, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """cos, sin (n, 32) fp32 of positions' angles (``QwenConfig.rope_theta``: (n,) text positions or (n, 3) (T, H, W))."""
+def rope_cs(cfg: AttnConfig, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """cos, sin (n, 32) fp32 of positions' angles (``cfg.rope_theta``; qwen35's: (n,) text positions or (n, 3) (T, H,
+    W))."""
     rows = cos_sin_rows(cfg.rope_theta(positions))
     return np.ascontiguousarray(rows[:, :ROT]), np.ascontiguousarray(rows[:, ROT:])

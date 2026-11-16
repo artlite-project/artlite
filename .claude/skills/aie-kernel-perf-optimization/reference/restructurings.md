@@ -274,7 +274,7 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   4 K pops for 8 MMULs, the accumulators starting at the rows' bias): ~350 cycles per call.
 - **P V over pairs of row blocks**: each V panel popped once for two blocks, one chain per block, the O update's load
   and store pointers distinct `__restrict` parameters of a helper: II 8 for 8 MMULs (2339 -> 648).
-- **One pass for twice the rows** (`qwen35/attn.py` "One pass"): a step of 8 tokens is 48 query rows per KV head. Position
+- **One pass for twice the rows** (`decode/attn256.py` "One pass"): a step of 8 tokens is 48 query rows per KV head. Position
   splits leave each core all 48 rows (two passes over the cache: +38 ms at 32K); instead both cores of a chain take one
   broadcast stream, each with its own heads' 24 rows, and Q, P go single bfp16 (one panel of 8 rows, half the MMULs, no
   KL cost at model level). What then binds is not arithmetic: a group's ~2600 of ~6500 cycles were the object loop and
@@ -315,7 +315,7 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   outer-loop-pipelined (520 -> 252 cycles a pair; the d-blocks unrolled spill), P V of both pairs in one MAC call
   alternating block by block between their O in two regions (region 0's conflicts 33 -> 1 us an op).
 
-qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core when a column holds one q head), per
+qwen35 (`prefill/attn256.py`: Q and K as hi + lo, two row panels per core when a column holds one q head), per
 32-key group and core, the 1B (MiniCPM-V's LM) at p0 = 16K:
 - **Every pop for as many MMULs as one-chain accumulators allow**: with K objects of two records (the memtile
   interleaves the records per d-block) the score loop pops 4 K and 4 Q panels per d-block for 12 MMULs on 4
@@ -330,13 +330,13 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   place in one region put P V 50% above its schedule (548 vs 364 cycles).
 - 9.95 -> 4.95 ms per layer at T = 512 (its DMA floor ~4.1). The 27B (three q heads per core) stays bound by its QK
   pops (each K panel once per head) and its in-place o (no L1 for a second copy).
-- **One pass whatever a step's S** (`models/qwen35/attn.py`, designs of 8 slots): rows head-major, octet h = head h's 8
+- **One pass whatever a step's S** (`artlite/decode/attn256.py`, designs of 8 slots): rows head-major, octet h = head h's 8
   slots, so a step's compute does not follow S. K hi alone, as pairs of records: 2 objects a group, not 3, a pass -1/3.
   Row maxima from the first group for the whole pass (no rescale, P clamps), then QK from the baseline 192 - m and the
   group's P in two pipelined passes (756 against 1068 cycles a group at 3 octets; one loop spills the exp's constants).
   A new K by the popped panels' lanes (900 cycles a record against a byte loop's 43,000). A step across a group: the
   first group's open record keeps its scores in the slot the second does not write. 27B at 32K: V(8) / V(1) 1.071 -> 1.016.
-- **A chain of 4 on two streams** (`models/qwen35/attn.py` `SPLIT_HALF`; `decode.design` "Shared A objects"): 32 query rows per
+- **A chain of 4 on two streams** (`artlite/decode/attn256.py` `SPLIT_ROUND`, `AttnShape.rounds`; `decode.design` "Shared A objects"): 32 query rows per
   KV head against a core's 16. Positions split alone took two passes; one pass on one stream reads at half the port. Two
   halves, each two cores with its heads and the groups split between them, on two streams, each read once and delivered to
   both halves: 35B-A3B at 32K, S 3 / 4 83.8 / 97.0 -> 77.2 / 89.2 ms with what follows. Two streams read ~46 GB/s against the chain's 56, so a shorter sub-step stays on the whole
@@ -347,7 +347,7 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   path (1.4 KB of code) or its head-major rows (a chain's S 1 would run two octets). Count a port's bytes first: this core
   had 176 B of program memory left, and a helper taken out of line to save code (`e192`, 64 B) spilled around its call on the
   hottest path (`psoft` +37%): read the frame in measure_ii.
-- **The same in decode** (`models/qwen35/attn.py`: up to 24 query rows, octets of two sets of [4 rows hi | 4 rows lo],
+- **The same in decode** (`artlite/decode/attn256.py`: up to 24 query rows, octets of two sets of [4 rows hi | 4 rows lo],
   against a pass over the whole cache): the cache d-block major (``decode.kv``: K records [d-block][hi | lo], V records
   in pairs [d-block][record 2], the order the prefill's stream reads), so per d-block K hi, K lo and an octet's two Q
   panels are each popped once, a chain per set and K half: II 4 for 4 MMULs, 158 cycles per record and octet (K hi then
@@ -357,7 +357,7 @@ qwen35 (`qwen35/attn_prefill.py`: Q and K as hi + lo, two row panels per core wh
   streams in (data-movement.md "Streams"). ~2420 -> under 700 cycles per set and group; a pass at 32K 2.04 / 2.07 ms per
   layer (2 / 3 sets), the DMA floor. 24 rows (the 27B's 4 slots: 6 sets) fit one pass with the A stream at depth 2, the
   records read from the two held last objects, the gates applied by the main core and the Q panels of octets 1-2 in the
-  main core's memory (models/qwen35/attn.py docstring): 2.13 ms against 4.15 for two passes, near the 2.04 of the DMA
+  main core's memory (artlite/decode/attn256.py docstring): 2.13 ms against 4.15 for two passes, near the 2.04 of the DMA
   floor (with K hi then K lo per record and each Q panel popped twice: 2.64, ~9.3K cycles per group, QK ~3.9K of it).
   Llama's cores (`decode/attn.py`, one head dim: 16 rows, A depth 2) with the octet softmax and P V: 1B at 16K a step of
   4 tokens 32.8 -> 26.4 ms (its pexp's per-pair exp2 calls were the largest part).

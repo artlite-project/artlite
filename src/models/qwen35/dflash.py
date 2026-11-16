@@ -39,6 +39,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
+from artlite.decode.attn256 import F_ATT
 from artlite.decode.image import Region
 from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.decode.protocol import (
@@ -101,7 +102,6 @@ from .dflash_image import DFlashImage
 from .draft import HeadTable
 from .image import tensor_f32
 from .overlay import KV_PAD, QwenOverlay
-from .words import F_ATT
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}

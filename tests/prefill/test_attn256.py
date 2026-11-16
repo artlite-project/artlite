@@ -1,4 +1,4 @@
-"""The attention prefill operators (models/qwen35/attn_prefill.py) on the NPU, on an attention layer's own inputs
+"""The attention prefill operators (artlite/prefill/attn256.py) on the NPU, on an attention layer's own inputs
 (llama.cpp's prompt-mode projections of an essay laid out as the attn_in GEMMs write them), two chunks: the second
 at position T, with padding tokens after its valid ones; non-causal (d3-lite's), one chunk with padding tokens."""
 
@@ -7,14 +7,14 @@ import numpy as np
 import pytest
 from ml_dtypes import bfloat16
 
+from artlite.decode import attn256 as AT
 from artlite.decode import kv as KV
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig, decision_gguf, qwen_gguf
 from artlite.operators import FusedOperator, bfp16
 from artlite.operators.design import COLS
+from artlite.prefill import attn256 as AP
 from artlite.prefill import gemm as PG
-from models.qwen35 import attn as AT
-from models.qwen35 import attn_prefill as AP
 from models.qwen35.image import QwenImage
 
 from ..common import essay
@@ -22,7 +22,7 @@ from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
 from ..model_files import require
 from ..numerics import bf16_round, rel_max
-from . import ref
+from ..qwen35 import ref
 
 MAX_POS = 1024
 

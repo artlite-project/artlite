@@ -68,11 +68,11 @@ from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS
 from artlite.operators.fused.layout import parse_name
 from artlite.operators.util import arg_bytes
+from artlite.prefill import attn256 as AP
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
 from artlite.prefill.norm import PrefillNormOperator
 
-from . import attn_prefill as AP
 from . import gdn as GD
 from . import gdn_prefill as GP
 from .conv_state import CS_OFF

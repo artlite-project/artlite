@@ -158,7 +158,7 @@ Pick by the symptom; restructurings.md has each case study with its numbers.
   by token at S 8), a step's tokens' grouping then showing at the rounding level.
 - **R11 Several tokens per decode step**: a DMA-bound step of S tokens costs about one (tokens on the MMUL's A rows,
   inputs interleaved per 8-element block, recurrent state replayed instead of snapshotted). Past 4 tokens the A rows
-  hold single bfp16 x, Q and P instead of hi + lo (``decode.gemv``, ``qwen35.attn``'s "One pass"), and a core's per-slot arrays outgrow L1: put what only
+  hold single bfp16 x, Q and P instead of hi + lo (``decode.gemv``, ``decode.attn256``'s "One pass"), and a core's per-slot arrays outgrow L1: put what only
   cold code touches in a neighbour's memory (``decode.design``'s "Designs of 8 slots": slots 4-7's residual in the
   helper's, the helper's scratch in the GDN core's).
 - **R12 Neighbour cores sharing derived data** through shared memory (GemmQ's dequant pairs: per k-tile 980 -> ~800

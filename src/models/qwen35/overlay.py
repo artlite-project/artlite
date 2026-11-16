@@ -50,8 +50,11 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import txn
+from artlite.decode import attn256 as attn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
+from artlite.decode.attn256 import F_ATT, M_ALANE, M_AMASK, M_BRANCH
+from artlite.decode.attn256_steps import AttentionSteps
 from artlite.decode.design import PG_ONE_CHANNEL
 from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, StepKey, host_bytes, paged_formats
 from artlite.decode.protocol import (
@@ -86,8 +89,7 @@ from artlite.operators import cdo
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
 
-from . import attn, gdn
-from .attn_steps import AttentionSteps
+from . import gdn
 from .conv_state import HSLOT, ConvHandoff, check_slot
 from .cursor import GdnCursor
 from .decode import QwenDecodeOperator
@@ -95,7 +97,7 @@ from .gdn_steps import GdnTransfers
 from .image import NORMS, QwenImage, gdn_v_heads, tensor_f32
 from .moe_steps import CP_BYTES, MoeTransfers
 from .steps import PanelTable, Step
-from .words import F_ATT, F_GDN, F_GIN, M_ALANE, M_AMASK, M_BRANCH, M_HPAN
+from .words import F_GDN, F_GIN, M_HPAN
 
 FLAGS = {"eh": F_RESID | F_EMITR,  # (a drafter's first phase: ``draft``)
          "gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
@@ -593,7 +595,7 @@ class QwenOverlay(ModelOverlay):
         if self.blocks:
             self.gdn_steps.patch_panels(st, p)
         if self.ash is not None:
-            self.attn_steps.set_position(st, p, rope)
+            self.attn_steps.set_position(st, p, np.concatenate(attn.rope_cs(self.cfg, rope), 1))
         self._rope_used = (p, p + st.S, rope.tobytes())
         return True
 

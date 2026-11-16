@@ -12,11 +12,11 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.decode import attn256 as AT
 from artlite.decode import kv as KV
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, minicpmv_gguf
 from models.minicpmv import host as M
-from models.qwen35 import attn as AT
 from models.qwen35.qwen import NpuQwen, Qwen
 from models.tokenizer import BpeTokenizer, chat_prompt
 

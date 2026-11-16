@@ -26,10 +26,10 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.operators.design import COLS
+from artlite.prefill import attn256 as AP
 from artlite.prefill import gemm as PG
 from artlite.prefill.norm import PrefillNormOperator
 
-from . import attn_prefill as AP
 from .draft import QwenDraft
 from .drafter_prefill import DrafterPrefill
 
