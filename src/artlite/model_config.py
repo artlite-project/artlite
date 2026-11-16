@@ -239,6 +239,44 @@ def qwen_dflash_of(model: str) -> str | None:
     return None
 
 
+SPARK_QUANTS = ("Q4_K_M", "Q8_0", "BF16")
+
+
+def spark_gguf(size: str = "4B", quant: str = "Q4_K_M", org: str = "XHToken") -> str:
+    """A file of a Spark-X2.6 GGUF repository: ``size`` "4B" / "1.7B"; ``quant`` one of ``SPARK_QUANTS`` (XHToken's
+    official files: Q4_K_M with Q6_K / Q8_0 in the sensitive tensors and a Q8_0 head beside a BF16 ``token_embd``;
+    "BF16": the unquantized file) or a community quantization (``org`` "bartowski": "Q4_K_M", "Q4_0")."""
+    name = f"Spark-X2.6-{size}"
+    return os.path.join(MODELS_DIR, org, f"{name}-GGUF", f"{name}.gguf" if quant == "BF16" else f"{name}-{quant}.gguf")
+
+
+def spark_dspark_of(model: str) -> str | None:
+    """The DSpark drafter of a Spark-X model file (GGUF architecture ``dflash`` with a Markov head, ``markov_w1``):
+    the first file of a repository ``<model's repository>-DSpark-GGUF`` of any organization (XHToken's) whose metadata
+    fits the model's (``tokenizer.ggml.pre`` "spark2_5", its hidden size and vocabulary, its taps below its layers),
+    or None."""
+    from .gguf_model import GGUFFile
+
+    d = os.path.dirname(os.path.abspath(model))
+    root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d).removesuffix("-GGUF")
+    m = None
+    for org in sorted(os.listdir(root)):
+        x = os.path.join(root, org, f"{repo}-DSpark-GGUF")
+        for f in sorted(os.listdir(x)) if os.path.isdir(x) else []:
+            if not f.endswith(".gguf"):
+                continue
+            g = GGUFFile(os.path.join(x, f))
+            if m is None:
+                m = GGUFFile(model)
+            ok = (g.arch == "dflash" and "markov_w1.weight" in g and g.meta.get("tokenizer.ggml.pre") == "spark2_5"
+                  and g.arch_meta("embedding_length") == m.arch_meta("embedding_length")
+                  and g.string_count("tokenizer.ggml.tokens") == m.string_count("tokenizer.ggml.tokens")
+                  and max(g.arch_meta("target_layers")) < int(m.arch_meta("block_count")))
+            if ok:
+                return os.path.join(x, f)
+    return None
+
+
 def sd15_dir() -> str:
     """The diffusers directory of Stable Diffusion 1.5 (``model_index.json``, ``tokenizer/``, ``text_encoder/``,
     ``unet/``, ``vae/``, ``scheduler/``)."""
@@ -518,6 +556,102 @@ class LfmConfig:
         d = self.head_dim
         base = self.rope_base if kind == "full" else self.rope_base_swa
         return base ** (-np.arange(0, 2 * self.rot(kind), 2, dtype=np.float64) / d)
+
+
+@dataclass(frozen=True)
+class SparkConfig:
+    """Architecture of a Spark-X2.5 / X2.6 model (GGUF ``spark2_5``), from the metadata of its GGUF file (llama.cpp's
+    ``src/models/spark2-5.cpp``, HF's ``modeling_spark.py``).
+
+    A dense pre-norm transformer: per layer ``h = x + o(gate * attn(norm1(x)))``, ``x' = h + down(gelu(gate(norm2(h)))
+    * up(norm2(h)))`` (GELU's erf form, the model's ``gelu``; llama.cpp computes its tanh form), RMSNorm with the weights
+    as stored. Attention: ``num_attention_heads`` query heads over ``num_key_value_heads`` KV heads of ``head_dim``
+    (256), fused ``attn_qkv`` rows [q | k | v], no q / k norms (scores q k / sqrt(head_dim)), a sigmoid output gate per
+    head (``attn_gate``: hidden -> heads, o_h *= sigmoid(x_n g_h) of the attention's normed input). Layer kinds
+    (``kinds[l]``): "full" (all positions; NeoX RoPE on the first ``rope_dims`` dims, base ``rope_base``) and "swa"
+    (the last ``sliding_window`` positions, keys p - window + 1 .. p; RoPE on ``rope_dims_swa`` dims, base
+    ``rope_base_swa``). The LM head: ``output`` (the official files') or the tied ``token_embd`` (``tied``)."""
+
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    kinds: tuple[str, ...]
+    sliding_window: int
+    rms_norm_eps: float
+    rope_base: float
+    rope_base_swa: float
+    rope_dims: int
+    rope_dims_swa: int
+    tied: bool
+    max_position_embeddings: int
+    bos_token_id: int
+    eos_token_ids: tuple[int, ...]
+    sampling: dict[str, float]
+
+    ARCHS: ClassVar[tuple[str, ...]] = ("spark2_5",)
+    moe: ClassVar[bool] = False  # (``decode.attn256.AttnConfig``)
+    causal: ClassVar[bool] = True
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> SparkConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch in cls.ARCHS, f"{gguf.path}: architecture {gguf.arch!r}, expected one of {cls.ARCHS}"
+        m = gguf.arch_meta
+        n = int(m("block_count"))
+        swa = [bool(x) for x in m("attention.sliding_window_pattern")]
+        hd = int(m("attention.key_length"))
+        assert int(m("attention.value_length")) == hd and len(swa) == n
+        return cls(
+            vocab_size=gguf.string_count("tokenizer.ggml.tokens"),
+            hidden_size=int(m("embedding_length")),
+            intermediate_size=int(m("feed_forward_length")),
+            num_hidden_layers=n,
+            num_attention_heads=int(m("attention.head_count")),
+            num_key_value_heads=int(m("attention.head_count_kv")),
+            head_dim=hd,
+            kinds=tuple("swa" if swa[i] else "full" for i in range(n)),
+            sliding_window=int(m("attention.sliding_window")),
+            rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")),
+            rope_base=float(m("rope.freq_base")),
+            rope_base_swa=float(m("rope.freq_base_swa", 10000.0)),
+            rope_dims=int(m("rope.dimension_count", hd)),
+            rope_dims_swa=int(m("rope.dimension_count_swa", hd)),
+            tied="output.weight" not in gguf,
+            max_position_embeddings=int(m("context_length")),
+            bos_token_id=int(gguf.meta["tokenizer.ggml.bos_token_id"]),
+            eos_token_ids=(int(gguf.meta["tokenizer.ggml.eos_token_id"]),),
+            sampling={k: float(gguf.meta[f"general.sampling.{k}"])
+                      for k in ("top_k", "top_p", "temp", "penalty_repeat", "penalty_last_n")
+                      if f"general.sampling.{k}" in gguf.meta},
+        )
+
+    def layers(self, kind: str) -> list[int]:
+        """The layers of a kind ("swa", "full")."""
+        return [i for i, k in enumerate(self.kinds) if k == kind]
+
+    @property
+    def q_per_kv(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
+
+    def rot(self, kind: str) -> int:
+        """The rotated pairs of a layer kind: pairs (i, i + rot) of the head's first 2 rot dims."""
+        return (self.rope_dims if kind == "full" else self.rope_dims_swa) // 2
+
+    def rope_theta(self, positions: np.ndarray | range | list, kind: str = "full") -> np.ndarray:
+        """(n, rot) float32 angles of positions for a layer kind: pair i turns by p * base^(-2 i / dims), the factor
+        built by repeated float32 multiplication as llama.cpp's CPU RoPE."""
+        dims, base = (self.rope_dims, self.rope_base) if kind == "full" else (self.rope_dims_swa, self.rope_base_swa)
+        scale = np.float32(np.power(np.float32(base), np.float32(-2.0 / dims)))
+        th = np.asarray(positions, np.float32).reshape(-1)
+        out = np.empty((th.shape[0], dims // 2), np.float32)
+        for i in range(dims // 2):
+            out[:, i] = th
+            th = (th * scale).astype(np.float32)
+        return out
 
 
 @dataclass(frozen=True)

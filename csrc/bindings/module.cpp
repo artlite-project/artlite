@@ -42,6 +42,7 @@ ARTLITE_NB_MODULE(ARTLITE_MODULE, m) {
   b::bind_sampling(m);
   b::bind_pack(m);
   b::bind_moe(m);
+  b::bind_text(m);
   b::bind_errors(m);
 }
 // NOLINTEND(bugprone-unused-raii)

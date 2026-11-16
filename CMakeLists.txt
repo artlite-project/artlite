@@ -97,7 +97,7 @@ file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/source_hash.cpp"
 set(ARTLITE_BINDINGS
   csrc/bindings/module.cpp csrc/bindings/device.cpp csrc/bindings/dispatch.cpp csrc/bindings/scratchpad.cpp
   csrc/bindings/profiler.cpp csrc/bindings/gguf.cpp csrc/bindings/sampling.cpp csrc/bindings/pack.cpp
-  csrc/bindings/moe.cpp csrc/bindings/errors.cpp)
+  csrc/bindings/moe.cpp csrc/bindings/text.cpp csrc/bindings/errors.cpp)
 function(artlite_module name backend)
   nanobind_add_module(${name} STABLE_ABI ${ARGN} ${ARTLITE_BINDINGS} "${CMAKE_BINARY_DIR}/source_hash.cpp")
   target_link_libraries(${name} PRIVATE artlite_${backend})
