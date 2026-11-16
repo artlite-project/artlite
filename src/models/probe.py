@@ -200,8 +200,7 @@ def ddr_rates(op: DmaProbeOperator, *, seconds: float) -> dict[str, float]:
     """GB/s of each of CASES (bytes over the median dispatch)."""
     dev = OverlayDevice(op)
     n = 16 * CHANNEL_BYTES
-    dev.alloc("src", n)
-    dev.alloc("dst", n)
+    dev.alloc_all({"src": n, "dst": n})
     src, dst = dev.address("src"), dev.address("dst")
     out = {}
     for i, (name, reads, writes, rows) in enumerate([CASES[2], *CASES]):  # (first: the DPM ramp's warm-up)
@@ -232,8 +231,7 @@ def page_rates(op: DmaProbeOperator, *, seconds: float) -> dict[str, list[float]
     the median dispatch."""
     dev = OverlayDevice(op)
     n = 16 * CHANNEL_BYTES
-    dev.alloc("src", n)
-    dev.alloc("dst", n)
+    dev.alloc_all({"src": n, "dst": n})
     src, dst = dev.address("src"), dev.address("dst")
     out = {}
     for i, case in enumerate([PAGE_CASES[0], *PAGE_CASES]):  # (first: the DPM ramp's warm-up)

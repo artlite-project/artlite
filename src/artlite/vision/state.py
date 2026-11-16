@@ -58,8 +58,7 @@ def load_state(cache: str, sources: Mapping[str, Source], *,
     res = [Slots.resolve(t, sources) for t in st["slots"]]
     if any(r is None for r in res):
         return None
-    npu = VisionDevice()
-    npu.restore(st["layout"])
+    npu = VisionDevice(layout=st["layout"])
     for name, off, data in st["writes"]:
         npu.write(name, np.frombuffer(data, np.uint8), off)
     npu.pack_behind(lambda: [Slots.restore(npu, t, r) for t, r in zip(st["slots"], res, strict=True)])

@@ -75,13 +75,18 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         device is loaded) and the wait for the weights' thread (``ready``)."""
         with ThreadPoolExecutor(1) as pool:
             build = pool.submit(self.prefill.compile) if self.prefill is not None else None  # (while the weights are packed)
-            self.overlay.load(threads=threads)
+            self.overlay.load(threads=threads, also=self._also())
             self._load_drafters(threads)
             self._prepare_steps()
             if build is not None:
                 build.result()  # (its error, if any)
                 self.prefill.bind()
         self.overlay.ready()  # (the weights' thread packs meanwhile)
+
+    def _also(self) -> dict[str, int]:
+        """The buffers on the overlay's device besides its own, allocated with them (``ModelOverlay.load``): the
+        prefill's."""
+        return dict(self.prefill.own) if self.prefill is not None else {}
 
     def _load_drafters(self, threads: int) -> None:
         """The drafters' weights and static objects on the loaded overlay's device."""

@@ -61,7 +61,7 @@ class _Phases:
         self.dev = dev = OverlayDevice(self.op)
         if (store := self.op.page_store()) is not None:  # (paged formats: a screened head's, ``ModelOverlay.load``)
             dev.set_prologue(self.op.page_prologue(store))
-        img.pack(dev.alloc("W", img.nbytes), release=False)
+        img.pack(dev.alloc("W", img.nbytes))
         dev.flush("W")
         self.act = 4 << 20
         dev.alloc("ACT", self.act)
@@ -331,7 +331,7 @@ class _Gdn:
                                                                                         for b in r.blocks}},
                                               tile_bytes=img.tile_bytes, eps=cfg.rms_norm_eps, gdn=sh)
         self.dev = dev = OverlayDevice(op)
-        img.pack(dev.alloc("W", img.nbytes), release=False)
+        img.pack(dev.alloc("W", img.nbytes))
         dev.flush("W")
         self.r = r = img.region(layer, "gdn_in")
         dev.alloc("ACT", PR.region_bytes(self.H))
@@ -922,7 +922,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = golden(path, tokens, ubatch=1, layers=("g", *layers), names="l_out|model.input_embed", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=128)
-    ov.load(release=False)
+    ov.load()
     errs = np.zeros((n, len(layers)))
     t = 0
     while t < n:
@@ -965,7 +965,7 @@ def test_drafts_exact(size: str) -> None:
 
     def run(drafts: bool) -> dict[int, np.ndarray]:
         ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=P + 64)
-        ov.load(release=False)
+        ov.load()
         out, t = {}, 0
         while t < P:
             S = int(rng.integers(1, ov.SLOTS + 1)) if drafts else 1
@@ -1003,7 +1003,7 @@ def test_moe_slice(first: int) -> None:
     G_ = golden(path, tokens, ubatch=1, layers=(("g",) if first == 0 else (first - 1,)) + tuple(layers),
                     names="l_out|model.input_embed|ffn_moe_logits|ffn_moe_topk", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
-    ov.load(release=False)
+    ov.load()
     E, k = ov.cfg.n_experts, ov.cfg.n_experts_used
     errs = np.zeros((n, len(layers)))
     clean = np.ones((n, len(layers)), bool)  # (no flip in the token's layers so far)
@@ -1047,7 +1047,7 @@ def test_dense_slice(first: int) -> None:
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
     G_ = golden(path, tokens, ubatch=1, layers=(first - 1, *layers), names="l_out", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64)
-    ov.load(release=False)
+    ov.load()
     errs = np.zeros((n, len(layers)))
     for t in range(n):
         ov.step(torch.from_numpy(np.asarray(G_["l_out", first - 1][t], np.float32).copy()), t, logits=False)
@@ -1079,7 +1079,7 @@ def test_split_slice(size: str, first: int, slots: int) -> None:
                 names="l_out|model.input_embed", logits="none")
     ov = QwenOverlay(GGUFFile(path), layers=layers, vocab=COLS * 64, max_positions=64, slots=slots)
     assert ov.image.split and ov.op.slots == slots
-    ov.load(release=False)
+    ov.load()
     errs = np.zeros((n, len(layers)))
     for t in range(n):
         x = G_["model.input_embed"][t] if first == 0 else G_["l_out", first - 1][t]
@@ -1104,7 +1104,7 @@ def test_lm_head(size: str) -> None:
     tokens = llama_tokenize(path, essay("apple.txt"))[:T]
     G_ = golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
     ov = QwenOverlay(g, layers=[L], max_positions=64)
-    ov.load(release=False)
+    ov.load()
     for t in range(T):
         got = ov.logits_of(np.asarray(G_["l_out", L][t], np.float32)).astype(np.float32)
         want = np.asarray(G_.logits[t], np.float32)
@@ -1131,7 +1131,7 @@ def test_screened(size: str) -> None:
     G_ = golden(path, tokens, ubatch=1, layers=(L,), names="l_out", logits="f32")
     ov = QwenOverlay(g, layers=[L], max_positions=64)
     assert ov.screen is not None and "Q6_KH" in ov.op.rows
-    ov.load(release=False)
+    ov.load()
     sc, V = ov.screen, ov.screen.n
     for t in range(T):
         row = ov.logits_of(np.asarray(G_["l_out", L][t], np.float32))
@@ -1172,7 +1172,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     require(path)
     g = GGUFFile(path)
     ov = QwenOverlay(g, layers=[L], vocab=COLS * 64, max_positions=128)
-    ov.load(release=False)
+    ov.load()
     cfg, H = ov.cfg, ov.H
     x = g.rows("token_embd.weight", llama_tokenize(path, essay("apple.txt"))[:S])
     ov.step(x, 0, logits=False)

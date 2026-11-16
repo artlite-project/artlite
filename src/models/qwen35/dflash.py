@@ -269,21 +269,19 @@ class DFlashOverlay(ModelOverlay):
     # Load
     # ------------------------------------------------------------------
 
-    def load(self, *, threads: int = 0, release: bool = True) -> None:
+    def load(self, *, threads: int = 0) -> None:
         """The design in its own hardware context on the target's device, the image packed, the target's buffers adopted, the static
-        objects written."""
+        objects written; then the file's pages given back and the selector's tables read ahead."""
         img, dev0 = self.image, self.target.dev
         self.dev = dev = OverlayDevice(self.op, device=dev0.device)
-        if img.pack(dev.alloc("W", img.nbytes), threads=threads, release=release):
+        dev.alloc_all({"W": img.nbytes, **self.sizes})
+        if img.pack(dev.view("W"), threads=threads):
             dev.flush("W")
         dev.adopt("MW", dev0.buffers["W"])
         dev.adopt("MACT", dev0.buffers["ACT"])
-        for name, n in self.sizes.items():
-            dev.alloc(name, n)
         self._load()
         dev.flush("ACT")
-        if release:
-            self.gguf.release()
+        self.gguf.release()
         self.selector.resident()
         self.reset()
 

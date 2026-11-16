@@ -210,14 +210,13 @@ def _items(pf: Any) -> tuple[dict[int, list], dict[str, int], dict[str, Any], in
     for op in ops:
         for name, value in op.item_params().items():
             assert params.setdefault(name, value) == value, (name, value, params[name])
-    dev = pf.ov.dev.device
-    pa = dev.alloc_host_buffer(max(arg_bytes(op, 0) for op in ops))
+    pa, pc = pf.ov.dev.device.alloc_host_buffers([max(arg_bytes(op, i) for op in ops) for i in (0, 2)])
     pa.write(activations(pa.size))
     pa.sync_to_device()
-    pc = dev.alloc_host_buffer(max(arg_bytes(op, 2) for op in ops))
+    # (the buffers the items address, not every buffer of the prefill: a command lists what its dispatch is given, and
+    # on the XRT backend at most 5 XRT buffers, ``backend``)
     used = {parse_name(ref)[0] for rl in runlists.values() for _, *refs in rl for ref in refs}
-    all_bufs = {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}
-    buffers = {k: all_bufs[k] for k in used}
+    buffers = {name: b for name, b in {**pf._buffers(), "PACE_A": pa, "PACE_C": pc}.items() if name in used}
     return {c: pf.lib.items(rl, buffers) for c, rl in runlists.items()}, params, buffers, T
 
 

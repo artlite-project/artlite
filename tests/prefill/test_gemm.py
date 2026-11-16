@@ -123,7 +123,7 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             from models.gemma4.image import GemmaImage as Image
         img = Image(g, layers=list(layers), vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
-        img.pack(W, release=False)
+        img.pack(W)
         _images[key] = (g, img, W)
     return _images[key]
 

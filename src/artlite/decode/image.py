@@ -197,18 +197,11 @@ class TileImage:
         self.regions: list[Region] = []
         self.slabs: list[Region] = []
         self._own: dict[str, QTensor] = {}  # (tensors a model substitutes: re-laid-out copies in memory)
-        self._views: dict[str, int] = {}  # (the file's tensors as rows of another width: ``view`` -> row_sb)
+        self._views: dict[str, QTensor] = {}  # (the file's tensors as rows of another width: ``view``)
 
     def tensor(self, name: str) -> QTensor:
         """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``)."""
-        if name in self._own:
-            return self._own[name]
-        t = self.gguf.tensor(name)
-        if name in self._views:
-            n = t.cols // (256 * self._views[name])
-            return QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
-                           raw=t.raw.reshape(t.rows * n, -1))
-        return t
+        return self._own.get(name) or self._views.get(name) or self.gguf.tensor(name)
 
     def view(self, name: str, row_sb: int) -> None:
         """The blocks read the file's tensor ``name`` as rows of row_sb super-blocks (a row of the file: several rows of
@@ -216,7 +209,8 @@ class TileImage:
         t = self.gguf.tensor(name)
         n = t.cols // (256 * row_sb)
         assert t.cols == n * 256 * row_sb, (name, t.cols, row_sb)
-        self._views[name] = row_sb
+        self._views[name] = QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
+                                    raw=t.raw.reshape(t.rows * n, -1))
 
     def qtype(self, name: str) -> str:
         """A tensor's GGUF type (a substitute's: ``_own``)."""
@@ -385,17 +379,18 @@ class TileImage:
                         ts[0].cols // 256, b.G))
         return out
 
-    def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
+    def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
         """Pack every region into ``out`` (uint8, nbytes; the PAD bytes are left as they are): the C++ packer
-        (``_native.pack_tiles``: threads over items of 2048 rows, non-temporal stores, the file read ahead), then the
-        data regions. ``release``: give back the GGUF file's pages of each packed tensor (they stay in the page
-        cache). Returns whether bytes went through the CPU caches (the data regions: flush a device buffer)."""
+        (``_native.pack_tiles``: threads over items of 2048 rows, non-temporal stores; the file's tensors through views
+        of its own, read ahead and unmapped tensor by tensor: the process never holds more of the file than the packer's
+        window), then the data regions. Returns whether bytes went through the CPU caches (the data regions: flush a
+        device buffer)."""
         assert out.dtype == np.uint8 and out.size >= self.nbytes
         blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
-        own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (memory of their own: never released)
+        own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (tensors in memory of their own)
         mapped = [x for x in blocks if x not in own]
         _pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
-                           release=release, file=(self.gguf.path, self.gguf.data))
+                    file=(self.gguf.path, self.gguf.data))
         if own:
             _pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
         self._fill_data(out)

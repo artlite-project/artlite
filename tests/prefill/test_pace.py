@@ -3,6 +3,7 @@ calibration's search on simulated machines (a paced run's time 1 / duty; a throt
 while its duty is above a trip point)."""
 
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -160,42 +161,35 @@ def test_activations() -> None:
     assert abs(float(v.std()) - 1) < 0.05 and abs(float(v.mean())) < 0.05 and np.count_nonzero(v) > 0.99 * v.size
 
 
-def test_items_filters_unreferenced_buffers() -> None:
-    """Calibration items pass only referenced buffers so unrelated XRT regions (KV, GSTATE) never trip the 5-BO limit."""
-    from types import SimpleNamespace
+def test_items_buffers() -> None:
+    """The calibration's dispatches are given the buffers its items address (the weights, its two scratch buffers,
+    allocated together), not every buffer of the prefill: on the XRT backend a command lists at most 5 XRT buffers."""
+    listed: list[set[str]] = []
 
-    seen_buffers: list[set[str]] = []
-
-    class FakeBuf:
+    class Buffer:
         def __init__(self, size: int) -> None:
             self.size = size
 
         def write(self, data: np.ndarray) -> None:
-            pass
+            assert data.size == self.size
 
         def sync_to_device(self) -> None:
             pass
 
-    class FakeDev:
-        def alloc_host_buffer(self, size: int) -> FakeBuf:
-            return FakeBuf(size)
+    class Device:
+        def alloc_host_buffers(self, sizes: list[int]) -> list[Buffer]:
+            return [Buffer(n) for n in sizes]
 
-    class FakeLib:
-        def items(self, rl: list, buffers: dict) -> list:
-            seen_buffers.append(set(buffers))
-            return rl
+    class Library:
+        def items(self, runlist: list, buffers: dict) -> list:
+            listed.append(set(buffers))
+            return runlist
 
-    op = SimpleNamespace(
-        pace=pace_class("qkv", False), mc_param=False, M=256, K=256, N=256, item_params=dict,
-        get_arg_spec=lambda: [SimpleNamespace(nbytes=1024), SimpleNamespace(nbytes=2048), SimpleNamespace(nbytes=4096)],
-    )
-    pf = SimpleNamespace(
-        sizes=(256,),
-        runlists={256: [(op, "PXN[0:1024]", "W[0:2048]", "G[0:4096]")]},
-        ov=SimpleNamespace(dev=SimpleNamespace(device=FakeDev())),
-        lib=FakeLib(),
-        _buffers=lambda: {"W": object(), "KV": object(), "GSTATE": object(), "F": object()},
-    )
-    _, _, buffers, _ = P._items(pf)
-    assert set(buffers) == {"W", "PACE_A", "PACE_C"}
-    assert seen_buffers == [{"W", "PACE_A", "PACE_C"}]
+    op = SimpleNamespace(pace=pace_class("qkv", False), mc_param=False, M=256, K=256, N=256, item_params=dict,
+                         get_arg_spec=lambda: [SimpleNamespace(nbytes=n) for n in (1024, 2048, 4096)])
+    pf = SimpleNamespace(sizes=(256,), runlists={256: [(op, "PXN[0:1024]", "W[0:2048]", "G[0:4096]")]},
+                         ov=SimpleNamespace(dev=SimpleNamespace(device=Device())), lib=Library(),
+                         _buffers=lambda: dict.fromkeys(("W", "KV", "GSTATE", "F", "PXN", "G")))
+    _, _, buffers, T = P._items(pf)
+    assert T == 256 and set(buffers) == {"W", "PACE_A", "PACE_C"} and listed == [{"W", "PACE_A", "PACE_C"}]
+    assert (buffers["PACE_A"].size, buffers["PACE_C"].size) == (1024, 4096)

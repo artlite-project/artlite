@@ -249,12 +249,12 @@ class ChunkPrefill:
         return rows.view(dtype).astype(np.float32).reshape(n, H)
 
     def bind(self) -> ChunkPrefill:
-        """Allocate the prefill's buffers on the (loaded) overlay's device, write the static ones."""
+        """The prefill's buffers on the (loaded) overlay's device (``own``: those its load did not allocate with its
+        own, ``ModelOverlay.load``'s ``also``), the static ones written."""
         assert self.ov.dev is not None, "load the overlay first"
         if self.bound:
             return self
-        for name, n in self.own.items():
-            self.ov.dev.alloc(name, n)
+        self.ov.dev.alloc_all(self.own)
         self._bind()
         self.bound = True
         return self

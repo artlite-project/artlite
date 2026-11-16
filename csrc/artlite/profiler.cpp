@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "artlite/error.h"
+#include "artlite/platform.h"
 #include "artlite/shim.h"
 
 namespace artlite {
@@ -36,7 +37,7 @@ struct Profiler::Impl {
         t0(std::chrono::steady_clock::now()) {
     if (counters.empty())
       throw artlite::Error("Profiler: no counters configured");
-    file = std::fopen(out_path.c_str(), "w");
+    file = artlite::platform::open_file(out_path, "w");
     if (!file)
       throw artlite::Error("Profiler: cannot open output file '" + out_path +
                            "': " + std::strerror(errno));
@@ -166,7 +167,7 @@ void dump_bo(shim_xdna::bo& buf, std::string_view path) {
   buf.sync(shim_xdna::direction::device2host);
   auto size = static_cast<size_t>(buf.get_properties().size);
   const auto* data = static_cast<const uint8_t*>(buf.map());
-  FILE* f = std::fopen(std::string(path).c_str(), "wb");
+  FILE* f = artlite::platform::open_file(path, "wb");
   if (!f)
     throw artlite::Error("dump_bo: cannot open '" + std::string(path) +
                          "': " + std::strerror(errno));

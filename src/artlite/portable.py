@@ -1,6 +1,7 @@
 """The operating system's part of the Python side (Linux, Windows): executable names, file locks, process groups, a
-thread's CPU, the memory still available, a pipe's buffer, the time since the system started, how the NPU wakes.
-(``gguf_model``'s page hints test for ``mmap.madvise`` themselves.)"""
+thread's CPU, the memory the process holds and the system has left, a pipe's buffer, the time since the system
+started, how the NPU wakes.
+(A file mapping's page hints are the native module's: ``_native.page_hint``.)"""
 
 import contextlib
 import os
@@ -97,6 +98,33 @@ def uptime() -> float:
     still there while the system sleeps)."""
     clock = getattr(time, "CLOCK_BOOTTIME", None)
     return time.monotonic() if clock is None else time.clock_gettime(clock)
+
+
+def process_memory() -> tuple[int, int] | None:
+    """(bytes of RAM this process holds, the most it held so far): Linux's VmRSS and VmHWM, Windows' working set and
+    its peak; None when unknown. The NPU's buffers are among them (pinned memory of the process), a mapped model
+    file's pages only while the process has them mapped."""
+    if WINDOWS:
+        import ctypes
+
+        class Counters(ctypes.Structure):  # (PROCESS_MEMORY_COUNTERS)
+            _fields_ = [("cb", ctypes.c_ulong), ("faults", ctypes.c_ulong)] + \
+                [(name, ctypes.c_size_t) for name in ("peak", "now", "peak_paged", "paged", "peak_nonpaged", "nonpaged",
+                                                      "pagefile", "peak_pagefile")]
+
+        pm = Counters()
+        pm.cb = ctypes.sizeof(pm)
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.K32GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        return (int(pm.now), int(pm.peak)) if k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pm), pm.cb) \
+            else None
+    try:
+        with open("/proc/self/status") as f:
+            kb = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in f) if k in ("VmRSS", "VmHWM")}
+        return kb["VmRSS"] << 10, kb["VmHWM"] << 10
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def available_memory() -> int | None:

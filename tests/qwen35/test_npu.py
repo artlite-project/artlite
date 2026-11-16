@@ -59,7 +59,7 @@ def test_slice(size: str) -> None:
     tokens = _tokens(path, n, "apple.txt")
     G = golden(path, tokens, ubatch=1, layers=(layers[0] - 1, *layers), names="l_out", logits="none")
     ov = QwenOverlay(g, layers=layers, vocab=512, max_positions=64)
-    ov.load(release=False)
+    ov.load()
     errs = np.zeros((n, len(layers)))
     for t in range(n):
         ov.step(torch.from_numpy(np.asarray(G["l_out", layers[0] - 1][t], np.float32).copy()), t, logits=False)

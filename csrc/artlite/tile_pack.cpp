@@ -14,9 +14,7 @@
 #include <cstring>
 #include <format>
 #include <memory>
-#include <optional>
 #include <unordered_map>
-#include <vector>
 
 #include "artlite/bfp16_simd.h"
 #include "artlite/error.h"
@@ -767,34 +765,72 @@ struct Item {
   int64_t t0, nt;  // row tiles
 };
 
-void run_batch(uint8_t* out, const PackBlock* blocks, size_t n_blocks, size_t max_S, const PackOptions& opt,
-               bool use_mapped_file) {
+}  // namespace
+
+TileFormat tile_format(std::string_view name) {
+  for (const FormatInfo& f : kFormats)
+    if (f.name == name) return f.fmt;
+  throw Error(std::format("pack_tiles: no native packer for {}", name));
+}
+
+size_t block_bytes(TileFormat f) { return info(f).block_bytes; }
+
+size_t used_bytes(TileFormat f, int R, int nsb) { return info(f).used_bytes(R, nsb); }
+
+void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blocks, const PackOptions& opt) {
+  // checks, the work items, the tensors in order of first use
   pack::Items run;
   std::unordered_map<const uint8_t*, uint32_t> tensor_of;
-  std::vector<std::vector<uint32_t>> block_tensors(n_blocks);
+  std::vector<std::vector<uint32_t>> block_tensors(blocks.size());
   std::vector<Item> items;
-  const int file = use_mapped_file && !opt.file.empty() ? 0 : -1;
-  for (size_t bi = 0; bi < n_blocks; bi++) {
+  size_t max_S = 64;
+  const int file = opt.file.path.empty() ? -1 : 0;
+  for (size_t bi = 0; bi < blocks.size(); bi++) {
     const PackBlock& b = blocks[bi];
-    const size_t row_bytes = size_t(b.row_sb) * info(b.fmt).block_bytes;
-    const int64_t tile_rows = int64_t(b.R) * b.G;
+    const FormatInfo& fi = info(b.fmt);
+    const size_t row_bytes = size_t(b.row_sb) * fi.block_bytes;
+    const bool pairs = fi.pairs, bfp = fi.bfp, f32 = b.fmt == TileFormat::BFP16_F32;
+    const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
+    if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
+        tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
+        b.kc_group <= 0 || b.n_kc % b.kc_group || fi.used_bytes(b.R, b.nsb) > b.S || b.row_sb <= 0 ||
+        b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
+        (b.G > 1 && (b.n_kc != 1 || b.row_sb * b.G != b.nsb || f32)) ||
+        b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
+        b.offset + (b.cols - 1) * b.col_stride + size_t(b.n_rt) * b.n_kc * b.S > out_size)
+      throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, G {}, S {}, nsb {}, row_sb {}, n {}, "
+                              "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
+                              b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
+                              b.cols * b.col_stride, b.offset, out_size));
+    if (b.fmt == TileFormat::IQ1_S && !opt.iq1_masks)
+      throw Error(std::format("pack_tiles: block {}: IQ1_S tiles need the grid's masks (iq1_masks)", bi));
+    int64_t total = 0;
     for (auto [data, rows] : b.tensors) {
+      total += rows;
       auto [it, added] = tensor_of.try_emplace(data, static_cast<uint32_t>(run.tensors.size()));
-      if (added) run.tensors.push_back({data, size_t(rows) * row_bytes, file});
+      if (added) run.tensors.push_back({data, 0, file});
+      pack::Tensor& x = run.tensors[it->second];  // (the bytes any block reads of it)
+      x.bytes = std::max(x.bytes, size_t(rows) * row_bytes);
       block_tensors[bi].push_back(it->second);
     }
-    const int64_t step = (std::max)(int64_t(1), kItemRows / tile_rows), tiles = b.n / tile_rows;
+    const int64_t indices = f32 ? 2 * total : total;  // (F32: two planes per row)
+    for (int64_t i = 0; i < b.cols * b.n; i++)
+      if (b.rows[i] < -1 || b.rows[i] >= indices)
+        throw Error(std::format("pack_tiles: block {}: row {} of {} stacked rows", bi, b.rows[i], indices));
+    max_S = std::max(max_S, b.S);
+    const int64_t step = std::max<int64_t>(1, kItemRows / tile_rows), tiles = b.n / tile_rows;
     for (int c = 0; c < b.cols; c++)
       for (int64_t t0 = 0; t0 < tiles; t0 += step) {
-        const int64_t nt = (std::min)(step, tiles - t0);
-        items.push_back({static_cast<int>(bi), c, t0, nt});
-        run.add(block_tensors[bi], size_t(nt) * tile_rows * row_bytes);
+        items.push_back({static_cast<int>(bi), c, t0, std::min(step, tiles - t0)});
+        run.add(block_tensors[bi], size_t(items.back().nt) * tile_rows * row_bytes);
       }
   }
 
-  std::vector<pack::MappedFile> files;
-  if (file == 0) files.push_back({opt.file, opt.map});
-  pack::run_items(run, files, opt.threads, use_mapped_file && opt.release, [&] {
+  pack::Views views(run, file == 0 ? std::vector<pack::MappedFile>{opt.file} : std::vector<pack::MappedFile>{});
+  std::vector<std::vector<const uint8_t*>> rows_of(blocks.size());  // (per block its tensors' bytes: the views')
+  for (size_t bi = 0; bi < blocks.size(); bi++)
+    for (uint32_t t : block_tensors[bi]) rows_of[bi].push_back(run.tensors[t].data);
+  pack::run_items(run, views, opt.threads, [&] {
     auto tile = std::shared_ptr<uint8_t>(platform::aligned_buffer<uint8_t>(64, (max_S + 63) / 64 * 64).release(),
                                          platform::AlignedFree{});
     if (!tile) throw std::bad_alloc();
@@ -819,10 +855,10 @@ void run_batch(uint8_t* out, const PackBlock* blocks, size_t n_blocks, size_t ma
           int64_t i = rows[r];
           lo[r] = f32 && i >= 0 ? i & 1 : 0;
           if (f32 && i >= 0) i >>= 1;
-          for (auto [data, n] : b.tensors) {
-            if (i < 0) break;
+          for (size_t t = 0; t < b.tensors.size() && i >= 0; t++) {
+            const int64_t n = b.tensors[t].second;
             if (i < n) {
-              base[r] = data + i * row_bytes;
+              base[r] = rows_of[it.block][t] + i * row_bytes;
               break;
             }
             i -= n;
@@ -856,198 +892,6 @@ void run_batch(uint8_t* out, const PackBlock* blocks, size_t n_blocks, size_t ma
       }
     });
   });
-}
-
-#ifdef _WIN32
-constexpr size_t kWinBatchBytes = size_t(64) << 20;
-
-/// RAII wrapper for a read-only Windows file mapping that packs in temporary chunked views so the caller's
-/// full-file np.memmap is not faulted into the working set.
-class WinFileMapping {
- public:
-  WinFileMapping(HANDLE file, HANDLE mapping, const uint8_t* map_base, uint64_t limit, DWORD gran)
-      : file_(file), mapping_(mapping), map_base_(map_base), limit_(limit), gran_(gran) {}
-  ~WinFileMapping() { reset(); }
-  WinFileMapping(WinFileMapping&& o) noexcept
-      : file_(o.file_), mapping_(o.mapping_), map_base_(o.map_base_), limit_(o.limit_), gran_(o.gran_) {
-    o.file_ = INVALID_HANDLE_VALUE;
-    o.mapping_ = nullptr;
-  }
-  WinFileMapping(const WinFileMapping&) = delete;
-  WinFileMapping& operator=(const WinFileMapping&) = delete;
-  WinFileMapping& operator=(WinFileMapping&&) = delete;
-
-  static std::optional<WinFileMapping> open(const std::string& path, const uint8_t* map_base, size_t map_size) {
-    if (path.empty() || map_base == nullptr || map_size == 0) return std::nullopt;
-    const int wlen = ::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen <= 1) return std::nullopt;
-    std::wstring wpath(static_cast<size_t>(wlen - 1), L'\0');
-    if (::MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen) == 0) return std::nullopt;
-    HANDLE fh = ::CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (fh == INVALID_HANDLE_VALUE) return std::nullopt;
-    LARGE_INTEGER fsize{};
-    if (!::GetFileSizeEx(fh, &fsize) || fsize.QuadPart <= 0) {
-      ::CloseHandle(fh);
-      return std::nullopt;
-    }
-    HANDLE mh = ::CreateFileMappingW(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (mh == nullptr) {
-      ::CloseHandle(fh);
-      return std::nullopt;
-    }
-    SYSTEM_INFO si{};
-    ::GetSystemInfo(&si);
-    const uint64_t limit = (std::min)(static_cast<uint64_t>(map_size), static_cast<uint64_t>(fsize.QuadPart));
-    return WinFileMapping(fh, mh, map_base, limit, si.dwAllocationGranularity);
-  }
-
-  bool in_range(const uint8_t* data, size_t bytes, uint64_t& off) const {
-    if (bytes == 0 || data < map_base_) return false;
-    const uintptr_t delta = reinterpret_cast<uintptr_t>(data) - reinterpret_cast<uintptr_t>(map_base_);
-    if (static_cast<uint64_t>(delta) >= limit_ || static_cast<uint64_t>(bytes) > limit_ - delta) return false;
-    off = static_cast<uint64_t>(delta);
-    return true;
-  }
-
-  void pack_chunked(uint8_t* out, const std::vector<PackBlock>& blocks, size_t max_S, const PackOptions& opt) const {
-    struct MappedView {
-      void* base = nullptr;
-      ~MappedView() {
-        if (base) ::UnmapViewOfFile(base);
-      }
-      MappedView(void* p = nullptr) : base(p) {}
-      MappedView(MappedView&& o) noexcept : base(o.base) { o.base = nullptr; }
-      MappedView(const MappedView&) = delete;
-      MappedView& operator=(const MappedView&) = delete;
-      MappedView& operator=(MappedView&&) = delete;
-    };
-
-    for (size_t bi0 = 0; bi0 < blocks.size();) {
-      std::unordered_map<const uint8_t*, size_t> unique;
-      size_t total_bytes = 0, bi1 = bi0;
-      for (; bi1 < blocks.size(); bi1++) {
-        const PackBlock& b = blocks[bi1];
-        const size_t row_bytes = size_t(b.row_sb) * info(b.fmt).block_bytes;
-        size_t added = 0;
-        std::vector<std::pair<const uint8_t*, size_t>> seen;
-        for (auto [data, rows] : b.tensors) {
-          const size_t bytes = size_t(rows) * row_bytes;
-          uint64_t off = 0;
-          if (!in_range(data, bytes, off)) continue;
-          auto it = unique.find(data);
-          const size_t cur = it == unique.end() ? 0 : it->second;
-          if (bytes > cur) added += bytes - cur;
-          seen.emplace_back(data, bytes);
-        }
-        if (bi1 > bi0 && total_bytes + added > kWinBatchBytes) break;
-        for (auto [data, bytes] : seen) {
-          size_t& slot = unique[data];
-          if (bytes > slot) {
-            total_bytes += bytes - slot;
-            slot = bytes;
-          }
-        }
-      }
-
-      std::vector<MappedView> views;
-      std::vector<WIN32_MEMORY_RANGE_ENTRY> prefetch;
-      std::unordered_map<const uint8_t*, const uint8_t*> remap;
-      views.reserve(unique.size());
-      prefetch.reserve(unique.size());
-      remap.reserve(unique.size());
-      for (const auto& [orig, bytes] : unique) {
-        uint64_t off = 0;
-        if (!in_range(orig, bytes, off)) continue;
-        const uint64_t aligned = (off / gran_) * gran_;
-        const size_t pad = static_cast<size_t>(off - aligned);
-        void* base = ::MapViewOfFile(mapping_, FILE_MAP_READ, static_cast<DWORD>(aligned >> 32),
-                                     static_cast<DWORD>(aligned & 0xFFFFFFFFu), pad + bytes);
-        if (!base) continue;
-        views.emplace_back(base);
-        const uint8_t* ptr = static_cast<const uint8_t*>(base) + pad;
-        remap.emplace(orig, ptr);
-        prefetch.push_back({const_cast<uint8_t*>(ptr), bytes});
-      }
-      if (!prefetch.empty()) ::PrefetchVirtualMemory(::GetCurrentProcess(), prefetch.size(), prefetch.data(), 0);
-
-      std::vector<PackBlock> batch(blocks.begin() + static_cast<ptrdiff_t>(bi0),
-                                   blocks.begin() + static_cast<ptrdiff_t>(bi1));
-      for (PackBlock& b : batch)
-        for (auto& [data, rows] : b.tensors)
-          if (auto it = remap.find(data); it != remap.end()) data = it->second;
-
-      run_batch(out, batch.data(), batch.size(), max_S, opt, false);
-      bi0 = bi1;
-    }
-  }
-
- private:
-  void reset() {
-    if (mapping_) ::CloseHandle(mapping_);
-    if (file_ != INVALID_HANDLE_VALUE) ::CloseHandle(file_);
-    mapping_ = nullptr;
-    file_ = INVALID_HANDLE_VALUE;
-  }
-
-  HANDLE file_ = INVALID_HANDLE_VALUE;
-  HANDLE mapping_ = nullptr;
-  const uint8_t* map_base_ = nullptr;
-  uint64_t limit_ = 0;
-  DWORD gran_ = 65536;
-};
-#endif
-
-}  // namespace
-
-TileFormat tile_format(std::string_view name) {
-  for (const FormatInfo& f : kFormats)
-    if (f.name == name) return f.fmt;
-  throw Error(std::format("pack_tiles: no native packer for {}", name));
-}
-
-size_t block_bytes(TileFormat f) { return info(f).block_bytes; }
-
-size_t used_bytes(TileFormat f, int R, int nsb) { return info(f).used_bytes(R, nsb); }
-
-void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blocks, const PackOptions& opt) {
-  size_t max_S = 64;
-  for (size_t bi = 0; bi < blocks.size(); bi++) {
-    const PackBlock& b = blocks[bi];
-    const FormatInfo& fi = info(b.fmt);
-    const size_t row_bytes = size_t(b.row_sb) * fi.block_bytes;
-    const bool pairs = fi.pairs, bfp = fi.bfp, f32 = b.fmt == TileFormat::BFP16_F32;
-    const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
-    if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
-        tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
-        b.kc_group <= 0 || b.n_kc % b.kc_group || fi.used_bytes(b.R, b.nsb) > b.S || b.row_sb <= 0 ||
-        b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
-        (b.G > 1 && (b.n_kc != 1 || b.row_sb * b.G != b.nsb || f32)) ||
-        b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
-        b.offset + (b.cols - 1) * b.col_stride + size_t(b.n_rt) * b.n_kc * b.S > out_size)
-      throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, G {}, S {}, nsb {}, row_sb {}, n {}, "
-                              "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
-                              b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
-                              b.cols * b.col_stride, b.offset, out_size));
-    if (b.fmt == TileFormat::IQ1_S && !opt.iq1_masks)
-      throw Error(std::format("pack_tiles: block {}: IQ1_S tiles need the grid's masks (iq1_masks)", bi));
-    int64_t total = 0;
-    for (auto [data, rows] : b.tensors) total += rows;
-    const int64_t indices = f32 ? 2 * total : total;  // (F32: two planes per row)
-    for (int64_t i = 0; i < b.cols * b.n; i++)
-      if (b.rows[i] < -1 || b.rows[i] >= indices)
-        throw Error(std::format("pack_tiles: block {}: row {} of {} stacked rows", bi, b.rows[i], indices));
-    max_S = (std::max)(max_S, b.S);
-  }
-
-#ifdef _WIN32
-  if (opt.release)
-    if (auto mapping = WinFileMapping::open(opt.file, opt.map, opt.map_size)) {
-      mapping->pack_chunked(out, blocks, max_S, opt);
-      return;
-    }
-#endif
-  run_batch(out, blocks.data(), blocks.size(), max_S, opt, true);
 }
 
 }  // namespace artlite

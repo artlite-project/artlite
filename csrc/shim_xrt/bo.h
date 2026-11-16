@@ -38,7 +38,8 @@ struct user_memory {};
 // context (XRT creates a buffer only on a device object with a context): the commands of every context list it, at one
 // address. (A buffer of the group kernel.group_id gives belongs to that context's xclbin slot: every context would pin
 // the memory again, on Windows another allocation of its size in the NPU's share of memory.) A data buffer is a range
-// of a region: small ones share one, a large one has its own.
+// of a region: the buffers allocated together have one of exactly their size (device::alloc_bos), a buffer allocated
+// alone lies in a shared one or, when large, in its own (device::take).
 struct region {
   explicit region(size_t size);
   ~region();
@@ -46,6 +47,8 @@ struct region {
   region& operator=(const region&) = delete;
 
   xrt::bo& xrt_for(const hw_ctx& ctx);
+  // The XRT buffer if a context made it already, else nullptr.
+  xrt::bo* made();
 
   void* host;
   size_t size;
@@ -62,6 +65,8 @@ struct bo {
 
   bo(device& dev, size_t size, kind k);
   bo(device& dev, size_t size, user_memory);
+  // A data buffer at `offset` of `r` (device::alloc_bos).
+  bo(device& dev, size_t size, std::shared_ptr<region> r, size_t offset);
   ~bo();
   bo(const bo&) = delete;
   bo& operator=(const bo&) = delete;

@@ -32,7 +32,7 @@ from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline
 from .detokenizer import StreamDecoder
-from .hostenv import performance_mode, stale_install
+from .hostenv import memory_note, performance_mode, stale_install
 from .lfm3a.host import asr_system
 from .model import MEDIA_MARKER, Model, media_parts
 from .npu_model import NpuModel, auto_capacity
@@ -149,7 +149,7 @@ def fail(error: object) -> NoReturn:
 def loaded(args: argparse.Namespace, model: Model, npu: NpuModel, t0: float, what: str) -> None:
     """The line to stderr that a model is loaded (``t0``: the start of its opening), ``what`` it is loaded for."""
     sys.stderr.write(f"{os.path.basename(args.model)} ({model.name}): {what}; loaded in {time.perf_counter() - t0:.1f} s: "
-                     f"{npu.describe()}\n")
+                     f"{npu.describe()}{memory_note()}\n")
 
 
 def generate_image(args: argparse.Namespace) -> None:

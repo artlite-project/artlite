@@ -67,8 +67,7 @@ def dma_rates(op: DmaProbeOperator, *, seconds: float, pages: str) -> dict[str, 
     """GB/s of ROWS on buffers of ``pages`` pages (bytes over the median dispatch)."""
     with host_pages(pages):
         dev = OverlayDevice(op)
-        dev.alloc("src", BUFFER)
-        dev.alloc("dst", BUFFER)
+        dev.alloc_all({"src": BUFFER, "dst": BUFFER})
     src, dst = dev.address("src"), dev.address("dst")
     out = {}
     for i, row in enumerate([ROWS[2], *ROWS]):  # (first: the DPM ramp's warm-up)
@@ -117,8 +116,7 @@ def control_rates(op: DmaProbeOperator, clock: ClockProbeOperator, *, seconds: f
     out) and per byte of control code; the dispatch round trip, NOP dispatches back to back blocking and with 1 or 3
     queued (the rate of ``xrt-smi validate``'s throughput test)."""
     dev = OverlayDevice(op)
-    dev.alloc("src", 4 * MB)
-    dev.alloc("dst", 4 * MB)
+    dev.alloc_all({"src": 4 * MB, "dst": 4 * MB})
     src = dev.address("src")
     out: dict[str, float] = {}
     for kind in CONTROL:

@@ -90,8 +90,6 @@ class FusedOperator(FusedElf):
         every BD address patched, in an instruction BO."""
         super()._load(elf)
         dev, sizes = self._device, self.layout.space_bytes
-        self._in_bo = dev.alloc_host_buffer(max(sizes["input"], 2))
-        self._out_bo = dev.alloc_host_buffer(max(sizes["output"], 2))
         self._ext = []  # (scratch start, end, BO, byte offset in the BO)
         for name, (bo, offset) in self.external_buffers.items():
             s = self.layout.spans[name]
@@ -100,7 +98,10 @@ class FusedOperator(FusedElf):
             if offset + s.nbytes > bo.size:  # (the NPU would read and write past the BO)
                 raise ValueError(f"{self.name}: external buffer {name} of {s.nbytes} bytes at {offset} in a BO of {bo.size}")
             self._ext.append((s.offset, s.offset + s.nbytes, bo, offset))
-        self._scratch_bo = dev.alloc_host_buffer(max(min((e[0] for e in self._ext), default=sizes["scratch"]), 2))
+        scratch = min((e[0] for e in self._ext), default=sizes["scratch"])
+        # (together: one XRT buffer of their size, ``OverlayDevice.alloc_all``)
+        self._in_bo, self._out_bo, self._scratch_bo = dev.alloc_host_buffers(
+            [max(n, 2) for n in (sizes["input"], sizes["output"], scratch)])
         code, self._bds = self._control_program(
             elf, lambda bd: txn.device_address(*self._bo_at(bd.space, bd.start), self._ctx))
         self._insts_bo = dev.alloc_insts_buffer(code.nbytes)

@@ -4,13 +4,14 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <format>
-#include <fstream>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,11 +99,7 @@ void bind_device(nb::module_& m) {
           "read_file",
           [](shim_xdna::bo& self, const std::string& path, size_t offset, uint64_t file_offset,
              int64_t nbytes) {
-            if (nbytes < 0) {
-              std::ifstream f(path, std::ios::binary | std::ios::ate);
-              if (!f) throw artlite::Error("read_file: cannot open '" + path + "'");
-              nbytes = static_cast<int64_t>(f.tellg()) - static_cast<int64_t>(file_offset);
-            }
+            if (nbytes < 0) nbytes = static_cast<int64_t>(artlite::file_size(path)) - static_cast<int64_t>(file_offset);
             nb::gil_scoped_release release;
             artlite::read_file(self, offset, path, file_offset, static_cast<size_t>(nbytes));
           },
@@ -208,6 +205,28 @@ void bind_device(nb::module_& m) {
           "memory, as alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows on pages of their own run at a "
           "fraction of the rate: on Strix Halo 12 instead of 57 GB/s for 128-byte rows).")
       .def(
+          "alloc_host_buffers",
+          [](nb::handle self, std::vector<size_t> sizes) {
+            auto& dev = nb::cast<shim_xdna::device&>(self);
+            std::vector<std::unique_ptr<shim_xdna::bo>> bos;
+            {
+              nb::gil_scoped_release release;
+              bos = dev.alloc_bos(sizes, user_bo_bytes);
+            }
+            nb::list out;
+            for (auto& b : bos) {
+              nb::object o = nb::cast(std::move(b));
+              nb::detail::keep_alive(o.ptr(), self.ptr());
+              out.append(o);
+            }
+            return out;
+          },
+          "sizes"_a, nb::sig("def alloc_host_buffers(self, sizes: list[int]) -> list[Buffer]"),
+          "Zeroed host buffers of the sizes, each as alloc_host_buffer's, allocated together. On the XRT backend they "
+          "are ranges of one XRT buffer of exactly their size (a command lists at most 5 XRT buffers, and a buffer "
+          "allocated alone lies in a shared 1 GB region that is pinned whole): what knows its buffers beforehand "
+          "allocates them here.")
+      .def(
           "alloc_user_buffer",
           [](shim_xdna::device& self, size_t size) {
             nb::gil_scoped_release release;
@@ -291,9 +310,7 @@ void bind_device(nb::module_& m) {
           },
           "The most recent asynchronous AIE error (device-wide), or None. A firmware query: only "
           "after a clean failure, never while a job may be hung.",
-          nb::sig("def last_async_error(self) -> dict[str, int] | None"))
-      .def_static("reserve_shared", &shim_xdna::device::reserve_shared, "bytes"_a,
-                  "Hint the next shared XRT buffer region capacity in bytes (0 resets the 1 GiB default; no-op on Linux).");
+          nb::sig("def last_async_error(self) -> dict[str, int] | None"));
 }
 
 }  // namespace artlite::bindings

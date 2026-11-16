@@ -37,9 +37,13 @@ class VisionDevice(ImageStore):
     """The compiled design, its DDR images by name (``ImageStore``), the roles' pages and the dispatches of ``seq.Seq``
     programs."""
 
-    def __init__(self, design: D.VisionDesign | None = None):
+    def __init__(self, design: D.VisionDesign | None = None, *, layout: dict | None = None):
+        """layout: another device's ``layout()`` (a cached build's): its buffers allocated together, before this one's
+        own images take a chunk alone (``restore``)."""
         self.design = design or D.VisionDesign()
         super().__init__(OverlayDevice(self.design))
+        if layout is not None:
+            self.restore(layout)
         self._packing: Future[None] | None = None  # (``pack_behind``)
         self.pager = role_pages(os.path.dirname(self.dev._prog.insts_path))
         nop = np.zeros(D.Q // 4, np.int32)

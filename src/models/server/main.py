@@ -23,7 +23,7 @@ import uvicorn
 from artlite import settings
 
 from .. import open_model
-from ..hostenv import performance_mode, stale_install
+from ..hostenv import memory_note, performance_mode, stale_install
 from ..model import Model
 from ..npu_model import NpuModel
 from ..sampling import Sampling
@@ -105,7 +105,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         npu.lookup = args.lookup
         if args.spec_draft_n_max is not None:
             npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
-        log.info("%s (%s): loaded in %.1f s: %s", name, model.name, time.perf_counter() - t0, npu.describe())
+        log.info("%s (%s): loaded in %.1f s: %s%s", name, model.name, time.perf_counter() - t0, npu.describe(),
+                 memory_note())
         return model, npu
 
     server: Server | None = None

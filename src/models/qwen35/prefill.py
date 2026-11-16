@@ -67,7 +67,7 @@ from ml_dtypes import bfloat16
 from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS
 from artlite.operators.fused.layout import parse_name
-from artlite.operators.util import arg_bytes, rup
+from artlite.operators.util import arg_bytes
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
 from artlite.prefill.norm import PrefillNormOperator
@@ -164,7 +164,6 @@ class QwenPrefill(ChunkPrefill):
         self._rows()
         self._library()
         self.runlists |= {("fresh", T): self._runlist_of(T, fresh=True) for T in self.fresh_sizes}
-        self._alias_scratch()
 
     # ------------------------------------------------------------------
     # The runlists
@@ -390,58 +389,6 @@ class QwenPrefill(ChunkPrefill):
 
     def _own_sizes(self, own: dict[str, int]) -> None:
         self.cs_rows = own.get("PCS", 0) // 256  # (the cos / sin table: every position the sub-chunks' slices reach)
-
-    def _alias_scratch(self) -> None:
-        """Fold non-overlapping dense-prefill scratch buffers into F and G to cut pinned XRT BO memory."""
-        if self.moe:
-            return
-        own = self.own
-        # Non-overlapping lifetimes per layer:
-        #   QS or (PR | O) -> A -> Y -> (GU -> F) | HP -> G
-        # and in DFlash end_items after all layers finish (FZ stays isolated/zeroed, FT lives across layers):
-        #   FY -> (FPN, FX0), then FG reuses [0:fg] while FPN remains live at [off_fpn:].
-        y, qs, pr, o = own.get("Y", 0), own.get("QS", 0), own.get("PR", 0), own.get("O", 0)
-        fy, fg, fpn = own.get("FY", 0), own.get("FG", 0), own.get("FPN", 0)
-        off_o = rup(pr, 4096)
-        off_a = max(qs, off_o + o, y)
-        off_fpn = max(fy, fg)
-        off_fx0 = off_fpn + rup(fpn, 4096)
-        alias: dict[str, tuple[str, int]] = {
-            "Y": ("F", 0),
-            "QS": ("F", 0),
-            "PR": ("F", 0),
-            "O": ("F", off_o),
-            "A": ("F", off_a),
-            "GU": ("F", 0),
-            "F": ("F", 0),
-            "FY": ("F", 0),
-            "FG": ("F", 0),
-            "FPN": ("F", off_fpn),
-            "FX0": ("F", off_fx0),
-            "G": ("G", 0),
-            "HP": ("G", 0),
-        }
-        merged: dict[str, int] = {}
-        for name, (dst, off) in alias.items():
-            if name in own:
-                merged[dst] = max(merged.get(dst, 0), rup(off + own.pop(name), 4096))
-        for dst, sz in merged.items():
-            own[dst] = max(own.get(dst, 0), sz)
-
-        def remap(op: object, i: int, ref: str) -> str:
-            base, a, b = parse_name(ref)
-            if base not in alias:
-                return ref
-            dst, off = alias[base]
-            if base == dst and off == 0:
-                return ref
-            end = arg_bytes(op, i) if b is None else b
-            return f"{dst}[{off + a}:{off + end}]"
-
-        self.runlists = {
-            k: [(op, *(remap(op, i, ref) for i, ref in enumerate(refs))) for op, *refs in rl]
-            for k, rl in self.runlists.items()
-        }
 
     def _bind(self) -> None:
         """The GDN layers' scan parameters (PP), the attention layers' q / k norms (PQN), the cos / sin table (PCS)."""

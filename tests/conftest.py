@@ -54,7 +54,8 @@ def npu() -> "VisionDevice":
 # the vision overlay's ops and weight packer).
 # Entries: test files or test ids.
 SMOKE = (
-    "test_app_designs.py", "decode/test_kv.py", "test_overlay.py", "gemma4/test_attn.py", "llama/test_image.py",
+    "test_app_designs.py", "decode/test_kv.py", "test_overlay.py", "test_gguf_model.py", "gemma4/test_attn.py",
+    "llama/test_image.py",
     "qwen35/test_image.py", "gemm/test_dma.py", "operators/test_render_cache.py", "server/test_server.py",
     "test_sampling.py", "prefill/test_pace.py", "minicpmv/test_host.py", "minicpmv/test_npu.py", "test_probe.py", "operators/test_kmath.py",
     "operators/test_kernel_lib.py",
@@ -63,6 +64,7 @@ SMOKE = (
     "operators/test_fused.py::test_library_without_reset", "operators/test_fused.py::test_library_abort",
     "operators/test_fused.py::TestFusedOperator::test_silu_add",
     "operators/test_fused.py::TestFusedLifecycle::test_buffer_pinned_once",
+    "operators/test_fused.py::TestFusedLifecycle::test_buffers_together",
     "operators/test_fused.py::TestFusedLifecycle::test_sync_lines",
     "decode/test_gemv.py::test_gemv[Q4_0-9216-4]",
     "prefill/test_gemm.py::test_prefill_gemm[llama-1B-Q4_K_M-L3-gate_up-T256]",

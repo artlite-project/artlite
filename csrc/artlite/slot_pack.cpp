@@ -128,8 +128,7 @@ size_t slot_row_bytes(SlotSource type, int64_t cols) {
 }
 
 void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPart>& parts,
-                const std::vector<SlotJob>& jobs, const std::vector<pack::MappedFile>& files, unsigned threads,
-                bool release) {
+                const std::vector<SlotJob>& jobs, const std::vector<pack::MappedFile>& files, unsigned threads) {
   // checks, the items, the tensors in order of first use
   pack::Items run;
   std::unordered_map<int, uint32_t> number;  // (tensor -> its index in run.tensors)
@@ -173,7 +172,10 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
       }
   }
 
-  pack::run_items(run, files, threads, release, [&] {
+  pack::Views views(run, files);
+  std::vector<SlotTensor> mapped = tensors;  // (the file tensors' bytes: the views')
+  for (auto [tensor, t] : number) mapped[tensor].data = run.tensors[t].data;
+  pack::run_items(run, views, threads, [&] {
     auto row = std::shared_ptr<float>(platform::aligned_buffer<float>(64, sizeof(float) * (kItemKt * kKt + 16)).release(),
                                       platform::AlignedFree{});
     auto span = std::shared_ptr<float>(platform::aligned_buffer<float>(64, sizeof(float) * (max_cols + 64)).release(),
@@ -200,7 +202,7 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
       clips->clear();
       for (int pi = j.part0; pi < j.part0 + j.n_parts; pi++) {
         const SlotPart& p = parts[pi];
-        Use u{&p, clips->size(), 0, INT64_MAX, -1, tensors[p.tensor].type == SlotSource::F32};
+        Use u{&p, clips->size(), 0, INT64_MAX, -1, mapped[p.tensor].type == SlotSource::F32};
         for (int r = 0; r < p.n_runs; r++) {
           const int32_t* v = p.runs + 4 * r;
           const int a = std::max<int>(v[0], k0), b = std::min<int>(v[0] + v[1], k0 + nk);
@@ -224,7 +226,7 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
           const Use& u = use[ui];
           const int64_t r = u.part->rows[int64_t(it.pass) * kPassRows + i];
           if (r < 0) continue;
-          const SlotTensor& t = tensors[u.part->tensor];
+          const SlotTensor& t = mapped[u.part->tensor];
           const float* src;
           int64_t base;  // (the source column of src[0])
           if (u.direct) {

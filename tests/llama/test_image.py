@@ -111,7 +111,7 @@ def test_pack_image() -> None:
     img = LlamaImage(g, layers=[0, 15], vocab=COLS * 64)
     T = img.tile_bytes
     out = np.zeros(img.nbytes, np.uint8)
-    img.pack(out, release=False)
+    img.pack(out)
     assert not out[:img.regions[0].offset].any()
     rng = np.random.default_rng(0)
     for r in img.regions:

@@ -106,6 +106,13 @@ struct device {
   std::unique_ptr<bo> alloc_bo(size_t size, uint32_t flags);
   // A host-only BO in this process's memory (bo's user_memory constructor): for large buffers.
   std::unique_ptr<bo> alloc_user_bo(size_t size);
+  // Data buffers of `sizes` allocated together (the XRT shim gives them one XRT buffer): here each its own BO, a
+  // user BO from user_from bytes on.
+  std::vector<std::unique_ptr<bo>> alloc_bos(std::span<const size_t> sizes, size_t user_from) {
+    std::vector<std::unique_ptr<bo>> out;
+    for (size_t n : sizes) out.push_back(n >= user_from ? alloc_user_bo(n) : alloc_bo(n, XCL_BO_FLAGS_HOST_ONLY));
+    return out;
+  }
 
   std::unique_ptr<hw_ctx> create_hw_context(std::span<const uint8_t> pdi,
                                             std::string_view cu_name);
@@ -129,8 +136,6 @@ struct device {
   // The most recent asynchronous AIE error the firmware reported (device-wide), if any. Uses
   // the management mailbox: only after a clean failure, never while a job may be hung.
   std::optional<amdxdna_async_error> last_async_error() const;
-  // Hint for the next shared host-buffer region size on Windows/XRT (0 resets default 1 GiB; no-op on Linux/XDNA).
-  static void reserve_shared(size_t) {}
 };
 
 }  // namespace shim_xdna

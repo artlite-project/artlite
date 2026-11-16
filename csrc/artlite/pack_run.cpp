@@ -13,31 +13,67 @@
 #include <system_error>
 #include <thread>
 
+#include "artlite/error.h"
 #include "artlite/platform.h"
 
 namespace artlite::pack {
 
 namespace {
 
-constexpr size_t kReadWindow = size_t(2) << 30;
+constexpr size_t kReadWindow = size_t(512) << 20;
 constexpr size_t kReadPiece = size_t(8) << 20;
 constexpr unsigned kReadThreads = 16;
 
-/// The whole pages inside [p, p + n) (MADV_DONTNEED must not touch a neighbour's) or around it (reading).
-std::pair<uintptr_t, size_t> pages(const uint8_t* p, size_t n, bool inside) {
-  const uintptr_t ps = static_cast<uintptr_t>(platform::page_size());
-  uintptr_t a = reinterpret_cast<uintptr_t>(p), b = a + n;
-  a = inside ? (a + ps - 1) / ps * ps : a / ps * ps;
-  b = inside ? b / ps * ps : (b + ps - 1) / ps * ps;
-  return {a, b > a ? b - a : 0};
+/// The whole pages around [p, p + n).
+std::pair<uintptr_t, size_t> pages(const uint8_t* p, size_t n) {
+  const uintptr_t ps = static_cast<uintptr_t>(platform::page_size()), at = reinterpret_cast<uintptr_t>(p);
+  const uintptr_t a = at / ps * ps, b = (at + n + ps - 1) / ps * ps;
+  return {a, b - a};
 }
 
 }  // namespace
 
-void run_items(const Items& items, const std::vector<MappedFile>& files, unsigned threads, bool release,
+Views::Views(Items& items, const std::vector<MappedFile>& files) : views_(items.tensors.size()), files_(files.size()) {
+  const uint64_t unit = platform::view_granularity();
+  for (size_t t = 0; t < items.tensors.size(); t++) {
+    Tensor& x = items.tensors[t];
+    if (x.file < 0 || x.bytes == 0) continue;
+    const MappedFile& f = files.at(static_cast<size_t>(x.file));
+    if (x.data < f.map || x.bytes > f.size || static_cast<size_t>(x.data - f.map) > f.size - x.bytes)
+      throw Error("pack: a tensor outside the mapping of its file " + f.path);
+    if (!files_[x.file]) files_[x.file] = std::make_unique<platform::File>(f.path);
+    const uint64_t offset = static_cast<uint64_t>(x.data - f.map), start = offset / unit * unit;
+    View& v = views_[t];
+    v.bytes = static_cast<size_t>(offset - start) + x.bytes;
+    v.base = files_[x.file]->map(start, v.bytes);
+    v.offset = offset;
+    x.data = static_cast<const uint8_t*>(v.base) + (offset - start);
+  }
+}
+
+Views::~Views() {
+  for (View& v : views_)
+    if (v.base) platform::File::unmap(v.base, v.bytes);
+}
+
+void Views::drop(size_t tensor) {
+  View& v = views_[tensor];
+  if (!v.base) return;
+#ifdef _WIN32
+  platform::File::unmap(v.base, v.bytes);  // (what takes a view's pages out of the working set for certain)
+  v.base = nullptr;
+#else
+  // (the pages now, the mapping with the object: an munmap holds mmap_lock exclusively, and a thousand of them between
+  // the other threads' populates and page faults made a page-cached 27B pack in 0.60 s instead of 0.41)
+  const size_t ps = platform::page_size();
+  platform::drop_pages(v.base, (v.bytes + ps - 1) / ps * ps);
+#endif
+}
+
+void run_items(const Items& items, Views& views, unsigned threads,
                const std::function<std::function<void(size_t)>()>& make) {
   struct State {
-    int64_t left = 0;                  // items (release)
+    int64_t left = 0;                  // items
     std::atomic<int64_t> pending{0};   // pieces not read yet
   };
   const size_t n_tensors = items.tensors.size();
@@ -66,18 +102,13 @@ void run_items(const Items& items, const std::vector<MappedFile>& files, unsigne
           while (state[*t].pending > 0 && !failed) std::this_thread::sleep_for(std::chrono::microseconds(100));
         body(k);
         done_bytes += items.bytes[k];
-        if (release) {
-          std::vector<uint32_t> drop;
-          {
-            std::lock_guard lock(mutex);
-            for (const uint32_t* t = t0; t < t1; t++)
-              if (--state[*t].left == 0 && items.tensors[*t].file >= 0) drop.push_back(*t);
-          }
-          for (uint32_t t : drop) {  // (the pages stay in the page cache)
-            auto [a, n] = pages(items.tensors[t].data, items.tensors[t].bytes, true);
-            if (n) platform::drop_pages(reinterpret_cast<void*>(a), n);
-          }
+        std::vector<uint32_t> last;  // (the tensors this was the last item of: their pages stay in the page cache)
+        {
+          std::lock_guard lock(mutex);
+          for (const uint32_t* t = t0; t < t1; t++)
+            if (--state[*t].left == 0) last.push_back(*t);
         }
+        for (uint32_t t : last) views.drop(t);
       }
       _mm_sfence();
     } catch (...) {
@@ -91,7 +122,6 @@ void run_items(const Items& items, const std::vector<MappedFile>& files, unsigne
   // finds it resident, at most a window ahead of the workers but for the tensors of claimed items (the window counts
   // the items' bytes, which can fall behind the tensors': workers waiting on a held-back tensor would never finish
   // one)
-  std::vector<std::unique_ptr<platform::File>> open(files.size());
   struct Piece {
     const uint8_t* data;
     size_t bytes, tensor;
@@ -100,8 +130,7 @@ void run_items(const Items& items, const std::vector<MappedFile>& files, unsigne
   size_t window = kReadWindow;  // (>= a tensor: the workers of its first item wait for all of it)
   for (size_t t = 0; t < n_tensors; t++) {
     const Tensor& x = items.tensors[t];
-    if (x.file < 0 || state[t].left == 0) continue;
-    if (!open[x.file]) open[x.file] = std::make_unique<platform::File>(files[x.file].path);
+    if (!views.views_[t].base || state[t].left == 0) continue;
     window = std::max(window, x.bytes);
     for (size_t o = 0; o < x.bytes; o += kReadPiece) pieces.push_back({x.data + o, std::min(kReadPiece, x.bytes - o), t});
     state[t].pending = -(-int64_t(x.bytes) / int64_t(kReadPiece));
@@ -117,12 +146,14 @@ void run_items(const Items& items, const std::vector<MappedFile>& files, unsigne
         std::this_thread::sleep_for(std::chrono::microseconds(200));
       issued += pc.bytes;
       const Tensor& x = items.tensors[pc.tensor];
-      auto [a, len] = pages(pc.data, pc.bytes, false);
+      auto [a, len] = pages(pc.data, pc.bytes);
+      // (the file offset of the view's address a: the tensor's, less what a lies before its first byte)
+      const uint64_t at = views.views_[pc.tensor].offset + a - reinterpret_cast<uintptr_t>(x.data);
       if (buf && platform::needs_reading(reinterpret_cast<void*>(a), len, resident.data()))
         for (size_t got = 0; got < len;) {  // (errors, no buffer: the workers' page faults read it)
           size_t r = 0;
           try {
-            r = open[x.file]->read_at(buf.get(), len - got, a - reinterpret_cast<uintptr_t>(files[x.file].map) + got);
+            r = views.files_[x.file]->read_at(buf.get(), len - got, at + got);
           } catch (const std::system_error&) {
           }
           if (r == 0) break;

@@ -218,7 +218,7 @@ class QwenImage(TileImage):
         assert self.draft_cols, "a file with an MTP block of its own"
         return MtpView(self, cfg)
 
-    def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
+    def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
         """(an MoE model's router tensors and an F32 alpha as their copies times w / bf16(w), module docstring; dropped
         after)"""
         names = []
@@ -238,7 +238,7 @@ class QwenImage(TileImage):
                     self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
                     names.append(name)
         try:
-            return super().pack(out, threads=threads, release=release)
+            return super().pack(out, threads=threads)
         finally:
             for name in names:
                 del self._own[name]

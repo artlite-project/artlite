@@ -4,11 +4,13 @@
   fixed at its allocation; a fused ELF's control program runs as an ELF (``ERT_START_NPU_PREEMPT_ELF``).
 - ``xrt`` (Windows; on Linux ``artlite._native_xrt``, built where XRT is installed): the same runtime over XRT's API
   (``csrc/shim_xrt``). A context opens from an xclbin of the program's PDI, built in memory. A command reaches only the
-  XRT buffers it lists, at most 5 (aiecc's kernel): data buffers lie in shared regions and a command lists theirs. A
-  buffer's device address exists only once a context does (an instruction buffer's differs between contexts), so
-  programs open their context before they resolve addresses (``ADDRESSES_NEED_CONTEXT``). A fused ELF's control program runs as a
-  transaction without its DDR patches (``txn.without_ddr_patches``). No profiler register reads, clocks, busy time or
-  firmware error queries.
+  XRT buffers it lists, at most 5 (aiecc's kernel): data buffers are ranges of regions (an XRT buffer each) and a
+  command lists theirs. Buffers allocated together (``Device.alloc_host_buffers``; an overlay's:
+  ``OverlayDevice.alloc_all``) are one region of exactly their size; a buffer allocated alone shares a region of 1 GB,
+  pinned whole, or has its own from 256 MB. A buffer's device address exists only once a context does (an instruction
+  buffer's differs between contexts), so programs open their context before they resolve addresses
+  (``ADDRESSES_NEED_CONTEXT``). A fused ELF's control program runs as a transaction without its DDR patches
+  (``txn.without_ddr_patches``). No profiler register reads, clocks, busy time or firmware error queries.
 
 ``ARTLITE_BACKEND`` picks one (default: the platform's own, ``xdna`` on Linux); ``artlite`` imports this module first.
 """

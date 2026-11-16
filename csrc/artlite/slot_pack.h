@@ -63,10 +63,10 @@ struct SlotJob {
 
 /// Pack every job (bit-identical to the host reference's bfp16 blocks of the same fp32 values: a source element
 /// converted to fp32 exactly, Q8_0's d q in fp32, times the part's scale in fp32), on threads over items of a pass's
-/// 16 k-tiles, non-temporal stores (no cache flush needed for the device after it); the file tensors read into the
-/// page cache ahead of the items, their pages given back after their last item with ``release`` (pack::run_items).
+/// 16 k-tiles, non-temporal stores (no cache flush needed for the device after it); the file tensors through views of
+/// the packer's own, read into the page cache ahead of the items and unmapped after their last item (pack::Views,
+/// pack::run_items).
 void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPart>& parts,
-                const std::vector<SlotJob>& jobs, const std::vector<pack::MappedFile>& files, unsigned threads = 0,
-                bool release = false);
+                const std::vector<SlotJob>& jobs, const std::vector<pack::MappedFile>& files, unsigned threads = 0);
 
 }  // namespace artlite

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <deque>
 #include <format>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,7 @@ struct Kernel::Impl {
   std::vector<std::pair<xrt::run, size_t>> idle;
   std::deque<std::pair<xrt::run, size_t>> pending;  // submitted, in order
   std::chrono::steady_clock::time_point t_submit;
+  uint64_t regions_gone = device::regions_gone();  // (when `idle`'s runs last ran: they hold those commands' buffers)
 
   Impl(hw_ctx& c, std::string_view name) : ctx(c) {
     if (!name.empty() && name != c.m_kernel_name)
@@ -58,7 +60,10 @@ struct Kernel::Impl {
   // The NPU reaches only the XRT buffers its command lists, at most kMaxBuffers, even where the transaction holds the
   // addresses. Up to kMaxBuffers data buffers are the arguments themselves, in order (an insts.bin's DDR patches take
   // the k-th one's address); more, or `resolved` (the transaction has every address and no DDR patch), are their
-  // regions, each once.
+  // regions, each once, and then the process's other regions while the command has room, the largest first: on
+  // Windows a buffer that only one of a model's contexts lists costs at every turn of the contexts (its decode steps
+  // and its drafter's: Qwen3.8 27B with its DFlash2 drafter and a KV cache of 4.6 GB, 131072 positions, on Krackan
+  // Point: steps of ~365 ms, 264 once each context listed the other's large buffers).
   // instr_bytes: the transaction's length (0: the whole BO).
   void submit_cu(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs, size_t instr_bytes = 0,
                  bool resolved = false) {
@@ -83,6 +88,16 @@ struct Kernel::Impl {
       if (args.size() > kMaxBuffers)
         throw DispatchError(std::format("the transaction's buffers lie in {} XRT buffers: a command takes {}",
                                         args.size(), kMaxBuffers));
+      std::vector<std::shared_ptr<shim_xdna::region>> others;  // (alive until the run holds their XRT buffers)
+      if (regions && args.size() < kMaxBuffers) others = device::regions();
+      for (const auto& r : others) {
+        xrt::bo* x = r->made();
+        if (args.size() < kMaxBuffers && x && std::find(args.begin(), args.end(), x) == args.end()) args.push_back(x);
+      }
+      if (const uint64_t gone = device::regions_gone(); gone != regions_gone) {
+        idle.clear();  // (a freed region stays pinned while a run holds its XRT buffer)
+        regions_gone = gone;
+      }
       xrt::run run;
       const auto same = std::find_if(idle.begin(), idle.end(), [&](const auto& p) { return p.second == args.size(); });
       if (same == idle.end()) {

@@ -1,14 +1,18 @@
 #pragma once
 
-// The few operating-system calls of the host code (file reads, aligned memory, page hints, sleeps, CPU affinity), for
-// Linux and Windows.
+// The few operating-system calls of the host code (file reads and views, aligned memory, page hints, sleeps, CPU
+// affinity), for Linux and Windows.
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 
@@ -69,13 +73,37 @@ AlignedPtr<T> aligned_buffer(size_t align, size_t n) {
   return AlignedPtr<T>(static_cast<T*>(aligned_alloc(align, n)));
 }
 
-// Tells the system a mapping's whole pages inside [addr, addr + n) are no longer needed (MADV_DONTNEED; Windows keeps them).
-inline void drop_pages(void* addr, size_t n) {
-#ifndef _WIN32
-  ::madvise(addr, n, MADV_DONTNEED);
+// The unit a file view's offset is a multiple of (File::map): the page size; on Windows the allocation granularity
+// (64 KB).
+inline size_t view_granularity() {
+#ifdef _WIN32
+  SYSTEM_INFO si;
+  ::GetSystemInfo(&si);
+  return si.dwAllocationGranularity;
 #else
-  (void)addr;
-  (void)n;
+  return page_size();
+#endif
+}
+
+// A file mapping's whole pages inside [addr, addr + n) leave the process (they stay in the system's file cache and come
+// back on the next access): MADV_DONTNEED; on Windows VirtualUnlock, which takes pages that are not locked out of the
+// working set.
+inline void drop_pages(void* addr, size_t n) {
+#ifdef _WIN32
+  ::VirtualUnlock(addr, n);
+#else
+  ::madvise(addr, n, MADV_DONTNEED);
+#endif
+}
+
+// Ask for the pages of [addr, addr + n) of a file mapping at once, read ahead into the file cache (MADV_WILLNEED;
+// Windows: PrefetchVirtualMemory): reads of scattered rows would fault them in from the disk one at a time.
+inline void will_need(void* addr, size_t n) {
+#ifdef _WIN32
+  WIN32_MEMORY_RANGE_ENTRY range{addr, n};
+  ::PrefetchVirtualMemory(::GetCurrentProcess(), 1, &range, 0);
+#else
+  ::madvise(addr, n, MADV_WILLNEED);
 #endif
 }
 
@@ -176,15 +204,39 @@ class ThreadOnCpu {
 #endif
 };
 
-// A file opened for reading at offsets from several threads.
+// The Python side's paths are UTF-8, and Windows reads a narrow path in the ANSI code page (a model under a user
+// directory with other letters would not open): the path for the standard library's streams, the wide string of the
+// W functions, fopen.
+inline std::filesystem::path fs_path(std::string_view path) {
+#ifdef _WIN32
+  return std::filesystem::path(std::u8string(path.begin(), path.end()));
+#else
+  return std::filesystem::path(path);
+#endif
+}
+
+#ifdef _WIN32
+inline std::wstring wide_path(std::string_view path) { return fs_path(path).wstring(); }
+#endif
+
+inline FILE* open_file(std::string_view path, const char* mode) {
+#ifdef _WIN32
+  return ::_wfopen(wide_path(path).c_str(), std::wstring(mode, mode + std::strlen(mode)).c_str());
+#else
+  return std::fopen(std::string(path).c_str(), mode);
+#endif
+}
+
+// A file opened for reading at offsets from several threads, and for read-only views of its bytes.
 class File {
  public:
   explicit File(const std::string& path) {
 #ifdef _WIN32
-    h_ = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                       FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    h_ = ::CreateFileW(wide_path(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (h_ == INVALID_HANDLE_VALUE)
       throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "cannot open '" + path + "'");
+    map_ = ::CreateFileMappingW(h_, nullptr, PAGE_READONLY, 0, 0, nullptr);  // (none of an empty file: map fails)
 #else
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) throw std::system_error(errno, std::generic_category(), "cannot open '" + path + "'");
@@ -192,6 +244,7 @@ class File {
   }
   ~File() {
 #ifdef _WIN32
+    if (map_) ::CloseHandle(map_);
     ::CloseHandle(h_);
 #else
     ::close(fd_);
@@ -199,6 +252,28 @@ class File {
   }
   File(const File&) = delete;
   File& operator=(const File&) = delete;
+
+  // A view of the file's bytes [offset, offset + n), offset a multiple of view_granularity(): pages of the system's
+  // file cache, in the process once touched and out of it again with unmap. Throws std::system_error.
+  void* map(uint64_t offset, size_t n) const {
+#ifdef _WIN32
+    const DWORD high = static_cast<DWORD>(offset >> 32), low = static_cast<DWORD>(offset);
+    void* p = map_ ? ::MapViewOfFile(map_, FILE_MAP_READ, high, low, n) : nullptr;
+    if (!p) throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "MapViewOfFile");
+    return p;
+#else
+    void* p = ::mmap(nullptr, n, PROT_READ, MAP_SHARED, fd_, static_cast<off_t>(offset));
+    if (p == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "mmap");
+    return p;
+#endif
+  }
+  static void unmap(void* p, [[maybe_unused]] size_t n) {
+#ifdef _WIN32
+    ::UnmapViewOfFile(p);
+#else
+    ::munmap(p, n);
+#endif
+  }
 
   // Hint that [offset, offset + n) is read front to back (Linux; Windows opens the file with the same hint).
   void advise_sequential([[maybe_unused]] uint64_t offset, [[maybe_unused]] uint64_t n) const {
@@ -232,6 +307,7 @@ class File {
  private:
 #ifdef _WIN32
   HANDLE h_ = INVALID_HANDLE_VALUE;
+  HANDLE map_ = nullptr;
 #else
   int fd_ = -1;
 #endif

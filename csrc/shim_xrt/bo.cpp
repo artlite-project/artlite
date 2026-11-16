@@ -85,9 +85,15 @@ bool has_ddr_patch(std::span<const uint32_t> w) {
 region::region(size_t n) : host(host_alloc(n)), size(round_up(n)) {}
 
 region::~region() {
+  device::region_gone();
   xrt.reset();
   hold.reset();
   host_free(host, size);
+}
+
+xrt::bo* region::made() {
+  std::lock_guard guard(lock);
+  return xrt.get();
 }
 
 xrt::bo& region::xrt_for(const hw_ctx& ctx) {
@@ -111,6 +117,10 @@ bo::bo(device& dev, size_t size, kind k) : m_device(dev), m_size(size), m_kind(k
 
 // (every data buffer is pinned host memory here: a user-memory one is placed like the others)
 bo::bo(device& dev, size_t size, user_memory) : bo(dev, size, kind::data) {}
+
+bo::bo(device& dev, size_t size, std::shared_ptr<region> r, size_t offset)
+    : m_device(dev), m_host(static_cast<char*>(r->host) + offset), m_size(size), m_kind(kind::data),
+      m_region(std::move(r)), m_offset(offset) {}
 
 bo::~bo() {
   m_sub.reset();

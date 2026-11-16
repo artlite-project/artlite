@@ -128,9 +128,9 @@ class GemmaImage(NormedImage):
         self._own[PLE_Q8] = QTensor(name=PLE_Q8, qtype="Q8_0", rows=t.rows, cols=t.cols, raw=raw)
         return PLE_Q8
 
-    def pack(self, out: np.ndarray, *, threads: int = 0, release: bool = True) -> bool:
+    def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
         """(once: the per-layer projection's copy is dropped after it)"""
-        dirty = super().pack(out, threads=threads, release=release)
+        dirty = super().pack(out, threads=threads)
         if PLE_Q8 in self._own:
             t = self._own[PLE_Q8]
             assert t.raw.size, "the image is packed once"

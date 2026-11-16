@@ -33,7 +33,7 @@ def _img() -> tuple[GGUFFile, GemmaImage, np.ndarray]:
         g = GGUFFile(path)
         img = GemmaImage(g, GemmaConfig.from_gguf(g), layers=list(LAYERS), vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
-        img.pack(W, release=False)
+        img.pack(W)
         _image["x"] = (g, img, W)
     return _image["x"]
 

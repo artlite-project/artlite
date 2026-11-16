@@ -43,7 +43,7 @@ from artlite.prefill import pace
 
 from . import open_model
 from .diagnose import telemetry
-from .hostenv import stale_install
+from .hostenv import memory_note, stale_install
 from .npu_model import NpuModel, auto_capacity
 from .spec_options import add_spec_options, spec_options
 
@@ -341,7 +341,7 @@ def main(argv: list[str] | None = None) -> None:
         except (OSError, ValueError, NotImplementedError) as e:
             sys.exit(f"artlite-bench: {name}: {e}")
         sys.stderr.write(f"artlite-bench: {name} ({model.name}): loaded in {time.perf_counter() - t0:.1f} s: "
-                         f"{npu.describe()}\n")
+                         f"{npu.describe()}{memory_note()}\n")
         tokens = token_source(n_vocab, model.encode("")[:1], rng)  # (encode: the model's BOS, if it has one)
         for test in group:
             i += 1

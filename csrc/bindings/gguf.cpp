@@ -11,6 +11,7 @@
 
 #include "artlite/dequant.h"
 #include "artlite/error.h"
+#include "artlite/file_io.h"
 #include "artlite/gguf_json.h"
 #include "bindings/bindings.h"
 
@@ -19,6 +20,26 @@ using namespace nb::literals;
 namespace artlite::bindings {
 
 void bind_gguf(nb::module_& m) {
+  m.def(
+      "page_hint",
+      [](nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> map, std::string hint,
+         nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> offsets, size_t nbytes) {
+        const bool need = hint == "willneed", drop = hint == "dontneed";
+        if (!need && !drop && hint != "populate") throw artlite::Error("page_hint: hint " + hint);
+        nb::gil_scoped_release release;
+        artlite::page_hint(map.data(), map.shape(0),
+                           need ? artlite::PageHint::will_need : drop ? artlite::PageHint::dont_need
+                                                                      : artlite::PageHint::populate,
+                           {offsets.data(), offsets.shape(0)}, nbytes);
+      },
+      "map"_a, "hint"_a, "offsets"_a, "nbytes"_a,
+      nb::sig("def page_hint(map: numpy.ndarray[numpy.uint8], hint: str, offsets: numpy.ndarray[numpy.int64], "
+              "nbytes: int) -> None"),
+      "A hint for the pages of the ranges [offset, offset + nbytes) of a file mapping (gguf_model.GGUFFile's): "
+      "\"willneed\" reads them ahead into the file cache at once, \"dontneed\" gives the whole pages inside back "
+      "(they stay in the file cache and come back on the next access), \"populate\" maps cached ones into the "
+      "process ahead of its reads (Linux). On Linux madvise; on Windows PrefetchVirtualMemory and VirtualUnlock.");
+
   m.def(
       "gguf_strings_json",
       [](nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> data, size_t pos, uint64_t count,

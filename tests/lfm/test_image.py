@@ -93,7 +93,7 @@ def test_pack_image(quant: str) -> None:
     img = LfmImage(g, layers=[3, 4, 6], vocab=COLS * 64)
     T = img.tile_bytes
     out = np.zeros(img.nbytes, np.uint8)
-    img.pack(out, release=False)
+    img.pack(out)
     assert not out[:img.regions[0].offset].any()
     rng = np.random.default_rng(0)
 
@@ -121,5 +121,5 @@ def test_pack_image(quant: str) -> None:
     full = LfmImage(g)
     buf = np.zeros(full.nbytes, np.uint8)
     t0 = time.perf_counter()
-    full.pack(buf, release=False)
+    full.pack(buf)
     print(f"{quant}: {full.nbytes / 1e6:.0f} MB packed in {time.perf_counter() - t0:.2f} s")

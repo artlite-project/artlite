@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "artlite/error.h"
+#include "artlite/platform.h"
 
 namespace artlite {
 
@@ -14,7 +15,7 @@ Executable::Executable(Executable&&) noexcept = default;
 Executable& Executable::operator=(Executable&&) noexcept = default;
 
 static std::vector<uint8_t> read_binary(std::string_view path) {
-  std::ifstream f(std::string(path), std::ios::binary | std::ios::ate);
+  std::ifstream f(platform::fs_path(path), std::ios::binary | std::ios::ate);
   if (!f) throw ExecutableError(std::format("Failed to open file: {}", path));
   auto sz = f.tellg();
   f.seekg(0);

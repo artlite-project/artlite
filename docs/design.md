@@ -47,8 +47,9 @@ flowchart TB
 one; on Linux a second module, `artlite._native_xrt`, where XRT is installed). `ARTLITE_BACKEND` picks one per
 process (`artlite.backend`, which also lists what the Python side does differently on XRT); `artlite.portable` holds
 the operating system's part of the Python side (file locks, process groups). On XRT a context opens from an xclbin
-that `shim_xrt/xclbin.cpp` builds around the PDI, a command lists at most 5 buffers (data buffers lie in shared
-regions), a buffer's device address exists once a context does, and a fused ELF's control program runs as a transaction
+that `shim_xrt/xclbin.cpp` builds around the PDI, a command lists at most 5 buffers (data buffers are ranges of
+regions, each one XRT buffer: the buffers allocated together, `Device.alloc_host_buffers`, have one of exactly their
+size), a buffer's device address exists once a context does, and a fused ELF's control program runs as a transaction
 (`txn.without_ddr_patches`). On Linux the two are level but for that last point: the firmware runs a control program
 slower as a transaction than as an ELF (a small fused ELF ~30 us more per dispatch, prefill 2-6% slower).
 

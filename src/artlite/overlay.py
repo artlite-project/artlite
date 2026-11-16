@@ -23,7 +23,7 @@ import functools
 import os
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import ClassVar, Protocol
 
 import numpy as np
@@ -278,6 +278,16 @@ class OverlayDevice:
         self.buffers[name] = self.device.alloc_host_buffer(nbytes)
         return self.buffers[name].map()
 
+    def alloc_all(self, sizes: Mapping[str, int]) -> None:
+        """Zeroed host buffers by name (as ``alloc``), those of ``sizes`` the device lacks, allocated together. On the
+        XRT backend buffers allocated together are one XRT buffer of exactly their size, and a command lists at most 5
+        (``backend``): an overlay's buffers and those of its prefill cost a command one, whatever their sizes, where a
+        buffer allocated alone lies in a shared region of 1 GB that is pinned whole, or in its own from 256 MB."""
+        new = {name: n for name, n in sizes.items() if name not in self.buffers}
+        assert all(n % 4 == 0 for n in new.values()), new
+        assert all(self.buffers[name].size >= n for name, n in sizes.items() if name not in new), sizes
+        self.buffers |= zip(new, self.device.alloc_host_buffers(list(new.values())))
+
     def adopt(self, name: str, buffer: object) -> np.ndarray:
         """A buffer allocated elsewhere on this device (e.g. in a thread); returns its uint8 view."""
         assert name not in self.buffers, name
@@ -403,32 +413,24 @@ class WeightBuffer:
     and the overlay's other buffers meanwhile (the allocation and the C++ packer release the GIL). ``image``: an
     ``decode.image.TileImage``.
     ``threads``: the packer's (default: 3/4 of the physical cores: the 27B's pack still ends before the app's main
-    thread, which all 16 slow down by ~0.1 s), ``release``: give back the GGUF's pages of each packed tensor."""
+    thread, which all 16 slow down by ~0.1 s)."""
 
-    def __init__(self, image: object, *, threads: int = 0, release: bool = True, start: bool = True):
+    def __init__(self, image: object, *, threads: int = 0):
         self.image = image
         threads = threads or max(1, (os.cpu_count() or 2) * 3 // 8)
         self._allocated = threading.Event()
         self._out: list = []
-        self._thread = threading.Thread(target=self._run, args=(threads, release), name="weights", daemon=True)
-        self._started = start
-        if start:
-            self._thread.start()
+        self._thread = threading.Thread(target=self._run, args=(threads,), name="weights", daemon=True)
+        self._thread.start()
 
-    def start(self) -> None:
-        """Begin background allocation and packing if created with ``start=False``."""
-        if not self._started:
-            self._started = True
-            self._thread.start()
-
-    def _run(self, threads: int, release: bool) -> None:
+    def _run(self, threads: int) -> None:
         try:
             parallel_compile.no_device()  # (planning mode: PlanStop, raised by buffer() and wait())
             dev = Device()
             buf = dev.alloc_user_buffer(self.image.nbytes)
             self._out = [dev, buf]
             self._allocated.set()
-            if self.image.pack(buf.map(), threads=threads, release=release):  # (else non-temporal stores only)
+            if self.image.pack(buf.map(), threads=threads):  # (else non-temporal stores only)
                 buf.sync_to_device()
         except BaseException as e:  # noqa: BLE001 (raised by buffer() and wait())
             self._out = [e]
@@ -436,7 +438,6 @@ class WeightBuffer:
 
     def buffer(self) -> tuple[Device, Buffer]:
         """(the device, the buffer) once allocated (its packing may still run: ``wait``)."""
-        self.start()
         self._allocated.wait()
         if isinstance(self._out[0], BaseException):
             raise self._out[0]
@@ -444,7 +445,6 @@ class WeightBuffer:
 
     def wait(self) -> None:
         """Until the image is packed."""
-        self.start()
         self._thread.join()
         if isinstance(self._out[0], BaseException):
             raise self._out[0]

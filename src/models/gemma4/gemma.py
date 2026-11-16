@@ -88,6 +88,10 @@ class NpuGemma(OverlayModel):
         if self.prefill is not None:
             self.prefill.lib._kernel()
 
+    def _also(self) -> dict[str, int]:
+        """(and the drafter's buffers)"""
+        return super()._also() | (self.drafter.sizes if self.drafter is not None else {})
+
     def _load_drafters(self, threads: int) -> None:
         if self.drafter is not None:
             self.drafter.load(threads=threads)

@@ -56,8 +56,8 @@ check_cxx_compiler_flag(-Werror=format-security ARTLITE_FORMAT_SECURITY)
 if(ARTLITE_FORMAT_SECURITY)
   add_compile_options(-Wformat -Werror=format-security)
 endif()
-if(WIN32)  # every source that includes windows.h (platform.h): no min / max macros
-  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+if(WIN32)  # every source that includes windows.h (platform.h): no min / max macros, Windows 10's API (memoryapi.h's)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS _WIN32_WINNT=0x0A00)
 endif()
 
 # --- C++ libraries (a static library per backend: artlite_xdna, artlite_xrt) ---

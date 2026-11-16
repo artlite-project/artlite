@@ -90,11 +90,9 @@ class ImageStore:
                 "chunk": self._chunk, "top": self._top}
 
     def restore(self, layout: dict) -> None:
-        """``layout()`` of a device built from the same design: the buffers this one lacks allocated in that order (the
-        same names), the images where they were (their bytes zero: the owner writes them)."""
-        for n, nbytes in layout["buffers"]:
-            if n not in self.dev.buffers:
-                self.dev.alloc(n, nbytes)
+        """``layout()`` of a device built from the same design: the buffers this one lacks allocated together (the same
+        names; ``OverlayDevice.alloc_all``), the images where they were (their bytes zero: the owner writes them)."""
+        self.dev.alloc_all(dict(layout["buffers"]))
         self._images = dict(layout["images"])
         self._chunk, self._top = layout["chunk"], layout["top"]
 

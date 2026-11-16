@@ -19,6 +19,7 @@ import inspect
 import math
 import mmap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
@@ -275,20 +276,21 @@ class ModelOverlay:
     # Load
     # ------------------------------------------------------------------
 
-    def load(self, *, threads: int = 0, release: bool = True) -> None:
+    def load(self, *, threads: int = 0, also: Mapping[str, int] | None = None) -> None:
         """Compile the design, allocate the buffers, pack the weight image (or adopt the ``WeightBuffer``'s), write the
-        static objects."""
-        img = self.image
+        static objects. ``also``: buffers of the overlay's device that others use (a prefill's own, a drafter's on the
+        model's device), allocated with the overlay's (``OverlayDevice.alloc_all``)."""
+        img, sizes = self.image, {**self.sizes, **(also or {})}
         if self.weights is not None or self.w_of is not None:
             device, buf = self.weights.buffer() if self.w_of is None else (self.w_of.dev.device, self.w_of.dev.buffers["W"])
             self.dev = dev = OverlayDevice(self.op, device=device)
             dev.adopt("W", buf)
+            dev.alloc_all(sizes)
         else:
             self.dev = dev = OverlayDevice(self.op)
-            if img.pack(dev.alloc("W", img.nbytes), threads=threads, release=release):
+            dev.alloc_all({"W": img.nbytes, **sizes})
+            if img.pack(dev.view("W"), threads=threads):
                 dev.flush("W")
-        for name, n in self.sizes.items():
-            dev.alloc(name, n)
         act = dev.view("ACT")
         for c in range(COLS):
             for s in range(self.SLOTS):

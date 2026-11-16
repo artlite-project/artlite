@@ -1,5 +1,5 @@
 """The host environment the tools check at start: whether the install is the checkout's (``stale_install``) and, on
-Windows, the NPU's power mode (``xrt-smi``)."""
+Windows, the NPU's power mode (``xrt-smi``); the process's memory for their line of a loaded model (``memory_note``)."""
 
 import importlib.metadata
 import os
@@ -10,6 +10,13 @@ import tomllib
 from collections.abc import Callable
 
 from artlite import backend, portable
+
+
+def memory_note() -> str:
+    """The RAM the process holds and the most it held, for the tools' line of a loaded model ("17.2 GB of RAM, 17.5 at
+    most": a load that needed much more than the model keeps shows here); '' when the system does not tell."""
+    held = portable.process_memory()
+    return f"; {held[0] / 1e9:.1f} GB of RAM, {held[1] / 1e9:.1f} at most" if held else ""
 
 
 def stale_toolchain() -> str | None:

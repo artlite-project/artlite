@@ -1,7 +1,6 @@
 """GGUF files on the host (``artlite.gguf_model``, ``artlite.model_config``): the IQ formats' fields and weights against
 gguf-py, the native row dequantization against ``QTensor.dequantize``, the drafter files' names."""
 
-import mmap
 from pathlib import Path
 
 import gguf
@@ -144,35 +143,69 @@ def test_qwen_mtp_of(tmp_path: object) -> None:
     assert qwen_mtp_of(str(model)) == str(repo / "model-1.0-mtp-Q4_K_M.gguf")
 
 
-def test_gguf_release_and_chunked_pack(tmp_path: Path) -> None:
-    """GGUFFile.release keeps metadata and tensors readable after releasing pages, and chunked release=True packing
-    matches release=False bit-for-bit."""
-    path = tmp_path / "mini.gguf"
+def _write_gguf(path: Path, rows: int, cols: int) -> np.ndarray:
+    """A GGUF file of two metadata arrays and the Q4_0 tensor ``w.weight`` (rows, cols); its raw rows."""
     w = gguf.GGUFWriter(str(path), "test")
     w.add_array("test.scores", [1, 2, 3, 4])
     w.add_array("tokenizer.ggml.tokens", ["<a>", "<b>"])
-    raw = random_tensor("Q4_0", 16, 256, 7).raw
+    raw = random_tensor("Q4_0", rows, cols, 7).raw
     w.add_tensor("w.weight", raw, raw_dtype=gguf.GGMLQuantizationType.Q4_0)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
+    return raw
 
+
+def _file_pages() -> int | None:
+    """Bytes of file mappings resident in this process (Linux: RssFile), else None."""
+    try:
+        with open("/proc/self/status") as f:
+            return next(int(line.split()[1]) << 10 for line in f if line.startswith("RssFile:"))
+    except (OSError, StopIteration):
+        return None
+
+
+def test_pack_reads_own_views(tmp_path: Path) -> None:
+    """``_native.pack_tiles`` reads a file's tensors through views of its own: the tiles are those of the tensor's
+    copy in memory, the process holds no more of the file after it than before (the caller's mapping untouched, the
+    views unmapped), and a tensor that is not in the file's mapping is refused."""
+    rows, cols, R, nsb = 4096, 4096, 16, 4  # (9.2 MB of Q4_0 rows)
+    path = tmp_path / "w.gguf"
+    raw = _write_gguf(path, rows, cols)
     g = GGUFFile(str(path))
-    want_scores = np.array(g.meta["test.scores"], copy=True)
-    want_raw = np.array(g.tensor("w.weight").raw, copy=True)
-    s_bytes = -(-FORMATS["Q4_0"].used_bytes(16, 1) // 64) * 64
-    rows_idx = np.arange(16, dtype=np.int64).reshape(1, 16)
-    blk = ("Q4_0", 16, s_bytes, 1, 1, 1, 1, 0, 0, s_bytes, [g.tensor("w.weight").raw], rows_idx, 1, 1)
-    out_keep = np.zeros(s_bytes, np.uint8)
-    out_rel = np.zeros(s_bytes, np.uint8)
-    _native.pack_tiles(out_keep, [blk], threads=1, release=False, file=(str(path), g.data))
-    _native.pack_tiles(out_rel, [blk], threads=1, release=True, file=(str(path), g.data))
-    assert np.array_equal(out_keep, out_rel)
+    S = -(-FORMATS["Q4_0"].used_bytes(R, nsb) // 64) * 64
+    n_kc, n_rt = cols // (256 * nsb), rows // R
+    index = np.arange(rows, dtype=np.int64).reshape(1, rows)
 
-    g.release()
-    assert np.array_equal(g.meta["test.scores"], want_scores)
-    if not hasattr(mmap.mmap, "madvise"):
-        assert not np.shares_memory(g.meta["test.scores"], g.data)
-    assert g.strings("tokenizer.ggml.tokens") == ["<a>", "<b>"]
-    assert np.array_equal(g.tensor("w.weight").raw, want_raw)
+    def block(tensor: np.ndarray) -> tuple:
+        return ("Q4_0", R, S, nsb, n_kc, n_kc, n_rt, 0, 0, n_rt * n_kc * S, [tensor], index, cols // 256, 1)
+
+    want, got = np.zeros(n_rt * n_kc * S, np.uint8), np.zeros(n_rt * n_kc * S, np.uint8)
+    _native.pack_tiles(want, [block(np.array(raw))], threads=2)
+    before = _file_pages()
+    _native.pack_tiles(got, [block(g.tensor("w.weight").raw)], threads=2, file=(str(path), g.data))
+    after = _file_pages()
+    assert want.any() and np.array_equal(got, want)
+    if before is not None:
+        assert after - before < 1 << 20, (before, after)
+    with pytest.raises(_native.Error, match="outside the mapping"):
+        _native.pack_tiles(got, [block(np.array(raw))], threads=1, file=(str(path), g.data))
+
+
+def test_gguf_page_hints(tmp_path: Path) -> None:
+    """``GGUFFile``'s page hints leave the file readable: the metadata and a tensor's rows after ``release``, after
+    ``willneed`` and ``populate`` of the tensor, and after a row prefetch."""
+    path = tmp_path / "mini.gguf"
+    raw = _write_gguf(path, 64, 256)
+    g = GGUFFile(str(path))
+    scores = np.array(g.meta["test.scores"])
+    for hint in (g.release, lambda: g.willneed("w.weight"), lambda: g.populate("w.weight"), g.release):
+        hint()
+        assert np.array_equal(g.meta["test.scores"], scores)
+        assert g.strings("tokenizer.ggml.tokens") == ["<a>", "<b>"]
+        assert np.array_equal(g.tensor("w.weight").raw, raw)
+    want = random_tensor("Q4_0", 64, 256, 7).dequantize()
+    assert np.array_equal(g.rows("w.weight", [5, 3, 5, 60]), want[[5, 3, 5, 60]])
+    with pytest.raises(_native.Error, match="outside the mapping"):
+        _native.page_hint(g.data, "willneed", np.array([g.data.size], np.int64), 4096)

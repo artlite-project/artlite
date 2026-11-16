@@ -25,7 +25,7 @@ void bind_pack(nb::module_& m) {
   m.def(
       "pack_tiles",
       [](nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out, nb::list blocks, unsigned threads,
-         bool release, std::optional<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::device::cpu>>> file,
+         std::optional<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>>> file,
          std::optional<nb::ndarray<const uint16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> iq1_masks) {
         using Rows = nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
         using Raw = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
@@ -60,12 +60,8 @@ void bind_pack(nb::module_& m) {
           b.n = static_cast<int64_t>(rows.shape(1));
           bs.push_back(std::move(b));
         }
-        artlite::PackOptions opt{threads, release};
-        if (file) {
-          opt.file = file->first;
-          opt.map = file->second.data();
-          opt.map_size = file->second.shape(0);
-        }
+        artlite::PackOptions opt{threads};
+        if (file) opt.file = {file->first, file->second.data(), file->second.shape(0)};
         if (iq1_masks) {
           if (iq1_masks->shape(0) != 2048) throw artlite::Error("pack_tiles: iq1_masks holds the grid's 2048 entries");
           opt.iq1_masks = iq1_masks->data();
@@ -73,9 +69,9 @@ void bind_pack(nb::module_& m) {
         nb::gil_scoped_release release_gil;
         artlite::pack_tiles(out.data(), out.shape(0), bs, opt);
       },
-      "out"_a, "blocks"_a, "threads"_a = 0, "release"_a = false, "file"_a = nb::none(), "iq1_masks"_a = nb::none(),
+      "out"_a, "blocks"_a, "threads"_a = 0, "file"_a = nb::none(), "iq1_masks"_a = nb::none(),
       nb::sig("def pack_tiles(out: numpy.ndarray[numpy.uint8], blocks: list[tuple], threads: int = 0, "
-              "release: bool = False, file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None, "
+              "file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None, "
               "iq1_masks: numpy.ndarray[numpy.uint16] | None = None) -> None"),
       "Pack weight tiles (every tile format: bit-identical to the formats' pack_tile) into out. A block: "
       "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb, G) as "
@@ -83,10 +79,10 @@ void bind_pack(nb::module_& m) {
       "\"BFP16/F32\" by its tensors' type; tensors: (rows, row bytes) uint8 arrays of GGUF blocks, stacked; rows: "
       "(columns, n) int64 stacked row indices, -1 a zero row (BFP16/F32: 2 i + p is plane p of row i); row_sb: a "
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
-      "consecutive in rows, along K). threads: 0 = one per physical core; release: "
-      "MADV_DONTNEED each tensor's pages when done (file mappings only); file: (path, its whole mapping) of the "
-      "tensors: read into the page cache ahead of the workers; iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), "
-      "which IQ1_S blocks need.");
+      "consecutive in rows, along K). threads: 0 = one per physical core; file: (path, the caller's mapping of the "
+      "whole file) when the tensors are arrays of that mapping: the packer reads them through views of its own, read "
+      "into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping stays untouched); "
+      "iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), which IQ1_S blocks need.");
 
   m.def(
       "pack_slots",
@@ -94,11 +90,11 @@ void bind_pack(nb::module_& m) {
          nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> parts,
          nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> scales,
          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> rows,
-         nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> runs, nb::list files, unsigned threads,
-         bool release) {
+         nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> runs, nb::list files,
+         unsigned threads) {
         using Out = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
         using Raw = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
-        using Map = nb::ndarray<const uint8_t, nb::ndim<1>, nb::device::cpu>;
+        using Map = nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
         std::vector<std::pair<uint8_t*, size_t>> out;
         for (nb::handle h : dsts) {
           auto a = nb::cast<Out>(h, false);
@@ -107,7 +103,8 @@ void bind_pack(nb::module_& m) {
         std::vector<artlite::pack::MappedFile> fs;
         for (nb::handle h : files) {
           auto t = nb::cast<nb::tuple>(h);
-          fs.push_back({nb::cast<std::string>(t[0]), nb::cast<Map>(t[1], false).data()});
+          auto map = nb::cast<Map>(t[1], false);
+          fs.push_back({nb::cast<std::string>(t[0]), map.data(), map.shape(0)});
         }
         std::vector<artlite::SlotTensor> ts;
         for (nb::handle h : tensors) {
@@ -160,21 +157,21 @@ void bind_pack(nb::module_& m) {
                         static_cast<int>(j[5]), static_cast<int>(j[6])});
         }
         nb::gil_scoped_release release_gil;
-        artlite::pack_slots(ts, ps, js, fs, threads, release);
+        artlite::pack_slots(ts, ps, js, fs, threads);
       },
       "dsts"_a, "tensors"_a, "jobs"_a, "parts"_a, "scales"_a, "rows"_a, "runs"_a, "files"_a = nb::list(),
-      "threads"_a = 0, "release"_a = false,
+      "threads"_a = 0,
       nb::sig("def pack_slots(dsts: list[numpy.ndarray[numpy.uint8]], tensors: list[tuple], "
               "jobs: numpy.ndarray[numpy.int64], parts: numpy.ndarray[numpy.int64], "
               "scales: numpy.ndarray[numpy.float32], rows: numpy.ndarray[numpy.int32], "
               "runs: numpy.ndarray[numpy.int32], files: list[tuple[str, numpy.ndarray[numpy.uint8]]] = [], "
-              "threads: int = 0, release: bool = False) -> None"),
+              "threads: int = 0) -> None"),
       "Pack the vision overlay's weight images (artlite::pack_slots, artlite.vision.weights): tensors (type \"F32\", "
       "\"F16\", \"BF16\", \"Q8_0\" or \"EYE\", raw (rows, row bytes) uint8 or None for EYE, rows, cols, file: an index "
       "into files or -1), jobs (J, 7) int64 [dst buffer, byte offset, passes, k-tiles, hilo, first part, parts], parts "
       "(P, 4) int64 [tensor, first of its passes x 80 rows in rows (-1: a zero row), first run, runs], scales (P,), "
-      "runs (R, 4) int32 [first column, columns, source column, stride]; files: (path, its whole mapping), read "
-      "ahead; threads: 0 = one per physical core; release: MADV_DONTNEED each file tensor's pages when done.");
+      "runs (R, 4) int32 [first column, columns, source column, stride]; files: (path, the caller's mapping of the "
+      "whole file): their tensors through views of the packer's own, as pack_tiles; threads: 0 = one per physical core.");
 }
 
 }  // namespace artlite::bindings

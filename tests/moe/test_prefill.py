@@ -38,7 +38,7 @@ def _image(model: str = "35B-A3B") -> tuple[GGUFFile, object, np.ndarray]:
         g = GGUFFile(path)
         img = QwenImage(g, layers=list(layers), vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
-        img.pack(W, release=False)
+        img.pack(W)
         _state.update(model=model, g=g, img=img, W=W)
     return _state["g"], _state["img"], _state["W"]
 

@@ -663,6 +663,27 @@ class TestFusedLifecycle:
         if linux:
             assert _vm_pin() - pinned <= buf.size  # (amdxdna: 0, pinned at its allocation; XRT: once)
 
+    def test_buffers_together(self):
+        """Buffers allocated together (``Device.alloc_host_buffers``) are zeroed memory of their own, pinned at their
+        size: on XRT ranges of one XRT buffer (device addresses their whole pages apart), not of a shared region of 1 GB
+        that would be pinned whole."""
+        f = _add_chain("t_pin_a").compile()
+        f.load()._kernel()
+        ctx = f.load()._ctx
+        linux = os.path.exists("/proc/self/status")
+        pinned = _vm_pin() if linux else 0
+        sizes = [4096, 3 << 20, 100, 5 << 20]
+        bufs = artlite.Device().alloc_host_buffers(sizes)
+        assert [b.size for b in bufs] == sizes and not any(b.map().any() for b in bufs)
+        for i, b in enumerate(bufs):
+            b.map()[:] = i + 1
+        assert all((b.map() == i + 1).all() for i, b in enumerate(bufs))
+        at = [b.paddr_in(ctx) for b in bufs]  # (XRT: its XRT buffer made, the memory pinned)
+        if backend.XRT:
+            assert [a - at[0] for a in at] == [0, 4096, 4096 + (3 << 20), 2 * 4096 + (3 << 20)]
+        if linux:
+            assert _vm_pin() - pinned <= sum(-(-n // 4096) * 4096 for n in sizes)
+
     def test_scratch_segments(self, monkeypatch):
         """Scratch larger than one sequence argument's 32-bit relocation addends is passed as
         several arguments ("segments"; forced here with a 2 KB limit): the patched BDs still

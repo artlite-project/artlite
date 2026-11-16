@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <format>
 #include <memory>
 #include <system_error>
@@ -73,6 +74,34 @@ void read_file(shim_xdna::bo& buf, size_t offset, const std::string& path, uint6
   for (auto& th : pool) th.join();
   for (auto& e : errors)
     if (e) std::rethrow_exception(e);
+}
+
+uint64_t file_size(const std::string& path) {
+  std::error_code ec;
+  const auto n = std::filesystem::file_size(platform::fs_path(path), ec);
+  if (ec) throw Error("cannot read '" + path + "': " + ec.message());
+  return n;
+}
+
+void page_hint(const uint8_t* map, size_t size, PageHint hint, std::span<const int64_t> offsets, size_t nbytes) {
+  for (int64_t at : offsets)
+    if (at < 0 || static_cast<size_t>(at) > size || nbytes > size - static_cast<size_t>(at))
+      throw Error("page_hint: a range outside the mapping");
+  const uintptr_t ps = platform::page_size(), base = reinterpret_cast<uintptr_t>(map);
+  const bool inside = hint == PageHint::dont_need;  // (a neighbour's bytes stay; else the pages around the range)
+  for (int64_t at : offsets) {
+    uintptr_t a = base + static_cast<uintptr_t>(at), b = a + nbytes;
+    a = inside ? (a + ps - 1) / ps * ps : a / ps * ps;
+    b = inside ? b / ps * ps : (b + ps - 1) / ps * ps;
+    if (b <= a) continue;
+    void* p = reinterpret_cast<void*>(a);
+    if (hint == PageHint::dont_need)
+      platform::drop_pages(p, b - a);
+    else if (hint == PageHint::will_need)
+      platform::will_need(p, b - a);
+    else
+      platform::populate(p, b - a);
+  }
 }
 
 }  // namespace artlite

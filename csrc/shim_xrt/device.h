@@ -44,6 +44,9 @@ struct device {
   // flags: XCL_BO_FLAGS_CACHEABLE makes an instruction buffer, any other a data buffer.
   std::unique_ptr<bo> alloc_bo(size_t size, uint32_t flags);
   std::unique_ptr<bo> alloc_user_bo(size_t size);
+  // Data buffers of `sizes` allocated together: ranges (of whole 4 KB pages) of one region of exactly their size, so
+  // one XRT buffer that a command lists once, whatever their number and sizes. (user_from: the amdxdna shim's.)
+  std::vector<std::unique_ptr<bo>> alloc_bos(std::span<const size_t> sizes, size_t user_from);
 
   // A context configured by a PDI (opened from an xclbin of it: pdi_xclbin).
   std::unique_ptr<hw_ctx> create_hw_context(std::span<const uint8_t> pdi, std::string_view kernel_name);
@@ -69,12 +72,19 @@ struct device {
   static void remove_context(const hw_ctx* ctx);
   static const hw_ctx* any_context(const device* preferred = nullptr);
 
-  // `bytes` (4 KB pages) for a data buffer: in the process's current shared region (`offset`), a new one when it is
-  // full, a region of its own from kSharedMax. (A command lists at most xrt_abi::kMaxBuffers XRT buffers (abi.h): a
-  // prefill's dozen buffers besides the weights, Qwen3.8 27B's KV cache and GDN states among them, reach the NPU
-  // through one or two regions.)
-  static void reserve_shared(size_t bytes);
+  // `bytes` (4 KB pages) for a data buffer allocated alone: in the process's current shared region (`offset`), a new
+  // one when it is full, a region of its own from kSharedMax. (A command lists at most xrt_abi::kMaxBuffers XRT buffers
+  // (abi.h): a program's many buffers reach the NPU through a few regions. A shared region is pinned whole, used or
+  // not: what knows its buffers' sizes beforehand allocates them together, alloc_bos.)
   static std::shared_ptr<region> take(size_t bytes, size_t& offset);
+
+  // The process's regions that have an XRT buffer, the largest first (kernel_xrt.cpp: a command lists the ones it has
+  // room for besides its own).
+  static std::vector<std::shared_ptr<region>> regions();
+  // Counts the regions freed (a region's destructor calls region_gone): a kernel drops the runs it keeps for reuse
+  // when it changed, as they hold the XRT buffers of the last command they ran.
+  static void region_gone();
+  static uint64_t regions_gone();
 
  private:
   static constexpr size_t kSharedMax = 256ull << 20;

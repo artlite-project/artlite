@@ -152,4 +152,4 @@ def pack_arrays(t: dict, view: Callable[[str], np.ndarray], *, threads: int = 0)
         ts.append((s.kind, s.raw, s.rows, s.cols, f))
     _native.pack_slots([view(b) for b in t["buffers"]], ts, t["jobs"], t["parts"], t["scales"],
                        np.ascontiguousarray(t["rows"], np.int32), np.ascontiguousarray(t["runs"], np.int32), fl,
-                       threads=threads, release=True)
+                       threads=threads)

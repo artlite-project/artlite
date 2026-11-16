@@ -3,6 +3,8 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "artlite/platform.h"
+
 namespace artlite {
 
 ParameterScratchpad::ParameterScratchpad(uint32_t* buffer, size_t bufferSizeBytes, const std::string& paramsPath)
@@ -63,7 +65,7 @@ void ParameterScratchpad::clear() {
 }
 
 void ParameterScratchpad::parseParams(const std::string& path) {
-  std::ifstream file(path);
+  std::ifstream file{platform::fs_path(path)};
   if (!file.is_open()) {
     throw std::runtime_error("ParameterScratchpad: cannot open '" + path + "'");
   }

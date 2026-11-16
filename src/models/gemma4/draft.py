@@ -296,16 +296,20 @@ class GemmaDraft:
     # Load
     # ------------------------------------------------------------------
 
+    @property
+    def sizes(self) -> dict[str, int]:
+        """The drafter's buffers on the overlay's device: its weight image, its objects, its logits."""
+        return {"DW": self.image.nbytes, "DACT": self.nbytes, "DLOGITS": 2 * self.vocab}
+
     def load(self, *, threads: int = 0) -> None:
-        """Pack the drafter's weights into a buffer of the overlay's device, write the static objects, build the
-        transaction."""
+        """Pack the drafter's weights into a buffer of the overlay's device (``sizes``: the overlay's load allocated
+        them with its own, else here), write the static objects, build the transaction."""
         dev = self.ov.dev
         assert dev is not None, "load the overlay first"
-        if self.image.pack(dev.alloc("DW", self.image.nbytes), threads=threads, release=False):
+        dev.alloc_all(self.sizes)
+        if self.image.pack(dev.view("DW"), threads=threads):
             dev.flush("DW")
         self.image._own.clear()  # (the re-laid-out copies)
-        dev.alloc("DACT", self.nbytes)
-        dev.alloc("DLOGITS", 2 * self.vocab)
         act = dev.view("DACT")
         for kind in (0, 1):  # (the first sub-step's token of each layer kind)
             m = np.zeros(META, np.int32)
