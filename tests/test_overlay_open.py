@@ -12,7 +12,7 @@ class _Overlay:
     def __init__(self, log: list[str]):
         self.log = log
 
-    def load(self, *, threads: int) -> None:
+    def load(self, *, threads: int, also: dict[str, int]) -> None:
         self.log.append(f"load {threads}")
 
     def prepare(self, S: int, logits: bool = True) -> None:
@@ -27,7 +27,7 @@ class _Model(OverlayModel):
 
     def __init__(self, log: list[str], *, prefill: bool):
         self.overlay = _Overlay(log)
-        self.prefill = SimpleNamespace(compile=lambda: self._compile(log), bind=lambda: log.append("bind")) \
+        self.prefill = SimpleNamespace(compile=lambda: self._compile(log), bind=lambda: log.append("bind"), own={}) \
             if prefill else None
 
     def _compile(self, log: list[str]) -> None:
