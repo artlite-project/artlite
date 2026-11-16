@@ -165,14 +165,15 @@ class PromptBuilder:
         """Whether the model thinks (``enable_thinking``), whether the earlier answers keep their thoughts
         (``preserve_reasoning``, llama-server's, or the templates' own ``preserve_thinking``) and the template's other
         variables (``reasoning_effort``, ...), of a request's ``chat_template_kwargs`` over its ``reasoning_effort``
-        (``effort``: ``none``, no thought; another level: a thought and the template's ``reasoning_effort``) over the
-        server's (``--reasoning-effort`` over ``--chat-template-kwargs``)."""
+        (``effort``: ``none``, no thought; another level: a thought and the template's ``reasoning_effort``, as the
+        model maps it, ``Model.efforts``) over the server's (``--reasoning-effort`` over ``--chat-template-kwargs``)."""
         ctx = self.ctx
         options = ctx.options
         server = {**options.chat_template_kwargs,
                   **({"reasoning_effort": options.reasoning_effort} if options.reasoning_effort else {})}
+        level = ctx.engine.model.efforts.get(effort, effort)  # (the template's spelling of a level: ``Model.efforts``)
         asked = {} if effort is None else {"enable_thinking": effort != "none"} | \
-            ({"reasoning_effort": effort} if effort != "none" else {})
+            ({"reasoning_effort": level} if effort != "none" else {})
         kw = {**server, **asked, **(kwargs or {})}
         if effort == "none" and "reasoning_effort" not in (kwargs or {}):
             kw.pop("reasoning_effort", None)
@@ -214,7 +215,8 @@ class PromptBuilder:
             try:
                 return await run(variables), think
             except jinja2.TemplateError as e:
-                if not effort or variables.get("reasoning_effort") != effort or "reasoning_effort" in (kwargs or {}):
+                if not effort or variables.get("reasoning_effort") != engine.model.efforts.get(effort, effort) or \
+                        "reasoning_effort" in (kwargs or {}):
                     raise
                 # (the server's, else the template's)
                 default = self.template_options(kwargs)[2].get("reasoning_effort")

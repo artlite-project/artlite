@@ -28,6 +28,9 @@ def seed(n: int | None = None) -> None:
     _rng.seed(n)
 
 
+TOP_K_ALL = 1000  # the candidates of top_k <= 0 (llama.cpp: all tokens; past these the probabilities are negligible)
+
+
 @dataclass(frozen=True)
 class Sampling:
     """How the next token is chosen: the logits penalized as llama.cpp's penalties sampler does (``Penalties``: the

@@ -81,8 +81,9 @@ message fails at load.
 
 A request's `chat_template_kwargs` and the server's `--chat-template-kwargs` are the template's variables, as in
 llama-server (the request's over the server's). A request's `reasoning_effort` (and a Responses request's
-`reasoning.effort`) sets the template's `reasoning_effort` and turns the thought on, `none` off; a level that the
-template refuses (Qwen3.8's takes `xhigh`, `medium` and `low`; clients send `high` or `minimal`) gives way to
+`reasoning.effort`) sets the template's `reasoning_effort` and turns the thought on, `none` off; Spark-X's levels
+take the template's two (`minimal` and `low` its `low`, `medium` .. `xhigh` its `high`); a level that the template
+refuses (Qwen3.8's takes `xhigh`, `medium` and `low`; clients send `high` or `minimal`) gives way to
 `--reasoning-effort`, else the template's own default, with a log line. A level given in `chat_template_kwargs` or
 by `--reasoning-effort` is the template's to take: a refused one fails the request, or the server's start.
 
@@ -480,14 +481,14 @@ Generation:
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3; default 32) |
 | `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
-| `--spec-type auto\|none\|draft-mtp\|draft-dflash`, `-md FILE`, `--spec-draft-model` | the model's drafter, as [artlite-cli](cli.md)'s (default `auto`: the one found by its file name) |
+| `--spec-type auto\|none\|draft-mtp\|draft-dflash\|draft-dspark`, `-md FILE`, `--spec-draft-model` | the model's drafter, as [artlite-cli](cli.md)'s (default `auto`: the one found by its file name) |
 | `--spec-draft-n-max N` | draft tokens per step at most, as [artlite-cli](cli.md)'s; a request's `speculative.n_max` lowers it for its generation |
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
 | `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |
 | `--reasoning-preserve`, `--no-reasoning-preserve` | earlier answers keep their thoughts in the prompt where the template can (the templates' `preserve_thinking`; default on); a request's `chat_template_kwargs.preserve_reasoning` (or `preserve_thinking`) overrides it |
-| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
+| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
 | `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
 

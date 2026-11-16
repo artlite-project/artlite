@@ -42,6 +42,7 @@ ARCHITECTURES = {
     "qwen35": ("models.qwen35.qwen", "Qwen"),
     "qwen35moe": ("models.qwen35.qwen", "Qwen"),
     "lfm3": ("models.lfm.lfm", "Lfm"),
+    "spark2_5": ("models.spark.spark", "Spark"),
 }
 # diffusers pipeline class (``_class_name`` of model_index.json) -> (module, class), imported on use
 PIPELINES = {

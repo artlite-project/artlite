@@ -12,9 +12,10 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
+from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf, spark_gguf
 from models.server.tools import (
     GEMMA4,
+    GLM45,
     LLAMA3,
     QWEN_XML,
     NameMask,
@@ -202,6 +203,50 @@ def test_llama(text: str, content: str, calls: list) -> None:
     check(LLAMA3, text, content, calls)
 
 
+def glm_call(name: str, sep: str = "", **args: str) -> str:
+    return f"<tool_call>{name}{sep}" + "".join(f"<arg_key>{k}</arg_key>{sep}<arg_value>{v}</arg_value>{sep}"
+                                                for k, v in args.items()) + "</tool_call>"
+
+
+GLM = [
+    (glm_call("special_function", arg1="1"), "", [("special_function", {"arg1": 1})]),
+    (glm_call("special_function", arg1="1") + glm_call("special_function_with_opt", arg1="1", arg2="2"), "",
+     [("special_function", {"arg1": 1}), ("special_function_with_opt", {"arg1": 1, "arg2": 2})]),
+    # (GLM-4.5's own newlines between the elements)
+    (glm_call("special_function_with_opt", "\n", arg1="1", arg2="2"), "",
+     [("special_function_with_opt", {"arg1": 1, "arg2": 2})]),
+    (glm_call("python", code='def hello():\n    print("Hello, world!")\n\nhello()\n'), "",
+     [("python", {"code": 'def hello():\n    print("Hello, world!")\n\nhello()\n'})]),
+    (glm_call("python", code='x = "\\u00e9" < 1 and "</arg_value"'), "", [("python", {"code": 'x = "\\u00e9" < 1 and "</arg_value"'})]),
+    (glm_call("python", code=""), "", [("python", {"code": ""})]),
+    (glm_call("empty_args"), "", [("empty_args", {})]),
+    ("Let me check.\n\n" + glm_call("get_time", city="Paris"), "Let me check.", [("get_time", {"city": "Paris"})]),
+    (glm_call("mixed", n="7", flag="true", any='{"a": [1]}', items="[1, 2]"), "",
+     [("mixed", {"n": 7, "flag": True, "any": {"a": [1]}, "items": [1, 2]})]),
+    (glm_call("mixed", n="seven", flag="maybe", any="plain text", items="not json"), "",
+     [("mixed", {"n": "seven", "flag": "maybe", "any": "plain text", "items": "not json"})]),
+    (glm_call("unknown", x="1"), "", [("unknown", {"x": 1})]),
+    ("<tool_call>get_time<arg_key>city</arg_key><arg_value>Rome</arg_value>", "", [("get_time", {"city": "Rome"})]),
+    ("Hello, world!\nWhat's up?", "Hello, world!\nWhat's up?", []),
+    ("a <tool_call> b", "a <tool_call> b", []),
+    ("x <tool_call>get time is\nlater", "x <tool_call>get time is\nlater", []),
+]
+
+
+@pytest.mark.parametrize("text,content,calls", GLM)
+def test_glm(text: str, content: str, calls: list) -> None:
+    check(GLM45, text, content, calls)
+
+
+def test_glm_streams_strings() -> None:
+    """A string-only value goes out as it comes (less what may begin ``</arg_value>``)."""
+    p = GLM45.parser(TOOLS)
+    out = p.parts([("content", "<tool_call>python<arg_key>code</arg_key><arg_value>print(1)\nprint(2)</arg")])
+    assert "".join(c.arguments for k, c in out if k == "tool_call") == '{"code": "print(1)\\nprint(2)'
+    out = p.parts([("content", "_value></tool_call>")]) + p.flush()
+    assert "".join(c.arguments for k, c in out if k == "tool_call") == '"}' and p.calls == 1
+
+
 def test_typed() -> None:
     """Strings where a schema allows none: the value they encode, if of an allowed type."""
     i, b, arr = {"type": "integer"}, {"type": "boolean"}, {"type": "array"}
@@ -220,7 +265,9 @@ def test_openers() -> None:
                                (GEMMA4, 'get_time{city:<|"|>Oslo<|"|>}<tool_call|>', None),
                                (GEMMA4, 'city:<|"|>Oslo<|"|>}<tool_call|>', "get_time"),
                                (LLAMA3, 'get_time", "parameters": {"city": "Oslo"}}', None),
-                               (LLAMA3, '{"city": "Oslo"}}', "get_time")]:
+                               (LLAMA3, '{"city": "Oslo"}}', "get_time"),
+                               (GLM45, "get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>", None),
+                               (GLM45, "<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>", "get_time")]:
         check(syntax, syntax.opener(name) + rest, "", [("get_time", {"city": "Oslo"})])
 
 
@@ -251,6 +298,8 @@ def test_naming() -> None:
         '{"type": "function", "name": "get_weather", "parameters": {}}'
     assert namings(LLAMA3, j) == heads('get_time"') | heads('get_weather"')
     assert namings(LLAMA3, 'The {"name": "x"} object') == set()
+    c = glm_call("python", code="<tool_call>x<arg_key>")
+    assert namings(GLM45, "Hi " + c + glm_call("get_time")) == heads("python<") | heads("get_time<")
 
 
 class Pieces:
@@ -301,11 +350,12 @@ def test_name_mask() -> None:
 WALKS = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML, "<tool_call>"),
          "gemma": (gemma_gguf, GEMMA4, "<|tool_call>"),
          "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3, '{"name": "'),
-         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML, "<tool_call>")}  # (the text after which a name's head comes)
+         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML, "<tool_call>"),
+         "spark": (lambda: spark_gguf("1.7B"), GLM45, "<tool_call>")}  # (the text after which a name's head comes)
 
 
 def tokenizer_of(family: str, path: str) -> object:
-    if family in ("qwen", "lfm3"):
+    if family in ("qwen", "lfm3", "spark"):
         from models.tokenizer import BpeTokenizer
         return BpeTokenizer(GGUFFile(path))
     if family == "gemma":
@@ -351,13 +401,15 @@ def test_name_mask_walks(family: str) -> None:
 
 
 def test_detection() -> None:
-    """The three syntaxes from templates like the model files' (their marker lines), none from a template without
+    """The four syntaxes from templates like the model files' (their marker lines), none from a template without
     tools."""
     qwen = "{{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}{{- '<parameter=' + args_name + '>\\n' }}"
     gemma = "{{- '<|tool_call>call:' + function['name'] + '{' -}}"
     llama = ("<|start_header_id|>{%- if tools is not none %}{{- '{\"name\": \"' + tool_call.name + '\", ' }}"
              "{{- '\"parameters\": ' }}{%- endif %}")
+    glm = "{{- '<tool_call>' + tool_call.function.name }}{{- '<arg_key>' ~ k ~ '</arg_key><arg_value>' ~ v ~ '</arg_value>' }}"
     assert syntax_of(qwen) is QWEN_XML and syntax_of(gemma) is GEMMA4 and syntax_of(llama) is LLAMA3
+    assert syntax_of(glm) is GLM45
     assert syntax_of("{% for message in messages %}{{ message['content'] }}{% endfor %}") is None
 
 
@@ -381,7 +433,7 @@ def test_functions_and_arguments() -> None:
 
 FILES = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML), "minicpmv": (minicpmv_gguf, QWEN_XML),
          "gemma": (gemma_gguf, GEMMA4), "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3),
-         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML)}
+         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML), "spark": (lambda: spark_gguf("1.7B"), GLM45)}
 
 
 @pytest.mark.parametrize("family", FILES)
@@ -413,6 +465,15 @@ def test_model_templates(family: str) -> None:
         # (the answer's content closed the model's turn: a new one opens)
         assert text.endswith("Checking.<turn|>\n<|turn>model\n")
         assert chat_prompt(g, msgs[:1], tools=fns).endswith("<|turn>user\nTime in Oslo?<turn|>\n<|turn>model\n")
+    elif family == "spark":
+        from models.spark.spark import Spark
+        m = Spark(path)
+
+        def chat_prompt(g: GGUFFile, msgs: list, tools: list, preserve_thinking: bool = False) -> str:
+            return m.chat_text(msgs, tools=tools, preserve=preserve_thinking)
+        text = chat_prompt(g, msgs, tools=fns)
+        assert "Checking.<tool_call>get_time<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>" in text
+        assert '"name":"get_time"' in text
     else:
         from models.tokenizer import chat_prompt
         text = chat_prompt(g, msgs, tools=fns)

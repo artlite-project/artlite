@@ -31,7 +31,7 @@ speeds go to stderr.
 | `-sys TEXT`, `--system-prompt` | system message |
 | `--raw` | the prompt as it is, without the chat template |
 | `--think` | let the model think first (Gemma 4, Qwen, LFM3; default: an empty thought) |
-| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort`, with `--think` (Qwen3.8: `xhigh`, `medium`, `low`; default `default`: the template's own) |
+| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort`, with `--think` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own) |
 | `--chat-template-kwargs JSON` | chat template variables as a JSON object (`{"tools_in_user_message": false}`, `{"date_string": "26 Jul 2024"}`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`); it gets the variables the file's gets (`enable_thinking`, `bos_token`, ...) |
 | `-n N`, `--n-predict` | tokens to generate (default -1: until an end-of-sequence token or a full KV cache) |
@@ -46,7 +46,7 @@ speeds go to stderr.
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |
-| `--spec-type auto\|none\|draft-mtp\|draft-dflash` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)); one asked for that the model does not have is an error |
+| `--spec-type auto\|none\|draft-mtp\|draft-dflash\|draft-dspark` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)), `draft-dspark` a DSpark block drafter (Spark-X2.6); one asked for that the model does not have is an error |
 | `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
 | `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4, LFM3), below |

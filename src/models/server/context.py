@@ -8,7 +8,7 @@ import dataclasses
 import logging
 from typing import Any
 
-from ..sampling import Sampling
+from ..sampling import TOP_K_ALL, Sampling
 from . import agents
 from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable
@@ -21,7 +21,6 @@ from .tools import Calls, Vocabulary, syntax_of
 
 log = logging.getLogger("artlite.server")
 
-TOP_K_ALL = 1000  # the candidates of top_k <= 0 (llama.cpp: all tokens; past these the probabilities are negligible)
 SAMPLERS = ["penalties", "top_k", "temperature", "top_p", "min_p"]  # in the order Sampling applies them
 # sampler fields the NPU path does not have, with their neutral values (others are ignored with a log line)
 NEUTRAL: dict[str, object] = {

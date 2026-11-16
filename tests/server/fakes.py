@@ -70,8 +70,9 @@ class FakeTokenizer:
 
 
 class FakeModel(Model):
-    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks); ``efforts``: the
-    ``reasoning_effort`` levels its template takes (Qwen3.8's raises for another; None: any)."""
+    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks); ``takes``: the
+    ``reasoning_effort`` levels its template takes (Qwen3.8's raises for another; None: any); ``efforts``: the model's
+    mapping of the levels (``Model.efforts``)."""
 
     name = "Fake"
 
@@ -85,7 +86,7 @@ class FakeModel(Model):
         self.preserved: bool | None = None  # (the last chat's preserve)
         self.thought: bool | None = None  # (the last chat's think)
         self.variables: dict[str, object] = {}  # (the last chat's template variables)
-        self.efforts: tuple[str, ...] | None = None
+        self.takes: tuple[str, ...] | None = None
 
     def encode(self, text: str) -> list[int]:
         return [BOS] + self.tokenizer.encode(text)
@@ -95,7 +96,7 @@ class FakeModel(Model):
              variables: dict[str, object] | None = None) -> list[int]:
         """(tools: their names in a system turn; an assistant's tool calls after its content)"""
         effort = (variables or {}).get("reasoning_effort")
-        if self.efforts is not None and effort is not None and effort not in self.efforts:
+        if self.takes is not None and effort is not None and effort not in self.takes:
             raise jinja2.TemplateError(f"Unexpected reasoning effort {effort}")
         self.rendered, self.preserved, self.thought, self.variables = (messages, tools), preserve, think, variables or {}
         text = "<s>" + (f"<|system|>tools: {' '.join(t['function']['name'] for t in tools)}" if tools else "")

@@ -9,11 +9,13 @@ model writes a call, parsed as the text streams (``Parser``: text in, content an
 | ``QwenXml`` | Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3 | ``<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>\\n</function>\\n</tool_call>`` |
 | ``Gemma4`` | Gemma 4 | ``<|tool_call>call:NAME{k:V,...}<tool_call|>``, strings between ``<|"|>`` |
 | ``Llama3`` | Llama 3.1 / 3.2 | the whole message ``{"name": NAME, "parameters": {...}}`` |
+| ``Glm45`` | Spark-X2.5 / X2.6 (GLM-4.5's syntax) | ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`` |
 
 A Qwen parameter's value is the text up to ``</parameter>`` (one newline after the tag and one before the closing tag
 are the syntax's): a string where the function's schema allows only strings, streamed as it comes; otherwise JSON when
 it parses to a type the schema allows, else the text (llama.cpp's rule), a Python literal where the schema allows no
-string (Qwen writes True and False). A Gemma or Llama call goes out whole at its end, its arguments typed the same way
+string (Qwen writes True and False). A GLM-4.5 value (``<arg_value>``) the same, white space between the tags
+(GLM-4.5's newlines) dropped. A Gemma or Llama call goes out whole at its end, its arguments typed the same way
 (``typed``). A call that does not parse is content.
 
 A call's name is one of the request's functions: while the model writes it, the sampling's candidates are the tokens
@@ -373,6 +375,127 @@ class QwenParser(Parser):
         return out
 
 
+class Glm45Parser(Parser):
+    """GLM-4.5's calls (``Glm45``): ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..</tool_call>``, white
+    space between the elements allowed; a value typed as a Qwen parameter's (``QwenParser._value``), a string-only
+    one streamed."""
+
+    OPEN, CLOSE = "<tool_call>", "</tool_call>"
+    KEY, KEY_END, VALUE, VALUE_END = "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>"
+    NAME_HEAD, NAME_END, NAME_BAD = "", "<", "<\n"  # (the name, then a tag)
+
+    def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
+        super().__init__(functions, parallel=parallel)
+        self.state = "text"  # text, name (after <tool_call>), args, key, open (before <arg_value>), value
+        self.name = ""
+        self.n_args = 0
+        self.key = ""
+        self.value = ""
+
+    _param_types = QwenParser._param_types
+    _arg = QwenParser._arg
+    _value = QwenParser._value
+    _feed = QwenParser._feed
+    _flush = QwenParser._flush
+
+    def naming(self) -> str | None:  # (the text after <tool_call> up to the tag after the name)
+        return self.buf if self.state == "name" and "<" not in self.buf else None
+
+    def _step(self, out: list[Part], *, final: bool = False) -> bool:
+        """One step of the parse; False: it waits for more text."""
+        b = self.buf
+        if self.state == "text":
+            if self.done:
+                self.buf = ""
+                return False
+            if self._text(out, self.OPEN, final=final) < 0:
+                return False
+            self.state = "name"
+            return True
+        if self.state == "name":
+            i = b.find("<")
+            name = b[:i].strip() if i >= 0 else ""
+            if i >= 0 and name and "\n" not in name and (b[i:].startswith((self.KEY, self.CLOSE)) or
+                                                         final or not any(t.startswith(b[i:]) for t in
+                                                                          (self.KEY, self.CLOSE))):
+                self.name, self.n_args, self.buf = name, 0, b[i:]
+                out.append(("tool_call", self._begin(self.name)))
+                self.state = "args"
+                return True
+            if not final and i < 0 and len(b) < 256 and "\n" not in b.strip():
+                return False
+            if not final and i >= 0 and name and any(t.startswith(b[i:]) for t in (self.KEY, self.CLOSE)):
+                return False
+            self._content(out, self.gap + self.OPEN + b)  # (not a call)
+            self.state, self.buf = "text", ""
+            return True
+        if self.state == "args":
+            s = b.lstrip()
+            if s.startswith(self.KEY):
+                self.buf, self.state = s[len(self.KEY):], "key"
+                return True
+            if s.startswith(self.CLOSE):
+                self._arg(out, "}" if self.n_args else "{}")
+                self.buf = s[len(self.CLOSE):]
+                self._ended()
+                self.state = "text"
+                return True
+            if not final and any(t.startswith(s) for t in (self.KEY, self.CLOSE)):
+                return False
+            self._arg(out, "}" if self.n_args else "{}")  # (something else: the call ends here)
+            self._ended()
+            self.state = "text"
+            return True
+        if self.state == "key":
+            i = b.find(self.KEY_END)
+            if i < 0:
+                if final:
+                    self.buf = ""
+                    self._arg(out, "}" if self.n_args else "{}")
+                    self._ended()
+                    self.state = "text"
+                return False
+            self.key, self.buf = b[:i].strip(), b[i + len(self.KEY_END):]
+            self._arg(out, ("{" if self.n_args == 0 else ", ") + json.dumps(self.key, ensure_ascii=False) + ": ")
+            self.n_args += 1
+            self.state = "open"
+            return True
+        if self.state == "open":
+            s = b.lstrip()
+            if s.startswith(self.VALUE):
+                self.buf, self.value, self.state = s[len(self.VALUE):], "", "value"
+                if self._param_types(self.key) == {"string"}:
+                    self._arg(out, '"')
+                return True
+            if not final and self.VALUE.startswith(s):
+                return False
+            self._arg(out, "null")  # (a key without its value)
+            self.state = "args"
+            return True
+        # value: the text up to </arg_value>
+        stream = self._param_types(self.key) == {"string"}
+        i = b.find(self.VALUE_END)
+        if i >= 0:
+            text, self.buf = self.value + b[:i], b[i + len(self.VALUE_END):]
+            if stream:
+                self._arg(out, json.dumps(text, ensure_ascii=False)[1:] if text else '"')
+            else:
+                self._arg(out, json.dumps(self._value(text), ensure_ascii=False))
+            self.state = "args"
+            return True
+        if final:
+            self.buf = ""
+            return False
+        k = held(b, (self.VALUE_END,))
+        text, self.buf = b[:len(b) - k], b[len(b) - k:]
+        if stream and text:
+            self._arg(out, json.dumps(self.value + text, ensure_ascii=False)[1:-1])
+            self.value = ""
+        else:
+            self.value += text
+        return False
+
+
 class _GemmaValue:
     """Gemma 4's value syntax (its template's ``format_argument``): strings between ``<|"|>``, numbers, true / false /
     null, ``{key:value,...}`` with bare keys, ``[value,...]``."""
@@ -697,13 +820,16 @@ QWEN_XML = Syntax("qwen-xml", QwenParser, "<tool_call>\n<function=", "<tool_call
                   ends=("<tool_call>",))
 GEMMA4 = Syntax("gemma4", GemmaParser, "<|tool_call>call:", "<|tool_call>call:{name}{{")
 LLAMA3 = Syntax("llama3-json", LlamaParser, '{"name": "', '{{"name": "{name}", "parameters": ')
+GLM45 = Syntax("glm-4.5", Glm45Parser, "<tool_call>", "<tool_call>{name}")
 
 
 def syntax_of(template: str) -> Syntax | None:
     """The tool-call syntax of a chat template's source (as llama.cpp's ``common_chat_template_detect_params_init``
-    and its autoparser find these three), or None: the template takes no tools."""
+    and its autoparser find these four), or None: the template takes no tools."""
     if "'<|tool_call>call:'" in template:
         return GEMMA4
+    if "<tool_call>" in template and "<arg_key>" in template and "<arg_value>" in template:
+        return GLM45
     if "<tool_call>" in template and "<function=" in template and "<parameter=" in template:
         return QWEN_XML
     if '"parameters": ' in template and "tools" in template and "<|start_header_id|>" in template:

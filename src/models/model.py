@@ -44,6 +44,9 @@ class Model:
     projectors: tuple[str, ...] = ()  # the projector types (``clip.projector_type``) of the mmproj files it takes
     thinks = False  # the chat template has a thinking mode
     reasoning: tuple[str, str] | None = None  # the text that opens and closes a thought (the model writes them)
+    # a reasoning_effort level as the chat template takes it, where the template refuses levels clients send (Spark-X's
+    # takes high and low); a level not in it goes as it is
+    efforts: dict[str, str] = {}  # noqa: RUF012
     thought_first = False  # a thought only begins an answer (its markers later in the answer are text)
     turn: str | None = None  # the text that begins every message in the chat template (a prompt cache's marks)
     user_turn: str | None = None  # the text that begins a user message

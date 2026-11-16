@@ -7,18 +7,19 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import model_path
 
 # the drafter of a model's multi-token steps (``--spec-type``: llama-server's names, and auto: the model's own choice)
-SPEC_TYPES = ("auto", "none", "draft-mtp", "draft-dflash")
+SPEC_TYPES = ("auto", "none", "draft-mtp", "draft-dflash", "draft-dspark")
 
 
 def drafter_type(spec_type: str, draft_model: str | None, types: tuple[str, ...], name: str) -> str:
     """The drafter a model loads (a ``Model``'s ``spec_type``, ``draft_model`` options): ``spec_type`` (one of
     ``SPEC_TYPES``; ``types``: the drafters the model ``name`` has), or a drafter file's type (``draft_model``: by its
-    architecture, ``dflash`` draft-dflash, any other draft-mtp). ValueError: a drafter the model does not have, or a
-    file of another type than ``spec_type``."""
+    architecture, ``dflash`` draft-dflash, with a Markov head draft-dspark, any other draft-mtp). ValueError: a drafter
+    the model does not have, or a file of another type than ``spec_type``."""
     if spec_type not in SPEC_TYPES:
         raise ValueError(f"spec_type: {spec_type!r} (one of {', '.join(SPEC_TYPES)})")
     if draft_model is not None:
-        kind = "draft-dflash" if GGUFFile(draft_model).arch == "dflash" else "draft-mtp"
+        g = GGUFFile(draft_model)
+        kind = ("draft-dspark" if "markov_w1.weight" in g else "draft-dflash") if g.arch == "dflash" else "draft-mtp"
         if spec_type not in ("auto", kind):
             raise ValueError(f"{draft_model}: a {kind} drafter, not {spec_type}")
         spec_type = kind
@@ -40,11 +41,11 @@ def add_spec_options(p: argparse.ArgumentParser | argparse._ArgumentGroup, *, n_
     ``--spec-draft-n-max``; ``spec_options`` reads them."""
     p.add_argument("--spec-type", choices=SPEC_TYPES, default="auto",
                    help="the drafter of the multi-token steps: auto, the model's found by file name (Qwen3.8 27B: its "
-                        "DFlash2 file, else its MTP layer; Gemma 4, Qwen3.6 35B-A3B, Occamy: their MTP files); none "
-                        "(the draft tokens from the context stay); draft-mtp, draft-dflash: that drafter, which must "
-                        "exist (default: auto)")
+                        "DFlash2 file, else its MTP layer; Gemma 4, Qwen3.6 35B-A3B, Occamy: their MTP files; "
+                        "Spark-X2.6: its DSpark file); none (the draft tokens from the context stay); draft-mtp, "
+                        "draft-dflash, draft-dspark: that drafter, which must exist (default: auto)")
     p.add_argument("-md", "--spec-draft-model", "--model-draft", metavar="FILE", type=model_path,
-                   help="the drafter's GGUF file (an MTP or a DFlash2 drafter, by its architecture) in place of the one "
+                   help="the drafter's GGUF file (an MTP, DFlash2 or DSpark drafter, by its architecture) in place of the one "
                         "found by name; a relative path is also looked up in the models directory")
     if n_max:
         p.add_argument("--spec-draft-n-max", type=draft_count, metavar="N",

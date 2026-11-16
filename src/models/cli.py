@@ -57,8 +57,8 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--raw", action="store_true", help="the prompt is the raw text (no chat template)")
     p.add_argument("--think", action="store_true", help="let the model think first (default: an empty thought)")
     p.add_argument("--reasoning-effort", metavar="LEVEL", default="default",
-                   help="the chat template's reasoning_effort, with --think (Qwen3.8's: xhigh, medium, low; default: "
-                        "default, the template's own)")
+                   help="the chat template's reasoning_effort, with --think (Qwen3.8's: xhigh, medium, low; Spark-X's: "
+                        "high, low; default: default, the template's own)")
     p.add_argument("--chat-template-kwargs", type=json.loads, default={},
                    help="chat template variables as a JSON object (reasoning_effort, tools_in_user_message, ...)")
     p.add_argument("--chat-template", metavar="JINJA_TEMPLATE",
@@ -333,6 +333,8 @@ def main(argv: list[str] | None = None) -> None:
         text = prompt_text(args)
         template = template_option(args.chat_template, args.chat_template_file)
         model = open_model(args.model, chat_template=template, **options)
+        if "reasoning_effort" in variables:  # (the template's spelling of a level: ``Model.efforts``)
+            variables["reasoning_effort"] = model.efforts.get(variables["reasoning_effort"], variables["reasoning_effort"])
         asr = bool(args.audio) and not args.video and args.prompt is None and not args.file
         system = args.system_prompt or (asr_system(args.language) if asr else None)
         ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,

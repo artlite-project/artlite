@@ -222,8 +222,16 @@ def test_spec_options(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None
     assert spec_options(p.parse_args(["-md", f, "--spec-draft-n-max", "0"])) == {"spec_type": "none"}
     with pytest.raises(SystemExit):
         p.parse_args(["--spec-draft-n-max", "-1"])
-    monkeypatch.setattr("models.spec_options.GGUFFile", lambda path: SimpleNamespace(arch=path))
+    class File:  # (a drafter file "arch[+tensor]")
+        def __init__(self, path: str):
+            self.arch, *self.tensors = path.split("+")
+
+        def __contains__(self, name: str) -> bool:
+            return name in self.tensors
+
+    monkeypatch.setattr("models.spec_options.GGUFFile", File)
     assert drafter_type("auto", "dflash", ("draft-mtp", "draft-dflash"), "Q") == "draft-dflash"
+    assert drafter_type("auto", "dflash+markov_w1.weight", ("draft-dspark",), "S") == "draft-dspark"
     assert drafter_type("draft-mtp", "qwen35moe", ("draft-mtp",), "Q") == "draft-mtp"
     for args, error in [(("draft-mtp", "dflash", ("draft-mtp", "draft-dflash")), "a draft-dflash drafter, not draft-mtp"),
                         (("none", "qwen35moe", ("draft-mtp",)), "a draft-mtp drafter, not none"),

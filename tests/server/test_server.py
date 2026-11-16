@@ -199,7 +199,7 @@ def test_template_variables() -> None:
     none turns the thought off, another level on and is the template's variable; a level from a request's field that
     the template refuses gives way to the server's, else the template's default; one in chat_template_kwargs fails."""
     model, _npu, engine = make(reasoning=QWEN)
-    model.efforts = ("xhigh", "medium", "low")
+    model.takes = ("xhigh", "medium", "low")
     hi = [{"role": "user", "content": "Hi"}]
     with TestClient(app_of(engine, chat_template_kwargs={"add_vision_id": True, "x": 1})) as client:
         assert engine.wait_ready(5)
