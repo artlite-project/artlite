@@ -102,9 +102,12 @@ the drafters' of Qwen3.6 35B-A3B, Occamy 1.0 and Gemma 4 E4B, runs of 2026-11-17
 
 ## FastFlowLM and OpenFlowLM
 
-FastFlowLM 1.0.13 (v1.0.13, its portable build) and OpenFlowLM 0.1.0-99fe7e4
-(Atomic-Germ/OpenFlowLM-Next at 99fe7e4, every model on its open kernels), each as `serve` with its default prefill
-chunks of 4096 tokens and each model at its native context (FastFlowLM's Qwen3.8 27B at its engine's 16377):
+FastFlowLM 1.0.13 (v1.0.13, its portable build) and OpenFlowLM 0.1.0-9b1409d
+(Atomic-Germ/OpenFlowLM-Next at 9b1409d, every model on its open kernels), each as `serve` with its default prefill
+chunks of 4096 tokens and each model at its native context (FastFlowLM's Qwen3.8 27B at its engine's 16377). 9b1409d
+answers wrongly on its Llama, Qwen3.5, Qwen3.6 and Qwen3.8 models (a regression of its GGUF-direct merge), so those
+rows run the newest build that answers correctly: 9b1409d's engine with the kernel sets of the commit before the
+merge, 96b915d4, for Llama, and 96b915d4 itself for the Qwen models; each such row names its build.
 
 - TTFT: a streaming `/v1/chat/completions` request with the same essay prompt of n tokens, greedy, 128 tokens: the
   client's time to the first token, median of up to 3;
@@ -115,7 +118,8 @@ chunks of 4096 tokens and each model at its native context (FastFlowLM's Qwen3.8
 
 | runtime | model | its model | weights | under Artlite's |
 |---|---|---|---|---|
-| FastFlowLM | Llama 3.2 1B Instruct | `llama3.2:1b` | Unsloth's imatrix Q4_1 GGUF, the Q4_1 file measured above | Q4_1 |
+| FastFlowLM | Qwen3 0.6B | `qwen3:0.6b` | imatrix Q4_1 GGUF (Unsloth style) | Q4_1 |
+| | Llama 3.2 1B Instruct | `llama3.2:1b` | Unsloth's imatrix Q4_1 GGUF, the Q4_1 file measured above | Q4_1 |
 | | Llama 3.2 3B Instruct | `llama3.2:3b` | imatrix Q4_1 GGUF (Unsloth style) | Q4_K_M |
 | | DeepSeek R1 Distill Llama 8B (Llama 3.1 8B's shapes) | `deepseek-r1:8b` | imatrix Q4_1 GGUF, untied | Llama 3.1 8B Q4_K_M |
 | | Gemma 4 E4B it | `gemma4-it:e4b` | imatrix Q4_1 GGUF; int8 embeddings, bf16 per-layer projections | Q4_0 |
@@ -123,14 +127,15 @@ chunks of 4096 tokens and each model at its native context (FastFlowLM's Qwen3.8
 | | Qwen3.6 35B-A3B | `qwen3.6-moe:35b-a3b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw) | Q4_K_M |
 | | MiniCPM-V 4.7 1B | `minicpm-v-4.7:1b` | FastFlowLM's own Q4_K quantization (560 MB per token, the lm_head Q8_0), not openbmb's GGUF files; text prompts | Q4_K_M |
 | | LFM3 1.7B | `lfm3:1.7b` | its own file (1.61 GB) of LiquidAI's quantization-aware-distilled Q4_0 weights | QAD-Q4_0 |
-| OpenFlowLM | Llama 3.2 1B Instruct | `llama3.2:1b` | FastFlowLM's container of the same Q4_1 | Q4_1 |
+| OpenFlowLM | Qwen3 0.6B | `qwen3:0.6b` | FastFlowLM's container | Q4_1 |
+| | Llama 3.2 1B Instruct | `llama3.2:1b` | FastFlowLM's container of the same Q4_1 | Q4_1 |
 | | Llama 3.2 3B Instruct | `llama3.2:3b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |
 | | Llama 3.1 8B Instruct | `llama3.1:8b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |
-| | Qwen3.8 27B | `qwen3.8:27b` | Q4_1 linears, Q8_0 lm_head and ssm_out, converted from a Q8_0 GGUF; no MTP head; 131072 positions | Q4_K_M |
+| | Qwen3.8 27B | `qwen3.8:27b` | Q4_1 linears, Q8_0 lm_head and ssm_out, converted from a Q8_0 GGUF; no MTP head; 131072 positions; prefill with `--prefill-precision single`, which gives these prompts the default's answers 4x sooner (the default's four products a projection: 118.5 s to the first token at 1k) | Q4_K_M |
+| | Qwen3.6 35B-A3B | `qwen3.6-moe:35b-a3b` | FastFlowLM's container: Q4_1 routed experts, Q8_0 shared expert, attention, DeltaNet projections and lm_head | Q4_K_M |
 
 OpenFlowLM runs that take over 5 minutes were not measured; the charts mark the missing values. The data files also
-hold models with no Artlite row yet (FastFlowLM's Qwen3 0.6B, Gemma 4 E2B; OpenFlowLM's Qwen3 0.6B, Qwen3.5 9B),
-which the charts leave out.
+hold models with no Artlite row yet (FastFlowLM's Gemma 4 E2B, OpenFlowLM's Qwen3.5 9B), which the charts leave out.
 
 ## llama.cpp
 

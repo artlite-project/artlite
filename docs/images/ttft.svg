@@ -16,7 +16,7 @@
 <text x="332.8" y="108.0" class="lbl">FastFlowLM 1.0.13</text>
 <line x1="456.8" y1="105.0" x2="476.8" y2="105.0" class="l3"/>
 <circle cx="466.792" cy="105" r="3.5" class="d3"/>
-<text x="482.8" y="108.0" class="lbl">OpenFlowLM 0.1.0-99fe7e4</text>
+<text x="482.8" y="108.0" class="lbl">OpenFlowLM 0.1.0-9b1409d</text>
 <text x="64.0" y="144.0" class="h">Qwen3 0.6B</text>
 <circle cx="67.5" cy="156.0" r="3.5" class="d0"/>
 <text x="74.0" y="160.0">Q4_1</text>
@@ -58,16 +58,16 @@
 <circle cx="118.9" cy="268.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 5.53 s</title></circle>
 <circle cx="135.5" cy="243.2" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 15.8 s</title></circle>
 <circle cx="152.1" cy="217.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 46.1 s</title></circle>
-<polyline points="69.0,289.2 85.6,270.6 102.2,250.0 118.9,212.0" class="l3"/>
-<circle cx="69.0" cy="289.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 2.33 s</title></circle>
-<circle cx="85.6" cy="270.6" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 5.06 s</title></circle>
-<circle cx="102.2" cy="250.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 11.9 s</title></circle>
-<circle cx="118.9" cy="212.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 8k tokens: 58.2 s</title></circle>
+<polyline points="69.0,302.7 85.6,282.4 102.2,258.5 118.9,214.3" class="l3"/>
+<circle cx="69.0" cy="302.7" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 1.33 s</title></circle>
+<circle cx="85.6" cy="282.4" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 3.09 s</title></circle>
+<circle cx="102.2" cy="258.5" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 8.39 s</title></circle>
+<circle cx="118.9" cy="214.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 8k tokens: 52.8 s</title></circle>
 <polyline points="69.0,366.0 118.9,301.3 152.1,241.9" class="l0"/>
 <circle cx="69.0" cy="366.0" r="3.5" class="d0"><title>Artlite Q4_1, 1k tokens: 0.0950 s</title></circle>
 <circle cx="118.9" cy="301.3" r="3.5" class="d0"><title>Artlite Q4_1, 8k tokens: 1.41 s</title></circle>
 <circle cx="152.1" cy="241.9" r="3.5" class="d0"><title>Artlite Q4_1, 32k tokens: 16.7 s</title></circle>
-<text x="125.9" y="216.0" class="halo">58.2 s</text>
+<text x="125.9" y="218.3" class="halo">52.8 s</text>
 <text x="159.1" y="221.5" class="halo">46.1 s</text>
 <text x="159.1" y="245.9" class="halo">16.7 s</text>
 <path d="M66.0,360.0h6M69.0,360.0V313.9M66.0,313.9h6" class="bracket"/>
@@ -85,7 +85,7 @@
 <circle cx="317.4" cy="156.0" r="3.5" class="d1"/>
 <text x="323.9" y="160.0">q4nx</text>
 <circle cx="363.3" cy="156.0" r="3.5" class="d3"/>
-<text x="369.8" y="160.0">q4nx</text>
+<text x="369.8" y="160.0">0.1.0-9b1409d+96b915d4-kernels q4nx</text>
 <line x1="265.0" y1="364.8" x2="408.0" y2="364.8" class="grid"/>
 <line x1="265.0" y1="309.5" x2="408.0" y2="309.5" class="grid"/>
 <line x1="265.0" y1="254.2" x2="408.0" y2="254.2" class="grid"/>
@@ -118,17 +118,17 @@
 <circle cx="336.5" cy="250.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 11.7 s</title></circle>
 <circle cx="353.1" cy="224.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 34.4 s</title></circle>
 <circle cx="369.8" cy="196.0" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 113 s</title></circle>
-<polyline points="270.0,262.3 286.6,234.6 303.2,204.1" class="l3"/>
-<circle cx="270.0" cy="262.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 7.16 s</title></circle>
-<circle cx="286.6" cy="234.6" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 22.7 s</title></circle>
-<circle cx="303.2" cy="204.1" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 80.8 s</title></circle>
+<polyline points="270.0,262.5 286.6,234.9 303.2,205.1" class="l3"/>
+<circle cx="270.0" cy="262.5" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 7.09 s</title></circle>
+<circle cx="286.6" cy="234.9" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 22.4 s</title></circle>
+<circle cx="303.2" cy="205.1" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 77.6 s</title></circle>
 <polyline points="270.0,362.5 319.9,307.9 353.1,257.9 369.8,228.9" class="l0"/>
 <circle cx="270.0" cy="362.5" r="3.5" class="d0"><title>Artlite Q4_1, 1k tokens: 0.110 s</title></circle>
 <circle cx="319.9" cy="307.9" r="3.5" class="d0"><title>Artlite Q4_1, 8k tokens: 1.07 s</title></circle>
 <circle cx="353.1" cy="257.9" r="3.5" class="d0"><title>Artlite Q4_1, 32k tokens: 8.60 s</title></circle>
 <circle cx="369.8" cy="228.9" r="3.5" class="d0"><title>Artlite Q4_1, 64k tokens: 28.8 s</title></circle>
 <text x="376.8" y="200.0" class="halo">113 s</text>
-<text x="310.2" y="208.1" class="halo">80.8 s</text>
+<text x="310.2" y="209.1" class="halo">77.6 s</text>
 <text x="376.8" y="232.9" class="halo">28.8 s</text>
 <path d="M267.0,356.5h6M270.0,356.5V320.9M267.0,320.9h6" class="bracket"/>
 <text x="277.0" y="342.7" class="lbl halo">7.3×</text>
@@ -144,7 +144,7 @@
 <circle cx="534.9" cy="156.0" r="3.5" class="d1"/>
 <text x="541.4" y="160.0">q4nx</text>
 <circle cx="580.8" cy="156.0" r="3.5" class="d3"/>
-<text x="587.3" y="160.0">q4nx</text>
+<text x="587.3" y="160.0">0.1.0-9b1409d+96b915d4-kernels q4nx</text>
 <line x1="466.0" y1="364.8" x2="609.0" y2="364.8" class="grid"/>
 <line x1="466.0" y1="309.5" x2="609.0" y2="309.5" class="grid"/>
 <line x1="466.0" y1="254.2" x2="609.0" y2="254.2" class="grid"/>
@@ -177,24 +177,24 @@
 <circle cx="537.5" cy="229.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 27.9 s</title></circle>
 <circle cx="554.1" cy="204.4" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 79.7 s</title></circle>
 <circle cx="570.8" cy="176.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 64k tokens: 254 s</title></circle>
-<polyline points="471.0,244.0 487.6,216.4 504.2,185.4" class="l3"/>
-<circle cx="471.0" cy="244.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 15.3 s</title></circle>
-<circle cx="487.6" cy="216.4" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 48.4 s</title></circle>
-<circle cx="504.2" cy="185.4" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 176 s</title></circle>
+<polyline points="471.0,244.3 487.6,216.8 504.2,187.2" class="l3"/>
+<circle cx="471.0" cy="244.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 15.2 s</title></circle>
+<circle cx="487.6" cy="216.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 47.5 s</title></circle>
+<circle cx="504.2" cy="187.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 163 s</title></circle>
 <polyline points="471.0,338.7 520.9,285.1 554.1,238.7 570.8,211.4" class="l0"/>
 <circle cx="471.0" cy="338.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.296 s</title></circle>
 <circle cx="520.9" cy="285.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 2.77 s</title></circle>
 <circle cx="554.1" cy="238.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 19.1 s</title></circle>
 <circle cx="570.8" cy="211.4" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 59.5 s</title></circle>
 <text x="577.8" y="180.6" class="halo">254 s</text>
-<text x="511.2" y="189.4" class="halo">176 s</text>
+<text x="511.2" y="191.2" class="halo">163 s</text>
 <text x="577.8" y="215.4" class="halo">59.5 s</text>
 <path d="M468.0,332.7h6M471.0,332.7V299.0M468.0,299.0h6" class="bracket"/>
 <text x="478.0" y="319.9" class="lbl halo">6.7×</text>
 <path d="M567.8,205.4h6M570.8,205.4V182.6M567.8,182.6h6" class="bracket"/>
 <text x="577.8" y="198.0" class="lbl halo">4.3×</text>
 <text x="490.6" y="192.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 490.6 192.9)">10 tok/s</text>
-<text x="513.0" y="225.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 513.0 225.8)">100 tok/s</text>
+<text x="510.7" y="228.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 510.7 228.0)">100 tok/s</text>
 <text x="505.2" y="288.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 505.2 288.8)">1k tok/s</text>
 <text x="580.3" y="269.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 580.3 269.0)">10k tok/s</text>
 <text x="591.0" y="313.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 591.0 313.6)">100k tok/s</text>
@@ -204,7 +204,7 @@
 <circle cx="735.9" cy="156.0" r="3.5" class="d1"/>
 <text x="742.4" y="160.0">q4nx*</text>
 <circle cx="786.0" cy="156.0" r="3.5" class="d3"/>
-<text x="792.5" y="160.0">q4nx</text>
+<text x="792.5" y="160.0">0.1.0-9b1409d+96b915d4-kernels q4nx</text>
 <line x1="667.0" y1="364.8" x2="810.0" y2="364.8" class="grid"/>
 <line x1="667.0" y1="309.5" x2="810.0" y2="309.5" class="grid"/>
 <line x1="667.0" y1="254.2" x2="810.0" y2="254.2" class="grid"/>
@@ -236,15 +236,15 @@
 <circle cx="721.9" cy="238.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 19.3 s</title></circle>
 <circle cx="738.5" cy="218.2" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 45.0 s</title></circle>
 <circle cx="755.1" cy="195.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 117 s</title></circle>
-<polyline points="672.0,233.9 688.6,207.5 705.2,177.7" class="l3"/>
-<circle cx="672.0" cy="233.9" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 23.3 s</title></circle>
-<circle cx="688.6" cy="207.5" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 70.1 s</title></circle>
-<circle cx="705.2" cy="177.7" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 243 s</title></circle>
+<polyline points="672.0,234.0 688.6,207.3 705.2,178.3" class="l3"/>
+<circle cx="672.0" cy="234.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 23.3 s</title></circle>
+<circle cx="688.6" cy="207.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 70.6 s</title></circle>
+<circle cx="705.2" cy="178.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 237 s</title></circle>
 <polyline points="672.0,319.9 721.9,265.9 755.1,220.4" class="l0"/>
 <circle cx="672.0" cy="319.9" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.648 s</title></circle>
 <circle cx="721.9" cy="265.9" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 6.16 s</title></circle>
 <circle cx="755.1" cy="220.4" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 40.9 s</title></circle>
-<text x="712.2" y="181.7" class="halo">243 s</text>
+<text x="712.2" y="182.3" class="halo">237 s</text>
 <text x="762.1" y="199.3" class="halo">117 s</text>
 <text x="762.1" y="224.4" class="halo">40.9 s</text>
 <path d="M669.0,313.9h6M672.0,313.9V287.2M669.0,287.2h6" class="bracket"/>
@@ -317,7 +317,7 @@
 <circle cx="333.9" cy="454.6" r="3.5" class="d1"/>
 <text x="340.4" y="458.6">q4nx</text>
 <circle cx="379.8" cy="454.6" r="3.5" class="d3"/>
-<text x="386.3" y="458.6">q4nx</text>
+<text x="386.3" y="458.6">0.1.0-96b915d4 q4nx</text>
 <line x1="265.0" y1="663.4" x2="408.0" y2="663.4" class="grid"/>
 <line x1="265.0" y1="608.1" x2="408.0" y2="608.1" class="grid"/>
 <line x1="265.0" y1="552.9" x2="408.0" y2="552.9" class="grid"/>
@@ -347,10 +347,10 @@
 <circle cx="303.2" cy="522.6" r="3.5" class="d1"><title>FastFlowLM q4nx, 4k tokens: 35.3 s</title></circle>
 <circle cx="319.9" cy="505.7" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 71.5 s</title></circle>
 <circle cx="336.1" cy="488.3" r="3.5" class="d1"><title>FastFlowLM q4nx, 16121 tokens: 148 s</title></circle>
-<polyline points="270.0,529.8 286.6,514.2 303.2,497.9" class="l3"/>
-<circle cx="270.0" cy="529.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 26.1 s</title></circle>
-<circle cx="286.6" cy="514.2" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 50.1 s</title></circle>
-<circle cx="303.2" cy="497.9" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 99.0 s</title></circle>
+<polyline points="270.0,526.5 286.6,509.8 303.2,491.1" class="l3"/>
+<circle cx="270.0" cy="526.5" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 30.0 s</title></circle>
+<circle cx="286.6" cy="509.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 60.1 s</title></circle>
+<circle cx="303.2" cy="491.1" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 131 s</title></circle>
 <polyline points="270.0,588.7 319.9,538.2 353.1,501.1 369.8,480.1" class="l0"/>
 <circle cx="270.0" cy="588.7" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 2.25 s</title></circle>
 <circle cx="319.9" cy="538.2" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 18.4 s</title></circle>
@@ -358,13 +358,13 @@
 <circle cx="369.8" cy="480.1" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 207 s</title></circle>
 <text x="376.8" y="484.1" class="halo">207 s</text>
 <text x="343.1" y="492.3" class="halo">148 s</text>
-<text x="310.2" y="501.9" class="halo">99.0 s</text>
+<text x="310.2" y="495.1" class="halo">131 s</text>
 <path d="M267.0,582.7h6M270.0,582.7V560.3M267.0,560.3h6" class="bracket"/>
 <text x="277.0" y="575.5" class="lbl halo">4.2×</text>
 <path d="M316.9,532.2h6M319.9,532.2V511.7M316.9,511.7h6" class="bracket"/>
 <text x="326.9" y="526.0" class="lbl halo">3.9×</text>
-<text x="289.6" y="491.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 289.6 491.6)">10 tok/s</text>
-<text x="294.6" y="524.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 294.6 524.8)">100 tok/s</text>
+<text x="287.9" y="493.2" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 287.9 493.2)">10 tok/s</text>
+<text x="296.8" y="522.6" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 296.8 522.6)">100 tok/s</text>
 <text x="332.8" y="558.8" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 332.8 558.8)">1k tok/s</text>
 <text x="289.9" y="657.0" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 289.9 657.0)">10k tok/s</text>
 <text x="387.7" y="614.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 387.7 614.5)">100k tok/s</text>
@@ -373,6 +373,8 @@
 <text x="476.0" y="458.6">Q4_K_M</text>
 <circle cx="534.9" cy="454.6" r="3.5" class="d1"/>
 <text x="541.4" y="458.6">q4nx</text>
+<circle cx="580.8" cy="454.6" r="3.5" class="d3"/>
+<text x="587.3" y="458.6">0.1.0-96b915d4 q4nx</text>
 <line x1="466.0" y1="663.4" x2="609.0" y2="663.4" class="grid"/>
 <line x1="466.0" y1="608.1" x2="609.0" y2="608.1" class="grid"/>
 <line x1="466.0" y1="552.9" x2="609.0" y2="552.9" class="grid"/>
@@ -403,11 +405,19 @@
 <circle cx="520.9" cy="528.8" r="3.5" class="d1"><title>FastFlowLM q4nx, 8k tokens: 27.3 s</title></circle>
 <circle cx="537.5" cy="511.1" r="3.5" class="d1"><title>FastFlowLM q4nx, 16k tokens: 57.0 s</title></circle>
 <circle cx="554.1" cy="492.5" r="3.5" class="d1"><title>FastFlowLM q4nx, 32k tokens: 124 s</title></circle>
+<polyline points="471.0,568.1 487.6,553.7 504.2,538.1 520.9,520.0 537.5,500.3 554.1,478.8" class="l3"/>
+<circle cx="471.0" cy="568.1" r="3.5" class="d3"><title>OpenFlowLM q4nx, 1k tokens: 5.29 s</title></circle>
+<circle cx="487.6" cy="553.7" r="3.5" class="d3"><title>OpenFlowLM q4nx, 2k tokens: 9.65 s</title></circle>
+<circle cx="504.2" cy="538.1" r="3.5" class="d3"><title>OpenFlowLM q4nx, 4k tokens: 18.5 s</title></circle>
+<circle cx="520.9" cy="520.0" r="3.5" class="d3"><title>OpenFlowLM q4nx, 8k tokens: 39.4 s</title></circle>
+<circle cx="537.5" cy="500.3" r="3.5" class="d3"><title>OpenFlowLM q4nx, 16k tokens: 89.2 s</title></circle>
+<circle cx="554.1" cy="478.8" r="3.5" class="d3"><title>OpenFlowLM q4nx, 32k tokens: 219 s</title></circle>
 <polyline points="471.0,613.2 520.9,572.9 554.1,534.2 570.8,511.8" class="l0"/>
 <circle cx="471.0" cy="613.2" r="3.5" class="d0"><title>Artlite Q4_K_M, 1k tokens: 0.811 s</title></circle>
 <circle cx="520.9" cy="572.9" r="3.5" class="d0"><title>Artlite Q4_K_M, 8k tokens: 4.34 s</title></circle>
 <circle cx="554.1" cy="534.2" r="3.5" class="d0"><title>Artlite Q4_K_M, 32k tokens: 21.8 s</title></circle>
 <circle cx="570.8" cy="511.8" r="3.5" class="d0"><title>Artlite Q4_K_M, 64k tokens: 55.4 s</title></circle>
+<text x="561.1" y="482.8" class="halo">219 s</text>
 <text x="561.1" y="496.5" class="halo">124 s</text>
 <text x="577.8" y="515.8" class="halo">55.4 s</text>
 <path d="M468.0,607.2h6M471.0,607.2V568.0M468.0,568.0h6" class="bracket"/>
