@@ -106,6 +106,9 @@ class _Device:
 
     alloc_host_buffer = alloc_user_buffer = alloc_insts_buffer = _alloc
 
+    def alloc_host_buffers(self, sizes: list[int]) -> list[_Buffer]:
+        return [self._alloc(n) for n in sizes]
+
 
 class _Kernel:
     def __init__(self, log: _Log):

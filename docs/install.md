@@ -7,7 +7,8 @@ Strix Halo (Ryzen AI Max). Artlite is developed and measured on a Ryzen AI Max+ 
 Hawk Point (AIE2) are not supported: Artlite's kernels and designs are written for AIE2P only.
 
 The NPU reads the weights from system memory, so a model needs about its file's size of RAM plus its KV cache
-(Qwen3.6 27B Q4_K_M: 16 GB of weights).
+(Qwen3.6 27B Q4_K_M: 16 GB of weights). A load needs no more than the model then keeps: the weights are converted
+from the file a window at a time, and the tools' load line ends with both figures ("19.4 GB of RAM, 19.6 at most").
 
 ## Software (Linux)
 
@@ -115,9 +116,9 @@ Remove-Item Env:XILINX_XRT
   overlay with its prefill's, a drafter's, a fused operator's (`Device.alloc_host_buffers`), so a model costs a command
   a region for its weights and one for the rest, whatever their sizes and the context length. A buffer allocated alone
   shares a 1 GB region of the process when it is under 256 MB (pinned whole, used or not) and has its own from there.
-  A command also lists the process's other regions while it has room, so that Windows keeps the buffers of a model's
-  other contexts (its drafter's) in the NPU's memory between their turns. Instruction buffers (control code, PDIs,
-  the scratchpad) need not be listed.
+  A command also lists the process's other regions while it has room: while a model's context and its drafter's
+  each listed only their own buffers, the model's steps ran a third slower on Windows (Krackan Point, Qwen3.8 27B with
+  DFlash2 and 131072 positions). Instruction buffers (control code, PDIs, the scratchpad) need not be listed.
 - A data buffer's region is one XRT buffer of the device, at one device address in every context, made once a
   context exists in the process (XRT's rule): a program opens its context before it resolves addresses. Instruction
   buffers are made in the memory group of the context that runs them (`Buffer.paddr_in`).

@@ -154,3 +154,16 @@ def test_overlay_idle_prologue(monkeypatch: pytest.MonkeyPatch) -> None:
         assert run(0.1) == ["step"]
     dev._prologue = None  # (a design that keeps nothing on the array)
     assert run(10 * IDLE_S) == ["step"]
+
+
+def test_process_memory() -> None:
+    """``portable.process_memory``: the RAM the process holds and its peak, which memory the process touches raises;
+    ``portable.uptime`` goes on."""
+    held, peak = overlay.portable.process_memory()
+    assert 0 < held <= peak
+    block = bytearray(64 << 20)
+    block[::4096] = bytes(len(block) // 4096)
+    more, peak2 = overlay.portable.process_memory()
+    assert peak2 >= peak and peak2 >= held + (32 << 20) and more <= peak2
+    t = overlay.portable.uptime()
+    assert overlay.portable.uptime() >= t > 0

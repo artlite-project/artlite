@@ -400,6 +400,10 @@ Address spaces and layout:
   versions; in-place edits of installed toolchain headers are not detected: `ARTLITE_IGNORE_CACHE=1`.
 - `ARTLITE_LOG_COMMANDS=1` with `ARTLITE_IGNORE_CACHE=1` shows the exact `clang++` / `aiecc` invocations.
 - `dmesg` shows `amdxdna ... IO_PAGE_FAULT` when DMA addresses or buffer layouts are wrong.
+- A dispatch that hangs only after a pause (`TIMEOUT`, state 8): the idle NPU powered down (Linux: 5 s after its last
+  job with the driver's default `power/control` `auto`; a machine where it is `on` never shows it) and the context came
+  back with its configuration alone. Whatever a design keeps on the array across dispatches must be written again
+  (`OverlayDevice.set_prologue`); test it with a sleep of 8 s between two dispatches and `power/control` `auto`.
 - Bring designs up incrementally: one block / layer at a time, then the host handoff between dispatches, then the
   whole chain. [mlir-aie `skills/aie-hw-bringup`]
 - Before blaming the compiler, rule out the stack (section 10), the layout (`tests/dma_model.py`) and the DMA

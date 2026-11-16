@@ -21,8 +21,9 @@ that run: [Models](models/README.md). The first run of a model builds its NPU de
 ## Text
 
 The prompt goes through the model's chat template (`--raw`: as it is); tokens are then sampled until an
-end-of-sequence token, `-n` tokens or a full KV cache. The answer streams to stdout; the load summary and the prompt
-and generation speeds go to stderr.
+end-of-sequence token, `-n` tokens or a full KV cache. The answer streams to stdout; the load summary (the model's
+weights and caches, then the RAM the process holds and the most it held while loading) and the prompt and generation
+speeds go to stderr.
 
 | option | |
 |---|---|

@@ -262,7 +262,7 @@ def test_window_attention(npu: VisionDevice) -> None:
     torch.manual_seed(5)
     n = COLS * 16  # (windows: per column 2 panels of 8)
     x = torch.randn(3, 4, n, M.C)  # (Q, K, V; source; window; channel)
-    x[0] *= M.LOG2E / M.HD ** 0.5 * 2
+    x[0] *= L.LOG2E / M.HD ** 0.5 * 2
     stride = M.C // 8 * 2 * 72  # (a source's [kb][2][72])
     QA, KA, VA, OA = 0, 4 * stride + 8192, 8 * stride + 16384, 12 * stride + 24576
     cols = [slice(c * 16, (c + 1) * 16) for c in range(COLS)]

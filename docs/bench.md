@@ -5,7 +5,7 @@ test names, result fields and output formats.
 
 ```console
 $ artlite-bench -m bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_0.gguf -p 512 -n 128 -r 3
-artlite-bench: Llama-3.2-3B-Instruct-Q4_0.gguf (Llama 3): loaded in 38.4 s: 1.93 GB of weights, 271 MB of KV cache (4096 positions, K single)
+artlite-bench: Llama-3.2-3B-Instruct-Q4_0.gguf (Llama 3): loaded in 14.4 s: 1.74 GB of weights, 273 MB of KV cache (4096 positions, K single); 3.0 GB of RAM, 3.3 at most
 | model                          |       size |     params | backend    |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --------------: | -------------------: |
 | llama 3B Q4_0                  |   1.78 GiB |     3.21 B | NPU        |           pp512 |       3490.08 ± 4.72 |

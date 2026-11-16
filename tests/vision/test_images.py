@@ -16,6 +16,11 @@ class FakeDevice:
     def alloc(self, name: str, nbytes: int) -> None:
         self.buffers[name] = np.zeros(nbytes, np.uint8)
 
+    def alloc_all(self, sizes: dict[str, int]) -> None:
+        for name, nbytes in sizes.items():
+            if name not in self.buffers:
+                self.alloc(name, nbytes)
+
     def view(self, name: str) -> np.ndarray:
         return self.buffers[name]
 

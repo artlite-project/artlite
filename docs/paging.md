@@ -171,8 +171,10 @@ sleeps on its wake lock. That channel streams the page, which waits in the memor
 TileControl.
 
 A request costs 86 cycles plus about 0.39 µs per KB of code. The store and its BDs are not part of the design's
-configuration. The host writes them (0.32 ms) before a dispatch when they are stale: after the configuration and
-after a prefill dispatch, which configures the array for its own designs.
+configuration. The host writes them (0.32 ms) before a dispatch when they are stale: after the configuration, after
+a prefill dispatch, which configures the array for its own designs, and after a pause of a second or more, as the
+system powers an idle NPU down (Linux's driver suspends it 5 s after its last job) and the array comes back with its
+configuration alone.
 
 Llama 3.2 3B Q3_K_M uses this: its weights come in four tile formats, and the GEMV kernels of all four do not fit a
 core together. Q3_K, the format with the most bytes, stays resident; Q4_K, Q5_K and Q6_K are pages. Without pages,

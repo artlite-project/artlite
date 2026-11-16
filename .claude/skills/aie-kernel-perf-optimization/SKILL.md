@@ -308,7 +308,9 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   slots, 2.7 µs for two 5760-B slots whatever the code; the host knows each row's role and puts the page before the op
   that needs it. Memtile (the core's request packet pushes a page BD on a memtile MM2S channel of its own): 86 cycles
   + ~0.39 µs per KB of code, at most 4 cores per channel; its store and BDs reloaded after another hardware context ran
-  (`OverlayDevice.set_prologue`: 0.3 ms). Decode overlays page the tile formats beyond the one of the most bytes when
+  and after a pause in which the NPU may have powered down (`OverlayDevice.set_prologue`: 0.3 ms; anything else a
+  design keeps on the array across dispatches needs the same: Linux suspends the idle device after 5 s, and a resume
+  restores its configuration alone). Decode overlays page the tile formats beyond the one of the most bytes when
   four or more do not fit (`DecodeOverlayOperator(paged=)`: Llama 3B Q3_K_M, a few loads per step, the main core 2.4 KB
   freer). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
   1.7 KB off the resident code). The vision overlay's pages hold 7232 B (16 KB less its 9152-B resident code; sizes:
