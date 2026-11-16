@@ -9,9 +9,9 @@
 <rect x="24" y="99" width="12" height="12" rx="3" class="f0"/>
 <text x="42.0" y="108.0" class="lbl">Artlite</text>
 <rect x="94.672" y="99" width="12" height="12" rx="3" class="f1"/>
-<text x="112.7" y="108.0" class="lbl">FastFlowLM 1.0.9</text>
-<rect x="230.036" y="99" width="12" height="12" rx="3" class="f2"/>
-<text x="248.0" y="108.0" class="lbl">llama.cpp b11699</text>
+<text x="112.7" y="108.0" class="lbl">FastFlowLM 1.0.13</text>
+<rect x="236.708" y="99" width="12" height="12" rx="3" class="f2"/>
+<text x="254.7" y="108.0" class="lbl">llama.cpp b11699</text>
 <text x="132.7" y="142.0" class="h">16x vision encoder: 64 tokens per entry</text>
 <text x="509.3" y="142.0" class="h">4x vision encoder: 256 tokens per entry</text>
 <line x1="132.7" y1="154.0" x2="132.7" y2="530.0" class="axis"/>
@@ -42,8 +42,8 @@
 <path d="M509.3,190.0h45.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-45.6z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, sd15-astronaut.jpg, 4x vision encoder: 256 tokens per entry: 0.598</title></path>
 <text x="564.0" y="200.5">0.598</text>
 <text x="122.7" y="215.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
-<path d="M132.7,205.0h95.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-95.6z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, sd15-astronaut.jpg, 16x vision encoder: 64 tokens per entry: 1.20</title></path>
-<text x="237.3" y="215.5">1.20<tspan dx="10" class="strong">Artlite 4.1× faster</tspan></text>
+<path d="M132.7,205.0h53.9a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-53.9z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, sd15-astronaut.jpg, 16x vision encoder: 64 tokens per entry: 0.698</title></path>
+<text x="195.6" y="215.5">0.698<tspan dx="10" class="strong">Artlite 2.4× faster</tspan></text>
 <text x="514.3" y="215.5">—*</text>
 <text x="122.7" y="230.5" text-anchor="end" class="lbl2">llama.cpp Vulkan</text>
 <path d="M132.7,220.0h41.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-41.6z" class="f2"><title>llama.cpp Vulkan, MiniCPM-V 4.7 1B Q4_K_M, sd15-astronaut.jpg, 16x vision encoder: 64 tokens per entry: 0.549</title></path>
@@ -59,8 +59,8 @@
 <path d="M509.3,287.0h84.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-84.0z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, airplane.jpeg, 4x vision encoder: 256 tokens per entry: 1.06</title></path>
 <text x="602.3" y="297.5">1.06</text>
 <text x="122.7" y="312.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
-<path d="M132.7,302.0h187.7a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-187.7z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, airplane.jpeg, 16x vision encoder: 64 tokens per entry: 2.31</title></path>
-<text x="329.4" y="312.5">2.31<tspan dx="10" class="strong">Artlite 4.5× faster</tspan></text>
+<path d="M132.7,302.0h103.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-103.1z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, airplane.jpeg, 16x vision encoder: 64 tokens per entry: 1.29</title></path>
+<text x="244.8" y="312.5">1.29<tspan dx="10" class="strong">Artlite 2.5× faster</tspan></text>
 <text x="514.3" y="312.5">—*</text>
 <text x="122.7" y="327.5" text-anchor="end" class="lbl2">llama.cpp Vulkan</text>
 <path d="M132.7,317.0h127.1a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-127.1z" class="f2"><title>llama.cpp Vulkan, MiniCPM-V 4.7 1B Q4_K_M, airplane.jpeg, 16x vision encoder: 64 tokens per entry: 1.58</title></path>
@@ -76,8 +76,8 @@
 <path d="M509.3,384.0h31.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-31.6z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, test-1.jpeg, 4x vision encoder: 256 tokens per entry: 0.429</title></path>
 <text x="550.0" y="394.5">0.429</text>
 <text x="122.7" y="409.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
-<path d="M132.7,399.0h89.0a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-89.0z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, test-1.jpeg, 16x vision encoder: 64 tokens per entry: 1.12</title></path>
-<text x="230.7" y="409.5">1.12<tspan dx="10" class="strong">Artlite 4.7× faster</tspan></text>
+<path d="M132.7,399.0h51.8a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-51.8z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, test-1.jpeg, 16x vision encoder: 64 tokens per entry: 0.672</title></path>
+<text x="193.5" y="409.5">0.672<tspan dx="10" class="strong">Artlite 2.8× faster</tspan></text>
 <text x="514.3" y="409.5">—*</text>
 <text x="122.7" y="424.5" text-anchor="end" class="lbl2">llama.cpp Vulkan</text>
 <path d="M132.7,414.0h37.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-37.3z" class="f2"><title>llama.cpp Vulkan, MiniCPM-V 4.7 1B Q4_K_M, test-1.jpeg, 16x vision encoder: 64 tokens per entry: 0.497</title></path>
@@ -93,8 +93,8 @@
 <path d="M509.3,481.0h63.6a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-63.6z" class="f0"><title>Artlite, MiniCPM-V 4.7 1B Q4_K_M, hk_OCR.jpg, 4x vision encoder: 256 tokens per entry: 0.814</title></path>
 <text x="581.9" y="491.5">0.814</text>
 <text x="122.7" y="506.5" text-anchor="end" class="lbl2">FastFlowLM q4nx</text>
-<path d="M132.7,496.0h145.4a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-145.4z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, hk_OCR.jpg, 16x vision encoder: 64 tokens per entry: 1.80</title></path>
-<text x="287.1" y="506.5">1.80<tspan dx="10" class="strong">Artlite 4.5× faster</tspan></text>
+<path d="M132.7,496.0h82.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-82.3z" class="f1"><title>FastFlowLM q4nx, MiniCPM-V 4.7 1B q4nx, hk_OCR.jpg, 16x vision encoder: 64 tokens per entry: 1.04</title></path>
+<text x="224.0" y="506.5">1.04<tspan dx="10" class="strong">Artlite 2.6× faster</tspan></text>
 <text x="514.3" y="506.5">—*</text>
 <text x="122.7" y="521.5" text-anchor="end" class="lbl2">llama.cpp Vulkan</text>
 <path d="M132.7,511.0h92.3a4.0,4.0 0 0 1 4.0,4.0v5.0a4.0,4.0 0 0 1 -4.0,4.0h-92.3z" class="f2"><title>llama.cpp Vulkan, MiniCPM-V 4.7 1B Q4_K_M, hk_OCR.jpg, 16x vision encoder: 64 tokens per entry: 1.16</title></path>

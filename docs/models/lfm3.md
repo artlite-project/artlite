@@ -74,10 +74,10 @@ Speed and accuracy (Strix Halo):
 Q8_0: KL 6.2e-4 / 5.7e-4 (llama.cpp 1.0e-3 / 5.2e-4). Steps of 1-4 tokens give the same logits bit for bit, and a greedy
 text with the context's drafts is the text without them.
 
-Against FastFlowLM 1.0.12 on the same NPU (its file of the same QAD Q4_0 weights, at most 32K positions): the first token
-8.4x sooner at 1K tokens (1.28 s there), 4.8x at 32K (28.2 s); generation 1.2x / 1.8x as fast after 1K / 32K (41.1 / 23.6
-tokens/s). Its documentation reports 81.3% on the first 150 GSM8K questions (its own requests) against its CPU engine's
-87.3%, the difference its NPU attention's.
+Against FastFlowLM 1.0.13 on the same NPU (its file of the same QAD Q4_0 weights): the first token 7.8x sooner at 1K
+tokens (1.19 s there), 4.6x at 32K (27.3 s); generation 1.2x / 1.7x as fast after 1K / 32K (41.8 / 24.5 tokens/s). Its
+documentation reports 81.3% on the first 150 GSM8K questions (its own requests) against its CPU engine's 87.3%, the
+difference its NPU attention's.
 
 Against llama.cpp's Vulkan backend on the iGPU (the same QAD-Q4_0 file): a prompt runs 1.16x as fast at 1K tokens and
 1.9x at 32K, with ~3.3x less energy; generation runs at ~30% of its speed (168.8 / 122.5 tokens/s after 1K / 32K):
