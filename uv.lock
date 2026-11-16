@@ -122,7 +122,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "anthropic", specifier = ">=0.60" },
-    { name = "nanobind", specifier = ">=2.12.0" },
+    { name = "nanobind", specifier = "==2.12.0" },
     { name = "openai", specifier = ">=1.60" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "ruff", specifier = ">=0.16.2" },
