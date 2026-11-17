@@ -236,7 +236,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
                  a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False,
-                 tails: bool = False):
+                 tails: bool = False, gating: str = "softmax", shared_gate: bool = True):
         """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -244,7 +244,8 @@ class DecodeOverlayOperator(ArtcOperator):
         than 16 rows (their [8 gate | 8 up] groups cross tiles: a window per slot); paged: formats whose kernels are
         code pages (module docstring); moe: (experts, experts used per token) of the MoE layers' phases (module
         docstring "MoE": the X stream packet-switched, the router's blocks, row-group tiles, the expert's sub-phases, the
-        combine); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
+        combine; gating: the routing's weights, "softmax" or "sigmoid", ``moe.route``; shared_gate: the shared expert's
+        sigmoid gate, S_SG); max_k: the K of a phase's group at most (its x panels in the helper's memory; moe: one more chunk,
         the side chunk); slots: the token slots of a step (``gemv``'s x panels; 8: module docstring "Designs of 8
         slots"); bcast: phase inputs on one broadcast stream (module docstring "Broadcast inputs"); a_bcast: pairs of columns
         (c, d): a fill of column c's A stream with the packet id AB_ID + i (i: the pair's index) reaches both columns'
@@ -275,7 +276,8 @@ class DecodeOverlayOperator(ArtcOperator):
         self.max_k = max_k
         self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
         assert hidden % (COLS * C_LEN) == 0 and hidden <= max_k
-        assert not moe or not (post or pli or packed or tok) and act == "silu" and nsb == 4
+        assert not moe or not (post or pli) and act == "silu" and nsb == 4
+        self.gating, self.shared_gate = gating, shared_gate
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert all(gemv.supported(f, nsb, slots) for f in rows), (rows, slots)
         assert act in ("silu", "gelu", "gelu_erf") and (not pli or act == "gelu")
@@ -474,7 +476,7 @@ class DecodeOverlayOperator(ArtcOperator):
             return {}
         route = moe_k.render(p, consts | {"META": META, "SLOTS": self.slots, "ITEM_WORDS": ITEM_WORDS,
                                           "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS,
-                             a_packet=AID if self.a_bcast else None)
+                             a_packet=AID if self.a_bcast else None, gating=self.gating, shared_gate=self.shared_gate)
         return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
                 "ITEM_WORDS": ITEM_WORDS}
 

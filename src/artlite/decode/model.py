@@ -26,6 +26,7 @@ from typing import Any, ClassVar, NamedTuple
 import numpy as np
 from ml_dtypes import bfloat16
 
+from .. import txn
 from ..formats import has_tile_format, tile_format
 from ..gguf_model import GGUFFile
 from ..operators.design import COLS
@@ -365,6 +366,11 @@ class ModelOverlay:
         """The slots of an input k block in a step of S slots (``protocol.packed_slots`` in a packed design) of a phase's
         input."""
         return packed_slots(S) if self.op.packed else self.SLOTS
+
+    @property
+    def a_bds(self) -> int:
+        """The host's BDs on A (an MoE design's 3: BD 3 is the experts', ``moe.route``)."""
+        return getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)
 
     def _weight_run(self, seq: Sequence, phases: list[tuple[int, str]], *, image: TileImage | None = None,
                     buf: str = "W", blocks: slice = slice(None)) -> None:

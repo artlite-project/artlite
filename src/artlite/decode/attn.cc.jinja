@@ -67,7 +67,13 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
 {# 2^x of 64 lanes, one copy for the softmax and the merge (two records or two partials at a time, two independent
    chains in one body: 88 cycles, 70 for 32 lanes), exactly 0 for the masked scores (-1e30) #}
 {% set exp2 = km.exp2(64, below="zero") %}
+{% if SINKS %}
+{% set exp2s = km.exp2(16, prec="fp32") %}
+{% endif %}
 {{ exp2.src }}
+{% if SINKS %}
+{{ exp2s.src }}
+{% endif %}
 
 // Q (the set's panels) against {{ DB }} d-blocks of K panels: two MMUL chains (even, odd d-blocks), two panel streams
 [[clang::always_inline]] inline aie::accum<accfloat, 64> {{ p }}_qk(const uint8_t *__restrict k, const uint8_t *__restrict qa)
@@ -278,7 +284,7 @@ __attribute__((noinline, minsize)) void {{ p }}_mark(int32_t *__restrict st, int
 // The masks of a record (positions Pr ..) of each set: its lanes past a slot's position, before a window or position 0
 __attribute__((noinline, minsize)) void {{ p }}_mrec(const int32_t *__restrict st, float *__restrict so, int Pr, int nsets)
 {
-    const int p = st[{{ A_P }}], S = st[{{ A_S }}], {{ "lnh = st[%d] == 4 ? 2 : 1" % A_NH if NH_POW2 else "nhm = st[%d]" % A_NHM }};
+    const int p = st[{{ A_P }}], S = st[{{ A_S }}], {{ "lnh = " ~ lnh("st[%d]" % A_NH) if NH_POW2 else "nhm = st[%d]" % A_NHM }};
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < nsets; set++) {
         aie::store_v(so, aie::select(aie::load_v<32>(so), aie::broadcast<float, 32>(-16384.0f),
@@ -333,7 +339,7 @@ __attribute__((noinline, minsize)) void {{ p }}_kobj(uint8_t *__restrict a, int3
     {{ p }}_AWin<{{ WINS['kobj'] }}> win_;
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int p = st[{{ A_P }}], S = st[{{ A_S }}], nd = st[{{ A_HD }}] >> 3, kper = {{ by_nd(KPER) }};
-    const int nsets = (st[{{ A_NH }}] * S + 3) >> 2, {{ "lnh = st[%d] == 4 ? 2 : 1" % A_NH if NH_POW2 else "nhm = st[%d]" % A_NHM }};
+    const int nsets = (st[{{ A_NH }}] * S + 3) >> 2, {{ "lnh = " ~ lnh("st[%d]" % A_NH) if NH_POW2 else "nhm = st[%d]" % A_NHM }};
     const int lo_all = st[{{ A_WIN }}] ? p + S - st[{{ A_WIN }}] : 0;  // (every row's window starts at or before it)
     float *__restrict sc = AW(float, {{ a.sc }});  // [set][record][8 q + j]
     AIE_LOOP_NO_UNROLL
@@ -602,7 +608,7 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int p = st[{{ A_P }}], S = st[{{ A_S }}], hd = st[{{ A_HD }}], nd = hd >> 3, r0 = p >> 3, r1 = (p + S - 1) >> 3;
 {% if NH_POW2 %}
-    const int lnh = st[{{ A_NH }}] == 4 ? 2 : 1, rec = st[{{ A_TREC }}] && (t == 0 || r1 == r0);
+    const int lnh = {{ lnh("st[%d]" % A_NH) }}, rec = st[{{ A_TREC }}] && (t == 0 || r1 == r0);
 {% else %}
     const int nh = st[{{ A_NH }}], rec = st[{{ A_TREC }}] && (t == 0 || r1 == r0);
 {% endif %}
@@ -704,7 +710,12 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% endif %}
     if (flags & {{ F_MAIN }}) {
         if (!(flags & {{ F_LOADR }})) {  // its input objects (under its norm-weight objects), its tiles
+{% if MOE %}
+            // (a combine's objects: whole, a slot's half's partials each)
+            const int nx = m[{{ M_NX }}], S = m[{{ M_NS }}], lper = (flags & {{ F_COMB }}) ? 0 : (S == 1 ? 2 : (S == 2 ? 1 : 0));
+{% else %}
             const int nx = m[{{ M_NX }}], S = m[{{ M_NS }}], lper = S == 1 ? 2 : (S == 2 ? 1 : 0);
+{% endif %}
             st[{{ A_NPS }}] = (flags & {{ F_POST }}) ? 1 : 0;
             st[{{ A_LPER }}] = lper;
             if (flags & {{ F_NORM + F_POST }}) {
@@ -791,8 +802,14 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
     al::copy<{{ GOFF + 64 * CHAIN }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd] | q_norm hd fp32 | gates)
 {% elif QK_W %}
     al::copy<{{ QCOPY + 2 * HDS[0] }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd] | q_norm hd fp32)
+{% if SINKS %}
+    aie::store_v(AW(float, {{ a.sk }}), aie::load_v<{{ HEADS }}>((const float *)(x + {{ 2 * META + QCOPY + 2 * HDS[0] }})));  // (| the heads' sinks log2 e)
+{% endif %}
 {% else %}
     al::copy<{{ QCOPY }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd])
+{% if SINKS %}
+    aie::store_v(AW(float, {{ a.sk }}), aie::load_v<{{ HEADS }}>((const float *)(x + {{ 2 * META + QCOPY }})));  // (| the heads' sinks log2 e)
+{% endif %}
 {% endif %}
     st[{{ A_I }}] = 0;
     st[{{ A_KS }}] = 0;
@@ -1038,7 +1055,19 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
     }
 {% endif %}
 {% if NH_POW2 %}
-    const int sp = st[{{ A_S }}], nh = st[{{ A_NH }}], lnh = nh == 4 ? 2 : 1;
+    const int sp = st[{{ A_S }}], nh = st[{{ A_NH }}], lnh = {{ lnh("nh") }};
+{% if SINKS %}
+    float *__restrict tz = AW(float, {{ a.tz }});  // (per row: 2^(its head's sink log2 e - its m), into l)
+    if (st[{{ A_CEND }}]) {
+        const float *__restrict sk = AW(float, {{ a.sk }}), *__restrict mr = AW(float, {{ a.m }});
+        AIE_LOOP_NO_UNROLL
+        for (int r = 0; r < {{ ROWS }}; r++)  // (row r: head r % nh; m as 8 lanes per row; rows past the slots: 2^-126)
+            tz[r] = r < 4 * nsets ? sk[r & (nh - 1)] - mr[8 * r] : -126.0f;
+        AIE_LOOP_NO_UNROLL
+        for (int r = 0; r < {{ ROWS }}; r += 16)  // (127: the exp2's range)
+            aie::store_v(tz + r, {{ exp2s }}(aie::min(aie::load_v<16>(tz + r), aie::broadcast<float, 16>(127.0f))));
+    }
+{% endif %}
 {% else %}
     const int sp = st[{{ A_S }}], nh = st[{{ A_NH }}], nhm = st[{{ A_NHM }}];
 {% endif %}
@@ -1050,6 +1079,10 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
         aie::vector<float, 16> gs = aie::broadcast<float, 16>(1.0f);  // (rows 4 set ..: 1 + e^-g)
         gs.insert(0, aie::load_v<4>(AW(float, {{ a.gt }}) + 4 * set));
         const aie::vector<float, 32> il = al::rows4(aie::inv(al::mulff<16>(al::sum8(aie::load_v<32>(l)), gs)));
+{% elif SINKS %}
+        aie::vector<float, 16> sk4 = aie::zeros<float, 16>();  // (rows 4 set ..: their sink terms)
+        sk4.insert(0, aie::load_v<4>(tz + 4 * set));
+        const aie::vector<float, 32> il = al::rows4(aie::inv(aie::add(al::sum8(aie::load_v<32>(l)), sk4)));
 {% else %}
         const aie::vector<float, 32> il = al::rows4(aie::inv(al::sum8(aie::load_v<32>(l))));
 {% endif %}
@@ -1089,8 +1122,7 @@ __attribute__((minsize)) void {{ p }}_aemit{{ X }}(int32_t *__restrict ws, bfloa
 {% if PAGED %}
 
 // Paging (``artlite.operators.paging``, the memtile transport): the worker's kernels above are resident stubs of the
-// pages' code - page 1 the query's preparation (aq0, aq, aqpan, akv), page 2 the attention over the cache (aobj, arec,
-// aend, aemit){{ ", page 3 the conv (cobj, cemit)" if CONV else "" }} - each entered through its dispatcher (the state words' entry)
+// pages' code - page 1 the query's preparation (aq0, aq, aqpan, akv{{ "" if CONV else "; and the chain's end, aend, aemit: the next layer's preparation follows it" }}), page 2 the attention over the cache (aobj, arec{{ ", aend, aemit" if CONV else "" }}){{ ", page 3 the conv (cobj, cemit)" if CONV else "" }} - each entered through its dispatcher (the state words' entry)
 {{ PAGER }}
 
 namespace {
@@ -1128,6 +1160,15 @@ extern "C" {
 // (the pages' entries: external, so that they stay in the object for ``paging.link``)
 void {{ p }}_pgprep(int op, void *a, int32_t *ws, void *d)
 {
+{% if not CONV %}
+    if (op >= 4) {  // (the chain's end. Two chains of compares: one of six would be a jump table, data a page may not read)
+        if (op == 4)
+            {{ p }}_aend_x(ws, (const int32_t *)d);
+        else
+            {{ p }}_aemit_x(ws, (bfloat16 *)d);
+        return;
+    }
+{% endif %}
     if (op == 0)
         {{ p }}_aq0_x(ws);
     else if (op == 1)
@@ -1142,12 +1183,17 @@ void {{ p }}_pgmain(int op, void *a, int32_t *ws, void *d)
 {
     if (op == 0)
         {{ p }}_aobj_x((uint8_t *)a, ws);
+{% if CONV %}
     else if (op == 1)
         {{ p }}_arec_x((const uint8_t *)a, ws, (bfloat16 *)d);
     else if (op == 2)
         {{ p }}_aend_x(ws, (const int32_t *)d);
     else
         {{ p }}_aemit_x(ws, (bfloat16 *)d);
+{% else %}
+    else
+        {{ p }}_arec_x((const uint8_t *)a, ws, (bfloat16 *)d);
+{% endif %}
 }
 {% if CONV %}
 
@@ -1172,8 +1218,13 @@ __attribute__((minsize)) void {{ p }}_arec(const uint8_t *__restrict a, int32_t 
 {
     {{ p }}_enter(2, 1, (void *)a, ws, d);
 }
+{% if CONV %}
 __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw) { {{ p }}_enter(2, 2, nullptr, ws, (void *)pw); }
 __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(2, 3, nullptr, ws, d); }
+{% else %}
+__attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw) { {{ p }}_enter(1, 4, nullptr, ws, (void *)pw); }
+__attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(1, 5, nullptr, ws, d); }
+{% endif %}
 {% if CONV %}
 __attribute__((minsize)) void {{ p }}_cobj(const bfloat16 *__restrict x, int32_t *__restrict ws) { {{ p }}_enter(3, 0, (void *)x, ws, nullptr); }
 __attribute__((minsize)) void {{ p }}_cemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(3, 1, nullptr, ws, d); }

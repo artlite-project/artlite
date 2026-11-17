@@ -13,7 +13,7 @@ A step is one dispatch of the transaction of its slot count and the attention's 
 use), patched per step with the positions (the KV cache and ring reads, the record drains, the F_ATT objects) and the
 GDN layers' lazy-commit words (``gdn``). The overlay owns the layout, the generic phases and the step; the transfers of a
 layer kind and what the position patches into them are a part each: ``gdn_steps`` (GDN layers), ``attn_steps`` (attention
-layers), ``moe_steps`` (MoE FFNs), over ``steps``' records; the lazy commit's and chunkwise blocks' host state is
+layers), ``moe.steps`` (MoE FFNs), over ``steps``' records; the lazy commit's and chunkwise blocks' host state is
 ``cursor.GdnCursor`` (``cur``), the conv states' copies between the decode and the prefill ``conv_state.ConvHandoff`` (``conv``).
 
 The prefill (``qwen35/prefill.py``) runs on these buffers: the GDN states (GSTATE: per column its panels), the KV
@@ -49,7 +49,6 @@ import os
 import numpy as np
 from ml_dtypes import bfloat16
 
-from artlite import txn
 from artlite.decode import attn256 as attn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
@@ -85,6 +84,7 @@ from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
+from artlite.moe.steps import CP_BYTES, MoeTransfers
 from artlite.operators import cdo
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
@@ -95,7 +95,6 @@ from .cursor import GdnCursor
 from .decode import QwenDecodeOperator
 from .gdn_steps import GdnTransfers
 from .image import NORMS, QwenImage, gdn_v_heads, tensor_f32
-from .moe_steps import CP_BYTES, MoeTransfers
 from .steps import PanelTable, Step
 from .words import F_GDN, F_GIN, M_HPAN
 
@@ -406,11 +405,6 @@ class QwenOverlay(ModelOverlay):
     def forget_branch(self) -> None:
         """The next step writes its step words again (``_set_branch``)."""
         self._branch = None
-
-    @property
-    def a_bds(self) -> int:
-        """The host's BDs on A."""
-        return getattr(self.op, "BD_COUNT", {}).get("A", txn.QUEUE_DEPTH)
 
     def zero_state(self) -> None:
         """The GDN layers' states (GSTATE) zero."""

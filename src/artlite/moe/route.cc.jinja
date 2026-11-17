@@ -1,7 +1,8 @@
 
 // ---- MoE routing (moe/route.py): the helper, on the route object m (its META words, then the slots'
 // logits [slot][E] fp32) for column col -> the control packets and the expert object's metadata in rbuf (the main core
-// emits them next), the shared expert's gate per slot (sigmoid of S_SG) in wsc
+// emits them next){{ ", the shared expert's gate per slot (sigmoid of S_SG) in wsc" if shared_gate else "" }}; the K's
+// weights: {{ "sigmoid(l) / max(sum, 2^-14) over the K" if sigmoid else "the softmax over the K" }}
 alignas(64) static const uint32_t {{ p }}_ech[{{ 2 * MAX_ITEMS }}] = { {% for h in ch %}{{ h }}u, {% endfor %}};  // (the BDs' control headers)
 alignas(64) static const int32_t {{ p }}_ebd[{{ MAX_ITEMS + 1 }}] = { {% for b in bds %}{{ b }}, {% endfor %}0 };
 
@@ -22,6 +23,7 @@ __attribute__((noinline)) void {{ p }}_rrcp(float *__restrict v)
     aie::store_v(v, {{ recip }}(aie::load_v<16>(v)));
 }
 
+{% if not sigmoid %}
 // v (16 fp32, in place) -> the softmax of its lanes (e^(v - v[0]) / sum; v[0] the largest; t: 16 fp32 of scratch)
 __attribute__((noinline, minsize)) void {{ p }}_rsoft(float *__restrict v, float *__restrict t)
 {
@@ -31,6 +33,7 @@ __attribute__((noinline, minsize)) void {{ p }}_rsoft(float *__restrict v, float
     {{ p }}_rrcp(t);
     aie::store_v(v, al::mulff<16>(aie::load_v<16>(v), aie::load_v<16>(t)));
 }
+{% endif %}
 
 // v (16 fp32, in place) -> sigmoid(v) = r or t r (v < 0), t = e^(-|v|), r = 1 / (1 + t) (t, r: 16 fp32 of scratch each)
 __attribute__((noinline, minsize)) void {{ p }}_rsig(float *__restrict v, float *__restrict t, float *__restrict r)
@@ -43,6 +46,19 @@ __attribute__((noinline, minsize)) void {{ p }}_rsig(float *__restrict v, float 
     const aie::vector<float, 16> rv = aie::load_v<16>(r);
     aie::store_v(v, aie::select(rv, al::mulff<16>(aie::load_v<16>(t), rv), aie::lt(aie::load_v<16>(v), aie::zeros<float, 16>())));
 }
+{% if sigmoid %}
+
+// v (16 fp32, in place) -> sigmoid(v) / max(sum of them, 2^-14) (llama.cpp's normalized sigmoid gating; t, r: 16 fp32
+// of scratch each)
+__attribute__((noinline, minsize)) void {{ p }}_rsigw(float *__restrict v, float *__restrict t, float *__restrict r)
+{
+    {{ p }}_rsig(v, t, r);
+    aie::store_v(t, aie::max(aie::broadcast<float, 16>(aie::reduce_add(aie::load_v<16>(v))),
+                             aie::broadcast<float, 16>(6.103515625e-5f)));
+    {{ p }}_rrcp(t);
+    aie::store_v(v, al::mulff<16>(aie::load_v<16>(v), aie::load_v<16>(t)));
+}
+{% endif %}
 
 __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict m, int32_t *__restrict ws, int col)
 {
@@ -88,11 +104,16 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < 16; j++)
             w[j] = j < {{ K }} ? kl[ti[j]] : (int32_t)0xF149F2CA;
+{% if sigmoid %}
+        {{ p }}_rsigw(wt + 16 * s, (float *)lv, (float *)lv + 16);
+{% else %}
         {{ p }}_rsoft(wt + 16 * s, (float *)lv);
+{% endif %}
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < {{ K }}; j++)
             used[ti[j] >> 5] |= 1u << (ti[j] & 31);
     }
+{% if shared_gate %}
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < 16; s++)  // the shared expert's gate per slot -> wsc [slot][8]
         lv[s] = s < {{ SLOTS }} ? st[{{ S_SG }} + s] : 0;
@@ -100,6 +121,7 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < {{ SLOTS }}; s++)
         aie::store_v(WS(float, {{ w_.wsc }}) + 8 * s, aie::broadcast<float, 8>(((const float *)lv)[s]));
+{% endif %}
     int u = 0;  // the union, by id
     AIE_LOOP_NO_UNROLL
     for (int e = 0; e < {{ E }}; e++)

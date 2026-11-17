@@ -901,7 +901,7 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     (``moe_ffn`` + ``shared_expert`` on x; Occamy's layer 10: 1.5%, its shared expert's output 2.6x the routed experts'
     and x small: 1.1% from the oracle, 0.8% from one with the cores' bf16 gate and h = silu(gate) up)."""
     from artlite.moe import route as MR
-    from models.qwen35.moe_steps import CP_BYTES
+    from artlite.moe.steps import CP_BYTES
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)

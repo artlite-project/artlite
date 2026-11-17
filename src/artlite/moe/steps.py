@@ -1,21 +1,26 @@
-"""A step's MoE layers on the decode overlay: the transfers of an MoE layer's FFN (``MoeTransfers.build``) and its
-metadata objects (``meta_writes``: per layer the route object's and expert objects' templates, the combine's).
+"""A step's MoE layers on the decode overlay (qwen35moe's, flint's): the transfers of an MoE layer's FFN
+(``MoeTransfers.build``) and its metadata objects (``meta_writes``: per layer the route object's and expert objects'
+templates, the combine's).
 
 An MoE layer (``decode.design``'s "MoE") after its residual's drains into moe_in's x: moe_in (normed: the shared expert's gate
-/ up, the router's logits, the shared gate's logit) | the route object (XCH: the logits of every column; the helper core's
-routing: ``moe.route``; its control packets out to CP, streamed back into the shim's TileControl: the expert slab's BDs
-pushed by the array) | sdown (the shared expert's down x its gate, into the residual) | the expert object (CP, after the
-routing's drain: the column's items; its sub-phases on the main core: gate / up, down into acc) | the combine (PART: the
-columns' partials of the slice, into the residual, then out).
+/ up, the router's logits, a gated shared expert's gate logit) | the route object (XCH: the logits of every column; the
+helper core's routing: ``moe.route``; its control packets out to CP, streamed back into the shim's TileControl: the expert
+slab's BDs pushed by the array) | sdown (the shared expert's down, times its gate where it has one, into the residual) |
+the expert object (CP, after the routing's drain: the column's items; its sub-phases on the main core: gate / up, down into
+acc) | the combine (PART: the columns' partials of the slice, into the residual, then out).
+
+sdown's input is the shared expert's h (Fs = ``shared_ffn``: Fs / 8 values of each column) in the side chunk: at Fs = kc
+its one chunk; at Fs = kc / 2 (the 35B-A3B's 512, row groups of 2) [h | h], the first input object twice (the design's
+unpacked 4-slot inputs).
 """
 
-from typing import TYPE_CHECKING
+from typing import Any, Protocol
 
 import numpy as np
 
-from artlite import txn
-from artlite.decode import phases as mp
-from artlite.decode.protocol import (
+from .. import txn
+from ..decode import phases as mp
+from ..decode.protocol import (
     DIMS_OBJ,
     F_COMB,
     F_GU,
@@ -32,27 +37,51 @@ from artlite.decode.protocol import (
     XB,
     XPAY,
 )
-from artlite.moe import route as MR
-from artlite.operators.design import COLS
-from artlite.overlay import Sequence
-
-if TYPE_CHECKING:
-    from .overlay import QwenOverlay
+from ..operators.design import COLS
+from ..overlay import Sequence
+from . import route as MR
 
 CP_BYTES = 128 * MR.RBUF_OBJECTS  # (a column's routing objects in CP; the expert object starts 256 B before their end)
+
+
+class MoeOverlay(Protocol):
+    """What the transfers take of a model's decode overlay (``decode.model.ModelOverlay``): its device, hidden size,
+    config (``n_experts``, ``shared_ffn``), image, the buffers per MoE layer (``xch``: its route object, by layer: the MoE
+    layers; ``cp``: per column
+    its routing's objects and expert object; ``part``: the combine's objects, ``part_col`` bytes per column), the phases'
+    input regions (``inp``) and its fills (``_weights``: a region-major image's A fills of a phase, ``_inputs``,
+    ``_values_to``, ``_weight_run``)."""
+
+    dev: Any
+    H: int
+    cfg: Any
+    image: Any
+    xch: dict[int, int]
+    cp: dict[int, int]
+    part: int
+    part_col: int
+    inp: dict
+
+    def _weights(self, seq: Sequence, phase: tuple[int, str], gi: int) -> None: ...
+
+    def _inputs(self, seq: Sequence, rg: Any, S: int, phase: tuple[int, str] | None = None) -> None: ...
+
+    def _values_to(self, seq: Sequence, c: int, phase: tuple[int, str], *, e0: int, n: int, S: int) -> None: ...
+
+    def _weight_run(self, seq: Sequence, phases: list[tuple[int, str]]) -> None: ...
 
 
 class MoeTransfers:
     """The MoE layers' transfers and metadata of the decode overlay ``ov``."""
 
-    def __init__(self, ov: "QwenOverlay"):
+    def __init__(self, ov: MoeOverlay):
         self.ov = ov
 
     def meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
         """Per layer its route object's and expert objects' templates, the combine's."""
         ov = self.ov
         out = []
-        for L in ov.layers:
+        for L in ov.xch:  # (the MoE layers)
             gu, dn = ov.image.region(L, "exp_gu"), ov.image.region(L, "exp_down")
             m = np.zeros(META, np.int32)
             m[M_FLAGS], m[M_NS] = F_MAIN | F_ROUTE, S
@@ -82,12 +111,13 @@ class MoeTransfers:
         the routing's drain), then ``run``'s weights (after the array's last packet: LOCK_DONE), the partials into PART, the
         combine; its residual -> ``to``."""
         ov = self.ov
-        dev, h8 = ov.dev, ov.H // COLS
+        dev, h8, hs = ov.dev, ov.H // COLS, ov.cfg.shared_ffn // COLS  # (hs: the shared expert's h of a column)
+        assert ov.image.kc in (ov.cfg.shared_ffn, 2 * ov.cfg.shared_ffn), ov.cfg.shared_ffn
         ov._weights(seq, (L, "moe_in"), 0)
         seq.sync()
         ov._inputs(seq, ov.inp[(L, "moe_in")][0], S)
         for c in range(COLS):  # (per slot: the shared expert's h, then the router's 32 logits (fp32))
-            ov._values_to(seq, c, (L, "sdown"), e0=64 * c, n=64, S=S)
+            ov._values_to(seq, c, (L, "sdown"), e0=hs * c, n=hs, S=S)
             seq.drain("C", c, dev.address("ACT", ov.xch[L] + 4 * META + 128 * c), S * 128, (32, S, 256, 32))
         seq.sync()
         for c in range(COLS):
@@ -97,10 +127,13 @@ class MoeTransfers:
             seq.fill("X", c, dev.address("ACT", cp), 4 * MR.PACKET_WORDS, packet=False, acquire=(MR.LOCK_CP, 1))
             seq.device_task("A", c)
         ov._weights(seq, (L, "sdown"), 0)
-        rg = ov.inp[(L, "sdown")][0]  # (its x [h | h]: the first input object twice)
-        for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", rg.off), 2 * XB, DIMS_OBJ)
-            seq.fill("X", c, dev.address("ACT", rg.off + XPAY), XB)
+        rg = ov.inp[(L, "sdown")][0]
+        if 2 * ov.cfg.shared_ffn == ov.image.kc:  # (its x [h | h]: the first input object twice)
+            for c in range(COLS):
+                seq.fill("X", c, dev.address("ACT", rg.off), 2 * XB, DIMS_OBJ)
+                seq.fill("X", c, dev.address("ACT", rg.off + XPAY), XB)
+        else:
+            ov._inputs(seq, rg, S, (L, "sdown"))
         seq.sync()
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", ov.cp[L] + c * (CP_BYTES + XB) + CP_BYTES - 4 * META), XB)

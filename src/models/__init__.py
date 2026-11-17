@@ -15,6 +15,8 @@ template, the inputs the host computes) or diffusers pipeline, what they share (
 | ``qwen35`` | ``qwen35`` | Qwen3.5 / Qwen3.6 / Qwen3.8 (Gated DeltaNet and full-attention layers; images: their Qwen3-VL mmproj), MiniCPM-V 4.7 (images: its mmproj) |
 | ``lfm3`` | ``lfm`` | LFM3-1.7B (short-convolution, sliding-window and full-attention layers), LFM3-VL-2B (images: its mmproj), d1-2B |
 | ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN; images: its mmproj) |
+| ``spark2_5`` | ``spark`` | Spark-X2.5 / X2.6 4B, 1.7B (sliding-window and full attention, head_dim 256) |
+| ``flint`` | ``flint`` | Recursive's Flint (40B: 256 experts of which 6 per token; sliding-window and full attention with sinks) |
 | ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 
@@ -43,6 +45,7 @@ ARCHITECTURES = {
     "qwen35moe": ("models.qwen35.qwen", "Qwen"),
     "lfm3": ("models.lfm.lfm", "Lfm"),
     "spark2_5": ("models.spark.spark", "Spark"),
+    "flint": ("models.flint.flint", "Flint"),
 }
 # diffusers pipeline class (``_class_name`` of model_index.json) -> (module, class), imported on use
 PIPELINES = {

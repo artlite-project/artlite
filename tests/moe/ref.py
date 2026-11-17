@@ -8,10 +8,11 @@ import numpy as np
 from ..np_ops import f32, sigmoid, silu, softmax
 
 
-def moe_route(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """The router's choice (``build_moe_ffn``: softmax gating, the weights renormalized, no scale, no groups): logits
-    (T, E) -> the experts of the k largest probabilities (T, k), largest first, and their weights p_e / their sum."""
-    p = softmax(logits)
+def moe_route(logits: np.ndarray, k: int, gating: str = "softmax") -> tuple[np.ndarray, np.ndarray]:
+    """The router's choice (``build_moe_ffn``: ``gating`` "softmax" or "sigmoid", the weights renormalized, no scale, no
+    groups, no selection bias): logits (T, E) -> the experts of the k largest probabilities (T, k), largest first (a tie:
+    the lower id), and their weights p_e / their sum."""
+    p = softmax(logits) if gating == "softmax" else sigmoid(logits)
     ids = np.argsort(-p, axis=-1, kind="stable")[:, :k]
     w = np.take_along_axis(p, ids, -1)
     return ids, (w / np.maximum(w.sum(-1, keepdims=True), np.float32(6.103515625e-5))).astype(np.float32)
@@ -40,19 +41,20 @@ def experts(gguf: object, layer: int) -> Callable[[int], tuple[np.ndarray, np.nd
 
 
 def moe_ffn(x: np.ndarray, ids: np.ndarray, weights: np.ndarray,
-            expert: Callable[[int], tuple[np.ndarray, np.ndarray, np.ndarray]]) -> np.ndarray:
+            expert: Callable[[int], tuple[object, object, object]], ffn: Callable[..., np.ndarray] = swiglu) -> np.ndarray:
     """The routed experts' sum (``ffn_moe_out``): y_t = sum_i weights[t, i] swiglu_e(x_t), e = ids[t, i] (``moe_route``);
-    x (T, H); ``expert(e)``: its (gate, up, down) (``experts``)."""
+    x (T, H); ``expert(e)``: its (gate, up, down) (``experts``), the arguments of ``ffn`` (``swiglu``: fp32 matrices)."""
     x = f32(x)
     y = np.zeros_like(x)
     for e in np.unique(ids):
         t, i = np.nonzero(ids == e)
-        y[t] += f32(weights)[t, i][:, None] * swiglu(x[t], *expert(int(e)))
+        y[t] += f32(weights)[t, i][:, None] * ffn(x[t], *expert(int(e)))
     return y
 
 
 def shared_expert(x: np.ndarray, gate: np.ndarray, up: np.ndarray, down: np.ndarray,
-                  gate_inp: np.ndarray) -> np.ndarray:
+                  gate_inp: np.ndarray | None) -> np.ndarray:
     """The shared expert times its gate (``ffn_shexp_gated``): sigmoid(gate_inp . x) swiglu(x); gate_inp (H,) (the
-    GGUF's ``ffn_gate_inp_shexp``). A layer's FFN output is ``moe_ffn`` + this."""
-    return sigmoid(f32(x) @ f32(gate_inp).reshape(-1, 1)) * swiglu(x, gate, up, down)
+    GGUF's ``ffn_gate_inp_shexp``; None: no gate, ``ffn_shexp``). A layer's FFN output is ``moe_ffn`` + this."""
+    y = swiglu(x, gate, up, down)
+    return y if gate_inp is None else sigmoid(f32(x) @ f32(gate_inp).reshape(-1, 1)) * y

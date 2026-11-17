@@ -1631,6 +1631,9 @@ __attribute__((minsize)) void {{ p }}_lstrip(int32_t *__restrict ws, int32_t *__
     cmd[1] = 0;
     cmd[2] = d;
     cmd[3] = st[{{ S_XC0 }}];
+{% if packed %}
+    cmd[{{ C_SP }}] = {{ SLOTS }};  // (the hold buffer: every slot's rows)
+{% endif %}
     cmd[{{ C_KIND }}] = {{ K_STRIP }};
 }
 
@@ -1788,6 +1791,10 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
         st[{{ S_NIN }}] = 0;
         st[{{ S_NE }}] = m[{{ M_NS }}] * {{ H8 // C_LEN }};
         st[{{ S_ESRC }}] = 1;
+{% if packed %}
+        st[{{ S_NXS }}] = 1;  // (whole objects, not strips: a slot's half's partials each)
+        st[{{ S_NXS1 }}] = 0;
+{% endif %}
     }
 {% endif %}
 {% if post %}
@@ -1806,6 +1813,10 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     else
 {% if packed %}
         st[{{ S_NXP }}] = (nx + (1 << lper) - 1) >> lper;  // (input objects of 1 << lper strips)
+{% if moe %}
+    if (flags & {{ F_COMB }})
+        st[{{ S_NXP }}] = nx;
+{% endif %}
 {% else %}
         st[{{ S_NXP }}] = nx;
 {% endif %}

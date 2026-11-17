@@ -5,7 +5,8 @@ of one head_dim 128, told apart by their rotated pairs: the F_ATT object's kind)
 of i < rot (per kind), scores in log2 units: q k times a constant per layer (the F_ATT object's: Gemma q_norm k_norm
 log2(e) with q and k RMS-normed per head, ``Attn(qk_norm=True)``; Llama log2(e) / sqrt(hd), Qwen3 too, with q and k
 RMS-normed per head and times their weights per dim before RoPE, ``qk_weights``), v as it is or RMS-normed without a
-weight (``v_norm``).
+weight (``v_norm``); learned sinks (``sinks``, Flint's): per query head an extra logit with no value, its 2^(sink log2 e -
+m) added into l at the chain's end (the F_ATT object's heads' sinks after its heads and q norm weights, fp32 times log2 e).
 
 The KV cache of a (layer, KV head) is groups of objects of ``a_bytes`` (``decode.kv``): ``kp`` K objects (records of 8
 positions: [K panels ND] per record, kp = 2: [hi panels ND | lo panels ND], kp = 1: one bfp16 block per 8 dims) and the
@@ -23,10 +24,10 @@ values are exact: ``M_ATREC``); per slot it encodes the open record up to the sl
 with the final running maxima.
 
 The ``chain`` columns of a KV head (Gemma 4: columns 4 h .. 4 h + 3; Llama 1: column h) attend together, with all
-query heads of the KV head (``M_ANH``: Gemma 4, its drafter 2, Llama 3 or 4; a set of 4 query rows holds row nh s + h
-of slot s, head h). A layer's attention runs in sub-steps (``decode.vring.substeps``): the slots of one pair of
+query heads of the KV head (``M_ANH``: Gemma 4, its drafter 2, Llama 3 or 4, Flint 8; a set of 4 query rows holds row
+nh s + h of slot s, head h). A layer's attention runs in sub-steps (``decode.vring.substeps``): the slots of one pair of
 records (16 positions: P V adds records 2 k, 2 k + 1 of a group together), at most as many as L1 holds query rows for
-(``Attn.rows``: 16 up to head_dim 256, 8 at 512); the columns' ranges of the cache's groups follow from the slots'
+(``Attn.rows``: 16 up to head_dim 256, 8 at 512, 32 with 8 query heads per KV head); the columns' ranges of the cache's groups follow from the slots'
 group alone (``decode.kv.ranges``: even shares, a sliding-window cache from the window's guard on). So a slot's
 attention - which column reads which groups, which partials merge, which records add together in which order - is
 the same in every step it can be part of, and its numbers too: a step of S slots gives each the logits of a step of
@@ -166,19 +167,23 @@ class Attn:
     stream's). ``conv``: a second job of the cores between attention layers (LFM3's short convolution,
     ``models.lfm.conv.ConvJob``: its kernels, its state words after A_WORDS, its workspace over the attention's scratch,
     its X objects from one with its ``flag``, its outputs on D). ``pages``: the cores' code as pages (a program beyond 16
-    KB: ``PAGES``), the memtile transport's words (``paging.PageSpec``: one core half)."""
+    KB: ``PAGES``), the memtile transport's words (``paging.PageSpec``: one core half). ``sinks``: a learned sink per query
+    head (module docstring); ``moe``: the design's MoE layers pass (their combine's objects are skipped whole, not as an
+    input's strips)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
-                 c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None):
+                 c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None,
+                 sinks: bool = False, moe: bool = False):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
-        assert chain in (1, 2, 4) and 1 <= heads <= 4, (chain, heads)
+        assert chain in (1, 2, 4) and (1 <= heads <= 4 or (heads == 8 and max(hds) <= 128)), (chain, heads, hds)
         assert not qk_weights or (qk_norm and not v_norm and len(hds) == 1), "per-dim weights: q / k norms, one head dim"
         assert not gate or (len(hds) == 1 and heads % chain == 0), "gates: one head dim, a chain column's heads alike"
+        assert not sinks or (len(hds) == 1 and not gate), "sinks: one head dim, no gate"
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
-        self.qk_weights, self.gate, self.conv, self.pages = qk_weights, gate, conv, pages
+        self.qk_weights, self.gate, self.conv, self.pages, self.sinks, self.moe = qk_weights, gate, conv, pages, sinks, moe
         self.kv_heads = COLS // chain
         self.d_len = min(256, min(hds)) // 2  # (bf16 of a D object: every record, ring slot and o in whole objects)
         self.kper = {hd: Records(hd, kp).kper(a_bytes) for hd in hds}  # K records per K object
@@ -192,10 +197,10 @@ class Attn:
         norm's weights); chain column c's heads' at goff + 64 c (a C object each: the qkv phase's last of the column)."""
         return self.heads * self.hds[0] + (2 * self.hds[0] if self.qk_weights else 0)
 
-    @staticmethod
-    def rows(hd: int) -> int:
-        """Query rows a column holds per sub-step (L1)."""
-        return 16 if hd <= 256 else 8
+    def rows(self, hd: int) -> int:
+        """Query rows a column holds per sub-step (L1): 16 up to head_dim 256, 8 at 512; 32 for 8 query heads per KV head
+        (head_dim 128 at most: a step of 4 slots in one sub-step, its cache read once)."""
+        return 32 if self.heads > 4 else (16 if hd <= 256 else 8)
 
     def slots(self, hd: int) -> int:
         """Slots of a sub-step at most (its query rows: ``rows``)."""
@@ -224,6 +229,8 @@ class Attn:
                  ("pp", self.ppo * sets // 2 if len(self.hds) == 1 else 72 * rg), ("m", 4 * 32 * sets)]
         if self.gate:
             sizes.append(("gt", 4 * 4 * sets))  # (1 + e^-g per query row)
+        if self.sinks:  # (the heads' sinks log2 e; the rows' sink terms, 64-byte aligned for their 16-lane loads)
+            sizes += [("sk", 4 * self.heads), ("tz", 4 * 4 * sets)]
         if self.pages is not None:
             sizes.append(("keep", 192))  # (the pager's slow path: the pages' constant data read into it)
         out = regions(sizes)
@@ -271,16 +278,20 @@ class Attn:
                            CONV=conv is not None, CONV_FLAG=conv.flag if conv else 0, X=X, PAGED=pg is not None, PG=pg,
                            PAGER=paging.source(p, wake=pg.wake, request=True) if pg is not None else "",
                            CONV_BEGIN=conv.begin_src(p) if conv else "", CONV_TOK=conv.token_src(A_WORDS) if conv else "",
-                           NH_POW2=self.heads in (1, 2, 4), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
+                           NH_POW2=self.heads in (1, 2, 4, 8), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
+                           lnh=lambda nh: f"{nh} == 8 ? 3 : ({nh} == 4 ? 2 : 1)" if self.heads == 8 else f"{nh} == 4 ? 2 : 1",
+                           SINKS=self.sinks, MOE=self.moe, HEADS=self.heads, ROWS=max(self.rows(hd) for hd in hds),
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
                            META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts())
 
     def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1,
-                extra: dict[int, list] | None = None) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
+                extra: dict[int, list] | None = None,
+                aws: list[Buffer] | None = None) -> tuple[list[Worker], list[tuple[int, ObjectFifo]]]:
         """The attention cores' workers on row ``row`` and their D streams (column, ObjectFifo) on the decode design's
         shared streams ``s`` (``decode.design._Streams``; kernel prefix s.p, object names from ``prefix``); ``a_depth``:
         their A objects in L1 (2: the next cache object arrives while the core works on one); ``extra``: per column
-        buffers of the core that its kernels reach through their addresses (the pager's state words)."""
+        buffers of the core that its kernels reach through their addresses (the pager's state words); ``aws``: the
+        columns' workspaces (default: buffers of their own; an MoE design's main cores hold acc in them)."""
         p, P, chain = s.p, prefix, self.chain
         bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
         x_ty, a_ty = s.x_ty, s.a_ty
@@ -380,8 +391,8 @@ class Attn:
                             cemit(ws, d)
                             d_f.release(1)
 
-        aws = [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AW["size"] // 4, np.int32),
-                      tile=Tile(c, row)) for c in range(COLS)]
+        aws = aws or [Buffer(aws_ty, name=f"{P}_aws{c}", initial_value=np.zeros(AW["size"] // 4, np.int32),
+                             tile=Tile(c, row)) for c in range(COLS)]
         toks = {c: ObjectFifo(tok_ty, name=f"{P}_T{c}", depth=1) for c in range(COLS) if c % chain < chain - 1}
         workers, d_fifos = [], []
         for c in range(COLS):
@@ -398,15 +409,16 @@ class Attn:
 
 
 def page_entries(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
-    """The attention cores' pages (``paging.link``'s ``pages``, page ids from 1 in this order): the query's preparation,
-    the attention over the cache, the conv job's."""
+    """The attention cores' pages (``paging.link``'s ``pages``, page ids from 1 in this order): the query's preparation
+    (without a conv job: and the chain's end), the attention over the cache, the conv job's."""
     return {"prep": (f"{p}_pgprep",), "main": (f"{p}_pgmain",), **({"conv": (f"{p}_pgconv",)} if conv else {})}
 
 
 def page_calls(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
-    """The resident stubs' calls of the pages' entries (``paging.link``'s ``calls``)."""
-    out = {f"{p}_{k}": (f"{p}_pgprep",) for k in ("aq0", "aq", "aqpan", "akv")}
-    out |= {f"{p}_{k}": (f"{p}_pgmain",) for k in ("aobj", "arec", "aend", "aemit")}
+    """The resident stubs' calls of the pages' entries (``paging.link``'s ``calls``): the chain's end (aend, aemit) in the
+    page the core needs next, the main page's with a conv job, else the next layer's preparation's."""
+    out = {f"{p}_{k}": (f"{p}_pgprep",) for k in ("aq0", "aq", "aqpan", "akv", *(() if conv else ("aend", "aemit")))}
+    out |= {f"{p}_{k}": (f"{p}_pgmain",) for k in ("aobj", "arec", *(("aend", "aemit") if conv else ()))}
     return out | ({f"{p}_{k}": (f"{p}_pgconv",) for k in ("cobj", "cemit")} if conv else {})
 
 

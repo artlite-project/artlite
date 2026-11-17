@@ -244,6 +244,11 @@ class AttentionOverlay(ModelOverlay):
         q_norm after a q object's heads, k_norm after a K / V object's [K | V]; none: {}."""
         return {}
 
+    def _sinks(self, L: int, h: int) -> np.ndarray | None:
+        """(``Attn.sinks``) The sinks of KV head h's query heads in layer L times log2 e (fp32), after a q object's heads
+        and q_norm weights; None: no sinks."""
+        return None
+
     def _load_attention(self, L: int) -> None:
         """The metadata words of layer L's KV heads' q and K / V objects: q object a's the F_ATT object of the sub-step from a
         on (static but M_ATREC: ``_tails``); a K / V object's (a layer with its own cache) M_NASKIP = -1 - its token t: after
@@ -265,6 +270,10 @@ class AttentionOverlay(ModelOverlay):
                 act[o:o + 4 * META] = m.view(np.uint8)
                 if w:
                     act[o + 4 * META + 2 * self.q_heads * kind.hd:][:w["q"].size] = w["q"]
+                sk = self._sinks(L, h)
+                if sk is not None:
+                    at = o + 4 * META + 2 * self.q_heads * kind.hd + (w["q"].size if w else 0)
+                    act[at:at + 4 * sk.size] = np.asarray(sk, np.float32).view(np.uint8)
                 if own:
                     k = np.zeros(META, np.int32)
                     k[M_NASKIP] = -1 - t
@@ -329,7 +338,8 @@ class AttentionOverlay(ModelOverlay):
         kind, src = self.kinds[use.kind], use.source
         own = src == L
         subs = self._kind_subs(st.subs, use.kind)
-        o, sp, nk = self.inp[(L, "o")][0], packed_slots(st.S), self.q_heads * kind.hd // 8  # (o: the KV head's k blocks)
+        sp, nq = packed_slots(st.S), self.q_heads * kind.hd  # (nq: o's elements of a KV head)
+        before = self.a_bds > 3  # (a run's first block before the X objects: ``_weight_run``)
         for u, (a, n) in enumerate(subs):
             if u and own:
                 seq.sync()  # (sub-step u - 1's records in DDR: this one reads them)
@@ -339,7 +349,7 @@ class AttentionOverlay(ModelOverlay):
                     st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[src]), T), L, c, u, t)
                                  for t in range(tails(n))]
             last = u == len(subs) - 1 and weights
-            if last:
+            if last and before:
                 self._weight_run(seq, weights, blocks=slice(1))  # (a later block's after the X objects: ``_weight_run``)
             if u == 0:
                 seq.sync()  # (the q and K / V objects in DDR)
@@ -350,15 +360,16 @@ class AttentionOverlay(ModelOverlay):
                 else:
                     seq.fill("X", c, dev.address("ACT", reg), n * XB)
             if last:
-                self._weight_run(seq, weights, blocks=slice(1, None))
+                self._weight_run(seq, weights, blocks=slice(1, None) if before else slice(None))
             for c in range(chain - 1, COLS, chain):
                 h = c // chain
                 if own:
                     for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
                         st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[src]), 2 * self.at.d_len),
                                            L, h, u, i))
-                at = dev.address("ACT", o.off + XB + 2 * sp * 8 * nk * h + 16 * a)  # ([k block][slot sp][8])
-                seq.drain("D", c, at, 16 * n * nk, None if n == sp else (4 * n, nk, 4 * sp, 4 * sp * nk))
+                o = next(rg for rg in self.inp[(L, "o")] if rg.k0 <= nq * h < rg.k0 + rg.K)  # (its K group)
+                at = dev.address("ACT", o.off + XB + 2 * sp * (nq * h - o.k0) + 16 * a)  # ([k block][slot sp][8])
+                seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
 
     def _token_at(self, b: int) -> int:
         """The token objects' offset in ACT of the transaction buffer ``b``."""
@@ -371,9 +382,13 @@ class AttentionOverlay(ModelOverlay):
         if i == 0:
             self._weight_run(seq, run(0))
 
+    def _begin(self, seq: Sequence) -> None:
+        """A step's first words (a model's: an MoE model's control route, ``moe.steps``)."""
+
     def _build(self, S: int, lm: bool, subs: tuple, b: int) -> StepPlan:
         dev = self.dev
         seq = Sequence(self.op, inputs=("X",))
+        self._begin(seq)
         st = StepPlan(S, subs, tok=self._token_at(b))
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", st.tok), self._tok_bytes)

@@ -1,10 +1,11 @@
 """An MoE layer's routing on the decode overlay's cores (``decode.design``'s "MoE": the helper core of every column runs
-it on the route object), model-independent: E experts, the top K of each token slot, softmax weights over the K
-(llama.cpp's ``build_moe_ffn`` with softmax gating, the weights renormalized: the tests' ``moe/ref.py``).
+it on the route object), model-independent: E experts, the top K of each token slot, their weights renormalized over the
+K (llama.cpp's ``build_moe_ffn``: the tests' ``moe/ref.py``) by the model's gating: softmax (qwen35moe), or sigmoid
+(flint: llama.cpp's ``expert_gating_func`` 2, the weights' sum clamped at 2^-14).
 
 Per slot the core takes the K largest logits (fp32, compared as ordered integer keys of their bits: ties go to the
-lower id) and their weights w = e^(l - l_max) / sum over the K (fp32 to ~2^-16: ``kmath.exp2``,
-``kmath.recip``). The union U of the slots' experts (by id) is dealt over the COLS columns (``deal``): U[i] whole to
+lower id; sigmoid is monotonic, so the K are the same) and their weights w = e^(l - l_max) / sum over the K, or
+sigmoid(l) / sum over the K (fp32 to ~2^-16: ``kmath.exp2``, ``kmath.recip``). The union U of the slots' experts (by id) is dealt over the COLS columns (``deal``): U[i] whole to
 column i % COLS for i < COLS nw (nw = |U| // COLS), the remaining r experts' 2 r halves j = 2 t + h to column j % COLS;
 so every column gets ceil(2 |U| / COLS) halves at most, in at most nw + 2 <= MAX_ITEMS runs (items), the same deal on
 every core. An item's weight in a slot: its expert's weight in the slot's top K, else 0.
@@ -65,12 +66,16 @@ def check_route(values: dict[int, int], cols: range) -> None:
                 f"column {c}: {reg:#x} = {v:#x} on the control route's arbiter and msel"
 
 
-def top_k(logits: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+def top_k(logits: np.ndarray, k: int, gating: str = "softmax") -> tuple[np.ndarray, np.ndarray]:
     """The cores' top k of each slot's fp32 logits (S, E): (ids (S, k) in decreasing logit order, ties to the lower id;
-    weights (S, k): the softmax over the k, float64)."""
+    weights (S, k), float64: the softmax over the k, or (gating "sigmoid") their sigmoids over their sum, at least 2^-14)."""
     lg = np.asarray(logits, np.float32)
     order = np.argsort(-lg.astype(np.float64), axis=1, kind="stable")[:, :k]
     top = np.take_along_axis(lg, order, 1).astype(np.float64)
+    if gating == "sigmoid":
+        sg = 1 / (1 + np.exp(-top))
+        return order, sg / np.maximum(sg.sum(1, keepdims=True), 2.0 ** -14)
+    assert gating == "softmax", gating
     e = np.exp(top - top[:, :1])
     return order, e / e.sum(1, keepdims=True)
 
@@ -87,9 +92,10 @@ def deal(union: list[int], cols: int) -> list[list[tuple[int, int, int]]]:
     return out
 
 
-def route(logits: np.ndarray, k: int, cols: int) -> tuple[np.ndarray, np.ndarray, list[list[tuple[int, int, int]]]]:
+def route(logits: np.ndarray, k: int, cols: int, gating: str = "softmax") -> tuple[np.ndarray, np.ndarray,
+                                                                                    list[list[tuple[int, int, int]]]]:
     """The routing of S slots' logits (S, E): (ids, weights: ``top_k``; the columns' items: ``deal`` of the union)."""
-    ids, w = top_k(logits, k)
+    ids, w = top_k(logits, k, gating)
     return ids, w, deal(sorted({int(e) for e in ids.reshape(-1)}), cols)
 
 
@@ -131,10 +137,13 @@ def packet_words(items: list[tuple[int, int, int]], *, base: int, stride: int, a
 _SRC = templating.load("artlite/moe/route.cc.jinja")
 
 
-def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: int, a_packet: int | None = None) -> str:
+def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: int, a_packet: int | None = None,
+           gating: str = "softmax", shared_gate: bool = True) -> str:
     """The routing kernel ``{p}_route`` (in the helper's anonymous namespace; ``WS``, ``{p}_zv`` and the workspace
     regions ``w_`` from the overlay's kernel source; ``consts``: its M_ / F_ / S_ words, META, SLOTS; a_packet: the A
-    stream's packet id where it is packet-switched: the items' BDs carry its header)."""
+    stream's packet id where it is packet-switched: the items' BDs carry its header; gating: the K's weights, "softmax"
+    or "sigmoid" (``top_k``); shared_gate: the shared expert's sigmoid gate of S_SG into wsc)."""
+    assert gating in ("softmax", "sigmoid"), gating
     assert experts % 32 == 0 and experts <= 256 and top <= 8 and cols == 8
     assert RBUF_META + consts["META"] <= 32 * RBUF_OBJECTS and PACKET_WORDS <= RBUF_META
     regs = [txn.SHIM_BD0 + txn.BD_BYTES * bd for bd in EXPERT_BDS]
@@ -144,4 +153,4 @@ def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: i
                        ch_lock=_ctl(txn.SHIM_LOCK0 + 16 * LOCK_DONE, 1), RBUF_OBJECTS=RBUF_OBJECTS,
                        RBUF_META=RBUF_META, BD_W4=txn.BD_BURST_512B, BD_W5=txn.BD_AXCACHE, BD_VALID=txn.BD_VALID,
                        BD_USE_NEXT=txn.BD_USE_NEXT, bd_w2=0 if a_packet is None else txn.bd_packet_bits(a_packet),
-                       **consts)
+                       sigmoid=gating == "sigmoid", shared_gate=shared_gate, **consts)

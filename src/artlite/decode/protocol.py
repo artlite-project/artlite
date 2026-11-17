@@ -176,7 +176,7 @@ TOK_STATE = STATE.kind("tok")
 S_NAS = TOK_STATE.block("S_NAS", N_TOK, at=52)  # (``tok``) the cache objects per token object (S_NAS + M_TOK_KIND)
 # (moe) the sub-phases of an expert object (a trip count), their local input strips (a trip count), the phase's first
 # panel chunk, the next sub-phase, the shared gate's logit per slot (fp32 bits)
-MOE_STATE = STATE.kind("moe", exclusive_with=(POST_STATE, TOK_STATE))
+MOE_STATE = STATE.kind("moe", exclusive_with=(POST_STATE,))
 S_NSUB, S_NLS, S_XC0, S_SUB = MOE_STATE.words("S_NSUB S_NLS S_XC0 S_SUB", at=44)
 S_SG = MOE_STATE.block("S_SG", SLOTS, at=48)
 
