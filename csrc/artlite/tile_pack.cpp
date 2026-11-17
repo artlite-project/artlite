@@ -309,6 +309,45 @@ void tile_q4_1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// Q4_1_64 (q4.py) from Q4_1 blocks in equal pairs (MLX's affine INT4 of groups of 64 stored as GGUF's Q4_1): per row
+/// [sb][d of the 4 pairs | m of the 4 pairs] bf16 (16 nsb bytes), then the codes as Q4_0's. Throws on a pair of
+/// unequal (d, m) or a d / m that bf16 does not hold exactly (the tile would change the weights).
+void tile_q4_1_64(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  uint8_t* codes = t + 16 * nsb * R;
+  for (int r = 0; r < R; r++) {
+    uint8_t* h = t + 16 * nsb * r;
+    for (int sb = 0; sb < nsb; sb++) {
+      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
+      for (int p = 0; p < 4; p++) {
+        const uint8_t* b = src[r] + 160 * sb + 40 * p;
+        const uint16_t d = bf16_of(b), m = bf16_of(b + 2);
+        auto exact = [](const uint8_t* f16, uint16_t v) {
+          uint16_t x;
+          std::memcpy(&x, f16, 2);
+          const float f = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x)));
+          uint32_t u;
+          std::memcpy(&u, &f, 4);
+          return (u & 0xFFFF) == 0 && uint16_t(u >> 16) == v;
+        };
+        if (std::memcmp(b, b + 20, 4) || !exact(b, d) || !exact(b + 2, m))
+          throw Error(std::format("Q4_1_64: row {} super-block {} blocks {}, {}: (d, m) not an equal pair exact in "
+                                  "bf16 (not group-64 Q4_1)", r, sb, 2 * p, 2 * p + 1));
+        put16(h + 16 * sb + 2 * p, d);
+        put16(h + 16 * sb + 8 + 2 * p, m);
+        for (int e2 = 0; e2 < 2; e2++) {
+          const int i = 2 * p + e2;
+          const uint8_t* q = b + 20 * e2 + 4;
+          for (int s = 0; s < 4; s++)
+            for (int jj = 0; jj < 4; jj++) {
+              const int e = 8 * s + 2 * jj;
+              c[32 * s + 4 * i + jj] = e < 16 ? nib(q[e], q[e + 1]) : static_cast<uint8_t>((q[e - 16] >> 4) | (q[e - 15] & 0xF0));
+            }
+        }
+      }
+    }
+  }
+}
+
 /// The 2-bit code of element e of a Q2_K / Q3_K block's qs (element 128 n + 32 j + 16 h + l: bits 2 j of
 /// qs[32 n + 16 h + l]).
 inline uint32_t k23_code(const uint8_t* qs, int e) {
@@ -742,6 +781,8 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return R % 8 ? ~size_t(0) : 136 * size_t(nsb) * R; }, plain<tile_iq4<true>>},
     {TileFormat::Q6_KH, "Q6_KH", 210, false, false,
      [](int R, int nsb) { return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R; }, plain<tile_q6kh>},
+    {TileFormat::Q4_1_64, "Q4_1_64", 160, false, false, [](int R, int nsb) { return 144 * size_t(nsb) * R; },
+     plain<tile_q4_1_64>},
     {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<false>>},
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },

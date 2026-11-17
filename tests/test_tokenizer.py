@@ -11,7 +11,7 @@ import jinja2
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
+from artlite.model_config import flint_gguf, lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
 from models.templating import template_option
 from models.tokenizer import BpeTokenizer, chat_prompt
 
@@ -38,14 +38,16 @@ TEXTS = [
     "'s 's .net .NET __init__ #include <stdio.h> $x+=1; a->b; ...abc !!!WOW i++ ---- ****",
     ("<｜start▁of▁sentence｜><|System|>\nsys<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>hi<｜end▁of▁sentence｜>"
      "<｜start▁of▁sentence｜><|Bot|><think>x</think><tool_call>f<arg_key>k</arg_key><arg_value>1</arg_value></tool_call>"),
+    "<|system|>sys<|user|>hi\n<|assistant|><think>t</think>a<|observation|><tool_response>{}</tool_response><|end_of_text|>",
+    "camelCaseWord HTTPServer getHTTPResponse iPhone McDonald's ÀÉÎ ǅ x'S y'Ll z'VE \t\tq ;\n\n  \r\n x",
 ]
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Factorize x^2 + x - 6 = 0"}]
 
 
-@pytest.fixture(scope="module", params=["qwen35", "qwen2", "lfm2", "spark2_5"])
+@pytest.fixture(scope="module", params=["qwen35", "qwen2", "lfm2", "spark2_5", "flint"])
 def tok(request: pytest.FixtureRequest) -> tuple[str, object]:
     path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf(),
-            "spark2_5": spark_gguf("1.7B")}[request.param]
+            "spark2_5": spark_gguf("1.7B"), "flint": flint_gguf()}[request.param]
     require(path)
     return path, BpeTokenizer(GGUFFile(path))
 
@@ -67,8 +69,8 @@ def test_encode(tok: tuple[str, object], i: int) -> None:
 @pytest.mark.parametrize("thinking", [False, True])
 def test_chat_prompt(tok: tuple[str, object], thinking: bool) -> None:
     path, t = tok
-    if GGUFFile(path).meta["tokenizer.ggml.pre"] in ("lfm2", "spark2_5"):
-        pytest.skip("LFM3's and Spark's templates: test_lfm3_template, tests/spark/test_host.py")
+    if GGUFFile(path).meta["tokenizer.ggml.pre"] in ("lfm2", "spark2_5", "flint"):
+        pytest.skip("LFM3's, Spark's and Flint's templates: test_lfm3_template, tests/{spark,flint}/test_host.py")
     p = chat_prompt(GGUFFile(path), MESSAGES, enable_thinking=thinking)
     opens = GGUFFile(path).meta["tokenizer.ggml.pre"] == "qwen35"  # (Qwen3's model writes its <think> itself)
     tail = ("<think>\n" if opens else "") if thinking else "<think>\n\n</think>\n\n"

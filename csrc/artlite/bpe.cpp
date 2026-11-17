@@ -37,6 +37,32 @@ Pieces split(const Pieces& in, Match match) {
   return out;
 }
 
+// The end of a run of pred from i, at most e.
+template <class Pred>
+size_t run(size_t i, size_t e, Pred pred) {
+  while (i < e && pred(i)) i++;
+  return i;
+}
+
+// The first two regexes of spark2_5's and flint's pre-tokenizers: \p{N}{1,3}, then [一-龥぀-ゟ゠-ヿ]+ (std::wregex on the
+// codepoints).
+Pieces digits_cjk(const uint32_t* cp, const uint8_t* cls, size_t n) {
+  auto num = [&](size_t i) { return cls[i] == PC_N; };
+  Pieces p{{0, n}};
+  p = split(p, [&](size_t i, size_t e) { return num(i) ? std::min<size_t>(run(i, e, num) - i, 3) : 0; });
+  auto cjk = [&](size_t i) {
+    const uint32_t c = cp[i];
+    return (c >= 0x4E00 && c <= 0x9FA5) || (c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF);
+  };
+  return split(p, [&](size_t i, size_t e) { return run(i, e, cjk) - i; });
+}
+
+std::vector<uint32_t> lengths(const Pieces& p) {
+  std::vector<uint32_t> out(p.size());
+  for (size_t k = 0; k < p.size(); k++) out[k] = uint32_t(p[k].second);
+  return out;
+}
+
 }  // namespace
 
 std::vector<uint32_t> pretokenize_spark2_5(const uint32_t* cp, const uint8_t* cls, size_t n) {
@@ -50,20 +76,8 @@ std::vector<uint32_t> pretokenize_spark2_5(const uint32_t* cp, const uint8_t* cl
     const uint32_t c = cp[i];
     return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) || (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
   };
-  auto run = [&](size_t i, size_t e, auto pred) {  // the end of a run of pred from i
-    while (i < e && pred(i)) i++;
-    return i;
-  };
 
-  Pieces p{{0, n}};
-  // \p{N}{1,3}
-  p = split(p, [&](size_t i, size_t e) { return is(i, PC_N) ? std::min<size_t>(run(i, e, [&](size_t j) { return is(j, PC_N); }) - i, 3) : 0; });
-  // [一-龥぀-ゟ゠-ヿ]+ (std::wregex on the codepoints)
-  auto cjk = [&](size_t i) {
-    const uint32_t c = cp[i];
-    return (c >= 0x4E00 && c <= 0x9FA5) || (c >= 0x3040 && c <= 0x309F) || (c >= 0x30A0 && c <= 0x30FF);
-  };
-  p = split(p, [&](size_t i, size_t e) { return run(i, e, cjk) - i; });
+  Pieces p = digits_cjk(cp, cls, n);
   // the main split: its alternatives in order, the first that matches at i
   p = split(p, [&](size_t i, size_t e) -> size_t {
     if (ascii_punct(i) && i + 1 < e && ascii_letter(i + 1)) return run(i + 1, e, ascii_letter) - i;
@@ -83,10 +97,48 @@ std::vector<uint32_t> pretokenize_spark2_5(const uint32_t* cp, const uint8_t* cl
   });
   // \p{N}
   p = split(p, [&](size_t i, size_t) -> size_t { return is(i, PC_N) ? 1 : 0; });
+  return lengths(p);
+}
 
-  std::vector<uint32_t> out(p.size());
-  for (size_t k = 0; k < p.size(); k++) out[k] = uint32_t(p[k].second);
-  return out;
+std::vector<uint32_t> pretokenize_flint(const uint32_t* cp, const uint8_t* cls, size_t n) {
+  if (!n) return {};
+  auto lm = [&](size_t i) { return cls[i] == PC_L || cls[i] == PC_M; };
+  auto ps = [&](size_t i) { return cls[i] == PC_P || cls[i] == PC_S; };
+  auto ws = [&](size_t i) { return cls[i] == PC_WS; };
+  auto nl = [&](size_t i) { return cp[i] == '\r' || cp[i] == '\n'; };
+  // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?: its length at i
+  auto contraction = [&](size_t i, size_t e) -> size_t {
+    if (i + 1 >= e || cp[i] != '\'') return 0;
+    auto lower = [&](size_t k) { return k < e && cp[k] < 0x80 ? char(cp[k] | 0x20) : '\0'; };
+    const char a = lower(i + 1), b = lower(i + 2);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+    if ((a == 'r' || a == 'v') && b == 'e') return 3;
+    if (a == 'l' && b == 'l') return 3;
+    return 0;
+  };
+
+  Pieces p = digits_cjk(cp, cls, n);
+  // the o200k-style split as llama.cpp runs it (std::regex on the categories, case classes collapsed to \p{L}):
+  // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(contraction)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+  p = split(p, [&](size_t i, size_t e) -> size_t {
+    const bool pre = !nl(i) && cls[i] != PC_L && cls[i] != PC_N;
+    if ((pre && i + 1 < e && lm(i + 1)) || lm(i)) {
+      const size_t j = run(lm(i) ? i : i + 1, e, lm);
+      return j - i + contraction(j, e);
+    }
+    if (ps(i) || (cp[i] == ' ' && i + 1 < e && ps(i + 1))) {
+      const size_t j = run(run(i + !ps(i), e, ps), e, nl);
+      return j - i;
+    }
+    if (ws(i)) {
+      const size_t j = run(i, e, ws);
+      for (size_t k = j; k > i; k--)  // \s*[\r\n]+: to the run's last line break
+        if (nl(k - 1)) return k - i;
+      return j == e || j - i == 1 ? j - i : j - i - 1;  // \s+(?!\S), else \s+
+    }
+    return 0;
+  });
+  return lengths(p);
 }
 
 namespace {

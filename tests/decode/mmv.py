@@ -388,13 +388,13 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return x.fold(C)
 
 
-_REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
+_REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q4_1_64": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
          "IQ1_S": _iq1, "IQ1_M": _iq1, "IQ2_XXS": _iq2, "IQ2_XS": _iq2, "IQ2_S": _iq2, "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
          "BFP16": _bfp16, "Q6_KH": _q6h}
 
 
 # (the formats with kernels of 8 slots)
-GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
+GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
                  "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16", "Q6_KH")
 
 

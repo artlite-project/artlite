@@ -1,0 +1,104 @@
+// ---- Q4_1_64 ({{ R41H }} rows): [row][sb][d of the 4 group pairs | m of the 4] bf16 | codes (mmv/q4s, at Q4_0's
+// offset); w = d (q - 8) + m + 8 d, d and m those of group i's pair i / 2
+
+// 8 rows' header words of a super-block (v: [row 8][d0 .. d3 m0 .. m3]) -> D, M [row 8][group 8] (each pair's d / m in
+// both its groups)
+inline void {{ p }}_q41h_dm(const aie::vector<bfloat16, 64> v, aie::vector<bfloat16, 64> &D, aie::vector<bfloat16, 64> &M)
+{
+    const auto [a, b] = aie::interleave_zip(v, v, 1);  // rows 0 .. 3, 4 .. 7: [d0 d0 .. d3 d3 | m0 m0 .. m3 m3]
+    D = aie::concat(aie::filter_even(a, 8), aie::filter_even(b, 8));
+    M = aie::concat(aie::filter_odd(a, 8), aie::filter_odd(b, 8));
+}
+
+// The scales of super-blocks 2 H, 2 H + 1 (d: their first header word, rows of {{ 8 * NSB }} bf16) -> tab [u][g][i][r]
+// (Q4_0's dtab<2, 2> of the expanded d)
+__attribute__((noinline)) void {{ p }}_q41h_tab(const bfloat16 *__restrict d, bfloat16 *__restrict tab)
+{
+    bfloat16 *__restrict pt = tab;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 4; t++) {  // (row group t % 2, super-block t / 2)
+        const bfloat16 *q = d + {{ 64 * NSB }} * (t & 1) + 8 * (t >> 1);
+        aie::vector<bfloat16, 64> D, M;
+        {{ p }}_q41h_dm(al::gather<8, 8>(q, {{ 8 * NSB }}), D, M);
+        aie::store_v(pt, aie::transpose(D, 8, 8));  // [r][i] -> [i][r]
+        pt += 64;
+    }
+}
+
+// The offsets: y[g] += sum_i XS_i (m_i + 8 d_i) of super-blocks 2 H, 2 H + 1 (Q4_1's q41_off on the expanded header{{ "; rg: 2 H + 1's rows into y + ys" if rg else "" }})
+{% if slots == 8 %}
+__attribute__((noinline)) void {{ p }}_q41h_off(const uint8_t *__restrict a, const uint8_t *__restrict xsum,
+                                                float *__restrict y, int H)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 4; t++) {  // (g, u) = (t / 2, t % 2)
+        const int g = t >> 1, u = t & 1;
+        al::BIn<> xz((const bfp16ebs8 *)xsum);
+        if (u) {
+            xz.pop();
+            xz.pop();
+        }
+        const v64bfp16ebs8 X = xz.pop(), XL = xz.pop();
+        aie::vector<bfloat16, 64> D, M;
+        {{ p }}_q41h_dm(al::gather<8, 8>((const bfloat16 *)a + 256 * g + 16 * H + 8 * u, 32), D, M);
+        al::BV hi, lo;
+        al::split_hilo(aie::mac(aie::accum<accfloat, 64>(M), D, aie::broadcast<bfloat16, 64>(8.0f)), nI, hi, lo);
+        const aie::accum<accfloat, 64> Y(mac_8x8_8x8T(XL, 1, lo, 1, mac_8x8_8x8T(XL, 1, hi, 1, mac_8x8_8x8T(X, 1, lo, 1, mul_8x8_8x8T(X, 1, hi, 1)))));
+        {{ p }}_yadd8(y + 64 * g, Y);
+    }
+}
+
+{% else %}
+__attribute__((noinline)) void {{ p }}_q41h_off(const uint8_t *__restrict a, const uint8_t *__restrict xsum,
+                                                float *__restrict y, int H{{ ", int ys" if rg else "" }})
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    al::BIn<> xz((const bfp16ebs8 *)xsum);
+    const v64bfp16ebs8 X0 = xz.pop(), X1 = xz.pop();
+    AIE_LOOP_NO_UNROLL
+    for (int g = 0; g < 2; g++) {
+{% if rg %}
+        AIE_LOOP_UNROLL_FULL
+        for (int u = 0; u < 2; u++) {  // (super-block 2 H + u: its own rows at y + u ys)
+            aie::vector<bfloat16, 64> D, M;
+            {{ p }}_q41h_dm(al::gather<8, 8>((const bfloat16 *)a + 256 * g + 16 * H + 8 * u, 32), D, M);
+            al::BV hi, lo;
+            al::split_hilo(aie::mac(aie::accum<accfloat, 64>(M), D, aie::broadcast<bfloat16, 64>(8.0f)), nI, hi, lo);
+            const v64bfp16ebs8 X = u ? X1 : X0;
+            {{ p }}_yadd(y + u * ys + 32 * g, aie::accum<accfloat, 64>(mac_8x8_8x8T(X, 1, lo, 1, mul_8x8_8x8T(X, 1, hi, 1))));
+        }
+{% else %}
+        aie::accum<accfloat, 64> Y = aie::zeros<accfloat, 64>();
+        AIE_LOOP_UNROLL_FULL
+        for (int u = 0; u < 2; u++) {  // (super-block 2 H + u: [row 8 g ..][i 8])
+            aie::vector<bfloat16, 64> D, M;
+            {{ p }}_q41h_dm(al::gather<8, 8>((const bfloat16 *)a + 256 * g + 16 * H + 8 * u, 32), D, M);
+            al::BV hi, lo;
+            al::split_hilo(aie::mac(aie::accum<accfloat, 64>(M), D, aie::broadcast<bfloat16, 64>(8.0f)), nI, hi, lo);
+            const v64bfp16ebs8 X = u ? X1 : X0;
+            Y = aie::accum<accfloat, 64>(mac_8x8_8x8T(X, 1, lo, 1, mac_8x8_8x8T(X, 1, hi, 1, Y)));
+        }
+        {{ p }}_yadd(y + 32 * g, Y);
+{% endif %}
+    }
+}
+
+{% endif %}
+// super-blocks 2 H, 2 H + 1 of a Q4_1_64 tile (d (q - 8) as Q4_0's, then the offsets{{ "; rg: 2 H + 1's rows into y + ys" if rg else "" }})
+template <int H>
+__attribute__((noinline)) void {{ p }}_q41h(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                            const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
+{
+    bfloat16 *tab = (bfloat16 *)(scr + 4096);
+    bfloat16 *c = (bfloat16 *)(scr + 4608);
+    {{ p }}_q4s_tr(a + {{ 64 * R41H }} + {{ 256 * R41H }} * H, scr, {{ 128 * R41H }});
+    {{ p }}_q41h_tab((const bfloat16 *)a + 16 * H, tab);
+    {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++)
+        {{ p }}_sc1<2>(c + {{ 16 * L }} * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
+    {{ p }}_q41h_off(a, xs + {{ XS_SLOT }} * H, y, H{{ ", ys" if rg else "" }});
+}

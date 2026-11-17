@@ -8,11 +8,12 @@ import numpy as np
 import pytest
 import torch
 
+from artlite import _native
 from artlite.decode import gemv
 from artlite.decode.image import pack_rows
-from artlite.formats import FORMATS, pack_tile, q6h, slice_fields, tile_format
+from artlite.formats import DERIVED, FORMATS, pack_tile, q4, q6h, slice_fields, tile_format
 from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
-from artlite.model_config import gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
+from artlite.model_config import flint_gguf, gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 
 from ..model_files import require
@@ -27,17 +28,18 @@ PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
         ("IQ3_S", 18432, 8), ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
         ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4), ("IQ1_S", 9280, 4), ("IQ1_M", 9280, 4),
-        ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4)]
+        ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4), ("Q4_1_64", 9216, 4)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "NSB"), PACK, ids=[f"{f}-{s}-nsb{n}" for f, s, n in PACK])
 def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
     """The C++ packer (pack_rows) is bit-identical to the slot's pack_tile: two stacked tensors, rows in a random order
     with padding rows, 3 K chunks (Q6_KH: tiles of Q6_K tensors, ``formats.q6h``)."""
-    fmt, qtype = (qtype, q6h.SOURCE) if qtype == "Q6_KH" else (tile_format(qtype), qtype)
+    fmt, qtype = (qtype, DERIVED[qtype]) if qtype in DERIVED else (tile_format(qtype), qtype)
     KC = 256 * NSB
     R = FORMATS[fmt].rows(S_BYTES, NSB, gemv.row_split(fmt, NSB) if gemv.supported(fmt, NSB) else 0)
-    a, b = random_tensor(qtype, 40, 3 * KC, 1), random_tensor(qtype, 9, 3 * KC, 2)
+    gen = fmt if fmt == "Q4_1_64" else qtype  # (Q4_1_64: Q4_1 blocks in pairs)
+    a, b = random_tensor(gen, 40, 3 * KC, 1), random_tensor(gen, 9, 3 * KC, 2)
     rows = np.concatenate([np.random.default_rng(3).permutation(49), [-1] * 5])
     rows = np.concatenate([rows, np.full((-rows.size) % R, -1)])
     tiles = pack_rows([a, b], rows, fmt, R, S_BYTES, 3, kc=KC)
@@ -56,16 +58,17 @@ def test_pack_native(qtype: str, S_BYTES: int, NSB: int) -> None:
 
 # (GGUF type, tile bytes, rows per tile row G): an MoE's downs (K 256 and 512 in tiles of 1024 columns)
 GROUPS = [("Q4_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_K", 9280, 2), ("Q6_K", 9280, 2), ("Q3_K", 9280, 4),
-          ("IQ3_XXS", 9280, 4), ("Q5_K", 9280, 2)]
+          ("IQ3_XXS", 9280, 4), ("Q5_K", 9280, 2), ("Q4_1_64", 9216, 4)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "G"), GROUPS, ids=[f"{f}-G{g}" for f, _, g in GROUPS])
 def test_pack_native_groups(qtype: str, S_BYTES: int, G: int) -> None:
     """Row-group tiles (pack_rows G): a tile row of G rows of 1024 / G columns, one after the other along K, as the
     slot's pack_tile packs those rows' fields side by side; two stacked tensors, padding rows, a partial last tile."""
-    fmt, K = tile_format(qtype), 1024 // G
+    fmt, K = (qtype if qtype in DERIVED else tile_format(qtype)), 1024 // G
     R = FORMATS[fmt].rows(S_BYTES, 4)
     a, b = random_tensor(qtype, 30, K, 4), random_tensor(qtype, 11, K, 5)
+    qtype = DERIVED.get(qtype, qtype)
     rows = np.concatenate([np.random.default_rng(6).permutation(41), [-1] * 3])
     rows = np.concatenate([rows, np.full((-rows.size) % (R * G), -1)])
     tiles = pack_rows([a, b], rows, fmt, R, S_BYTES, 1, G=G)
@@ -81,6 +84,22 @@ def test_pack_native_groups(qtype: str, S_BYTES: int, G: int) -> None:
             per.append({key: np.concatenate([p[key] for p in parts], 1) for key in parts[0]})
         f = {key: np.concatenate([p[key] for p in per]) for key in per[0]}
         assert np.array_equal(tiles[t, 0], pack_tile(fmt, f, S_BYTES)), t
+
+
+def test_pack_q4_1_64_checks() -> None:
+    """Q4_1_64 tiles of Q4_1 blocks not in pairs: the packer refuses them (an unequal m in one pair, a d bf16 does not
+    hold), and ``q4.pairs64`` tells them from the paired ones."""
+    t = random_tensor("Q4_1_64", 16, 1024, 8)
+    rows = np.arange(16)
+    assert q4.pairs64(t.raw)
+    pack_rows([t], rows, "Q4_1_64", 16, 9216, 1)
+    for off, val in ((20 * 7 + 2, 1), (20 * 4, 1)):  # (block 7's m: its pair's differs; block 4's d: 11 bits)
+        raw = t.raw.copy()
+        raw[3, off] ^= val
+        bad = QTensor(name="t", qtype="Q4_1", rows=16, cols=1024, raw=raw)
+        assert not q4.pairs64(bad.raw)
+        with pytest.raises(_native.Error, match="Q4_1_64"):
+            pack_rows([bad], rows, "Q4_1_64", 16, 9216, 1)
 
 
 def test_pack_native_planes() -> None:
@@ -117,7 +136,7 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         return bfp16.values(w).astype(np.float64)
     if fmt == "Q4_0":
         return per(f["d"], 32) * (q - 8)
-    if fmt == "Q4_1":
+    if fmt in ("Q4_1", "Q4_1_64"):
         return per(f["d"], 32) * q + per(f["m"], 32)
     if fmt == "Q8_0":
         return per(f["d"], 32) * q
@@ -174,10 +193,14 @@ GEMV = [
     ("IQ2_S", 9280, 4, ("random",), "IQ2_S"),
     ("IQ1_S", 9280, 4, ("random",), "IQ1_S"),  # (32 rows)
     ("IQ1_M", 9280, 4, ("random",), "IQ1_M"),
+    ("Q4_1_64", 9216, 4, ("random",), "Q4_1_64"),  # (16 rows)
+    ("Q4_1_64", 9216, 4, ("flint",), "blk.0.attn_q.weight"),
 ]
 
 
 def _path(key: tuple[str, ...]) -> str:
+    if key[0] == "flint":
+        return flint_gguf()
     if key[0] in ("occamy", "swift"):
         return occamy_gguf() if key[0] == "occamy" else swift_gguf()
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])
@@ -207,7 +230,7 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
         path = _path(key)
         require(path)
         t = GGUFFile(path).tensor(name)
-    assert tile_format(t.qtype) == (q6h.SOURCE if fmt == "Q6_KH" else fmt)
+    assert t.qtype == DERIVED[fmt] if fmt in DERIVED else tile_format(t.qtype) == fmt
     KC = 256 * NSB
     n_tiles = 3
     op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB, slots=slots)

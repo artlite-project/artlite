@@ -1,5 +1,5 @@
 """Model architectures from the metadata of a GGUF file (:class:`LlamaConfig`, :class:`GemmaConfig`,
-:class:`QwenConfig`, :class:`LfmConfig`), and where model files live.
+:class:`QwenConfig`, :class:`LfmConfig`, :class:`SparkConfig`, :class:`FlintConfig`), and where model files live.
 
 Model directories live under :data:`MODELS_DIR` (``ARTLITE_MODELS_DIR``) as ``<org>/<repository>/`` (the Hugging Face
 repository a file comes from):
@@ -275,6 +275,17 @@ def spark_dspark_of(model: str) -> str | None:
             if ok:
                 return os.path.join(x, f)
     return None
+
+
+FLINT_FILES = {"int4": "RecursiveSI/flint-int4-gguf/flint-int4-q4_1.gguf",
+               "UD-Q4_K_XL": "unsloth/flint-GGUF/flint-UD-Q4_K_XL.gguf",
+               "Q4_K_M": "lmstudio-community/flint-GGUF/flint-Q4_K_M.gguf"}
+
+
+def flint_gguf(quant: str = "int4") -> str:
+    """A Flint file: ``quant`` "int4" (Recursive's official file: the model's trained INT4 codes, MLX's groups of 64
+    stored as Q4_1 block pairs), or a community quantization ("UD-Q4_K_XL": unsloth's, "Q4_K_M": lmstudio's)."""
+    return os.path.join(MODELS_DIR, FLINT_FILES[quant])
 
 
 def sd15_dir() -> str:
@@ -649,6 +660,126 @@ class SparkConfig:
         th = np.asarray(positions, np.float32).reshape(-1)
         out = np.empty((th.shape[0], dims // 2), np.float32)
         for i in range(dims // 2):
+            out[:, i] = th
+            th = (th * scale).astype(np.float32)
+        return out
+
+
+@dataclass(frozen=True)
+class FlintConfig:
+    """Architecture of Recursive's Flint (GGUF ``flint``), from the metadata of its GGUF file (llama.cpp's
+    ``src/models/flint.cpp``).
+
+    A pre-norm transformer: per layer ``h = x + o(attn(norm1(x)))``, ``x' = h + ffn(norm2(h))``, RMSNorm with the
+    weights as stored. Attention in every layer: ``num_attention_heads`` query heads over ``num_key_value_heads`` KV
+    heads of ``head_dim``, q / k RMS-normed per head with a weight per dim, scores q k / sqrt(head_dim), a learned sink
+    per query head (``attn_sinks``: an extra logit in the softmax with no value). Layer kinds (``kinds[l]``): "swa"
+    (keys p - ``sliding_window`` + 1 .. p; NeoX RoPE on every dim, base ``rope_base``) and "full" (all positions, no
+    positional encoding). FFN: the first ``n_dense`` layers a SwiGLU of ``intermediate_size``; the others an MoE of
+    ``n_experts`` SwiGLU experts of ``expert_ffn``, the ``n_experts_used`` largest of sigmoid(router logits) per token
+    weighted by their sigmoids over the sum of the chosen ones (``weights_norm``), plus an ungated shared expert of
+    ``shared_ffn`` (the model's two shared experts merged). The LM head is ``output``."""
+
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    kinds: tuple[str, ...]
+    sliding_window: int
+    rms_norm_eps: float
+    rope_base: float
+    max_position_embeddings: int
+    eos_token_ids: tuple[int, ...]
+    sampling: dict[str, float]
+    n_dense: int
+    n_experts: int
+    n_experts_used: int
+    expert_ffn: int
+    shared_ffn: int
+    weights_norm: bool = True
+
+    ARCHS: ClassVar[tuple[str, ...]] = ("flint",)
+    # (llama.cpp's end-of-generation tokens of Flint: the end of text, the turns that follow an assistant's)
+    EOG: ClassVar[tuple[str, ...]] = ("<|end_of_text|>", "<|user|>", "<|observation|>")
+    moe: ClassVar[bool] = True
+    causal: ClassVar[bool] = True
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> FlintConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch in cls.ARCHS, f"{gguf.path}: architecture {gguf.arch!r}, expected one of {cls.ARCHS}"
+        m = gguf.arch_meta
+        n = int(m("block_count"))
+        swa = [bool(x) for x in m("attention.sliding_window_pattern")]
+        rope = [bool(x) for x in m("attention.rope_pattern", swa)]
+        assert swa == rope and len(swa) == n, "Flint's layers: RoPE exactly in the sliding-window ones"
+        hd = int(m("attention.key_length"))
+        assert int(m("attention.value_length")) == hd and int(m("rope.dimension_count", hd)) == hd
+        gating = int(m("expert_gating_func"))
+        scale = float(m("expert_weights_scale", 1.0))
+        assert gating == 2 and scale == 1.0, f"{gguf.path}: gating {gating}, weights scale {scale}: sigmoid, 1"
+        assert "blk.0.attn_sinks.weight" in gguf and "blk.0.attn_q_norm.weight" in gguf
+        vocab = gguf.string_count("tokenizer.ggml.tokens")
+        tail = max(0, vocab - 512)
+        eos = [int(gguf.meta["tokenizer.ggml.eos_token_id"])]
+        eos += [i for i, t in enumerate(gguf.strings("tokenizer.ggml.tokens", tail), tail) if t in cls.EOG]
+        eos += [int(x) for x in gguf.meta.get("tokenizer.ggml.eog_token_ids", ())]
+        return cls(
+            vocab_size=vocab,
+            hidden_size=int(m("embedding_length")),
+            intermediate_size=int(m("feed_forward_length")),
+            num_hidden_layers=n,
+            num_attention_heads=int(m("attention.head_count")),
+            num_key_value_heads=int(m("attention.head_count_kv")),
+            head_dim=hd,
+            kinds=tuple("swa" if swa[i] else "full" for i in range(n)),
+            sliding_window=int(m("attention.sliding_window")),
+            rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")),
+            rope_base=float(m("rope.freq_base")),
+            max_position_embeddings=int(m("context_length")),
+            eos_token_ids=tuple(dict.fromkeys(eos)),
+            sampling={k: float(gguf.meta[f"general.sampling.{k}"])
+                      for k in ("top_k", "top_p", "temp", "penalty_repeat", "penalty_last_n")
+                      if f"general.sampling.{k}" in gguf.meta},
+            n_dense=int(m("leading_dense_block_count")),
+            n_experts=int(m("expert_count")),
+            n_experts_used=int(m("expert_used_count")),
+            expert_ffn=int(m("expert_feed_forward_length")),
+            shared_ffn=int(m("expert_shared_feed_forward_length")),
+            weights_norm=bool(m("expert_weights_norm", True)),
+        )
+
+    def layers(self, kind: str) -> list[int]:
+        """The layers of a kind ("swa", "full"; "moe", "dense": by FFN)."""
+        if kind in ("moe", "dense"):
+            return [i for i in range(self.num_hidden_layers) if self.moe_layer(i) == (kind == "moe")]
+        return [i for i, k in enumerate(self.kinds) if k == kind]
+
+    def moe_layer(self, layer: int) -> bool:
+        return layer >= self.n_dense
+
+    @property
+    def q_per_kv(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
+
+    def rot(self, kind: str) -> int:
+        """The rotated pairs of a layer kind: all of the head's (NeoX pairs i, i + head_dim / 2) or none."""
+        return self.head_dim // 2 if kind == "swa" else 0
+
+    def rope_inv_freq(self, kind: str) -> np.ndarray:
+        """RoPE frequencies (rot pairs,) float64 of a layer kind: base^(-2 i / head_dim)."""
+        return self.rope_base ** (-np.arange(0, 2 * self.rot(kind), 2, dtype=np.float64) / self.head_dim)
+
+    def rope_theta(self, positions: np.ndarray | range | list, kind: str = "swa") -> np.ndarray:
+        """(n, rot) float32 angles of positions for a layer kind: pair i turns by p * base^(-2 i / head_dim), the factor
+        built by repeated float32 multiplication as llama.cpp's CPU RoPE."""
+        scale = np.float32(np.power(np.float32(self.rope_base), np.float32(-2.0 / self.head_dim)))
+        th = np.asarray(positions, np.float32).reshape(-1)
+        out = np.empty((th.shape[0], self.rot(kind)), np.float32)
+        for i in range(self.rot(kind)):
             out[:, i] = th
             th = (th * scale).astype(np.float32)
         return out

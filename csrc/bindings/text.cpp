@@ -32,20 +32,24 @@ namespace artlite::bindings {
 void bind_text(nb::module_& m) {
   using U32 = nb::ndarray<const uint32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
   using U8 = nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
-  m.def(
-      "pretokenize_spark2_5",
-      [](U32 cp, U8 cls) {
-        if (cls.shape(0) != cp.shape(0)) throw artlite::Error("pretokenize_spark2_5: a class per codepoint");
-        std::vector<uint32_t> v;
-        {
-          nb::gil_scoped_release nogil;
-          v = artlite::pretokenize_spark2_5(cp.data(), cls.data(), cp.shape(0));
-        }
-        return owned(v);
-      },
-      "cp"_a, "cls"_a,
-      "The pieces' lengths (codepoints, uint32) of llama.cpp's spark2_5 pre-tokenizer over a text's codepoints and "
-      "their classes (models.tokenizer.unicode_classes).");
+  auto pre = [&](const char* name, std::vector<uint32_t> (*fn)(const uint32_t*, const uint8_t*, size_t)) {
+    m.def(
+        name,
+        [name, fn](U32 cp, U8 cls) {
+          if (cls.shape(0) != cp.shape(0)) throw artlite::Error(std::string(name) + ": a class per codepoint");
+          std::vector<uint32_t> v;
+          {
+            nb::gil_scoped_release nogil;
+            v = fn(cp.data(), cls.data(), cp.shape(0));
+          }
+          return owned(v);
+        },
+        "cp"_a, "cls"_a,
+        "The pieces' lengths (codepoints, uint32) of a llama.cpp pre-tokenizer over a text's codepoints and their "
+        "classes (models.tokenizer.unicode_classes).");
+  };
+  pre("pretokenize_spark2_5", artlite::pretokenize_spark2_5);
+  pre("pretokenize_flint", artlite::pretokenize_flint);
   nb::class_<artlite::BpeEncoder>(m, "BpeEncoder",
                                   "A byte-level BPE vocabulary's merges (the lowest rank first, as llama.cpp).")
       .def(nb::init<const std::vector<std::string>&, const std::vector<std::string>&>(), "tokens"_a, "merges"_a,

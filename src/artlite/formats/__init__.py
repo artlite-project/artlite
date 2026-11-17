@@ -1,7 +1,7 @@
 """Weight tile formats of the GGUF weight images (the decode overlays, the prefill GEMMs): the registry of the format
 slots.
 
-A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
+A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1 / Q4_1_64, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
 (of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0), ``iq1`` (IQ1_S, IQ1_M), ``iq2`` (IQ2_XXS, IQ2_XS, IQ2_S), ``iq3``
 (IQ3_XXS), ``iq3s`` (IQ3_S), ``iq4`` (IQ4_NL, IQ4_XS); ``k23``: their shared parts, a slot without formats) holds for its formats the ``TileFormat`` records (tile geometry), the host-side packing (a lossless re-layout of the
 GGUF fields; only fp16 -> bf16 scales change, BFP16 rounds bf16 weights once), the kernel-source fragments of the
@@ -28,7 +28,7 @@ from jinja2 import ChoiceLoader, FunctionLoader, Template
 from . import bf16, common, iq1, iq2, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6h, q6k, q8
 from .common import KC, KT, SB, TAB, TAB_BYTES, DqKernels, Slot, TileFormat
 
-__all__ = ["FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
+__all__ = ["DERIVED", "FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
            "has_tile_format", "kernel_template", "pack_tile", "packs_from", "slice_fields", "slot", "tile_format"]
 
 # the slots
@@ -50,6 +50,10 @@ def slot(fmt: str) -> Slot:
     return _SLOT_OF[fmt]
 
 
+# the tile formats packed from tensors of another GGUF type (a plane or a compact layout of theirs): their source type
+DERIVED: dict[str, str] = {"Q6_KH": q6h.SOURCE, "Q4_1_64": q4.SOURCE_64}
+
+
 def tile_format(qtype: str) -> str:
     """Tile format of a GGUF tensor type (BF16 and F16 tensors: BFP16, their values rounded once to bfp16ebs8)."""
     fmt = "BFP16" if qtype in ("BF16", "F16") else qtype
@@ -60,9 +64,9 @@ def tile_format(qtype: str) -> str:
 
 def packs_from(fmt: str, qtype: str) -> bool:
     """Whether tiles of ``fmt`` are packed from tensors of the GGUF type ``qtype``: its own format (``tile_format``), or
-    a plane of it (Q6_KH: of Q6_K tensors, ``q6h``)."""
-    if fmt == "Q6_KH":
-        return qtype == q6h.SOURCE
+    one derived from it (``DERIVED``: Q6_KH of Q6_K tensors, ``q6h``; Q4_1_64 of Q4_1 tensors in group-64 pairs, ``q4``)."""
+    if fmt in DERIVED:
+        return qtype == DERIVED[fmt]
     return fmt == "BFP16" if qtype == "F32" else has_tile_format(qtype) and tile_format(qtype) == fmt
 
 

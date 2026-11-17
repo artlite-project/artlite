@@ -24,7 +24,7 @@ void bind_sampling(nb::module_& m);
 void bind_pack(nb::module_& m);
 /// The MoE prefill's host step: moe_route, moe_plan, ctl_assemble.
 void bind_moe(nb::module_& m);
-/// Text: pretokenize_spark2_5, BpeEncoder.
+/// Text: pretokenize_spark2_5, pretokenize_flint, BpeEncoder.
 void bind_text(nb::module_& m);
 /// The exception types and their translators, the heap reclaim hook (after every function that raises them).
 void bind_errors(nb::module_& m);

@@ -1,6 +1,6 @@
 """The GPT-2 BPE tokenizer and the chat template of a GGUF file, from its own metadata: the qwen35 architecture's files
-(Qwen3.5 on), the llama package's qwen3 ones (Qwen3, its embedding, reranker and decision models), LFM3's and
-Spark-X's.
+(Qwen3.5 on), the llama package's qwen3 ones (Qwen3, its embedding, reranker and decision models), LFM3's,
+Spark-X's and Flint's.
 
 ``tokenizer.ggml.model == "gpt2"``: GPT-2 byte-level BPE, run by gigatoken (its native API) from a tokenizer.json built
 from the file's vocabulary and merges (``gguf_model.bpe_tokenizer_json``). The split regex is the tokenizer.json form of
@@ -8,9 +8,10 @@ llama.cpp's for the file's pre-tokenizer (``src/llama-vocab.cpp``, ``LLAMA_VOCAB
 also keeps marks with the letters; ``lfm2``: Llama 3's split, a word in the vocabulary one token whatever the merges
 say); control and user-defined tokens (``<|im_start|>``, ``<think>``, ...) written in a text become their ids, as
 llama.cpp's ``parse_special``. A pre-tokenizer gigatoken has no scanner for (``SPLITS``: ``spark2_5``, four regexes
-in sequence, a CJK run split before the main one) encodes natively: the special tokens cut out, the rest split as
-llama.cpp's regexes split it (``_native.pretokenize_spark2_5`` over the text's codepoints and their classes,
-``unicode_classes``: the categories the regexes collapse a codepoint to) and each piece merged
+in sequence, a CJK run split before the main one; ``flint``: three, the last o200k's as llama.cpp runs it, the letter
+cases one class) encodes natively: the special tokens cut out, the rest split as llama.cpp's regexes split it
+(``_native.pretokenize_spark2_5`` / ``_flint`` over the text's codepoints and their classes, ``unicode_classes``: the
+categories the regexes collapse a codepoint to) and each piece merged
 (``_native.BpeEncoder``: gigatoken always splits with a scheme of its own); gigatoken still decodes. No BOS (the chat
 templates write their own). Checked against ``llama-tokenize`` (tests/test_tokenizer.py).
 """
@@ -51,7 +52,8 @@ PATTERNS = {"qwen35": (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
                      r"|\s+(?!\S)"
                      r"|\s+")}
 IGNORE_MERGES = {"lfm2"}  # (llama.cpp's ``ignore_merges``: a word in the vocabulary is one token)
-SPLITS = {"spark2_5": _native.pretokenize_spark2_5}  # (the pre-tokenizers split natively: module docstring)
+SPLITS = {"spark2_5": _native.pretokenize_spark2_5,  # (the pre-tokenizers split natively: module docstring)
+          "flint": _native.pretokenize_flint}
 T_NORMAL, T_CONTROL, T_USER = 1, 3, 4  # tokenizer.ggml.token_type (5: unused, [PAD...]: not in the tokenizer)
 
 # A codepoint's class for the native splits (``_native.pretokenize_spark2_5``'s PreClass): an ASCII one by the ranges

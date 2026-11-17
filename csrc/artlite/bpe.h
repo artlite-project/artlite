@@ -22,6 +22,12 @@ enum PreClass : uint8_t { PC_OTHER = 0, PC_N = 1, PC_L = 2, PC_P = 3, PC_M = 4, 
 // ?[\p{P}\p{S}]+|[\r\n]|\s+(?!\S)|\s+, then \p{N}. cp: the codepoints, cls: their classes.
 std::vector<uint32_t> pretokenize_spark2_5(const uint32_t* cp, const uint8_t* cls, size_t n);
 
+// The same of llama.cpp's "flint" pre-tokenizer: \p{N}{1,3}, then [一-龥぀-ゟ゠-ヿ]+, then
+// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'s|'t|'re|'ve|'m|'ll|'d)?|...|
+// ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+ as llama.cpp runs it: std::regex over the categories, where the
+// letter cases are one \p{L} (the contractions' letters either case).
+std::vector<uint32_t> pretokenize_flint(const uint32_t* cp, const uint8_t* cls, size_t n);
+
 // A vocabulary's merges as token ids.
 class BpeEncoder {
  public:

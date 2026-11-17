@@ -13,8 +13,16 @@ BLOCK = {"Q4_0": (32, 18, (0,)), "Q4_1": (32, 20, (0, 2)), "Q8_0": (32, 34, (0,)
 
 
 def random_tensor(qtype: str, rows: int, cols: int, seed: int) -> QTensor:
-    """Random GGUF blocks (fp16 scales of a plausible range), or random BF16 / F16 values."""
+    """Random GGUF blocks (fp16 scales of a plausible range), or random BF16 / F16 values; "Q4_1_64": a Q4_1 tensor
+    whose blocks come in pairs of equal (d, m) exact in bf16 (``formats.q4``'s group-64 Q4_1)."""
     rng = np.random.default_rng(seed)
+    if qtype == "Q4_1_64":
+        t = random_tensor("Q4_1", rows, cols, seed)
+        b = t.raw.reshape(rows, cols // 64, 2, 20).copy()
+        dm = b[:, :, 0, :4].copy().view(np.float16)  # (bf16-exact: the fp16 values rounded to 8 significant bits)
+        dm = torch.from_numpy(dm.astype(np.float32)).bfloat16().float().numpy().astype(np.float16)
+        b[:, :, :, :4] = dm.view(np.uint8)[:, :, None, :]
+        return QTensor(name="t", qtype="Q4_1", rows=rows, cols=cols, raw=b.reshape(rows, -1))
     if qtype in ("BF16", "F16"):
         w = (rng.standard_normal((rows, cols)) * 0.02).astype(np.float32)
         raw = w.astype(np.float16) if qtype == "F16" else torch.from_numpy(w).bfloat16().view(torch.int16).numpy()
