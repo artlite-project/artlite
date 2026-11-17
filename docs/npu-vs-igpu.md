@@ -81,6 +81,26 @@ The NPU draws 18-22 W over idle against the iGPU's 39-53 W, and uses ~3.3x less 
 other way: 50.0 / 41.5 tokens/s on the NPU after 1K / 32K tokens against the iGPU's 168.8 / 122.5 (`llama-bench`).
 Prompt-heavy work on this model (agents' long system prompts and re-read files, long documents) is where the NPU fits.
 
+## A dense model with a drafter: Spark-X2.6
+
+Spark-X2.6 4B and 1.7B (official Q4_K_M) through each server (`artlite-server` on the NPU, `llama-server -ngl 99 -fa on`
+on the iGPU, the same files), a chat request of an essay prompt and one generated token, each request new and
+uncached, energy above idle (socket power from the SMU):
+
+| prompt tokens | 4B: NPU / iGPU | energy above idle | 1.7B: NPU / iGPU | energy above idle |
+|---|---|---|---|---|
+| 1111 | 0.69 / 1.12 s | 8.7 / 27 J | 0.30 / 0.47 s | 4.0 / 12 J |
+| 8541 | 4.46 / 10.5 s | 87 / 218 J | 1.76 / 4.0 s | 29 / 92 J |
+| 33789 | 21.8 / 52.1 s | 409 / 1168 J | 7.9 / 21.1 s | 127 / 495 J |
+
+The 4B's nine full-attention layers of 16 heads x 256 slow the iGPU's long prompts most (691 tokens/s at 32K in
+`llama-bench`, the NPU's prefill 1583). Generation goes the other way without a drafter (4B: 15.9 tokens/s on the NPU
+after 1K tokens, 66.8 on the iGPU in `llama-bench`; 1.7B 39.5 and 138), and the model's DSpark drafter closes part of
+the gap on the NPU only: its 7-token block and an 8-token verify cost the NPU's step ~35% more than a step of one,
+while on the iGPU they cost about as much as three tokens (XHToken's llama.cpp fork with DSpark on Vulkan: 53.1 ->
+55.3 tokens/s on six chat prompts, 78.1 on code). On the NPU the 4B with DSpark runs code at 54.4 tokens/s and math at
+51.8, prose at 22-28 ([Spark-X](models/spark.md)).
+
 ## Prefill-only work: decisions, embeddings, rerank
 
 A decision, an embedding or a rerank score is one forward pass over a prompt and no generated text, so the work is
