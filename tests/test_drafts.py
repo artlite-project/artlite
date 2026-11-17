@@ -14,7 +14,22 @@ from ml_dtypes import bfloat16
 import models
 from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
 from models import open_model
-from models.drafts import DRAFTER_MATCH, NMAX, PAUSE, PRIOR, RETRY, WARM, Lookup, Planner, bucket
+from models.drafts import (
+    ALL,
+    DRAFTER_MATCH,
+    FEW,
+    FIRST,
+    MOST,
+    NMAX,
+    ONE,
+    PAUSE,
+    PRIOR,
+    RETRY,
+    WARM,
+    Lookup,
+    Planner,
+    bucket,
+)
 from models.overlay_model import OverlayModel
 from models.sampling import Penalties, Sampling
 from models.spec_options import add_spec_options, drafter_type, spec_options
@@ -28,57 +43,76 @@ GREEDY = Sampling(greedy=True)
 
 def test_lookup() -> None:
     """The longest repeated suffix, its latest occurrence, drafts up to k and the sequence's end, none from an
-    image's row on; the buffer grows."""
+    image's row on, and how the suffix's occurrences continue; the buffer grows."""
     seq = Lookup([1, 2, 3, 4, 9, 2, 3, 5, 7, 1, 2, 3])
-    assert seq.draft(3) == (3, [4, 9, 2])  # (1 2 3: at 0 .. 2, not the later 2 3 at 5 .. 6)
+    assert seq.draft(3) == (3, ONE, [4, 9, 2])  # (1 2 3: at 0 .. 2, not the later 2 3 at 5 .. 6)
     seq.extend([5])
-    assert seq.draft(2) == (3, [7, 1])  # (2 3 5 at 5 .. 7)
-    assert Lookup([1, 2, 3]).draft(3) == (0, [])
-    assert Lookup([4, 4, 4, 4]).draft(3) == (3, [4])  # (the suffix's latest earlier end: the sequence's end next)
-    assert Lookup([6, 1, -1, -1, 2, 6]).draft(3) == (1, [1])
-    assert Lookup([1, 2, 3, 1, 2]).draft(0) == (0, [])
+    assert seq.draft(2) == (3, ONE, [7, 1])  # (2 3 5 at 5 .. 7)
+    assert Lookup([1, 2, 3]).draft(3) == (0, ONE, [])
+    assert Lookup([4, 4, 4, 4]).draft(3) == (3, ONE, [4])  # (the suffix's latest earlier end: the sequence's end next)
+    assert Lookup([6, 1, -1, -1, 2, 6]).draft(3) == (1, ONE, [1])
+    assert Lookup([1, 2, 3, 1, 2]).draft(0) == (0, ONE, [])
+    for after, agree in (((6, 6, 6), ALL), ((5, 6, 6), MOST), ((6, 5, 6), MOST), ((5, 5, 6), FEW), ((5, 6, 7), FEW)):
+        # (1 after 7, 8, 9 and now 3: three occurrences of a match of 1, the latest one's continuation drafted)
+        tokens = [7, 1, after[0], 8, 1, after[1], 9, 1, after[2], 3, 1]
+        assert Lookup(tokens).draft(2) == (1, agree, [after[2], 3])
     seq = Lookup(np.arange(5))
     for i in range(3000):
         seq.extend([i % 7])
-    assert seq.draft(3) == (NMAX, [(2999 + 1 + j) % 7 for j in range(3)])  # (the period's next ones)
+    assert seq.draft(3) == (NMAX, ALL, [(2999 + 1 + j) % 7 for j in range(3)])  # (the period's next ones)
 
 
 def test_planner() -> None:
     """A dense model's steps (+5% for 4 tokens) take every draft of a weak match; an MoE's (+30% per token) none of a
-    weak match and all of a long one; acceptance moves the estimate; a drafter's measured rate decides against the
+    weak match and all of a long one, after a match of 5 two where its occurrences agree, none where few of them continue
+    as the drafts; acceptance moves the estimate (the first draft's by agreement, the later ones' by match); a drafter's measured rate decides against the
     context's once it has run ``WARM`` rounds after matches of the same length (of at least ``DRAFTER_MATCH``), and it
     drafts again after ``RETRY`` rounds of that length without."""
     assert [bucket(m) for m in (1, 5, 6, 8, 9, 16, 17, 99)] == [0, 4, 5, 5, 6, 6, 7, 7]
     dense, moe = Planner((1.0, 1.02, 1.035, 1.05)), Planner((1.0, 1.31, 1.60, 1.94))
-    assert dense.choose(1, 3, drafter=False) == 3
-    assert moe.choose(1, 3, drafter=False) == 0 and moe.choose(20, 3, drafter=False) == 3
+    assert dense.choose(1, 3, agree=ONE, drafter=False) == 3
+    assert moe.choose(1, 3, agree=ONE, drafter=False) == 0 and moe.choose(20, 3, agree=ONE, drafter=False) == 3
     for S, t in enumerate((0.040, 0.054, 0.066, 0.080), 1):  # (measured: the MoE's prior ratios, in seconds)
         moe.ran(S, t)
-    assert moe.choose(1, 3, drafter=False) == 0 and moe.choose(20, 3, drafter=False) == 3
+    assert moe.choose(1, 3, agree=ONE, drafter=False) == 0 and moe.choose(20, 3, agree=ONE, drafter=False) == 3
     assert moe.step_time(4) == pytest.approx(0.080)
-    e0 = moe.expected(5, 3)
-    assert e0 == pytest.approx(1 + PRIOR[4, 0] + PRIOR[4, 0] * PRIOR[4, 1] + np.prod(PRIOR[4, :3]))
-    assert moe.choose(5, 3, drafter=False) == 2
+    e0 = moe.expected(5, 3, ONE)
+    assert e0 == pytest.approx(1 + FIRST[4, ONE] * (1 + PRIOR[4, 0] + PRIOR[4, 0] * PRIOR[4, 1]))
+    assert [moe.choose(5, 3, agree=a, drafter=False) for a in (ONE, ALL, FEW)] == [2, 2, 0]
+    assert moe.expected(5, 3, ALL) > e0 > moe.expected(5, 3, FEW)
     for _ in range(50):
-        moe.accepted(5, 3, 0)
-    assert moe.expected(5, 3) < 1.4 < e0 and moe.choose(5, 3, drafter=False) == 0
+        moe.accepted(5, 3, 0, agree=ONE)
+    assert moe.expected(5, 3, ONE) < 1.4 < e0 and moe.choose(5, 3, agree=ONE, drafter=False) == 0
+    q = Planner((1.0,) * 4)  # (of 3 drafts the first 2 kept: the first counted by its agreement, the later ones by bucket)
+    before = [x.copy() for x in (q.tried1, q.kept1, q.tried, q.kept)]
+
+    def added() -> list[np.ndarray]:
+        return [np.round(x - b, 6) for x, b in zip((q.tried1, q.kept1, q.tried, q.kept), before, strict=True)]
+
+    q.accepted(3, 3, 2, agree=MOST)
+    t1, k1, t, k = added()
+    assert t1[bucket(3), MOST] == k1[bucket(3), MOST] == 1 == t1.sum() == k1.sum()
+    assert t[bucket(3)].tolist() == [1, 1, 0, 0, 0, 0] and k[bucket(3)].tolist() == [1, 0, 0, 0, 0, 0]
+    q.accepted(3, 1, 0, agree=MOST)  # (a first draft rejected: no later one tried)
+    t1, k1, t, k = added()
+    assert (t1.sum(), k1.sum(), t.sum(), k.sum()) == (2, 1, 2, 1)
     p = Planner((1.0, 1.05, 1.1, 1.15))
-    assert p.choose(20, 3, drafter=True) is None  # (the drafter's first rounds)
+    assert p.choose(20, 3, agree=ONE, drafter=True) is None  # (the drafter's first rounds)
     for m in (1, 3, 20):
         for _ in range(WARM):
             p.ran(4, 0.105)
             p.drafted(m, 3 if m > 1 else 2, 0.110)  # (27 tokens/s; after matches of 1: 18)
-    assert p.choose(1, 3, drafter=True) is None  # (E 1.39 per 0.105 s, but short matches: the drafter's)
-    assert p.choose(DRAFTER_MATCH, 3, drafter=True) is None  # (no drafter rounds after matches of 6 yet)
-    assert [p.choose(20, 3, drafter=True) for _ in range(RETRY + 1)] == [3] * RETRY + [None]  # (E 3.4 per 0.105 s)
+    assert p.choose(1, 3, agree=ONE, drafter=True) is None  # (E 1.39 per 0.105 s, but short matches: the drafter's)
+    assert p.choose(DRAFTER_MATCH, 3, agree=ONE, drafter=True) is None  # (no drafter rounds after matches of 6 yet)
+    assert [p.choose(20, 3, agree=ONE, drafter=True) for _ in range(RETRY + 1)] == [3] * RETRY + [None]  # (E 3.4 / 0.105 s)
     for _ in range(RETRY):  # (the retry counts per bucket: another bucket's drafter rounds leave it due)
         p.drafted(3, 3, 0.110)
-    assert p.choose(20, 3, drafter=True) is None
+    assert p.choose(20, 3, agree=ONE, drafter=True) is None
     p.drafted(20, 3, 0.110)
-    assert p.choose(20, 3, drafter=True) == 3
+    assert p.choose(20, 3, agree=ONE, drafter=True) == 3
     for _ in range(10):
         p.drafted(20, 4, 0.110)  # (where the context repeats, the drafter guesses it too: 36 tokens/s)
-    assert p.choose(20, 3, drafter=True) is None
+    assert p.choose(20, 3, agree=ONE, drafter=True) is None
 
 
 def test_planner_stop() -> None:
@@ -91,22 +125,22 @@ def test_planner_stop() -> None:
     for _ in range(WARM):
         p.drafted(0, 1, 0.330)  # (a block's 30 ms for nothing)
     for wait in (PAUSE, 2 * PAUSE, 4 * PAUSE, RETRY, RETRY):
-        assert [p.choose(0, 0, drafter=True) for _ in range(wait + 1)] == [0] * wait + [None]
+        assert [p.choose(0, 0, agree=ONE, drafter=True) for _ in range(wait + 1)] == [0] * wait + [None]
         p.drafted(0, 1, 0.330)
-    assert p.choose(0, 0, drafter=True) == 0
+    assert p.choose(0, 0, agree=ONE, drafter=True) == 0
     for _ in range(RETRY):
-        p.choose(0, 0, drafter=True)
+        p.choose(0, 0, agree=ONE, drafter=True)
     for _ in range(3 * WARM):  # (a text it guesses again)
-        assert p.choose(0, 0, drafter=True) is None
+        assert p.choose(0, 0, agree=ONE, drafter=True) is None
         p.drafted(0, 3, 0.330)
     for _ in range(64):  # (its running average back under a step of one's: a slow one)
         p.drafted(0, 1, 0.330)
-    assert [p.choose(0, 0, drafter=True) for _ in range(PAUSE + 1)] == [0] * PAUSE + [None]
+    assert [p.choose(0, 0, agree=ONE, drafter=True) for _ in range(PAUSE + 1)] == [0] * PAUSE + [None]
     q = Planner((1.0, 1.002, 1.006, 1.008))
     q.ran(1, 0.340)
     for _ in range(3 * WARM):
         q.drafted(0, 2, 0.353)  # (prose at 32K: ~2.4 tokens a round, against 1 token in 340 ms)
-    assert q.choose(0, 0, drafter=True) is None
+    assert q.choose(0, 0, agree=ONE, drafter=True) is None
 
 
 def test_planner_crossing() -> None:
@@ -131,13 +165,13 @@ def test_planner_crossing() -> None:
     r.place(30000)
     for S, t in enumerate((0.060, 0.090, 0.105, 0.120), 1):
         r.ran(S, t)
-    assert r.choose(1, 3, drafter=False) == 0
+    assert r.choose(1, 3, agree=ONE, drafter=False) == 0
     r.place(100)
     assert r.step_time(4) == 0.120  # (a span of no steps: the nearest measured one's)
     r.ran(1, 0.030)
-    assert r.step_time(4) == pytest.approx(0.030 * 1.05) and r.choose(1, 3, drafter=False) == 3
+    assert r.step_time(4) == pytest.approx(0.030 * 1.05) and r.choose(1, 3, agree=ONE, drafter=False) == 3
     r.place(31000)
-    assert r.step_time(1) == 0.060 and r.choose(1, 3, drafter=False) == 0
+    assert r.step_time(1) == 0.060 and r.choose(1, 3, agree=ONE, drafter=False) == 0
     q = Planner((1.0, 1.1))
     q.crossing = (False, True)
     q.ran(2, 0.3)

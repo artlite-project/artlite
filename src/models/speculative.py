@@ -12,7 +12,7 @@ import numpy as np
 
 from artlite import _native
 
-from .drafts import EWMA, Lookup, Planner
+from .drafts import EWMA, ONE, Lookup, Planner
 from .sampling import LogitsLike, Mask, Penalties, Probs, Sampling
 from .sequence import token_ids
 
@@ -204,19 +204,19 @@ class SpeculativeMixin:
                 f = forced()[:k] if forced is not None and k > 0 else []
                 more: list[int] = []
                 if f:  # (the forced tokens first, none of the planner's counts; the context's drafts after them)
-                    m, mtp = 0, False
+                    m, agree, mtp = 0, ONE, False
                     if ctx is not None and k > len(f):
                         ctx.extend(f)
-                        m, more = ctx.draft(k - len(f))
+                        m, agree, more = ctx.draft(k - len(f))
                         ctx.n -= len(f)
-                        j = plan.choose(m, len(more), drafter=False) if more else 0
+                        j = plan.choose(m, len(more), agree=agree, drafter=False) if more else 0
                         more = more[:j or 0]
                         if more and valid is not None:
                             more = more[:valid(f + more) - len(f)]
                     d = f + more
                 else:
-                    m, d = ctx.draft(k) if ctx is not None else (0, [])
-                    j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
+                    m, agree, d = ctx.draft(k) if ctx is not None else (0, ONE, [])
+                    j = plan.choose(m, len(d), agree=agree, drafter=self._drafting and k > 0)
                     mtp = j is None
                     d = self._mtp(token, k, penalties) if mtp else d[:j]
                     if valid is not None and d:
@@ -253,14 +253,15 @@ class SpeculativeMixin:
                     self.forced += min(kept, len(f))
                     self.drafted += len(d)
                     if more:
-                        plan.accepted(m, len(more), max(kept - len(f), 0))
+                        if kept >= len(f):  # (the context's drafts were checked: the forced tokens before them kept)
+                            plan.accepted(m, len(more), kept - len(f), agree=agree)
                         self.drafted_ctx += len(more)
                         self.accepted_ctx += max(kept - len(f), 0)
                 elif mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
                     plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
                     self._calibrate(len(new) - 1)
                 elif d:
-                    plan.accepted(m, len(d), len(new) - 1)
+                    plan.accepted(m, len(d), len(new) - 1, agree=agree)
                     self.drafted += len(d)
                     self.drafted_ctx += len(d)
                     self.accepted_ctx += len(new) - 1

@@ -12,8 +12,11 @@ text is a span of a file they read, a rewritten file is mostly the old one, a co
 
 ``Planner`` (one per model, across its generations) chooses a round's drafts: k of the context's are worth
 E(m, k) = 1 + a1 + a1 a2 + ... tokens (a_i: how often the i-th draft after a match of m tokens was accepted when the
-ones before it were: ``PRIOR``, then counted), against the time of a step of k + 1 tokens at the round's position (an
-average per S and span of positions as the steps run, ``SPAN``, before, the model's ``STEP_COST`` ratios to a measured
+ones before it were: ``FIRST`` and ``PRIOR``, then counted; a1 also by how the match's earlier occurrences continue:
+where they disagree, the latest one's token is right less often, after 4 tokens 0.78 where all agree with it against
+0.22 where at most half do, and agent sessions replayed offline run 1-5% faster than with a1 by m alone, most where
+slots are dear), against the time of a step of k + 1 tokens at the round's position (an average per S and span of
+positions as the steps run, ``SPAN``, before, the model's ``STEP_COST`` ratios to a measured
 one; a step across a KV cache group adds a second attention pass, a measure of its own: the position decides, and
 neither a crossing step's time nor a long context's must stand for S's at another position, or S looks dear and never
 runs again to correct it; the time another process's turn on the NPU took is not the step's); a drafter's rounds
@@ -38,13 +41,19 @@ import numpy as np
 from .sequence import token_ids
 
 NMAX = 32  # a match's tokens at most
-# P(the i-th context draft is accepted | the ones before it were) after a match of m tokens, per bucket of m (1, 2, 3,
-# 4, 5, 6-8, 9-16, 17 on): agent sessions' (Claude Code, Codex and opencode on Qwen3.6-35B-A3B, temperature 1)
+# how the earlier occurrences of a round's match continue (``Lookup.draft``): there is one; several, all with the same
+# token; several that disagree, more than half of them with the latest one's token (the drafts' first); at most half
+ONE, ALL, MOST, FEW = range(4)
+# P(the first context draft is accepted) after a match of m tokens, per bucket of m (1, 2, 3, 4, 5, 6-8, 9-16, 17 on) and
+# its occurrences' agreement (ONE, ALL, MOST, FEW); P(the i-th draft is accepted | the ones before it were) for i = 2, 3
+# per bucket (drafts past the third: the third's, up to an 8-slot step's 7): agent sessions' (Claude Code, Codex and
+# opencode on Qwen3.6-35B-A3B, temperature 1)
 BUCKETS = (0, 0, 1, 2, 3, 4, 5, 5, 5)  # (m <= 8: its bucket; then 6 up to 16, 7 above)
-# (drafts past the third: the third's, up to an 8-slot step's 7)
-PRIOR = np.pad(np.array([(0.23, 0.46, 0.55), (0.36, 0.54, 0.62), (0.44, 0.59, 0.65), (0.51, 0.64, 0.70), (0.62, 0.70, 0.77),
-                         (0.72, 0.78, 0.82), (0.81, 0.82, 0.83), (0.89, 0.91, 0.92)]), ((0, 0), (0, 4)), mode="edge")
-PRIOR_N = 8  # the prior's weight in rounds
+FIRST = np.array([(0.25, 0.66, 0.57, 0.16), (0.36, 0.76, 0.54, 0.19), (0.43, 0.75, 0.41, 0.20), (0.51, 0.78, 0.52, 0.22),
+                  (0.57, 0.80, 0.51, 0.23), (0.61, 0.82, 0.70, 0.33), (0.80, 0.92, 0.57, 0.38), (0.88, 0.94, 0.81, 0.41)])
+PRIOR = np.pad(np.array([(0.46, 0.55), (0.54, 0.62), (0.59, 0.65), (0.64, 0.70), (0.70, 0.77), (0.78, 0.82), (0.82, 0.83),
+                         (0.91, 0.92)]), ((0, 0), (0, 4)), mode="edge")
+PRIOR_N = 8  # the priors' weight in rounds
 EWMA = 0.2  # a new measurement's weight in a running average
 # ... of a drafter's round in its bucket's tokens and seconds while it drafts, after its first 1 / EWMA_RATE rounds' plain
 # mean: a round's tokens vary by more (1 .. S) than the edge the drafter is judged on (15 - 25% over a step of one), which
@@ -91,15 +100,16 @@ class Lookup:
         self._buf[self.n:n] = tokens
         self.n = n
 
-    def draft(self, k: int) -> tuple[int, list[int]]:
+    def draft(self, k: int) -> tuple[int, int, list[int]]:
         """Up to k tokens after the latest earlier occurrence of the sequence's longest repeated suffix (none from an
-        image's row on) and that suffix's length m (0: none occurred before; no drafts)."""
+        image's row on), that suffix's length m (0: none occurred before; no drafts) and how its occurrences continue
+        (``ONE``, ``ALL``, ``MOST``, ``FEW``)."""
         seq, L = self._buf, self.n
         if L < 2 or k <= 0:
-            return 0, []
+            return 0, ONE, []
         cand = np.flatnonzero(seq[:L - 1] == seq[L - 1])  # (where the suffix's occurrences end, ascending)
         if not len(cand):
-            return 0, []
+            return 0, ONE, []
         m = 1
         while m < min(NMAX, L - 1):
             c = cand[cand >= m]
@@ -108,9 +118,11 @@ class Lookup:
                 break
             cand, m = longer, m + 1
         at = int(cand[-1]) + 1
+        same = int((seq[cand + 1] == seq[at]).sum())
+        agree = ONE if len(cand) == 1 else ALL if same == len(cand) else MOST if 2 * same > len(cand) else FEW
         out = seq[at:min(at + k, L)]
         neg = np.flatnonzero(out < 0)
-        return m, out[:neg[0] if len(neg) else len(out)].tolist()
+        return m, agree, out[:neg[0] if len(neg) else len(out)].tolist()
 
 
 class Planner:
@@ -125,8 +137,9 @@ class Planner:
         self._again: dict[int, float] = {}
         self.span = 0  # (the round's)
         self.crossing = (False,) * len(cost)  # (per S: whether a step of S at the round's position crosses a group)
-        self.tried = np.full(PRIOR.shape, float(PRIOR_N))
-        self.kept = PRIOR * PRIOR_N
+        # (per bucket and agreement the first drafts tried and kept, per bucket the later ones': counts from the priors)
+        self.tried1, self.kept1 = np.full(FIRST.shape, float(PRIOR_N)), FIRST * PRIOR_N
+        self.tried, self.kept = np.full(PRIOR.shape, float(PRIOR_N)), PRIOR * PRIOR_N
         n = len(PRIOR) + 1  # (per context-match bucket, ``_mtp_bucket``: a drafter round's count, and its tokens and
         # seconds as running averages; the rounds since its last)
         self.mtp_rounds, self.mtp_tokens, self.mtp_s = np.zeros(n, np.int64), np.zeros(n), np.zeros(n)
@@ -173,17 +186,19 @@ class Planner:
         s = min(known, key=lambda s: abs(s - (S - 1)))
         return t[s] * self.cost[S - 1] / self.cost[s]
 
-    def expected(self, m: int, k: int) -> float:
-        """The tokens a round of k context drafts after a match of m tokens gives (with the sampled one)."""
-        a = self.kept[bucket(m)] / self.tried[bucket(m)]
+    def expected(self, m: int, k: int, agree: int) -> float:
+        """The tokens a round of k context drafts after a match of m tokens whose occurrences agree as ``agree`` gives
+        (with the sampled one)."""
+        b = bucket(m)
+        a = np.concatenate(([self.kept1[b, agree] / self.tried1[b, agree]], self.kept[b] / self.tried[b]))
         return 1.0 + float(np.cumprod(a[:k]).sum())
 
-    def choose(self, m: int, k: int, *, drafter: bool) -> int | None:
-        """The context drafts to take of k after a match of m tokens, or None: the drafter's (``drafter``: it can
-        draft this round)."""
+    def choose(self, m: int, k: int, *, agree: int, drafter: bool) -> int | None:
+        """The context drafts to take of k after a match of m tokens whose occurrences agree as ``agree``, or None:
+        the drafter's (``drafter``: it can draft this round)."""
         best_k, best = 0, 0.0
         for j in range(1, k + 1):
-            r = self.expected(m, j) / self.step_time(j + 1)
+            r = self.expected(m, j, agree) / self.step_time(j + 1)
             if r > best:
                 best_k, best = j, r
         if drafter:
@@ -201,7 +216,7 @@ class Planner:
                 self.wait[b] = min(2 * self.wait[b], RETRY) if self.lost[b] else PAUSE
                 self.lost[b] = True
             self.since_mtp[b] += 1
-        margin = 1 + (MARGIN - 1) * PRIOR_N / self.tried[bucket(m), 0] if m else 1.0
+        margin = 1 + (MARGIN - 1) * PRIOR_N / self.tried1[bucket(m), agree] if m else 1.0
         return best_k if best >= margin / self.step_time(1) else 0
 
     def ran(self, S: int, seconds: float) -> None:
@@ -214,11 +229,14 @@ class Planner:
         t = self.t[S - 1]
         self.t[S - 1] = seconds if t is None else (1 - EWMA) * t + EWMA * seconds
 
-    def accepted(self, m: int, k: int, a: int) -> None:
-        """Of k context drafts after a match of m tokens the first a were accepted."""
+    def accepted(self, m: int, k: int, a: int, *, agree: int) -> None:
+        """Of k >= 1 context drafts after a match of m tokens whose occurrences agree as ``agree`` the first a were
+        accepted."""
         b = bucket(m)
-        self.tried[b, :min(a + 1, k)] += 1
-        self.kept[b, :a] += 1
+        self.tried1[b, agree] += 1
+        self.kept1[b, agree] += a > 0
+        self.tried[b, :min(a, k - 1)] += 1  # (the later drafts: tried after a kept one)
+        self.kept[b, :max(a - 1, 0)] += 1
 
     def rate(self) -> float | None:
         """A drafter's rounds' tokens per second (any match), None before ``WARM`` of them."""
