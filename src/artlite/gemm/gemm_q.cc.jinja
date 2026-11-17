@@ -3,8 +3,8 @@
 namespace {
 
 {{ mac_src }}
-{% if silu and act == "gelu" %}
-{% set gact = km.act(km.GELU, table_arg=True, walk=(2, 128)) %}
+{% if silu and act != "silu" %}
+{% set gact = km.act(km.TABLES[act], table_arg=True, walk=(2, 128)) %}
 {{ gact.src }}
 {% endif %}
 {# the gate/up epilogues' last loop: h = y up (y in the scratch, up the C tile's up halves) -> hout as bfp16 panels #}
@@ -210,13 +210,13 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
 }
 
 {% endif %}
-{% if silu and act == "gelu" %}
-// gate/up epilogue (GELU, Gemma): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
+{% if silu and act != "silu" %}
+// gate/up epilogue (GELU: Gemma's tanh form, Spark-X's erf): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
 // panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
 // table, in two 16 KB regions), then times up.
 {% set parts = 2 if csplit else sxp %}
 {% set mp = m // parts %}
-void {{ p }}_gelu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
+void {{ p }}_{{ act }}(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
                   const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd{{ ", int32_t c_part" if c_parts == 2 else "" }})
 {
 {% if "act" in ablate %}

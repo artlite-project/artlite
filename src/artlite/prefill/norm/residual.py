@@ -1,5 +1,5 @@
-"""``ResidualNormOperator`` (Gemma's and LFM3's fp32 residual stream): the residual update and norm of a chunk (module
-docstring of ``prefill.norm``)."""
+"""``ResidualNormOperator`` (Gemma's, LFM3's and Spark-X's fp32 residual stream): the residual update and norm of a chunk
+(module docstring of ``prefill.norm``)."""
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
@@ -16,7 +16,7 @@ from ...operators.kernel_source import kernel_prefix
 from ...operators.util import Attr, bf16_value, regions
 from ...txn import HardwareLimitError
 
-MODES = ("in", "post", "plain")
+MODES = ("in", "post", "plain", "add")
 RCH = 16  # chunks per row (ResidualNormOperator: E / 16 columns each, 160 for E = 2560, 128 for 2048)
 
 _RSRC = templating.load("artlite/prefill/norm/residual.cc.jinja")
@@ -41,16 +41,19 @@ def residual_params(w_post: np.ndarray | None, w1: np.ndarray | None, scale: flo
 
 class ResidualNormOperator(ArtcOperator):
     """The residual update and norm of T tokens (module docstring). Runtime sequence: ``in``: (P, X, XN); ``post`` /
-    ``plain``: (P, X, D, XO, XN), XO = X in place. P: the parameters (``params``), X / XO: (T, E) fp32 (as bf16
-    pairs), D: the deltas (2 T 8 d_pitch per delta, ``d_stride`` apart), XN: panels."""
+    ``plain`` / ``add``: (P, X, D, XO, XN), XO = X in place. P: the parameters (``params``), X / XO: (T, E) fp32 (as bf16
+    pairs), D: the deltas (2 T 8 d_pitch per delta, ``d_stride`` apart), XN: panels in rows of ``out_pitch`` columns
+    (default E; more: the GEMM's K in whole chunks, the padding panels unwritten)."""
 
     STACK = 1024
     p = kernel_prefix("gn")
 
     def __init__(self, *, T: int, E: int, mode: str, eps: float, d_pitch: int = 0, deltas: int = 1, d_stride: int = 0,
-                 scale: bool = False, cols: int = COLS):
+                 scale: bool = False, cols: int = COLS, out_pitch: int = 0):
         """``scale``: x' = (...) s with s from the parameters (the layer's output scale), else s = 1 (cheaper)."""
         assert mode in MODES and E % 128 == 0, (mode, E)
+        self.out_pitch = out_pitch or E
+        assert self.out_pitch >= E and self.out_pitch % 64 == 0, (E, out_pitch)
         assert T % 8 == 0 and T >= 8 * cols and 1 <= cols <= COLS and deltas in (1, 2, 4)
         assert mode == "post" or not scale
         self.T, self.E, self.mode, self.eps, self.cols, self.scale = T, E, mode, eps, cols, scale
@@ -83,7 +86,7 @@ class ResidualNormOperator(ArtcOperator):
         specs = [ArgSpec("in", (8 * E,), bfloat16), ArgSpec("in", (2 * T * E,), bfloat16)]
         if self.mode != "in":
             specs += [ArgSpec("in", (self.n_delta,), bfloat16), ArgSpec("out", (2 * T * E,), bfloat16)]
-        specs.append(ArgSpec("out", (T * E * 9 // 16,), bfloat16))
+        specs.append(ArgSpec("out", (T * self.out_pitch * 9 // 16,), bfloat16))
         return specs
 
     def get_mlir_artifact(self) -> Module:
@@ -99,10 +102,10 @@ class ResidualNormOperator(ArtcOperator):
         k_ss = Kernel(f"{p}_ss", "kernel.o", [xc_ty if mode == "in" else dc_ty, ws_ty, np.int32])
         k_upd = Kernel(f"{p}_upd", "kernel.o", [xc_ty, dc_ty, ws_ty, xc_ty] + ([pan_ty] if mode == "plain" else [])
                        + [np.int32]) if mode != "in" else None
-        k_pan = Kernel(f"{p}_pan", "kernel.o", [xc_ty] + ([dc_ty] if mode == "post" else []) + [ws_ty, pan_ty, np.int32]) \
-            if mode != "plain" else None
+        k_pan = Kernel(f"{p}_pan", "kernel.o", [xc_ty] + ([dc_ty] if mode in ("post", "add") else [])
+                       + [ws_ty, pan_ty, np.int32]) if mode != "plain" else None
         # replays per group: (x, d)
-        x_rep, d_rep = {"in": (2, 1), "post": (2, 3), "plain": (1, 2)}[mode]
+        x_rep, d_rep = {"in": (2, 1), "post": (2, 3), "plain": (1, 2), "add": (2, 2)}[mode]
 
         def replayed(name: str, c: int, n: int, k: int, rep: int) -> tuple[ObjectFifo, ObjectFifo]:
             """A group object of k blocks of [8 tokens][n] through the memtile, sent ``rep`` times as chunks
@@ -133,10 +136,11 @@ class ResidualNormOperator(ArtcOperator):
                         d_f.release(1)
                 for _ in range_(n_g):
                     a_f = x_f if mode == "in" else d_f
-                    for kc in range_(n_kc):  # pass A
-                        v = a_f.acquire(1)
-                        ss(v, ws, kc)
-                        a_f.release(1)
+                    if mode != "add":  # (add: no pass A, d's rms unused)
+                        for kc in range_(n_kc):  # pass A
+                            v = a_f.acquire(1)
+                            ss(v, ws, kc)
+                            a_f.release(1)
                     if mode != "in":
                         for kc in range_(n_kc):  # pass B
                             x = x_f.acquire(1)
@@ -155,7 +159,7 @@ class ResidualNormOperator(ArtcOperator):
                         for kc in range_(n_kc):  # pass C
                             x = x_f.acquire(1)
                             pn = p_f.acquire(1)
-                            if mode == "post":
+                            if mode in ("post", "add"):
                                 d = d_f.acquire(1)
                                 pan(x, d, ws, pn, kc)
                                 d_f.release(1)
@@ -180,7 +184,7 @@ class ResidualNormOperator(ArtcOperator):
         d_h = [f[0].prod(tile=Tile(c, 0)) for c, f in enumerate(df)]
         o_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]
         p_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(pf)]
-        cols = self.cols
+        cols, op_ = self.cols, self.out_pitch
 
         def seq(*a):
             if mode == "in":
@@ -201,14 +205,14 @@ class ResidualNormOperator(ArtcOperator):
                                                       [8 * cols * ed, self.d_stride, dp, 1]), group=tg)
                     oh[c].drain(XO, TensorAccessPattern((n,), 16 * E * c, [n_g, n_kc, 8, 2 * ch],
                                                         [16 * cols * E, 2 * ch, 2 * E, 1]), group=tg, wait=True)
-                ph[c].drain(XN, TensorAccessPattern((T * E * 9 // 16,), c * (E // 8) * 36,
-                                                    [1, n_g, 8, E // 64 * 36], [0, cols * (E // 8) * 36, E // 64 * 36, 1]),
+                ph[c].drain(XN, TensorAccessPattern((T * op_ * 9 // 16,), c * (op_ // 8) * 36,
+                                                    [1, n_g, 8, E // 64 * 36], [0, cols * (op_ // 8) * 36, E // 64 * 36, 1]),
                             group=tg, wait=True)
             tg.finish()
 
         types = [np.ndarray[(8 * E,), bf], np.ndarray[(n,), bf]]
         if mode != "in":
             types += [np.ndarray[(self.n_delta,), bf], np.ndarray[(n,), bf]]
-        types.append(np.ndarray[(T * E * 9 // 16,), bf])
+        types.append(np.ndarray[(T * self.out_pitch * 9 // 16,), bf])
         rt = Runtime(seq, [*types, x_h, d_h, p_h, *([o_h] if mode != "in" else [])])
         return Program(NPU2(), rt, workers=workers).resolve_program()

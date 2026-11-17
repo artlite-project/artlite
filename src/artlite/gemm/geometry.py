@@ -321,8 +321,7 @@ class Geometry:
         tiles = spec.tiles or 64 // rows
         TR = tiles * rows
         act = spec.act
-        assert act in ("silu", "gelu") and (silu or act == "silu"), act
-        assert act == "silu" or dq_core, "the GELU epilogue: GemmQd"
+        assert act in ("silu", "gelu", "gelu_erf") and (silu or act == "silu"), act
         # rows the memtile reads per pass: a planar SiLU pass of a whole group (128 rows and the padding rows of the
         # group's last tile) drops the padding rows when every part of the tile, header included, maps tile row r to
         # gathered row r (``hdr_direct``); else the dequant skips them

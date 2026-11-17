@@ -117,8 +117,8 @@ class GemmQdOperator(GemmQOperator):
                 "acc": ((2 if lp.pingpong or g.halves == 2 or g.slots == 2 else 1) if g.silu or g.c_pack
                         else 0, m * nm * 2),
                 "sx": (1 if g.silu else 0, m * nm // lp.sxp),
-                "lut": (1 if g.silu and g.act == "gelu" else 0, kmath.GELU.table_words().nbytes),
-                "lutb": (1 if g.silu and g.act == "gelu" else 0, kmath.GELU.table_words().nbytes)}
+                "lut": (1 if g.silu and g.act != "silu" else 0, kmath.TABLES[g.act].table_words().nbytes),
+                "lutb": (1 if g.silu and g.act != "silu" else 0, kmath.TABLES[g.act].table_words().nbytes)}
 
     def _plan_l1(self, g: Geometry) -> L1Plan:
         """The L1 choices of the geometry (g.m chosen): the dequantizing core's weight objects (``_dq_pick``), the C
@@ -362,8 +362,8 @@ class GemmQdOperator(GemmQOperator):
 
         p = self.p
         k_zero = Kernel(f"{p}_zero", "kernel.o", [acc_ty])
-        gelu = self.silu and self.act == "gelu"
-        lut_ty = np.ndarray[(kmath.GELU.table_words().size,), np.dtype[np.uint32]]
+        gelu = self.silu and self.act != "silu"  # (a GELU form: its table, ``kmath.TABLES``)
+        lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]]
         k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, *([lut_ty] * 2 if gelu else [np.int32]),
                                                          *[np.int32] * (self.c_parts - 1)]) if self.silu else None
         # the table's two copies (gelu): in two regions where the layout is pinned (``_place_plan``); else where aiecc
@@ -567,7 +567,7 @@ class GemmQdOperator(GemmQOperator):
                 if self.csplit:  # (the tiles' second halves: the kernels reach them 16 KB on)
                     extra += [Buffer(acc_ty, name=f"gq_{h}_{c}_{row}") for h in ("acch", "accbh")]
                 if gelu:
-                    extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.GELU.table_words())
+                    extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.TABLES[self.act].table_words())
                               for key in ("lut", "lutb")]
                 workers.append(Worker(mac_fn, [pcs.get((c, 3 + row)), prm, d_f[c].cons(), a_l1[row].cons(),
                                                c_l1[row][c].prod(), k_zero,

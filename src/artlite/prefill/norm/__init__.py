@@ -9,20 +9,22 @@ GEMM's A port).
   then xn = x' / rms(x') w1 (the next GEMM's input);
 - ``plain`` (Gemma after the down projection): x' = x + d / rms(d) w_post, xn = x' (the per-layer input gate reads the
   residual itself);
+- ``add`` (a pre-norm model's update, Spark-X's): x' = x + d, then xn = x' / rms(x') w1;
 
 with d the projection's output (bf16, column c's E / 8 values at c d_pitch of a row of 8 d_pitch; ``deltas`` = 2, 4:
 the sum of K parts, d_stride elements apart), s the layer's output scale (``post`` after the per-layer projection; 1
-elsewhere). x' overwrites x.
+elsewhere). x' overwrites x. The panels go out in rows of ``out_pitch`` columns (the next GEMM's K in whole chunks: the
+4B Spark-X's 2560 in rows of 3072; the padding panels never written).
 
 The arithmetic: d w_post exact in fp32 (d1 w + d2 w for two parts), times a = s / rms(d) (fp32, as bf16 hi / lo; the
 product's hi / lo parts: three products), plus x s (x hi / lo times s hi / lo, or x itself when s = 1): within ~2^-16
-of the exact update. The norm's input xn = bf16(x') w1 / rms(x') (rms of the bf16
+of the exact update; ``add``'s x + (d1 + d2 ..) one fp32 rounding (the parts' bf16 sum exact). The norm's input xn = bf16(x') w1 / rms(x') (rms of the bf16
 values; 1 / rms as bf16 hi / lo) as the GEMM's single bfp16 panels.
 
 ``cols`` cores (one per column) take the token groups of 8 in turn (core c: groups c, c + cols, ..). Per group the
 memtile holds x (8 x E fp32) and d and sends them to the core once per pass (``repeat_count``), in chunks of 8 tokens x
 ``ch`` columns; each pass works in panels (8 tokens x 8 columns: the lanes 8 t + e): pass A sums d's squares (``in``:
-x's), pass B computes x' (and its squares; ``plain``: also its panels), pass C x' again (the same
+x's; ``add``: no pass A), pass B computes x' (and its squares; ``plain``: also its panels), pass C x' again (the same
 arithmetic) and its panels. The parameters (w_post, w1, s: ``residual_params``, [8 rows][E] bf16: row 0 w_post, row 1
 w1, row 2 the hi / lo bits of s) are d's first object.
 

@@ -69,7 +69,7 @@ from aie.iron.device import Tile
 from ml_dtypes import bfloat16
 
 from ..formats import KC, KT, kernel_template, slot
-from ..operators import templating
+from ..operators import kmath, templating
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.chain import chained_fill
 from ..operators.design import COLS, ROWS, SHIM_QUEUE, TILE_BDS, range32, times_i32
@@ -293,20 +293,21 @@ class GemmQOperator(ArtcOperator):
         (one k-tile), B (one k-tile of the pass's tiles) and C, the MAC target ``acc`` (silu
         only), the scale workspace ``ws``, the core's half of a dequantized k-tile ``X`` (its FIFO to the partner) and
         ``st``, the second C tile (also the collected header, ``Slot.gemm_q_collects``, and the SiLU scratch); BFP16:
-        A, B, C, ``acc`` and ``st``, the SiLU scratch. get_mlir_artifact asserts its buffer types against
-        this."""
+        A, B, C, ``acc`` and ``st``, the SiLU scratch; a GELU epilogue's table copies ``lut``, ``lutb`` (``kmath.act``'s
+        two). get_mlir_artifact asserts its buffer types against this."""
         m = g.m
+        lut = (1 if g.silu and g.act != "silu" else 0, kmath.TABLES[g.act].table_words().nbytes)
         if g.pair:
             return {"A": (2, m * 72), "B": (B_DEPTH, 4 * g.b_l1_words),
                     "C": (2, m * g.n_out * 9 // 8 * g.c_parts if g.c_bfp16 else m * g.n_c * 2),
                     "acc": (1 if g.silu else 0, m * g.n * 2),
                     "ws": (1, 1024 * g.nsb * g.ws_planes * g.tq // TILES),
                     "st": (1, max(m * g.n * 2, 16 * g.b_l1_words if slot(g.fmt).gemm_q_collects else 0)),
-                    "X": (2, g.n // 2 * KT * 9 // 8)}
+                    "X": (2, g.n // 2 * KT * 9 // 8), "lut": lut, "lutb": lut}
         return {"A": (2, m * 72), "B": (B_DEPTH, 4 * g.b_l1_words),
                 "C": (2, m * g.n_out * 9 // 8 * g.c_parts if g.c_bfp16 else m * g.n_c * 2),
                 "acc": (1 if g.silu or g.c_pairs else 0, m * g.n * (4 if g.c_pairs else 2)),
-                "st": (1, max(64, m * g.n if g.silu else 0))}
+                "st": (1, max(64, m * g.n if g.silu else 0)), "lut": lut, "lutb": lut}
 
     def _l1_bytes(self, g: Geometry, plan: L1Plan) -> int:
         """Core data memory of the design with g.m tokens per core row (buffers and the 2 KB stack)."""
@@ -334,13 +335,16 @@ class GemmQOperator(ArtcOperator):
         else:
             order = [("st", [0]), ("A", [1]), (target, [2])] + ([("C", [0, 3, 1])] if g.silu or g.c_pairs else [])
             order += [("B", [3])]
+        if sizes["lut"][0]:  # (a GELU table's two copies in two regions: the gathers of the two halves of a vector)
+            order += [("lut", [3, 2, 1, 0]), ("lutb", [0, 1, 2, 3])]
         free = [REGION - 2048] + [REGION] * 3
         nxt = [2048, REGION, 2 * REGION, 3 * REGION]
         layout: dict[str, list[int]] = {}
         for name, regions in order:
             n, sz = sizes[name]
             need = n * align64(sz)
-            r = next((r for r in regions if free[r] >= need), None)
+            r = next((r for r in regions if free[r] >= need and not (name == "lutb" and nxt[r] // REGION
+                                                                      == layout["lut"][0] // REGION)), None)
             if r is None:
                 return None
             layout[name] = [nxt[r] + i * align64(sz) for i in range(n)]
@@ -433,7 +437,9 @@ class GemmQOperator(ArtcOperator):
 
         p = self.p
         k_zero = Kernel(f"{p}_zerof" if self.c_pairs else f"{p}_zero", "kernel.o", [acc_ty])
-        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, np.int32,
+        gelu = self.silu and self.act != "silu"  # (a GELU form: its table's two copies, ``kmath.TABLES``)
+        lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]]
+        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, *([lut_ty] * 2 if gelu else [np.int32]),
                                                          *[np.int32] * (self.c_parts - 1)]) if self.silu else None
         pair = self.pair
         if pair:
@@ -490,8 +496,8 @@ class GemmQOperator(ArtcOperator):
                         mm(a, b, acc)
                         af.release(1)
                         bf.release(1)
-                    if silu:
-                        extra[0](acc, c, st, 0, *([h] if parts == 2 else []))  # (0: the kernel's opaque runtime zero)
+                    if silu:  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
+                        extra[0](acc, c, st, *(extra[2:4] if gelu else (0,)), *([h] if parts == 2 else []))
                     elif c_pairs:
                         extra[0](acc, c)
                 cf.release(1)
@@ -531,8 +537,8 @@ class GemmQOperator(ArtcOperator):
                         mm(a, x, y, acc, st, h, kt)  # (the C tiles acc and st in turn: an even count per chunk)
                         xi.release(1)
                         af.release(1)
-            if silu:
-                extra[0](acc, c, st, 0, *([part] if parts == 2 else []))  # (0: the kernel's opaque runtime zero)
+            if silu:  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
+                extra[0](acc, c, st, *(extra[2:4] if gelu else (0,)), *([part] if parts == 2 else []))
 
         workers = []
         prm = self._mc_prm()
@@ -543,6 +549,9 @@ class GemmQOperator(ArtcOperator):
                 st = Buffer(st_ty, name=f"gq_st_{c}_{row}")
                 extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.silu else
                          [k_pairs, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.c_pairs else [])
+                if gelu:  # (extra[2:4]; Q4_K's header expansion stays last)
+                    extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.TABLES[self.act].table_words())
+                              for key in ("lut", "lutb")]
                 if k_hdr2 is not None:
                     extra.append(k_hdr2)
                 if pair:
@@ -560,7 +569,8 @@ class GemmQOperator(ArtcOperator):
         module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), ROWS, c_bfp16=cb)
         # the L1 budget / pinned layout describe these buffers
         actual = {"A": DP.nbytes(A_l1_ty), "B": DP.nbytes(B_l1_ty), "C": DP.nbytes(C_l1_ty), "acc": DP.nbytes(acc_ty),
-                  "st": DP.nbytes(st_ty), **({"ws": DP.nbytes(ws_ty), "X": DP.nbytes(X_ty)} if pair else {})}
+                  "st": DP.nbytes(st_ty), **({"ws": DP.nbytes(ws_ty), "X": DP.nbytes(X_ty)} if pair else {}),
+                  "lut": DP.nbytes(lut_ty), "lutb": DP.nbytes(lut_ty)}
         assert actual == {k: b for k, (_, b) in bufs.items()}, (actual, bufs)
         layout = self._l1_layout()
         if layout is not None:

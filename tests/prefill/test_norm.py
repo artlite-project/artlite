@@ -171,7 +171,9 @@ def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.T
                         scale: float, eps: float, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
     """(x', xn values before the bfp16 rounding) in fp64 of fp32 x (T, E), d (T, E) the (summed) delta."""
     x = x.double()
-    if mode != "in":
+    if mode == "add":
+        x = x + d.double()
+    elif mode != "in":
         dd = d.double()
         iv = torch.rsqrt(dd.bfloat16().double().pow(2).mean(-1, keepdim=True) + eps)
         x = (x + dd * iv * w_post.bfloat16().double()) * scale
@@ -182,22 +184,27 @@ def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.T
     return x, xb * w1.bfloat16().double() * iv
 
 
-# (mode, E, deltas, d_pitch, scale): Gemma E4B's modes, LFM3's (E 2048)
-RESIDUAL = [("in", 2560, 1, 320, False), ("post", 2560, 1, 320, False), ("post", 2560, 1, 384, True),
-            ("plain", 2560, 2, 320, False), ("plain", 2560, 2, 384, False), ("plain", 2560, 4, 320, False),
-            ("in", 2048, 1, 256, False), ("post", 2048, 1, 256, False), ("post", 2048, 2, 256, False)]
+# (mode, E, deltas, d_pitch, scale, the panels' row: 0 = E): Gemma E4B's modes, LFM3's (E 2048), Spark-X's pre-norm
+# updates (add; the 4B's 2560 in rows of 3072: the GEMMs' K in whole chunks)
+RESIDUAL = [("in", 2560, 1, 320, False, 0), ("post", 2560, 1, 320, False, 0), ("post", 2560, 1, 384, True, 0),
+            ("plain", 2560, 2, 320, False, 0), ("plain", 2560, 2, 384, False, 0), ("plain", 2560, 4, 320, False, 0),
+            ("in", 2048, 1, 256, False, 0), ("post", 2048, 1, 256, False, 0), ("post", 2048, 2, 256, False, 0),
+            ("in", 2560, 1, 320, False, 3072), ("add", 2560, 1, 320, False, 3072), ("add", 2560, 2, 384, False, 3072),
+            ("add", 2048, 1, 256, False, 0), ("add", 2048, 2, 256, False, 0)]
 
 
-@pytest.mark.parametrize(("mode", "E", "deltas", "d_pitch", "scale"), RESIDUAL,
-                         ids=[f"{m}-E{e}-d{d}-p{p}{'-s' if s else ''}" for m, e, d, p, s in RESIDUAL])
-def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool) -> None:
+@pytest.mark.parametrize(("mode", "E", "deltas", "d_pitch", "scale", "pitch"), RESIDUAL,
+                         ids=[f"{m}-E{e}-d{d}-p{p}{'-s' if s else ''}{f'-o{o}' if o else ''}"
+                              for m, e, d, p, s, o in RESIDUAL])
+def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool, pitch: int) -> None:
     """ResidualNormOperator against its fp64 model: x' within ~2^-16 (the fp32 update), the panels within 1.1 x the
     error of the model's values rounded to bfp16. Several deltas: a down projection's K parts, ``d_stride`` apart
-    (padded)."""
+    (padded). Panels in longer rows (``pitch``): the padding panels unwritten."""
     T, eps = 256, 1e-6
     stride = T * COLS * d_pitch + (1024 if deltas > 1 else 0)
     op = ResidualNormOperator(T=T, E=E, mode=mode, eps=eps, d_pitch=d_pitch, deltas=deltas, d_stride=stride,
-                              scale=scale).compile()
+                              scale=scale, out_pitch=pitch).compile()
+    P_ = pitch or E
     dev = op.device
     g = torch.Generator().manual_seed(3 + E)
     x = torch.randn(T, E, generator=g) * 4
@@ -207,7 +214,7 @@ def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool
     prm = residual_params(wp.numpy(), w1.numpy(), s, E).view(np.int16)
     P = artlite.from_numpy(prm.view(bfloat16), dev)
     X = artlite.from_numpy(to_numpy(x.contiguous().view(torch.bfloat16).reshape(-1)), dev)
-    XN = artlite.from_numpy(np.zeros(T * E * 9 // 16, bfloat16), dev)
+    XN = artlite.from_numpy(np.full(T * P_ * 9 // 16, 7.0, bfloat16), dev)  # (the padding: not zero)
     dd = d[..., :E // COLS].float().reshape(deltas, T, E).sum(0)
     if mode == "in":
         op.dispatch(P, X, XN)
@@ -220,7 +227,9 @@ def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool
     XN.sync_from_device()
     want_x, want_n = _residual_reference(x, dd, wp, w1, s, eps, mode)
     got_x = to_torch(X.numpy()).view(torch.float32).reshape(T, E).double()
-    got_n = to_torch(bfp16.from_panels(XN.numpy(), T, E)).double()
+    got_n = to_torch(bfp16.from_panels(XN.numpy(), T, P_)[:, :E]).double()
+    pad = XN.numpy().reshape(T // 8, P_ // 8, 36)[:, E // 8:]  # (the padding panels as they were)
+    assert np.array_equal(pad, np.full_like(pad, 7.0))
     want_q = torch.from_numpy(bfp16.values(want_n.float().numpy())).double()
 
     ex, en, eq = rel(got_x, want_x), rel(got_n, want_n), rel(want_q, want_n)

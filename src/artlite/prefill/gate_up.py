@@ -1,7 +1,7 @@
 """The activation of a split gate / up block's prefill (``decode.image.Block.fmt2``: gate and up in two tile formats):
 their GEMMs write plain bf16 rows into GU (``prefill.gemm``'s split plan), this operator turns them into the down
-projection's A, h = bf16(silu(gate) up) as bfp16 panels, the gate / up epilogue's arithmetic (``gemm_q``'s times_up,
-kmath.silu_tanh), so a split layer's h is what one GEMM of both parts would give.
+projection's A, h = bf16(act(gate) up) as bfp16 panels, the gate / up epilogue's arithmetic (``gemm_q``'s times_up,
+kmath.silu_tanh, or a GELU form through its table), so a split layer's h is what one GEMM of both parts would give.
 
 GU: T rows of ``COLS`` column slices of ``groups`` x [gate W | up W] (each part's first 64 values its group's outputs, the
 rest the passes' padding rows). HP: the panels [T / 8][K / 8][72 B] (K: the down's), column c's outputs at their place
@@ -17,7 +17,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from ..operators import templating
+from ..operators import kmath, templating
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, MAX_BD_ITER
 from ..operators.kernel_source import kernel_prefix
@@ -33,16 +33,17 @@ def chunk_groups(groups: int) -> int:
 
 
 class GateUpActOperator(ArtcOperator):
-    """h = bf16(silu(gate) up) of T tokens (module docstring). Runtime sequence: GU (T x COLS ``groups`` 2 W bf16), HP
-    (panels of T x K)."""
+    """h = bf16(act(gate) up) of T tokens (module docstring; ``act``: silu, or a GELU form of ``kmath.TABLES``). Runtime
+    sequence: GU (T x COLS ``groups`` 2 W bf16), HP (panels of T x K)."""
 
     STACK = 1024
     p = kernel_prefix("guact")
 
-    def __init__(self, *, T: int, groups: int, W: int, K: int):
+    def __init__(self, *, T: int, groups: int, W: int, K: int, act: str = "silu"):
         # (a shim channel's tasks: pieces of MAX_BD_ITER token blocks, at most 4 queued)
         assert T % 8 == 0 and T // 8 <= 4 * MAX_BD_ITER and W % 8 == 0 and W >= PART and K >= COLS * groups * PART, (T, W, K)
-        self.T, self.groups, self.W, self.K = T, groups, W, K
+        assert act == "silu" or act in kmath.TABLES, act
+        self.T, self.groups, self.W, self.K, self.act = T, groups, W, K, act
         self.G = chunk_groups(groups)
         super().__init__()
 
@@ -52,7 +53,7 @@ class GateUpActOperator(ArtcOperator):
         return COLS * self.groups * 2 * self.W
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, G=self.G, W=self.W)
+        return _SRC.render(p=self.p, G=self.G, W=self.W, act=self.act)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (self.T * self.N,), bfloat16), ArgSpec("out", (self.T * self.K * 9 // 16,), bfloat16)]
@@ -65,21 +66,25 @@ class GateUpActOperator(ArtcOperator):
         s_ty = np.ndarray[(8 * G * 128,), bf]
         y_ty = np.ndarray[(8 * G * 64,), bf]
         o_ty = np.ndarray[(8 * G * 36,), bf]  # (8 G panels of 72 B)
-        k_act = Kernel(f"{p}_act", "kernel.o", [x_ty, s_ty, y_ty, o_ty, np.int32])
+        gelu = self.act != "silu"  # (the table's two copies, cold: aiecc places them)
+        lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]]
+        k_act = Kernel(f"{p}_act", "kernel.o", [x_ty, s_ty, y_ty, o_ty, *([lut_ty] * 2 if gelu else [np.int32])])
         xf = [ObjectFifo(x_ty, name=f"ga_x{c}", depth=2) for c in range(COLS)]
         of = [ObjectFifo(o_ty, name=f"ga_o{c}", depth=2) for c in range(COLS)]
 
-        def core(x_f, o_f, act, s, y):
+        def core(x_f, o_f, act, s, y, *luts):
             for _ in forever_():
                 for _ in range_(nb * nc):
                     x = x_f.acquire(1)
                     o = o_f.acquire(1)
-                    act(x, s, y, o, 0)
+                    act(x, s, y, o, *(luts or (0,)))  # (silu: the kernel's opaque runtime zero)
                     o_f.release(1)
                     x_f.release(1)
 
+        luts = [[Buffer(lut_ty, name=f"ga_{key}{c}", initial_value=kmath.TABLES[self.act].table_words())
+                 for key in ("lut", "lutb")] if gelu else [] for c in range(COLS)]
         workers = [Worker(core, [xf[c].cons(), of[c].prod(), k_act, Buffer(s_ty, name=f"ga_s{c}"),
-                                 Buffer(y_ty, name=f"ga_y{c}")],
+                                 Buffer(y_ty, name=f"ga_y{c}"), *luts[c]],
                           tile=Tile(c, 2), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS)]
         P, nh = self.groups * 2 * W, T * K * 9 // 16

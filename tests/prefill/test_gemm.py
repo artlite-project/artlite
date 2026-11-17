@@ -30,6 +30,7 @@ from artlite.model_config import (
     occamy_gguf,
     qwen3_gguf,
     qwen_gguf,
+    spark_gguf,
     swift_gguf,
 )
 from artlite.operators import bfp16
@@ -98,7 +99,19 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("lfm", "QAD-Q4_0", "", (0, 2), 0, "in", 64), ("lfm", "Q4_K_M", "", (1, 2), 2, "qkv", 256),
          ("lfm", "Q4_K_M", "", (1, 2), 1, "down", 256), ("lfm", "Q4_K_M", "", (1, 2), 1, "in", 256),
          ("lfm", "Q8_0", "", (0, 2), 2, "qkv", 256), ("lfm", "Q8_0", "", (0, 2), 0, "gate_up", 256),
-         ("lfm", "BF16", "", (0, 2), 0, "in", 256)]
+         ("lfm", "BF16", "", (0, 2), 0, "in", 256),
+         # Spark-X: the gate rows (BFP16, or the F32 gate's BF16 copy) after q, k, v; the 4B's hidden 2560 and the 1.7B's
+         # ffn 6656 padded to whole K chunks (3072, 7168); gate / up with GELU's erf form (GemmQ, GemmQd; a split block's
+         # activation: ``test_gate_up.py``)
+         ("spark", "Q4_K_M", "4B", (0, 3), 0, "attn_in", 256), ("spark", "Q4_K_M", "4B", (0, 3), 3, "attn_in", 64),
+         ("spark", "Q4_K_M", "4B", (0, 3), 0, "gate_up", 256), ("spark", "Q4_K_M", "4B", (0, 3), 0, "down", 256),
+         ("spark", "Q4_K_M", "4B", (0, 3), 3, "attn_out", 64), ("spark", "Q4_K_M", "4B", (0, 3), 0, "gate_up", 1024),
+         ("spark", "Q4_K_M", "1.7B", (0, 3), 3, "attn_in", 256), ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "gate_up", 64),
+         ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "down", 256), ("spark", "Q4_K_M", "1.7B", (0, 3), 3, "down", 1024),
+         ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "attn_out", 256),
+         ("spark", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark", "Q8_0", "4B", (0,), 0, "attn_in", 64),
+         ("spark-bartowski", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
+         ("spark-bartowski", "Q4_0", "4B", (0,), 0, "gate_up", 256), ("spark-bartowski", "Q4_0", "4B", (0,), 0, "down", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -107,7 +120,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
     """The model's image of the layers (a truncated vocabulary), packed."""
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
-            "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant)}[model]()
+            "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
+            "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski")}[model]()
     require(path)
     key = (path, layers)
     if key not in _images:
@@ -119,6 +133,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             from models.qwen35.image import QwenImage as Image
         elif model == "lfm":
             from models.lfm.image import LfmImage as Image
+        elif model.startswith("spark"):
+            from models.spark.image import SparkImage as Image
         else:
             from models.gemma4.image import GemmaImage as Image
         img = Image(g, layers=list(layers), vocab=COLS * 64)
@@ -137,6 +153,8 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
         from models.llama.prefill import plan_gemm
     elif model == "lfm":
         from models.lfm.prefill import plan_gemm
+    elif model.startswith("spark"):
+        from models.spark.prefill import plan_gemm
     else:
         return PG.plan_phase(img, region, T, pitch=pitch)
     return plan_gemm(img, region, T, pitch=pitch)
@@ -240,7 +258,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         gt, up = (_rows(img, (t,), idx, K) for t in b.tensors)
         y_g, y_u = Aq[:T] @ gt.T, Aq[:T] @ up.T
         act = (lambda y: torch.nn.functional.gelu(y, approximate="tanh")) if model == "gemma4" else \
-            torch.nn.functional.silu
+            torch.nn.functional.gelu if model.startswith("spark") else torch.nn.functional.silu
         want = act(y_g.bfloat16().float()) * y_u
         assert rel_native(C[:, idx], want) < 3.5e-2  # (and the bfp16 C panels)
         agree(lambda C, Cb: C[:, idx])

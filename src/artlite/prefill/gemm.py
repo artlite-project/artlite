@@ -14,9 +14,10 @@ the image) and the layout of their output (``Layout``):
   after it overwrites the pass's other outputs: qwen35's [alpha | beta] slot);
 - output projections (``OUT``: into the residual stream): column c's rows (hidden / 8) at c d_pitch (``d_pitch``: one
   pitch for every layer, the residual add reads it);
-- gate_up: act(gate) up as bfp16 panels (the down projection's A; ``act``: silu, or gelu for Gemma), column c's
-  outputs (ffn / 8) at their place, in rows of the down projection's K (the ffn padded to whole K chunks: MiniCPM-V's
-  3584 in rows of 4096, the padding columns never written: zero).
+- gate_up: act(gate) up as bfp16 panels (the down projection's A; ``act``: silu, or a GELU form: Gemma's gelu, Spark-X's
+  gelu_erf), column c's outputs (ffn / 8) at their place, in rows of the down projection's K (the ffn padded to whole K
+  chunks: MiniCPM-V's 3584 in rows of 4096, Spark-X 1.7B's 6656 in rows of 7168, the padding columns never written:
+  zero).
 
 A run of consecutive blocks of one tile format is one GEMM: Q4_K and BFP16 tile-major (64-row passes, GemmQ or GemmQd),
 planar tiles (Q5_K / Q6_K, Gemma's Q4_0 of 32 rows x 512 columns, ...: ``planar.choose_planar_plan``). Limits of a
@@ -273,7 +274,6 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
     """A split gate / up block (``decode.image.Block.fmt2``): a GEMM per part (passes of its tiles, a group apart: the pass
     step) of plain bf16 rows into GU ([column][group][gate W | up W], ``gate_up``), then the activation into the phase's
     output (HP: the down's panels)."""
-    assert act == "silu", act
     (b,) = region.blocks
     groups, W = image.cfg.intermediate_size // COLS // 64, split_width(b)
     P, KC = groups * 2 * W, region.kc
@@ -290,9 +290,10 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
             assert tiles * R == ROWS, (fmt, R, tiles)  # (a tile-major pass: one part of 64 rows)
         op = gemm_op(kw, T, "gu", ops)
         gemms.append(Gemm(op, region.offset - op.hdr_skip, c="GU"))
-    key = ("act", T, groups, W, image.region(region.layer, "down").K)  # (one object per distinct activation, as the GEMMs)
+    # (one object per distinct activation, as the GEMMs)
+    key = ("act", T, groups, W, image.region(region.layer, "down").K, act)
     if ops is None or key not in ops:
-        act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-1])
+        act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-2], act=act)
         if ops is not None:
             ops[key] = act_op
     return PhasePlan(gemms, None, act=ops[key] if ops is not None else act_op)
@@ -302,7 +303,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
                act: str = "silu", k_part: int = 0, layout_T: int = 0) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
     projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
-    reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu). ``k_part``: an output
+    reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu, gelu_erf). ``k_part``: an output
     projection in K parts of that many chunks (dividing a chunk group: each part's A strip may stay in the memtile, and
     each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input
     projection's layout (its planar passes) as planned for that many tokens (the layout of buffers that outlive a chunk,
