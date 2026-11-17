@@ -8,9 +8,10 @@ namespace artlite {
 
 /// The routing of n tokens (``moe.plan.route``): per token t its k largest of E logits (the router GEMM's rows: expert
 /// e at logits + t row + (e / per_col) pitch + e % per_col), largest first, ties to the lower id, into ids (n x k) and
-/// weights (n x k): e^(l - l_max) over the k in double, normalized (numpy's summation order), rounded to fp32.
-void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, int32_t* ids,
-               float* weights);
+/// weights (n x k): e^(l - l_max) over the k in double, normalized (numpy's summation order), rounded to fp32; with
+/// ``sigmoid`` sigmoid(l) over their sum (at least 2^-14).
+void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, bool sigmoid,
+               int32_t* ids, float* weights);
 
 /// The chunks of n tokens' routing (ids n x k, ``moe.plan.Plan``): an expert's (token, slot) pairs in token order, in
 /// chunks of at most ``chunk``, dealt to the cols columns in turn (expert by expert): experts (cols x cap) each

@@ -709,6 +709,20 @@ void {{ p }}_pv(const bfloat16 *__restrict v, float *__restrict ws, float *__res
 }
 
 // Head h's output: o / l of its QB row blocks as the O GEMM's A panels (per block ND panels of 8 queries x 8 dims)
+{% if SINK %}
+// The chunk's SINK object (the layer's sinks times log2 e, fp32 at the object's start: stream B's walk keeps its first 72
+// values in place): the column's heads' (hc ..) into sk
+__attribute__((minsize)) void {{ p }}_ssel(const bfloat16 *__restrict u, float *__restrict ws, int32_t hc)
+{
+    const float *__restrict v = (const float *)u;
+    for (int h = 0; h < {{ QH }}; h++)
+        AW(float, {{ w.sk }})[h] = v[hc + h];
+}
+
+{% set exp2s = km.exp2(16, prec="fp32") %}
+{{ exp2s.src }}
+
+{% endif %}
 __attribute__((minsize)) void {{ p }}_fin(float *__restrict ws, float *__restrict wo, bfloat16 *__restrict out, int32_t h)
 {
 {% if "ev_fin" in ablate %}
@@ -718,7 +732,18 @@ __attribute__((minsize)) void {{ p }}_fin(float *__restrict ws, float *__restric
     al::BOut<> po((bfp16ebs8 *)out);
     for (int j = 0; j < {{ QB }}; j++) {
         const int b = {{ QH }} * j + h;
+{% if SINK %}
+        // (8 l, each l in every lane of its row: 8 times it; the head's sink 2^(sink + bias - 128) in the same units,
+        // the bias in every lane of its row; 127: the exp2's range)
+        const aie::vector<float, 8> sb = aie::add(al::group8<true>(aie::load_v<64>(AW(float, {{ w.bias }}) + 64 * b)),
+                                                  aie::broadcast<float, 8>(AW(float, {{ w.sk }})[h] - 128.0f));
+        const aie::vector<float, 16> st = {{ exp2s }}(aie::concat(aie::min(sb, aie::broadcast<float, 8>(127.0f)),
+                                                                  aie::broadcast<float, 8>(-126.0f)));
+        const aie::vector<float, 8> ls = aie::add(al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * b)),
+                                                  aie::mul(st.template extract<8>(0), 8.0f).template to_vector<float>());
+{% else %}
         const aie::vector<float, 8> ls = al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * b));  // (8 l)
+{% endif %}
         const aie::vector<float, 16> inv = aie::inv(aie::concat(ls, aie::broadcast<float, 8>(1.0f)));
 {% if GATE %}
         const aie::vector<float, 8> gs = aie::load_v<8>(AW(float, {{ w.gt }}) + {{ 8 * QB }} * h + 8 * j);  // (the rows' gates)

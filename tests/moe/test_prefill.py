@@ -1,7 +1,8 @@
 """An MoE layer's prefill operators (artlite/moe: the router, the shared expert, the experts' work lists, the
-combine) on the decode images (``qwen35.image.QwenImage``, layers packed in host memory, each GEMM's W argument copied
-to the device) of Qwen3.6-35B-A3B Q4_K_M (layers 3, 5: Q6_K / Q4_K downs) and Occamy 1.0 APEX (layers 3, 13: Q3_K /
-IQ3_XXS experts, a Q5_K shared expert), against fp64 models on the operators' own inputs."""
+combine) on the decode images (``qwen35.image.QwenImage``, ``flint.image.FlintImage``: layers packed in host memory, each
+GEMM's W argument copied to the device) of Qwen3.6-35B-A3B Q4_K_M (layers 3, 5: Q6_K / Q4_K downs), Occamy 1.0 APEX
+(layers 3, 13: Q3_K / IQ3_XXS experts, a Q5_K shared expert) and Flint's official file (layers 2, 5: Q4_1_64 tiles, the
+top 6 by sigmoid, an ungated shared expert of 1024), against fp64 models on the operators' own inputs."""
 
 
 import numpy as np
@@ -11,8 +12,9 @@ from ml_dtypes import bfloat16
 
 import artlite
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import occamy_gguf, qwen_gguf
+from artlite.model_config import flint_gguf, occamy_gguf, qwen_gguf
 from artlite.moe import gemm as MG
+from artlite.moe.gather import SHARED_W
 from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from artlite.prefill.norm import PrefillNormOperator
@@ -23,7 +25,9 @@ from ..numerics import rel_max
 from . import ref
 
 # (model, layer): the layers each image holds
-MODELS = {"35B-A3B": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13))}
+MODELS = {"35B-A3B": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13)),
+          "flint": (flint_gguf, (2, 5))}
+FLINT = "flint"  # (its block's norm: ffn_norm; sigmoid gating; no shared gate)
 LAYERS = [(m, L) for m, (_, ls) in MODELS.items() for L in ls]
 _state: dict[str, object] = {}
 
@@ -33,10 +37,12 @@ def _image(model: str = "35B-A3B") -> tuple[GGUFFile, object, np.ndarray]:
     path, layers = MODELS[model][0](), MODELS[model][1]
     require(path)
     if _state.get("model") != model:
-        from models.qwen35.image import QwenImage
-
         g = GGUFFile(path)
-        img = QwenImage(g, layers=list(layers), vocab=COLS * 64)
+        if model == FLINT:
+            from models.flint.image import FlintImage as Image
+        else:
+            from models.qwen35.image import QwenImage as Image
+        img = Image(g, layers=list(layers), vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W)
         _state.update(model=model, g=g, img=img, W=W)
@@ -49,6 +55,16 @@ def _w_arg(op: object, W: np.ndarray, w_off: int, dev: object) -> object:
     a, b = max(w_off, 0), min(w_off + op.w_bytes, W.size)
     w[a - w_off:b - w_off] = W[a:b]
     return artlite.from_numpy(w.view(bfloat16), dev)
+
+
+def _wn(model: str, g: GGUFFile, L: int) -> np.ndarray:
+    """The MoE block's norm weight (fp64)."""
+    name = "ffn_norm" if model == FLINT else "post_attention_norm"
+    return np.asarray(g.tensor(f"blk.{L}.{name}.weight").dequantize(), np.float64).reshape(-1)
+
+
+def _gating(model: str) -> str:
+    return "sigmoid" if model == FLINT else "softmax"
 
 
 def _f32(g: GGUFFile, name: str) -> np.ndarray:
@@ -69,7 +85,7 @@ def test_router(model: str, L: int) -> None:
     """The post-attention norm with lo panels (``PrefillNormOperator(lo=True)``), then the router GEMM
     (``moe.gemm.router``: BFP16 hi / lo rows against x hi + lo, fp32 pairs): the logits within 5e-5 of fp64 math on the
     bf16 residual (rms, the fp32 norm weight, the F32 rows; x hi + lo carries ~2^-16 of each block's maximum: 2.6e-5, the
-    logits 3.1-4.2e-5), the shared gate's within 8e-5 (one row: 4.6-5.8e-5); the top 8 the oracle's where the 8th / 9th
+    logits 3.1-4.2e-5), the shared gate's within 8e-5 (one row: 4.6-5.8e-5); the top k the oracle's where the k-th / (k + 1)-th
     gap exceeds 1e-3."""
     g, img, W = _image(model)
     cfg = img.cfg
@@ -82,7 +98,7 @@ def test_router(model: str, L: int) -> None:
     dev = norm.device
     rng = np.random.default_rng(L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
+    wn = _wn(model, g, L)
     xb = artlite.from_numpy(x.reshape(-1), dev)
     xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
     norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
@@ -92,16 +108,17 @@ def test_router(model: str, L: int) -> None:
     C.sync_from_device()
     c = C.numpy().view(np.float32).reshape(T, COLS, MG.router_pitch(region))
     got = c[:, :, :E // COLS].reshape(T, E)
-    got_sg = c[:, :, router_gate(region)]
     xd = x.astype(np.float64)
     xr = xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
     want = xr @ _f32(g, f"blk.{L}.ffn_gate_inp.weight").T
-    want_sg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp_shexp.weight")[0]
-    err, err_sg = rel_max(got, want), rel_max(got_sg, np.repeat(want_sg[:, None], COLS, 1))
+    err, err_sg = rel_max(got, want), 0.0
+    if MG.gated(region):
+        want_sg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp_shexp.weight")[0]
+        err_sg = rel_max(c[:, :, router_gate(region)], np.repeat(want_sg[:, None], COLS, 1))
     print(f"layer {L}: logits rel-rms {err:.2e}, shared gate {err_sg:.2e}")
     assert err < 5e-5 and err_sg < 8e-5
-    ids, _ = ref.moe_route(got.astype(np.float32), cfg.n_experts_used)
-    rids, _ = ref.moe_route(want.astype(np.float32), cfg.n_experts_used)
+    ids, _ = ref.moe_route(got.astype(np.float32), cfg.n_experts_used, _gating(model))
+    rids, _ = ref.moe_route(want.astype(np.float32), cfg.n_experts_used, _gating(model))
     srt = np.sort(want, 1)[:, ::-1]
     clear = srt[:, cfg.n_experts_used - 1] - srt[:, cfg.n_experts_used] > 1e-3
     assert (np.sort(ids, 1) == np.sort(rids, 1)).all(1)[clear].all()
@@ -122,7 +139,7 @@ def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.
     dev = norm.device
     rng = np.random.default_rng(100 + L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
+    wn = _wn(model, g, L)
     xb = artlite.from_numpy(x.reshape(-1), dev)
     xn = artlite.empty((2 * T * H * 9 // 16,), dtype=bfloat16, device=dev)
     norm.dispatch(xb, artlite.from_numpy(np.zeros(T * H, bfloat16), dev),
@@ -132,7 +149,7 @@ def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.
 
 
 SHARED = [("35B-A3B", 3, 256), ("35B-A3B", 5, 256), ("35B-A3B", 3, 128), ("35B-A3B", 5, 64), ("occamy", 3, 128),
-          ("occamy", 13, 64)]
+          ("occamy", 13, 64), ("flint", 2, 256), ("flint", 5, 64)]
 
 
 @pytest.mark.parametrize(("model", "L", "T"), SHARED)
@@ -270,7 +287,7 @@ def test_moe_block(model: str, L: int) -> None:
     """A whole MoE block of 256 tokens (random bf16 residual) in two programs around the host's routing (``plan``):
     the norm with lo panels, the router, the shared expert (gate / up, down: the prefill's whole-chunk designs); then the
     gathered norm (XP), the experts' gate / up and down (work lists), the combine and the residual norm. The routing from the NPU's logits equals the
-    oracle's top 8 where the gaps are clear; the delta (routed + shared, ``moe_ffn`` + ``shared_expert`` on the routing
+    oracle's top k where the gaps are clear; the delta (routed + shared, ``moe_ffn`` + ``shared_expert`` on the routing
     the NPU's logits give) within 2.5e-2 of fp64 (the experts' bfp16 inputs and weights, bf16 H and y); the residual
     x + delta exactly the bf16 sum."""
     from artlite.moe import plan as MP
@@ -291,14 +308,14 @@ def test_moe_block(model: str, L: int) -> None:
     gnorm = GatherNormOperator(E=H, eps=eps, cap=cap)
     gu = ExpertGemmOperator.of("gu", img.region(L, "exp_gu"), cap=cap, out=F)
     dn = ExpertGemmOperator.of("down", img.region(L, "exp_down"), cap=cap, out=H)
-    comb = CombineOperator(E=H, T=T, ds_pitch=pitch, y_layout=dn.y_layout)
+    comb = CombineOperator(E=H, T=T, ds_pitch=pitch, y_layout=dn.y_layout, K=K)
     norm = PrefillNormOperator(T=T, E=H, eps=eps)
     ops = [norm_lo, router.op, sgu.op, sdown.op, gnorm, gu, dn, comb, norm]
     lib = Library(f"t_moe_block_{model}{L}", ops).compile().load()
     dev = lib.device
     rng = np.random.default_rng(10 + L)
     x = (rng.standard_normal((T, H)) * 2).astype(np.float32).astype(bfloat16)
-    wn = np.asarray(g.tensor(f"blk.{L}.post_attention_norm.weight").dequantize(), np.float64).reshape(-1)
+    wn = _wn(model, g, L)
     bufs = {}
 
     def buf(name: str, n: int, init: np.ndarray | None = None) -> object:
@@ -332,8 +349,8 @@ def test_moe_block(model: str, L: int) -> None:
     for k in ("LG", "PX"):
         bufs[k].sync_from_device()
     lg = bufs["LG"].numpy().view(np.float32).reshape(T, COLS, MG.router_pitch(mi))
-    logits, sg = lg[:, :, :E // COLS].reshape(T, E), lg[:, 0, MG.PASS // 2]
-    ids, w = MP.route(logits, K)
+    logits, sg = lg[:, :, :E // COLS].reshape(T, E), lg[:, 0, MG.PASS // 2] if MG.gated(mi) else None
+    ids, w = MP.route(logits, K, gating=_gating(model))
     plan = MP.Plan.of(ids, cap=cap, E=E)
     counts = plan.counts
     # the control streams, the weights, the counts
@@ -359,7 +376,7 @@ def test_moe_block(model: str, L: int) -> None:
         v[c * comb.cb_words:c * comb.cb_words + words.size] = words
     wt = bufs["DS"]._raw.map().view(np.float32).reshape(sdown.op.M, -1)[:T, COLS * pitch // 2:]  # (a row's weights)
     wt[:, :K] = w
-    wt[:, K] = 1 / (1 + np.exp(-sg.astype(np.float64)))
+    wt[:, SHARED_W] = 1 / (1 + np.exp(-sg.astype(np.float64))) if MG.gated(mi) else 1.0
     for k in ("CBG", "CBU", "CBD", "CBC", "DS"):
         bufs[k]._raw.sync_to_device()
     groups = [int((-(-plan.sizes[c] // CHAIN)).sum()) for c in range(COLS)]
@@ -373,14 +390,14 @@ def test_moe_block(model: str, L: int) -> None:
     xd = x.astype(np.float64)
     xr = xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + eps) * wn
     want_lg = xr @ _f32(g, f"blk.{L}.ffn_gate_inp.weight").T
-    rids, _ = ref.moe_route(want_lg.astype(np.float32), K)
+    rids, _ = ref.moe_route(want_lg.astype(np.float32), K, _gating(model))
     srt = np.sort(want_lg, 1)[:, ::-1]
     clear = srt[:, K - 1] - srt[:, K] > 1e-3
     assert (np.sort(ids, 1) == np.sort(rids, 1)).all(1)[clear].all()
     b = f"blk.{L}."
     shared = ref.shared_expert(xr, *(g.tensor(b + t).dequantize() for t in
                                      ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
-                               _f32(g, b + "ffn_gate_inp_shexp.weight")[0])
+                               _f32(g, b + "ffn_gate_inp_shexp.weight")[0] if MG.gated(mi) else None)
     want = ref.moe_ffn(xr, ids, w, ref.experts(g, L)) + shared
     err, rms = rel_max(got, want), np.sqrt(((got - want) ** 2).mean() / (want ** 2).mean())
     print(f"layer {L}: chunks per column {counts}; delta err max {err:.2e}, rms {rms:.2e}")

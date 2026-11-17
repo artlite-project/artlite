@@ -38,10 +38,12 @@ double row_sum(const double* a, int n) {
   return s;
 }
 
+constexpr double kMinWeightSum = 6.103515625e-5;  // (sigmoid gating: the weights' sum at least 2^-14, llama.cpp's clamp)
+
 // (the reference: per token an insertion sort of ordered keys; NaN logits and the shapes ``route_rows_avx512`` does
 // not take)
 void route_rows_scalar(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E,
-                       int k, int32_t* ids, float* weights) {
+                       int k, bool sigmoid, int32_t* ids, float* weights) {
   // per token the k largest keys, descending: a logit's ordered bits, then ~id (ties to the lower id; -0 as +0)
   std::vector<uint64_t> top(k + 1);
   std::vector<double> e(k);
@@ -62,9 +64,10 @@ void route_rows_scalar(const float* logits, int64_t t0, int64_t t1, int64_t row,
     for (int j = 0; j < k; j++) {
       const int32_t x = int32_t(~uint32_t(top[j]));
       ids[t * k + j] = x;
-      e[j] = std::exp(double(p[(x / per_col) * pitch + x % per_col]) - l0);
+      const double l = p[(x / per_col) * pitch + x % per_col];
+      e[j] = sigmoid ? 1.0 / (1.0 + std::exp(-l)) : std::exp(l - l0);
     }
-    const double s = row_sum(e.data(), k);
+    const double s = sigmoid ? std::max(row_sum(e.data(), k), kMinWeightSum) : row_sum(e.data(), k);
     for (int j = 0; j < k; j++) weights[t * k + j] = float(e[j] / s);
   }
 }
@@ -93,7 +96,7 @@ __m512d exp_nonpos(__m512d x) {
 // id; -0 == +0 as the scalar path's keys). The weights: exp_nonpos (k == 8) in numpy's summation order. A token with a
 // NaN logit goes to the scalar path.
 void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E,
-                       int k, int32_t* ids, float* weights) {
+                       int k, bool sigmoid, int32_t* ids, float* weights) {
   const int nv = E / 16, vpc = per_col / 16;
   const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
   __m512 v[32];
@@ -111,7 +114,7 @@ void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row,
       nan |= _mm512_cmp_ps_mask(v[j], v[j], _CMP_UNORD_Q);
     }
     if (nan) {
-      route_rows_scalar(logits, t, t + 1, row, per_col, pitch, E, k, ids, weights);
+      route_rows_scalar(logits, t, t + 1, row, per_col, pitch, E, k, sigmoid, ids, weights);
       continue;
     }
     __m512 m[32];  // (a max tree)
@@ -153,10 +156,11 @@ void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row,
       tv[j] = x, ti[j] = ci[i];
     }
     for (int j = 0; j < k; j++) ids[t * k + j] = ti[j];
-    if (k != 8) {
+    if (k != 8 || sigmoid) {
       double e[16];
-      for (int j = 0; j < k; j++) e[j] = std::exp(double(tv[j]) - double(tv[0]));
-      const double s = row_sum(e, k);
+      for (int j = 0; j < k; j++)
+        e[j] = sigmoid ? 1.0 / (1.0 + std::exp(-double(tv[j]))) : std::exp(double(tv[j]) - double(tv[0]));
+      const double s = sigmoid ? std::max(row_sum(e, k), kMinWeightSum) : row_sum(e, k);
       for (int j = 0; j < k; j++) weights[t * k + j] = float(e[j] / s);
       continue;
     }
@@ -170,27 +174,27 @@ void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row,
 }
 
 void route_rows(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E, int k,
-                int32_t* ids, float* weights) {
+                bool sigmoid, int32_t* ids, float* weights) {
   if (k <= 16 && per_col % 16 == 0 && E % per_col == 0 && E <= 512)
-    route_rows_avx512(logits, t0, t1, row, per_col, pitch, E, k, ids, weights);
+    route_rows_avx512(logits, t0, t1, row, per_col, pitch, E, k, sigmoid, ids, weights);
   else
-    route_rows_scalar(logits, t0, t1, row, per_col, pitch, E, k, ids, weights);
+    route_rows_scalar(logits, t0, t1, row, per_col, pitch, E, k, sigmoid, ids, weights);
 }
 
 }  // namespace
 
-void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, int32_t* ids,
-               float* weights) {
+void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, bool sigmoid,
+               int32_t* ids, float* weights) {
   if (k < 1 || k > E || E % per_col) throw Error(std::format("moe_route: k {} of E {} ({} per column)", k, E, per_col));
   // (threads of 4096 tokens at least: the vector path takes ~0.16 us per token, a thread's start ~0.1 ms)
   const int64_t nt = std::min<int64_t>(n / 4096, std::max(1u, std::thread::hardware_concurrency() / 2));
   if (nt <= 1) {
-    route_rows(logits, 0, n, row, per_col, pitch, E, k, ids, weights);
+    route_rows(logits, 0, n, row, per_col, pitch, E, k, sigmoid, ids, weights);
     return;
   }
   std::vector<std::thread> ts;
   for (int64_t t = 0; t < nt; t++)
-    ts.emplace_back(route_rows, logits, n * t / nt, n * (t + 1) / nt, row, per_col, pitch, E, k, ids, weights);
+    ts.emplace_back(route_rows, logits, n * t / nt, n * (t + 1) / nt, row, per_col, pitch, E, k, sigmoid, ids, weights);
   for (auto& t : ts) t.join();
 }
 

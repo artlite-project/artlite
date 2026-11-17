@@ -27,18 +27,21 @@ from ..prefill.norm import PrefillNormOperator
 from . import gemm as MG
 from . import plan as MP
 from .expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
-from .gather import CHAIN, CombineOperator, GatherNormOperator, ds_row
+from .gather import CHAIN, SHARED_W, CombineOperator, GatherNormOperator, ds_row
 
 
 class MoEPrefill:
-    """The MoE blocks of ``layers`` of an image (``qwen35.image.QwenImage``'s MoE regions) for chunks of ``sizes``
-    tokens (sub-chunks of at most ``sub``)."""
+    """The MoE blocks of ``layers`` of an image (``moe.image``'s MoE regions: qwen35moe's, flint's) for chunks of
+    ``sizes`` tokens (sub-chunks of at most ``sub``); ``gating``: the routing's weights ("softmax", "sigmoid": ``plan``);
+    a shared expert without a gate row (``gemm.gated``) weighs 1."""
 
-    def __init__(self, image: object, *, layers: list[int], sizes: tuple[int, ...], sub: int, eps: float):
+    def __init__(self, image: object, *, layers: list[int], sizes: tuple[int, ...], sub: int, eps: float,
+                 gating: str = "softmax"):
         cfg = image.cfg
-        self.img, self.layers, self.sub, self.eps = image, layers, sub, eps
+        self.img, self.layers, self.sub, self.eps, self.gating = image, layers, sub, eps, gating
         self.H, self.E, self.K = cfg.hidden_size, cfg.n_experts, cfg.n_experts_used
         self.F, self.Fs = cfg.expert_ffn, cfg.shared_ffn
+        self.gated = MG.gated(image.region(layers[0], "moe_in"))
         max_t = max(sizes)
         self.cap = -(-(self.E + -(-max_t * self.K // CHUNK)) // COLS)
         self.pitch = MG.shared_pitch(image, layers)
@@ -49,8 +52,8 @@ class MoEPrefill:
                    for L in layers}
         self.dn = {L: self._op(ExpertGemmOperator.of("down", image.region(L, "exp_down"), cap=self.cap, out=self.H))
                    for L in layers}
-        self.comb = {(T, op.y_layout): CombineOperator(E=self.H, T=T, ds_pitch=self.pitch, y_layout=op.y_layout)
-                     for T in sizes for op in self.dn.values()}
+        self.comb = {(T, op.y_layout): CombineOperator(E=self.H, T=T, ds_pitch=self.pitch, y_layout=op.y_layout,
+                                                       K=self.K) for T in sizes for op in self.dn.values()}
         self.y_pitch = max(op.N for op in self.dn.values())
         # (the post-attention norm with lo panels: the out projection's output at the prefill's column pitch)
         dp = {t: PG.d_pitch(image, t) for t in {min(T, sub) for T in sizes}}
@@ -137,8 +140,8 @@ class MoEPrefill:
         dev.fetch("LG", 0, T * rb["LG"])
         lg = dev.view("LG")[:T * rb["LG"]].view(np.float32).reshape(T, -1)
         pitch = lg.shape[1] // COLS
-        ids, wts = MP.route(lg[:n], self.K, E=self.E, per_col=self.E // COLS, pitch=pitch)
-        sg = lg[:n, MG.PASS // 2].astype(np.float64)
+        ids, wts = MP.route(lg[:n], self.K, E=self.E, per_col=self.E // COLS, pitch=pitch, gating=self.gating)
+        sg = lg[:n, MG.PASS // 2].astype(np.float64) if self.gated else None
         plan = MP.Plan.of(ids, cap=self.cap, E=self.E)
         px = self._addr(dev, lib, "PX") + 2 * self.H * np.arange(T, dtype=np.int64)
         w = self.gnorm.cb_words
@@ -186,7 +189,7 @@ class MoEPrefill:
         wt = dev.view("DS")[:T * rb["DS"]].view(np.float32).reshape(T, -1)[:, COLS * self.pitch // 2:]
         wt[:] = 0
         wt[:n, :self.K] = wts
-        wt[:n, self.K] = 1 / (1 + np.exp(-sg))
+        wt[:n, SHARED_W] = 1 / (1 + np.exp(-sg)) if sg is not None else 1.0
         for name in ("CBU", "CBD", "CBC"):
             dev.flush(name)
         dev.flush("DS", 0, T * rb["DS"])  # (the weights' lines: the host writes no other line of DS)

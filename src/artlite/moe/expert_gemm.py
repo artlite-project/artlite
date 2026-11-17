@@ -29,7 +29,8 @@ planar format's: one SiLU group, in two halves) in the halves' order: H = silu(g
 width. "down": the slab's "exp_down" (all hidden rows over a half's columns, row groups of 4), the halves as two K
 chunks one slab stride apart (A: the expert's H, 512 columns), two slots per C object (``GemmQOperator.slots``), passes
 of up to 4 tiles of at most 64 rows (21-row tiles 3: 9 passes instead of 13 of 2, 195 -> 168 us per chunk). Tile
-formats: Q4_K and BFP16 (tile-major), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS's units: ``formats.Slot.unit_bytes``).
+formats: Q4_K, Q4_1_64 and BFP16 (tile-major; a header expanded per super-block, or the halves' headers straight into
+their scale workspaces), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS's units: ``formats.Slot.unit_bytes``).
 """
 
 import functools
@@ -454,17 +455,18 @@ class ExpertGemmOperator(GemmQdOperator):
                                     sbk(hb0, ws0, sb)
                                 dq_tiles(bf, dfo, dq, ws0, sb, ex)
                         continue
-                    for hb in (hb0, hb1):  # (the halves' header units, in turn)
+                    for hb, ws in ((hb0, ws0), (hb1, ws1)):  # (the halves' header units, in turn)
                         for kt in range_(4):
                             b = bf.acquire(1)
-                            hdr(b, hb, *([0] if dk.unit else []), kt)
+                            hdr(b, hb if dk.collect else ws, *([0] if dk.unit else []), kt)
                             bf.release(1)
                     if chunk is not None:
                         chunk(hb0, ws0)
                         chunk(hb1, ws1)
                     for sb in range_(nsb):  # (G = nsb: a slot per super-block, both halves')
                         for hb, ws in ((hb0, ws0), (hb1, ws1)):
-                            sbk(hb, ws, sb)
+                            if sbk is not None:
+                                sbk(hb, ws, sb)
                             dq_tiles(bf, dfo, dq, ws, sb, ex)
 
         c_pack, silu, pingpong = self.c_pack, self.silu, self.pingpong

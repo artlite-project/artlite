@@ -14,7 +14,7 @@ straight into the column's core, one 4 KB row an object).
   ds; the weights fp32, as bf16 hi + lo products into an fp32 sum, rounded once), for the residual norm that adds it.
   A row of Y is read as the runs of its chunk slot's pass-major layout (``expert_gemm.ExpertGemmOperator.y_layout``),
   through the column's memtile, which sends it on in output order.
-  A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_7, w_s, 0 ..]: 64 bytes, a cache line of their own
+  A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_k-1, 0 .., w_s at ``SHARED_W``, 0 ..]: 64 bytes, a cache line of their own
   past the GEMM's outputs, which the host writes per layer): a column's input is one strided transfer.
 
 Both read their per-layer lists from the host (``plan``): the gather norm the column's row groups (bits 8 .. of the
@@ -60,6 +60,7 @@ BLOCK_BDS = (5, 14)
 DRAIN_BDS, LOCKS = (4, 8), (2, 3)  # (the gather norm's per-chunk drains: two sets, a shim lock each)
 DRAIN_WORDS = 2 * 6 + 3  # (a chunk's drain BD and push)
 WT_ROW = 16  # fp32 per token of the combine's weights
+SHARED_W = 8  # (the shared expert's weight's index in them: after 8 experts' at most)
 
 _SRC = templating.load("artlite/moe/gather.cc.jinja")
 
@@ -295,11 +296,12 @@ class CombineOperator(_Gathered):
     """The delta of an MoE layer's T tokens (module docstring): arguments the control streams (per column
     ``cb_words``), DS (per token its shared-down row and weights: ``ds_row``), the output (T rows of E bf16). Column c
     takes tokens c T / COLS .. ; ``ds_pitch``: the shared down's column pitch; ``y_layout``: Y's chunk slots
-    (``ExpertGemmOperator.y_layout``)."""
+    (``ExpertGemmOperator.y_layout``); K: the experts per token (their weights the first K, the shared expert's at
+    ``SHARED_W``)."""
 
-    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int, int]):
-        assert T % COLS == 0 and ds_pitch % 32 == 0
-        self.T, self.y_layout = T, tuple(y_layout)
+    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int, int], K: int = 8):
+        assert T % COLS == 0 and ds_pitch % 32 == 0 and 1 <= K <= SHARED_W
+        self.T, self.y_layout, self.K = T, tuple(y_layout), K
         passes, vp, tiles, run, row = self.y_layout
         assert passes * vp * tiles * run >= E and run % 2 == 0 and row >= tiles * run
         super().__init__(E=E, ds_pitch=ds_pitch)
@@ -317,7 +319,7 @@ class CombineOperator(_Gathered):
 
     @property
     def cb_words(self) -> int:
-        return -(-(self.b0_words + self.stream_words(self.T // COLS * 8)) // 16) * 16
+        return -(-(self.b0_words + self.stream_words(self.T // COLS * self.K)) // 16) * 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16),
@@ -349,7 +351,7 @@ class CombineOperator(_Gathered):
             for _ in range_(tpc):
                 d = d_f.acquire(1)
                 cs(d, acc)
-                for i in range_(8):
+                for i in range_(self.K):
                     y = y_f.acquire(1)
                     cy(y, d, acc, i)
                     y_f.release(1)

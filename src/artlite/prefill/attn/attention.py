@@ -33,7 +33,7 @@ from ...operators.util import Attr, mask64, regions
 
 # scratchpad parameters
 from .layout import OS, STACK, l1_layout, two_copies, workspace_regions
-from .mode import AttnMode, Kind
+from .mode import AttnMode, Kind, swa_groups
 from .ring import MT_BYTES, mt_bytes, ring_memtiles
 from .shape import P_FG, P_FH, P_FO, P_FQ, P_G0, P_HK, P_P8, P_SW, Shape
 
@@ -66,7 +66,11 @@ class AttnOperator(ArtcOperator):
     row q sees the keys below the state's end S (``P_HK``) and its own, lo .. hi - 1 (the SEG argument, ``set_seg``: an
     object per pass after the GATE object, per row lo then hi, int16): the state's rows and the padding's every key of
     the prompt, a question's rows the state's and their question's. Key chunks no row of a core sees are skipped, those
-    some row sees in part masked (-1e30)."""
+    some row sees in part masked (-1e30).
+
+    Sinks (``Shape.sink``: Flint's learned sink per query head, an extra logit with no value): the SK argument (``sinks``:
+    the layer's, fp32 times log2 e) is stream B's first object of the chunk; each core keeps its column's heads' and
+    adds 2^(sink + bias - 128) to each row's l at the pass's end (``fin``: the softmax's terms are 2^(s + bias - 128))."""
 
     pfx = kernel_prefix("paa")
     # stats builds: core counters 0: cycles in the region, 1: lock (memory) stall cycles, 2: all cycles, 3: windows
@@ -97,6 +101,7 @@ class AttnOperator(ArtcOperator):
         self.n_pass = T // self.pq
         self.mode = AttnMode.make(s, T=T, m=self.m, window=window, ring=ring, swa=swa, kv0=kv0, bcast=bcast,
                                   causal=causal)
+        assert not (s.sink and (ring or self.mode.kind is Kind.NONCAUSAL)), "sinks: the causal and window designs"
         if ring:
             assert mt_bytes(s, ring=ring, window=window, qb=self.qb) <= MT_BYTES, "a column's memory tile"
         self.oc = 2 if two_copies(self) is not None else 1  # (o's copies: ``l1_layout``)
@@ -139,8 +144,14 @@ class AttnOperator(ArtcOperator):
 
     def workspace(self) -> dict[str, int]:
         gt = [("gt", 32 * self.qb * self.shape.qh)] if self.shape.gate else []
+        sk = [("sk", 4 * self.shape.qh)] if self.shape.sink else []  # (the core's heads' sinks log2 e)
         return regions(workspace_regions(self.qb * self.shape.qh, self.cr, self.qb if self.win else 0,
-                                    self.qb if self.nc else 0) + gt)
+                                    self.qb if self.nc else 0) + gt + sk)
+
+    @property
+    def wg(self) -> int:
+        """(sliding window) The cache groups a pass streams before its own (``mode.swa_groups``)."""
+        return swa_groups(self.swa, self.shape.pg) if self.swa else 0
 
     @property
     def max_segment(self) -> int:
@@ -150,7 +161,9 @@ class AttnOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         p = self.pfx
         s = self.shape
-        tri, tril = mask64(lambda q, j: j > q), mask64(lambda q, j: j <= q)
+        # (tril: the window's boundary record, keys q - 8 WR + i, masked at a distance of the window or more: i <= q for
+        # a window of whole records, i < q for one more position)
+        tri, tril = mask64(lambda q, j: j > q), mask64(lambda q, j: j <= q - self.swa % 8)
         w = self.workspace()
         cur = f" + {OS} * AW(int32_t, {w['st']})[15]" if self.oc == 2 else ""
         return _ATTN.render(p=p, w=Attr(w), ND=s.nd, QB=self.qb, QH=s.qh, RB=self.qb * s.qh, CR=self.cr,
@@ -158,7 +171,7 @@ class AttnOperator(ArtcOperator):
                             KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
                             WIN=self.win, RG=s.rg, RING=self.ring, R=self.win + 1, GQ=s.rg // self.cr,
                             HBC=self.ring * s.rg // self.cr, SWA=self.swa > 0, WR=self.swa // 8,
-                            WG=self.swa // s.pg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc)
+                            WG=self.wg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc, SINK=s.sink)
 
     @property
     def n_qs(self) -> int:
@@ -177,10 +190,24 @@ class AttnOperator(ArtcOperator):
         """bf16 of the SEG argument (packed): an object of two units per pass."""
         return self.n_pass * self.shape.unit
 
+    @property
+    def n_sk(self) -> int:
+        """bf16 of the SK argument (``Shape.sink``): one object of two units, the layer's sinks (``sinks``) first."""
+        return self.shape.unit
+
+    def sinks(self, sk: np.ndarray) -> np.ndarray:
+        """The SK argument's bytes (uint8) of a layer's sinks (heads,): fp32 times log2 e, the B stream's first values
+        (its walk keeps an object's first 72 in place)."""
+        out = np.zeros(self.n_sk, bfloat16)
+        assert sk.size * 2 <= 72
+        out[:2 * sk.size] = (np.asarray(sk, np.float64) / np.log(2)).astype(np.float32).view(bfloat16)
+        return out.view(np.uint8)
+
     def get_arg_spec(self) -> list[ArgSpec]:
         seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.mode.has_seg else []
+        sk = [ArgSpec("in", (self.n_sk,), bfloat16)] if self.shape.sink else []
         return [ArgSpec("in", (self.n_qs,), bfloat16), ArgSpec("in", (self.n_kv,), bfloat16),
-                ArgSpec("out", (self.n_a,), bfloat16), *seg]
+                ArgSpec("out", (self.n_a,), bfloat16), *seg, *sk]
 
     def seg(self, lo: np.ndarray) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk: ``lo`` (T,) per token the chunk-relative first key of its
@@ -251,6 +278,7 @@ class AttnOperator(ArtcOperator):
         k_pv = Kernel(f"{p}_pv", "kernel.o", [u_ty, ws_ty, wo_ty, pp_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, wo_ty, o_ty, np.int32])
         k_gsel = Kernel(f"{p}_gsel", "kernel.o", [u_ty, ws_ty, np.int32]) if s.gate else None
+        k_ssel = Kernel(f"{p}_ssel", "kernel.o", [u_ty, ws_ty, np.int32]) if s.sink else None
         p_p8, p_fq = ScratchpadParameter(P_P8, np.int32), ScratchpadParameter(P_FH if self.ring else P_FQ, np.int32)
         p_fg, p_fo = ScratchpadParameter(P_FG, np.int32), ScratchpadParameter(P_FO, np.int32)
         p_sw = ScratchpadParameter(P_SW, np.int32)
@@ -311,7 +339,7 @@ class AttnOperator(ArtcOperator):
             else:
                 init(ws, wo, p8.read(), bg, bb)
             if self.swa:  # (the window's groups and the pass's)
-                n = gq * (self.swa // s.pg + 1)
+                n = gq * (self.wg + 1)
             else:
                 n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
             if self.swa or self.nc:  # (non-causal: the prompt's groups, every pass)
@@ -345,7 +373,17 @@ class AttnOperator(ArtcOperator):
         npg = n_pass // m  # (the chunk's groups)
 
         def core(a_h, b_h, o_h, init, qsel, qk, pv, fin, ws, wo, pp, q, p8, fq, me, row, *extra):
+            sk, extra = (extra[-2:], extra[:-2]) if s.sink else (None, extra)
             seg, gs = (extra[:-2], extra[-2:]) if s.gate else (extra, None)
+
+            def sinks() -> None:  # (the chunk's SINK object: two units, the first read; the column's heads' sinks)
+                if sk is not None:
+                    u = b_h.acquire(1)
+                    sk[0](u, ws, sk[1])
+                    b_h.release(1)
+                    b_h.acquire(1)
+                    b_h.release(1)
+
             if self.ring:  # (every pass the held history and the whole ring)
                 for _ in forever_():
                     for bg in range_(npg):
@@ -353,6 +391,7 @@ class AttnOperator(ArtcOperator):
                              2 * rb * s.qp, *seg)
                 return
             for _ in forever_():
+                sinks()
                 # (packed: the passes whose window is every group of the chunk after its first, then the rest's last
                 # win)
                 for bg in range_(min(npg, win + 1) if win else npg):
@@ -377,7 +416,8 @@ class AttnOperator(ArtcOperator):
                                  Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq,
                                  rb * (r + 4 * jb(c)), r,
                                  *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win or self.nc else []),
-                                 *([k_gsel, r + 4 * jb(c)] if s.gate else [])],
+                                 *([k_gsel, r + 4 * jb(c)] if s.gate else []),
+                                 *([k_ssel, qh * c] if s.sink else [])],
                           tile=Tile(c, 2 + r), stack_size=STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs, n_kv, n_a, NH = self.n_qs, self.n_kv, self.n_a, COLS * qh
@@ -389,10 +429,11 @@ class AttnOperator(ArtcOperator):
         else:
             k_tap = [1, 1, rows, 576], [0, g2, 576, 1]
 
-        n_seg = self.n_seg
+        n_seg, n_sk = self.n_seg, self.n_sk
 
         def seq(QS, KV, A, *rest):
-            *seg, ah, bh, oh = rest  # (packed: SEG)
+            *extra, ah, bh, oh = rest  # (packed: SEG; sinks: SK)
+            seg, SK = (extra[:-1], extra[-1]) if s.sink else (extra, None)
 
             def kv_part(off: int, n: int = 0, *, sizes: list[int], strides: list[int]) -> ChainPart:
                 """A KV head's groups from ``off`` (bf16): the history's (P_FG groups, n = 0) or n of the chunk's from
@@ -423,7 +464,7 @@ class AttnOperator(ArtcOperator):
             # (a pass's fills: at most three in flight, within the shim tiles' BDs; packed or gated: two, their SEG / GATE
             # parts more)
             inflight = []
-            tw, gw2, wg = s.tgu // 2, s.gw // 2, self.swa // s.pg  # (QS's token groups; a group's gates; window groups)
+            tw, gw2, wg = s.tgu // 2, s.gw // 2, self.wg  # (QS's token groups; a group's gates; window groups)
             for b in range(n_pass):
                 tp = TaskGroup()
                 ng = b // m  # (the chunk's groups after its first that the pass streams; packed: the last win of them)
@@ -450,8 +491,14 @@ class AttnOperator(ArtcOperator):
                                                                    [0, sg * tw, tw, 1])),
                                  ChainPart(QS, TensorAccessPattern((n_qs,), 0, [1, 1, 1, s.unit - nc * 4 * qb * gw2],
                                                                    [0, 0, 0, 1]))]
+                    elif nc > 1:  # (the broadcast: both columns' Q units of the pass's token groups, contiguous per column)
+                        parts = [ChainPart(QS, TensorAccessPattern((n_qs,), qc, [1, nc, 4 * qb * qh, uw],
+                                                                   [0, sg * tw, uw, 1]))]
                     else:
                         parts = [ChainPart(QS, TensorAccessPattern((n_qs,), qc, [1, 1, 4 * qb * qh, uw], [0, 0, uw, 1]))]
+                    if SK is not None and b == 0:  # (the chunk's SINK object first)
+                        parts.insert(0, ChainPart(SK, TensorAccessPattern((n_sk,), 0, [1, 1, n_sk // 576, 576],
+                                                                          [0, 0, 576, 1])))
                     if seg:
                         parts.append(ChainPart(seg[0], TensorAccessPattern((n_seg,), b * s.unit,
                                                                            [1, 1, s.unit // 576, 576], [0, 0, 576, 1])))
@@ -508,6 +555,7 @@ class AttnOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if win or self.nc else []),
+                           *([np.ndarray[(n_sk,), bf]] if s.sink else []),
                            [a3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [b3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])

@@ -32,8 +32,13 @@ def test_attn_mode_refuses_combinations() -> None:
     with pytest.raises(AssertionError):  # (the ring needs the packed window)
         AttnMode.make(HILO, T=512, m=1, ring=3)
     assert AttnMode.make(HILO, T=512, m=1, window=2, ring=3).kind is Kind.RING
-    with pytest.raises(AssertionError):  # (the broadcast: LFM3's shapes with gates)
-        AttnMode.make(Shape(hd=64, qh=2, kp=1, a_bytes=9280, per=2), T=512, m=1)
+    flint = Shape(hd=128, qh=4, kp=2, a_bytes=9216, per=2, sink=True)  # (the broadcast without gates, a window of 513)
+    assert AttnMode.make(flint, T=512, m=2).bcast
+    assert AttnMode.make(flint, T=512, m=2, swa=513, kv0=8 * flint.group).kind is Kind.SWA
+    with pytest.raises(AssertionError):  # (one position past whole records at most)
+        AttnMode.make(flint, T=512, m=2, swa=514, kv0=8 * flint.group)
+    with pytest.raises(AssertionError):  # (its guard: the 8 groups keys p - 512 .. p reach)
+        AttnMode.make(flint, T=512, m=2, swa=513, kv0=7 * flint.group)
 
 
 def test_blocks_fit_the_core() -> None:

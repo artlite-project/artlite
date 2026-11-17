@@ -3,7 +3,7 @@ qwen35's ``QwenImage``, Gemma 4's ``GemmaImage``: slices of a few layers, read i
 model's prefill plans them, with random bfp16 activations, against the dequantized GGUF rows: input projections at
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
-Q4_1 (planar at 1024 columns; Gemma's at 512), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
+Q4_1 (planar at 1024 columns; Gemma's at 512), Q4_1_64 (tile-major: Flint's), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
 file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups; Gemma's
 16-row copy of the per-layer projection), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
 in / out and its qkv with a gate block of one tile (two rows a column). The GEMMs
@@ -24,6 +24,7 @@ from artlite.gemm.pacing import PACE, pace_word
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
     decision_gguf,
+    flint_gguf,
     gemma_gguf,
     lfm3_gguf,
     llama_gguf,
@@ -118,7 +119,11 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 256), ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 1024),
          ("spark-tails", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark-tails", "Q8_0", "4B", (0,), 0, "attn_in", 64),
          ("spark-bartowski-tails", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
-         ("spark-bartowski-tails", "Q4_0", "4B", (0,), 0, "gate_up", 256)]
+         ("spark-bartowski-tails", "Q4_0", "4B", (0,), 0, "gate_up", 256),
+         # Flint's official file: Q4_1_64 (tile-major, the compact header); o's K 4096, down's 6144
+         ("flint", "int4", "", (0, 2), 0, "qkv", 256), ("flint", "int4", "", (0, 2), 2, "qkv", 64),
+         ("flint", "int4", "", (0, 2), 0, "o", 256), ("flint", "int4", "", (0, 2), 0, "gate_up", 256),
+         ("flint", "int4", "", (0, 2), 0, "down", 256), ("flint", "int4", "", (0, 2), 2, "o", 64)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -128,8 +133,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
             "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
-            "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski")
-            }[model.removesuffix("-tails")]()
+            "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski"),
+            "flint": lambda: flint_gguf(quant)}[model.removesuffix("-tails")]()
     require(path)
     key = (path, layers, model.endswith("-tails"))
     if key not in _images:
@@ -143,6 +148,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             from models.lfm.image import LfmImage as Image
         elif model.startswith("spark"):
             from models.spark.image import SparkImage as Image
+        elif model == "flint":
+            from models.flint.image import FlintImage as Image
         else:
             from models.gemma4.image import GemmaImage as Image
         img = Image(g, layers=list(layers), vocab=COLS * 64,

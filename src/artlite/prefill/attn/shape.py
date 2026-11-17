@@ -30,9 +30,10 @@ P_SW = "pa_sw"  # (sliding window) bf16 offset of the chunk's first cache group 
 class Shape:
     """The attention's shapes: head_dim, query heads per column, K panels per record, the cache's object bytes, Q panels
     per row block (``qp``: 1 single bfp16, 2 hi + lo), P panels per row block and record (``pp``: 1, 2), columns per KV
-    head (``per``: 1, Llama's; 2, LFM3's: the KV head's K and V halves in the two columns' G slices), a sigmoid output
-    gate per head (``gate``: its logits the G slices' block "g", per token group the column's heads' gates after their
-    Q units in QS)."""
+    head (``per``: 1, Llama's; 2, LFM3's and Flint's: the KV head's K and V halves in the two columns' G slices), a
+    sigmoid output gate per head (``gate``: its logits the G slices' block "g", per token group the column's heads' gates
+    after their Q units in QS), learned sinks (``sink``: per query head an extra logit with no value, the layer's sinks
+    the attention's SK argument)."""
 
     hd: int
     qh: int
@@ -42,6 +43,7 @@ class Shape:
     pp: int = 1
     per: int = 1
     gate: bool = False
+    sink: bool = False
 
     @cached_property
     def kvh(self) -> int:  # KV heads (of the array's columns)

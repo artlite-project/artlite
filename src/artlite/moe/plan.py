@@ -2,9 +2,9 @@
 every token and their weights: ``route``) and the experts' chunks dealt to the columns (``Plan``), for the columns'
 control streams of the work-list operators (``expert_gemm``, ``gather``: their ``stream``).
 
-The routing is llama.cpp's (``build_moe_ffn``: softmax gating, the top k, the weights renormalized): the k largest
-logits (ties to the lower id: the decode's ``route.top_k``), w = e^(l - l_max) over the k, normalized; the shared
-expert's gate sigmoid(l_s).
+The routing is llama.cpp's (``build_moe_ffn``: the top k, the weights renormalized): the k largest logits (ties to the
+lower id: the decode's ``route.top_k``), w = e^(l - l_max) over the k (softmax gating, qwen35moe) or sigmoid(l) (flint),
+normalized; a gated shared expert's gate sigmoid(l_s).
 
 A chunk is up to ``CHUNK`` of one expert's (token, slot) pairs, in token order; an expert of r pairs takes ceil(r /
 CHUNK) chunks (its last one partial: the padding rows repeat its first token, their outputs never read). The chunks
@@ -22,15 +22,17 @@ from ..operators.design import COLS
 from .expert_gemm import CHUNK
 
 
-def route(logits: np.ndarray, k: int, *, E: int = 0, per_col: int = 0, pitch: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def route(logits: np.ndarray, k: int, *, E: int = 0, per_col: int = 0, pitch: int = 0,
+          gating: str = "softmax") -> tuple[np.ndarray, np.ndarray]:
     """(ids (T, k) int32, largest first, ties to the lower id; weights (T, k) float32 summing to 1) of fp32 logits:
     (T, E), or rows of the router GEMM's layout (expert e at (e / per_col) pitch + e % per_col of its row)
-    (``_native.moe_route``)."""
+    (``_native.moe_route``; ``gating`` "sigmoid": sigmoid(l) over their sum, at least 2^-14)."""
+    assert gating in ("softmax", "sigmoid"), gating
     lg = np.ascontiguousarray(logits, np.float32)
     T = lg.shape[0]
     E = E or lg.shape[1]
     ids, w = np.empty((T, k), np.int32), np.empty((T, k), np.float32)
-    _native.moe_route(lg.reshape(-1), T, lg.shape[1], per_col or E, pitch, E, ids, w)
+    _native.moe_route(lg.reshape(-1), T, lg.shape[1], per_col or E, pitch, E, ids, w, gating == "sigmoid")
     return ids, w
 
 

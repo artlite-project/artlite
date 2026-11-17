@@ -83,7 +83,7 @@ class PrepOperator(ArtcOperator):
         s = shape
         assert T % s.pg == 0 and T // s.pg <= 64 and {"q", "k", "v"} <= set(layout.off)
         assert s.qh in (2, 3, 4) and s.used % 1152 == 0 and s.per in (1, 2)
-        assert s.per == 1 or (s.qh == 2 and s.hd % (2 * 64) == 0), "two columns per KV head: a column's two heads"
+        assert s.per == 1 or (s.qh in (2, 4) and s.hd % (2 * 64) == 0), "two columns per KV head: a column's 2 or 4 heads"
         assert not s.gate or (s.per == 2 and "g" in layout.off), "the gates: the cores two columns of a KV head free"
         self.T, self.shape, self.layout, self.kv_bytes, self.cs_positions = T, s, layout, kv_bytes, cs_positions
         self.kv_pad, self.norm, self.eps, self.kv0 = kv_pad, norm, eps, kv0
@@ -237,22 +237,23 @@ class PrepOperator(ArtcOperator):
 
 
     def _pair_design(self) -> Module:
-        """Two columns per KV head (``Shape.per``): column c = 2 h + j takes its two heads' Q (cores (c, 2), (c, 3)); KV head
-        h's K records from both columns' K halves on core (2 h, 4), its V records on (2 h + 1, 5); each column's gates
-        (``Shape.gate``: sigmoid of its heads' logits, after its Q units in QS) on its free core ((2 h, 5), (2 h + 1, 4))."""
+        """Two columns per KV head (``Shape.per``): column c = 2 h + j takes its heads' Q (cores (c, 2), (c, 3): one or two
+        heads each); KV head h's K records from both columns' K halves on core (2 h, 4), its V records on (2 h + 1, 5);
+        each column's gates (``Shape.gate``: sigmoid of its heads' logits, after its Q units in QS) on its free core
+        ((2 h, 5), (2 h + 1, 4))."""
         p, T, lay, s = self.pfx, self.T, self.layout, self.shape
-        hd, N, pitch, qh = s.hd, lay.N, lay.pitch, s.qh
+        hd, N, pitch, qh, nq = s.hd, lay.N, lay.pitch, s.qh, self.nq
         bf = np.dtype[bfloat16]
-        q_ty = np.ndarray[(8 * hd,), bf]  # 8 rows of a Q core's head
+        q_ty = [np.ndarray[(8 * n * hd,), bf] for n in nq]  # 8 rows of a Q core's heads
         row_ty = np.ndarray[(8 * hd,), bf]  # 8 rows of K or V (both halves)
         gi_ty = np.ndarray[(8 * qh,), bf]  # 8 rows of the column's gate logits
         cs_ty = np.ndarray[(8 * 2 * hd,), bf]
-        qo_ty = np.ndarray[(s.qunit // 2,), bf]
+        qo_ty = [np.ndarray[(n * s.qunit // 2,), bf] for n in nq]
         go_ty = np.ndarray[(s.gw // 2,), bf]
         kg_ty = np.ndarray[(s.kp * s.used // 2,), bf]
         vg_ty = np.ndarray[(s.used // 2,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
-        k_q = [Kernel(f"{p}_q{i}", "kernel.o", [q_ty, cs_ty, ws_ty, qo_ty, np.int32, np.int32]) for i in range(2)]
+        k_q = [Kernel(f"{p}_q{i}", "kernel.o", [q_ty[i], cs_ty, ws_ty, qo_ty[i], np.int32, np.int32]) for i in range(2)]
         k_k = Kernel(f"{p}_k", "kernel.o", [row_ty, cs_ty, ws_ty, kg_ty, np.int32])
         k_v = Kernel(f"{p}_v", "kernel.o", [row_ty, vg_ty, np.int32])
         k_g = Kernel(f"{p}_g", "kernel.o", [gi_ty, go_ty]) if s.gate else None
@@ -264,7 +265,7 @@ class PrepOperator(ArtcOperator):
         def parts(j: int) -> list[tuple[object, int]]:  # (per column the memtile object's pieces: rows 2 .. 5)
             kv = [(row_ty, 8 * hd)]
             g = [(gi_ty, 8 * qh)] if gate else []
-            return [(q_ty, 8 * hd), (q_ty, 8 * hd), *(kv + g if j == 0 else g + kv)]
+            return [(q_ty[0], 8 * nq[0] * hd), (q_ty[1], 8 * nq[1] * hd), *(kv + g if j == 0 else g + kv)]
 
         a1, o1, kvo = {}, {}, {}
         for c in range(COLS):
@@ -275,21 +276,22 @@ class PrepOperator(ArtcOperator):
             a1[c] = (a3, a3.cons().split(offs, tile=Tile(c, 1), depths=[2] * len(pc), obj_types=[t for t, _ in pc],
                                          names=[f"lp_a{c}_{i}" for i in range(len(pc))]))
             o3 = ObjectFifo(np.ndarray[(s.tgu // 2,), bf], name=f"lp_o{c}", depth=2)
-            jo = [0, s.qunit // 2] + ([qh * s.qunit // 2] if gate else [])
+            jo = [0, nq[0] * s.qunit // 2] + ([qh * s.qunit // 2] if gate else [])
             o1[c] = (o3, o3.prod().join(jo, tile=Tile(c, 1), depths=[2] * len(jo),
-                                        obj_types=[qo_ty, qo_ty] + ([go_ty] if gate else []),
+                                        obj_types=qo_ty + ([go_ty] if gate else []),
                                         names=[f"lp_o{c}_{i}" for i in range(len(jo))]))
             kvo[c] = ObjectFifo(kg_ty if j == 0 else vg_ty, name=f"lp_g{c}", depth=2)
         b = [ObjectFifo(cs_ty, name=f"lp_b{c}", depth=2) for c in range(COLS)]
 
-        def core_q(a_h, b_h, o_h, fn, ws, k_prm):
+        def core_q(a_h, b_h, o_h, fn, ws, n, k_prm):
             for _ in forever_():
                 prm(b_h, k_prm, ws)
                 for _ in range_(n_tg):
                     x = a_h.acquire(1)
                     cs = b_h.acquire(1)
                     out = o_h.acquire(1)
-                    fn(x, cs, ws, out, 0, 1)
+                    for h in range(n):
+                        fn(x, cs, ws, out, h, n)
                     o_h.release(1)
                     b_h.release(1)
                     a_h.release(1)
@@ -310,7 +312,7 @@ class PrepOperator(ArtcOperator):
             j, sp, jn = c % 2, a1[c][1], o1[c][1]
             for i in range(2):
                 workers.append(Worker(core_q, [sp[i].cons(), b[c].cons(), jn[i].prod(), k_q[i],
-                                               Buffer(ws_ty, name=f"lp_ws{c}_{i}"), k_prm],
+                                               Buffer(ws_ty, name=f"lp_ws{c}_{i}"), nq[i], k_prm],
                                       tile=Tile(c, 2 + i), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
             if j == 0:
@@ -340,8 +342,8 @@ class PrepOperator(ArtcOperator):
                     q0 = c * pitch + lay.off["q"] + 8 * t0 * N
                     kv = TensorAccessPattern((T * N,), 2 * h * pitch + lay.off["k" if j == 0 else "v"] + 8 * t0 * N,
                                              [nt, 8, 2, hd // 2], [8 * N, N, pitch, 1])  # (both columns' halves)
-                    pieces = [TensorAccessPattern((T * N,), q0, [nt, 1, 8, hd], [8 * N, 0, N, 1]),
-                              TensorAccessPattern((T * N,), q0 + hd, [nt, 1, 8, hd], [8 * N, 0, N, 1])]
+                    pieces = [TensorAccessPattern((T * N,), q0, [nt, 1, 8, nq[0] * hd], [8 * N, 0, N, 1]),
+                              TensorAccessPattern((T * N,), q0 + nq[0] * hd, [nt, 1, 8, nq[1] * hd], [8 * N, 0, N, 1])]
                     g = [TensorAccessPattern((T * N,), c * pitch + lay.off["g"] + 8 * t0 * N, [nt, 1, 8, qh],
                                              [8 * N, 0, N, 1])] if gate else []
                     chained_fill(ah[c], G, pieces + ([kv] + g if j == 0 else g + [kv]), tg)

@@ -3,6 +3,7 @@ ELF (``design.render``; cached on disk), and on the NPU the ELF's PDIs, its cont
 parameters) and its hardware context, created at the first dispatch (on XRT at the load: ``backend``).
 """
 
+import gc
 import os
 import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -215,5 +216,11 @@ class FusedElf:
         return self._kern
 
     def _open_context(self) -> None:
-        """The hardware context, configured by the first PDI (the Kernel refers to it)."""
-        self._ctx = self._device.create_context(self._first_pdi, "main")
+        """The hardware context, configured by the first PDI (the Kernel refers to it). A dropped ELF keeps its own until
+        the cycle collector runs (its operators' design objects are reference cycles): a refused one is retried after a
+        collection, as ``artlite.Program``'s."""
+        try:
+            self._ctx = self._device.create_context(self._first_pdi, "main")
+        except RuntimeError:
+            gc.collect()
+            self._ctx = self._device.create_context(self._first_pdi, "main")

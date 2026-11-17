@@ -1,11 +1,11 @@
 """An MoE layer's prefill GEMMs on its decode image (``qwen35.image``'s "moe_in", "sdown" and the expert slabs; GemmQ /
 GemmQd, ``prefill.gemm``), model-independent.
 
-- ``router``: the router's rows (BFP16 hi / lo planes per expert, the shared gate's planes after them) against x as
-  [hi | lo] panels (``PrefillNormOperator(lo=True)``: the weights' K chunks stream twice, ``k_rep``), fp32 C, each
-  expert's [hi, lo] row pair summed (``c_pairs``): per token and column c, row width ``router_pitch`` fp32, the column's
-  E / 8 logits from c ``router_pitch`` on, then the shared gate's logit (the second pass's first pair; the rest of
-  that pass: the zero rows of the gate's tile and the next region's tiles, never read).
+- ``router``: the router's rows (BFP16 hi / lo planes per expert, a gated shared expert's gate planes after them)
+  against x as [hi | lo] panels (``PrefillNormOperator(lo=True)``: the weights' K chunks stream twice, ``k_rep``), fp32
+  C, each expert's [hi, lo] row pair summed (``c_pairs``): per token and column c, row width ``router_pitch`` fp32, the
+  column's E / 8 logits from c ``router_pitch`` on, then the shared gate's logit (the second pass's first pair; the
+  rest of that pass: the zero rows of the gate's tile and the next region's tiles, never read).
 - ``shared_gate_up``: the shared expert's gate / up rows ("sgu", ``decode.image.gate_up_rows``) on the hi panels, its
   silu(gate) up as bfp16 panels of the shared width (tile-major passes of 64 rows, or a planar format's SiLU groups).
 - ``shared_down``: the shared expert's down ("sdown": row groups of G = kc / width rows per tile row,
@@ -24,10 +24,15 @@ ROW_GROUP_TILES = 4  # tiles per pass of a row-group GEMM (Q6_K: 44 rows, a 48-c
 PASS = 64  # rows of a tile-major pass
 
 
+def gated(region: object) -> bool:
+    """Whether an MoE layer's input region has the shared expert's gate (block "sgate")."""
+    return any(b.name == "sgate" for b in region.blocks)
+
+
 def router_passes(region: object) -> int:
     """Passes over a column's router and shared-gate tiles."""
-    b, s = region.block("router"), region.block("sgate")
-    return -(-(b.tiles + s.tiles) * b.R // PASS)
+    b = region.block("router")
+    return -(-(b.tiles + (region.block("sgate").tiles if gated(region) else 0)) * b.R // PASS)
 
 
 def router_pitch(region: object) -> int:
@@ -43,7 +48,7 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None, wh
     """The router GEMM of T tokens (module docstring); C in bf16 units: per token COLS router_pitch fp32 values.
     ``whole``: the token chunks' count a scratchpad parameter (``chunk_param``: one design for any T)."""
     b = region.block("router")
-    assert b.fmt == "BFP16" and region.block("sgate").fmt == "BFP16"
+    assert b.fmt == "BFP16" and (not gated(region) or region.block("sgate").fmt == "BFP16")
     passes, pitch = router_passes(region), 2 * router_pitch(region)  # (pitch: bf16 units)
     kw = {"fmt": "BFP16", "rows": b.R, "M": T, "K": region.K, "N": COLS * pitch, "tile_bytes": region.tile_bytes,
           "col_bytes": region.col_stride, "passes": passes,

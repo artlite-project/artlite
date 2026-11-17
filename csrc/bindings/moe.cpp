@@ -21,19 +21,19 @@ void bind_moe(nb::module_& m) {
       "moe_route",
       [](nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> logits, int64_t n, int64_t row,
          int per_col, int64_t pitch, int E, nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
-         nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu> weights) {
+         nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu> weights, bool sigmoid) {
         const int k = int(ids.shape(1));
         if (ids.shape(0) < size_t(n) || weights.shape(0) < size_t(n) || weights.shape(1) != ids.shape(1) ||
             (n && logits.shape(0) < size_t((n - 1) * row + (E / per_col - 1) * pitch + per_col)))
           throw artlite::Error("moe_route: arrays too small");
         nb::gil_scoped_release release;
-        artlite::moe_route(logits.data(), n, row, per_col, pitch, E, k, ids.data(), weights.data());
+        artlite::moe_route(logits.data(), n, row, per_col, pitch, E, k, sigmoid, ids.data(), weights.data());
       },
-      "logits"_a, "n"_a, "row"_a, "per_col"_a, "pitch"_a, "E"_a, "ids"_a, "weights"_a,
+      "logits"_a, "n"_a, "row"_a, "per_col"_a, "pitch"_a, "E"_a, "ids"_a, "weights"_a, "sigmoid"_a = false,
       nb::sig("def moe_route(logits: numpy.ndarray[numpy.float32], n: int, row: int, per_col: int, pitch: int, E: int, "
-              "ids: numpy.ndarray[numpy.int32], weights: numpy.ndarray[numpy.float32]) -> None"),
+              "ids: numpy.ndarray[numpy.int32], weights: numpy.ndarray[numpy.float32], sigmoid: bool = False) -> None"),
       "The top k of n tokens' E logits (token t's at logits[t row ..], expert e at (e / per_col) pitch + e % per_col) "
-      "into ids and weights (n x k): artlite::moe_route.");
+      "into ids and weights (n x k), softmax or (sigmoid) sigmoid weights over the k: artlite::moe_route.");
   m.def(
       "moe_plan",
       [](nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids, int E, int chunk,

@@ -21,6 +21,38 @@ void {{ p }}_hdr(const bfloat16 *__restrict b, bfloat16 *__restrict ws, int32_t 
 }
 
 {% include "gemm/dq_tile_major" %}
+{% elif not planar and fmt == "Q4_1_64" %}
+// k-tile slot kt of the header unit of 1024-column tiles (a {{ tq // 2 }} KB L1 object; the upper half of a slice-sized
+// unit read from 1 KB before the tile, Q4_0's place and permutation): a row's header word w (sb = w / 4, p = w % 4) is
+// the bf16 pair (d_2p, d_2p+1) of super-block sb's 4 group pairs (p = 0, 1), or (m_2p-4, m_2p-3) (p = 2, 3). Slot kt
+// holds the words 8 hw + 2 kt + j (hw, j = 0, 1): part kt % 2 (d, m) of super-block 2 hw + kt / 2, pairs 2 j, 2 j + 1 ->
+// ws [part][w'][tile][h][row 16] as Q4_1's (w' = 4 sb + kt': groups 8 sb + 2 kt' + h, both of pair kt')
+void {{ p }}_hdr(const bfloat16 *__restrict b, bfloat16 *__restrict ws, int32_t plane, int32_t kt)
+{
+    const uint32_t *__restrict src = (const uint32_t *)b;
+    bfloat16 *__restrict dst = ws + {{ 512 * tq }} * (kt & 1) + {{ 128 * tq }} * (kt >> 1);
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tq }}; t++) {
+{% for hw in range(2) %}
+{% for j in range(2) %}
+        {
+            const uint32_t *__restrict w = src + {{ 64 * j + 16 * hw + 8 }};
+            auto [r0, r1] = aie::interleave_zip(aie::load_v<8>(w), aie::load_v<8>(w + 32), 1);
+            const aie::vector<bfloat16, 32> v = aie::concat(r0, r1).template cast_to<bfloat16>();  // [row 16][pair 2]
+            const aie::vector<bfloat16, 16> e = aie::filter_even(v, 1), o = aie::filter_odd(v, 1);
+            aie::store_v(dst + {{ (8 * hw + 2 * j) * 32 * tq }}, e);
+            aie::store_v(dst + {{ (8 * hw + 2 * j) * 32 * tq + 16 }}, e);
+            aie::store_v(dst + {{ (8 * hw + 2 * j + 1) * 32 * tq }}, o);
+            aie::store_v(dst + {{ (8 * hw + 2 * j + 1) * 32 * tq + 16 }}, o);
+        }
+{% endfor %}
+{% endfor %}
+        src += 128;
+        dst += 32;
+    }
+}
+
+{% include "gemm/dq_tile_major" %}
 {% elif not planar %}
 {% set parts = 2 if fmt == "Q4_1" else 1 %}
 // k-tile slot kt of the header unit of 1024-column tiles (a {{ tq // 2 }} KB L1 object; {{ "d | m: the whole slice-sized unit" if parts == 2 else "d: the upper half of a slice-sized unit read from 1 KB before the tile" }}). The memtile's permutation

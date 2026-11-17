@@ -9,7 +9,8 @@ Q4_0's size. The packer checks every pair (``_native.pack_tiles`` throws on the 
 checks a tensor's first blocks to choose the format.
 
 Prefill: tiles of 16 rows x 2048 or 1024 columns take the tile-major permutation (GemmQ, GemmQd; ``_hdr`` expands the
-scale header: 1024 columns read it as a slice-sized unit, Q4_0's from 1 KB before the tile), any other (14 or 32
+scale header: 1024 columns read it as a slice-sized unit, Q4_0's and Q4_1_64's from 1 KB before the tile, Q4_1_64's pairs
+into both groups of a pair), any other (14 or 32
 rows, or 512 columns) GemmQd's planar gather (the nibbles as 4 planes
 [row][step][32 B]; Gemma's 512-column Q4_0 tiles of 32 rows: one header unit per 4 K chunks, ``GemmQOperator.hg``)."""
 
@@ -81,6 +82,7 @@ class Q4Slot(Slot):
         return parts
 
     def planar(self, fmt: str, rows: int, kc: int) -> bool:
+        assert fmt != "Q4_1_64" or self.tile_major(fmt, rows, kc), (fmt, rows, kc)  # (its compact header: tile-major only)
         return not self.tile_major(fmt, rows, kc)
 
     def tile_major(self, fmt: str, rows: int, kc: int) -> bool:

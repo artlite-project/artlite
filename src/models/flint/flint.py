@@ -4,10 +4,13 @@ without positional encoding, learned attention sinks. The official file (``model
 trained INT4 codes in groups of 64, stored as GGUF Q4_1 pairs) runs as Q4_1_64 tiles, its F32 router as BFP16 planes
 (``flint.image``).
 
-A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the weights
+A decode dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the weights
 (``flint.overlay.FlintOverlay``): the projections and the experts on the main cores and their helpers, the routing on the
 helpers (the experts' tiles pushed by the columns themselves: ``moe.route``), the attention and its KV caches on the
-attention cores. The host reads the tokens' embedding rows from the mapped file and samples from the logits.
+attention cores. Prompts run in chunks of up to 2048 tokens through the prefill (``flint.prefill.FlintPrefill``:
+layer-major from one library ELF on the same weight image, the host routing each MoE layer's tokens between its pieces),
+which leaves the caches the decode continues from. The host reads the tokens' embedding rows from the mapped file and
+samples from the logits.
 
 The chat template (the file's): GLM-style turns ``<|system|>``, ``<|user|>``, ``<|assistant|>``, ``<|observation|>`` (tool
 results); the model opens its own ``<think>`` (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's
@@ -15,6 +18,8 @@ syntax (``server.tools``). A generation ends at ``<|end_of_text|>``, ``<|user|>`
 
 The KV caches hold K as hi + lo bfp16 blocks by default (``kv_k``; "single": one block per 8 dims): 14 full layers x 4 KV
 heads x 432 B = 24.2 KB per position, and every sliding-window layer's cache (linear in the positions)."""
+
+import numpy as np
 
 from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
@@ -27,20 +32,21 @@ from ..sampling import TOP_K_ALL, Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import FlintImage
 from .overlay import FlintOverlay
+from .prefill import SIZES, FlintPrefill
 
 
 class NpuFlint(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("hilo",
-    "single"); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``). Prompts run as decode steps of
-    up to 4 tokens."""
+    "single"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``;
+    ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
-                 weights: WeightBuffer | None = None):
+                 prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):
         self.gguf = gguf
         self.overlay = FlintOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
-        self.prefill = None
+        self.prefill = FlintPrefill(self.overlay, sizes=sizes) if prefill else None
         self._open(threads=threads)
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
@@ -63,6 +69,14 @@ class NpuFlint(OverlayModel):
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
         return (self.gguf.rows("token_embd.weight", tokens),)
+
+    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
+        return (self.gguf.rows("token_embd.weight", tokens),)
+
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
+        """(the LM head alone on the chunk's last output row)"""
+        x = self.prefill.hidden(n - 1)
+        return self._dispatch(lambda: self.overlay.logits_of(x))
 
 
 class Flint(Model):
@@ -110,7 +124,7 @@ class Flint(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuFlint:
-        return NpuFlint(self.gguf, capacity=capacity, kv_k=self.kv_k, weights=self.weights)
+        return NpuFlint(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
 
 
 __all__ = ["Flint", "NpuFlint"]
