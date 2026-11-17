@@ -7,7 +7,7 @@ trained INT4 codes in groups of 64, stored as GGUF Q4_1 pairs) runs as Q4_1_64 t
 A decode dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the weights
 (``flint.overlay.FlintOverlay``): the projections and the experts on the main cores and their helpers, the routing on the
 helpers (the experts' tiles pushed by the columns themselves: ``moe.route``), the attention and its KV caches on the
-attention cores. Prompts run in chunks of up to 2048 tokens through the prefill (``flint.prefill.FlintPrefill``:
+attention cores. Prompts run in chunks of up to 8192 tokens through the prefill (``flint.prefill.FlintPrefill``:
 layer-major from one library ELF on the same weight image, the host routing each MoE layer's tokens between its pieces),
 which leaves the caches the decode continues from. The host reads the tokens' embedding rows from the mapped file and
 samples from the logits.

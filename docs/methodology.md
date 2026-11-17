@@ -79,6 +79,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 | LFM3 1.7B | QAD-Q4_0 | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-QAD-Q4_0.gguf) `LFM3-1.7B-QAD-Q4_0.gguf` | `43a7d09a0e9c` | 2026-11-10 |
 | | Q4_K_M | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-Q4_K_M.gguf) `LFM3-1.7B-Q4_K_M.gguf` | `3793e1e6e226` | 2026-11-10 |
+| Flint | int4 | [RecursiveSI/flint-int4-gguf](https://huggingface.co/RecursiveSI/flint-int4-gguf/blob/main/flint-int4-q4_1.gguf) `flint-int4-q4_1.gguf` | `43c07baccdba` | 2026-11-18 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
 runs, with the toolchain pinned then:
@@ -94,6 +95,7 @@ runs, with the toolchain pinned then:
 | 2026-11-05 | 1.4.6.dev3+g6a97402 | 22.0.0.2026102001+4f5df13d |
 | 2026-11-10 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026110801+22c4674a |
 | 2026-11-16 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
+| 2026-11-18 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 | 2026-11-17 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 
 The decode speeds of the files whose LM head is screened (Qwen3 0.6B, the Llama files but the BF16 ones and 3B Q3_K_M,

@@ -59,7 +59,7 @@ Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its arguments)
 with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7,
-Occamy and LFM3 (Qwen's XML calls), Gemma 4, Spark-X (GLM-4.5's calls) and Llama 3.1 / 3.2 have them; a template without
+Occamy and LFM3 (Qwen's XML calls), Gemma 4, Spark-X and Flint (GLM-4.5's calls) and Llama 3.1 / 3.2 have them; a template without
 tools (Llama 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt; a
 call's opener of one token, Qwen's, Gemma's, GLM-4.5's, is never sampled, and a call Llama 3 writes stays text),
 `required`, a named function (the answer begins with the call, after the model's thought; a

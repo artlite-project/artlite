@@ -2,7 +2,8 @@
 models present (Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the
 app's default: the design runs the drafter's formats too; LFM3's QAD-Q4_0 and Q4_K_M images), the Stable Diffusion UNet
 program. They compile (program
-memory, stack and BD limits of the whole models, which the layer-slice tests do not reach), a paged design's code pages
+memory, stack and BD limits of the whole models, which the layer-slice tests do not reach; Flint's overlay of 49
+layers and its prefill's chunks to 8192), a paged design's code pages
 link (each within the slot its core's resident code leaves: ``paging.link``, else only at load), and
 ``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
 
@@ -13,6 +14,7 @@ import pytest
 from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
+    flint_gguf,
     gemma_gguf,
     lfm3_gguf,
     llama_gguf,
@@ -74,6 +76,15 @@ def _lfm(path: str) -> None:
     ov.op.page_store()
 
 
+def _flint(path: str) -> None:
+    from models.flint.overlay import FlintOverlay
+    from models.flint.prefill import FlintPrefill
+
+    ov = FlintOverlay(GGUFFile(path), max_positions=32768)
+    parallel_compile.compile_all([ov.op, FlintPrefill(ov).lib])
+    ov.op.page_store()
+
+
 def _sd15(path: str) -> None:
     from artlite.vision.design import VisionDesign
 
@@ -98,6 +109,7 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "swift-1.5-APEX": (swift_gguf(), _qwen),
     "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
+    "flint-int4": (flint_gguf(), _flint),
     "sd15": (sd15_dir(), _sd15),
 }
 
