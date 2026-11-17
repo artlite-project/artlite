@@ -3,15 +3,18 @@ buffers (``overlay.FlintOverlay``: the weight image, the KV caches), so that the
 chunk leaves; the prompt's last token's logits from the LM head alone on the chunk's last output row
 (``ModelOverlay.logits_of``).
 
-A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256 up to 2048: the flash attention's 64 passes of 32 queries)
-runs layer-major in sub-chunks of ``SUB`` tokens (a ``SMALL`` size: one of its own): each operator of a layer runs over
-the sub-chunks back to back on buffer slices a sub-chunk apart (a ConfigureOp per layer and operator), the attention
-preps in blocks of ``PREP_SIZES``, the flash attention once over the whole chunk. The residual stream x is bf16 (PX,
+A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256 up to 2048, then multiples of 2048 up to 8192) runs
+layer-major in sub-chunks of ``SUB`` tokens (a ``SMALL`` size: one of its own): each operator of a layer runs over the
+sub-chunks back to back on buffer slices a sub-chunk apart (a ConfigureOp per layer and operator), the attention preps in
+blocks of ``PREP_SIZES``, the flash attention once over a chunk of up to ``ATTN_T`` tokens (its 64 passes of 32 queries),
+a larger chunk's in parts of ``ATTN_T`` (``AttnOperator(part=)``: each at its own position, its history from the cache,
+which the preps filled with the whole chunk's records first). A chunk streams the experts' weights once: from 2048
+tokens on the expert GEMMs are weight-bound, so a larger chunk takes them for more tokens. The residual stream x is bf16 (PX,
 ``prefill.norm.PrefillNormOperator``; the MoE block gathers its rows). Per layer L (the decode's order):
 
 - qkv GEMM (``prefill.gemm``) of xn -> G; the attention prep of the layer's kind (``prefill.attn``: q / k RMS-normed with
   their weights per dim, rotated by the kind's cos / sin table: a sliding-window layer's NeoX RoPE on all 64 pairs, a
-  full layer's none (cos 1, sin 0); Q units hi + lo into QS, the chunk's K / V records into the layer's cache, a
+  full layer's none (cos 1, sin 0); Q units into QS, the chunk's K / V records into the layer's cache, a
   sliding-window cache after its guard), the flash attention over the chunk (two columns per KV head on one broadcast
   cache stream, 4 query heads each; the layer's learned sinks in SK, added to each row's sum at a pass's end; a
   sliding-window pass streams its window of 513 positions) -> A; o GEMM -> Y;
@@ -49,8 +52,9 @@ from .overlay import KINDS, KV_PAD, FlintOverlay
 
 SUB = 256  # tokens per sub-chunk (the operators' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
-SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design per size and kind: 64 passes of 32
-# queries at most)
+ATTN_T = 2048  # a flash attention item's tokens at most (its 64 passes of 32 queries)
+SIZES = SMALL + tuple(range(SUB, ATTN_T + 1, SUB)) + (4096, 6144, 8192)  # chunk sizes (a flash attention design per size
+# and kind up to ATTN_T; larger ones: its parts)
 MAX_T = SIZES[-1]
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
 PHASES = {"dense": ("qkv", "o", "gate_up", "down"), "moe": ("qkv", "o")}  # (the GEMM phases: an MoE layer's FFN is
@@ -63,17 +67,21 @@ MOE_WEIGHT_S, MOE_ROW_S = 1 / 38e9, 1 / 38e9
 
 class FlintPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches);
-    ``run`` runs one. ``precise``: the attention's P as hi + lo panels (``prefill.attn.Shape.pp``)."""
+    ``run`` runs one. ``qp``: the attention's Q as single (1, the default) or hi + lo panels (2); ``precise``: its P as
+    hi + lo panels (``prefill.attn.Shape``'s ``qp``, ``pp``). Single Q and P: their hi + lo changed the next-token NLL
+    after the prompt by nothing measurable (six 1K prompts, two of 32K: within an MoE model's noise; Flint's q / k norm
+    weights reach 7.5, Qwen3's ~100) and cost the full layers' attention 1.2x at 30K; K follows the caches' ``kv_k``."""
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "flint_prefill", KV_PAD
     SHARED_KV_RANGE = True  # (the attention's P_FO: one range for every size)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
-    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, precise: bool = True):
+    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, qp: int = 1, precise: bool = False):
         ov = overlay
-        s = PA.Shape(ov.hd, ov.nh // 2, ov.kp, ov.T, 2, 2 if precise else 1, per=2, sink=True)
+        s = PA.Shape(ov.hd, ov.nh // 2, ov.kp, ov.T, qp, 2 if precise else 1, per=2, sink=True)
         pq = 32 * s.blocks[0]  # (the flash attention's queries per pass: 64 passes a chunk at most)
-        super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and t // pq <= 64))
+        assert pq * 64 >= ATTN_T
+        super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and (t <= ATTN_T or t % ATTN_T == 0)))
         cfg, img = self.cfg, self.img
         self.layers = ov.layers
         self.kv_layers = list(self.layers)  # (every layer its own cache and ring)
@@ -95,15 +103,25 @@ class FlintPrefill(ChunkPrefill):
         self._k_parts: dict[tuple, int] = {}  # (per region shape and size: output projections in resident K parts)
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
         self.plans = self.sz[SUB].plans if SUB in self.sz else self.sz[max(self.sz)].plans
-        self.attn = {(k, T): PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes[k], kv_pad=self.pad, sub=self._pt(T),
-                                             swa=self.win[k], kv0=self.kv0[k])
-                     for k in kinds for T in self.sizes}
+        self.attn = {(k, T): self._attn(k, T) for k in kinds for T in self.sizes if T <= ATTN_T}
+        # (a larger chunk's parts: part 0 the ATTN_T design, the others with parameters of their own)
+        self.parts = {(k, j): self.attn[(k, ATTN_T)] if j == 0 and (k, ATTN_T) in self.attn else self._attn(k, ATTN_T, j)
+                      for k in kinds for j in range(self.sizes[-1] // ATTN_T) if self.sizes[-1] > ATTN_T}
         self._rows()
         self._library()
 
     # ------------------------------------------------------------------
     # The operators
     # ------------------------------------------------------------------
+
+    def _attn(self, kind: str, T: int, part: int = 0) -> PA.AttnOperator:
+        """The flash attention of a kind over T tokens (``part``: a larger chunk's)."""
+        return PA.AttnOperator(T=T, shape=self.shape, kv_bytes=self.kv_bytes[kind], kv_pad=self.pad, sub=self._pt(T),
+                               swa=self.win[kind], kv0=self.kv0[kind], part=part)
+
+    def _attns(self, kind: str, T: int) -> list[PA.AttnOperator]:
+        """The flash attention items of a chunk of size T (one, or its parts of ATTN_T tokens)."""
+        return [self.attn[(kind, T)]] if T <= ATTN_T else [self.parts[(kind, j)] for j in range(T // ATTN_T)]
 
     @staticmethod
     def _t(T: int) -> int:
@@ -185,7 +203,7 @@ class FlintPrefill(ChunkPrefill):
                 self.np_off[(L, n)] = k * 2 * H
                 k += 1
         self.nw = PA.PrepOperator.nw_bytes(s.hd)
-        self.sk = 2 * next(iter(self.attn.values())).n_sk  # (bytes of a layer's SK argument)
+        self.sk = 2 * next(iter((self.attn | self.parts).values())).n_sk  # (bytes of a layer's SK argument)
 
     def _np(self, key: object) -> str:
         o = self.np_off[key]
@@ -219,7 +237,7 @@ class FlintPrefill(ChunkPrefill):
             rg = 2 * COLS * p_in.layout.pitch
             rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("G", j, g.op, i=2, row=rg))
                    for g in p_in.gemms for j in range(S)]
-            prep, attn = o.preps[(kind, p_in.layout.key, pt)], self.attn[(kind, T)]
+            prep = o.preps[(kind, p_in.layout.key, pt)]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)
             gb = pt // s.pg * s.group  # (a block's cache groups)
             cs = "CSS" if kind == "swa" else "CSF"
@@ -227,8 +245,9 @@ class FlintPrefill(ChunkPrefill):
             rl += [(prep, tok("G", 0, prep, i=0, row=rg, extra=b * pt * rg), sl(cs, b * pt * 4 * s.hd, prep, i=1),
                     tok("QS", 0, prep, i=2, extra=b * pt * self.rb["QS"]), f"KV[{kv0 + b * gb}:{kv0 + b * gb + kvb}]", nw)
                    for b in range(T // pt)]
-            rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2),
-                       f"SK[{i * self.sk}:{(i + 1) * self.sk}]"))
+            rl += [(at, sl("QS", j * at.T * self.rb["QS"], at, i=0), f"KV[{kv0}:{kv0 + arg_bytes(at, 1)}]",
+                    sl("A", j * at.T * self.rb["A"], at, i=2), f"SK[{i * self.sk}:{(i + 1) * self.sk}]")
+                   for j, at in enumerate(self._attns(kind, T))]
             (g,) = o.plans[(L, "o")].gemms
             rl += [(g.op, tok("A", j, g.op, i=0), self._w(g), tok("Y", j, g.op, i=2, row=ry)) for j in range(S)]
             nxt = self._np((L, "d"))
@@ -294,7 +313,7 @@ class FlintPrefill(ChunkPrefill):
                 else "output_norm.weight")
         dev.flush("NP")
         nw, sk = dev.view("NW"), dev.view("SK")
-        at = next(iter(self.attn.values()))
+        at = next(iter((self.attn | self.parts).values()))
         for i, L in enumerate(self.layers):
             w = np.concatenate([vec(f"blk.{L}.attn_{n}_norm.weight") for n in "qk"]).view(np.uint8)
             nw[i * self.nw:i * self.nw + w.size] = w
@@ -320,7 +339,9 @@ class FlintPrefill(ChunkPrefill):
         out = self.moe.params(T) if self.moe else {}
         for (k, _, pt), prep in self.sz[self._t(T)].preps.items():
             if pt == self._pt(T):
-                out |= prep.params(p0) | self.attn[(k, T)].params(p0)
+                out |= prep.params(p0)
+                for j, at in enumerate(self._attns(k, T)):
+                    out |= at.params(p0 + j * at.T)
         return out
 
     def run(self, x: np.ndarray, p0: int, T: int = 0) -> None:
@@ -356,14 +377,15 @@ class FlintPrefill(ChunkPrefill):
         streams (a full layer's: from position 0 to its queries' group; a sliding-window layer's: its window's groups
         and its own), RECORD_S each."""
         T = round(S * SUB)
-        kind = self.cfg.kinds[L]
-        at, s = self.attn[(kind, T)], self.shape
-        if kind == "swa":
-            g = PA.mode.swa_groups(self.win["swa"], s.pg)
-            recs = sum(min(g, (p0 + b * at.pq) // s.pg) + 1 for b in range(at.n_pass)) * s.rg
-        else:
-            q, r = divmod(at.n_pass, at.m)  # (sum over the passes b of b // m)
-            recs = (at.n_pass * (p0 // s.pg + 1) + at.m * q * (q - 1) // 2 + q * r) * s.rg
+        kind, s, recs = self.cfg.kinds[L], self.shape, 0
+        for j, at in enumerate(self._attns(kind, T)):
+            p = p0 + j * at.T
+            if kind == "swa":
+                g = PA.mode.swa_groups(self.win["swa"], s.pg)
+                recs += sum(min(g, (p + b * at.pq) // s.pg) + 1 for b in range(at.n_pass)) * s.rg
+            else:
+                q, r = divmod(at.n_pass, at.m)  # (sum over the passes b of b // m)
+                recs += (at.n_pass * (p // s.pg + 1) + at.m * q * (q - 1) // 2 + q * r) * s.rg
         return RECORD_S * recs
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:

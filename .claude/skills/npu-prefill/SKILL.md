@@ -37,7 +37,10 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   Choose their operators by speed, not configuration size (configurations by control packets: GemmQ, the attention on
   4 rows, the norms on 4 columns, also qwen35's; 3B's chat prompt 96 -> 70 ms). Long prompts the other way: chunks past 2048 in whole
   1024-token sub-chunks (Llama 3072 / 4096, where the flash attention's 64 passes allow) halve the ConfigureOps per
-  token (1B 8K TTFT 1.29 -> 1.21 s).
+  token (1B 8K TTFT 1.29 -> 1.21 s). Past the flash attention's 64 passes a chunk's attention runs as items of 2048
+  tokens at their own positions (`AttnOperator(part=)`: scratchpad parameters of their own; the preps write the whole
+  chunk's records first): an MoE model's experts stream their weights once per chunk, weight-bound below ~4096 tokens
+  (Flint's chunks of 8192: TTFT 8K 5.4 -> 3.8 s, 32K 31.8 -> 23.6 s with the attention's planes below).
 - **Library ELF** (`fused.Library`): each design compiled once, whatever the depth and chunk sizes;
   `run(items, splits=, bufs=, hooks=)` assembles a chunk's program on the host and dispatches it in pieces of
   whole layers, each estimated under `PIECE_BUDGET_S` (the driver kills a dispatch after 2 s; DDR contention adds up
@@ -162,6 +165,11 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
   8K essay window over two trajectories (prompt graphs of two ubatch sizes: ~1e-2 nats of noise per run). Its router:
   BFP16 hi + lo rows against x hi + lo, the logits fp32 up to the top k (single BFP16 rows change 6% of the top-8 sets
   per layer and cost ~2.5e-2 nats per token; bf16 logits change 11%).
+- The attention's planes for an MoE model: decide K (the decode's caches too) on teacher-forced decode steps over
+  several short texts (paired NLL, KL against llama.cpp), not on long prompts, whose routing chaos (~1e-2 nats over
+  512 tokens) hides it: Flint's single K was within the noise after 32K-token prompts but worse on all six 512-token
+  essays (+0.013 nats a token); its single Q and P showed nothing (q / k norm weights up to 7.5) and cost the full
+  attention 1.2x at 30K.
 - Long-K output projections in K parts (`plan_phase(k_part=)`): each part's bf16 C tile sums fewer
   k-tiles, the residual add sums the parts in fp32. Llama 3B's down (K 8192, 128 k-tiles) in two parts: KL(same) on a
   chat prompt 0.00071 -> 0.00031, an essay's 0.00122 -> 0.00101.
@@ -171,6 +179,9 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 
 ## Speed: where a chunk's time goes
 
+- Per piece of a real chunk: `Library` keeps each piece's shortest duration (`_cache._ends`, keyed by the items list and
+  the piece's bounds): run a prompt, then map the pieces to their items' operators. Per operator: its run of items of
+  one layer through `lib.run` alone, on the buffers a chunk left (~0.2 ms of dispatch each).
 - Per operator kind: drop its items from the program and time the rest.
 - Per design switch: a program of one item of the design alternating with another kind's, minus both repeated alone
   (no switch between them); or the program's configurations alone (its RunOps dropped). ~30-40 µs each: ~0.1 µs per

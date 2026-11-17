@@ -75,10 +75,13 @@ def test_prefill(P: int) -> None:
     model = NpuFlint(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)
-    agree = float((split.argmax(-1) == got.argmax(-1)).float().mean())
-    agree_llama = float((split.argmax(-1) == dec.argmax(-1)).float().mean())
+    top2 = torch.topk(split, 2).values
+    sure = top2[:, 0] - top2[:, 1] >= 1  # (as ``test_teacher_forced``: a near tie flips on either side's rounding)
+    agree = float((split.argmax(-1) == got.argmax(-1))[sure].float().mean())
+    agree_llama = float((split.argmax(-1) == dec.argmax(-1))[sure].float().mean())
     print(f"P {P}: KL vs llama.cpp's split run: prompt's last token {float(kl[0]):.4f} (llama.cpp decode-only "
           f"{float(kl_llama[0]):.4f}), mean over {K} positions {float(kl.mean()):.4f} ({float(kl_llama.mean()):.4f}); "
-          f"argmax agreement {agree:.3f} ({agree_llama:.3f})")
+          f"argmax agreement {agree:.3f} ({agree_llama:.3f}) over {int(sure.sum())} of {K} tokens")
+    # (one clear token may flip: P 300's prompt's last token flips on the decode steps' path too)
     assert float(kl.clamp(max=0.5).mean()) < 1.5 * float(kl_llama.clamp(max=0.5).mean()) + 2e-3 and \
-        agree > agree_llama - 0.05
+        agree * int(sure.sum()) >= agree_llama * int(sure.sum()) - 1

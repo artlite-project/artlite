@@ -16,8 +16,9 @@ The chat template (the file's): GLM-style turns ``<|system|>``, ``<|user|>``, ``
 results); the model opens its own ``<think>`` (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's
 syntax (``server.tools``). A generation ends at ``<|end_of_text|>``, ``<|user|>`` or ``<|observation|>``.
 
-The KV caches hold K as hi + lo bfp16 blocks by default (``kv_k``; "single": one block per 8 dims): 14 full layers x 4 KV
-heads x 432 B = 24.2 KB per position, and every sliding-window layer's cache (linear in the positions)."""
+The KV caches hold K as hi + lo bfp16 blocks by default (``kv_k``; "single": one block per 8 dims, a third fewer bytes,
+but +0.013 nats a token in teacher-forced text, worse on every one of six essays): per position and layer 4 KV heads x
+432 B, 84.7 KB a position over the 49 layers (the sliding-window layers' caches linear in the positions)."""
 
 import numpy as np
 

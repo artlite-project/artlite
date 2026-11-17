@@ -78,7 +78,7 @@ class AttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
                  ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
-                 bcast: bool = True, causal: bool = True):
+                 bcast: bool = True, causal: bool = True, part: int = 0):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
@@ -87,7 +87,10 @@ class AttnOperator(ArtcOperator):
         groups before its own and its own, from ``kv0`` bytes of a KV head's cache, its guard, before group 0); ``bcast``
         (two columns per KV head, ``Shape.per``): the KV head's streams read once, by column 2 h's shim, and broadcast by
         its memtile to the cores of both columns (each taking its column's Q units and gates of both), else each column
-        reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring)."""
+        reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring);
+        ``part``: the item's place in a larger chunk whose attention runs as items of T tokens, each at its own position
+        (its scratchpad parameters named with the suffix ``_<part>``; the cache holds the whole chunk's records before the
+        first item: ``PrepOperator``)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -98,14 +101,20 @@ class AttnOperator(ArtcOperator):
         assert 4 * self.qb * s.qh % 4 == 0  # (a pass's Q units: whole B objects of 4)
         assert self.pq <= 72, "a pass's segment starts in its object's first 72 values (stream B's walk)"
         self.T, self.shape, self.kv_bytes, self.kv_pad, self.ablate = T, s, kv_bytes, kv_pad, tuple(ablate)
+        self.part = part
         self.n_pass = T // self.pq
         self.mode = AttnMode.make(s, T=T, m=self.m, window=window, ring=ring, swa=swa, kv0=kv0, bcast=bcast,
                                   causal=causal)
         assert not (s.sink and (ring or self.mode.kind is Kind.NONCAUSAL)), "sinks: the causal and window designs"
+        assert not part or self.mode.kind in (Kind.CAUSAL, Kind.SWA), "parts: the causal and sliding-window designs"
         if ring:
             assert mt_bytes(s, ring=ring, window=window, qb=self.qb) <= MT_BYTES, "a column's memory tile"
         self.oc = 2 if two_copies(self) is not None else 1  # (o's copies: ``l1_layout``)
         super().__init__()
+
+    def _pn(self, name: str) -> str:
+        """A scratchpad parameter's name in this design (``part``)."""
+        return f"{name}_{self.part}" if self.part else name
 
     @property
     def win(self) -> int:
@@ -242,6 +251,9 @@ class AttnOperator(ArtcOperator):
     def params(self, p0: int, lead: int = 0) -> dict[str, int]:
         """The scratchpad parameters of a chunk at p0 (packed: ``lead``, its first keys every row sees: 0 or a cache
         group, a prompt every segment continues; its rows a segment of their own)."""
+        return {self._pn(k): v for k, v in self._params(p0, lead).items()}
+
+    def _params(self, p0: int, lead: int) -> dict[str, int]:
         s = self.shape
         assert not self.nc, "non-causal: set_params"
         assert p0 % s.pg == 0 and lead in (0, s.pg) and (self.win or not lead)
@@ -279,9 +291,10 @@ class AttnOperator(ArtcOperator):
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, wo_ty, o_ty, np.int32])
         k_gsel = Kernel(f"{p}_gsel", "kernel.o", [u_ty, ws_ty, np.int32]) if s.gate else None
         k_ssel = Kernel(f"{p}_ssel", "kernel.o", [u_ty, ws_ty, np.int32]) if s.sink else None
-        p_p8, p_fq = ScratchpadParameter(P_P8, np.int32), ScratchpadParameter(P_FH if self.ring else P_FQ, np.int32)
-        p_fg, p_fo = ScratchpadParameter(P_FG, np.int32), ScratchpadParameter(P_FO, np.int32)
-        p_sw = ScratchpadParameter(P_SW, np.int32)
+        p_p8 = ScratchpadParameter(self._pn(P_P8), np.int32)
+        p_fq = ScratchpadParameter(self._pn(P_FH if self.ring else P_FQ), np.int32)
+        p_fg, p_fo = ScratchpadParameter(self._pn(P_FG), np.int32), ScratchpadParameter(self._pn(P_FO), np.int32)
+        p_sw = ScratchpadParameter(self._pn(P_SW), np.int32)
         n_pass, ku, gq = self.n_pass, cr * s.kp // 2, s.rg // cr
 
         # stream A: the K records (hi + lo: a group's [K obj | padding | K obj], the memtile reads the objects' records)
@@ -415,7 +428,7 @@ class AttnOperator(ArtcOperator):
                                  Buffer(wo_ty, name=f"la_wo{c}_{r}"), Buffer(pp_ty, name=f"la_pp{c}_{r}"),
                                  Buffer(q_ty, name=f"la_q{c}_{r}"), p_p8, p_fq,
                                  rb * (r + 4 * jb(c)), r,
-                                 *([k_seg, ScratchpadParameter(P_HK, np.int32)] if win or self.nc else []),
+                                 *([k_seg, ScratchpadParameter(self._pn(P_HK), np.int32)] if win or self.nc else []),
                                  *([k_gsel, r + 4 * jb(c)] if s.gate else []),
                                  *([k_ssel, qh * c] if s.sink else [])],
                           tile=Tile(c, 2 + r), stack_size=STACK, dynamic_objfifo_lowering=True, while_true=False)
@@ -521,7 +534,7 @@ class AttnOperator(ArtcOperator):
         def ring_fills(QS: object, KV: object, SEG: object, ah: list, bh: list, tg: TaskGroup) -> None:
             """The ring variant's fills: per column the held history (groups from position 0, the chunk's first among
             them) once, then pass b's group b (stream A: its K; B: the pass's Q units, SEG, its V), each read once."""
-            p_g0, hold = ScratchpadParameter(P_G0, np.int32), self.ring
+            p_g0, hold = ScratchpadParameter(self._pn(P_G0), np.int32), self.ring
             hist = TaskGroup()
             for c in range(COLS):  # (a group's K: its two objects' records, without the first one's padding)
                 k0, v0 = c * hb, c * hb + s.kp * o2

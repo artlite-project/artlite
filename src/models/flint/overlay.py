@@ -76,7 +76,7 @@ FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down"
          "moe_in": F_NORM, "sdown": F_RESID}
 MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32}  # (moe_in's blocks: ``decode.design``)
 CHAIN = 2  # columns per KV head
-KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache
+KV_PAD = 8192  # positions past the caches (the last layer's): the prefill's slices of a cache
 KINDS = ("swa", "full")  # the cache kinds: token object t = SLOTS kind + a, of the sub-step from slot a on
 
 

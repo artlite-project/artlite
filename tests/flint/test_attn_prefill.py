@@ -3,7 +3,8 @@ one broadcast stream (each column four query heads, the KV head's K and V from b
 RMS-normed with weights per dim, learned sinks (the SK argument), full layers without positional encoding (every pair's
 cos 1, sin 0) and sliding-window layers of 513 positions (keys p - 512 .. p, the cache after a guard of 8 groups), on
 random projections of a chunk at p0 after a cache the host filled: the Q units and the K / V records against their fp64
-model, the output panels against the exact attention with sinks of the cores' own operands."""
+model (single panels: within their own bfp16 rounding), the output panels against the exact attention with sinks of
+the cores' own operands. Flint's planes (single K, Q and P: ``FlintPrefill``'s) and hi + lo ones."""
 
 import numpy as np
 import pytest
@@ -26,6 +27,8 @@ LAYOUT = Layout(640, {"q": 0, "k": 512, "v": 576})  # (the qkv GEMMs' layout of 
 # (chunk, its position, sliding window (0: a full layer))
 CASES = [(256, 0, 0), (512, 128, 0), (256, 0, WIN), (512, 448, WIN), (1024, 640, WIN), (64, 0, 0), (64, 576, WIN),
          (2048, 0, WIN), (512, 1024, 0)]
+PLANES = [(1, 1, 1)] * len(CASES) + [(2, 2, 2)] * 3  # (K, Q, P planes: Flint's, then hi + lo on a few cases)
+CASES = [(*c, pl) for c, pl in zip(CASES + [CASES[1], CASES[3], CASES[7]], PLANES, strict=True)]
 
 
 def _q_values(units: np.ndarray, hd: int, qp: int) -> np.ndarray:
@@ -36,9 +39,11 @@ def _q_values(units: np.ndarray, hd: int, qp: int) -> np.ndarray:
     return np.moveaxis(v, -3, -2).reshape(*lead, 8, hd)
 
 
-@pytest.mark.parametrize(("T", "p0", "win"), CASES, ids=[f"T{a}-p{b}-{'swa' if c else 'full'}" for a, b, c in CASES])
-def test_flint_attn(T: int, p0: int, win: int) -> None:
-    shape = PA.Shape(HD, QH, 2, A_BYTES, 2, 2, per=2, sink=True)
+@pytest.mark.parametrize(("T", "p0", "win", "planes"), CASES,
+                         ids=[f"T{a}-p{b}-{'swa' if c else 'full'}-k{d[0]}q{d[1]}p{d[2]}" for a, b, c, d in CASES])
+def test_flint_attn(T: int, p0: int, win: int, planes: tuple[int, int, int]) -> None:
+    kp, qp, pp = planes
+    shape = PA.Shape(HD, QH, kp, A_BYTES, qp, pp, per=2, sink=True)
     max_pos = max(1024, p0 + T)
     guard = PA.mode.swa_groups(win, shape.pg) if win else 0  # (groups before a sliding-window cache's group 0)
     n_groups = guard + max_pos // shape.pg
@@ -46,7 +51,7 @@ def test_flint_attn(T: int, p0: int, win: int) -> None:
     prep = PA.PrepOperator(T=T, shape=shape, layout=LAYOUT, kv_bytes=kvb, cs_positions=max_pos, norm=True, eps=1e-6,
                            kv0=kv0)
     attn = PA.AttnOperator(T=T, shape=shape, kv_bytes=kvb, swa=win, kv0=kv0)
-    fused = FusedOperator(name=f"fla_test_{'s' if win else 'f'}", input_args=["G", "CS", "NW", "SK"],
+    fused = FusedOperator(name=f"fla_test_{'s' if win else 'f'}{kp}{qp}{pp}", input_args=["G", "CS", "NW", "SK"],
                           output_args=["A"], runlist=[(prep, "G", "CS", "QS", "KV", "NW"),
                                                       (attn, "QS", "KV", "A", "SK")]).compile()
     gen = torch.Generator().manual_seed(p0 + T + win)
@@ -66,7 +71,7 @@ def test_flint_attn(T: int, p0: int, win: int) -> None:
         if p0:
             k_h = torch.randn(p0, HD, generator=gen).numpy() * 2
             v_h = torch.randn(p0, HD, generator=gen).numpy()
-            kv[h, guard:guard + p0 // shape.pg] = KV.kv_groups(k_h, v_h, A_BYTES, 2)
+            kv[h, guard:guard + p0 // shape.pg] = KV.kv_groups(k_h, v_h, A_BYTES, kp)
     q = torch.randn(T, COLS * QH, HD, generator=gen) * 2  # (head 4 c + i: column c's)
     k = torch.randn(T, KVH, HD, generator=gen) * 2
     v = torch.randn(T, KVH, HD, generator=gen)
@@ -95,13 +100,16 @@ def test_flint_attn(T: int, p0: int, win: int) -> None:
 
     qs = fused.get_buffer("QS").view(np.uint8)[:prep.n_qs * 2].reshape(COLS, T // 8, QH, shape.qunit)
     qv = _q_values(qs, HD, shape.qp).transpose(0, 2, 1, 3, 4).reshape(COLS * QH, T, HD)  # [head][query][hd]
+    def floor(x: np.ndarray, planes: int) -> float:  # (the error of x's single bfp16 panels; hi + lo: 2e-4)
+        return 2e-4 if planes == 2 else 1.05 * rel(bfp16.values(x.reshape(-1, x.shape[-1])).reshape(x.shape), x)
+
     want_q = rope(q, wq).transpose(1, 0, 2) * shape.scale
-    assert rel(qv, want_q) < 2e-4
+    assert rel(qv, want_q) < floor(want_q, qp)
     n = (p0 + T) // shape.pg
     Ks, Vs = {}, {}
     for h in range(KVH):
         Ks[h], Vs[h] = (np.asarray(x, np.float64) for x in KV.kv_from_groups(kv[h, guard:guard + n], HD))
-        assert rel(Ks[h][p0:], rope(k, wk)[:, h]) < 2e-4, h
+        assert rel(Ks[h][p0:], rope(k, wk)[:, h]) < floor(rope(k, wk)[:, h], kp), h
         assert rel(Vs[h][p0:], v[:, h].bfloat16().double().numpy()) < 1e-2, h
     A = bfp16.from_panels(fused.get_buffer("A")[:attn.n_a], T, COLS * QH * HD).reshape(T, COLS * QH, HD)
     want = np.zeros((T, COLS * QH, HD))
@@ -118,4 +126,6 @@ def test_flint_attn(T: int, p0: int, win: int) -> None:
     err = rel(A, want)
     eq = rel(bfp16.values(want.reshape(T, -1).astype(np.float32)).reshape(want.shape), want)
     print(f"attention {err:.2e} (the exact output rounded to bfp16: {eq:.2e}); QB, CR {shape.blocks}")
-    assert err < 1.5 * eq
+    # (hi + lo P: the exact output's own rounding, 1.00x; single P adds its rounding: 1.34-1.44x after a history, 1.65-1.72x
+    # at p0 0, whose first rows see few keys)
+    assert err < (1.1 if pp == 2 else 1.9) * eq
