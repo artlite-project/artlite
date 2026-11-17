@@ -58,7 +58,8 @@ agrees with, so the text is the one the model writes alone. The drafter's head i
 LM head, laid out for it at load (the head's rows reordered, no weight copied). Each slot of a step routes its own
 experts (~+33% of a one-token step), so a round's step takes only the drafts whose probability (the drafter's, as the
 rounds calibrate it) pays for their slots at the measured step times, and the generation runs the drafter's rounds
-while they beat steps of one token.
+while they beat steps of one token. Short chat prompts, 400 tokens greedy, against ~32.4 tokens/s without it: math
+1.31x, code 1.24x, prose 1.13x, JSON 1.07x; the drafter takes 0.19 GB.
 
 ## Speed and accuracy (Strix Halo)
 
@@ -66,6 +67,7 @@ while they beat steps of one token.
 |---|---|---|---|---|
 | time to the first token (`artlite-bench`, essays) | 0.81 s | 3.87 s | 23.7 s | 70.1 s |
 | generation (greedy, 256 tokens, essay summary) | 31.4 tokens/s | | 19.3 tokens/s | |
+| the same with the DFlash2 drafter (steps of up to 4 tokens) | 36.5 tokens/s | | 21.6 tokens/s | |
 
 Accuracy against llama.cpp's CPU runs of the same file:
 

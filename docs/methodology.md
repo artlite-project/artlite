@@ -6,7 +6,7 @@ prompt's time to first token also with llama.cpp on the iGPU:
 
 | chart | what |
 |---|---|
-| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4, Qwen3.8 27B (DFlash2), Qwen3.6 35B-A3B and Occamy 1.0 (MTP) also with their drafters |
+| decode | tokens/s generated after a 1k- and a 32k-token prompt; Gemma 4, Qwen3.8 27B and Flint (DFlash2), Qwen3.6 35B-A3B and Occamy 1.0 (MTP) also with their drafters |
 | prefill | tokens/s of a 1k- and a 32k-token prompt |
 | TTFT | time to first token against prompt length, 1k to 128k tokens, log-log |
 | image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
@@ -79,7 +79,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 | LFM3 1.7B | QAD-Q4_0 | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-QAD-Q4_0.gguf) `LFM3-1.7B-QAD-Q4_0.gguf` | `43a7d09a0e9c` | 2026-11-10 |
 | | Q4_K_M | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-Q4_K_M.gguf) `LFM3-1.7B-Q4_K_M.gguf` | `3793e1e6e226` | 2026-11-10 |
-| Flint | int4 | [RecursiveSI/flint-int4-gguf](https://huggingface.co/RecursiveSI/flint-int4-gguf/blob/main/flint-int4-q4_1.gguf) `flint-int4-q4_1.gguf` | `43c07baccdba` | 2026-11-18 |
+| Flint | int4 | [RecursiveSI/flint-int4-gguf](https://huggingface.co/RecursiveSI/flint-int4-gguf/blob/main/flint-int4-q4_1.gguf) `flint-int4-q4_1.gguf`, its drafter [incoai/Flint-DFlash2-GGUF](https://huggingface.co/incoai/Flint-DFlash2-GGUF/blob/main/Flint-DFlash2-Q4_K_M.gguf) `Flint-DFlash2-Q4_K_M.gguf` | `43c07baccdba`, `c14e92d3f666` | 2026-11-18 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
 runs, with the toolchain pinned then:
