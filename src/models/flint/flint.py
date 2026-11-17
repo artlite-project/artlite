@@ -15,9 +15,9 @@ samples from the logits.
 With the DFlash2 drafter (incoai's Flint-DFlash2, ``model_config.flint_dflash_of``; ``artlite.decode.dflash``) a
 round's drafts come from one dispatch of the drafter's design in a hardware context of its own: it takes the model's last
 step's rows from the taps at layers 6, 16, 27, 37, 47 and guesses a block, whose first 3 drafts the model's next step
-verifies with the token (steps of 4 slots; each slot routes its own experts, ~+33% of a step: the rounds run while they
-beat steps of one, ``models.drafts.Planner``). Its head is the first 33280 rows of the model's LM head (the LM rows laid
-out with it: ``FlintImage(head=)``).
+verifies with the token (steps of 4 slots; each slot routes its own experts, ~+33% of a step: a round verifies the drafts
+that pay for their slots, ``models.dflash``, and the rounds run while they beat steps of one, ``models.drafts.Planner``).
+Its head is the first 33280 rows of the model's LM head (the LM rows laid out with it: ``FlintImage(head=)``).
 
 The chat template (the file's): GLM-style turns ``<|system|>``, ``<|user|>``, ``<|assistant|>``, ``<|observation|>`` (tool
 results); the model opens its own ``<think>`` (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's

@@ -3,12 +3,15 @@
 model's steps.
 
 The drafter takes the rows of the model's steps from the taps its step left in its ACT (``Injection``), one dispatch per
-round with its block of drafts; a block may carry a sibling branch (a model whose overlay ``can_branch``: steps of 8).
+round with its block of drafts, of which the round's step verifies those that pay at the model's step times (the walk's
+chain probabilities, calibrated by the rounds: ``SpeculativeMixin._keep``; an MoE's slots route to more experts, so it
+takes fewer); a block may carry a sibling branch (a model whose overlay ``can_branch``: steps of 8).
 
 The model supplies: ``dflash`` (the drafter), ``overlay``, ``position``, ``capacity``, ``carry``, ``rounds``,
 ``eos_token_ids``, ``_drafting``, ``_dispatch``, ``stale``, ``_rows`` (tokens' embedding rows), ``_mask`` (the mask token's
-row), the counters ``t_draft``, ``drafted``, ``blocks``, and ``_dflash_ahead(S, p)``: the model's step of S slots at p
-patched while the drafter's dispatch runs (``ModelOverlay.patch_ahead``, and what the model's positions need first).
+row), the counters ``t_draft``, ``drafted``, ``blocks``, ``_keep`` and ``_chains`` (``SpeculativeMixin``), and
+``_dflash_ahead(S, p)``: the model's step of S slots at p patched while the drafter's dispatch runs
+(``ModelOverlay.patch_ahead``, and what the model's positions need first).
 """
 
 import dataclasses
@@ -102,9 +105,14 @@ class DFlashDrafting:
                             and p % 8 + c + self.BRANCH <= 7) else 0  # (a branch inside its parent's 8 positions: ``QwenOverlay.step``)
         out = d.selector.walk(d.logits(), d.gates(), token, d.table.ids, n, set(m.eos_token_ids), sibling=L)
         self.sibling = d.selector.sibling if L else None
-        if self.sibling is not None:
+        if self.sibling is not None:  # (its step's slots all run; no calibration: a won branch's tokens are no drafts)
             out = out[:n - L]
             self.siblings += 1
+            m._chains = ()
+        else:  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``, calibrated by the rounds)
+            chains = d.selector.chains
+            out = out[:next((i for i in range(len(out)) if not m._keep(chains[i], i)), len(out))]
+            m._chains = tuple(chains[:len(out)])
         m.t_draft += time.perf_counter() - t0
         m.drafted += len(out) + len(self.sibling or ())
         m.blocks += 1

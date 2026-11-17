@@ -27,6 +27,7 @@ class Selector:
     def __init__(self, gguf: GGUFFile, cfg: DFlashConfig):
         self.gguf, self.top_k = gguf, cfg.top_k
         self.sibling: list[int] | None = None
+        self.chains: list[float] = []  # (``walk``)
 
     def resident(self) -> None:
         """The tables' pages read ahead (after the drafter's load released the file's): ~200 scattered rows a round."""
@@ -40,8 +41,9 @@ class Selector:
         walk) when that candidate's probability exceeds ``SIBLING`` times the n drafts' (the probabilities: the lattice's softmax
         over a position's candidates), else None: the drafts that a step gives their slots are the last ones, kept with the
         chain's probability, the branch where the first draft is not (prose: a third of first drafts at 32K, of which the
-        second candidate is right in a third to a half)."""
-        self.sibling = None
+        second candidate is right in a third to a half). ``self.chains``: per draft its chain's probability (its own and the
+        drafts' before it)."""
+        self.sibling, self.chains = None, []
         if n <= 0:
             return []
         k = self.top_k
@@ -56,14 +58,14 @@ class Selector:
         for i in range(n):
             sc = succ[i] @ (pred[j] * gates[i + 1]) + top[i][0]
             a = int(np.argmax(sc))
-            if sibling:
-                e = np.exp(sc - sc[a])
-                chain /= e.sum()
-                if i == 0:
-                    e[a] = 0.0
-                    b = int(np.argmax(e))
-                    p2 = e[b] * chain
+            e = np.exp(sc - sc[a])
+            chain /= float(e.sum())
+            if sibling and i == 0:
+                e[a] = 0.0
+                b = int(np.argmax(e))
+                p2 = e[b] * chain
             out.append(int(c[i, a]))
+            self.chains.append(chain)
             if out[-1] in stop:
                 break
             j = 1 + i * k + a

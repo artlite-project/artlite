@@ -1,7 +1,8 @@
 """Flint's DFlash2 drafter (``artlite.decode.dflash``, incoai's Flint-DFlash2 Q4_K_M) on the NPU, the whole model:
 
 - greedy text the same with and without the drafter (the model verifies every draft), on a code prompt; the drafts'
-  acceptance (llama.cpp's on the iGPU at 3 drafts a round: 0.66 on code; the NPU's 0.74 over these 200 tokens);
+  acceptance (llama.cpp's on the iGPU at 3 drafts a round: 0.66 on code; the NPU's 0.81 over these 200 tokens, its
+  rounds taking the drafts that pay);
 - the drafter's rows of a prompt written by the prefill (``prefill.dflash``) against the injections' of the same prompt
   run as decode steps: the drafter's next block's logits within the two paths' rounding (5.2%: the taps are the model's
   residuals, a few % apart between its prefill and its decode steps, test_prefill.py), the same drafts.

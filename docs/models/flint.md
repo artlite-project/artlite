@@ -56,8 +56,9 @@ guesses a block of tokens after the next one from the model's rows at five layer
 taps); the model's next step checks the first 3 of them with the token (steps of up to 4 slots) and keeps the ones it
 agrees with, so the text is the one the model writes alone. The drafter's head is the first 33280 rows of the model's
 LM head, laid out for it at load (the head's rows reordered, no weight copied). Each slot of a step routes its own
-experts (~+33% of a one-token step), so drafts pay where the text is predictable: the generation runs the drafter's
-rounds while their measured tokens per second beat steps of one token, and steps of one where they do not.
+experts (~+33% of a one-token step), so a round's step takes only the drafts whose probability (the drafter's, as the
+rounds calibrate it) pays for their slots at the measured step times, and the generation runs the drafter's rounds
+while they beat steps of one token.
 
 ## Speed and accuracy (Strix Halo)
 
