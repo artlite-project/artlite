@@ -51,6 +51,19 @@ constexpr Idx low_planes(bool q6k, int half) {
 constexpr Idx kQ4Lo = low_planes(false, 0), kQ4Hi = low_planes(false, 1);
 constexpr Idx kQ6Lo = low_planes(true, 0), kQ6Hi = low_planes(true, 1);
 
+/// The same of a Q4_0 / Q4_1 super-block's 8 blocks, their 16 code bytes each side by side (``q4_codes``): code 32 i + l
+/// is nibble l / 16 of byte 16 i + l % 16.
+constexpr Idx q4_planes(int half) {
+  Idx idx{};
+  for (int o = 0; o < 64; o++) {
+    int b = 64 * half + o, s = b >> 5, i = (b >> 2) & 7, jj = b & 3, e = 8 * s + 2 * jj;
+    idx[o] = static_cast<uint8_t>(16 * i + (e & 15) + (e >> 4));
+  }
+  return idx;
+}
+
+constexpr Idx kQ40Lo = q4_planes(0), kQ40Hi = q4_planes(1);
+
 /// Q5_K's high-bit plane: byte 4 i + jj = bits i of qh[8 s + 2 jj] (s = 0 .. 3: the low nibble) and of
 /// qh[8 s + 2 jj + 1] (the high one), a transposed 8 x 8 bit matrix per jj (GF2P8AFFINEQB with the identity as
 /// data: result byte i bit k = matrix byte 7 - k bit i). kQ5Gather: the matrices (byte 7 - k of qword jj = row k
@@ -124,6 +137,20 @@ inline uint16_t bf16_of(const uint8_t* f16, bool neg = false, float scale = 1.0f
 }
 
 inline void put16(uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); }
+
+/// A Q4_0 / Q4_1 super-block's 128 tile code bytes (q: block 0's 16 code bytes, block i's stride i bytes after) -> c.
+inline void q4_codes(uint8_t* c, const uint8_t* q, int stride) {
+  auto four = [&](const uint8_t* p) {  // (blocks 4 h .. 4 h + 3: their code bytes side by side)
+    __m512i x = _mm512_castsi128_si512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    x = _mm512_inserti32x4(x, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + stride)), 1);
+    x = _mm512_inserti32x4(x, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 2 * stride)), 2);
+    x = _mm512_inserti32x4(x, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 3 * stride)), 3);
+    return nibble_pairs(x);
+  };
+  const __m512i x0 = four(q), x1 = four(q + 4 * stride);
+  _mm512_storeu_si512(c, _mm512_permutex2var_epi8(x0, load_idx(kQ40Lo), x1));
+  _mm512_storeu_si512(c + 64, _mm512_permutex2var_epi8(x0, load_idx(kQ40Hi), x1));
+}
 
 /// The 6-bit scales and mins of a Q4_K / Q5_K super-block (its 12 scale bytes).
 inline void scales_k(const uint8_t* s, uint8_t* sc, uint8_t* mn) {
@@ -254,17 +281,9 @@ void tile_q4_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   for (int r = 0; r < R; r++) {
     uint8_t* h = t + 16 * nsb * r;
     for (int sb = 0; sb < nsb; sb++) {
-      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
-      for (int i = 0; i < 8; i++) {
-        const uint8_t* b = src[r] + 144 * sb + 18 * i;
-        put16(h + 16 * sb + 2 * i, bf16_of(b));
-        const uint8_t* q = b + 2;
-        for (int s = 0; s < 4; s++)
-          for (int jj = 0; jj < 4; jj++) {
-            const int e = 8 * s + 2 * jj;
-            c[32 * s + 4 * i + jj] = e < 16 ? nib(q[e], q[e + 1]) : static_cast<uint8_t>((q[e - 16] >> 4) | (q[e - 15] & 0xF0));
-          }
-      }
+      const uint8_t* b = src[r] + 144 * sb;
+      for (int i = 0; i < 8; i++) put16(h + 16 * sb + 2 * i, bf16_of(b + 18 * i));
+      q4_codes(codes + (size_t(sb) * R + r) * 128, b + 2, 18);
     }
   }
 }
@@ -293,18 +312,12 @@ void tile_q4_1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   for (int r = 0; r < R; r++) {
     uint8_t* h = t + 16 * nsb * r;
     for (int sb = 0; sb < nsb; sb++) {
-      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
+      const uint8_t* b = src[r] + 160 * sb;
       for (int i = 0; i < 8; i++) {
-        const uint8_t* b = src[r] + 160 * sb + 20 * i;
-        put16(h + 16 * sb + 2 * i, bf16_of(b));
-        put16(m + 16 * nsb * r + 16 * sb + 2 * i, bf16_of(b + 2));
-        const uint8_t* q = b + 4;
-        for (int s = 0; s < 4; s++)
-          for (int jj = 0; jj < 4; jj++) {
-            const int e = 8 * s + 2 * jj;
-            c[32 * s + 4 * i + jj] = e < 16 ? nib(q[e], q[e + 1]) : static_cast<uint8_t>((q[e - 16] >> 4) | (q[e - 15] & 0xF0));
-          }
+        put16(h + 16 * sb + 2 * i, bf16_of(b + 20 * i));
+        put16(m + 16 * nsb * r + 16 * sb + 2 * i, bf16_of(b + 20 * i + 2));
       }
+      q4_codes(codes + (size_t(sb) * R + r) * 128, b + 4, 20);
     }
   }
 }
@@ -317,7 +330,7 @@ void tile_q4_1_64(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   for (int r = 0; r < R; r++) {
     uint8_t* h = t + 16 * nsb * r;
     for (int sb = 0; sb < nsb; sb++) {
-      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
+      q4_codes(codes + (size_t(sb) * R + r) * 128, src[r] + 160 * sb + 4, 20);
       for (int p = 0; p < 4; p++) {
         const uint8_t* b = src[r] + 160 * sb + 40 * p;
         const uint16_t d = bf16_of(b), m = bf16_of(b + 2);
@@ -334,15 +347,6 @@ void tile_q4_1_64(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
                                   "bf16 (not group-64 Q4_1)", r, sb, 2 * p, 2 * p + 1));
         put16(h + 16 * sb + 2 * p, d);
         put16(h + 16 * sb + 8 + 2 * p, m);
-        for (int e2 = 0; e2 < 2; e2++) {
-          const int i = 2 * p + e2;
-          const uint8_t* q = b + 20 * e2 + 4;
-          for (int s = 0; s < 4; s++)
-            for (int jj = 0; jj < 4; jj++) {
-              const int e = 8 * s + 2 * jj;
-              c[32 * s + 4 * i + jj] = e < 16 ? nib(q[e], q[e + 1]) : static_cast<uint8_t>((q[e - 16] >> 4) | (q[e - 15] & 0xF0));
-            }
-        }
       }
     }
   }

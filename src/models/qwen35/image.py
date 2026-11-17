@@ -16,23 +16,9 @@ Per-column rows (the columns' work is independent up to each output projection):
   hidden / 8 c ..; "lm": rows vocab / 8 c .. of ``output``, the vocabulary padded to whole C objects per column
   (MiniCPM-V's 248094 -> 248320; padding rows -1: zero tiles).
 
-An MoE layer (``qwen35moe``: ``QwenConfig.moe``) has instead of gate_up and down:
-
-- "moe_in" (normed by ``post_attention_norm``): "sgu", the shared expert's gate / up rows (``gate_up_rows``);
-  "router", the router's rows of the column's experts E / 8 c .. (the F32 ``ffn_gate_inp`` as BFP16 planes,
-  ``decode.image.Block``: per expert its hi and lo rows, whose outputs the decode adds: the logits' order of
-  llama.cpp's fp32 up to ~3e-5 of a weight); "sgate", the shared expert's gate row (``ffn_gate_inp_shexp``: its hi and
-  lo planes) in every column. Both F32 tensors are packed times w / bf16(w), w the layer's ``post_attention_norm``
-  (``pack``): the decode's norm multiplies x by bf16 weights (``decode.protocol.norm_objects``), the logits need w's
-  fp32 (with the bf16 weights alone they are 8e-4 of their largest off, against 1.3e-5);
-- "sdown": the shared expert's down, rows hidden / 8 c .., its K (512) as row groups of 2 per tile row
-  (``decode.image.group_rows``);
-- the experts as slab regions (``TileImage.slabs``; half k = 2 e + h of expert e: its outputs h F / 2 .. of the expert's
-  F = ``expert_ffn``): "exp_gu", the half's gate / up rows (``gate_up_rows`` over the 3-D ``ffn_gate_exps`` /
-  ``ffn_up_exps``: expert e's rows e F ..), then "exp_down", the down's rows (all hidden of them) over the half's K
-  (F / 2 columns, h F / 2 .., of ``ffn_down_exps``' rows e hidden ..) as row groups of kc / (F / 2) (4 for F 512).
-  Expert e's two halves are one run of the image (``Region.col_stride`` apart: half 2 e + 1 right after half 2 e):
-  a decode column streams a whole expert, or one half of one.
+An MoE layer (``qwen35moe``: ``QwenConfig.moe``) has instead of gate_up and down the regions of ``moe.image``: "moe_in"
+(normed by ``post_attention_norm``: the shared expert's gate / up, the router's BFP16 planes, the shared expert's gate
+row "sgate"), "sdown" (its K 512 as row groups of 2 per tile row) and the expert slabs "exp_gu", "exp_down".
 
 A file with a multi-token-prediction block of its own (Qwen3.8: ``QwenConfig.nextn_layers``, the block at layer
 ``num_hidden_layers``) holds it after the LM head: "eh" (``nextn.eh_proj``, rows hidden / 8 c .. over K 2 hidden), then
@@ -58,16 +44,16 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 """
 
 import numpy as np
-from ml_dtypes import bfloat16
 
 from artlite.decode.attn256 import OBJ_BYTES
 from artlite.decode.head import HEAD_ROWS, TABLE_ROWS, draft_cols, head_region, head_rows, head_tokens, lm_order
-from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
+from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
 from artlite.decode.screen import screened
-from artlite.gguf_model import GGUFFile, QTensor
+from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
+from artlite.moe.image import MoeImage
 from artlite.operators.design import COLS
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
@@ -99,7 +85,7 @@ def contiguous(region: Region) -> bool:
     return all(g == region.kc_group for _, g in group_chunks(region))
 
 
-class QwenImage(TileImage):
+class QwenImage(MoeImage, TileImage):
     """The weight image of a qwen35 GGUF file. ``draft_cols``: its MTP block's drafter's head rows per column (0: no
     block laid out; module docstring)."""
 
@@ -115,7 +101,6 @@ class QwenImage(TileImage):
         (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
-        self._expert_rows: dict[tuple[str, int], np.ndarray] = {}  # (every layer's slab blocks share them)
         H, I = cfg.hidden_size, cfg.intermediate_size
         self.n_ids = cfg.vocab_size if vocab is None else vocab  # (the token ids of the LM rows: 0 .. ids - 1)
         if vocab is None:
@@ -123,9 +108,6 @@ class QwenImage(TileImage):
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab)
         assert H % (64 * COLS) == 0 and I % (64 * COLS) == 0
-        assert not cfg.moe or (cfg.n_experts % COLS == 0 and cfg.shared_ffn % (64 * COLS) == 0
-                               and KC % cfg.shared_ffn == 0 and KC % (cfg.expert_ffn // 2) == 0
-                               and cfg.expert_ffn % 128 == 0)
         assert cfg.ssm_k_heads % COLS == 0 and cfg.num_attention_heads % COLS == 0
         assert cfg.num_key_value_heads * cfg.head_dim % (COLS * 64) == 0
         assert self.vocab % COLS == 0
@@ -196,19 +178,10 @@ class QwenImage(TileImage):
         names = []
         for L in self.layers:
             b = f"blk.{L}."
-            planes = [(b + "post_attention_norm", (b + "ffn_gate_inp.weight", b + "ffn_gate_inp_shexp.weight"))] \
-                if self.cfg.moe else []
+            if self.cfg.moe:
+                names += self.scaled_planes(b + "post_attention_norm.weight", self.router_planes(L))
             if not self.cfg.attention[L] and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
-                planes.append((b + "attn_norm", (b + "ssm_alpha.weight",)))
-            for norm, tensors in planes:
-                w = self.gguf.tensor(norm + ".weight").dequantize().reshape(-1)
-                bw = w.astype(bfloat16).astype(np.float32)
-                ratio = np.where(bw != 0, w / np.where(bw != 0, bw, 1), 1).astype(np.float32)
-                for name in tensors:
-                    t = self.gguf.tensor(name)
-                    raw = (np.asarray(t.raw, np.float32).reshape(t.rows, t.cols) * ratio).astype(np.float32)
-                    self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
-                    names.append(name)
+                names += self.scaled_planes(b + "attn_norm.weight", (b + "ssm_alpha.weight",))
         try:
             return super().pack(out, threads=threads)
         finally:
@@ -256,44 +229,11 @@ class QwenImage(TileImage):
                                         ("z", (b + "attn_gate.weight",), np.stack(z)), *abp], H)
             self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
         if cfg.moe:
-            self._moe(layer)
+            self._moe(layer, gated=True)
             return
         R = self.R[self.fmt(b + "ffn_gate.weight")]
         self._add(layer, "gate_up", [("gu", (b + "ffn_gate.weight", b + "ffn_up.weight"), gate_up_rows(I, R))], H)
         self._add(layer, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
-
-    def _moe(self, layer: int) -> None:
-        """An MoE layer's regions (module docstring)."""
-        cfg, b = self.cfg, f"blk.{layer}."
-        H, E, F, Fs = cfg.hidden_size, cfg.n_experts, cfg.expert_ffn, cfg.shared_ffn
-        mine = E // COLS * np.arange(COLS)[:, None] + np.arange(E // COLS)[None]  # (the column's experts)
-        planes = (b + "ffn_gate_inp.weight", b + "ffn_gate_inp_shexp.weight")  # (rows 0 .. E - 1, E)
-        R = self.R[self.fmt(b + "ffn_gate_shexp.weight")]
-        self._add(layer, "moe_in", [("sgu", (b + "ffn_gate_shexp.weight", b + "ffn_up_shexp.weight"),
-                                     gate_up_rows(Fs, R)),
-                                    ("router", planes, np.stack([2 * mine, 2 * mine + 1], -1).reshape(COLS, -1)),
-                                    ("sgate", planes, np.tile([2 * E, 2 * E + 1], (COLS, 1)))], H)
-        R = self.R[self.fmt(b + "ffn_down_shexp.weight")]
-        self._add(layer, "sdown", [("sdown", (b + "ffn_down_shexp.weight",), group_rows(column_rows(H), R, KC // Fs))],
-                  Fs, G=KC // Fs)
-        gu, down = (b + "ffn_gate_exps.weight", b + "ffn_up_exps.weight"), b + "ffn_down_exps.weight"
-        self._add_slab(layer, "exp_gu", [("gu", gu, self._slab_rows("gu", self.R[self.fmt(gu[0])]))], H)
-        self.view(down, F // 512)  # (a row of the view: a half's K)
-        self._add_slab(layer, "exp_down", [("down", (down,), self._slab_rows("down", self.R[self.fmt(down)]))], F // 2,
-                       G=2 * KC // F)
-
-    def _slab_rows(self, name: str, R: int) -> np.ndarray:
-        """(2 E, n) the rows of the expert halves' "gu" or "down" block of R-row tiles (module docstring)."""
-        if (name, R) not in self._expert_rows:
-            cfg = self.cfg
-            H, E, F = cfg.hidden_size, cfg.n_experts, cfg.expert_ffn
-            if name == "gu":
-                rows = gate_up_rows(E * F, R, 2 * E)
-            else:  # (rows of the view: half h of the file's row e H + o at 2 (e H + o) + h)
-                k = np.arange(2 * E)[:, None]
-                rows = group_rows(2 * (H * (k // 2) + np.arange(H)[None]) + k % 2, R, 2 * KC // F)
-            self._expert_rows[(name, R)] = rows
-        return self._expert_rows[(name, R)]
 
 
 class MtpView:
