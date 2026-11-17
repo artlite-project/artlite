@@ -41,6 +41,9 @@ class NpuSpark(OverlayModel):
     drafter's next dispatch, the round's block's or one of their own before the model's next dispatch. A round's step of
     the token and 7 drafts injects all 8 rows; the kept ones are the sequence's, the next block writes over the others."""
 
+    recurrent = True  # (the sliding-window layers' rings and the drafter's hold a window: a position comes back from a
+    # checkpoint, ``SparkOverlay.snapshot``)
+
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] = SIZES, dspark: str | None = None):
         self.gguf = gguf

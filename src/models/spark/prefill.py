@@ -95,9 +95,9 @@ class SparkPrefill(ChunkPrefill):
         self._k_parts: dict[tuple, int] = {}
         self._gemms: dict[tuple, object] = {}
         self._preps: dict[tuple, AP.AttnPrepOperator] = {}
-        self.plans = {t: {(L, n): self._plan(L, n, t) for L in self.layers for n in self._phases(L)}
-                      for t in sorted({self._t(T) for T in self.sizes})}
-        self.d_pitch = {t: PG.d_pitch(self.img, t) for t in self.plans}
+        ts = sorted({self._t(T) for T in self.sizes})
+        self.d_pitch = {t: PG.d_pitch(self.img, t) for t in ts}  # (every output projection's pitch: once per size)
+        self.plans = {t: {(L, n): self._plan(L, n, t) for L in self.layers for n in self._phases(L)} for t in ts}
         self.attn = {(k, T): AP.PrefillAttnOperator(
             T=T, cfg=cfg, spec=ov.ash.spec, window=self.window if k == "swa" else 0, ring=ov.nr if k == "swa" else 0,
             head_bytes=ov.nr * AP.GROUP if k == "swa" else ov.ash.head_bytes, stage=self.stage if k == "swa" else 0)
@@ -125,8 +125,7 @@ class SparkPrefill(ChunkPrefill):
         return ("attn_in", "attn_out", "gate_up", "down")
 
     def _plan(self, L: int, name: str, t: int) -> PG.PhasePlan:
-        pitch = PG.d_pitch(self.img, t) if name in PG.OUT else PG.phase_pitch(self.img, name, t) \
-            if name == "attn_in" else 0
+        pitch = self.d_pitch[t] if name in PG.OUT else PG.phase_pitch(self.img, name, t) if name == "attn_in" else 0
         plan = plan_gemm(self.img, self.img.region(L, name), t, pitch=pitch, ops=self._gemms, k_parts=self._k_parts)
         assert plan.parts in (1, 2, 4), (L, name, plan.parts)
         return plan
