@@ -558,6 +558,11 @@ class GGUFFile:
         self._hint("populate", off, nbytes)
 
 
+def tensor_f32(gguf: GGUFFile, name: str) -> np.ndarray:
+    """A tensor of the file as a flat fp32 copy (an F32 / F16 / BF16 vector or matrix)."""
+    return np.asarray(gguf.tensor(name).raw, np.float32).reshape(-1).copy()
+
+
 def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bool = False,
                        special: bool = True) -> bytes:
     """A Hugging Face tokenizer.json of a GGUF byte-level BPE vocabulary (``tokenizer.ggml.model == "gpt2"``), for

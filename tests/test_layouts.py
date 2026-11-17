@@ -12,11 +12,12 @@ from jinja2 import meta
 
 from artlite.decode import attn as decode_attn
 from artlite.decode import attn256, protocol
+from artlite.decode.dflash import core as dflash_core
 from artlite.operators import templating
 from artlite.operators.words import LayoutError
 from artlite.vision import core as vision_core
 from models.lfm import conv as lfm_conv
-from models.qwen35 import dflash_core, gdn, words
+from models.qwen35 import gdn, words
 
 # the layout names a template may use: the words, flags and values of the layouts (their prefixes)
 _NAMES = re.compile(r"(M|F|S|B|K|C|A|G|V|MG|E|O|ST|DW|DW1|REC|ROLE)_[A-Z0-9_]+")
@@ -35,7 +36,7 @@ def _templates() -> dict[str, dict[str, int]]:
     }
     out |= {f"artlite/decode/{t}": attn256.consts() for t in ("attn256.cc.jinja", "attn256.main.cc.jinja",
                                                               "attn256.main_one.cc.jinja", "attn256.one.cc.jinja")}
-    out |= {f"models/qwen35/{t}": dflash_core.consts() for t in ("dflash_core.att.cc.jinja", "dflash_core.conv.cc.jinja")}
+    out |= {f"artlite/decode/dflash/{t}": dflash_core.consts() for t in ("core.att.cc.jinja", "core.conv.cc.jinja")}
     root = os.path.dirname(os.path.dirname(templating.__file__))
     for path in glob.glob(os.path.join(os.path.dirname(root), "models", "qwen35", "gdn*.jinja")):
         out[f"models/qwen35/{os.path.basename(path)}"] = gdn.consts()
@@ -52,7 +53,7 @@ def test_template_names_are_declared(name: str) -> None:
 
 @pytest.mark.parametrize("module", ["artlite.decode.design", "artlite.vision.design", "models.gemma4.decode",
                                     "models.llama.decode", "models.lfm.decode", "models.qwen35.decode",
-                                    "models.qwen35.dflash_core"])
+                                    "artlite.decode.dflash.core"])
 def test_layouts_import(module: str) -> None:
     """The designs' modules import (every layout of their cores is checked at import)."""
     importlib.import_module(module)

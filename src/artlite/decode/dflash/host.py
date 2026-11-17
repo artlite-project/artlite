@@ -1,12 +1,12 @@
-"""The DFlash2 drafter's host side (``dflash.DFlashOverlay`` runs the dispatches): the selector's greedy walk over a block's
-logits and gates, and the rotary angles of a block's or a chunk's positions."""
+"""The DFlash2 drafter's host side (``decode.dflash.overlay.DFlashOverlay`` runs the dispatches): the selector's greedy walk
+over a block's logits and gates, and the rotary angles of a block's or a chunk's positions."""
 
 import numpy as np
+from ml_dtypes import bfloat16
 
+from artlite import _native
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
-
-from ..sampling import top_logits
 
 
 def angles(cfg: DFlashConfig, positions: np.ndarray) -> np.ndarray:
@@ -45,7 +45,8 @@ class Selector:
         if n <= 0:
             return []
         k = self.top_k
-        top = [top_logits(logits[i], k, rows=ids) for i in range(1, n + 1)]
+        bits = logits.view(np.uint16) if logits.dtype == bfloat16 else logits  # (the head's bf16 logits: the native code's)
+        top = [_native.top_logits(bits[i], k, 0.0, rows=ids) for i in range(1, n + 1)]
         c = np.stack([c for _, c in top])
         succ = self.gguf.rows(self.TABLES[0], c.reshape(-1), prefetch=False).reshape(n, k, -1)
         pred = self.gguf.rows(self.TABLES[1], np.concatenate([[anchor], c[:-1].reshape(-1)]), prefetch=False)

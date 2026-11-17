@@ -1,6 +1,6 @@
-"""A prompt chunk's rows of the DFlash2 drafter's cache (``dflash``) in the model's chunk prefill (``qwen35.prefill.QwenPrefill(dflash=)``):
-the chunk leaves the records of its positions, in the ring (``dflash_core``), and the open rows of a record it does not fill. The rows
-are the injection's (``dflash``), in GEMMs:
+"""A prompt chunk's rows of the DFlash2 drafter's cache (``decode.dflash``) in the model's chunk prefill (``prefill.chunks.ChunkPrefill``'s
+drafters: qwen35's ``QwenPrefill(dflash=)``): the chunk leaves the records of its positions, in the ring (``decode.dflash.core``), and the
+open rows of a record it does not fill. The rows are the injection's (``decode.dflash.overlay``), in GEMMs:
 
 - at each tap layer's start (PX holds the model's residual there): x as bfp16 panels into columns i H .. of FT's rows of len(taps) H
   (``PrefillNormOperator(raw=True)``);
@@ -39,6 +39,9 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from artlite import txn
+from artlite.decode.dflash.core import HD, MAX_CHUNK, MAX_PADDING, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
+from artlite.decode.dflash.host import angles
+from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.operators import templating
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import block_values
@@ -47,16 +50,12 @@ from artlite.operators.design import COLS, MAX_BD_ITER
 from artlite.operators.kernel_source import kernel_prefix
 from artlite.operators.util import Attr, arg_bytes
 from artlite.prefill import gemm as PG
+from artlite.prefill.drafter import DrafterPrefill
 from artlite.prefill.norm import PrefillNormOperator
-
-from .dflash import DFlashOverlay
-from .dflash_core import HD, MAX_CHUNK, MAX_PADDING, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
-from .dflash_host import angles
-from .drafter_prefill import DrafterPrefill
 
 QD_KV = "qd_kv"  # bf16 offset of the chunk's first object in a layer's ring
 
-_PREP = templating.load("models/qwen35/dflash_prefill.cc.jinja")
+_PREP = templating.load("artlite/prefill/dflash.cc.jinja")
 
 
 class DFlashPrepOperator(ArtcOperator):
@@ -187,11 +186,11 @@ class DFlashPrefill(DrafterPrefill):
         shape, sizes = self.d.shape, self.pf.sizes
         if sizes[-1] // POS_PER_GROUP > shape.over:
             raise txn.HardwareLimitError(f"a chunk of {sizes[-1]} tokens writes {sizes[-1] // POS_PER_GROUP} cache objects past the "
-                                     f"DFlash2 ring, which holds {shape.over} (dflash_core.MAX_CHUNK {MAX_CHUNK})")
+                                     f"DFlash2 ring, which holds {shape.over} (decode.dflash.core.MAX_CHUNK {MAX_CHUNK})")
         gap = max(b - a for a, b in itertools.pairwise((0, *sizes)))
         if gap > MAX_PADDING:
             raise txn.HardwareLimitError(f"chunk sizes {sizes} leave up to {gap} padding rows, the DFlash2 ring keeps "
-                                     f"{MAX_PADDING} out of its window (dflash_core.MAX_PADDING)")
+                                     f"{MAX_PADDING} out of its window (decode.dflash.core.MAX_PADDING)")
 
     def _ops(self, t: int) -> SimpleNamespace:
         d, H = self.d, self.H

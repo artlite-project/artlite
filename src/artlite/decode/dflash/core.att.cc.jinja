@@ -1,7 +1,7 @@
 
-// The attention core (``dflash_core``'s docstring). Offsets in bytes: DFlashShape.workspace(); AP: a region whose address is in
+// The attention core (``decode.dflash.core``'s docstring). Offsets in bytes: DFlashShape.workspace(); AP: a region whose address is in
 // state word w (DFlashShape.ext: in the main core's memory)
-{% include "models/qwen35/dflash_core.common.cc.jinja" %}
+{% include "artlite/decode/dflash/core.common.cc.jinja" %}
 
 namespace {
 

@@ -1,7 +1,8 @@
-"""The DFlash2 block drafter's cores (``dflash``): a design of its own on the shared decode overlay (``decode.design``, 8 slots:
-the main and helper cores as every model's), in a hardware context of its own, with
+"""The DFlash2 block drafter's cores (``decode.dflash.overlay``): a design of its own on the shared decode overlay
+(``decode.design``, 8 slots: the main and helper cores as every model's), in a hardware context of its own, with
 
-- the conv core (c, 2), which holds the block's residual: res [k block 80][slot 8][8] fp32 of the column's 640 channels. It
+- the conv core (c, 2), which holds the block's residual: res [k block XK][slot 8][8] fp32 of the column's H8 = hidden / COLS
+  channels (``DFlashShape``: Qwen3.8 27B's drafter 640, Flint's 256). It
   emits x for the next normed phase, computes conv-in from res, the phase's rows (dyn) and the norm's sums of squares (``sq``,
   the helper's, in this core's memory), conv-out from the K-group sums of an output phase, into res. A group of 16 channels
   and its 2 + 2 taps' coefficients stay in one column: dyn's rows are the column's own (``dflash.conv_rows``).
@@ -23,10 +24,10 @@ masked per lane (P exactly 0). At the end o = y / l goes to the main core (R), w
 Conv core objects (``F_CV``, for the others an object of another core; ``M_CVOP``):
 
 - ``CV_LOAD``: payload objects of res (fp32 [k block][slot 8][8]), the block's input rows; then x goes out (``M_CVNE`` D objects);
-- ``CV_IN``: the object's payload [w 640 | b0 640 | b1 640] bf16 (the norm's weights, the conv's base of side 0, tap 0 and 1), then one
-  object of dyn [slot 8][192] bf16 (rows [side 2][tap 2][40 groups]: side 1's stay for ``CV_OUT``): the phase's input x from res, x =
+- ``CV_IN``: the object's payload [w H8 | b0 H8 | b1 H8] bf16 (the norm's weights, the conv's base of side 0, tap 0 and 1), then one
+  object of dyn [slot 8][DYN_ROWS] bf16 (rows [side 2][tap 2][GROUPS]: side 1's stay for ``CV_OUT``): the phase's input x from res, x =
   res w / rms, out_s = (b0 + d0_s) x_s + (b1 + d1_s) x_(s - 1) as bf16 x on D;
-- ``CV_OUT``: the payload [b0 640 | b1 640], then objects of y ([k block][slot 8][8] bf16, 32 k blocks each): res += (b0 + d0_s) y_s +
+- ``CV_OUT``: the payload [b0 H8 | b1 H8], then objects of y ([k block][slot 8][8] bf16, 32 k blocks each): res += (b0 + d0_s) y_s +
   (b1 + d1_s) y_(s - 1), then x from res on D.
 """
 
@@ -64,10 +65,6 @@ PO = 288  # an octet's P panels of 4 records
 CHUNK = 4 * PO  # the 4 octets' P panels of 4 records
 CV_LOAD, CV_IN, CV_OUT = range(3)
 D_BYTES = 2048  # a conv core's D object: 16 k blocks of x
-XK = 80  # k blocks of a column's x
-H8 = 8 * XK  # a column's channels
-GROUPS = H8 // 16  # conv groups of a column
-DYN_ROWS = 192  # dyn's rows per slot in its object: whole C objects of its 160
 # metadata words: a conv core's object (``CONV``: the flag ``F_CV``, the op and the objects' count) and an attention step's first
 # object (``ATT``: ``decode.attn256.F_ATT``)
 CONV = XMETA.kind("dflash conv")
@@ -95,20 +92,29 @@ def consts() -> dict[str, int]:
     return XMETA.consts(PHASE, CONV, ATT, FLAGS) | CONV_STATE.consts() | STATE.consts()
 
 
-_CONV = templating.load("models/qwen35/dflash_core.conv.cc.jinja")
+_CONV = templating.load("artlite/decode/dflash/core.conv.cc.jinja")
 
-_ATT = templating.load("models/qwen35/dflash_core.att.cc.jinja")
+_ATT = templating.load("artlite/decode/dflash/core.att.cc.jinja")
 
 
 class DFlashShape:
-    """The cores' sizes for a drafter ``cfg`` (hidden 5120, 8 KV heads of 128, 4 query heads per KV head), the conv and attention
-    workspaces, the ring of groups a window spans."""
+    """The cores' sizes for a drafter ``cfg`` (8 KV heads of 128, 4 query heads per KV head; hidden a multiple of COLS 32:
+    ``h8`` channels a column, ``xk`` k blocks of them, ``groups`` conv groups, ``dyn_rows`` dyn's rows per slot: whole C
+    objects of its 4 groups; ``ne``, ``y_objs``, ``nobj_r``: D objects of a column's x, X objects of its y and of its res),
+    the conv and attention workspaces, the ring of groups a window spans; ``a_bytes``: the objects' size (the model's tile
+    size: the drafter's head reads the model's LM tiles)."""
 
     def __init__(self, cfg: DFlashConfig, *, a_bytes: int = OBJ_BYTES):
-        assert cfg.head_dim == HD and cfg.kv_heads == COLS and cfg.heads == QC * COLS and cfg.hidden == COLS * H8
+        assert cfg.head_dim == HD and cfg.kv_heads == COLS and cfg.heads == QC * COLS and cfg.hidden % (COLS * 32) == 0
         assert cfg.block == 8 and cfg.conv_kernel == 2 and cfg.conv_group == 16, cfg
-        assert 4 * PAIR <= a_bytes and OPEN_BYTES <= a_bytes
-        assert 3 * H8 * 2 <= XPAY and 8 * DYN_ROWS * 2 <= XPAY and 8 * 128 * 4 <= XPAY
+        self.h8 = cfg.hidden // COLS
+        self.xk, self.groups = self.h8 // 8, self.h8 // 16
+        self.dyn_rows = -(-4 * self.groups // C_LEN) * C_LEN
+        self.ne = self.xk * 2 * 8 * 8 // D_BYTES
+        self.y_objs = -(-self.xk * 128 // XPAY)
+        self.nobj_r = -(-self.xk * 8 * 8 * 4 // XPAY)
+        assert 4 * PAIR <= a_bytes and OPEN_BYTES <= a_bytes and self.xk * 2 * 8 * 8 % D_BYTES == 0
+        assert 3 * self.h8 * 2 <= XPAY and 8 * self.dyn_rows * 2 <= XPAY and 8 * 128 * 4 <= XPAY
         self.cfg, self.a_bytes = cfg, a_bytes
         self.window = cfg.window
         # (objects: a window's closed records in distinct ones, what a chunk's padding rows overwrite past them)
@@ -119,7 +125,8 @@ class DFlashShape:
 
     def conv_workspace(self) -> dict[str, int]:
         """The conv core's workspace: state words, res, the constants of an object, dyn, the slots' 1 / rms."""
-        return regions([("st", 4 * 16), ("res", 4 * 8 * 8 * XK), ("cs", 2 * 3 * H8), ("dyn", 2 * 8 * DYN_ROWS), ("ir", 4 * 64)])
+        return regions([("st", 4 * 16), ("res", 4 * 8 * 8 * self.xk), ("cs", 2 * 3 * self.h8), ("dyn", 2 * 8 * self.dyn_rows),
+                        ("ir", 4 * 64)])
 
     def workspace(self) -> dict[str, int]:
         """The attention core's workspace. y: per set its blocks [db][row 4 x 8] fp32, then l (before the panels: the q rows
@@ -137,7 +144,8 @@ class DFlashShape:
         at = [(A_NRM, tail + e["nrm"]), (A_ROPE, tail + e["rope"]), (A_KO, tail + e["ko"]), (A_VO, tail + e["vo"])]
         v = dict(p=p, a=Attr(self.workspace()), v=Attr(self.conv_workspace()), at=at, QC=QC, SETS=self.sets, HD=HD, ND=ND, PO=PO, CHUNK=CHUNK,
                  PAIR=PAIR, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, OPEN_BYTES=OPEN_BYTES, C_LEN=C_LEN, eps=repr(self.eps),
-                 WINDOW=self.window, META=META, XPAY=XPAY, H8=H8, XK=XK, NX_PER_NORM=nx_per_norm, GROUPS=GROUPS, DYN_ROWS=DYN_ROWS, H=self.cfg.hidden,
+                 WINDOW=self.window, META=META, XPAY=XPAY, H8=self.h8, XK=self.xk, NX_PER_NORM=nx_per_norm, GROUPS=self.groups,
+                 DYN_ROWS=self.dyn_rows, H=self.cfg.hidden,
                  NO_OBJ=NE_BLOCK, NE_INJ=NE_INJ, CV_LOAD=CV_LOAD, CV_IN=CV_IN, CV_OUT=CV_OUT,
                  **consts())
         return _CONV.render(**v) + _ATT.render(**v)

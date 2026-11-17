@@ -1,4 +1,4 @@
-"""The DFlash2 block drafter (``qwen35.dflash``) of Qwen3.8-27B: ``dflash_ref.DFlash`` (fp32) against llama.cpp's draft-dflash, its design on
+"""The DFlash2 block drafter (``decode.dflash``) of Qwen3.8-27B: ``dflash_ref.DFlash`` (fp32) against llama.cpp's draft-dflash, its design on
 the NPU against ``dflash_ref.DFlash`` on the same taps, rounds of a generation.
 
 - the reference: the block's tensors (llama.cpp quantizes its activations to Q8_K: 1-7% per layer, as much as two of its builds
@@ -20,14 +20,14 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.decode.dflash.core import HD, PAIR, POS_PER_GROUP, QC, ROWS_B
+from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.decode.kv import kv_from_groups
 from artlite.decode.protocol import META, XB, interleave
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import qwen_dflash_of
 from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
-from models.qwen35.dflash import DFlashOverlay
-from models.qwen35.dflash_core import HD, PAIR, POS_PER_GROUP, QC, ROWS_B
 from models.qwen35.overlay import QwenOverlay
 from models.qwen35.qwen import NpuQwen, Qwen
 from models.sampling import Sampling, seed
@@ -345,7 +345,7 @@ def _state(d: DFlashOverlay) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
 
 @pytest.mark.parametrize("n", [301, 2301])
 def test_prefill(n: int) -> None:
-    """The records of a prompt's chunks (``qwen35.dflash_prefill``) are the injections' of the same rows, within the two paths' rounding (the
+    """The records of a prompt's chunks (``prefill.dflash``) are the injections' of the same rows, within the two paths' rounding (the
     model's rows differ between a chunk and decode steps: K ~2%, V ~4%, and by far more at its unstable tokens, 1 in 300 of this text, up to 3%
     of others: tokens the layers from 20 on reshape, whose rows part ways between any two graphs, llama.cpp's own too, ' colloquial' 26-29%,
     with the GDN and attention cores within their rounding of their own operands there); a chunk's last record's rows open."""

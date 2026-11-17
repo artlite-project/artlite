@@ -28,10 +28,10 @@ from ml_dtypes import bfloat16
 from artlite.operators.design import COLS
 from artlite.prefill import attn256 as AP
 from artlite.prefill import gemm as PG
+from artlite.prefill.drafter import DrafterPrefill
 from artlite.prefill.norm import PrefillNormOperator
 
 from .draft import QwenDraft
-from .drafter_prefill import DrafterPrefill
 
 
 class DraftPrefill(DrafterPrefill):

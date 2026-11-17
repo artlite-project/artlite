@@ -1,35 +1,34 @@
-"""The DFlash2 drafter's weights (``dflash.DFlashOverlay``): its matrices' tile regions in a ``TileImage``."""
+"""The DFlash2 drafter's weights (``decode.dflash.overlay.DFlashOverlay``): its matrices' tile regions in a ``TileImage``."""
 
 import numpy as np
 
-from artlite.decode.attn256 import OBJ_BYTES
 from artlite.decode.image import Region, TileImage, column_rows, gate_up_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
 
-from .dflash_core import GROUPS, QC
-from .image import KC, payload
+from .core import QC
 
 
-def conv_rows(c: int) -> np.ndarray:
-    """A conv projection's rows of column c: [side 2][tap 2] the column's GROUPS conv groups."""
-    return np.concatenate([q * COLS * GROUPS + GROUPS * c + np.arange(GROUPS) for q in range(4)])
+def conv_rows(c: int, groups: int) -> np.ndarray:
+    """A conv projection's rows of column c: [side 2][tap 2] the column's ``groups`` conv groups."""
+    return np.concatenate([q * COLS * groups + groups * c + np.arange(groups) for q in range(4)])
 
 
 class DFlashImage(TileImage):
     """The drafter's weights, its matrices' tiles (the selector's tables stay in the file, read by row): fc, per layer ain,
     aqkv ([q | K | V] of the column's 4 query heads and KV head), aout, fin, gu, down, then gate (``selector_hidden``). An injection's K and V
-    are aqkv's rows (``ikv``: a view of its tiles)."""
+    are aqkv's rows (``ikv``: a view of its tiles). ``kc``, ``payload``, ``tile_bytes``: the model's image's (its K groups,
+    its objects: the drafter's head reads the model's LM tiles)."""
 
-    def __init__(self, gguf: GGUFFile, cfg: DFlashConfig):
+    def __init__(self, gguf: GGUFFile, cfg: DFlashConfig, *, kc: int, payload: int, tile_bytes: int):
         self.cfg = cfg
         H, I, d = cfg.hidden, cfg.ffn, cfg.head_dim
-        super().__init__(gguf, kc=KC, payload=payload(H), tile_bytes=OBJ_BYTES, vocab=0)
+        super().__init__(gguf, kc=kc, payload=payload, tile_bytes=tile_bytes, vocab=0)
         self._add(-2, "fc", [("fc", ("fc.weight",), column_rows(H))], len(cfg.taps) * H)
         q = np.stack([QC * d * c + np.arange(QC * d) for c in range(COLS)])
         kv = np.stack([d * c + np.arange(d) for c in range(COLS)])
-        conv = np.stack([conv_rows(c) for c in range(COLS)])
+        conv = np.stack([conv_rows(c, H // COLS // 16) for c in range(COLS)])
         for L in range(cfg.layers):
             b = f"blk.{L}."
             self._add(L, "ain", [("dyn", (b + "attn_conv_proj.weight",), conv)], H)

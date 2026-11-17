@@ -81,7 +81,7 @@ from artlite.decode.protocol import (
 )
 from artlite.decode.screen import Screen
 from artlite.decode.vring import substeps
-from artlite.gguf_model import GGUFFile
+from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
 from artlite.moe.steps import CP_BYTES, MoeTransfers
@@ -94,7 +94,7 @@ from .conv_state import HSLOT, ConvHandoff, check_slot
 from .cursor import GdnCursor
 from .decode import QwenDecodeOperator
 from .gdn_steps import GdnTransfers
-from .image import NORMS, QwenImage, gdn_v_heads, tensor_f32
+from .image import NORMS, QwenImage, gdn_v_heads
 from .steps import PanelTable, Step
 from .words import F_GDN, F_GIN, M_HPAN
 
@@ -152,6 +152,7 @@ class QwenOverlay(ModelOverlay):
     # 8 slots writes its steps' branch words between them.
     STEPS_AHEAD = True
     AHEAD_PREPARED = False
+    KV_PAD = KV_PAD  # (``decode.dflash.overlay.DFlashTarget``)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
@@ -767,19 +768,9 @@ class QwenOverlay(ModelOverlay):
         h = cur.gcur if cur.conv_in_ghdr else cur.half(cur.gnext)
         return slice(256 + h * self.ghalf, 256 + (h + 1) * self.ghalf)
 
-    def tap_x(self, L: int) -> int:
-        """ACT offset of the x of layer L's first phase (L = -1: the LM head): the residual stream that layer read, as
-        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (the DFlash2 drafter reads it in place)."""
-        return self.inp[self._input(L)][0].off + XB
-
-    def move_tap_slots(self, L: int, S: int, src: list[int]) -> None:
-        """After a step of S slots: layer L's tap of the slots ``src`` moved to its first slots."""
-        sp = self._sp(S)
-        off, n = self.tap_x(L), self.H * sp * 2
-        self.dev.fetch("ACT", off, n)
-        x = self.dev.view("ACT")[off:off + n].view(np.uint16).reshape(self.H // 8, sp, 8)
-        x[:, :len(src)] = x[:, src].copy()
-        self.dev.flush("ACT", off, n)
+    def drafter_view(self) -> object:
+        """(a DFlash2 drafter's head: the MTP block's view of the LM rows, ``QwenImage.mtp_view``; ``DFlashTarget``)"""
+        return self.image.mtp_view(self.cfg) if self.image.draft_cols else None
 
     def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""

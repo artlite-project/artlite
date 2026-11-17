@@ -246,6 +246,20 @@ class ModelOverlay:
         """Token slots of a step at most (the design's)."""
         return self.op.slots
 
+    def tap_x(self, L: int) -> int:
+        """ACT offset of the x of layer L's first phase (L = -1: the LM head): the residual stream that layer read, as
+        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place)."""
+        return self.inp[self._input(L)][0].off + XB
+
+    def move_tap_slots(self, L: int, S: int, src: list[int]) -> None:
+        """After a step of S slots: layer L's tap of the slots ``src`` moved to its first slots."""
+        sp = self._sp(S)
+        off, n = self.tap_x(L), self.H * sp * 2
+        self.dev.fetch("ACT", off, n)
+        x = self.dev.view("ACT")[off:off + n].view(np.uint16).reshape(self.H // 8, sp, 8)
+        x[:, :len(src)] = x[:, src].copy()
+        self.dev.flush("ACT", off, n)
+
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------

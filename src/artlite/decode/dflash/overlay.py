@@ -1,27 +1,28 @@
-"""The DFlash2 block drafter of a qwen35 model (GGUF architecture ``dflash``, llama.cpp's ``src/models/dflash.cpp`` and
-``common/speculative.cpp``'s draft-dflash) on a decode overlay of its own (``dflash_core``): one dispatch per round, in its own
-hardware context, the model's verify between two of them. A dispatch after another hardware context costs ~1.9 ms, a verify too:
-~3.7 ms a round, against 10 ms of each MTP draft.
+"""The DFlash2 block drafter of a model (GGUF architecture ``dflash``, llama.cpp's ``src/models/dflash.cpp`` and
+``common/speculative.cpp``'s draft-dflash; Qwen3.8 27B's, Flint's) on a decode overlay of its own (``decode.dflash.core``): one
+dispatch per round, in its own hardware context, the model's verify between two of them (the model's overlay: ``DFlashTarget``).
+A dispatch after another hardware context costs ~1.9 ms, a verify too: ~3.7 ms a round, against 10 ms of each of Qwen3.8 27B's
+MTP drafts.
 
 A dispatch holds up to two parts:
 
 - the injection of the verify's kept rows. The drafter's cache takes the rows of the model's sequence: fc over the rows' taps (the
   model's residual before layers ``DFlashConfig.taps``, which are the x of those layers' first phases: its ACT holds them after
   its step, read in place, 5 K groups into the main cores' residual), bf16 g, normed by enc.output_norm; per layer K (RMS-normed,
-  rotated) and V of g, into the open object (``dflash_core``), a closed record into the ring.
+  rotated) and V of g, into the open object (``decode.dflash.core``), a closed record into the ring.
 - the block at position p: the anchor token and 7 mask tokens, non-causal. Per layer, the conv core holding the residual:
 
   ain (x normed: the conv projection's rows dyn) | conv-in -> aqkv (q, K, V) | the attention over the window and the block | aout
   (o) | conv-out, into the residual | fin (x normed: the FFN's conv projection) | conv-in -> gu (gate / up) | down | conv-out
 
   then, normed by output_norm, gate (``selector_hidden``, the selector's 256 dims) and lm: the head, the first rows of the model's
-  LM head per column in the model's weight buffer (``QwenImage.mtp_view``: the fixed tokens and the table of the sequence's own,
-  ``decode.head.HeadTable``).
+  LM head per column in the model's weight buffer (``DFlashTarget.drafter_view``: the fixed tokens and the table of the
+  sequence's own, ``decode.head.HeadTable``).
 
 The selector runs on the host (``Selector``): per position the top 16 logits, their rows of the file's ``selector_successor`` /
 ``selector_predecessor`` (dequantized on demand from the mapped file, read ahead after the load), a greedy walk; in a generation's
 rounds also a sibling branch where the first draft is uncertain: two tokens from the first position's second candidate on, which the
-round's step runs in its last two slots, branching off the round's token (``NpuQwen._sibling``).
+round's step runs in its last two slots, branching off the round's token (the model's rounds: ``models.dflash``).
 
 The main cores' residual is a scratch here: aout's, down's and fc's K groups sum into it (zero-loaded objects first) and go out
 as whole x; the phases need no kernel of their own.
@@ -33,7 +34,7 @@ prompt cache's usual one, goes back over a whole answer.
 
 import dataclasses
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -65,19 +66,16 @@ from artlite.decode.protocol import (
     XPAY,
     input_fill,
 )
-from artlite.gguf_model import GGUFFile
+from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import DFlashConfig
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
 
-from .dflash_core import (
+from .core import (
     CV_IN,
     CV_LOAD,
     CV_OUT,
-    D_BYTES,
-    DYN_ROWS,
     F_CV,
-    H8,
     HD,
     M_ANOBJ,
     M_CVNE,
@@ -94,21 +92,16 @@ from .dflash_core import (
     POS_PER_GROUP,
     QC,
     REC_K,
-    XK,
     DFlashOperator,
     DFlashShape,
 )
-from .dflash_host import Selector, angles
-from .dflash_image import DFlashImage
-from .image import tensor_f32
-from .overlay import KV_PAD, QwenOverlay
+from .host import Selector, angles
+from .image import DFlashImage
 
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}
 SCATTER = (18, ND, 36, 36 * ND)  # a record's drain into its pair (words): ND panels 144 B apart
-NE = XK * 2 * 8 * 8 // D_BYTES  # D objects of a column's x
-Y_OBJS = -(-XK * 128 // XPAY)  # X objects of a column's y
-NOBJ_R = 5  # X objects of a column's res
+SLOTS_OF = 8  # the model's steps' slots at most (the drafter's injections read their x in place: packed, as its own)
 
 
 class Run(NamedTuple):
@@ -142,33 +135,54 @@ class Step:
     patch: dict[str, np.ndarray] | None = None  # (``_tables``)
 
 
+class DFlashTarget(Protocol):
+    """What the drafter needs of its model's overlay: its config, file, device and image (``kc``, ``payload``: the K groups
+    of the drafter's own image; ``T``: the objects' size, its head's tiles being the model's), its steps' slots (``SLOTS``,
+    packed inputs: the drafter's injections read their x in place), the taps (``tap_x``: a layer's input x in its ACT) and
+    the drafter's head: the first rows of each column of its LM region (``drafter_view``: a ``decode.head`` view, its fixed
+    tokens and its table; None: no such rows); ``KV_PAD``: the positions past its last layer's caches that its prefill's
+    slices reach (the drafter's rings have as many past them)."""
+
+    cfg: Any
+    gguf: GGUFFile
+    dev: OverlayDevice
+    image: Any
+    T: int
+    SLOTS: int
+    KV_PAD: int
+
+    def tap_x(self, L: int) -> int: ...
+
+    def drafter_view(self) -> Any: ...
+
+
 class DFlashOverlay(ModelOverlay):
-    """The drafter ``gguf`` of the model on overlay ``target``. ``load`` after the target's (its device, weight and activation
-    buffers); ``step`` runs a dispatch."""
+    """The drafter ``gguf`` of the model on overlay ``target`` (``DFlashTarget``). ``load`` after the target's (its device,
+    weight and activation buffers); ``step`` runs a dispatch."""
 
     CONFIG = DFlashConfig
     IMAGE = DFlashImage
-    SLOTS_OF = 8  # (the model's step: the drafter's injections read its slots' x)
 
-    def __init__(self, target: QwenOverlay, gguf: GGUFFile):
+    def __init__(self, target: DFlashTarget, gguf: GGUFFile):
         self.target = target
         self.cfg = cfg = DFlashConfig.from_gguf(gguf)
         tc = target.cfg
         if (cfg.hidden != tc.hidden_size or len(cfg.taps) * cfg.hidden != gguf.tensor("fc.weight").cols
                 or max(cfg.taps) >= tc.num_hidden_layers):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
-        if not target.image.draft_cols or target.SLOTS != self.SLOTS_OF:
-            raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of steps of {self.SLOTS_OF} tokens and a drafter head "
-                             f"(an MTP block), not {target.gguf.path}")
-        self.shape = DFlashShape(cfg)
-        self.image = DFlashImage(gguf, cfg)
-        view = target.image.mtp_view(target.cfg)
+        view = target.drafter_view()
+        if view is None or target.SLOTS > SLOTS_OF or not target.op.packed:
+            raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of packed steps of at most {SLOTS_OF} tokens and "
+                             f"a drafter head, not {target.gguf.path}")
+        self.shape = DFlashShape(cfg, a_bytes=target.T)
+        self.image = DFlashImage(gguf, cfg, kc=target.image.kc, payload=target.image.payload, tile_bytes=target.T)
         self.table = HeadTable(view, tc.vocab_size, lambda: target.dev)
         self.head = view.region(-1, "lm")
         self.image.vocab = self.head.n_rt * self.head.blocks[0].R * COLS
         super().__init__(gguf, layers=list(range(cfg.layers)), vocab=None, weights=None, image=self.image)
         fmts = self.image.formats() | {self.head.blocks[0].fmt}
-        self.op = DFlashOperator(hidden=cfg.hidden, rows={f: self.image.R[f] for f in sorted(fmts)}, shape=self.shape, eps=cfg.rms_norm_eps)
+        self.op = DFlashOperator(hidden=cfg.hidden, rows={f: self.image.R[f] for f in sorted(fmts)}, shape=self.shape,
+                                 tile_bytes=target.T, eps=cfg.rms_norm_eps)
         self.flags = FLAGS
         self.n_norm = -(-cfg.hidden // (NX_PER_NORM * OBJ_K))
         self.selector = Selector(gguf, cfg)
@@ -227,10 +241,11 @@ class DFlashOverlay(ModelOverlay):
         for L in range(cfg.layers):
             self.norm_off[(L, "attn")] = take("NORM", nw)
             self.norm_off[(L, "ffn")] = take("NORM", nw)
-        self.cload = take("ACT", COLS * (XB + NOBJ_R * XPAY))  # [column][F_CV object | res]
+        sh = self.shape
+        self.cload = take("ACT", COLS * (XB + sh.nobj_r * XPAY))  # [column][F_CV object | res]
         # (per layer and branch, per column: conv-in's object, dyn's object; conv-out's object | y)
         self.cvin = take("ACT", cfg.layers * 2 * COLS * 2 * XB)
-        self.cvy = take("ACT", cfg.layers * 2 * COLS * (XB + Y_OBJS * XPAY))
+        self.cvy = take("ACT", cfg.layers * 2 * COLS * (XB + sh.y_objs * XPAY))
         self.fatt = take("ACT", 2 * 2 * XB)  # ([block | injection][F_ATT object | rope object])
         self.norms = take("ACT", cfg.layers * XB)  # (a layer's q_norm, k_norm)
         self.qobj = take("ACT", cfg.layers * COLS * self.SLOTS * XB)  # [layer][column][slot]: q, K, V
@@ -239,8 +254,8 @@ class DFlashOverlay(ModelOverlay):
         self.ring_off = take("KV", cfg.layers * COLS * self.ring_bytes)
         self.open_off = take("KV", cfg.layers * COLS * T)
         self.sink = take("KV", 2 * PAIR)  # (the records no injection closes)
-        take("KV", KV_PAD // POS_PER_GROUP * T)  # (the prefill's sub-chunk slices of the last layer's rings run past them:
-        # ``dflash_prefill``'s DFlashPrepOperator, a sub-chunk's rings from its first object on)
+        take("KV", self.target.KV_PAD // POS_PER_GROUP * T)  # (the prefill's sub-chunk slices of the last layer's rings run past them:
+        # ``prefill.dflash``'s DFlashPrepOperator, a sub-chunk's rings from its first object on)
         take("GATE", 2 * COLS * self.SLOTS * C_LEN)
         self._sizes()
 
@@ -257,7 +272,7 @@ class DFlashOverlay(ModelOverlay):
 
     def _cvy(self, L: int, b: int, c: int) -> int:
         """ACT offset of the conv-out object, its y's objects overlapping it."""
-        return self.cvy + ((L * 2 + b) * COLS + c) * (XB + Y_OBJS * XPAY)
+        return self.cvy + ((L * 2 + b) * COLS + c) * (XB + self.shape.y_objs * XPAY)
 
     def _q(self, L: int, c: int) -> int:
         return self.qobj + (L * COLS + c) * self.SLOTS * XB
@@ -294,8 +309,9 @@ class DFlashOverlay(ModelOverlay):
         return x.reshape(2, 2, self.cfg.hidden)
 
     def _load(self) -> None:
-        cfg = self.cfg
+        cfg, sh = self.cfg, self.shape
         norm, act = self.dev.view("NORM"), self.dev.view("ACT")
+        H8, NE, Y_OBJS, NOBJ_R = sh.h8, sh.ne, sh.y_objs, sh.nobj_r
 
         def bf(x: np.ndarray) -> np.ndarray:
             return x.astype(bfloat16).view(np.uint8)
@@ -378,11 +394,13 @@ class DFlashOverlay(ModelOverlay):
         """The conv core's x -> a phase's x."""
         rg = self.inp[phase][0]
         for c in range(COLS):
-            seq.drain("D", c, self.dev.address("ACT", rg.off + XB + 2 * self.SLOTS * H8 * c), 2 * self.SLOTS * H8)
+            seq.drain("D", c, self.dev.address("ACT", rg.off + XB + 2 * self.SLOTS * self.shape.h8 * c),
+                      2 * self.SLOTS * self.shape.h8)
 
     def _x_drains(self, seq: Sequence, c: int, phase: tuple[int, str], S: int) -> None:
         """Column c's residual out of the main core (F_EMITR) -> a phase's x."""
-        self._values_to(seq, c, phase, e0=H8 * c, n=H8, S=S, whole=True)
+        h8 = self.shape.h8
+        self._values_to(seq, c, phase, e0=h8 * c, n=h8, S=S, whole=True)
 
     def _inject(self, seq: Sequence, st: Step) -> None:
         """fc over the rows' taps, g normed, per layer K and V, the attention core's records."""
@@ -430,8 +448,9 @@ class DFlashOverlay(ModelOverlay):
     def _rows_to(self, seq: Sequence, phase: tuple[int, str], L: int, b: int) -> None:
         """A normed phase's rows (dyn) -> its conv object."""
         for c in range(COLS):
-            seq.drain("C", c, self.dev.address("ACT", self._cvin(L, b, c) + XB + 4 * META), 2 * self.SLOTS * DYN_ROWS,
-                      (C_LEN // 2, self.SLOTS, DYN_ROWS // 2, C_LEN // 2))
+            dr = self.shape.dyn_rows
+            seq.drain("C", c, self.dev.address("ACT", self._cvin(L, b, c) + XB + 4 * META), 2 * self.SLOTS * dr,
+                      (C_LEN // 2, self.SLOTS, dr // 2, C_LEN // 2))
 
     def _phase_in(self, seq: Sequence, phase: tuple[int, str], norm: object = None) -> None:
         """A phase's weights, its inputs after the drains so far."""
@@ -445,17 +464,17 @@ class DFlashOverlay(ModelOverlay):
         """An output phase's x (F_EMITR) in DDR: conv-out; x -> ``to``."""
         seq.sync()
         for c in range(COLS):
-            seq.fill("X", c, self.dev.address("ACT", self._cvy(L, b, c)), (1 + Y_OBJS) * XB, DIMS_OBJ)
+            seq.fill("X", c, self.dev.address("ACT", self._cvy(L, b, c)), (1 + self.shape.y_objs) * XB, DIMS_OBJ)
         self._d_to(seq, to)
 
     def _y_drains(self, seq: Sequence, L: int, b: int) -> None:
         for c in range(COLS):
-            seq.drain("C", c, self.dev.address("ACT", self._cvy(L, b, c) + XB), 2 * self.SLOTS * H8)
+            seq.drain("C", c, self.dev.address("ACT", self._cvy(L, b, c) + XB), 2 * self.SLOTS * self.shape.h8)
 
     def _block(self, seq: Sequence, st: Step) -> None:
-        dev, cfg, S = self.dev, self.cfg, self.SLOTS
+        dev, cfg, S, nr = self.dev, self.cfg, self.SLOTS, self.shape.nobj_r
         for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", self.cload + c * (XB + NOBJ_R * XPAY)), (1 + NOBJ_R) * XB, DIMS_OBJ)
+            seq.fill("X", c, dev.address("ACT", self.cload + c * (XB + nr * XPAY)), (1 + nr) * XB, DIMS_OBJ)
         self._d_to(seq, (0, "ain"))
         for L in range(cfg.layers):
             self._phase_in(seq, (L, "ain"), (L, "attn"))
@@ -634,12 +653,12 @@ class DFlashOverlay(ModelOverlay):
 
     def _write_rows(self, x: np.ndarray) -> None:
         """The block's rows (8, hidden) fp32 -> the conv cores' res ([column][k block][slot 8][8])."""
-        act = self.dev.view("ACT")
-        n = x.reshape(8, COLS, XK, 8).transpose(1, 2, 0, 3).astype(np.float32)
+        act, sh = self.dev.view("ACT"), self.shape
+        n = x.reshape(8, COLS, sh.xk, 8).transpose(1, 2, 0, 3).astype(np.float32)
         for c in range(COLS):
-            o = self.cload + c * (XB + NOBJ_R * XPAY)
+            o = self.cload + c * (XB + sh.nobj_r * XPAY)
             act[o + XB:][:n[c].nbytes] = n[c].view(np.uint8).reshape(-1)
-        self.dev.flush("ACT", self.cload, COLS * (XB + NOBJ_R * XPAY))
+        self.dev.flush("ACT", self.cload, COLS * (XB + sh.nobj_r * XPAY))
 
     def snapshot(self, position: int) -> dict[str, Any]:
         """What continuing from ``position`` needs of the drafter (the module docstring): the ring's objects of the positions before it,

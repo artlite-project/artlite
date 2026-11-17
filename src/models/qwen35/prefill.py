@@ -71,14 +71,14 @@ from artlite.operators.util import arg_bytes
 from artlite.prefill import attn256 as AP
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
+from artlite.prefill.dflash import DFlashPrefill
+from artlite.prefill.drafter import DrafterPrefill
 from artlite.prefill.norm import PrefillNormOperator
 
 from . import gdn as GD
 from . import gdn_prefill as GP
 from .conv_state import CS_OFF
-from .dflash_prefill import DFlashPrefill
 from .draft_prefill import DraftPrefill
-from .drafter_prefill import DrafterPrefill
 from .overlay import KV_PAD, QwenOverlay
 
 SUB = 256  # tokens per sub-chunk (the operators' T)
@@ -143,7 +143,7 @@ class QwenPrefill(ChunkPrefill):
         self.qn_off = {L: i * 4 * 2 * AP.HD for i, L in enumerate(self.att + ([draft.L] if draft is not None else []))}
         # (an MTP drafter's cache records of the prompt: ``draft_prefill``)
         self.dp = DraftPrefill(draft, self) if draft is not None else None
-        # (a DFlash2 drafter's rows of the prompt: ``dflash_prefill``)
+        # (a DFlash2 drafter's rows of the prompt: ``prefill.dflash``)
         self.fp = DFlashPrefill(dflash, self) if dflash is not None else None
         self.drafters: list[DrafterPrefill] = [d for d in (self.dp, self.fp) if d is not None]
         self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,

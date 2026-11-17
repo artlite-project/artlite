@@ -196,7 +196,7 @@ greedy text with drafts can differ from greedy text without where the top two lo
 dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
 
 Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory (`--spec-type draft-mtp`: with its MTP layer, whose
-263 MB the image otherwise leaves out, as with `--spec-type none`; the drafter takes 1.07 GB; `qwen35/dflash.py`). Instead of a chain of drafts, one dispatch guesses a whole
+263 MB the image otherwise leaves out, as with `--spec-type none`; the drafter takes 1.07 GB; `artlite/decode/dflash/`). Instead of a chain of drafts, one dispatch guesses a whole
 block of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a design of its own, which adds under 1 s to a load and no visible time
 to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt
 chunk; its head is the first 84480 rows of the model's LM head (the special tokens, the first ids and 512 of the sequence's own tokens: a few

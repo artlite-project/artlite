@@ -1,7 +1,8 @@
-"""What a drafter adds to the model's chunk prefill (``prefill.QwenPrefill``): its cache's records of the chunk's positions.
+"""What a drafter adds to the model's chunk prefill (``prefill.chunks.ChunkPrefill``: qwen35's ``QwenPrefill``, Flint's
+``FlintPrefill``): its cache's records of the chunk's positions.
 
-``DrafterPrefill`` is the protocol of ``DraftPrefill`` (an MTP drafter's records: ``draft_prefill``) and ``DFlashPrefill`` (the
-DFlash2 drafter's: ``dflash_prefill``); the prefill holds its drafters and calls each at the same places of a chunk:
+``DrafterPrefill`` is the protocol of qwen35's ``DraftPrefill`` (an MTP drafter's records) and ``prefill.dflash.DFlashPrefill`` (the
+DFlash2 drafter's); the prefill holds its drafters and calls each at the same places of a chunk:
 
 - the buffers it adds (``rows``: bytes per token; ``buffers``, ``external``), its static contents (``static``);
 - items of the chunk's runlist: at its start (``start_items``), at the start of a layer (``tap_items``), at its end

@@ -43,6 +43,7 @@ from collections.abc import Callable, Iterator
 
 import numpy as np
 
+from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
@@ -59,7 +60,6 @@ from ..sampling import Mask, Penalties, Probs, Sampling
 from ..sequence import Sequence, token_ids
 from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
-from .dflash import DFlashOverlay
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
 from .drafting import DFlashDrafting, MtpDrafting
 from .image import QwenImage

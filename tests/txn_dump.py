@@ -380,7 +380,7 @@ def _qwen(path: str, *, draft: str | None = None, dflash: str | None = None
     """A qwen35 model's run; ``draft``: its MTP drafter ("": the file's own block, else a drafter file), ``dflash``: a
     DFlash2 drafter's file (the drafter's steps follow the model's)."""
     def run(attach: Callable[[object], _Log]) -> None:
-        from models.qwen35.dflash import DFlashOverlay
+        from artlite.decode.dflash.overlay import DFlashOverlay
         from models.qwen35.draft import QwenDraft, draft_formats, draft_gate_up
         from models.qwen35.image import QwenImage
         from models.qwen35.overlay import QwenOverlay

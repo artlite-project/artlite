@@ -8,11 +8,11 @@ import numpy as np
 import pytest
 
 from artlite import txn
+from artlite.decode.dflash.core import MAX_CHUNK, MAX_PADDING, POS_PER_GROUP
+from artlite.prefill.dflash import DFlashPrefill
+from artlite.prefill.drafter import DrafterPrefill
 from models.qwen35 import conv_state
 from models.qwen35.cursor import GdnCursor
-from models.qwen35.dflash_core import MAX_CHUNK, MAX_PADDING, POS_PER_GROUP
-from models.qwen35.dflash_prefill import DFlashPrefill
-from models.qwen35.drafter_prefill import DrafterPrefill
 from models.qwen35.drafting import DFlashDrafting, Injection
 from models.qwen35.steps import PanelTable, StatePanel
 
