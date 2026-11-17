@@ -1,6 +1,7 @@
-"""References of the Spark-X tests: the files (``gguf``), token sequences (an essay's tokens, a chat turn with a fixed
-reply), the fp32 CPU model's logits (``cpu.SparkCpu``, cached in ``tests/refs/<model>/``: ``common.cached_ref``) and
-llama.cpp's CPU logits of a sequence (the golden dump tool: ``tests.goldens.text.golden`` runs any architecture)."""
+"""References of the Spark-X tests: the files (``gguf``), token sequences (an essay's tokens, the corpus's, a chat turn
+with a fixed reply), the fp32 CPU model's logits (``cpu.SparkCpu``, cached in ``tests/refs/<model>/``:
+``common.cached_ref``) and llama.cpp's CPU logits of a sequence (the golden dump tool: ``tests.goldens.text.golden`` runs
+any architecture)."""
 
 import numpy as np
 import torch
@@ -35,6 +36,11 @@ def gguf(size: str = "1.7B", quant: str = "Q4_K_M", org: str = "XHToken") -> GGU
 def essay_ids(n: int, size: str = "1.7B", name: str = "addiction.txt") -> list[int]:
     """The BOS and the first n - 1 tokens of an essay of the corpus."""
     return [BOS] + llama_tokenize(path(size), common.essay(name))[:n - 1]
+
+
+def corpus_ids(n: int, size: str = "1.7B") -> list[int]:
+    """The BOS and the first n - 1 tokens of the essay corpus (``common.essays``: past one essay's length)."""
+    return [BOS] + llama_tokenize(path(size), common.essays()[:8 * n])[:n - 1]
 
 
 def chat_ids(size: str = "1.7B") -> list[int]:

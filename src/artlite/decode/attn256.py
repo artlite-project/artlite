@@ -463,18 +463,19 @@ def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[i
 def window_words(p: int, window: int) -> tuple[int, int, np.ndarray]:
     """(a windowed spec) A sliding-window layer's F_ATT words of a step at p (row s: slot s at p + s, its keys
     p + s - window + 1 .. p + s): the cache's first group streamed (``M_G0``: the group of the first slot's window
-    start), the record of that start (``M_WREC``: -1, every row's window from position 0 on), the rows' masks of it and
-    the next record (``M_WMASK``: per record rows 0 .. 3, 4 .. 7, a row's lanes before its window)."""
+    start, or of position 0), the record of that start (``M_WREC``: -1, every row's window from position 0 on), the
+    rows' masks of it and the next record (``M_WMASK``: per record rows 0 .. 3, 4 .. 7, a row's lanes before its
+    window: a later slot's window may start past position 0 where the first slot's does not)."""
     first = p - window + 1
     w = np.zeros(4, np.uint32)
-    if first <= 0:
+    if first + 7 <= 0:
         return 0, -1, w
-    r = first >> 3
+    r = max(first, 0) >> 3
     for k in range(2):
         for s in range(8):
             n = min(max(first + s - 8 * (r + k), 0), 8)
             w[2 * k + s // 4] |= ((1 << n) - 1) << (8 * (s % 4))
-    return first >> 5, r, w
+    return max(first, 0) >> 5, r, w
 
 
 # ----------------------------------------------------------------------

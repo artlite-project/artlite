@@ -53,10 +53,10 @@ whole rows in DDR, where a slot's objects scattered 16-byte rows, ~22 us a phase
 slots, but the residual): the main core's workspace holds the residual of slots 0 .. 3, the helper's memory that of 4
 .. 7 (``hres``: the main core's south neighbour), the helper's scratch (its GEMV scratch and a K group's 16-k sums),
 the sum of squares and the B operands of the 16-k sums (``ONEHOT``) lie in the core south of it (``HS8_ROW``: the
-model's core there leaves it room), the main core's SiLU table in the helper's memory (``SILU8_AT``): the main core
+model's core there leaves it room), the main core's activation table in the helper's memory (``ACT8_AT``): the main core
 holds a second X object, so that the next object comes in while the helper converts this one's strips (at 8 rows per k
 block the objects double). With gather tables (paged formats, tiles
-of more than 16 rows, gate / up windows) every byte counts: the cores' buffers pinned (``l1_8``), one X object, one SiLU
+of more than 16 rows, gate / up windows) every byte counts: the cores' buffers pinned (``l1_8``), one X object, one activation
 copy, smaller stacks (``STACK8``: the pages' frames counted, ``operators.checks``), the residual's pitch 16 past a row.
 Their memtiles' channels leave a side 14 BDs: each core half's pages have a channel of their own (``pg_split``). No moe,
 post, packed designs.
@@ -173,8 +173,9 @@ from .protocol import (
 _SRC = templating.load("artlite/decode/design.cc.jinja")  # (the main and helper cores' kernels)
 
 WS8_AT = 0x4000  # (8 slots) the main core's workspace (region 1 on; then the sum panels)
-# (8 slots) the main core's SiLU table, its two copies in regions 0, 3 of the helper's memory: the room of a second X object
-SILU8_AT = (0x0800, 0xF9C0)
+# (8 slots) the main core's activation table (SiLU's, GELU's), its two copies in regions 0, 3 of the helper's memory: the
+# room of a second X object
+ACT8_AT = (0x0800, 0xF9C0)
 # (8 slots with gather tables: ``l1_8``) the main core's table copies in regions 1 (its workspace after it) and 3, the
 # helper's in regions 0 and 3 (its scratch is in the core south of it)
 TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
@@ -234,7 +235,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
                  a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False):
-        """act: the gate/up activation ("silu", "gelu"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
+        """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
         count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold other
@@ -271,7 +272,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not moe or not (post or pli or packed or tok) and act == "silu" and nsb == 4
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert all(gemv.supported(f, nsb, slots) for f in rows), (rows, slots)
-        assert act in ("silu", "gelu") and (not pli or act == "gelu")
+        assert act in ("silu", "gelu", "gelu_erf") and (not pli or act == "gelu")
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
         self.paged = tuple(sorted(paged))
@@ -283,7 +284,6 @@ class DecodeOverlayOperator(ArtcOperator):
         self.stacks = STACK8 if slots == 8 and self.tables else (self.STACK, self.HELPER_STACK)  # (main, helper)
         assert len([f for f in self.tables if f not in self.paged]) <= 1 and \
             (set(self.tables) <= set(self.paged) or len(self.tables) == 1), (self.tables, self.paged)
-        assert not gu_win or act == "silu"
         assert not split or (gu_win and moe is None), "split gate / up blocks: dense designs with the gate / up windows"
         self.split = split
         self.rowsplit = sorted(f for f in rows if gemv.row_split(f, nsb))
@@ -339,10 +339,10 @@ class DecodeOverlayOperator(ArtcOperator):
         """(8 slots with gather tables) The pinned buffers (local addresses) of the main core (``m_*``): A object 0 and the
         X object in region 0 after its stack, table copy 0 at region 1's start, the workspace (its scratch in region 2) and
         the sum panels after it, A object 1 and table copy 1 in region 3; of the helper (``h_*``): table copy 0 after its
-        stack, the x panels, slots 4 .. 7's residual (``hres``), its partial rows (one object), the SiLU table (one copy,
+        stack, the x panels, slots 4 .. 7's residual (``hres``), its partial rows (one object), the activation table (one copy,
         the main core gathers it twice) and ``hst``, table copy 1 (its scratch is in the core south of it: ``HS8_ROW``).
-        The rest (statics, C and command objects) goes into the gaps: no room is left for a second X object or SiLU copy
-        (``x_l1_depth``, ``silu8_addresses``)."""
+        The rest (statics, C and command objects) goes into the gaps: no room is left for a second X object or table copy
+        (``x_l1_depth``, ``act8_addresses``)."""
         W, (mt, ht) = self.workspace(), self.tab
 
         def up(n: int) -> int:
@@ -358,17 +358,17 @@ class DecodeOverlayOperator(ArtcOperator):
         out["h_xp"] = ht[0] - 0x70000 + TAB_BYTES
         out["h_hres"] = out["h_xp"] + up(self.xp_bytes)
         out["h_res"] = out["h_hres"] + up(self.hres_bytes)
-        out["h_silu"] = out["h_res"] + up(4 * self.yn)
-        out["h_hst"] = out["h_silu"] + up(4 * kmath.SILU.table_words().size)
+        out["h_act"] = out["h_res"] + up(4 * self.yn)
+        out["h_hst"] = out["h_act"] + up(4 * kmath.TABLES[self.act].table_words().size)
         assert out["h_hst"] + 16 <= ht[1] - 0x70000, out
         return out
 
-    def silu8_addresses(self) -> list[int]:
-        """(8 slots) The SiLU table's two copies as the main core reads them in the helper's memory (at 0x40000), with
-        gather tables its one copy twice (``l1_8``)."""
+    def act8_addresses(self) -> list[int]:
+        """(8 slots) The activation table's two copies as the main core reads them in the helper's memory (at
+        0x40000), with gather tables its one copy twice (``l1_8``)."""
         if self.slots != 8:
             return [0, 0]
-        return [0x40000 + self.l1_8()["h_silu"]] * 2 if self.tables else [0x40000 + a for a in SILU8_AT]
+        return [0x40000 + self.l1_8()["h_act"]] * 2 if self.tables else [0x40000 + a for a in ACT8_AT]
 
     @property
     def xp_bytes(self) -> int:
@@ -454,7 +454,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, split=self.split, split_rows=SPLIT_ROWS, POST_K=POST_K, xh=self.xh,
                                  COLS=COLS, paged=bool(self.paged),
-                                 packed=self.packed, MAX_K=MAX_K, ablate=self.ablate, SILU8=self.silu8_addresses(),
+                                 packed=self.packed, MAX_K=MAX_K, ablate=self.ablate, ACT8=self.act8_addresses(),
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  **self._moe_vars(p, consts), **consts)
 
@@ -660,7 +660,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
         def main_fn(a_f, x_f, c_f, cmd_f, res_f, *rest):
             rest = list(rest)
-            if s8:  # (the SiLU table's copies: placed, read through their addresses)
+            if s8:  # (the activation table's copies: placed, read through their addresses)
                 rest = rest[:-(1 if self.tables else 2)]
             if self.tables:  # (the gather tables: placed, read through their addresses)
                 rest = rest[:-2]
@@ -829,12 +829,12 @@ class DecodeOverlayOperator(ArtcOperator):
                     grids[c, h] = [Buffer(t_ty, tile=Tile(c, r), name=f"{P}_grid{c}_{r}{i}",
                                           address=self.tab[h][i] - 0x70000, initial_value=init[i])
                                    for i in range(2)]
-        def silu_tab(c: int) -> list[Buffer]:  # (placed, read through their addresses)
+        def act_tab(c: int) -> list[Buffer]:  # (placed, read through their addresses)
             if not s8:
                 return []
-            words = kmath.SILU.table_words()
-            at = [self.l1_8()["h_silu"]] if self.tables else list(SILU8_AT)
-            return [Buffer(np.ndarray[(words.size,), np.dtype[np.uint32]], name=f"{P}_msilu{c}_{i}", tile=Tile(c, hr), address=a,
+            words = kmath.TABLES[self.act].table_words()
+            at = [self.l1_8()["h_act"]] if self.tables else list(ACT8_AT)
+            return [Buffer(np.ndarray[(words.size,), np.dtype[np.uint32]], name=f"{P}_mact{c}_{i}", tile=Tile(c, hr), address=a,
                            initial_value=words) for i, a in enumerate(at)]
 
         # (paged: the main cores take COLS + their column, not a constant 0 in column 0, which can give its control code
@@ -860,7 +860,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
                                             *([k_psums] if self.post else []), ws, xp, xs,
                                             (COLS if self.paged else 0) + c, *pg_main.get(c, []),
-                                            *grids.get((c, 0), []), *silu_tab(c)],
+                                            *grids.get((c, 0), []), *act_tab(c)],
                                   tile=Tile(c, mr), stack_size=self.stacks[0], dynamic_objfifo_lowering=True,
                                   while_true=False))
             help_args = []

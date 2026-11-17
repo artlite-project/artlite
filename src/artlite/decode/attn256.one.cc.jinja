@@ -381,18 +381,41 @@ __attribute__((noinline, minsize)) void {{ p }}_wmask(int32_t *__restrict ws, in
 }
 
 {% endif %}
+{% if WINDOW %}
+// (a sliding-window layer) The lanes of a set's rows (slots 4 h .. 4 h + 3) whose window starts past the first group of
+// the stream (in its second: slots s >= 32 (g0 + 1) - (p - window + 1)), as a mask word; none in a full layer
+[[clang::always_inline]] inline uint32_t {{ p }}_late(const int32_t *__restrict st, int h)
+{
+    const int t = 32 * (st[{{ A_G0 }}] + 1) - (st[{{ A_P }}] - {{ WINDOW - 1 }}) - 4 * h;
+    return st[{{ A_KD }}] != {{ KIND_SWA }} || t >= 4 ? 0u : t <= 0 ? ~0u : ~0u << (8 * t);
+}
+
+{% endif %}
 // The first group's scores in (from baselines 0): each row's reference m its maximum in them (a later score above it by up to
 // 2^63.5: scores span less than that, P clamps there): the softmax needs no rescale. Baselines b = 192 - m: scores
-// as A = s + b from QK on, this group's too
-__attribute__((noinline, minsize)) void {{ p }}_m0(int32_t *__restrict ws)
+// as A = s + b from QK on, this group's too. A sliding-window layer's rows whose window starts in the stream's second group
+// (``late``): their reference that group's instead (their first group: every key masked, its P 0), from baselines 0 as a step
+// of their position alone takes it (late 0: the other rows', 1: those rows')
+__attribute__((noinline, minsize)) void {{ p }}_m0(int32_t *__restrict ws{% if WINDOW %}, int late{% endif %})
 {
+{% if WINDOW %}
+    const int32_t *__restrict st = AW(int32_t, {{ a.st }});
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < {{ SETS }}; set++) {
         float *__restrict ss = AW(float, {{ a.sc }}) + 128 * set;
         const aie::vector<float, 32> m = al::max8(aie::max(aie::max(aie::load_v<32>(ss), aie::load_v<32>(ss + 32)),
                                                            aie::max(aie::load_v<32>(ss + 64), aie::load_v<32>(ss + 96))));
+{% if WINDOW %}
+        const uint32_t lw = {{ p }}_late(st, set & 1);
+        const aie::mask<32> mk = aie::mask<32>::from_uint32(late ? lw : ~lw);  // (the rows whose reference this is)
+        float *__restrict ml = AW(float, {{ a.ml }}) + 64 * set;
+        const aie::vector<float, 32> b = aie::select(aie::zeros<float, 32>(), aie::sub(aie::broadcast<float, 32>(192.0f), m), mk);
+        aie::store_v(ml, aie::select(aie::load_v<32>(ml), b, mk));
+{% else %}
         const aie::vector<float, 32> b = aie::sub(aie::broadcast<float, 32>(192.0f), m);
         aie::store_v(AW(float, {{ a.ml }}) + 64 * set, b);
+{% endif %}
         AIE_LOOP_NO_UNROLL
         for (int k = 0; k < 128; k += 32)
             aie::store_v(ss + k, aie::add(aie::load_v<32>(ss + k), b));
@@ -607,7 +630,9 @@ void {{ p }}_asoft(int32_t *__restrict ws)
     aie::set_rounding(aie::rounding_mode::conv_even);
 {% if WINDOW %}
     if (g == st[{{ A_G0 }}])
-        {{ p }}_m0(ws);
+        {{ p }}_m0(ws, 0);
+    else if (g == st[{{ A_G0 }}] + 1 && {{ p }}_late(st, 1))  // (rows whose window starts here: their reference)
+        {{ p }}_m0(ws, 1);
     if (st[{{ A_KD }}] == {{ KIND_SWA }} && 4 * g <= st[{{ A_WR }}] + 1)  // (after m0: its references are the rows' scores)
         {{ p }}_wmask(ws, g);
 {% else %}

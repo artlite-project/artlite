@@ -51,6 +51,7 @@ from artlite.model_config import (
     qwen_gguf,
     qwen_mtp_of,
     sd15_dir,
+    spark_gguf,
     swift_gguf,
 )
 from artlite.moe import route as moe_route
@@ -262,6 +263,37 @@ def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
             ov.step(x, e, p, logits=lg)
 
         _run_plain(ov, log, step, lm=False)
+
+    return run
+
+
+def _spark(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    """Spark-X: steps of 1 .. 8 slots across the window's start (511) and the sliding-window rings' first wrap (82
+    groups: 2624 positions), a snapshot and its restore, a reset."""
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.spark.overlay import SparkOverlay
+
+        ov = SparkOverlay(GGUFFile(path), max_positions=3072)
+        log = attach(ov.op)
+        rng = np.random.default_rng(2)
+        ov.load()
+        p, i, snap = 0, 0, None
+        while p + 8 <= 2900:
+            S = (1, 8, 3, 5, 8, 2, 7, 8, 4, 6)[i % 10] if p < 600 or p > 2600 else 8
+            log.label = f"S={S} p={p}"
+            ov.step(_x(rng, S, ov.H), p, logits=i % 4 == 0)
+            if p >= 700 and snap is None:
+                snap = (p + S, ov.snapshot(p + S))
+            p, i = p + S, i + 1
+        ov.restore(snap[1])
+        log.label = f"restored S=1 p={snap[0]}"
+        ov.step(_x(rng, 1, ov.H), snap[0])
+        ov.reset()
+        for p in range(0, 40, 4):
+            log.label = f"after reset S=4 p={p}"
+            ov.step(_x(rng, 4, ov.H), p)
+        log.label = "logits_of"
+        ov.logits_of(_x(rng, 1, ov.H)[0])
 
     return run
 
@@ -531,6 +563,9 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "qwen-3.8-27B-dflash": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda p: _qwen(p, dflash=qwen_dflash_of(p))),
     "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
+    "spark-4B-Q4_K_M": (spark_gguf("4B"), _spark),
+    "spark-1.7B-Q4_K_M": (spark_gguf("1.7B"), _spark),
+    "spark-4B-bartowski-Q4_K_M": (spark_gguf("4B", "Q4_K_M", "bartowski"), _spark),
 }
 
 

@@ -443,13 +443,13 @@ def _spark_ref(r: dict, p: int, S: int, c: int, s: int) -> tuple[np.ndarray, np.
                          [("4B", "swa", 0, 1, 0), ("4B", "swa", 5, 3, 0), ("4B", "swa", 511, 1, 0), ("4B", "swa", 512, 8, 0),
                           ("4B", "swa", 540, 8, 0), ("4B", "swa", 1000, 8, 0), ("4B", "full", 1001, 8, 0),
                           ("4B", "full", 30, 4, 0), ("1.7B", "swa", 1003, 8, 0), ("1.7B", "full", 700, 5, 0),
-                          ("4B", "swa", 1000, 8, 20), ("1.7B", "swa", 1500, 7, 18)])
+                          ("4B", "swa", 1000, 8, 20), ("1.7B", "swa", 1500, 7, 18), ("1.7B", "swa", 505, 8, 0)])
 def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int) -> None:
     """Spark's attention (``SPARK``): per column and slot o within bfp16 / bf16 rounding of the fp64 attention over what the
     slot sees: a sliding-window layer's keys p + s - 511 .. p + s (its window's first group streamed first, the keys
     before a row's window masked: rows whose window starts in the second group too), a full layer's all; the rotation of
     the kind (128 bf16 pairs, 32 fp32); one gate per head; the relayed K records of the step's positions; a ring whose
-    window crosses its end read in two fills."""
+    window crosses its end read in two fills; a step whose later slots' windows start past position 0 (505)."""
     r = _spark(size, kind, p, S, ring=ring)
     ash, HD = r["ash"], A1.HD
     for c in range(COLS):
