@@ -61,15 +61,19 @@ def _cpu(m: cpu.SparkCpu, ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
     return m.mm(m.rms(x, m.norm), m.head_w[:VOCAB]), torch.stack(res, 1)
 
 
-@pytest.mark.parametrize(("name", "n"), [("1.7B", 700), ("4B", 700), ("1.7B", 2800), ("4B-Q8_0", 300),
-                                         ("bartowski-4B", 300), ("bartowski-4B-Q4_0", 300)],
-                         ids=["1.7B", "4B", "1.7B-wrap", "4B-Q8_0", "bartowski-4B", "bartowski-4B-Q4_0"])
-def test_spark_overlay_layers(name: str, n: int) -> None:
+@pytest.mark.parametrize(("name", "n", "tails"), [("1.7B", 700, False), ("4B", 700, False), ("1.7B", 2800, False),
+                                                  ("4B-Q8_0", 300, False), ("bartowski-4B", 300, False),
+                                                  ("bartowski-4B-Q4_0", 300, False), ("4B", 700, True),
+                                                  ("4B-Q8_0", 300, True), ("bartowski-4B", 300, True),
+                                                  ("bartowski-4B-Q4_0", 300, True)],
+                         ids=["1.7B", "4B", "1.7B-wrap", "4B-Q8_0", "bartowski-4B", "bartowski-4B-Q4_0", "4B-tails",
+                              "4B-Q8_0-tails", "bartowski-4B-tails", "bartowski-4B-Q4_0-tails"])
+def test_spark_overlay_layers(name: str, n: int, tails: bool) -> None:
     g = ref.gguf(*FILES[name])
     ids = ref.corpus_ids(n, FILES[name][0])
     m = cpu.SparkCpu(g, layers=SLICE)
     want, wres = _cpu(m, ids)
-    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=n + 64)
+    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=n + 64, tails=tails)
     ov.load()
     hidden: list[np.ndarray] = []
     got = _run(ov, m.emb[torch.tensor(ids)], STEPS, hidden)
@@ -80,13 +84,14 @@ def test_spark_overlay_layers(name: str, n: int) -> None:
     assert all(np.mean(v) < TOL and max(v) < 3 * TOL for v in err.values()), err
 
 
-def test_spark_overlay_steps() -> None:
+@pytest.mark.parametrize("tails", [False, True], ids=["padded", "tails"])
+def test_spark_overlay_steps(tails: bool) -> None:
     """Steps of 1 .. 8 slots give the logits of steps of one, bit for bit, past the window; so do steps that continue
     from fewer slots than the last one ran (a generation's rejected drafts: the slots past the accepted ones hold other
     tokens)."""
     g = ref.gguf()
     ids = ref.essay_ids(600)
-    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=640)
+    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=640, tails=tails)
     ov.load()
     m = cpu.SparkCpu(g, layers=[])
     x = m.emb[torch.tensor(ids)]

@@ -23,6 +23,7 @@ from .protocol import (
     B_NA,
     B_NB,
     B_PAIR,
+    B_PT,
     B_SPLIT,
     F_EMITR,
     F_LOADR,
@@ -51,16 +52,14 @@ from .protocol import (
 
 @dataclass
 class Group:
-    """A K group of a phase: chunks k0 .. k0 + g, the metadata of its input."""
+    """A K group of a phase: chunks k0 .. k0 + g, the metadata of its input (K elements: the last group of a
+    ``Region.half`` region's, half a chunk short)."""
 
     k0: int  # first K chunk
     g: int  # chunks
     meta: np.ndarray  # (META,) int32
     kc: int  # columns of a chunk
-
-    @property
-    def K(self) -> int:
-        return self.g * self.kc
+    K: int  # input elements
 
 
 def valid_rows(region: Region) -> list[int]:
@@ -97,6 +96,11 @@ def group_chunks(region: Region) -> list[tuple[int, int]]:
     return [(k, min(max_g, n - k)) for k in range(0, n, max_g)]
 
 
+def group_K(region: Region, k0: int, g: int) -> int:
+    """The input elements of the K group of chunks k0 .. k0 + g (a ``Region.half`` region's last: half a chunk short)."""
+    return min(g * region.kc, region.K_in - k0 * region.kc)
+
+
 def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
            block_flags: dict[str, int] | None = None, slots: int = gemv.SLOTS) -> list[Group]:
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
@@ -110,7 +114,7 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
         f32 = B_F32 if (flags & F_MSG or f32_ab) and b.name in ("ab", "beta") else 0
         f32 |= B_PAIR if b.name == "alpha" else 0
         assert b.G in (1, 2, 4), b.G
-        g = {1: 0, 2: B_G2, 4: B_G4}[b.G]
+        g = {1: 0, 2: B_G2, 4: B_G4}[b.G] | (B_PT if b.pt else 0)
         blk += [rt, format_word(b) | f32 | g | (block_flags or {}).get(b.name, 0), nv]
     parts = group_chunks(region)
     out = []
@@ -119,11 +123,13 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
         last = i + 1 == len(parts)
         first = F_NORM | F_POST | F_PZERO
         f = F_MAIN | flags & ~(first | F_EMITR) | (flags & first if i == 0 else 0) | (flags & F_EMITR if last else 0)
-        nx = g * region.kc // POST_K if flags & F_POST else n_inputs(g * region.kc, slots)
-        m[M_FLAGS], m[M_NS], m[M_NX], m[M_K] = f, S, nx, g * region.kc
-        m[M_NT], m[M_G], m[M_NRT], m[M_NB] = region.n_rt * g, g, region.n_rt, len(region.blocks)
+        K = group_K(region, k0, g)
+        nx = K // POST_K if flags & F_POST else n_inputs(K, slots)
+        m[M_FLAGS], m[M_NS], m[M_NX], m[M_K] = f, S, nx, K
+        nt = region.n_t if region.half else region.n_rt * g  # (a half region: one group, its pairs' tiles)
+        m[M_NT], m[M_G], m[M_NRT], m[M_NB] = nt, g, region.n_rt, len(region.blocks)
         m[M_B:M_B + len(blk)] = blk
-        out.append(Group(k0, g, m, region.kc))
+        out.append(Group(k0, g, m, region.kc, K))
     return out
 
 
@@ -145,6 +151,8 @@ def a_reads(region: Region, c: int, group: Group) -> list[AFill]:
     S, n, g_img, n_rt = region.tile_bytes, region.n_kc, region.kc_group, region.n_rt
     tw = S // 4  # words of a tile, read in n0-word pieces (a BD's inner dimension is < 1024 words)
     n0 = next(k for k in range(1023, 0, -1) if tw % k == 0)
+    if region.half:  # (one group: the column's tiles)
+        return [AFill(base, region.col_bytes, None, 1, None)]
     if group.g == g_img:  # a block of whole row tiles' chunk groups: contiguous
         return [AFill(base + group.k0 * n_rt * S, n_rt * group.g * S, None, 1, None)]
     if g_img == n:  # part of each row tile's chunks: per row tile g tiles, n tiles apart

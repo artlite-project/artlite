@@ -39,6 +39,13 @@ constexpr int kMaxNsb = 16;
 /// columns past them are zero super-blocks (a K padded to whole chunks). G > 1 (row groups: one chunk, G row_sb = nsb):
 /// a tile row is G tensor rows, consecutive in ``rows``, one after the other along K. BFP16 of F32 tensors: row index
 /// 2 i + p is plane p of stacked row i (0: bfp16(w), 1: bfp16(w - plane 0)).
+///
+/// tile0 >= 0 (a ``Region.half`` region's block, one K group: a row tile's chunks consecutive): the block's tiles from
+/// tile tile0 of the column block on, col_tiles tiles a column block; row tile rt's chunks at tile0 + rt n_kc (pair 0),
+/// or (pair 1) in pairs of 2 n_kc - 1 tiles: row tile 2 q's full chunks, the pair's tail tile, row tile 2 q + 1's full
+/// chunks, the tail tile's tile rows those of 2 q's rows (its first nsb / 2 super-blocks) and 2 q + 1's (the others)
+/// over the tensor rows' last nsb / 2 super-blocks (row_sb = (n_kc - 1) nsb + nsb / 2); an odd last row tile's
+/// second half zero super-blocks.
 struct PackBlock {
   TileFormat fmt;
   int R;
@@ -56,6 +63,9 @@ struct PackBlock {
   int cols;
   int64_t n;
   int G = 1;             // tensor rows per tile row
+  int64_t tile0 = -1;    // (>= 0) the block's first tile in a column block: its tiles by index (see above)
+  int pair = 0;          // (tile0) row tiles in pairs sharing their tail tile
+  int64_t col_tiles = 0; // (tile0) tiles of a column block
 };
 
 struct PackOptions {

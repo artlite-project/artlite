@@ -145,6 +145,7 @@ class GemmQOperator(ArtcOperator):
         lines: bool = False,
         pace: int | None = None,
         pass_step: int = 0,
+        ptail: bool = False,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -173,7 +174,11 @@ class GemmQOperator(ArtcOperator):
         nrows m): the designs of any M are one (the runtime sequence: M / (nrows m) chunks). ``pace``: the design's pace
         class (``pacing.PACE_CLASSES``; None: unpaced), its level from the ``PACE`` parameter (``pacing``).
         ``pass_step``: row tiles from a pass's first to the next's within a block (default ``tiles``; a split gate / up
-        block's part: its group, ``prefill.gemm``).
+        block's part: its group, ``prefill.gemm``). A K of half a chunk short (``decode.image.Region.half``: K 2560 of
+        tiles of 1024 columns): the last chunk's first half of the super-blocks (``Geometry.tail``); ``ptail``: a block
+        of row tiles in pairs sharing that chunk's tile (``decode.image.Block.pt``; ``blocks``: (its first tile, passes),
+        ``region_rt``: a column's tiles), read in pass pairs, the even row tiles' pass and the odd ones' (from the tail
+        tile's second half), the two parts of a gate / up C object (``Geometry.tile``).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -184,7 +189,7 @@ class GemmQOperator(ArtcOperator):
             out_cols=out_cols, silu=silu, act=act, nrows=nrows, c_bfp16=c_bfp16, ablate=ablate, kc=kc,
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
-            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step)
+            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()
@@ -472,7 +477,7 @@ class GemmQOperator(ArtcOperator):
         # C: the column's cores join in its memtile
         c_l3, c_l1 = DP.c_join(df, C_l2_ty, C_l1_ty, ROWS, 2)
 
-        n_kc, planes = self.n_kc, self.hdr_units
+        planes = self.hdr_units
         q4k = k_hdr2 is not None  # (Q4_K: the header slots collected in st, expanded per K chunk)
 
         silu = self.silu
@@ -490,7 +495,7 @@ class GemmQOperator(ArtcOperator):
                 for h in range(parts):
                     acc = extra[1] if silu or c_pairs else c
                     zero(acc)
-                    for _ in range_(self.k_rep * n_kc * (self.kc // KT)):
+                    for _ in range_(self.k_tiles):
                         b = bf.acquire(1)
                         a = af.acquire(1)
                         mm(a, b, acc)
@@ -515,30 +520,36 @@ class GemmQOperator(ArtcOperator):
         def pass_fn(bf, af, xo, xi, zero, hdr, dq, mm, ws, st, h, c, part, *extra):
             acc = extra[1] if silu else c
             zero(acc)
-            for _ in range_(n_kc):
-                for pl in range(planes):  # header planes, one k-tile slot per L1 object (this half's tiles)
-                    for kt in range_(4):
-                        b = bf.acquire(1)
-                        hdr(b, st if q4k else ws, *([] if q4k else [pl]), kt)
-                        bf.release(1)
-                if q4k:
-                    extra[-1](st, ws)
-                for sb in range_(self.nsb):
-                    for kt in range_(4):
-                        b = bf.acquire(1)
-                        x = xo.acquire(1)
-                        dq(b, ws, x, sb, kt)
-                        # (the partner may read x now; this core keeps reading it: the FIFO hands the object back
-                        # for the next k-tile but one, after the partner's release)
-                        xo.release(1)
-                        bf.release(1)
-                        a = af.acquire(1)
-                        y = xi.acquire(1)
-                        mm(a, x, y, acc, st, h, kt)  # (the C tiles acc and st in turn: an even count per chunk)
-                        xi.release(1)
-                        af.release(1)
+            for _ in range_(self.n_full):
+                chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(self.nsb), *extra)
+            if self.tail:  # (its first super-blocks; ``ptail``: a pass pair's second part, the odd row tiles, the others)
+                s0 = self.tail * part if self.ptail else 0
+                chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(s0, s0 + self.tail), *extra)
             if silu:  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
                 extra[0](acc, c, st, *(extra[2:4] if gelu else (0,)), *([part] if parts == 2 else []))
+
+        def chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, sbs, *extra):  # a K chunk's super-blocks sbs
+            for pl in range(planes):  # header planes, one k-tile slot per L1 object (this half's tiles)
+                for kt in range_(4):
+                    b = bf.acquire(1)
+                    hdr(b, st if q4k else ws, *([] if q4k else [pl]), kt)
+                    bf.release(1)
+            if q4k:
+                extra[-1](st, ws)
+            for sb in sbs:
+                for kt in range_(4):
+                    b = bf.acquire(1)
+                    x = xo.acquire(1)
+                    dq(b, ws, x, sb, kt)
+                    # (the partner may read x now; this core keeps reading it: the FIFO hands the object back
+                    # for the next k-tile but one, after the partner's release)
+                    xo.release(1)
+                    bf.release(1)
+                    a = af.acquire(1)
+                    y = xi.acquire(1)
+                    mm(a, x, y, acc, st, h, kt)  # (the C tiles acc and st in turn: an even count per chunk)
+                    xi.release(1)
+                    af.release(1)
 
         workers = []
         prm = self._mc_prm()

@@ -32,7 +32,8 @@ void bind_pack(nb::module_& m) {
         std::vector<artlite::PackBlock> bs;
         for (nb::handle h : blocks) {
           auto t = nb::cast<nb::tuple>(h);
-          if (t.size() != 14) throw artlite::Error("pack_tiles: a block is a tuple of 14");
+          if (t.size() != 14 && t.size() != 17)
+            throw artlite::Error("pack_tiles: a block is a tuple of 14 (or 17: with tile0, pair, col_tiles)");
           artlite::PackBlock b{};
           b.fmt = artlite::tile_format(nb::cast<std::string>(t[0]));
           b.R = nb::cast<int>(t[1]);
@@ -46,6 +47,11 @@ void bind_pack(nb::module_& m) {
           b.col_stride = nb::cast<size_t>(t[9]);
           b.row_sb = nb::cast<int>(t[12]);
           b.G = nb::cast<int>(t[13]);
+          if (t.size() == 17) {
+            b.tile0 = nb::cast<int64_t>(t[14]);
+            b.pair = nb::cast<int>(t[15]);
+            b.col_tiles = nb::cast<int64_t>(t[16]);
+          }
           const size_t row_bytes = size_t(b.row_sb) * artlite::block_bytes(b.fmt);
           for (nb::handle r : nb::cast<nb::list>(t[10])) {
             auto raw = nb::cast<Raw>(r, false);
@@ -79,7 +85,9 @@ void bind_pack(nb::module_& m) {
       "\"BFP16/F32\" by its tensors' type; tensors: (rows, row bytes) uint8 arrays of GGUF blocks, stacked; rows: "
       "(columns, n) int64 stacked row indices, -1 a zero row (BFP16/F32: 2 i + p is plane p of row i); row_sb: a "
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
-      "consecutive in rows, along K). threads: 0 = one per physical core; file: (path, the caller's mapping of the "
+      "consecutive in rows, along K), or that and (tile0, pair, col_tiles): a Region.half region's block, its tiles "
+      "from tile tile0 of a column block of col_tiles tiles, pair 1: row tiles in pairs sharing their tail tile "
+      "(artlite::PackBlock). threads: 0 = one per physical core; file: (path, the caller's mapping of the "
       "whole file) when the tensors are arrays of that mapping: the packer reads them through views of its own, read "
       "into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping stays untouched); "
       "iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), which IQ1_S blocks need.");

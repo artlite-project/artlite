@@ -307,9 +307,19 @@ __attribute__((noinline)) void {{ p }}_hinput(uint8_t *__restrict xs, const floa
                                               float *__restrict r, int nsb, int norm{{ ", float ih" if post else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if tails %}
+    // (an input that ends half a chunk into its last chunk, ``decode.image.Region.half``: that chunk's second half of
+    // super-blocks as its first, the tail tiles' second halves on the helper)
+    const int nh = (nsb & {{ gv.NSB - 1 }}) == {{ gv.NSB // 2 }} ? {{ gv.NSB // 2 }} : 0;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < nsb + nh; s++)  // (super-block s: chunk s / {{ gv.NSB }})
+        {{ p }}_xs_sb(t + {{ 16 * SLOTS }} * (s < nsb ? s : s - nh), xs + {{ gv.XS_CHUNK }} * (s >> {{ gv.NSB.bit_length() - 1 }}),
+                      s & {{ gv.NSB - 1 }});
+{% else %}
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < nsb; s++)  // (super-block s: chunk s / {{ gv.NSB }})
         {{ p }}_xs_sb(t + {{ 16 * SLOTS }} * s, xs + {{ gv.XS_CHUNK }} * (s >> {{ gv.NSB.bit_length() - 1 }}), s & {{ gv.NSB - 1 }});
+{% endif %}
     if (!norm)
         return;
 {% if SLOTS == 8 %}
@@ -948,6 +958,29 @@ __attribute__((noinline)) int {{ p }}_gusplit(int32_t *__restrict ws, int S, int
     return part ? k : 0;
 }
 {% endif %}
+{% if tails %}
+
+// (B_PT blocks, ``decode.image.Region``) Row tile nrt's place in the pairs of its block bn (S_PT): 2 a pair's second (its
+// tail came with the first's), 1 a pair's first (its tail tile's second half: nrt + 1's), else 0
+[[clang::always_inline]] inline void {{ p }}_pplace(int32_t *__restrict st, int bn, int nrt)
+{
+    const int r0 = bn ? st[{{ S_B }} + 3 * (bn - 1)] : 0, rel = nrt - r0;
+    const int pt = st[{{ S_B }} + 3 * bn + 1] & {{ B_PT }};
+    st[{{ S_PT }}] = !pt ? 0 : (rel & 1) ? 2 : (rel + 1 < st[{{ S_B }} + 3 * bn] - r0 ? 1 : 0);
+}
+
+// The next row tile's yt: after a pair's first, the helper's partial rows of the pair's tail tile (the second's tail:
+// its sums start from them), else zero
+[[clang::always_inline]] inline void {{ p }}_ynext(float *__restrict yt, const float *__restrict r, int pf)
+{
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ YN }}; i += 32)
+        aie::store_v(yt + i, pf ? aie::load_v<32>(r + i) : aie::zeros<float, 32>());
+    AIE_LOOP_UNROLL_FULL
+    for (int i = {{ YN }}; i < {{ YT }}; i += 32)
+        aie::store_v(yt + i, aie::zeros<float, 32>());
+}
+{% endif %}
 
 }  // namespace
 
@@ -1293,6 +1326,14 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     float *__restrict yh = yt + {{ p }}_hy(st[{{ S_FMT }}]);  // (a row-split tile: the helper's rows)
     for (int i = 0; i < 64; i += 32)
         aie::store_v(yh + i, aie::add(aie::load_v<32>(yh + i), aie::load_v<32>(r + i)));
+{% elif tails %}
+    const int kc = st[{{ S_KC }}], more = kc + 1 < st[{{ S_G }}] - (st[{{ S_PT }}] >> 1);  // (a pair's second: its tail came
+    // before)
+    const int pf = st[{{ S_PT }}] & 1;
+    if (more || !pf)  // (a pair's tail tile: the helper's rows are the next row tile's, ``ynext``)
+        AIE_LOOP_UNROLL_FULL
+        for (int i = 0; i < {{ YN }}; i += 64)
+            aie::store_v(yt + i, aie::add(aie::load_v<64>(yt + i), aie::load_v<64>(r + i)));
 {% elif SLOTS == 8 %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YN }}; i += 64)
@@ -1305,11 +1346,18 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     st[{{ S_NM }}] = 0;
     const int tl = st[{{ S_TL }}] - 1;
     st[{{ S_TL }}] = tl;
+{% if tails %}
+    if (more) {
+        st[{{ S_KC }}] = kc + 1;
+        return;
+    }
+{% else %}
     const int kc = st[{{ S_KC }}];
     if (kc + 1 < st[{{ S_G }}]) {
         st[{{ S_KC }}] = kc + 1;
         return;
     }
+{% endif %}
     st[{{ S_KC }}] = {{ "st[%d]" % S_XC0 if moe else "0" }};
     const int rt = st[{{ S_RT }}], nrt = rt + 1 < st[{{ S_NRT }}] ? rt + 1 : 0;
     st[{{ S_RT }}] = nrt;
@@ -1321,6 +1369,9 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     const int fw = st[{{ S_B }} + 3 * b + 1], R = {{ p }}_rows(fw & 255);
 {% endif %}
     const int bn = b + 1 < st[{{ S_NB }}] && nrt >= st[{{ S_B }} + 3 * b] ? b + 1 : (nrt ? b : 0);  // (the next row tile's)
+{% if tails %}
+    {{ p }}_pplace(st, bn, nrt);
+{% endif %}
 {% if moe %}
     st[{{ S_FMT }}] = st[{{ S_B }} + 3 * bn + 1] & {{ 255 + B_G2 + B_G4 }};
     const int G = (fw & {{ B_G4 }}) ? 4 : ((fw & {{ B_G2 }}) ? 2 : 1);  // (a tile's outputs: G R rows)
@@ -1417,9 +1468,13 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     int add = nv0 > 0 ? {{ p }}_slots(ws, S, flags, fw, nv0, row0 + r0, n, hres, 0) : 0;
     if (nv1 > 0)
         add += {{ p }}_slots(ws, S, flags, fw, nv1, row0 + r0 + 16, n + add, hres, 1);
+{% if tails %}
+    {{ p }}_ynext(yt, r, pf);
+{% else %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YT }}; i += 32)
         aie::store_v(yt + i, aie::zeros<float, 32>());
+{% endif %}
 {% else %}
     int add = 0;
     AIE_LOOP_NO_UNROLL
@@ -1443,9 +1498,13 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
 {% endif %}
 {% if SLOTS == 8 %}
     const int add = {{ p }}_slots(ws, S, flags, fw, nv, row0 + r0, n, hres);
+{% if tails %}
+    {{ p }}_ynext(yt, r, pf);
+{% else %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YT }}; i += 32)
         aie::store_v(yt + i, aie::zeros<float, 32>());
+{% endif %}
 {% else %}
     int add = 0;
     AIE_LOOP_NO_UNROLL
@@ -1707,6 +1766,9 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     for (int i = 0; i < {{ 3 * NBLK }}; i++)
         st[{{ S_B }} + i] = m[{{ M_B }} + i];
     st[{{ S_FMT }}] = m[{{ M_B + 1 }}] & {{ 255 + B_G2 + B_G4 if moe else 255 }};  // (the first row tile's)
+{% if tails %}
+    st[{{ S_PT }}] = (m[{{ M_B + 1 }}] & {{ B_PT }}) && m[{{ M_B }}] > 1;  // (the first row tile: a pair's first)
+{% endif %}
     st[{{ S_TL }}] = m[{{ M_NT }}];
     {{ p }}_zv(WS(int32_t, {{ w_.stg }}), {{ 2 * SLOTS * C_LEN * 2 // 64 }});
     st[{{ S_KC }}] = 0;
@@ -1903,6 +1965,13 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 {% endif %}
             {{ p }}_hpstrip<4>(x, w, w + {{ NX_PER_NORM * POST_K }}, ivv, sq, xpk, t, nb);
         return;
+    }
+{% endif %}
+{% if tails %}
+    if ((cmd[2] >> 5 & {{ gv.NSB - 1 }}) == {{ gv.NSB // 2 }}) {  // (a half chunk at the end: its x panels as the helper's
+        // half of the chunk too, ``hinput``)
+        const int c = cmd[2] >> {{ 5 + gv.NSB.bit_length() - 1 }};
+        {{ p }}_cv((int32_t *)(xp + {{ gv.XPH }} + {{ gv.XPHC }} * c), (const int32_t *)(xp + {{ gv.XPHC }} * c), {{ gv.XPHC // 64 }});
     }
 {% endif %}
     {{ p }}_hinput((uint8_t *)(uintptr_t)cmd[0], (const float *)scr, sq, r, cmd[2] >> 5, cmd[1]{{ ", __builtin_bit_cast(float, cmd[3])" if post else "" }});

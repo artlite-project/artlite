@@ -13,8 +13,8 @@ GEMM's A port).
 
 with d the projection's output (bf16, column c's E / 8 values at c d_pitch of a row of 8 d_pitch; ``deltas`` = 2, 4:
 the sum of K parts, d_stride elements apart), s the layer's output scale (``post`` after the per-layer projection; 1
-elsewhere). x' overwrites x. The panels go out in rows of ``out_pitch`` columns (the next GEMM's K in whole chunks: the
-4B Spark-X's 2560 in rows of 3072; the padding panels never written).
+elsewhere). x' overwrites x. The panels go out in rows of ``out_pitch`` columns (the next GEMM's K: default E; an image
+of inputs padded to whole chunks: the padding panels never written).
 
 The arithmetic: d w_post exact in fp32 (d1 w + d2 w for two parts), times a = s / rms(d) (fp32, as bf16 hi / lo; the
 product's hi / lo parts: three products), plus x s (x hi / lo times s hi / lo, or x itself when s = 1): within ~2^-16

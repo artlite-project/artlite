@@ -123,7 +123,10 @@ class Dataflow:
             # core's segment of the join)
             # (whole-line windows: win columns of each row, the rest from the next row's or the object's tail, ``lines``)
             # (two bfp16 parts: [part][group][panels] to the groups' rows of both parts' panels)
-            c_dims=(stream_walk(c_l1, [(m // 8, no // 8 * 36), (2, m // 8 * no // 8 * 36), (no // 8 * 36, 1)])
+            # (``ptail``: the parts are a pass pair's even and odd row tiles, their panels in turn)
+            c_dims=(stream_walk(c_l1, [(m // 8, no // 8 * 36), (no // 8, 36), (2, m // 8 * no // 8 * 36), (36, 1)])
+                    if geo.c_parts == 2 and geo.ptail else
+                    stream_walk(c_l1, [(m // 8, no // 8 * 36), (2, m // 8 * no // 8 * 36), (no // 8 * 36, 1)])
                     if geo.c_parts == 2 else
                     stream_walk(c_l1, [(m, geo.n_c), (geo.win, 1)], [(0, 0), (0, 0)])
                     if geo.n_c != geo.win else
@@ -155,11 +158,53 @@ class Dataflow:
                     for k in range(k0, k0 + r)]
         return out
 
+    def _tail_units(self, k: int, e: int) -> list[tuple[int, int]]:
+        """(a geometry with a ``tail``) The weight fills of K chunk k of a pass of parity e (``ptail``; else 0) as
+        (first unit, units) of its tiles: a whole chunk's units; the tail's header units and its super-blocks from tail e
+        (an odd pass's: the tail tile's second half; one run, or two where the header is not next to them)."""
+        geo = self.geo
+        nsl, _ = geo.fill_units
+        hu, s0 = geo.hdr_units, geo.tail * e
+        if k < geo.n_kc - 1:
+            return [(0, nsl)]
+        return [(0, hu + geo.tail)] if s0 == 0 or not hu else [(0, hu), (hu + s0, geo.tail)]
+
+    def _tail_bds(self, c: int, p0: int, np_: int) -> list[TensorAccessPattern]:
+        """(a geometry with a ``tail``) The BDs of the weight fills of passes p0 .. p0 + np_ of a block, each
+        [iteration, units, tiles, words] at ``Geometry.tile``'s tiles: per K chunk (``ptail``: per pass pair, the even
+        pass's chunks, then the odd one's)."""
+        geo = self.geo
+        tw, (_, sw) = geo.tile_bytes // 2, geo.fill_units
+        assert geo.us == 1 and geo.hg == 1 and geo.k_rep == 1, "a tail: plain units"
+        base = c * geo.col_bytes // 2
+        w_dims = (1, geo.w_bytes // 2)
+        step = 2 if geo.ptail else 1  # (passes per iteration)
+        out = []
+        for e in range(step):
+            p = p0 + e
+            it = (geo.tile(p + step, 0, 0) - geo.tile(p, 0, 0)) * tw if np_ > step else tw  # (the next iteration's)
+            for k in range(geo.n_kc):
+                ts = (geo.tile(p, 1, k) - geo.tile(p, 0, k)) * tw if geo.tiles > 1 else tw
+                for u0, nu in self._tail_units(k, e):
+                    out.append(TensorAccessPattern(w_dims, base + geo.tile(p, 0, k) * tw + u0 * sw,
+                                                   [np_ // step, nu, geo.tiles, sw], [it, sw, ts, 1]))
+        return out
+
     def b_taps(self, c: int) -> list[tuple[int, TensorAccessPattern]]:
         """(first pass, tap) of the weight fills of column c in bf16 units (one fill for all passes of a
         block where one pattern covers them): per pass and K chunk the header units and the super-block
         slices of the pass's tiles."""
         geo = self.geo
+        if geo.tail:  # (per pass, ``ptail``: per pass pair, the pieces of ``_tail_bds``' iterations)
+            out, p0 = [], 0
+            step = 2 if geo.ptail else 1
+            for _, np_ in geo.blocks:
+                bds = self._tail_bds(c, p0, np_)
+                for q in range(np_ // step):
+                    out += [(p0 + q * step, TensorAccessPattern(t.tensor_dims, t.offset + q * t.strides[0],
+                                                                 [1, *t.sizes[1:]], [0, *t.strides[1:]])) for t in bds]
+                p0 += np_
+            return out
         tw, (nsl, sw) = geo.tile_bytes // 2, geo.fill_units
         nt, nk, g, rs, ps = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride, geo.pass_step
         # units start hdr_skip bytes before each tile (a header shorter than a slice: see __init__); the
@@ -196,8 +241,17 @@ class Dataflow:
     def b_chain(self, c: int) -> list[list[TensorAccessPattern]] | None:
         """The weight fill of column c as one chained task per block, when b_taps needs fills per pass:
         one BD per K chunk, each 4-dimensional [pass (BD iteration), unit, tile, words] (the task repeats
-        once per pass of the block and every BD of the chain advances its iteration then), or None."""
+        once per pass of the block and every BD of the chain advances its iteration then), or None. A geometry with a
+        ``tail``: always (``_tail_bds``; ``ptail``: the task repeats per pass pair)."""
         geo = self.geo
+        if geo.tail:
+            chains, p0 = [], 0
+            for _, np_ in geo.blocks:
+                assert np_ // (2 if geo.ptail else 1) <= MAX_BD_ITER, "a BD iterates at most MAX_BD_ITER times"
+                chains.append(self._tail_bds(c, p0, np_))
+                p0 += np_
+            assert sum(map(len, chains)) <= MAX_CHAIN_BDS, "chained weight fills of more than MAX_CHAIN_BDS shim BDs"
+            return chains
         if geo.hg > 1:
             assert max(n for _, n in geo.blocks) <= MAX_BD_ITER, "a BD iterates at most MAX_BD_ITER times"
             chains = [self._hg_bds(c, rt0, np_) for rt0, np_ in geo.blocks]

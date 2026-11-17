@@ -6,7 +6,7 @@ GemmQd on 1 .. 3 MAC rows) and with how many tokens per MAC row (``planar_gemm``
 import itertools
 from dataclasses import dataclass
 
-from ..formats import FORMATS, KT, slot
+from ..formats import FORMATS, slot
 from ..gemm.gemm_qd import GemmQdOperator, k_tile_cycles
 from ..gemm.geometry import LINE, GemmSpec, L1Error, line_window
 from ..operators.design import COLS
@@ -101,7 +101,7 @@ def choose_planar_plan(block_rows: list[int], R: int, *, few_passes: bool, T: in
     def est(plan: PlanarPlan) -> float:  # (a GemmQd of the plan: the arguments that matter for L1 and the estimate)
         nb = len(plan.pitches)
         spec = GemmSpec(fmt=fmt, rows=R, M=T, K=K, N=COLS * sum(plan.pitches), tile_bytes=tile_bytes,
-                        col_bytes=plan.region_rt * (K // kc) * tile_bytes, passes=plan.passes,
+                        col_bytes=plan.region_rt * -(-K // kc) * tile_bytes, passes=plan.passes,
                         out_cols=plan.out_cols([0] * nb, list(plan.pitches)), kc_group=kc_group, kc=kc,
                         tiles=plan.tiles, region_rt=plan.region_rt, blocks=plan.blocks, c_pack=True)
         return planar_seconds(planar_gemm(spec.operator_kwargs(), T))
@@ -133,7 +133,7 @@ def planar_seconds(op: GemmQdOperator) -> float:
     it does not stay in the memtile, once per pass). It ranks O and down plans as measured (it underestimates both by
     ~1.3x)."""
     sweeps = op.M // (op.nrows * op.m)
-    compute = sweeps * op.passes * op.n_kc * (op.kc // KT) * k_tile_cycles(op) / 1.81e9
+    compute = sweeps * op.passes * op.k_tiles * k_tile_cycles(op) / 1.81e9
     weights = COLS * op.passes * op.pass_fill_words * 2  # (bytes of a sweep)
     a = op.M * op.K * 9 / 8 * (1 if op.flow.a_res else op.passes)
     return max(compute, (sweeps * weights + a) / 56e9)

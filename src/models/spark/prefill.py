@@ -7,7 +7,7 @@ A chunk of T tokens (``SIZES``: ``SMALL``, multiples of ``SUB`` up to 2048: the 
 ``overlay.ring_groups``) runs layer-major in sub-chunks of ``SUB`` tokens (a ``SMALL`` size: one of its own): each
 operator of a layer runs over the sub-chunks back to back on buffer slices a sub-chunk apart. The residual stream x is
 fp32 (PX, ``prefill.norm.ResidualNormOperator``: N0 measured a bf16 one 66% worse on the 4B's chats), its panels in rows
-of the GEMMs' K (the 4B's 2560 in 3072: ``out_pitch``). Per layer L:
+of the GEMMs' K (``kmax``: the hidden size, or an image padded to whole chunks: ``out_pitch``). Per layer L:
 
 - attn_in GEMMs of xn -> G (per column [q | k part | v part | gate rows], ``plan_gemm``); the attention prep of the
   layer's kind per sub-chunk (``prefill.attn256.AttnPrepOperator``: Q slots with the gates into QS; a full layer's
@@ -65,7 +65,7 @@ def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[
     k = 0
     if region.name in PG.OUT:
         cache = {} if k_parts is None else k_parts
-        key = (region.name, region.K, region.kc_group, tuple(b.fmt for b in region.blocks), T, pitch, k)
+        key = (region.name, region.K_in, region.kc_group, tuple(b.fmt for b in region.blocks), T, pitch, k)
         if key not in cache:
             cache[key] = PG.resident_k_part(img, region, T, pitch=pitch, k_part=k)
         k = cache[key]
@@ -90,7 +90,7 @@ class SparkPrefill(ChunkPrefill):
         self.window = cfg.sliding_window
         self.wg = self.window // 32
         self.stage = self.wg + MAX_T // 32  # (the staging's groups per KV head: one layout for every size)
-        self.kmax = max(r.K for r in self.img.regions if r.name == "attn_in")  # (the panels' K: the hidden padded)
+        self.kmax = max(r.K_in for r in self.img.regions if r.name == "attn_in")  # (the panels' K: the GEMMs' A)
         self._norm_ops: dict[tuple, ResidualNormOperator] = {}
         self._k_parts: dict[tuple, int] = {}
         self._gemms: dict[tuple, object] = {}

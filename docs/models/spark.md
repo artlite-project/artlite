@@ -50,7 +50,10 @@ decode overlay of 8 token slots (`artlite.decode`) with the head_dim-256 attenti
   drafter's rows of its last window too.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
-size (the 4B's inputs of 2560 padded to 3072 columns); nothing is written to disk.
+size; nothing is written to disk. The 4B's hidden size of 2560 is two and a half of the 1024-column tiles: the
+feed-forward's gate / up and the LM head keep the last 512 columns of two rows' tiles in one tile, the attention's
+inputs are padded to 3072 columns (the official 4B: a decode step streams 3.04 instead of 3.33 GB; the prompt's
+matrix products skip the padding).
 
 ## Speed and accuracy (Strix Halo)
 
@@ -58,27 +61,27 @@ Prompts (`artlite-bench`, time to the first token, with the drafter's rows; essa
 
 | | 1K | 8K | 32K | 64K |
 |---|---|---|---|---|
-| 4B Q4_K_M | 0.498 s | 4.06 s | 20.7 s | 53.8 s |
-| 4B bartowski Q4_K_M | 0.477 s | 3.92 s | 20.2 s | 52.8 s |
+| 4B Q4_K_M | 0.462 s | 3.80 s | 19.9 s | 51.8 s |
+| 4B bartowski Q4_K_M | 0.443 s | 3.67 s | 19.4 s | 50.7 s |
 | 1.7B Q4_K_M | 0.209 s | 1.60 s | 7.48 s | 18.3 s |
 
 Generation (greedy, 256 tokens; tokens/s without a drafter, then with DSpark):
 
 | | essay summary, 1K | essay summary, 32K | code | math | JSON |
 |---|---|---|---|---|---|
-| 4B Q4_K_M | 15.9 -> 22.4 | 13.2 -> 19.4 | 15.5 -> 54.4 | 15.5 -> 51.8 | 15.5 -> 44.9 |
-| 4B bartowski Q4_K_M | 17.4 -> 22.9 | 14.2 -> 20.3 | | | |
+| 4B Q4_K_M | 17.3 -> 24.7 | 14.2 -> 20.4 | 16.6 -> 61.6 | 16.7 -> 56.5 | 16.7 -> 44.5 |
+| 4B bartowski Q4_K_M | 18.6 -> 25.8 | 15.1 -> 22.0 | | | |
 | 1.7B Q4_K_M | 39.5 -> 53.6 | 28.7 -> 36.5 | 38.1 -> 128.1 | 38.1 -> 134.5 | 38.1 -> 106.6 |
 
 (code, math, JSON: short chat prompts, 320 tokens.) A round's drafts are kept 1.5 to 5 tokens at a time: text that the
-drafter guesses (code, math, structured output) runs 3-3.5x as fast, prose 1.3-1.5x; where rounds keep too little the
+drafter guesses (code, math, structured output) runs 2.7-3.7x as fast, prose 1.3-1.6x; where rounds keep too little the
 generation falls back to steps of one token.
 
 Accuracy:
 
 | | |
 |---|---|
-| against the fp32 evaluation of the same file | teacher-forced KL, chat and essay: 4B 2.0e-3 / 1.6e-3, 1.7B 5.4e-3 / 1.8e-3 (llama.cpp's CPU build of the same file: 4B 2.4e-3 / 1.7e-3, 1.7B 3.9e-3 / 1.3e-3); a prompt through the prefill and the text after it 1.6-2.7e-3 |
+| against the fp32 evaluation of the same file | teacher-forced KL, chat and essay: 4B 2.7e-3 / 1.7e-3, 1.7B 5.4e-3 / 1.8e-3 (llama.cpp's CPU build of the same file: 4B 2.4e-3 / 1.7e-3, 1.7B 3.9e-3 / 1.3e-3); a prompt through the prefill and the text after it 1.6-3.3e-3 |
 | the drafter against XHToken's llama.cpp fork | tokens per round on the fork's six forced texts 3.61 vs 3.58 (1.7B); its first draft the fork-equivalent fp32 drafter's on 98-99.5% of positions |
 | tools and math (4B, thinking off, greedy) | BFCL simple / multiple / parallel 124 / 150 (llama-server on the same file: 122); GSM8K's first 150: 124 (llama.cpp CPU: 124) |
 | determinism | a token's logits depend on the tokens up to it only: steps of 1-8 tokens give the same logits bit for bit (greedy text with drafts is the text without) |

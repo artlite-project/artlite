@@ -193,7 +193,8 @@ ONEHOT = (np.arange(64)[None, :] // 8 == np.arange(8)[:, None]).astype(np.int8).
 class DecodeOverlayOperator(ArtcOperator):
     """The shared decode overlay design (module docstring): the main and helper cores of every column. ``hidden``: the
     model's hidden size (the norm length, the residual slices; one of part of a K chunk: the phases reading it take
-    whole chunks of zero-padded weights, their inputs' padding k zero, which the helper's norm squares); ``rows``: {tile format: rows per tile} of the formats
+    whole chunks of zero-padded weights, their inputs' padding k zero, which the helper's norm squares, or with ``tails``
+    inputs of the hidden size); ``rows``: {tile format: rows per tile} of the formats
     the phases use; ``tile_bytes``: the A object size; ``nsb``: super-blocks per tile (its K chunk). The runtime
     sequence (W, ACT, OUT) is a probe that issues one task per stream (``check_endpoints``; never dispatched): the
     host runs the design with transactions.
@@ -234,7 +235,8 @@ class DecodeOverlayOperator(ArtcOperator):
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
                  gu_win: bool = False, paged: tuple[str, ...] = (), moe: tuple[int, int] | None = None,
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
-                 a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False):
+                 a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False,
+                 tails: bool = False):
         """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -249,7 +251,11 @@ class DecodeOverlayOperator(ArtcOperator):
         memtiles, the same objects in both columns (module docstring "Shared A objects"); pairs: a dense design's blocks
         of plane pairs (B_PAIR: an F32 matrix's [hi, lo] rows, their sums out as fp32; an MoE design has them anyway);
         split: gate / up blocks of two formats (B_SPLIT, ``decode.image.Block.fmt2``: a group's 64 gate rows into the slot's
-        window of 64, its up rows times their act(gate) as they come, ``gusplit``; with gu_win, not moe)."""
+        window of 64, its up rows times their act(gate) as they come, ``gusplit``; with gu_win, not moe); tails: phases
+        of ``decode.image.Region.half`` regions (an input half a chunk short of whole chunks: its last chunk's first half
+        of x and sum panels the helper's half too, ``hinput``) with B_PT blocks (row tiles in pairs sharing their tail
+        tile: one chunk less for a pair's second, whose sums start from the helper's half of the tail tile, ``collect``;
+        8 slots, the super-block split)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
         # (a ``post`` design has TOK_STATE's words too: S_NAS is always declared)
         STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
@@ -290,6 +296,8 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the x panels as [core half][chunk]: the two cores' panels of a tile in different L1 regions of the helper's
         # memory, not one chunk's 128 panels in a row: their reads at once conflict; a 512-k input strip is a half)
         self.xh = nsb == 4 and not self.rowsplit and not post
+        self.tails = tails
+        assert not tails or (slots == 8 and self.xh and moe is None), "tails: designs of 8 slots, the super-block split"
         # (tiles of more than 16 rows, or an MoE design's gate / up windows)
         self.wide = any(r > 16 for r in rows.values()) or (moe is not None and gu_win)
         self.yt = (128 if self.wide else 64) * slots // 4  # (floats of a row tile's outputs)
@@ -453,6 +461,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                            if gemv.helper_y(f, self.chunk.nsb)],
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, split=self.split, split_rows=SPLIT_ROWS, POST_K=POST_K, xh=self.xh,
+                                 tails=self.tails,
                                  COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, MAX_K=MAX_K, ablate=self.ablate, ACT8=self.act8_addresses(),
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,

@@ -44,8 +44,9 @@ def _records(d: DSparkOverlay, L: int, lo: int, n: int) -> list[tuple[np.ndarray
     return out
 
 
-@pytest.mark.parametrize("size", ["1.7B", "4B"])
-def test_dspark_rounds(size: str) -> None:
+@pytest.mark.parametrize(("size", "tails"), [("1.7B", False), ("4B", False), ("4B", True)],
+                         ids=["1.7B", "4B", "4B-tails"])
+def test_dspark_rounds(size: str, tails: bool) -> None:
     """Steps of 8, 3 and 1 slots over 700 positions (the rings' 20 groups wrap), each followed by the injection of its
     rows, blocks at 300 and 700 (the block's records then overwritten by the next injection): the window's records, the
     block's logits and h against the CPU's; the drafter's state at 300 restored after the rest (its rings wrapped
@@ -55,7 +56,7 @@ def test_dspark_rounds(size: str) -> None:
     require(dpath)
     dg = GGUFFile(dpath)
     taps = DSparkConfig.from_gguf(dg).taps
-    tgt = SparkOverlay(g, layers=sorted(taps), vocab=VOCAB, max_positions=1024, **needs(dg))
+    tgt = SparkOverlay(g, layers=sorted(taps), vocab=VOCAB, max_positions=1024, tails=tails, **needs(dg))
     tgt.load()
     d = DSparkOverlay(tgt, dg)
     d.load()
@@ -157,9 +158,9 @@ def test_dspark_prefill(size: str, n: int) -> None:
         for h, ((k, v), (wk, wv)) in enumerate(zip(got[L], want[L], strict=True)):
             worst[f"K{L}.{h}"], worst[f"V{L}.{h}"] = rel_finite(k, wk), rel_finite(v, wv)
     print({k: round(v, 4) for k, v in worst.items()})
-    # (the two paths' taps differ by the model's prefill against its decode: 3-3.7%; the drafter's part alone:
-    # ``test_dspark_prefill_rows``)
-    assert all(v < (0.15 if k == "argmax" else 0.045) for k, v in worst.items()), worst
+    # (the two paths' taps differ by the model's prefill against its decode: 3-3.7% the records, 3.4-4.6% the block's
+    # logits over prompts of 300 .. 900 (4B); the drafter's part alone: ``test_dspark_prefill_rows``)
+    assert all(v < {"argmax": 0.15, "logits": 0.05}.get(k, 0.045) for k, v in worst.items()), worst
 
 
 @pytest.mark.parametrize(("size", "p0", "T"), [("1.7B", 0, 512), ("4B", 64, 256), ("4B", 0, 64)])

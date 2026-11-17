@@ -92,7 +92,8 @@ class GemmQdOperator(GemmQOperator):
         step = mac_rows * m
         super().__init__(nrows=mac_rows, M=-(-self.T // step) * step, m=m, **kw)
         assert self.dequant, "GemmQd: dequantized tile formats"
-        assert not self.pingpong or self.n_kc * (self.kc // KT) % 2 == 0
+        assert not self.ptail, "GemmQd: passes of one row tile each (no pass pairs)"
+        assert not self.pingpong or self.k_tiles % 2 == 0
         # two C tiles (a pass's halves), each in halves 16 KB apart (``csplit``, plan g1s): the MAC loop's blocks
         # alternate regions, so a block's C stores never meet the next block's C loads (one region per tile: a
         # conflict per C access)
@@ -418,34 +419,44 @@ class GemmQdOperator(GemmQOperator):
                                         extra[0](hb, ws, sb, q)
                                         dq_tiles(bf, dfo, dq, ws, ex, sb)
                 else:
-                    for _ in range_(n_kc):
-                        for pl in range(planes):  # header units, one k-tile slot per L1 object
-                            for kt in range_(4):
-                                b = bf.acquire(1)
-                                hdr(b, hb if dk.collect else ws, *([pl] if dk.unit else []), kt)
-                                bf.release(1)
-                        if dk.chunk is not None:  # (Q6_K: d of the rows) once per K chunk
-                            extra[1 if dk.sb is not None else 0](hb, ws)
-                        for sb in range_(nsb):
-                            if dk.sb is not None:  # (the super-block's records, just before its k-tiles)
-                                extra[0](hb, ws, sb)
-                            dq_tiles(bf, dfo, dq, ws, ex, sb)
+                    for _ in range_(self.n_full):
+                        dq_chunk(bf, dfo, hdr, dq, ws, hb, ex, range_(nsb), *extra)
+                    if self.tail:  # (the last chunk's first super-blocks)
+                        dq_chunk(bf, dfo, hdr, dq, ws, hb, ex, range_(self.tail), *extra)
+
+        def dq_chunk(bf, dfo, hdr, dq, ws, hb, ex, sbs, *extra):  # a K chunk's header units, its super-blocks sbs
+            for pl in range(planes):  # header units, one k-tile slot per L1 object
+                for kt in range_(4):
+                    b = bf.acquire(1)
+                    hdr(b, hb if dk.collect else ws, *([pl] if dk.unit else []), kt)
+                    bf.release(1)
+            if dk.chunk is not None:  # (Q6_K: d of the rows) once per K chunk
+                extra[1 if dk.sb is not None else 0](hb, ws)
+            for sb in sbs:
+                if dk.sb is not None:  # (the super-block's records, just before its k-tiles)
+                    extra[0](hb, ws, sb)
+                dq_tiles(bf, dfo, dq, ws, ex, sb)
 
         def units_fn(pc, prm, bf, dfo, sbk, dq, ws, hb, *ex):  # (super-block units: a weight object per unit; ex: ``ex``, tables)
             run_paced(pc, self.pace, lambda b: units_item(prm, b, dfo, sbk, dq, ws, hb, *ex), bf)
 
         def units_item(prm, bf, dfo, sbk, dq, ws, hb, *ex):
             for _ in self._chunk_passes(prm):
-                for _ in range_(n_kc):
-                    for sb in range_(nsb):
-                        b = bf.acquire(1)
-                        sbk(b, ws, hb, sb)
-                        for kt in range_(4):
-                            for h in range(halves):
-                                d = dfo.acquire(1)
-                                dq(b, ws, d, sb, kt, *([h] if halves > 1 else []), *ex)
-                                dfo.release(1)
-                        bf.release(1)
+                for _ in range_(self.n_full):
+                    units_chunk(bf, dfo, sbk, dq, ws, hb, range_(nsb), *ex)
+                if self.tail:  # (the last chunk's first super-blocks)
+                    units_chunk(bf, dfo, sbk, dq, ws, hb, range_(self.tail), *ex)
+
+        def units_chunk(bf, dfo, sbk, dq, ws, hb, sbs, *ex):
+            for sb in sbs:
+                b = bf.acquire(1)
+                sbk(b, ws, hb, sb)
+                for kt in range_(4):
+                    for h in range(halves):
+                        d = dfo.acquire(1)
+                        dq(b, ws, d, sb, kt, *([h] if halves > 1 else []), *ex)
+                        dfo.release(1)
+                bf.release(1)
 
         c_pack = self.c_pack
         lines = self.carry is not None
@@ -479,7 +490,7 @@ class GemmQdOperator(GemmQOperator):
                 for _ in self._chunk_passes(prm):
                     for acc in accs:
                         zero(acc)
-                    for _ in range_(n_kc * (self.kc // KT)):
+                    for _ in range_(self.k_tiles):
                         a = af.acquire(1)
                         for acc in accs:
                             d = dfi.acquire(1)
@@ -501,7 +512,7 @@ class GemmQdOperator(GemmQOperator):
             def mac_loop(acc: object) -> None:  # (a pass's k-tiles into its C tile)
                 zero(acc)
                 if pingpong:  # acc -> accb -> acc: an even k-tile count ends in acc
-                    for _ in range_(n_kc * (self.kc // KT) // 2):
+                    for _ in range_(self.k_tiles // 2):
                         for src, dst in ((acc, extra[3]), (extra[3], acc)):
                             d = dfi.acquire(1)
                             a = af.acquire(1)
@@ -509,7 +520,7 @@ class GemmQdOperator(GemmQOperator):
                             af.release(1)
                             dfi.release(1)
                 else:
-                    for _ in range_(n_kc * (self.kc // KT)):
+                    for _ in range_(self.k_tiles):
                         d = dfi.acquire(1)
                         a = af.acquire(1)
                         mm(a, d, acc)

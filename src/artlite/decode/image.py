@@ -18,7 +18,10 @@ A region whose input is longer than an activation object's payload (``payload``:
 groups (``kc_group``: the largest divisor of the chunk count whose group fits the payload); every other region keeps a
 row tile's chunks consecutive. An input of no whole number of chunks (MiniCPM-V's ffn 3584) is padded to the next one:
 its tiles' columns past the matrix are zero super-blocks; an input of a fraction 1 / G of a chunk (an MoE's down, K 512
-or 256) takes row groups instead (``Block.G``, ``group_rows``: G rows of K columns per tile row, no padding bytes).
+or 256) takes row groups instead (``Block.G``, ``group_rows``: G rows of K columns per tile row, no padding bytes). An
+input half a chunk short of whole chunks in one K group (the 4B Spark-X's hidden 2560) may be a ``Region.half`` region
+(``tails``): its phases' inputs of that K, the blocks the model pairs (``pairs``: those the prefill reads in pairs)
+without zero super-blocks (``Block.pt``).
 The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB before a tile, and past a
 region's last tile.
 
@@ -35,7 +38,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native
-from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, packs_from, tile_format
+from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, packs_from, slot, tile_format
 from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
 from .protocol import NX_PER_NORM, OBJ_K, POST_K
@@ -87,6 +90,7 @@ class Block:
     pairs: bool = False
     fmt2: str = ""
     R2: int = 0
+    pt: bool = False  # (a ``Region.half`` region's) its row tiles in pairs that share their last chunk's tile (``Region``)
 
     @property
     def formats(self) -> tuple[str, ...]:
@@ -127,7 +131,18 @@ class Block:
 @dataclass
 class Region:
     """The tiles of one phase: ``cols`` column blocks (the 8 columns'; a slab region's: one per expert half) of
-    ``col_bytes`` from ``offset`` on."""
+    ``col_bytes`` from ``offset`` on.
+
+    A ``half`` region's input is half a chunk short of its K chunks (``K_in``: the 4B Spark-X's hidden 2560 in 3 chunks;
+    a row tile's chunks consecutive, one K group): the last chunk's columns are a tail of nsb / 2 super-blocks. A ``pt``
+    block of it holds its row tiles in pairs (2 p, 2 p + 1) of 2 n_kc - 1 tiles each, ``PAIR``: the full chunks of 2 p,
+    then the pair's tail tile (super-blocks 0 .. nsb / 2 - 1: row tile 2 p's tail, the rest: 2 p + 1's, as a tile of
+    row groups of 2, ``group_rows``), then the full chunks of 2 p + 1; an odd block's last row tile is a single, its
+    tiles as a plain block's (its tail tile's second half zero super-blocks). The decode streams a pair's tiles in that
+    order (the main core runs a tile's first super-blocks, the helper the others: 2 p's tail on the main core, 2 p + 1's
+    on the helper, whose partial rows start 2 p + 1's sums, ``decode.design``); the prefill GEMMs read pass pairs of
+    their even and odd row tiles (``gemm.geometry.GemmSpec.ptail``), the other blocks' tail tiles for their first half
+    (``Geometry.tail``). The 4B Q4_K_M's gate / up and LM head in pairs: a decode step streams 3.04 GB instead of 3.33."""
 
     layer: int  # -1: the LM head
     name: str
@@ -141,31 +156,70 @@ class Region:
     col_stride: int = 0  # (from a column's block to the next)
     rt0: dict[str, int] = field(default_factory=dict)  # first row tile of each block
     cols: int = COLS
+    half: bool = False  # (the input: ``K_in`` = K - kc / 2; module docstring)
+    t0: dict[str, int] = field(default_factory=dict)  # (``half``) first tile of each block in a column's block
 
     def __post_init__(self) -> None:
         assert self.n_kc % self.kc_group == 0
-        rt = 0
+        assert not self.half or (self.kc_group == self.n_kc and self.n_kc >= 2), (self.name, self.n_kc, self.kc_group)
+        assert self.half or not any(b.pt for b in self.blocks), self.name
+        rt = t = 0
         for b in self.blocks:
-            self.rt0[b.name] = rt
+            self.rt0[b.name], self.t0[b.name] = rt, t
             rt += b.tiles
-        self.n_rt = rt
+            t += self.block_tiles(b)
+        self.n_rt, self.n_t = rt, t
 
     @property
     def K(self) -> int:
         return self.n_kc * self.kc
 
     @property
+    def K_in(self) -> int:
+        """The input's elements (a ``half`` region's: half a chunk short of K)."""
+        return self.K - self.kc // 2 if self.half else self.K
+
+    @property
+    def pair(self) -> int:
+        """Tiles of a pair of a ``pt`` block's row tiles."""
+        return 2 * self.n_kc - 1
+
+    def block_tiles(self, b: Block) -> int:
+        """Tiles of block b in a column's block."""
+        n = b.tiles
+        return n // 2 * self.pair + n % 2 * self.n_kc if b.pt else n * self.n_kc
+
+    @property
     def col_bytes(self) -> int:
-        return self.data or self.n_rt * self.n_kc * self.tile_bytes
+        return self.data or self.n_t * self.tile_bytes
 
     @property
     def nbytes(self) -> int:
         return self.cols * self.col_bytes
 
+    def block_of(self, rt: int) -> Block:
+        """The block of row tile rt."""
+        return next(b for b in reversed(self.blocks) if self.rt0[b.name] <= rt)
+
     def tile(self, rt: int, kc: int) -> int:
-        """Index in a column block of row tile rt's tile of K chunk kc."""
-        g = self.kc_group
-        return (kc // g * self.n_rt + rt) * g + kc % g
+        """Index in a column block of row tile rt's tile of K chunk kc (a ``pt`` block's last chunk: the pair's tail tile,
+        row tile rt's super-blocks in its half ``tail_half``)."""
+        if not self.half:
+            g = self.kc_group
+            return (kc // g * self.n_rt + rt) * g + kc % g
+        b = self.block_of(rt)
+        j = rt - self.rt0[b.name]
+        if not b.pt:
+            return self.t0[b.name] + j * self.n_kc + kc
+        base = self.t0[b.name] + j // 2 * self.pair
+        return base + (self.n_kc - 1 if kc == self.n_kc - 1 else kc + (self.n_kc if j % 2 else 0))
+
+    def tail_half(self, rt: int) -> int:
+        """Which half of its last chunk's tile holds row tile rt's tail: 1 for the second of a ``pt`` block's pair."""
+        if not self.half:
+            return 0
+        b = self.block_of(rt)
+        return int(b.pt and (rt - self.rt0[b.name]) % 2 == 1)
 
     def block(self, name: str) -> Block:
         return next(b for b in self.blocks if b.name == name)
@@ -184,11 +238,14 @@ class TileImage:
     fills a buffer of nbytes. A model's subclass adds its regions (``_add``, ``_add_slab``) and calls ``_place``."""
 
     def __init__(self, gguf: GGUFFile, *, kc: int, payload: int, tile_bytes: int, vocab: int,
-                 max_rows: dict[str, int] | None = None, column_major: bool = False):
+                 max_rows: dict[str, int] | None = None, column_major: bool = False, tails: frozenset[str] = frozenset()):
         """kc: the K chunk of a tile (columns); payload: the elements of an activation object's payload (the K groups);
         tile_bytes: the object size (0: chosen from the file's formats, ``choose_tile_bytes``); max_rows: the rows of
-        a format's tile at most (default: the format's); column_major: the layout (module docstring)."""
+        a format's tile at most (default: the format's); column_major: the layout (module docstring); tails: the regions
+        (names) whose input of half a chunk short of whole chunks is a ``Region.half`` region, its blocks of one tile
+        format read in the super-block split ``pt`` blocks."""
         self.gguf, self.kc, self.nsb, self.payload, self.vocab = gguf, kc, kc // 256, payload, vocab
+        self.tails = tails
         self.tile_bytes = tile_bytes or self._choose_tile_bytes()
         mr = max_rows or {}
         self.R = {f: FORMATS[f].rows(self.tile_bytes, self.nsb, mr.get(f, 0)) for f in FORMATS
@@ -251,6 +308,9 @@ class TileImage:
 
     def _region(self, layer: int, name: str, parts: list[tuple], K: int, G: int) -> Region:
         assert G == 1 or G * K == self.kc, (name, K, G)
+        n_kc = -(-K // self.kc)
+        g = kc_group(n_kc, self.payload, self.kc)
+        half = name in self.tails and K % self.kc == self.kc // 2 and n_kc >= 2 and g == n_kc and G == 1
         blocks = []
         for bname, tensors, rows, *own in parts:  # (own: the block's tile format, a plane of its tensors': ``packs_from``)
             fmts = [self.fmt(t) for t in tensors]
@@ -269,10 +329,15 @@ class TileImage:
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
             pairs = all(self.qtype(t) == "F32" for t in tensors)
-            blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs))
-        n_kc = -(-K // self.kc)
-        return Region(layer, name, blocks, n_kc, kc_group(n_kc, self.payload, self.kc), self.tile_bytes, self.kc,
-                      cols=parts[0][2].shape[0])
+            # (a tail tile's halves: the super-block split's)
+            pt = half and not pairs and not slot(fmt).mmv_split(fmt, self.nsb) and self.pairs(name, bname, fmt, R)
+            blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs, pt=pt))
+        return Region(layer, name, blocks, n_kc, g, self.tile_bytes, self.kc, cols=parts[0][2].shape[0], half=half)
+
+    def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:
+        """Whether a block of a ``Region.half`` region holds its row tiles in pairs (``Block.pt``): the model's (the
+        prefill must read them: ``prefill.gemm.pair_tails``)."""
+        return False
 
     def _add_data(self, layer: int, name: str, nbytes: int) -> None:
         """A data region of nbytes per column ("<phase>_norm": ``norm_objects``, written at pack time)."""
@@ -370,13 +435,17 @@ class TileImage:
     # ------------------------------------------------------------------
 
     def _native_blocks(self, r: Region, b: Block) -> list[tuple]:
-        """A block for ``_native.pack_tiles``: its runs of one format (``Block.parts``)."""
+        """A block for ``_native.pack_tiles``: its runs of one format (``Block.parts``); a ``half`` region's by their
+        first tile in a column's block, a ``pt`` block's in pairs (``Region``)."""
         out = []
         for fmt, R, rt, names, rows in b.parts(self.tensor(b.tensors[0]).rows):
             ts = [self.tensor(t) for t in names]
-            out.append((_native_format(fmt, ts), R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt,
-                        r.rt0[b.name] + rt, r.offset, r.col_stride, [_raw_bytes(t) for t in ts], np.ascontiguousarray(rows),
-                        ts[0].cols // 256, b.G))
+            blk = (_native_format(fmt, ts), R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt,
+                   r.rt0[b.name] + rt, r.offset, r.col_stride, [_raw_bytes(t) for t in ts], np.ascontiguousarray(rows),
+                   ts[0].cols // 256, b.G)
+            if r.half:
+                blk += (r.t0[b.name] + rt * r.n_kc, int(b.pt), r.n_t)
+            out.append(blk)
         return out
 
     def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
@@ -397,17 +466,21 @@ class TileImage:
         return any(r.data for r in self.regions)
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
-        """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer):
-        the (offset, bytes) of its tiles, one per K chunk."""
+        """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer), with
+        the other row tile of its pair in a ``pt`` block (their shared tail tile): the (offset, bytes) of the tiles."""
         assert not b.fmt2, "a split block's row tiles are of two formats"
         blk = list(self._native_blocks(r, b)[0])
         n = b.R * b.G
-        blk[7] += rt
+        lo = rt - rt % 2 if b.pt else rt
+        hi = min(lo + 2, b.tiles) if b.pt else rt + 1
+        blk[7] += lo
         blk[8] += col * r.col_stride
-        blk[11] = np.ascontiguousarray(b.rows[col, rt * n:(rt + 1) * n]).reshape(1, -1)
+        blk[11] = np.ascontiguousarray(b.rows[col, lo * n:hi * n]).reshape(1, -1)
+        if r.half:
+            blk[14] = r.tile(r.rt0[b.name] + lo, 0)
         _pack_tiles(out, [tuple(blk)], threads=1)
-        t = r.rt0[b.name] + rt
-        return [(r.offset + col * r.col_stride + r.tile(t, k) * r.tile_bytes, r.tile_bytes) for k in range(r.n_kc)]
+        tiles = sorted({r.tile(r.rt0[b.name] + t, k) for t in range(lo, hi) for k in range(r.n_kc)})
+        return [(r.offset + col * r.col_stride + i * r.tile_bytes, r.tile_bytes) for i in tiles]
 
 
 # ----------------------------------------------------------------------

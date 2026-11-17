@@ -111,7 +111,14 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "attn_out", 256),
          ("spark", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark", "Q8_0", "4B", (0,), 0, "attn_in", 64),
          ("spark-bartowski", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
-         ("spark-bartowski", "Q4_0", "4B", (0,), 0, "gate_up", 256), ("spark-bartowski", "Q4_0", "4B", (0,), 0, "down", 256)]
+         ("spark-bartowski", "Q4_0", "4B", (0,), 0, "gate_up", 256), ("spark-bartowski", "Q4_0", "4B", (0,), 0, "down", 256),
+         # (the image's regions of half a chunk short, ``SparkImage(tails=True)``: their tail tiles' halves; gate / up's
+         # Q4_K and Q4_0 blocks in pairs of row tiles: pass pairs)
+         ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "attn_in", 256), ("spark-tails", "Q4_K_M", "4B", (0, 4), 4, "attn_in", 64),
+         ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 256), ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 1024),
+         ("spark-tails", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark-tails", "Q8_0", "4B", (0,), 0, "attn_in", 64),
+         ("spark-bartowski-tails", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
+         ("spark-bartowski-tails", "Q4_0", "4B", (0,), 0, "gate_up", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -121,9 +128,10 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
             "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
-            "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski")}[model]()
+            "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski")
+            }[model.removesuffix("-tails")]()
     require(path)
-    key = (path, layers)
+    key = (path, layers, model.endswith("-tails"))
     if key not in _images:
         _images.clear()
         g = GGUFFile(path)
@@ -137,7 +145,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             from models.spark.image import SparkImage as Image
         else:
             from models.gemma4.image import GemmaImage as Image
-        img = Image(g, layers=list(layers), vocab=COLS * 64)
+        img = Image(g, layers=list(layers), vocab=COLS * 64,
+                    **({"tails": model.endswith("-tails")} if model.startswith("spark") else {}))
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W)
         _images[key] = (g, img, W)
@@ -220,7 +229,7 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
     ops = list(dict.fromkeys(gm.op for gm in pp.gemms))
     twins = {id(op): _twin(op) for op in ops}
     lib = Library("t_prefill_gemm", [*ops, *twins.values()]).compile().load()
-    M, K = max(gm.op.M for gm in pp.gemms), region.K  # (GemmQd pads the tokens to whole passes)
+    M, K = max(gm.op.M for gm in pp.gemms), region.K_in  # (GemmQd pads the tokens to whole passes)
     A = (torch.randn(M, K, generator=torch.Generator().manual_seed(T + K)) * 0.5).bfloat16()
     Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), M, K))  # (the GEMM's operand values)
 
@@ -241,6 +250,25 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
 
     variants = {level: outputs(level) for level in (0, None, LEVEL)}
     C, Cb = variants[0]
+    if model.endswith("-tails"):  # (the padded image's GEMMs on A's columns and zeros: bit for bit, the k-tiles
+        # less exact zeros)
+        _, pimg, PW = _image(model.removesuffix("-tails"), quant, size, layers)
+        ppp = _plan(model, pimg, pimg.region(layer, phase), T)
+        pops = list(dict.fromkeys(gm.op for gm in ppp.gemms))
+        plib = Library("t_prefill_gemm_pad", [*pops, *map(_twin, pops)]).compile().load()
+        Ap = torch.nn.functional.pad(A, (0, pimg.region(layer, phase).K - K))
+        if ppp.layout is not None:  # (the blocks' valid rows: a pass's rows past its block read other tiles)
+            assert ppp.layout == pp.layout
+            Pb = torch.zeros((M, ppp.gemms[0].op.N), dtype=torch.bfloat16)
+            for gm in ppp.gemms:
+                Pb = _run(plib, gm.op, Ap[:gm.op.M], PW, gm.w_off, gm.a_off, Pb)
+            cols = np.concatenate([pp.layout.pitch * c + pp.layout.off[b.name] + np.arange(int((b.rows[c] >= 0).sum()))
+                                   for b in region.blocks for c in range(COLS)])
+            assert torch.equal(Pb[:T, cols].view(torch.int16), Cb[:T, cols].view(torch.int16)), "the padded image's"
+        else:
+            P = sum(_run(plib, gm.op, Ap[:gm.op.M], PW, gm.w_off, gm.a_off)[:T].float() for gm in ppp.gemms)
+            assert torch.equal(P.view(torch.int32), C.view(torch.int32)), "the padded image's output"
+        _image(model, quant, size, layers)
 
     def agree(f: object) -> None:
         """The values checked (``f(C, Cb)``) bit-identical in every variant (as bits: fp32 halves can be NaN)."""

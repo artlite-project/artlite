@@ -14,13 +14,13 @@ def attn_spec(cfg: SparkConfig) -> AT.AttnSpec:
 
 class SparkDecodeOperator(Attn256DecodeOperator):
     """The Spark-X decode overlay design: ``rows``: {tile format: rows per tile} of tiles of 1024 columns
-    (``attn256.OBJ_BYTES``), ``attn``: the attention's shape (8 slots, ``attn_spec``); paged, gu_win, split:
+    (``attn256.OBJ_BYTES``), ``attn``: the attention's shape (8 slots, ``attn_spec``); paged, gu_win, split, tails:
     ``decode.design``'s."""
 
     PREFIX = "spk"
 
     def __init__(self, *, hidden: int, rows: dict[str, int], attn: AT.AttnShape, eps: float,
-                 paged: tuple[str, ...] = (), gu_win: bool = False, split: bool = False):
+                 paged: tuple[str, ...] = (), gu_win: bool = False, split: bool = False, tails: bool = False):
         assert attn.one and attn.spec.window, attn.spec
         super().__init__(attn=attn, hidden=hidden, rows=rows, eps=eps, nsb=4, act="gelu_erf", paged=paged, slots=8,
-                         packed=True, bcast=True, gu_win=gu_win, split=split)
+                         packed=True, bcast=True, gu_win=gu_win, split=split, tails=tails)

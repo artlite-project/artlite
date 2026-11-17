@@ -86,9 +86,9 @@ class SparkOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None):
+                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None, tails: bool = True):
         if image is None and weights is None:
-            image = SparkImage(gguf, layers=layers, vocab=vocab, head=head)
+            image = SparkImage(gguf, layers=layers, vocab=vocab, head=head, tails=tails)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
@@ -102,7 +102,7 @@ class SparkOverlay(ModelOverlay):
         # Q4_K_M, whose Q5_K page overflows the slot beside a resident Q4_K by 1.2 KB)
         self.op = SparkDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, attn=self.ash,
                                       eps=cfg.rms_norm_eps, paged=paged_formats(gguf, fmts, wide=gu_win),
-                                      gu_win=gu_win, split=img.split)
+                                      gu_win=gu_win, split=img.split, tails=any(r.half for r in img.regions))
         self.attn_steps = AttentionSteps(self)
         self._plan()
 

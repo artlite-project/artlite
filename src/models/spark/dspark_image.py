@@ -7,7 +7,10 @@ K chunks of 1024 columns, tiles of ``decode.attn256.OBJ_BYTES``; the BF16 files'
   up rows), "down", as the model's; an injection's K and V are attn_in's rows (``ikv``: a view of the "k" and "v" blocks'
   tiles, normed by ``enc.output_norm``).
 
-The head is the model's (``decode.head.HeadView`` of its image: ``head``, set by the overlay)."""
+The head is the model's (``decode.head.HeadView`` of its image: ``head``, set by the overlay). With the model's image of
+half regions (``tails``, Spark's ``image``) the drafter's fc, attn_in and gate_up of the 4B's hidden 2560 are half regions
+too (fc reads the model's attn_in input), the blocks no prefill GEMM reads (gate / up, attn_in's q and gate rows) in
+pairs of row tiles (``pairs``)."""
 
 import numpy as np
 
@@ -17,10 +20,12 @@ from artlite.decode.protocol import MAX_K
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import DSparkConfig
 from artlite.operators.design import COLS
+from artlite.prefill.gemm import pair_tails
 
 from .image import KC
 
 NORMS = {"attn_in": "attn_norm", "gate_up": "ffn_norm"}  # (a layer's normed phases; fc's: fc_norm, ikv's: enc, lm's: output)
+TAILS = frozenset({"fc", *NORMS})  # (``tails``: the regions of the hidden's input, ``decode.image.Region.half``)
 
 
 def attn_rows(cfg: DSparkConfig) -> dict[str, np.ndarray]:
@@ -37,11 +42,12 @@ class DSparkImage(TileImage):
 
     head: Region | None = None
 
-    def __init__(self, gguf: GGUFFile, cfg: DSparkConfig):
+    def __init__(self, gguf: GGUFFile, cfg: DSparkConfig, *, tails: bool = False):
         self.cfg = cfg
         H, I = cfg.hidden, cfg.ffn
         self.layers = list(range(cfg.layers))
-        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=OBJ_BYTES, vocab=0)
+        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=OBJ_BYTES, vocab=0,
+                         tails=TAILS if tails else frozenset())
         assert H % 256 == 0 and gguf.tensor("fc.weight").cols == len(cfg.taps) * H
         self.view("fc.weight", H // 256)
         n = len(cfg.taps)
@@ -61,9 +67,13 @@ class DSparkImage(TileImage):
         for L in self.layers:
             r = self.region(L, "attn_in")
             assert r.kc_group == r.n_kc and [b.name for b in r.blocks] == ["q", "k", "v", "g"]
-            q = r.blocks[0].tiles
             self.ikv[L] = Region(L, "ikv", r.blocks[1:3], r.n_kc, r.kc_group, r.tile_bytes, r.kc,
-                                 offset=r.offset + q * r.n_kc * r.tile_bytes, col_stride=r.col_stride)
+                                 offset=r.offset + r.t0["k"] * r.tile_bytes, col_stride=r.col_stride, half=r.half)
+
+    def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:
+        """The blocks no prefill GEMM reads (gate / up; attn_in's q and gate rows: the prefill's injection reads fc
+        and the K / V rows, ``ikv``), and those it reads in pairs (``pair_tails``)."""
+        return region == "gate_up" or (region == "attn_in" and block in ("q", "g")) or pair_tails(region, fmt, R)
 
     def region(self, layer: int, name: str) -> Region:
         if name == "ikv":

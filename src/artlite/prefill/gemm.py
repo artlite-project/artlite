@@ -1,7 +1,8 @@
 """The prefill GEMMs of a model on its decode overlay's weight image (``decode.image.TileImage``: qwen35's
 ``QwenImage``, gemma4's ``GemmaImage``): every projection of a T-token chunk, read in place by GemmQ / GemmQd
 (``gemm.gemm_q``, ``gemm.gemm_qd``; the image's tile convention is theirs: K chunks in groups of ``kc_group``, group G of row
-tile j at (G n_rt + j) kc_group).
+tile j at (G n_rt + j) kc_group; a ``Region.half`` region's K of half a chunk short: its tail tiles' first halves, a
+``Block.pt`` block's pairs of row tiles in pass pairs, ``pair_tails``).
 
 ``plan_phase`` turns an image region into its GEMMs (``Gemm``: the operator and the byte offset of its W argument in
 the image) and the layout of their output (``Layout``):
@@ -90,6 +91,14 @@ class PhasePlan:
     act: GateUpActOperator | None = None  # (a split gate / up block) GU -> the phase's output, after the GEMMs
 
 
+def pair_tails(name: str, fmt: str, R: int) -> bool:
+    """Whether ``plan_phase`` reads a ``decode.image.Block.pt`` block (row tiles in pairs sharing their tail tile) of
+    this tile format in a region ``name``: gate / up's of 16-row tile-major tiles (GemmQ: pass pairs, a pair's even and
+    odd row tiles the two parts of a C object, ``geometry.GemmSpec.ptail``). The other regions of half a chunk short
+    read their tiles unpaired (the tail tile's first half only)."""
+    return name == "gate_up" and fmt in ("Q4_K", "Q4_0") and R == 16
+
+
 def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOperator] | None = None
             ) -> GemmQOperator:
     """GemmQ or GemmQd of the operator keywords ``kw`` by the tokens and format (``planar.gemm_mac_rows``), paced as its
@@ -169,7 +178,7 @@ def d_pitch(image: TileImage, T: int) -> int:
     p = 0
     for r in image.regions:
         if r.name in OUT:
-            p = max(p, *_extents(r, [0], T, r.K, r.name == "down"))
+            p = max(p, *_extents(r, [0], T, r.K_in, r.name == "down"))
     return -(-p // 32) * 32
 
 
@@ -179,7 +188,7 @@ def _in_layout(region: Region, T: int, pitch: int = 0) -> Layout:
     off: dict[str, int] = {}
     col = end = 0  # (end: of every block's pass outputs, a pair block's whole pass included)
     for run in _runs(region):
-        for i, e in zip(run, _extents(region, run, T, region.K, False)):
+        for i, e in zip(run, _extents(region, run, T, region.K_in, False)):
             b = region.blocks[i]
             off[b.name] = col
             end = max(end, col + e)
@@ -205,7 +214,7 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
                              "col_bytes": region.col_stride, "passes": len(out_cols[0]), "out_cols": out_cols,
                              "kc": region.kc, "kc_group": region.kc_group}
     if planar(b0.fmt, b0.R, region.kc):
-        plan = _plan(region, run, plan_T or T, region.K, few)
+        plan = _plan(region, run, plan_T or T, region.K_in, few)
         blocks = tuple((rt0 + r, n) for r, n in plan.blocks)
         kw.update(tiles=plan.tiles, c_pack=True, blocks=blocks, lines=LINES)
         rt_end = max(r + plan.tiles * n for r, n in blocks)
@@ -217,7 +226,7 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
     # (the chunk group stride; a run that reads past the region: its last column's extra tiles counted)
     kw["region_rt"] = min(region.n_rt, rt_end)
     if k_part[1]:
-        kw["a_cols"] = (k_part[0] * region.kc, region.K)
+        kw["a_cols"] = (k_part[0] * region.kc, region.K_in)
     return kw
 
 
@@ -277,9 +286,10 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
     (b,) = region.blocks
     groups, W = image.cfg.intermediate_size // COLS // 64, split_width(b)
     P, KC = groups * 2 * W, region.kc
+    assert not b.pt, "a split block's row tiles unpaired"
     gemms = []
     for part, (fmt, R, tiles, rt0) in enumerate(((b.fmt, b.R, b.na, 0), (b.fmt2, b.R2, b.nb, b.na))):
-        kw = {"fmt": fmt, "rows": R, "M": T, "K": region.K, "N": COLS * P, "tile_bytes": region.tile_bytes,
+        kw = {"fmt": fmt, "rows": R, "M": T, "K": region.K_in, "N": COLS * P, "tile_bytes": region.tile_bytes,
               "col_bytes": region.col_stride, "passes": groups,
               "out_cols": [[P * c + 2 * W * j + W * part for j in range(groups)] for c in range(COLS)], "kc": KC,
               "kc_group": region.kc_group, "blocks": ((rt0, groups),), "pass_step": b.na + b.nb, "region_rt": region.n_rt}
@@ -308,7 +318,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
     each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input
     projection's layout (its planar passes) as planned for that many tokens (the layout of buffers that outlive a chunk,
     e.g. qwen35's conv states in G's rows; default T)."""
-    name, K, S, KC = region.name, region.K, region.tile_bytes, region.kc
+    name, K, S, KC = region.name, region.K_in, region.tile_bytes, region.kc
     which = WHICH[name]
     if name == "gate_up" and region.blocks[0].fmt2:
         return _split_gate_up(image, region, T, ops, act)
@@ -324,13 +334,18 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         assert passes * width == ffn
         ng = -(-passes // 64)
         gemms = []
-        for i in range(ng):  # (GEMMs of consecutive passes)
-            p0, p1 = passes * i // ng, passes * (i + 1) // ng
+        # (a block of row tile pairs: pass pairs of tp pairs each, ``pair_tails``)
+        assert not b.pt or (b.tiles % (2 * tp) == 0 and not pl and LINES), (b.tiles, tp)
+        for i in range(ng):  # (GEMMs of consecutive passes; of pass pairs)
+            p0, p1 = passes * i // ng // (1 + b.pt) * (1 + b.pt), passes * (i + 1) // ng // (1 + b.pt) * (1 + b.pt)
             oc = [[ffn * c + width * p for p in range(p0, p1)] for c in range(COLS)]
             kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": -(-ffn * COLS // KC) * KC, "tile_bytes": S,
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
                   "blocks": ((tp * p0, p1 - p0),), "lines": LINES}
+            if b.pt:  # (the block's first tile, then a pair's 2 n_kc - 1 tiles per pass tile; region_rt: the column's)
+                kw.update(blocks=((region.t0[b.name] + region.pair * tp * p0 // 2, p1 - p0),), ptail=True,
+                          region_rt=region.n_t)
             if pl:
                 kw["tiles"] = tp
             op = gemm_op(kw, T, which, ops)

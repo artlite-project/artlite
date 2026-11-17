@@ -97,7 +97,8 @@ class DSparkOverlay(SparkOverlay):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         if not target.image.draft_cols:
             raise ValueError("the model's LM rows without the drafter's head: SparkOverlay(**dspark.needs(gguf))")
-        image = DSparkImage(gguf, cfg)
+        image = DSparkImage(gguf, cfg, tails=any(r.half for r in target.image.regions))  # (the model's layout: fc
+        # reads its attn_in's x)
         self.head = HeadView(target.image, target.image.draft_cols)
         image.head = self.head.region(-1, "lm")
         image.vocab = self.head.vocab
@@ -145,7 +146,7 @@ class DSparkOverlay(SparkOverlay):
         """A phase that reads another's x (one K group): its metadata object only."""
         r = self.image.region(*phase)
         (k0, g), = mp.group_chunks(r)
-        self.inp[phase] = [InputRegion(self._take("ACT", XB), k0 * r.kc, g * r.kc)]
+        self.inp[phase] = [InputRegion(self._take("ACT", XB), k0 * r.kc, mp.group_K(r, k0, g))]
 
     def _plan(self) -> None:
         """Byte offsets in ACT, NORM, KV."""

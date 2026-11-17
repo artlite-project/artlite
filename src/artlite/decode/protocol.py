@@ -21,7 +21,8 @@ The main core's program, per X object (``_begin``):
 - else a phase's metadata object: ``M_NX`` input objects follow; with ``F_NORM`` they arrive under norm-weight A
   objects (``nbegin``: each holds the weights of ``NX_PER_NORM`` input objects, the input is multiplied by them,
   and the outputs are scaled by the slots' 1 / rms), then ``M_NT`` weight tiles (``M_NRT`` row tiles x ``M_G`` K
-  chunks, a row tile's chunks in a row; blocks of row tiles ``M_B``: end row tile, format (| ``B_F32``), valid
+  chunks, a row tile's chunks in a row; a ``B_PT`` block's pairs of row tiles share the tile of their last chunk, the
+  second one a chunk less: ``S_PT``; blocks of row tiles ``M_B``: end row tile, format (| ``B_F32``), valid
   rows). Per tile the main core posts the helper's command, runs its half, adds the helper's partial rows; a
   complete row tile's rows per slot: ``F_RESID`` into the residual (fp32), ``F_GU`` (rows 0 .. 7 gate, 8 .. 15 up) ->
   bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
@@ -122,6 +123,10 @@ B_G4 = PHASE.flag("B_G4", 13, of="format")
 # a split gate / up block (``decode.image.Block.fmt2``: a SiLU group's gate rows in tiles of the format at bits 0 .. 7, then its
 # up rows in tiles of the format at bits 16 .. 23, B_NA and B_NB tiles: F_GU of its own, ``gusplit``)
 B_SPLIT = PHASE.flag("B_SPLIT", 14, of="format")
+# its row tiles in pairs sharing the tile of their last chunk (``decode.image.Block.pt``): a pair's tiles are the first
+# row tile's full chunks, the tail tile (its first half: that row tile's, the second: the next one's), the next one's full
+# chunks; an odd block's last row tile as a plain one
+B_PT = PHASE.flag("B_PT", 15, of="format")
 B_FMT2, B_NA, B_NB = 16, 24, 28  # (a split block's second format, its gate and up tiles per group: their bits' shifts)
 
 TOKEN = XMETA.kind("token")
@@ -157,6 +162,9 @@ S_SP, S_NXS, S_NXS1 = _S.words("S_SP S_NXS S_NXS1")
 # (``gu_win`` designs) the rows in the gate / up windows (a split block's: its next tile's place in its group, ``gusplit``),
 # the windows of 16 so far in a SiLU group
 S_GN, S_GK = _S.words("S_GN S_GK")
+# (``tails`` designs) the row tile's place in a B_PT block's pairs: 1 its first (its tail tile's second half: the next
+# row tile's), 2 its second (its tail came with the first's: one chunk less), else 0
+S_PT = _S.word("S_PT")
 S_B = _S.block("S_B", 3 * NBLK, at=32)  # the block table, 3 words per block
 S_TEND = _S.word("S_TEND", at=S_WORDS - 1)  # (tile) the window's end
 # (``post`` designs) the partial sums object (a trip count), the scale (bf16 bits), the column, the phase's residual

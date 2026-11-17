@@ -791,13 +791,19 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     const size_t row_bytes = size_t(b.row_sb) * fi.block_bytes;
     const bool pairs = fi.pairs, bfp = fi.bfp, f32 = b.fmt == TileFormat::BFP16_F32;
     const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
+    // (tiles of a column block, of this block: by index from tile0; a pair's 2 n_kc - 1 tiles, a single's n_kc)
+    const size_t col_tiles = b.tile0 >= 0 ? size_t(b.col_tiles) : size_t(b.n_rt) * b.n_kc;
+    const int64_t nrt = tile_rows > 0 ? b.n / tile_rows : 0;
+    const int64_t block_tiles = b.pair ? nrt / 2 * (2 * b.n_kc - 1) + nrt % 2 * b.n_kc : nrt * b.n_kc;
     if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
         tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
         b.kc_group <= 0 || b.n_kc % b.kc_group || fi.used_bytes(b.R, b.nsb) > b.S || b.row_sb <= 0 ||
         b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
         (b.G > 1 && (b.n_kc != 1 || b.row_sb * b.G != b.nsb || f32)) ||
-        b.col_stride < size_t(b.n_rt) * b.n_kc * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
-        b.offset + (b.cols - 1) * b.col_stride + size_t(b.n_rt) * b.n_kc * b.S > out_size)
+        b.col_stride < col_tiles * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
+        b.offset + (b.cols - 1) * b.col_stride + col_tiles * b.S > out_size ||
+        (b.tile0 >= 0 && (b.kc_group != b.n_kc || b.G > 1 || b.tile0 + block_tiles > b.col_tiles)) ||
+        (b.pair && (b.tile0 < 0 || b.n_kc < 2 || b.nsb % 2 || b.row_sb != (2 * b.n_kc - 1) * b.nsb / 2 || f32)))
       throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, G {}, S {}, nsb {}, row_sb {}, n {}, "
                               "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
                               b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
@@ -818,7 +824,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       if (b.rows[i] < -1 || b.rows[i] >= indices)
         throw Error(std::format("pack_tiles: block {}: row {} of {} stacked rows", bi, b.rows[i], indices));
     max_S = std::max(max_S, b.S);
-    const int64_t step = std::max<int64_t>(1, kItemRows / tile_rows), tiles = b.n / tile_rows;
+    // (a pair's row tiles in one item: its tail tile packs both)
+    const int64_t q = kItemRows / tile_rows;
+    const int64_t step = b.pair ? std::max<int64_t>(2, q / 2 * 2) : std::max<int64_t>(1, q), tiles = b.n / tile_rows;
     for (int c = 0; c < b.cols; c++)
       for (int64_t t0 = 0; t0 < tiles; t0 += step) {
         items.push_back({static_cast<int>(bi), c, t0, std::min(step, tiles - t0)});
@@ -848,23 +856,46 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       const size_t bb = fi.block_bytes, row_bytes = size_t(b.row_sb) * bb;
       std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
       uint8_t* col = out + b.offset + it.col * b.col_stride;
-      for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
+      const int64_t tiles = b.n / tile_rows;
+      auto row_bases = [&](int64_t rt, const uint8_t** out_base, uint8_t* out_lo) {  // (row tile rt's rows)
         const int64_t* rows = b.rows + it.col * b.n + rt * tile_rows;
         for (int r = 0; r < tile_rows; r++) {
-          base[r] = nullptr;
-          int64_t i = rows[r];
-          lo[r] = f32 && i >= 0 ? i & 1 : 0;
+          out_base[r] = nullptr;
+          int64_t i = rt < tiles ? rows[r] : -1;
+          out_lo[r] = f32 && i >= 0 ? i & 1 : 0;
           if (f32 && i >= 0) i >>= 1;
           for (size_t t = 0; t < b.tensors.size() && i >= 0; t++) {
             const int64_t n = b.tensors[t].second;
             if (i < n) {
-              base[r] = rows_of[it.block][t] + i * row_bytes;
+              out_base[r] = rows_of[it.block][t] + i * row_bytes;
               break;
             }
             i -= n;
           }
         }
+      };
+      const uint8_t* base2[256];  // (pair: the other row tile's rows, for the tail tile)
+      uint8_t lo2[256];
+      for (int64_t rt = it.t0; rt < it.t0 + it.nt; rt++) {
+        row_bases(rt, base, lo);
+        const int odd = b.pair ? int(rt % 2) : 0;
         for (int kc = 0; kc < b.n_kc; kc++) {
+          const bool tail = b.pair && kc == b.n_kc - 1;
+          if (tail && odd) continue;  // (the pair's tail tile: its first row tile's)
+          if (tail) {  // [this row tile's last nsb / 2 super-blocks | the next one's] per tile row
+            row_bases(rt + 1, base2, lo2);
+            const int h = b.nsb / 2;
+            if (part->size() < size_t(b.R) * b.nsb * bb) part->assign(size_t(b.R) * b.nsb * bb, 0);
+            for (int r = 0; r < b.R; r++) {
+              uint8_t* p = part->data() + size_t(r) * b.nsb * bb;
+              std::memcpy(p, base[r] ? base[r] + kc * b.nsb * bb : kZeroRow, h * bb);
+              std::memcpy(p + h * bb, base2[r] ? base2[r] + kc * b.nsb * bb : kZeroRow, h * bb);
+              src[r] = p;
+            }
+            fi.pack(tile.get(), src, TileAux{lo, opt.iq1_masks}, b.R, b.nsb);
+            memory::stream_copy(col + (b.tile0 + rt / 2 * (2 * b.n_kc - 1) + kc) * b.S, tile.get(), b.S);
+            continue;
+          }
           const int have = std::clamp(b.row_sb - kc * b.nsb, 0, b.nsb);  // (the chunk's super-blocks in a row)
           if ((have < b.nsb || b.G > 1) && part->size() < size_t(b.R) * b.nsb * bb)
             part->assign(size_t(b.R) * b.nsb * bb, 0);
@@ -886,7 +917,9 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
             }
           }
           fi.pack(tile.get(), src, TileAux{lo, opt.iq1_masks}, b.R, b.nsb);
-          const int64_t g = b.kc_group, idx = (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
+          const int64_t g = b.kc_group;
+          const int64_t idx = b.pair ? b.tile0 + rt / 2 * (2 * b.n_kc - 1) + (odd ? b.n_kc : 0) + kc
+                              : b.tile0 >= 0 ? b.tile0 + rt * b.n_kc + kc : (kc / g * b.n_rt + b.rt0 + rt) * g + kc % g;
           memory::stream_copy(col + idx * b.S, tile.get(), b.S);
         }
       }

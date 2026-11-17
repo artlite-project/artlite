@@ -89,7 +89,7 @@ SMOKE = (
     "qwen35/test_decode.py::test_phase[9B-gdn_in-4]", "qwen35/test_decode.py::test_moe_layer[3-35B-A3B-0]",
     "moe/test_route.py", "moe/test_plan.py", "moe/test_prefill.py::test_moe_block[35B-A3B-5]",
     "qwen35/test_decode.py::test_overlay_slice[lazy-35B-A3B]", "spark/test_host.py",
-    "spark/test_overlay.py::test_spark_overlay_steps",
+    "spark/test_overlay.py::test_spark_overlay_steps[tails]",
     "qwen35/test_prefill.py::test_prefill_slice[9B]", "qwen35/test_prefill.py::test_prefill_slice[27B]",
     "qwen35/test_prefill.py::test_prefill_slice[35B-A3B]", "qwen35/test_prefill.py::test_prefill_slice[occamy]",
     "prefill/test_attn256.py::test_attn_prefill[9B-64-1]", "prefill/test_attn256.py::test_attn_prefill[1B-192-2]",

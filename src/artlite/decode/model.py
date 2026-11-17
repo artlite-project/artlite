@@ -265,7 +265,7 @@ class ModelOverlay:
         r = self.image.region(*phase)
         regs = []
         for k0, g in mp.group_chunks(r):
-            K = g * r.kc
+            K = mp.group_K(r, k0, g)
             n = (post_region_bytes(K) if post else region_bytes(K, self.SLOTS)) + extra * K
             regs.append(InputRegion(self._take("ACT", n), k0 * r.kc, K, post))
         self.inp[phase] = regs

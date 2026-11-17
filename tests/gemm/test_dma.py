@@ -12,7 +12,8 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from artlite.formats import FORMATS, KT
+from artlite.decode.image import Block, Region
+from artlite.formats import FORMATS
 from artlite.gemm.gemm_q import GemmQOperator
 from artlite.gemm.gemm_qd import GemmQdOperator
 from artlite.gemm.geometry import LINE, line_window
@@ -75,9 +76,38 @@ def _op_planar(fmt: str, *, R: int, S: int, kc: int, M: int, K: int, tiles: int,
 
 def _tile(op: GemmQOperator, c: int, p: int, kc: int, t: int) -> int:
     """Index (in its column) of tile t of pass p, K chunk kc (a row tile's chunks in groups of
-    ``kc_group``: (kc // g) n_rt g + j g + kc % g)."""
+    ``kc_group``: (kc // g) n_rt g + j g + kc % g; a GEMM of a ``decode.image.Region`` of half a chunk short, ``_op_half``:
+    the region's ``tile`` of the pass's row tile)."""
+    if getattr(op, "region", None) is not None:
+        return op.region.tile(_row_tile(op, p, t), kc)
     g, j = op.kc_group, op.pass_rt[p] + t
     return (kc // g) * op.region_rt * g + j * g + kc % g
+
+
+def _row_tile(op: GemmQOperator, p: int, t: int) -> int:
+    """(``_op_half``) The region's row tile of tile t of pass p: pass_rt[p] + t, or (``ptail``: blocks of (first tile,
+    passes) of a pt block from row tile 0) pass 2 q + e's pairs q tiles .., their row tiles of parity e."""
+    if not op.ptail:
+        return op.pass_rt[p] + t
+    i = p
+    for _, cnt in op.blocks:
+        if i < cnt:
+            break
+        i -= cnt
+    q, e = divmod(i, 2)
+    first = sum(cnt for _, cnt in op.blocks) and op.blocks[0][0]
+    assert first == 0, "a test block of pairs from the region's first tile"
+    return 2 * (q * op.tiles + t) + e
+
+
+def _units(op: GemmQOperator, p: int, kc: int) -> list[int]:
+    """The units (header units, then super-block slices) of K chunk kc that pass p reads of its tiles: every one; a
+    tail chunk's header units and its row tiles' half of the super-blocks (``Region.tail_half``)."""
+    hu = op.hdr_units
+    if not op.tail or kc < op.n_kc - 1:
+        return list(range(hu + op.nsb))
+    s0 = op.tail * (op.region.tail_half(_row_tile(op, p, 0)) if getattr(op, "region", None) is not None else 0)
+    return list(range(hu)) + [hu + s0 + i for i in range(op.tail)]
 
 
 def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
@@ -96,7 +126,7 @@ def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
         out = []
         if op.hg == 1:
             for kc in range(op.n_kc):
-                for sl in range(op.hdr_units + op.nsb):
+                for sl in _units(op, p, kc):
                     out.append([col + _tile(op, c, p, kc, t) * tw + sl * op.slice // 4 for t in range(op.tiles)])
             return out
         hw = op.slice // 4 // op.hg  # (a tile's header, words)
@@ -159,7 +189,7 @@ def _expected_a(op: GemmQOperator, ch: int, row: int) -> list[np.ndarray]:
     [band][k-step][half][8 x 8 panel]."""
     m, K = op.m, op.K
     out = []
-    for kt in range(K // KT):  # panels [token group][k8][36 units]
+    for kt in range(op.k_tiles):  # panels [token group][k8][36 units]
         g0 = (ch * op.nrows + row) * (m // 8)
         out.append(np.array([((g0 + 2 * band + h) * (K // 8) + 8 * kt + q) * 36 + u
                              for band in range(m // 16) for q in range(8) for h in range(2) for u in range(36)]))
@@ -274,8 +304,9 @@ def _check_outputs(op: GemmQOperator, df: object) -> None:
                         for tok in range(m):
                             expect[(t0 + tok) * N + start + np.arange(op.win)] = ids[tok * op.n_c + np.arange(op.win)]
                     elif op.c_bfp16:  # panels [group][col block][36 units] (two parts: [part][group][...], a
-                        # group's row of both parts' panels in C)
-                        v = ids.reshape(op.c_parts, m // 8, no // 8, 36).transpose(1, 0, 2, 3).reshape(m // 8, -1, 36)
+                        # group's row of both parts' panels in C; ``ptail``: a pass pair's even and odd tiles in turn)
+                        v = ids.reshape(op.c_parts, m // 8, no // 8, 36)
+                        v = (v.transpose(1, 2, 0, 3) if op.ptail else v.transpose(1, 0, 2, 3)).reshape(m // 8, -1, 36)
                         cols = col0 + np.arange(no * op.c_parts)
                         for g in range(m // 8):
                             for j in range(no * op.c_parts // 8):
@@ -383,6 +414,68 @@ def test_gemm_qd_planar_dataflow(fmt: str, R: int, S: int, kc: int, kw: dict) ->
     df = op.flow
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
+    _check_weights(op, df)
+    _check_activations(op, df)
+    _check_outputs(op, df)
+
+
+def _op_half(fmt: str, *, R: int, S: int, M: int, blocks: list[tuple[int, bool]], silu: bool = False,
+             tiles: int = 0, planar_dq: bool = False, **kw: object) -> GemmQOperator:
+    """A GEMM of the K = 2560 region (3 chunks of 1024 columns, ``decode.image.Region.half``) of ``blocks`` (row tiles,
+    paired: ``Block.pt``) as ``prefill.gemm`` plans it: passes of ``tiles`` row tiles of every block (a paired one's
+    in pass pairs, ``ptail``: its even then its odd row tiles), the operator's ``region`` the image's."""
+    bl = [Block(f"b{i}", ("t",), np.zeros((COLS, n * R), np.int64), fmt, R, pt=pt) for i, (n, pt) in enumerate(blocks)]
+    region = Region(0, "x", bl, 3, 3, S, 1024, offset=0, col_stride=0, half=True)
+    tiles = tiles or 64 // R
+    col_bytes = region.n_t * S
+    if any(b.pt for b in bl):
+        assert len(bl) == 1 and bl[0].tiles % (2 * tiles) == 0
+        passes = bl[0].tiles // tiles
+        kw.update(ptail=True, blocks=((0, passes),), region_rt=region.n_t)
+    else:
+        passes_b = [-(-b.tiles // tiles) for b in bl]
+        passes = sum(passes_b)
+        kw.update(blocks=tuple((region.rt0[b.name], n) for b, n in zip(bl, passes_b)), region_rt=region.n_rt)
+    step = 32 if silu else tiles * R + tiles * R % 2
+    pitch = -(-passes * step // 64) * 64
+    out_cols = [[c * pitch + step * p for p in range(passes)] for c in range(COLS)]
+    cls = GemmQdOperator if planar_dq else GemmQOperator
+    op = cls(fmt=fmt, rows=R, M=M, K=2560, N=COLS * pitch, tile_bytes=S, col_bytes=col_bytes, passes=passes,
+             out_cols=out_cols, silu=silu, c_bfp16=silu, kc=1024, kc_group=3, **({"tiles": tiles} if tiles != 64 // R
+                                                                                 or planar_dq else {}), **kw)
+    op.region = region
+    return op
+
+
+CASES_HALF = [
+    # (unpaired: every row tile's tail tile read for its first half, as today's padded tiles less the zero half)
+    ("Q4_K", 16, 9280, {"M": 256, "blocks": [(8, False)]}),
+    ("Q4_K", 16, 9280, {"M": 512, "blocks": [(12, False)], "silu": True, "lines": True}),
+    ("BFP16", 8, 9280, {"M": 256, "blocks": [(16, False)]}),
+    ("Q4_0", 16, 9280, {"M": 256, "blocks": [(8, False), (4, False)]}),
+    ("Q6_K", 11, 9280, {"M": 192, "blocks": [(13, False), (4, False)], "tiles": 6, "planar_dq": True, "c_pack": True,
+                        "m": 64}),
+    ("Q4_K", 16, 9280, {"M": 192, "blocks": [(8, False), (4, False)], "planar_dq": True, "c_pack": True, "m": 64}),
+    # (pairs: gate / up's pass pairs, a pair's even and odd row tiles the two parts of a C object)
+    ("Q4_K", 16, 9280, {"M": 512, "blocks": [(16, True)], "silu": True, "lines": True}),
+    ("Q4_K", 16, 9280, {"M": 256, "blocks": [(24, True)], "silu": True, "lines": True}),
+    ("Q4_0", 16, 9280, {"M": 512, "blocks": [(16, True)], "silu": True, "lines": True}),
+]
+
+
+@pytest.mark.parametrize("fmt,R,S,kw", CASES_HALF, ids=[f"{f}-" + "-".join(f"{k}{v}" for k, v in kw.items())
+                                                       .replace(" ", "") for f, _, _, kw in CASES_HALF])
+def test_gemm_half_dataflow(fmt: str, R: int, S: int, kw: dict) -> None:
+    """A K of half a chunk short (``decode.image.Region.half``): per pass 2 chunks and the tail tile's header units and
+    first super-blocks (40 k-tiles); a block of pairs (``Block.pt``) in pass pairs (``ptail``): the even pass's tiles,
+    then the odd one's, the tail tile's second half for the odd row tiles, at the region's tile indices; their two
+    parts of a C object's panels in the output's order."""
+    op = _op_half(fmt, R=R, S=S, **kw)
+    assert op.tail == 2 and op.k_tiles == 40 and op.n_kc == 3
+    df = op.flow
+    dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
+    dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
+    assert sum(map(len, df.b_chain(0))) <= 14
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)

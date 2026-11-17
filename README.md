@@ -107,7 +107,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 | [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0 | prefill, decode with its MTP drafter |
 | [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B; the decision models d3-lite, d3-nano, Kev-4B](docs/models/qwen35.md) | GGUF Q4_K_M, Q8_0; Occamy's IQ3_XXS / Q3_K mix | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's); decisions, also about images |
 | [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B; the decision models d1-2B, d1-Omni-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio, LFM3-Omni Q4_K_M, Q4_0; d1-Omni Q8_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images and videos through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription) and its generator (text to speech, spoken replies); all of them in one model (LFM3-Omni: videos with their sound, realtime conversations); decisions, also about images, videos and audio |
-| [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.5x on code and math); tool calls, thinking levels |
+| [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.7x on code and math); tool calls, thinking levels |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).
