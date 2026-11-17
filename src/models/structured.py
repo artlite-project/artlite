@@ -77,7 +77,8 @@ class Constraint:
     ``lenient``. ``whitespace``: the
     pattern between a JSON value's tokens (vLLM's ``whitespace_pattern``; None: ``WHITESPACE``), ``compact``: none
     (``disable_any_whitespace``), ``closed``: every object without ``additionalProperties`` is closed
-    (``disable_additional_properties``); ``name``: for the log (a schema's)."""
+    (``disable_additional_properties``); ``name``: for the log (a schema's); ``subs``: a Lark grammar's sub-grammars
+    (name, Lark), which it references as ``@name`` (custom tools' inputs: ``call_grammar``)."""
 
     kind: str
     source: str
@@ -86,6 +87,7 @@ class Constraint:
     compact: bool = False
     closed: bool = False
     name: str = ""
+    subs: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         assert self.kind in KINDS, self.kind
@@ -142,6 +144,9 @@ class Constraint:
             schema = json.loads(self.source) if self.kind == "json_schema" or self.source else {"type": "object"}
             body = json.dumps(self.schema(schema), ensure_ascii=False)
             return f"%llguidance {{}}\nstart: LEAD? value\nLEAD: /[ \\t\\r\\n]{{1,{LEAD}}}/\nvalue: %json {body}\n"
+        if self.kind == "lark" and self.subs:
+            return json.dumps({"grammars": [{"lark_grammar": self.source},
+                                            *({"name": n, "lark_grammar": g} for n, g in self.subs)]})
         if self.kind == "lark":
             return llguidance.LLMatcher.grammar_from_lark(self.source)
         if self.kind == "gbnf":

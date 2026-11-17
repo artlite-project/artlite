@@ -1,12 +1,13 @@
 """artlite-server's structured output on the fake model (no NPU): every spelling of a request parsed into one
 constraint (``constraints.constraint_of``) and its errors, then generations held to it - a model that writes something
 else is kept to the grammar, a thought stays free, logprobs before and after the mask, completions' grammar, the
-server's default (``Options.constraint``); the agents' APIs' spellings, ``allowed_tools``, the tools' options and the
-SDKs' helpers."""
+server's default (``Options.constraint``); the agents' APIs' spellings, ``allowed_tools``, custom tools, the tools'
+options and the SDKs' helpers."""
 
 import json
 import math
 
+import httpx
 import llguidance
 import pydantic
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from models.server import agents
 from models.server.constraints import constraint_of
 from models.server.errors import ApiError
+from models.server.tools import INPUT
 from models.structured import Constraint, ConstraintError, add_arguments, compiled, from_args
 
 from .fakes import (
@@ -219,7 +221,7 @@ def test_logprobs() -> None:
 
 def test_server_default() -> None:
     """The server's constraint (--grammar, --json-schema) holds a request that asks for none; one that asks for its own
-    replaces it."""
+    replaces it; a grammar does not hold a request with tools."""
     default = {"constraint": Constraint("choice", json.dumps(["A", "B"]))}
     with client_of(default, chars=True) as (_model, npu, _engine, client):
         npu.replies = [["Z"]]
@@ -227,6 +229,11 @@ def test_server_default() -> None:
         npu.replies = [["7"]]
         r = chat(client, "Q", structured_outputs={"regex": "[0-9]"}, temperature=0).json()
         assert r["choices"][0]["message"]["content"] == "7"
+    with client_of({**default, "template": TOOLS_TEMPLATE}, chars=True) as (_model, npu, _engine, client):
+        npu.replies = [call_pieces("get_time")]  # (a request with tools: the grammar does not apply)
+        r = chat(client, "Q", tools=[TIME], temperature=0)
+        assert r.status_code == 200 and r.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == \
+            "get_time"
 
 
 # ----------------------------------------------------------------------
@@ -307,6 +314,48 @@ def test_tool_options(tmp_path: object) -> None:
                           (["--grammar-file", str(tmp_path / "missing")], "grammar-file")):
         with pytest.raises(ConstraintError, match=message):
             from_args(p.parse_args(argv))
+
+
+CALC = 'start: expr\nexpr: NUM (OP NUM)*\nNUM: /[0-9]+/\nOP: "+" | "-"\n'
+CALC_TOOL = {"type": "custom", "custom": {"name": "calc", "description": "Arithmetic", "format": {
+    "type": "grammar", "grammar": {"syntax": "lark", "definition": CALC}}}}
+
+
+def test_custom_tools() -> None:
+    """OpenAI's custom tools on chat completions: the template's function of one string parameter, a call a custom
+    one (its input, streamed as it comes; the openai SDK's type), one in the history the template's function call; a
+    grammar that does not compile: a 400 that names the tool."""
+    import openai
+    forced, choice = "<tool_call>\n<function=calc>\n", {"type": "custom", "custom": {"name": "calc"}}
+    model, npu, engine = make(chars=True)
+    with live(engine, template=TOOLS_TEMPLATE) as url, httpx.Client(base_url=url) as client:
+        npu.replies = [rest_of(forced, "calc", input="12+30")]
+        c = chat(client, "Q", tools=[CALC_TOOL, TIME], tool_choice=choice).json()["choices"][0]
+        (call,) = c["message"]["tool_calls"]
+        assert call["type"] == "custom" and call["custom"] == {"name": "calc", "input": "12+30"}
+        assert c["finish_reason"] == "tool_calls" and model.rendered[1][0]["function"]["parameters"] == INPUT
+        npu.replies = [rest_of(forced, "calc", input="12+30")]
+        evs = events(chat(client, "Q", tools=[CALC_TOOL, TIME], tool_choice=choice, stream=True))
+        parts = [t for e in evs if isinstance(e, dict) and e.get("choices")
+                 for t in e["choices"][0]["delta"].get("tool_calls") or []]
+        assert parts[0]["type"] == "custom" and parts[0]["custom"]["name"] == "calc" and parts[0]["id"]
+        assert "".join(p["custom"]["input"] for p in parts) == "12+30"
+        history = [{"role": "user", "content": "Q"},
+                   {"role": "assistant", "content": "", "tool_calls": [
+                       {"id": "c1", "type": "custom", "custom": {"name": "calc", "input": "1+2"}}]},
+                   {"role": "tool", "tool_call_id": "c1", "content": "3"}]
+        npu.replies = [list("Three.")]
+        assert chat(client, history, tools=[CALC_TOOL]).status_code == 200
+        assert model.rendered[0][1]["tool_calls"][0]["function"] == {"name": "calc", "arguments": {"input": "1+2"}}
+        bad = {"type": "custom", "custom": {"name": "calc", "format": {"type": "grammar", "grammar": {
+            "syntax": "lark", "definition": "start: nope"}}}}
+        r = chat(client, "Q", tools=[bad])
+        assert r.status_code == 400 and "custom tool 'calc'" in r.json()["error"]["message"]
+        npu.replies = [rest_of(forced, "calc", input="4-1")]
+        oc = openai.OpenAI(base_url=f"{url}/v1", api_key="none")
+        m = oc.chat.completions.create(model="m", messages=[{"role": "user", "content": "Q"}], tools=[CALC_TOOL],
+                                       tool_choice=choice).choices[0].message
+        assert m.tool_calls[0].type == "custom" and m.tool_calls[0].custom.input == "4-1"
 
 
 class Person(pydantic.BaseModel):

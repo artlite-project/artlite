@@ -20,14 +20,17 @@ string (Qwen writes True and False). A GLM-4.5 value (``<arg_value>``) the same,
 
 A call is held to the request's functions by a grammar built from these parsers' texts (``call_grammar``): its name
 is one of theirs, its arguments follow the function's schema in this syntax. Without it a model invents names
-(``tool_choice`` required where no function fits: ``tool_call``, ``none``) and arguments."""
+(``tool_choice`` required where no function fits: ``tool_call``, ``none``) and arguments.
+
+OpenAI's custom tools (text in a grammar's form: ``Custom``) are functions of one string parameter ``input``
+(``functions``, ``customs``); a call's input is that argument (``custom_input``; as it streams: ``InputStream``)."""
 
 from __future__ import annotations
 
 import ast
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .ids import alnum_id
@@ -39,13 +42,50 @@ def call_id() -> str:
     return alnum_id(24, "call_")
 
 
+INPUT = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}  # (a custom tool's)
+
+
+@dataclass(frozen=True)
+class Custom:
+    """A custom tool's input format (OpenAI's ``custom`` tools): ``syntax`` text (any text), lark or regex, its
+    ``definition``."""
+
+    syntax: str = "text"
+    definition: str = ""
+
+
+def _custom(t: dict[str, Any]) -> tuple[str, str, Custom]:
+    """A custom tool's name, description and format (``{"type": "custom", "custom": {"name", "description",
+    "format"}}``; a format ``{"type": "text"}`` or ``{"type": "grammar", "grammar": {"syntax": "lark" or "regex",
+    "definition"}}``). ValueError: not one."""
+    c = t.get("custom")
+    if not isinstance(c, dict) or not isinstance(c.get("name"), str) or not c["name"]:
+        raise ValueError(f"a custom tool must be {{\"type\": \"custom\", \"custom\": {{\"name\": ...}}}}: {t!r}")
+    fmt = c.get("format") or {"type": "text"}
+    g = fmt.get("grammar") if isinstance(fmt, dict) else None
+    if isinstance(fmt, dict) and fmt.get("type") == "text":
+        return c["name"], c.get("description") or "", Custom()
+    if not isinstance(fmt, dict) or fmt.get("type") != "grammar" or not isinstance(g, dict) or \
+            g.get("syntax") not in ("lark", "regex") or not isinstance(g.get("definition"), str):
+        raise ValueError(f"custom tool {c['name']!r}: a format {{\"type\": \"text\"}} or {{\"type\": \"grammar\", "
+                         f"\"grammar\": {{\"syntax\": \"lark\" or \"regex\", \"definition\": ...}}}}: {fmt!r}")
+    return c["name"], c.get("description") or "", Custom(g["syntax"], g["definition"])
+
+
 def functions(tools: object) -> list[dict[str, Any]]:
     """A request's ``tools`` as the templates take them (llama.cpp's form): ``{"type": "function", "function": {"name",
-    "description", "parameters"}}`` each. ValueError: not a list of functions."""
+    "description", "parameters"}}`` each; a custom tool (OpenAI's ``{"type": "custom", ...}``) a function of one
+    string parameter ``input`` (its format held by the call grammar: ``customs``). ValueError: not a list of
+    functions and custom tools."""
     if tools is None:
         return []
     out = []
     for t in tools if isinstance(tools, list) else [tools]:
+        if isinstance(t, dict) and t.get("type") == "custom":
+            name, description, _ = _custom(t)
+            out.append({"type": "function", "function": {"name": name, "description": description,
+                                                         "parameters": INPUT}})
+            continue
         f = t.get("function") if isinstance(t, dict) else None
         if not isinstance(t, dict) or t.get("type") != "function" or not isinstance(f, dict) or \
                 not isinstance(f.get("name"), str) or not f["name"]:
@@ -55,14 +95,70 @@ def functions(tools: object) -> list[dict[str, Any]]:
     return out
 
 
+def customs(tools: object) -> dict[str, Custom]:
+    """A request's custom tools' formats by name (its tools checked: ``functions``)."""
+    return {n: c for n, _, c in (_custom(t) for t in tools or [] if isinstance(t, dict) and t.get("type") == "custom")}
+
+
+def tool_name(t: dict[str, Any]) -> object:
+    """The name of a tool (or a ``tool_choice``'s): ``{"type": "function", "function": {"name"}}`` or
+    ``{"type": "custom", "custom": {"name"}}``."""
+    inner = t.get("custom" if t.get("type") == "custom" else "function")
+    return inner.get("name") if isinstance(inner, dict) else None
+
+
+def custom_input(arguments: str) -> str:
+    """A custom tool's input from its call's arguments (``{"input": ...}``; others: their text)."""
+    try:
+        args = json.loads(arguments)
+    except ValueError:
+        return arguments
+    return args["input"] if isinstance(args, dict) and isinstance(args.get("input"), str) else arguments
+
+
+class InputStream:
+    """A custom tool call's input as its arguments stream (``{"input": "...``, the parsers' JSON text): ``feed`` takes
+    the next fragment and returns the input's new text (its string decoded as far as its escapes are complete)."""
+
+    HEAD = re.compile(r'\s*\{\s*"input"\s*:\s*"')
+
+    def __init__(self) -> None:
+        self.args, self.sent = "", ""
+
+    def feed(self, fragment: str) -> str:
+        self.args += fragment
+        m = self.HEAD.match(self.args)
+        if m is None:
+            return ""
+        body, i = self.args[m.end():], 0
+        while i < len(body) and body[i] != '"':
+            if body[i] == "\\":
+                n = 6 if body[i + 1:i + 2] == "u" else 2
+                if i + n > len(body):
+                    break
+                i += n
+            else:
+                i += 1
+        text = json.loads(f'"{body[:i]}"')
+        if text and "\ud800" <= text[-1] <= "\udbff":  # (half a surrogate pair: the rest comes next)
+            text = text[:-1]
+        delta, self.sent = text[len(self.sent):], text
+        return delta
+
+
 def call_arguments(message: dict[str, Any]) -> dict[str, Any]:
     """A message whose tool calls' ``arguments`` (JSON text in OpenAI's API) are objects, as the templates iterate
-    them. ValueError: arguments that are not a JSON object."""
+    them; a custom tool's call (``{"type": "custom", "custom": {"name", "input"}}``) a function's, its input the
+    argument ``input``. ValueError: arguments that are not a JSON object."""
     calls = message.get("tool_calls")
     if not isinstance(calls, list):
         return message
     out = []
     for c in calls:
+        if isinstance(c, dict) and c.get("type") == "custom" and isinstance(c.get("custom"), dict):
+            out.append({"id": c.get("id"), "type": "function", "function": {
+                "name": c["custom"].get("name"), "arguments": {"input": str(c["custom"].get("input") or "")}}})
+            continue
         f = c.get("function") if isinstance(c, dict) else None
         if isinstance(f, dict) and isinstance(f.get("arguments"), str):
             try:
@@ -727,7 +823,7 @@ class Calls:
     """The tool calls of a request's answer: its ``functions`` (the ones it may call), the template's ``syntax``,
     ``parallel_tool_calls``, ``force``: the text the answer's call begins with (``tool_choice`` required or a named
     function), or None; ``choice``: auto, required (a call, ``name``: of that function); ``strict``: the functions whose
-    schemas compile exactly (the call grammar: ``call_grammar.answer``)."""
+    schemas compile exactly (the call grammar: ``call_grammar.answer``); ``custom``: the custom tools' formats."""
 
     syntax: Syntax
     functions: list[dict[str, Any]]
@@ -736,6 +832,7 @@ class Calls:
     choice: str = "auto"
     name: str | None = None
     strict: frozenset[str] = frozenset()
+    custom: dict[str, Custom] = field(default_factory=dict)
 
     def parser(self) -> Parser:
         return self.syntax.parser(self.functions, parallel=self.parallel)

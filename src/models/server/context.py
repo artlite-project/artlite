@@ -111,21 +111,26 @@ class ApiContext:
     async def constrained(self, req: GenerationRequest, *, route: str = "chat", calls: Calls | None = None
                           ) -> structured.Compiled | None:
         """The request's structured output (``constraints.constraint_of``; none: the server's, ``--grammar``,
-        ``--json-schema``) and its tool calls (``calls``: their grammar, ``call_grammar.answer``, with a JSON response
-        format as the answer that is no call), compiled against the model's tokens (in a thread: the first request may
-        wait for them). A field that does not compile: a 400 that names it."""
+        ``--json-schema``, which a request with tools takes only as JSON) and its tool calls (``calls``: their grammar,
+        ``call_grammar.answer``, with a JSON response format as the answer that is no call), compiled against the
+        model's tokens (in a thread: the first request may wait for them). A field that does not compile: a 400 that
+        names it."""
         got = constraint_of(req.constraint_fields(), route=route)
-        if got is None and self.options.constraint is not None:
-            got = (self.options.constraint, "--grammar / --json-schema")
+        default = self.options.constraint
+        if got is None and default is not None and calls is not None and not default.json:
+            self.warn_once(("constraint", "tools"), "--grammar: requests with tools are answered without it (a call "
+                           "or free text; a JSON schema would go with them)")
+        elif got is None and default is not None:
+            got = (default, "--grammar / --json-schema")
         if got is None and calls is None:
             return None
         v = await self.vocab()
         constraint, field = got if got is not None else (None, "tools")
-        try:
-            if calls is not None:
-                constraint = call_grammar.answer(calls, v, constraint)
-                field = "tools" if got is None else f"tools with {field}"
-            return await run_in_threadpool(structured.compiled, constraint, v)
+        if calls is not None:
+            field = "tools" if got is None else f"tools with {field}"
+        try:  # (in a thread: a custom tool's grammar is analysed too, ``lexemes``)
+            return await run_in_threadpool(lambda: structured.compiled(
+                call_grammar.answer(calls, v, constraint) if calls is not None else constraint, v))
         except structured.ConstraintError as e:
             raise bad_request(f"{field}: {e}") from None
 

@@ -271,6 +271,38 @@ def test_responses(agent: tuple) -> None:
     assert r["status"] == "incomplete" and r["incomplete_details"] == {"reason": "max_output_tokens"}
 
 
+def test_responses_custom() -> None:
+    """A Responses custom tool (a Lark grammar's input): its call a custom_tool_call item, its input streamed
+    (custom_tool_call_input.delta, .done; the openai SDK's types); the call and its output in the next request's
+    history as the template's function call and a tool message."""
+    calc = 'start: expr\nexpr: NUM (OP NUM)*\nNUM: /[0-9]+/\nOP: "+" | "-"\n'
+    tool = {"type": "custom", "name": "calc", "description": "Arithmetic",
+            "format": {"type": "grammar", "syntax": "lark", "definition": calc}}
+    forced, choice = "<tool_call>\n<function=calc>\n", {"type": "custom", "name": "calc"}
+    model, npu, engine = make(chars=True)
+    with live(engine, template=TOOLS_TEMPLATE) as url, httpx.Client(base_url=url) as client:
+        npu.replies = [rest_of(forced, "calc", input="7-2")]
+        r = responses(client, "Q", tools=[tool], tool_choice=choice).json()
+        (item,) = r["output"]
+        assert item["type"] == "custom_tool_call" and item["name"] == "calc" and item["input"] == "7-2"
+        assert item["id"].startswith("ctc_") and item["call_id"].startswith("call_")
+        npu.replies = [rest_of(forced, "calc", input="7-2")]
+        evs = named(responses(client, "Q", tools=[tool], tool_choice=choice, stream=True))
+        (done,) = [d for n, d in evs if n == "response.custom_tool_call_input.done"]
+        assert "".join(d["delta"] for n, d in evs if n == "response.custom_tool_call_input.delta") == done["input"]
+        assert done["input"] == "7-2" and not any(n.startswith("response.function_call") for n, _ in evs)
+        npu.replies = [list("Five.")]
+        out = [{"type": "custom_tool_call_output", "call_id": item["call_id"], "output": "5"}]
+        assert responses(client, out, previous_response_id=r["id"], tools=[tool]).status_code == 200
+        msgs = model.rendered[0]
+        assert msgs[-2]["tool_calls"][0]["function"] == {"name": "calc", "arguments": {"input": "7-2"}}
+        assert msgs[-1]["role"] == "tool"
+        npu.replies = [rest_of(forced, "calc", input="9")]
+        oc = openai.OpenAI(base_url=f"{url}/v1", api_key="none")
+        sdk = oc.responses.create(model="m", input="Q", tools=[tool], tool_choice=choice)
+        assert sdk.output[0].type == "custom_tool_call" and sdk.output[0].input == "9"
+
+
 def test_responses_stream(agent: tuple) -> None:
     """The Responses events: numbered from 0, each item added, its deltas, its .done events when it ends, then
     response.completed with the whole response."""

@@ -1,11 +1,12 @@
 """artlite-server's structured output on the NPU, one small model per family and call syntax: a JSON schema extraction
 that parses and validates, an enum classification, a thought then JSON; tool calls with typed and nested arguments
-(required, a named function, auto with parallel_tool_calls false, a response format beside the tools); a decision's
-options with their probabilities. Greedy, through the server's routes (the engine over the model, a test client)."""
+(required, a named function, auto with parallel_tool_calls false, a response format beside the tools); custom tools'
+inputs (a Lark grammar, a regex); a decision's options with their probabilities. Greedy, through the server's routes (the engine over the model, a test client)."""
 
 import json
 import math
 import os
+import re
 from collections.abc import Iterator
 
 import pytest
@@ -16,6 +17,7 @@ from models import open_model
 from models.server.api import create_app
 from models.server.engine import Engine
 from models.server.settings import ModelInfo, Options
+from models.server.tools import LLAMA3, syntax_of
 
 from ..model_files import require
 
@@ -150,6 +152,26 @@ def test_tool_or_json(served: tuple) -> None:
             assert msg["tool_calls"][0]["function"]["name"] in ("get_weather", "get_time")
         else:
             assert isinstance(json.loads(msg["content"])["answer"], str), msg
+
+
+def test_custom_tool(served: tuple) -> None:
+    """OpenAI's custom tools: a Lark grammar's input held in the template's call (Llama 3's JSON calls: free text), a
+    regex's everywhere."""
+    client, _ = served
+    calc = {"type": "custom", "custom": {"name": "calc", "description": "Evaluates an arithmetic expression", "format": {
+        "type": "grammar", "grammar": {"syntax": "lark", "definition": 'start: NUM (OP NUM)*\nNUM: /[0-9]+/\nOP: "+" | "-" | "*"\n'}}}}
+    date = {"type": "custom", "custom": {"name": "remind", "description": "Sets a reminder on a date", "format": {
+        "type": "grammar", "grammar": {"syntax": "regex", "definition": r"\d{4}-\d{2}-\d{2}"}}}}
+    choice = ask(client, "What is 12 plus 30, times 2? Use the calculator.", tools=[calc, date],
+                 tool_choice={"type": "custom", "custom": {"name": "calc"}})
+    (call,) = choice["message"]["tool_calls"]
+    assert call["type"] == "custom" and call["custom"]["name"] == "calc", call
+    if syntax_of(client.get("/props").json()["chat_template"]) is not LLAMA3:
+        assert re.fullmatch(r"[0-9]+([-+*][0-9]+)*", call["custom"]["input"]), call
+    choice = ask(client, "Remind me about the dentist on the 3rd of March 2027.", tools=[calc, date],
+                 tool_choice={"type": "custom", "custom": {"name": "remind"}})
+    (call,) = choice["message"]["tool_calls"]
+    assert call["custom"]["name"] == "remind" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", call["custom"]["input"]), call
 
 
 def test_decision(served: tuple) -> None:

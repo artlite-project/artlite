@@ -2,7 +2,8 @@
 llama.cpp's test vectors (``test_tools``) as a toy tokenizer gives them, every valid call in the template's form taken
 and every other refused; each template's form of a call through the model files' tokenizers (where they are here),
 token by token under the mask; random walks under the grammar parsed back into calls their schemas take; the
-``tool_choice`` modes, a response format beside the tools, ``tool_choice`` none's ban; strict tools' errors."""
+``tool_choice`` modes, a response format beside the tools, ``tool_choice`` none's ban; strict tools' errors; custom
+tools' inputs (a Lark grammar, a regex, text)."""
 
 import json
 import os
@@ -16,7 +17,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, spark_gguf
 from models import structured as S
 from models.server import call_grammar as CG
-from models.server.tools import GEMMA4, GLM45, LLAMA3, QWEN_XML, Calls, Syntax, functions
+from models.server.tools import GEMMA4, GLM45, LLAMA3, QWEN_XML, Calls, Syntax, customs, functions
 
 from .test_tools import GEMMA, GLM, LLAMA, QWEN, TOOLS, glm_call, parse, qwen_call
 
@@ -310,3 +311,49 @@ def test_agreement() -> None:
     p = GEMMA4.parser(fns)
     parts = p.parts([("content", gemma)]) + p.flush()
     assert [(c.name, json.loads(c.arguments)) for k, c in parts if k == "tool_call"] == [("m", {"id": "a<tool_call|>b"})]
+
+
+CALC = 'start: expr\nexpr: NUM (OP NUM)*\nNUM: /[0-9]+/\nOP: "+" | "-"\n'
+CUSTOM = [{"type": "custom", "custom": {"name": "calc", "description": "Arithmetic", "format": {
+              "type": "grammar", "grammar": {"syntax": "lark", "definition": CALC}}}},
+          {"type": "custom", "custom": {"name": "code", "format": {
+              "type": "grammar", "grammar": {"syntax": "regex", "definition": "[a-z]{2,4}-[0-9]+"}}}},
+          {"type": "custom", "custom": {"name": "note"}},
+          {"type": "custom", "custom": {"name": "day", "format": {
+              "type": "grammar", "grammar": {"syntax": "regex", "definition": "^[0-9]{4}-[0-9]{2}$"}}}},
+          {"type": "custom", "custom": {"name": "run", "format": {"type": "grammar", "grammar": {
+              "syntax": "lark", "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/\n"}}}}]
+
+
+def custom_call(syntax: Syntax, name: str, text: str) -> str:
+    """A custom tool's call (a function of one string parameter ``input``) as the template writes it."""
+    if syntax is QWEN_XML:
+        return qwen_call(name, input=text)
+    if syntax is GLM45:
+        return glm_call(name, input=text)
+    if syntax is GEMMA4:
+        return f'<|tool_call>call:{name}{{input:<|"|>{text}<|"|>}}<tool_call|>'
+    return json.dumps({"name": name, "parameters": {"input": text}})
+
+
+@pytest.mark.parametrize("syntax", [QWEN_XML, GEMMA4, GLM45, LLAMA3], ids=["qwen", "gemma", "glm", "llama"])
+def test_custom(syntax: Syntax) -> None:
+    """Custom tools: a Lark grammar's input, a regex's (anchored or not), any text, each taken exactly and read back by
+    the parser as written; a grammar whose regex runs over the call's closing text (a catch-all), or any Lark grammar in Llama 3's
+    JSON calls, leaves the input free; a grammar that does not compile: an error that names the tool."""
+    fns = functions(CUSTOM)
+    g = grammar(syntax, fns, custom=customs(CUSTOM))
+    cases = [("calc", "12+3-4", True), ("calc", "12+", syntax is LLAMA3), ("calc", "1 + 2", syntax is LLAMA3),
+             ("code", "ab-12", True), ("code", "a-1", False), ("note", "any\ntext, <b>", True),
+             ("day", "2027-03", True), ("day", "2027-3", False),
+             ("run", "print(1)\nprint(2)", True)]
+    for name, text, good in cases:
+        call = custom_call(syntax, name, text)
+        assert takes(g, TOY.encode(call)) == good, (name, text)
+        if good:
+            _, calls = parse(syntax, call, len(call))
+            assert calls == [(name, {"input": text})], (name, text, calls)
+    bad = [{"type": "custom", "custom": {"name": "calc", "format": {"type": "grammar", "grammar": {
+        "syntax": "lark", "definition": "start: nope\n"}}}}]
+    with pytest.raises(S.ConstraintError, match="custom tool 'calc'"):
+        CG.answer(Calls(syntax, functions(bad), custom=customs(bad)), V)

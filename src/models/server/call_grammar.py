@@ -26,15 +26,28 @@ A Qwen or GLM-4.5 value is the raw text of a parameter whose schema allows only 
 (Qwen's booleans also ``True`` / ``False``: the parser maps them); a Gemma value is its own syntax, numbers, booleans
 and null its JSON. A function's schema compiles exactly when the tool is ``strict`` (a keyword not held: an error that
 names it), else leniently; an object that declares properties takes no others unless ``additionalProperties`` says so
-(extra Qwen / GLM parameters, extra Gemma keys at the end)."""
+(extra Qwen / GLM parameters, extra Gemma keys at the end).
+
+A custom tool (``tools.Custom``) is a function of one string parameter ``input``, written as any string parameter of the
+syntax: its text any text, a regex's match (the parameter's ``pattern``), or a Lark grammar's text (the grammar a
+sub-grammar, ``@name``: OpenAI's grammars are llguidance's Lark; Qwen's closing newline optional where its parser's
+taking it off changes nothing). A grammar's lexemes are greedy and a sub-grammar has no stop text, so one with a lexeme
+that goes on with the input's closing text (``lexemes.ending``: a catch-all such as Codex's ``/[\\s\\S]+/``) would keep
+the call from ever ending: its input is free text there, as in Llama 3's JSON calls (a JSON string holds a regex, not a
+Lark grammar), logged once. OpenAI's calls end with a special token, which no lexeme takes; these syntaxes' closing
+texts are text tokens."""
 
 import json
+import logging
 from typing import Any
 
 import llguidance
 
 from ..structured import Constraint, ConstraintError, Vocab, closed_objects
-from .tools import Calls, GemmaParser, Glm45Parser, QwenParser, _GemmaValue, _types, resolve
+from .lexemes import ending
+from .tools import Calls, Custom, GemmaParser, Glm45Parser, QwenParser, _GemmaValue, _types, resolve
+
+log = logging.getLogger("artlite.server")
 
 ANY = r"(.|\n)*"  # (a regex of any text: a raw string's)
 LEAD = r"/[ \t\r\n]{1,8}/"  # (blanks before an answer's first call or value: a forced opener's gap)
@@ -56,6 +69,7 @@ class Grammar:
     def __init__(self, v: Vocab):
         self.v = v
         self.rules: dict[str, str] = {}
+        self.subs: dict[str, str] = {}  # (sub-grammars by name: custom tools' Lark grammars)
         self._n = 0
 
     def rule(self, body: str, hint: str = "r", *, attrs: str = "") -> str:
@@ -74,6 +88,15 @@ class Grammar:
     def text(self, start: str) -> str:
         return "%llguidance {}\n" + f"start: {start}\n" + "".join(f"{k}: {b}\n" for k, b in self.rules.items())
 
+    def sub(self, lark: str) -> str:
+        """A Lark grammar as a sub-grammar: its reference."""
+        name = f"input_{len(self.subs)}"
+        self.subs[name] = lark
+        return f"@{name}"
+
+    def constraint(self, start: str) -> Constraint:
+        return Constraint("lark", self.text(start), name="tools", subs=tuple(self.subs.items()))
+
 
 def _ref(root: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
     """A local ``$ref``'s target in the function's parameters (as the parser types it: ``tools.resolve``)."""
@@ -88,13 +111,37 @@ def _with_defs(root: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
 
 
 class Tool:
-    """A function's call grammar under construction: ``g``, its name, its ``parameters`` (``root``), ``strict``."""
+    """A function's call grammar under construction: ``g``, its name, its ``parameters`` (``root``), ``strict``; a
+    custom tool's (``custom``): its input's grammar ``sub`` (a Lark grammar's reference), or its pattern in ``root``."""
 
-    def __init__(self, g: Grammar, fn: dict[str, Any], strict: bool):
-        self.g, self.name, self.strict = g, fn["name"], strict
+    def __init__(self, g: Grammar, fn: dict[str, Any], strict: bool, custom: Custom | None = None, *,
+                 end: str | None = None):
+        self.g, self.name, self.strict, self.sub = g, fn["name"], strict or custom is not None, None
+        self.newline = False  # (a sub-grammar's input: Qwen's closing newline optional, ``lexemes.Ending``)
         params = fn.get("parameters")
         self.root = params if isinstance(params, dict) else {}
-        self.json = Constraint("json_schema", "{}", strict=strict, name=self.name)
+        if custom is not None:
+            value: dict[str, Any] = {"type": "string"}
+            rx = _unanchored(custom.definition) if custom.syntax == "regex" else ""
+            if custom.syntax != "text":  # (a regex as the call holds it: text before and after it)
+                msg = _check_grammar(custom.definition if custom.syntax == "lark" else
+                                     llguidance.LLMatcher.grammar_from_regex(f"a(?:{rx})a"))
+                if msg is not None:
+                    raise ConstraintError(f"custom tool {self.name!r}: its {custom.syntax} grammar: {msg}")
+            if custom.syntax == "regex":
+                value["pattern"] = f"^(?:{rx})$"
+            elif custom.syntax == "lark":
+                e = ending(custom.definition, end) if end is not None else None
+                if e is not None and e.over is None:
+                    self.sub, self.newline = g.sub(custom.definition), e.newline
+                elif (self.name, custom.definition, end) not in _warned:  # (free text: the call can end)
+                    _warned.add((self.name, custom.definition, end))
+                    why = "a JSON string cannot hold a Lark grammar" if e is None else \
+                        f"its grammar's {e.over} can go on with the call's closing text {end!r}"
+                    log.warning("custom tool %r: %s: its input is free text in this template's calls", self.name, why)
+            self.root = {"type": "object", "properties": {"input": value}, "required": ["input"],
+                         "additionalProperties": False}
+        self.json = Constraint("json_schema", "{}", strict=self.strict, name=self.name)
 
     def unheld(self, schema: dict[str, Any], held: set[str], where: str) -> None:
         """A strict tool's schema keyword this syntax does not hold: an error that names it."""
@@ -147,6 +194,9 @@ class Tool:
         return ANY
 
 
+_warned: set[tuple[str, str, str]] = set()
+
+
 def _escape(text: str) -> str:
     """A text as a regex of itself (Lark's ``/.../``)."""
     out = []
@@ -165,10 +215,22 @@ def _escape(text: str) -> str:
 def _check(schema: dict[str, Any]) -> str | None:
     """llguidance's error of a JSON schema alone (its own message), or None."""
     try:
-        error, messages = llguidance.LLMatcher.validate_grammar_with_warnings(
-            llguidance.LLMatcher.grammar_from_json_schema(schema))
+        return _check_grammar(llguidance.LLMatcher.grammar_from_json_schema(schema))
     except ValueError as e:
         return str(e)
+
+
+def _unanchored(rx: str) -> str:
+    """A custom tool's regex without the ``^`` and ``$`` around it (the whole input matches it anyway)."""
+    rx = rx.removeprefix("^")
+    if rx.endswith("$") and (len(rx) - 1 - len(rx[:-1].rstrip("\\"))) % 2 == 0:  # (an even run of \\: not \\$)
+        rx = rx[:-1]
+    return rx
+
+
+def _check_grammar(grammar: str) -> str | None:
+    """llguidance's error of a grammar alone (its own message), or None."""
+    error, messages = llguidance.LLMatcher.validate_grammar_with_warnings(grammar)
     return messages[0].removesuffix("<non-verbose/>").strip() if error else None
 
 
@@ -180,6 +242,8 @@ def _check(schema: dict[str, Any]) -> str | None:
 def _qwen_value(t: Tool, k: str, schema: dict[str, Any]) -> str:
     """A Qwen parameter after ``<parameter=K>\\n``: its value, ``\\n</parameter>\\n``."""
     g, end = t.g, "\n" + QwenParser.END
+    if t.sub is not None:  # (the newline optional where a lexeme of the input may take it: ``lexemes``)
+        return f'{t.sub} "\\n"{"?" if t.newline else ""} {lit(QwenParser.END + chr(10))}'
     raw = t.raw_string(schema)
     if raw is not None:
         v = g.rule(f"/{raw}{_escape(end)}/", "v", attrs="[lazy]")
@@ -212,6 +276,8 @@ def _glm_call(t: Tool) -> str:
     props, extra = t.properties()
 
     def value(schema: dict[str, Any]) -> str:
+        if t.sub is not None:
+            return f"{t.sub} {g.token(P.VALUE_END)}"
         raw = t.raw_string(schema)
         if raw is None:
             return f"{t.json_value(schema)} {g.token(P.VALUE_END)}"
@@ -286,7 +352,7 @@ class _Gemma:
         if isinstance(kind, list):
             return "(" + " | ".join(self.value({**schema, "type": k}) for k in kind) + ")"
         if kind == "string":
-            return self.string(t.raw_string(schema))
+            return f"{self.q} {t.sub} {self.q}" if t.sub is not None else self.string(t.raw_string(schema))
         if kind in ("integer", "number", "boolean", "null"):
             return t.json_value(schema)
         if kind == "array" or "items" in schema:
@@ -379,9 +445,11 @@ def answer(calls: Calls, v: Vocab, response: Constraint | None = None) -> Constr
     if not fns:
         raise ConstraintError("no function to call")
     llama = syntax.parser_class.__name__ == "LlamaParser"
+    end = {"QwenParser": "\n" + QwenParser.END, "Glm45Parser": Glm45Parser.VALUE_END,
+           "GemmaParser": _GemmaValue.Q}.get(syntax.parser_class.__name__)  # (a string value's closing text)
     bodies = []
     for fn in fns:
-        t = Tool(g, fn, fn["name"] in calls.strict)
+        t = Tool(g, fn, fn["name"] in calls.strict, calls.custom.get(fn["name"]), end=end)
         body = {"QwenParser": _qwen_call, "Glm45Parser": _glm_call, "GemmaParser": _gemma_call,
                 "LlamaParser": _llama_call}[syntax.parser_class.__name__](t)
         bodies.append(g.rule(body, "fn"))
@@ -398,22 +466,22 @@ def answer(calls: Calls, v: Vocab, response: Constraint | None = None) -> Constr
     sep = LLAMA_SEP if llama else SEP
     calls_rule = g.rule(f"{call} ({sep}? {call})*" if calls.parallel else call, "calls")
     if response is not None and calls.choice == "auto":
-        return Constraint("lark", g.text(f"{LEAD}? ({calls_rule} | {response_value(response)})"), name="tools")
+        return g.constraint(f"{LEAD}? ({calls_rule} | {response_value(response)})")
     if calls.choice != "auto":
-        return Constraint("lark", g.text(f"{LEAD}? {calls_rule}"), name="tools")
+        return g.constraint(f"{LEAD}? {calls_rule}")
     if llama:
         text = g.rule(r"/[^ \t\r\n{](.|\n)*/", "text")
-        return Constraint("lark", g.text(f"{LEAD}? ({calls_rule} | {text})?"), name="tools")
+        return g.constraint(f"{LEAD}? ({calls_rule} | {text})?")
     if opener is not None:  # (free text: any token but the opener and the end of the turn)
         free = g.rule("<[^" + ",".join(str(i) for i in sorted({opener, *v.eos})) + "]>*", "free")
         rest = f"({call} {free})*" if calls.parallel else f"{call}?"
-        return Constraint("lark", g.text(f"{free} {rest}"), name="tools")
+        return g.constraint(f"{free} {rest}")
     # (an opener that is text: free text up to it, lazily; the text after the last call cannot hold one)
     trig = g.rule(f"/{ANY}{_escape(P.OPEN)}/", "trig", attrs="[lazy]")
     seg = g.rule(f"{trig} {after}", "seg")
     g.rules["TAIL"] = f"/(.|\\n)+/ & ~/{ANY}{_escape(P.OPEN)}{ANY}/"
     rest = f"{seg}* TAIL?" if calls.parallel else f"({seg} | TAIL)?"
-    return Constraint("lark", g.text(rest), name="tools")
+    return g.constraint(rest)
 
 
 def response_value(response: Constraint) -> str:

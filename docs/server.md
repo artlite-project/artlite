@@ -57,16 +57,105 @@ llama-server takes them (`/props`' `modalities.video`); and a chat's `modalities
 Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
-writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its
-arguments) with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8,
-MiniCPM-V 4.7, Occamy and LFM3 (Qwen's XML calls), Gemma 4 and Llama 3.1 / 3.2 have them; a template without tools (Llama
-3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt, nothing is
-parsed), `required` and a named function (the answer begins with the call, after the model's thought; a named
-function's call is the only one), and `parallel_tool_calls: false` ends the answer after its first call. A call's
-name is always one of the request's functions: while the model writes it, only the tokens that spell one can come
-(with `required` where no function fits, the model calls the closest one instead of inventing a name). The arguments
-are not constrained by a grammar: a call the model writes malformed stays text, and a string argument whose schema
-allows no string becomes the value it encodes (Llama 3.1 quotes numbers and lists).
+writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its arguments)
+with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7,
+Occamy and LFM3 (Qwen's XML calls), Gemma 4, Spark-X (GLM-4.5's calls) and Llama 3.1 / 3.2 have them; a template without
+tools (Llama 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt; a
+call's opener of one token, Qwen's, Gemma's, GLM-4.5's, is never sampled, and a call Llama 3 writes stays text),
+`required`, a named function (the answer begins with the call, after the model's thought; a
+named function's call is the only one) and `allowed_tools` (the calls are of its tools, the prompt keeps them all), and
+`parallel_tool_calls: false` ends the answer after its first call. A grammar in the template's own call syntax holds the
+calls to the tools: a call's name is one of the functions' (with `required` where no function fits, the model calls the
+closest one instead of inventing a name), its arguments follow the function's `parameters` (types, enums, required and
+nested properties; an object that lists its properties takes no others unless `additionalProperties` says so), so every
+call parses; the text around the calls stays free, and with a `response_format` beside the tools the answer is a call or
+that JSON. A tool with `strict: true` is held exactly: a keyword its call syntax cannot hold (`format`, `uniqueItems`,
+...) is a 400 that names it; without, such a keyword is not enforced. OpenAI's custom tools take text in a grammar's
+form: [Custom tools](#custom-tools).
+
+## Structured output
+
+Every route that generates holds its answer to a JSON schema, a grammar, a regular expression or a list of texts
+when the request asks for one: as the model writes, only the tokens that keep the answer valid can come
+([llguidance](https://github.com/guidance-ai/llguidance) masks the others), so the answer parses; the schema does not
+go into the prompt. A model that thinks first thinks freely, and the constraint holds the answer after the thought.
+
+| field | API |
+|---|---|
+| `response_format`: `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}` (or `"schema"` beside `"type"`), `{"type": "json_object"}` (any JSON object, or its `"schema"`) | OpenAI's chat completions, llama-server's |
+| `json_schema` (`{}`: any JSON object), `grammar` (GBNF, or Lark when it starts with `%llguidance`) | llama-server's chat and completions |
+| `structured_outputs` (one of `json`, `regex`, `choice`, `grammar`, `json_object`, `structural_tag`, with `whitespace_pattern`, `disable_any_whitespace`, `disable_additional_properties`), `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `response_format` `structural_tag` | vLLM's |
+| `text.format` (`json_schema`, `json_object`) | OpenAI's Responses API |
+| `output_config.format` (`json_schema`; its deprecated spelling `output_format`) | Anthropic's Messages API |
+
+`--grammar`, `--grammar-file`, `-j` / `--json-schema` and `-jf` / `--json-schema-file` hold every answer whose request
+asks for no constraint of its own, as llama-server's options do ([artlite-cli](cli.md#text) takes them too); beside a
+request's tools a JSON schema is the answer that is no call, and a grammar does not apply (logged once). The
+openai SDK's `chat.completions.parse` and `responses.parse` and the anthropic SDK's `messages.parse` work with their
+pydantic models.
+
+A JSON answer:
+
+- its keys come in the schema's order; an object that lists its `properties` takes no others unless its
+  `additionalProperties` says so (llama.cpp's rule; an object that `allOf` or another subschema extends stays open);
+- up to 8 blanks before the value, between its tokens a space or a newline and indentation (llama.cpp's), none after
+  it, no Markdown fence; a run of digits outside strings is 16 digits at most;
+- a schema is held exactly when strict (OpenAI's `json_schema` unless `"strict": false`, Anthropic's always): a
+  keyword llguidance does not implement is a 400 that names it; otherwise (llama-server's `json_schema`, vLLM's) that
+  keyword is logged once and not enforced;
+- a schema has 2 MiB, 5000 properties, 1000 `enum` and `const` values and 256 levels at most.
+
+Once the answer is complete, only the end of the turn can come (`finish_reason: stop`); `max_tokens` can still cut it
+(`length`). Two constraints in one request are a 400 ("Cannot use both json_schema and grammar"), as are a grammar or
+schema that does not compile (llguidance's message, after the field's name; on `/v1/messages` in Anthropic's error
+shape) and tools beside a grammar, a regex or choices (a JSON schema can go with them). `logprobs` are the model's
+before the mask (a token the grammar forbids can be among the top ones), `post_sampling_probs` the sampler's after it.
+Should the model's text and the grammar part ways (a forced call out of step), the answer goes on unconstrained, with a
+log line.
+
+Holding an answer costs little: the next mask is computed while the NPU runs a step (a step takes 0-2% longer), and
+the tokens the grammar forces (a JSON answer's keys and punctuation) go into the step as draft tokens it keeps, so
+MiniCPM-V 4.7 writes a 400-token JSON list in 360 steps instead of 399. Drafters (MTP, DSpark, the prompt's draft
+tokens) guess within the grammar; a greedy generation with them writes the same text as without.
+
+### Custom tools
+
+OpenAI's custom tools take text instead of JSON arguments: `{"type": "custom", "custom": {"name", "description",
+"format"}}` in chat completions, `{"type": "custom", "name", "description", "format"}` in the Responses API, the
+format `{"type": "text"}` (any text, the default) or a grammar, `{"type": "grammar", "grammar": {"syntax": "lark" or
+"regex", "definition"}}` (Responses: `"syntax"` and `"definition"` in the format); `tool_choice`
+`{"type": "custom", "custom": {"name"}}` (Responses: `{"type": "custom", "name"}`) calls one. The template sees a
+function of one string parameter `input`, and the grammar holds the call's input (OpenAI's Lark is llguidance's); a
+call comes back as `{"type": "custom", "custom": {"name", "input"}}` (streamed: `delta.tool_calls[].custom.input`),
+in the Responses API as a `custom_tool_call` item (`response.custom_tool_call_input.delta` and `.done`), and goes back
+in the history the same way, its result as a tool message (Responses: a `custom_tool_call_output` item). A regex
+matches the whole input (`^` and `$` around it change nothing). llguidance's lexemes are greedy, so a Lark grammar
+with a lexeme (a terminal, a literal, a regex in a rule) that can go on, after a complete match, with the text that
+closes the template's call, or whose lexemes after the input spell part of that text, would never let the call end: a
+catch-all such as `/[\s\S]+/` (Codex's code tool), a terminal of several lines before Qwen's `</parameter>`, a line's
+`/(.+)/` that may end the input before Gemma 4's and Spark-X's closing tags, a `"</"` that may follow it before
+Spark-X's (Codex's `apply_patch` is held in all of them). There, in a grammar the server cannot analyse (llguidance's
+`&`, `%regex` or inline grammars, a lexeme that may match nothing beside `%ignore`), and in Llama 3's calls (JSON, whose
+strings hold a regex but not a grammar), the input is any text, with a log line.
+
+### Options and their probabilities
+
+A chat request whose `response_format` (or `json_schema`) is a few options, with `logprobs: true`, gets each option's
+probability instead of a generation, on any chat model: an `enum`, a `oneOf` / `anyOf` of `const` values, a
+`{"type": "boolean"}`, or an object of one required property of those (2 to 64 options). `message.content` is the
+most likely option as JSON in the schema's shape, and `logprobs.content[0].top_logprobs` has one entry per option
+(`token`: a string option as it is, another as JSON; `logprob`: the log of its probability; the probabilities sum
+to 1), as Halogen's
+decisions read them. An option's probability is that of its text as the model's next tokens, then the end of the turn:
+the prompt runs, then a decode step from a checkpoint for each token several options share (the opening quote, a
+common first word); nothing is generated. A model whose template opened a thought, and a request with tools, generate
+as any request.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages": [{"role": "user",
+  "content": "Classify the sentiment: the worst purchase I ever made."}], "logprobs": true, "response_format":
+  {"type": "json_schema", "json_schema": {"name": "s", "schema": {"enum": ["positive", "negative", "neutral"]}}}}'
+```
 
 ## Chat template
 
@@ -127,11 +216,13 @@ thinks can take longer):
 ```
 
 - Messages API: `system`, the blocks `text`, `image` (base64), `thinking`, `tool_use` and `tool_result`, `tools`,
-  `tool_choice`, `stop_sequences`, and Anthropic's event stream. `thinking` turns the model's thought on (`enabled`,
+  `tool_choice`, tools' `strict`, `output_config.format` ([Structured output](#structured-output)), `stop_sequences`,
+  and Anthropic's event stream. `thinking` turns the model's thought on (`enabled`,
   `adaptive`) or off (`disabled`; without it, `-rea` decides); its budget is not enforced. A prompt longer than the
   context answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
-- Responses API: `instructions`, the items `message`, `reasoning`, `function_call` and `function_call_output`,
-  function tools (others, such as `web_search`, are left out), `tool_choice`, `reasoning.effort` (`none`: no
+- Responses API: `instructions`, the items `message`, `reasoning`, `function_call`, `function_call_output`,
+  `custom_tool_call` and `custom_tool_call_output`, function and [custom](#custom-tools) tools (others, such as
+  `web_search`, are left out), `tool_choice`, `text.format`, `reasoning.effort` (`none`: no
   thought; another: a thought, and the template's `reasoning_effort`: [above](#chat-template)), `max_output_tokens`,
   and OpenAI's event stream. `previous_response_id` continues one of the last 1024
   responses the server keeps (not those with `store: false`); `GET` and `DELETE /v1/responses/{id}` read and drop
@@ -195,6 +286,9 @@ within a cosine of 0.994-0.999 of llama.cpp's CPU result (its CPU and Vulkan bui
 0.999) and a rerank score within 0.18. Model pages: [Qwen3](models/qwen3.md).
 
 ## Decisions
+
+Any chat model also gives the probabilities of a few options, as a chat request: [Structured
+output](#options-and-their-probabilities).
 
 A decision model (a GGUF file with `{arch}.decision.*` metadata and a `systemone` template) answers `/v1/systemone`
 as llama-server does (TypeSafe's System One API): a `state` (text, a JSON value or chat messages) and `questions`, each
@@ -491,6 +585,8 @@ Generation:
 | `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
 | `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
+| `--grammar GRAMMAR`, `--grammar-file FILE` | a GBNF grammar (Lark after `%llguidance`) that the answers follow where a request asks for no constraint of its own and has no tools ([Structured output](#structured-output)) |
+| `-j SCHEMA`, `--json-schema`; `-jf FILE`, `--json-schema-file` | a JSON schema the same (`{}`: any JSON object); beside a request's tools, the answer that is no call |
 
 NPU:
 

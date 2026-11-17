@@ -13,13 +13,19 @@ from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_ggu
 from models.server.tools import (
     GEMMA4,
     GLM45,
+    INPUT,
     LLAMA3,
     QWEN_XML,
+    Custom,
+    InputStream,
     Syntax,
     ToolCall,
     call_arguments,
+    custom_input,
+    customs,
     functions,
     syntax_of,
+    tool_name,
     typed,
 )
 
@@ -351,3 +357,33 @@ def test_model_templates(family: str) -> None:
                  "content": "09:30."}, {"role": "user", "content": "And Rome?"}]
         kept = [("Oslo's clock." in chat_prompt(g, later, tools=fns, preserve_thinking=p)) for p in (False, True)]
         assert kept == [False, family != "minicpmv"]
+
+
+def test_custom_tools() -> None:
+    """Custom tools as the templates take them (a function of one string parameter ``input``) and their formats; a
+    custom call in the history as a function's; a call's input streamed from its arguments' JSON text, whatever the
+    fragments (escapes and surrogate pairs cut anywhere), and whole."""
+    tools = [{"type": "custom", "custom": {"name": "calc", "description": "Math", "format": {
+        "type": "grammar", "grammar": {"syntax": "lark", "definition": "start: /[0-9]+/"}}}},
+             {"type": "custom", "custom": {"name": "note"}}, tool("get_time")]
+    assert functions(tools)[0] == {"type": "function", "function": {"name": "calc", "description": "Math",
+                                                                    "parameters": INPUT}}
+    assert customs(tools) == {"calc": Custom("lark", "start: /[0-9]+/"), "note": Custom()}
+    assert tool_name({"type": "custom", "custom": {"name": "calc"}}) == "calc" == \
+        tool_name({"type": "function", "function": {"name": "calc"}})
+    for bad in ({"type": "custom", "custom": {}}, {"type": "custom", "custom": {"name": "x", "format": {
+            "type": "grammar", "grammar": {"syntax": "gbnf", "definition": "root ::= x"}}}}):
+        with pytest.raises(ValueError, match="custom tool"):
+            functions([bad])
+    msg = call_arguments({"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "custom", "custom": {"name": "calc", "input": "1+2"}}]})
+    assert msg["tool_calls"] == [{"id": "c1", "type": "function", "function": {"name": "calc",
+                                                                               "arguments": {"input": "1+2"}}}]
+    text = 'a "b" \\ c\né\x01 😀 end'
+    args = json.dumps({"input": text})
+    for step in (1, 2, 3, 7):
+        s = InputStream()
+        got = "".join(s.feed(args[i:i + step]) for i in range(0, len(args), step))
+        assert got == text, step
+    assert custom_input(json.dumps({"input": text}, ensure_ascii=False)) == text
+    assert custom_input("not json") == "not json"

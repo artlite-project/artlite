@@ -1,5 +1,5 @@
 """OpenAI's chat completions (llama-server's shapes): ``/v1/chat/completions``, streamed (``ChatFormat``) or not, with
-``reasoning_content``, tool calls, ``logprobs``, ``timings``, ``prompt_progress`` and ``usage``; a request with audio
+``reasoning_content``, tool calls (a custom tool's: its input), ``logprobs``, ``timings``, ``prompt_progress`` and ``usage``; a request with audio
 output goes to ``speech.chat_audio``, one whose answer is one of a few options with ``logprobs`` to ``answers`` (their
 probabilities: ``decide``)."""
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from typing import Any
 
 from fastapi import APIRouter, Header, Request
@@ -23,22 +23,36 @@ from .jobs import timings
 from .schemas import ChatRequest, Message
 from .speech import chat_audio
 from .streaming import Format, collect, stream_response, usage
-from .tools import ToolCall
+from .tools import InputStream, ToolCall, custom_input, customs
 
 
-def call_delta(c: ToolCall) -> dict[str, Any]:
-    """A tool call's part as a streamed ``delta.tool_calls`` entry (its first part: id, type and name)."""
-    if c.id is None:
-        return {"index": c.index, "function": {"arguments": c.arguments}}
-    return {"index": c.index, "id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}
+def call_message(c: ToolCall, arguments: str, custom: Collection[str]) -> dict[str, Any]:
+    """A complete tool call as a message's ``tool_calls`` entry (a custom tool's: its input)."""
+    if c.name in custom:
+        return {"id": c.id, "type": "custom", "custom": {"name": c.name, "input": custom_input(arguments)}}
+    return {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": arguments}}
 
 
 class ChatFormat(Format):
     """A chat completion's chunks (``head``: the fields every chunk has; ``timings``: ``timings_per_token``;
-    ``include_usage``: ``stream_options``'s)."""
+    ``include_usage``: ``stream_options``'s; ``custom``: the custom tools' names, whose calls stream their input)."""
 
-    def __init__(self, head: dict[str, Any], *, timings: bool, include_usage: bool):
-        self.head, self.timings, self.include_usage = head, timings, include_usage
+    def __init__(self, head: dict[str, Any], *, timings: bool, include_usage: bool, custom: Collection[str] = ()):
+        self.head, self.timings, self.include_usage, self.custom = head, timings, include_usage, custom
+        self.inputs: dict[int, InputStream] = {}  # (the custom calls' inputs by index)
+
+    def call_delta(self, c: ToolCall) -> dict[str, Any]:
+        """A tool call's part as a streamed ``delta.tool_calls`` entry (its first part: id, type and name)."""
+        if c.id is not None and c.name in self.custom:
+            self.inputs[c.index] = InputStream()
+        if c.index in self.inputs:
+            out = {"index": c.index, "custom": {"input": self.inputs[c.index].feed(c.arguments)}}
+            return out if c.id is None else {**out, "id": c.id, "type": "custom",
+                                              "custom": {"name": c.name, **out["custom"]}}
+        if c.id is None:
+            return {"index": c.index, "function": {"arguments": c.arguments}}
+        return {"index": c.index, "id": c.id, "type": "function", "function": {"name": c.name,
+                                                                                "arguments": c.arguments}}
 
     def chunk(self, delta: dict[str, Any], finish: str | None = None, probs: list | None = None, **extra: object
               ) -> dict[str, Any]:
@@ -57,7 +71,7 @@ class ChatFormat(Format):
         parts, out = data["parts"], []
         for i, (k, v) in enumerate(parts):
             last = i == len(parts) - 1
-            out.append(sse(self.chunk({"tool_calls": [call_delta(v)]} if k == "tool_call" else {k: v},
+            out.append(sse(self.chunk({"tool_calls": [self.call_delta(v)]} if k == "tool_call" else {k: v},
                                       probs=data.get("probs") if last else None,
                                       **({"timings": data["timings"]} if last and self.timings else {}))))
         return out
@@ -128,10 +142,10 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
             return decision if not req.stream else StreamingResponse(decision_events(decision),
                                                                      media_type="text/event-stream")
         j, events = await ctx.start(req, conv_id=x_conversation_id)
+        custom = customs(req.tools).keys()  # (checked: ``start``)
         if not req.stream:
             blocks, done = await collect(j, events, request)
-            calls = [{"id": b.call.id, "type": "function", "function": {"name": b.call.name, "arguments": b.text}}
-                     for b in blocks.complete(done["n_calls"]) if b.kind == "call"]
+            calls = [call_message(b.call, b.text, custom) for b in blocks.complete(done["n_calls"]) if b.kind == "call"]
             message = {"role": "assistant", "content": blocks.text("text") or (None if calls else "")}
             if blocks.text("thinking"):
                 message["reasoning_content"] = blocks.text("thinking")
@@ -143,5 +157,5 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
             return {"choices": [choice], **head, "object": "chat.completion", "usage": usage(done),
                     "timings": done["timings"]}
         fmt = ChatFormat(head, timings=bool(req.timings_per_token),
-                         include_usage=bool((req.stream_options or {}).get("include_usage")))
+                         include_usage=bool((req.stream_options or {}).get("include_usage")), custom=custom)
         return await stream_response(j, events, ctx.ping_of(req), fmt)

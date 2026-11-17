@@ -43,6 +43,8 @@ speeds go to stderr.
 | `--repeat-last-n N` | the tokens the penalties look back at (default: the model's, 64; 0: none) |
 | `--presence-penalty X`, `--frequency-penalty X` | subtract X, or X times their count, from those tokens' logits (default: the model's, 0) |
 | `--greedy` | always the most likely token |
+| `--grammar GRAMMAR`, `--grammar-file FILE` | the answer follows a GBNF grammar (Lark after `%llguidance`; llama.cpp's `grammars/README.md`), after the model's thought |
+| `-j SCHEMA`, `--json-schema`; `-jf FILE`, `--json-schema-file` | the answer is JSON of the schema (`{}`: any JSON object), held as [artlite-server](server.md#structured-output) holds it |
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |

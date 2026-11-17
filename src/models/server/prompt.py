@@ -25,7 +25,7 @@ from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
 from .schemas import ROLES, ChatRequest, Message
-from .tools import Calls, call_arguments, functions
+from .tools import Calls, call_arguments, customs, functions, tool_name
 
 if TYPE_CHECKING:
     from .context import ApiContext
@@ -240,13 +240,13 @@ class PromptBuilder:
 
     def calls_of(self, req: ChatRequest) -> tuple[list[dict[str, Any]], Calls | None]:
         """A request's functions for the template and how to read its answer's calls (None: as text: no tools, or
-        ``tool_choice`` none). ``tool_choice`` required or a named function: the answer begins with a call (its opener
-        forced; a named function's call alone); ``allowed_tools``: the calls are of its functions (the prompt keeps
+        ``tool_choice`` none). ``tool_choice`` required or a named function (or custom tool): the answer begins with a
+        call (its opener forced; a named function's call alone); ``allowed_tools``: the calls are of its functions (the prompt keeps
         them all, its cached prefix too), required or not. A template that takes no tools: they are ignored (the web
         UI sends its own)."""
         syntax = self.ctx.syntax
         try:
-            fns = functions(req.tools)
+            fns, custom = functions(req.tools), customs(req.tools)
         except ValueError as e:
             raise bad_request(str(e)) from None
         choice = "auto" if req.tool_choice is None else req.tool_choice
@@ -256,17 +256,18 @@ class PromptBuilder:
             mode, listed = spec.get("mode", "auto"), spec.get("tools")
             if mode not in ("auto", "required") or not isinstance(listed, list):
                 raise bad_request('tool_choice allowed_tools: {"mode": "auto" or "required", "tools": [...]}')
-            allowed = {(t.get("function") or {}).get("name") for t in listed if isinstance(t, dict)}
+            allowed = {tool_name(t) for t in listed if isinstance(t, dict)}
             if unknown := allowed - {f["function"]["name"] for f in fns}:
                 raise bad_request(f"tool_choice allowed_tools names {sorted(map(str, unknown))}, not among the tools")
             if not allowed and mode == "required":
                 raise bad_request("tool_choice allowed_tools: required, of no tool")
             choice = mode if allowed else "none"  # (none allowed: no call, as none)
         if isinstance(choice, dict):
-            name = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
+            name = tool_name(choice) if choice.get("type") in ("function", "custom") else None
             if not isinstance(name, str):
                 raise bad_request('tool_choice: "auto", "none", "required", {"type": "function", "function": '
-                                  '{"name": ...}} or {"type": "allowed_tools", ...}')
+                                  '{"name": ...}}, {"type": "custom", "custom": {"name": ...}} or '
+                                  '{"type": "allowed_tools", ...}')
             if name not in {f["function"]["name"] for f in fns}:
                 raise bad_request(f"tool_choice names {name!r}, not one of the tools")
         elif choice not in ("auto", "none", "required"):
@@ -287,7 +288,7 @@ class PromptBuilder:
         strict = frozenset(t["function"]["name"] for t in req.tools or [] if isinstance(t, dict) and
                            isinstance(t.get("function"), dict) and t["function"].get("strict") is True)
         return fns, Calls(syntax, callable_, parallel=parallel, force=force,
-                          choice="auto" if force is None else "required", name=name, strict=strict)
+                          choice="auto" if force is None else "required", name=name, strict=strict, custom=custom)
 
     async def counted(self, req: ChatRequest) -> int:
         """The prompt tokens of a chat request."""

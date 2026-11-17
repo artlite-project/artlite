@@ -33,6 +33,9 @@ device rather than for portability.
   they apply.
 - **A local model for coding agents.** Claude Code, Codex and opencode work against `artlite-server`, with tool calls
   and a prompt cache, so each turn reads only what is new ([Agents](docs/server.md#agents)).
+- **Answers that parse.** JSON schemas, grammars and tool calls hold what the model writes, in every API's spelling
+  (OpenAI's, Anthropic's, llama-server's, vLLM's), about as fast as free text ([Structured
+  output](docs/server.md#structured-output)).
 - **Speech in and out.** LFM3-Audio transcribes audio files and live audio (`/v1/audio/transcriptions`, OpenAI's
   realtime transcription) with llama.cpp's accuracy, at two thirds of the iGPU's energy and a third of the CPU's,
   live with the NPU busy a sixth of the time; it speaks text (`/tts`, `/v1/audio/speech`) and answers in voice

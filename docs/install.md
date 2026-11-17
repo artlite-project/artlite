@@ -22,7 +22,8 @@ from the file a window at a time, and the tools' load line ends with both figure
 | Python 3.12 to 3.14 (the toolchain wheels' versions), [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
 | FFmpeg (optional) | videos in prompts ([LFM3-VL, LFM3-Omni](models/lfm3.md#videos)): `ffmpeg` and `ffprobe` on PATH read their frames and soundtrack, with llama.cpp's commands (llama.cpp's video input needs them too); without them a video is an error that names them |
 
-`uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed.
+`uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed. llguidance
+(structured output) comes as a wheel for Linux and Windows: no Rust toolchain.
 
 If `ulimit -l` prints a number, not `unlimited`, raise the limit (Artlite raises its own up to the hard limit, which
 only root can raise), then log in again:

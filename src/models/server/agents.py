@@ -12,6 +12,8 @@ Where the conversions differ from llama-server's:
 - structured output: a Responses request's ``text.format`` and an Anthropic one's ``output_config.format`` (or its
   deprecated ``output_format``: always exact) become the chat body's ``response_format`` (``constraints``); function
   tools keep their ``strict``; a Responses ``tool_choice`` ``allowed_tools`` becomes the chat API's;
+- a Responses custom tool (its input text, or a Lark or regex grammar's) becomes the chat API's, its calls
+  ``custom_tool_call`` items, their input streamed (``response.custom_tool_call_input.delta``);
 - Anthropic's ``tool_choice`` ``tool`` names its function, ``none`` and ``disable_parallel_tool_use`` apply;
   ``thinking`` ``enabled`` and ``adaptive`` turn the model's thought on, ``disabled`` off (absent: the server's
   ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off; another level: the template's
@@ -21,7 +23,8 @@ Where the conversions differ from llama-server's:
   hash are fixed, the workload dropped, so the system prompt's tokens stay a cached prefix;
 - a Responses request may continue a stored response (``previous_response_id``, ``Store``; llama-server refuses
   it); a reasoning item without content gives its summary, an assistant message needs no ``type``;
-- tools other than functions (Anthropic's server tools, Codex's ``namespace`` and ``web_search``) are left out.
+- tools other than functions and custom tools (Anthropic's server tools, Codex's ``namespace`` and ``web_search``)
+  are left out.
 
 The streams follow the APIs' own: Anthropic's closes each block before the next opens (``signature_delta`` before a
 thought's stop) and stops for a stop string with ``stop_sequence``; the Responses stream numbers its events and
@@ -40,7 +43,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .ids import alnum_id, hex_id
-from .tools import Part, ToolCall
+from .tools import InputStream, Part, ToolCall, custom_input
 
 Note = Callable[[str], None]  # a field the conversion ignores: logged once
 
@@ -409,7 +412,14 @@ def responses_messages(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 prev.setdefault("tool_calls", []).append(call)
             else:
                 out.append({"role": "assistant", "content": [], "tool_calls": [call]})
-        elif kind == "function_call_output":
+        elif kind == "custom_tool_call":
+            call = {"id": str(item.get("call_id", "")), "type": "custom",
+                    "custom": {"name": str(item.get("name", "")), "input": str(item.get("input") or "")}}
+            if prev is not None:
+                prev.setdefault("tool_calls", []).append(call)
+            else:
+                out.append({"role": "assistant", "content": [], "tool_calls": [call]})
+        elif kind in ("function_call_output", "custom_tool_call_output"):
             output = item.get("output")
             out.append({"role": "tool", "tool_call_id": str(item.get("call_id", "")),
                         "content": output if isinstance(output, str) else content_parts(output)})
@@ -438,6 +448,13 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
     out: dict[str, Any] = {"messages": messages}
     tools = []
     for t in body.get("tools") or []:
+        if isinstance(t, dict) and t.get("type") == "custom":  # (the chat API's spelling: its grammar nested)
+            fmt = t.get("format")
+            if isinstance(fmt, dict) and fmt.get("type") == "grammar":
+                fmt = {"type": "grammar", "grammar": {k: fmt.get(k) for k in ("syntax", "definition")}}
+            tools.append({"type": "custom", "custom": {k: v for k, v in (("name", t.get("name")), (
+                "description", t.get("description")), ("format", fmt)) if v is not None}})
+            continue
         if not isinstance(t, dict) or t.get("type") != "function":
             note(f"tools of type {t.get('type') if isinstance(t, dict) else t!r}")
             continue
@@ -445,17 +462,23 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
     if tools:
         out["tools"] = tools
     choice = body.get("tool_choice")
+
+    def named(t: object) -> object:
+        """A Responses tool choice of a function or custom tool in the chat API's spelling."""
+        if isinstance(t, dict) and t.get("type") in ("function", "custom"):
+            return {"type": t["type"], t["type"]: {"name": t.get("name")}}
+        return t
+
     if isinstance(choice, dict):
         kind = choice.get("type")
-        if kind == "function":
-            out["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
+        if kind in ("function", "custom"):
+            out["tool_choice"] = named(choice)
         elif kind == "allowed_tools":  # (the chat API's spelling: its list in an object of its own)
-            allowed = [{"type": "function", "function": {"name": t.get("name")}} if isinstance(t, dict) and
-                       t.get("type") == "function" else t for t in choice.get("tools") or []]
-            out["tool_choice"] = {"type": "allowed_tools",
-                                  "allowed_tools": {"mode": choice.get("mode", "auto"), "tools": allowed}}
+            out["tool_choice"] = {"type": "allowed_tools", "allowed_tools": {
+                "mode": choice.get("mode", "auto"), "tools": [named(t) for t in choice.get("tools") or []]}}
         else:
-            raise ValueError(f"tool_choice of type {kind!r} (auto, none, required, a function or allowed_tools)")
+            raise ValueError(f"tool_choice of type {kind!r} (auto, none, required, a function, a custom tool or "
+                             "allowed_tools)")
     elif choice is not None:
         out["tool_choice"] = choice
     if body.get("max_output_tokens") is not None:
@@ -527,13 +550,20 @@ class Responses:
                      "truncation": "disabled", "metadata": {}, "text": {"format": {"type": "text"}}} | \
             {k: body[k] for k in ECHOED if k in body}
         self.encrypted = "reasoning.encrypted_content" in (body.get("include") or [])
+        self.custom = {t.get("name") for t in body.get("tools") or [] if isinstance(t, dict) and
+                       t.get("type") == "custom"}  # (their calls: custom_tool_call items, their input streamed)
         self.blocks = Blocks()
         self.ids: dict[int, str] = {}  # (each block's item id)
+        self.inputs: dict[int, InputStream] = {}  # (each custom call's input)
         self.seq = 0
 
+    def _custom(self, b: Block) -> bool:
+        return b.kind == "call" and b.call.name in self.custom
+
     def item_id(self, b: Block) -> str:
-        return self.ids.setdefault(b.index, {"thinking": "rs_", "text": "msg_", "call": "fc_"}[b.kind] + (
-            b.call.id.removeprefix("call_") if b.kind == "call" else alnum_id(24)))
+        kind = "ctc_" if self._custom(b) else {"thinking": "rs_", "text": "msg_", "call": "fc_"}[b.kind]
+        return self.ids.setdefault(b.index, kind + (b.call.id.removeprefix("call_") if b.kind == "call" else
+                                                    alnum_id(24)))
 
     def item(self, b: Block, *, status: str = "completed") -> dict[str, Any]:
         """A block as an output item (``status`` in_progress: as just added, without its text)."""
@@ -545,6 +575,9 @@ class Responses:
         if b.kind == "text":
             return {"id": rid, "type": "message", "role": "assistant", "status": status,
                     "content": [self._text(b.text)] if done else []}
+        if self._custom(b):
+            return {"id": rid, "type": "custom_tool_call", "status": status, "call_id": b.call.id,
+                    "name": b.call.name, "input": custom_input(b.text) if done else ""}
         return {"id": rid, "type": "function_call", "status": status, "call_id": b.call.id, "name": b.call.name,
                 "arguments": b.text if done else ""}
 
@@ -588,7 +621,11 @@ class Responses:
                 if b.kind == "text":
                     out.append(self._event("response.content_part.added", **at, content_index=0, part=self._text("")))
             elif what == "delta":
-                if b.kind == "call":
+                if self._custom(b):
+                    delta = self.inputs.setdefault(b.index, InputStream()).feed(text)
+                    if delta:
+                        out.append(self._event("response.custom_tool_call_input.delta", **at, delta=delta))
+                elif b.kind == "call":
                     out.append(self._event("response.function_call_arguments.delta", **at, delta=text))
                 else:
                     kind = "response.reasoning_text.delta" if b.kind == "thinking" else "response.output_text.delta"
@@ -602,6 +639,8 @@ class Responses:
                                            logprobs=[]))
                     out.append(self._event("response.content_part.done", **at, content_index=0,
                                            part=self._text(b.text)))
+                elif self._custom(b):
+                    out.append(self._event("response.custom_tool_call_input.done", **at, input=custom_input(b.text)))
                 else:
                     out.append(self._event("response.function_call_arguments.done", **at, name=b.call.name,
                                            arguments=b.text))
