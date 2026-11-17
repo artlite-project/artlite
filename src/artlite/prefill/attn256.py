@@ -1,7 +1,12 @@
-"""The prefill of the gated attention of head_dim 256 (``decode.attn256``: the qwen35 models' full-attention layers): a
-T-token chunk at position p0 (a multiple of 32) from the attn_in GEMMs' output G (``prefill.gemm``: per column [q + gate
-of its QC heads | K part | V part]: KV head h's dims in the NPH = 8 / KV heads columns NPH h ..) to the attn_out GEMM's
-A.
+"""The prefill of the gated attention of head_dim 256 (``decode.attn256``: the qwen35 models' full-attention layers,
+Spark-X's full and sliding-window layers): a T-token chunk at position p0 (a multiple of 32) from the attn_in GEMMs'
+output G (``prefill.gemm``: per column [q + gate of its QC heads | K part | V part]: KV head h's dims in the NPH = 8 / KV
+heads columns NPH h ..) to the attn_out GEMM's A.
+
+Spark-X (``AttnSpec``: no norms, a gate per head, ``window``): the prep rotates q (times log2(e) / 16) and k without
+norms, by the layer kind's pairs; a Q slot holds single Q panels and, in d-block 0's lo panel, the head's sigmoid(gate)
+of its 8 tokens (no gate slots: half the slots the attention streams); a sliding-window layer's records go to a
+staging the attention reads at static offsets, its ring of the decode filled from there (``PrefillAttnOperator``).
 
 ``AttnPrepOperator``: per column c, cores 2 .. 1 + QC one per q head (the column's heads QC c ..), core 2 + QC the
 column's KV role. Per 8 tokens a Q core turns its head's rows into the attention's operands: q / rms(q) q_norm, the
@@ -93,7 +98,13 @@ QA_N = "qa_n"  # p0 / 32 + 1 (cache groups every attention pass streams first; t
 # prompt's groups
 QA_NK = "qa_nk"  # (non-causal) the prompt's keys in its last group (1 .. 32)
 QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
+QA_CS_SWA = "qa_cs_swa"  # (a sliding-window layer's prep) bf16 offset of the chunk's rows in its cos / sin table
+# (a sliding-window layer's attention) the ring's two pieces (first slot as a bf16 offset, groups: ``ring_pieces``) of
+# the window's history before the chunk (into the staging's head) and (T's) of the chunk's groups (from the staging)
+QA_HA, QA_HAN, QA_HB, QA_HBN = "qa_ha", "qa_han", "qa_hb", "qa_hbn"
+QA_CA, QA_CAN, QA_CB, QA_CBN = "qa_ca", "qa_can", "qa_cb", "qa_cbn"
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
+GATE_AT = PANEL_BYTES // 2  # (a gate per head) bf16 index in a Q slot of its 8 tokens' sigmoid(gate): d-block 0's lo panel
 
 
 def pass_groups(cfg: AttnConfig, T: int) -> int:
@@ -118,15 +129,33 @@ def part_walk() -> TensorAccessPattern:
     return stream_walk(SLOT // 4, [(ND // 4, 72), (2, SLOT // 8), (72, 1)])
 
 
-def cs_rows(cfg: AttnConfig, positions: np.ndarray | range) -> np.ndarray:
-    """(n, 64) fp32: per position (text, or M-RoPE (T, H, W)) [cos 32 | sin 32] of the rotated pairs
-    (``cfg.rope_theta``)."""
-    return cos_sin_rows(cfg.rope_theta(positions))
+def cs_rows(cfg: AttnConfig, positions: np.ndarray | range, kind: str = "full") -> np.ndarray:
+    """(n, 2 rot) fp32: per position (text, or M-RoPE (T, H, W)) [cos rot | sin rot] of the rotated pairs
+    (``cfg.rope_theta``; a windowed spec's sliding-window layer, ``kind`` "swa": its 128 pairs)."""
+    return cos_sin_rows(cfg.rope_theta(positions) if kind == "full" else cfg.rope_theta(positions, kind))
 
 
-def cs_table(cfg: AttnConfig, n: int) -> np.ndarray:
-    """(n, 64) fp32: ``cs_rows`` of the text positions 0 .. n - 1."""
-    return cs_rows(cfg, range(n))
+def cs_table(cfg: AttnConfig, n: int, kind: str = "full") -> np.ndarray:
+    """(n, 2 rot): ``cs_rows`` of the text positions 0 .. n - 1, fp32 (a sliding-window layer's 128 pairs: bf16, as the
+    decode's: their rows in the prep's L1 at half the bytes)."""
+    rows = cs_rows(cfg, range(n), kind)
+    return rows if kind == "full" else rows.astype(bfloat16)
+
+
+def rot_pairs(kind: str) -> int:
+    """The rotated pairs of a layer kind: a full layer's first 32 (``AT.ROT``), a sliding-window layer's 128."""
+    return AT.ROT if kind == "full" else HD // 2
+
+
+def ring_pieces(g0: int, n: int, nr: int) -> tuple[int, int, int, int]:
+    """Groups g0 .. g0 + n - 1 of a ring of nr groups (group g at slot g % nr; n >= 2) as two pieces (first slot,
+    groups): split where they wrap the ring, else before the last group (the transfers' tasks the same at every
+    position)."""
+    a = g0 % nr
+    assert 2 <= n <= nr, (n, nr)
+    if a + n <= nr:
+        return a, n - 1, a + n - 1, 1
+    return a, nr - a, 0, n - (nr - a)
 
 
 _PREP = templating.load("artlite/prefill/attn256.prep.cc.jinja")
@@ -134,21 +163,42 @@ _PREP = templating.load("artlite/prefill/attn256.prep.cc.jinja")
 
 class AttnPrepOperator(ArtcOperator):
     """The attention prep of a chunk (module docstring). Runtime sequence: G (attn_in's output, ``layout``), CS (the
-    cos / sin table of ``cs_positions`` rows, as bf16 pairs), NRM (q_norm | k_norm fp32), QS (per column, token group
-    and head a ``SLOT``, pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head], ``pass_groups``;
-    a sub-chunk's part of a chunk's QS contiguous),
+    cos / sin table of ``cs_positions`` rows, as bf16 pairs), NRM (q_norm | k_norm fp32; none without norms), QS (per
+    column, token group and head a ``SLOT``, pass-major: [32 QG-token pass][column][token group 4 QG][Q | gate][head],
+    ``pass_groups``; a sub-chunk's part of a chunk's QS contiguous),
     KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
-    of the first token (default p0), ``QA_KV`` (T's) = GROUP / 2 * p0 / 32 (``params``)."""
+    of the first token (default p0), ``QA_KV`` (T's) = GROUP / 2 * p0 / 32 (``params``).
+
+    ``spec`` (``decode.attn256.AttnSpec``) and ``kind``: Spark-X's attention: no norms (q times log2(e) / 16 by hi / lo
+    products, k as it is), the rotation of the kind (a full layer's 32 pairs, a sliding-window layer's 128: CS rows of
+    [cos 128 | sin 128] bf16, ``cs_table(kind=)``), a gate per head (``spec.gate`` "head": a Q core's object [its head's
+    8 q rows | 8 rows of ``GW`` values from the gate block, the column's QC gates first]; its slot holds the single Q
+    panel per d-block and, in d-block 0's lo panel, the 8 tokens' sigmoid(g) as bf16 (``GATE_AT``): one slot per head
+    and token group, no gate slot: ``tg_slots``). ``hist`` (a sliding-window layer): KV is the
+    attention's staging (``PrefillAttnOperator``'s S: per KV head ``hist`` groups of the window's history, then the
+    chunk's), the chunk's records after the history at a static offset (no ``QA_KV``)."""
 
     STACK = 3072
+    GW = 16  # (a gate per head) gate values a Q core reads per row from the column's gate block (32 bytes: aligned rows)
+
+    @property
+    def tg_slots(self) -> int:
+        """Slots per head and token group in QS: [Q | sigmoid(gate)], or (a gate per head) Q alone."""
+        return 1 if self.gh else 2
     pfx = kernel_prefix("qap")
 
-    def __init__(self, *, T: int, cfg: AttnConfig, layout: Layout, head_bytes: int, cs_positions: int):
+    def __init__(self, *, T: int, cfg: AttnConfig, layout: Layout, head_bytes: int, cs_positions: int,
+                 spec: AT.AttnSpec = AT.QWEN, kind: str = "full", hist: int = 0):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0, "whole cache groups"
         check_bd_iterations(T // 8, "AttnPrep")
         assert {"q", "k", "v"} <= set(layout.off)
+        assert kind in ("full", "swa") and (kind == "full" or not spec.norms) and (not hist or kind == "swa"), (kind, hist)
+        self.spec, self.kind, self.hist = spec, kind, hist
+        self.norms, self.gh = spec.norms, spec.gate == "head"
+        assert not self.gh or "g" in layout.off
+        self.rot = rot_pairs(kind)
         self.T, self.cfg, self.layout = T, cfg, layout
         self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
         self.qc = cfg.num_attention_heads // COLS
@@ -165,7 +215,8 @@ class AttnPrepOperator(ArtcOperator):
         p = self.pfx
         qs = bf16_hilo(math.log2(math.e) / 16)
         return _PREP.render(p=p, HD=HD, ND=ND, w=Attr(self.workspace()), eps=repr(self.cfg.rms_norm_eps), qs=qs,
-                            tmax=repr(kmath.SIGMOID.t_max))
+                            tmax=repr(kmath.SIGMOID.t_max), NORMS=self.norms, GH=self.gh, ROT=self.rot, GW=self.GW,
+                            GATE_AT=GATE_AT)
 
     def kv_job(self, c: int) -> tuple[str, int] | None:
         """Column c's KV core's job: ("k" or "v", the KV head), or None (one every COLS / (2 KV heads) columns)."""
@@ -175,50 +226,60 @@ class AttnPrepOperator(ArtcOperator):
         j = c // step
         return ("k" if j < self.kvh else "v"), j % self.kvh
 
+    @property
+    def cs_row(self) -> int:
+        """bf16 of a position's cos / sin row ([cos rot | sin rot]: fp32, a sliding-window layer's bf16, ``cs_table``)."""
+        return 4 * self.rot if self.kind == "full" else 2 * self.rot
+
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
         return [ArgSpec("in", (T * self.layout.N,), bfloat16),
-                ArgSpec("in", (self.cs_positions * 128,), bfloat16),
-                ArgSpec("in", (2 * HD * 2,), bfloat16),
+                ArgSpec("in", (self.cs_positions * self.cs_row,), bfloat16),
+                *([ArgSpec("in", (2 * HD * 2,), bfloat16)] if self.norms else []),
                 ArgSpec("out", (self.n_qs,), bfloat16),
                 ArgSpec("out", (self.kvh * self.head_bytes // 2,), bfloat16)]
 
     @property
     def n_qs(self) -> int:
         """bf16 of the QS argument."""
-        return COLS * self.T // 8 * self.qc * SLOT
+        return COLS * self.T // 8 * self.qc * SLOT // 2 * self.tg_slots
 
     def params(self, p0: int, cs_row: int | None = None) -> dict[str, int]:
         """The scratchpad parameters of a chunk at position p0 whose tokens' cos / sin start at table row ``cs_row``
         (default p0)."""
         r = p0 if cs_row is None else cs_row
         assert p0 % 32 == 0 and 0 <= r and r + self.T <= self.cs_positions
+        if self.hist:  # (the staging's static offsets; the kind's own CS parameter)
+            return {QA_CS_SWA: self.cs_row * r}
         return {QA_CS: 128 * r, f"{QA_KV}{self.T}": GROUP // 2 * (p0 // 32)}
 
     def get_mlir_artifact(self) -> Module:
-        p, T, qc, lay = self.pfx, self.T, self.qc, self.layout
+        p, T, qc, lay, gh, norms, GW = self.pfx, self.T, self.qc, self.layout, self.gh, self.norms, self.GW
         N, pitch = lay.N, lay.pitch
         bf = np.dtype[bfloat16]
-        row_ty = np.ndarray[(8 * 2 * HD,), bf]  # 8 rows of [q | gate]
+        rq = 8 * (HD + GW) if gh else 8 * 2 * HD  # (a Q core's object: 8 rows of [q | gate], or [q] then the gates)
+        row_ty = np.ndarray[(rq,), bf]
         kv_ty = np.ndarray[(8 * HD,), bf]  # 8 rows of a KV head
-        in_ty = np.ndarray[(qc * 8 * 2 * HD + 8 * HD,), bf]
-        inq_ty = np.ndarray[(qc * 8 * 2 * HD,), bf]  # (a column without a KV job)
+        in_ty = np.ndarray[(qc * rq + 8 * HD,), bf]
+        inq_ty = np.ndarray[(qc * rq,), bf]  # (a column without a KV job)
         jobs = {c: self.kv_job(c) for c in range(COLS) if self.kv_job(c) is not None}
-        cs_ty = np.ndarray[(8 * 128,), bf]  # 8 positions x 64 fp32 (the norms: 512 fp32)
+        cs_ty = np.ndarray[(8 * self.cs_row,), bf]  # 8 positions x 2 rot fp32 (the norms: 512 fp32)
         slot_ty = np.ndarray[(SLOT // 2,), bf]
         qs_ty = np.ndarray[(qc * SLOT // 2,), bf]
         vr_ty = np.ndarray[(AT.REC_V,), bf]  # (a pair of K or V records)
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
-        k_prm = Kernel(f"{p}_prm", "kernel.o", [cs_ty, ws_ty])
-        k_q = Kernel(f"{p}_q", "kernel.o", [row_ty, cs_ty, ws_ty, slot_ty])
-        k_sg = Kernel(f"{p}_sg", "kernel.o", [row_ty, ws_ty, slot_ty])
+        nrm_ty = np.ndarray[(2 * HD * 2,), bf]
+        k_prm = Kernel(f"{p}_prm", "kernel.o", [nrm_ty, ws_ty]) if norms else None
+        k_q = Kernel(f"{p}_q", "kernel.o", [row_ty, cs_ty, ws_ty, slot_ty, *([np.int32] if gh else [])])
+        k_sg = None if gh else Kernel(f"{p}_sg", "kernel.o", [row_ty, ws_ty, slot_ty])
         k_k = Kernel(f"{p}_k", "kernel.o", [kv_ty, cs_ty, ws_ty, vr_ty, np.int32])
         k_v = Kernel(f"{p}_v", "kernel.o", [kv_ty, cs_ty, ws_ty, vr_ty, np.int32])
-        p_cs, p_kv = ScratchpadParameter(QA_CS, np.int32), ScratchpadParameter(f"{QA_KV}{T}", np.int32)
+        p_cs = ScratchpadParameter(QA_CS_SWA if self.kind == "swa" else QA_CS, np.int32)
+        p_kv = None if self.hist else ScratchpadParameter(f"{QA_KV}{T}", np.int32)
         n_tg = T // 8
 
         a3 = [ObjectFifo(in_ty if c in jobs else inq_ty, name=f"qp_a{c}", depth=2) for c in range(COLS)]
-        a1 = [a3[c].cons().split([8 * 2 * HD * h for h in range(qc + (c in jobs))], tile=Tile(c, 1),
+        a1 = [a3[c].cons().split([rq * h for h in range(qc + (c in jobs))], tile=Tile(c, 1),
                                  depths=[2] * (qc + (c in jobs)), obj_types=[row_ty] * qc + [kv_ty] * (c in jobs),
                                  names=[f"qp_ah{c}_{h}" for h in range(qc + (c in jobs))]) for c in range(COLS)]
         b = [ObjectFifo(cs_ty, name=f"qp_b{c}", depth=2) for c in range(COLS)]
@@ -228,16 +289,17 @@ class AttnPrepOperator(ArtcOperator):
               for c in range(COLS)]
         k = {c: ObjectFifo(vr_ty, name=f"qp_k{c}", depth=2) for c in jobs}
 
-        def core(a_h, b_h, o_h, prm, fn, ws, sg=None):
+        def core(a_h, b_h, o_h, prm, fn, ws, sg=None, head=None):
             for _ in forever_():
-                n = b_h.acquire(1)
-                prm(n, ws)
-                b_h.release(1)
+                if prm is not None:  # (the norms: the first object)
+                    n = b_h.acquire(1)
+                    prm(n, ws)
+                    b_h.release(1)
                 for _ in range_(n_tg):
                     x = a_h.acquire(1)
                     cs = b_h.acquire(1)
                     o = o_h.acquire(1)
-                    fn(x, cs, ws, o)
+                    fn(x, cs, ws, o, *([head] if gh and head is not None else []))
                     o_h.release(1)
                     if sg is not None:  # (a Q core: then the token group's sigmoid(gate))
                         o = o_h.acquire(1)
@@ -246,14 +308,15 @@ class AttnPrepOperator(ArtcOperator):
                     b_h.release(1)
                     a_h.release(1)
 
-        def core_q(a_h, b_h, o_h, prm, fn, sg, ws):
-            core(a_h, b_h, o_h, prm, fn, ws, sg)
+        def core_q(a_h, b_h, o_h, prm, fn, sg, ws, head):
+            core(a_h, b_h, o_h, prm, fn, ws, sg, head)
 
         def core_v(a_h, b_h, o_h, prm, fn, ws):  # (a KV job: two token groups' records per object)
             for _ in forever_():
-                n = b_h.acquire(1)
-                prm(n, ws)
-                b_h.release(1)
+                if prm is not None:
+                    n = b_h.acquire(1)
+                    prm(n, ws)
+                    b_h.release(1)
                 for _ in range_(n_tg // 2):
                     o = o_h.acquire(1)
                     for half in range(2):
@@ -269,32 +332,40 @@ class AttnPrepOperator(ArtcOperator):
             for h in range(qc + (c in jobs)):
                 ws = Buffer(ws_ty, name=f"qp_ws{c}_{h}")
                 if h < qc:
-                    fn, args = core_q, [a1[c][h].cons(), b[c].cons(), o1[c][h].prod(), k_prm, k_q, k_sg, ws]
+                    fn, args = core_q, [a1[c][h].cons(), b[c].cons(), o1[c][h].prod(), k_prm, k_q, k_sg, ws, h]
                 else:
                     args = [a1[c][h].cons(), b[c].cons(), k[c].prod(), k_prm, k_k if jobs[c][0] == "k" else k_v, ws]
                     fn = core_v
                 workers.append(Worker(fn, args, tile=Tile(c, 2 + h), stack_size=self.STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
-        n_cs, n_qs, n_kv = arg_elems(self, 1), arg_elems(self, 3), arg_elems(self, 4)
+        n_cs, n_qs, n_kv = arg_elems(self, 1), arg_elems(self, 3 if norms else 2), arg_elems(self, 4 if norms else 3)
         nph, per = self.nph, self.per
-        blk = 4 * self.qg * qc * SLOT  # (bf16 of a column's slots in a pass)
+        blk = 4 * self.qg * qc * SLOT // 2 * self.tg_slots  # (bf16 of a column's slots in a pass)
         hb, g2, o2 = self.head_bytes // 2, GROUP // 2, AT.OBJ_BYTES // 2
 
-        def seq(G, CS, NRM, QS, KV, ah, bh, oh, khs):
+        def seq(G, CS, *rest):
+            NRM, QS, KV, ah, bh, oh, khs = rest if norms else (None, *rest)
             kh = dict(zip(k, khs))
             sync_parameters()
             tg = TaskGroup()
             for c in range(COLS):
-                taps = [TensorAccessPattern((T * N,), c * pitch + lay.off["q"], [n_tg, qc, 8, 2 * HD],
-                                            [8 * N, 2 * HD, N, 1])]
+                if gh:  # (per head its q rows, then GW values of the gate block per row: the column's gates first)
+                    taps = [TensorAccessPattern((T * N,), c * pitch + lay.off[part] + (HD * h if part == "q" else 0),
+                                                [n_tg, 1, 8, HD if part == "q" else GW], [8 * N, 0, N, 1])
+                            for h in range(qc) for part in ("q", "g")]
+                else:
+                    taps = [TensorAccessPattern((T * N,), c * pitch + lay.off["q"], [n_tg, qc, 8, 2 * HD],
+                                                [8 * N, 2 * HD, N, 1])]
                 if c in jobs:  # (the KV head's rows: its dims in its NPH columns)
                     kind, h = jobs[c]
                     taps.append(TensorAccessPattern((T * N,), nph * h * pitch + lay.off[kind], [n_tg, 8, nph, per],
                                                     [8 * N, N, pitch, 1]))
                 chained_fill(ah[c], G, taps, tg)
-                bh[c].fill(NRM, TensorAccessPattern((2 * HD * 2,), 0, [1, 1, 1, 2 * HD * 2], [0, 0, 0, 1]), group=tg)
-                bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * 128], [0, 0, 0, 1]), offset_parameter=p_cs,
-                           group=tg)
+                if norms:
+                    bh[c].fill(NRM, TensorAccessPattern((2 * HD * 2,), 0, [1, 1, 1, 2 * HD * 2], [0, 0, 0, 1]),
+                               group=tg)
+                bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * self.cs_row], [0, 0, 0, 1]),
+                           offset_parameter=p_cs, group=tg)
                 oh[c].drain(QS, TensorAccessPattern((n_qs,), c * blk,
                                                     [1, n_tg // (4 * self.qg), blk // PREP_ROW, PREP_ROW],
                                                     [0, COLS * blk, PREP_ROW, 1]), group=tg, wait=True)
@@ -304,10 +375,16 @@ class AttnPrepOperator(ArtcOperator):
                 # (the K or V object of group g + i: its 4 records)
                 tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2, [1, T // 32, 8, PREP_ROW],
                                           [0, g2, PREP_ROW, 1])
+                if self.hist:  # (the staging: after the window's history, static)
+                    tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2 + self.hist * g2,
+                                              [1, T // 32, 8, PREP_ROW], [0, g2, PREP_ROW, 1])
+                    kh[c].drain(KV, tap, group=tg, wait=True)
+                    continue
                 kh[c].drain(KV, tap, offset_parameter=p_kv, group=tg, wait=True)
             tg.finish()
 
-        rt = Runtime(seq, [np.ndarray[(T * N,), bf], np.ndarray[(n_cs,), bf], np.ndarray[(2 * HD * 2,), bf],
+        rt = Runtime(seq, [np.ndarray[(T * N,), bf], np.ndarray[(n_cs,), bf],
+                           *([np.ndarray[(2 * HD * 2,), bf]] if norms else []),
                            np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b)],
@@ -332,6 +409,16 @@ class PrefillAttnOperator(ArtcOperator):
     at position 0, every pass streams the prompt's groups (``QA_N`` of them) and each query sees all of its keys, those
     after the prompt's in its last group masked (``QA_NK``: the prompt's keys there).
 
+    Sliding-window (``window``: Spark-X's; its caches a ring of ``ring`` groups, group g at slot g % ring): the passes
+    read a linear staging S (per KV head WG = window / 32 groups of the window's history, then the chunk's, which the
+    prep writes there: ``AttnPrepOperator(hist=)``); first the history's groups are copied from the ring into S's head
+    (each KV head's column: shim -> memtile -> shim, its free channels; the ring's two pieces ``QA_HA`` ..), last the
+    chunk's groups from S into the ring (``QA_CA`` .., T's): a runtime sequence reads at most 32 parameters, so the
+    passes' windows (a ring's pieces per pass) read S at static offsets. Every pass streams NW = WG + QG groups ending at
+    its last (the window of its first query and its own); the keys before each row's window masked (in the group WG
+    before its diagonal one the complement of the causal triangle, before it whole) and the groups before position 0
+    (junk from the ring's end) whole.
+
     Packed (``pack``: several inputs, segments, in a chunk): each row sees the history (the positions before p0: a
     prefix every segment continues; causal only) and its segment's keys from its first up to itself (causal) or to its
     last (non-causal, at position 0), the others masked (-16384: P 0 against any of its own; a row's groups before its
@@ -342,7 +429,7 @@ class PrefillAttnOperator(ArtcOperator):
     pfx = kernel_prefix("qaa")
 
     def __init__(self, *, T: int, cfg: AttnConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
-                 pp: int = 1, pack: bool = False):
+                 pp: int = 1, pack: bool = False, window: int = 0, ring: int = 0, spec: AT.AttnSpec = AT.QWEN):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
         results); "ev_qk", "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters
         programmed (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or
@@ -351,6 +438,12 @@ class PrefillAttnOperator(ArtcOperator):
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0
         self.T, self.cfg, self.head_bytes, self.causal, self.pp, self.pack = T, cfg, head_bytes, causal, pp, pack
+        assert (window == 0) == (ring == 0) and window % 32 == 0 and (not window or (causal and not pack)), (window, ring)
+        self.window, self.ring = window, ring
+        # (a gate per head, Spark-X's: QS holds the Q slots alone, single Q panels, the gates in d-block 0's lo panel:
+        # ``AttnPrepOperator.tg_slots``)
+        self.gh = spec.gate == "head"
+        assert not self.gh or (not spec.norms and not pack), spec
         self.nph = COLS // self.kvh
         self.ablate = tuple(ablate)
         self.qc = cfg.num_attention_heads // COLS
@@ -362,6 +455,8 @@ class PrefillAttnOperator(ArtcOperator):
         # stream, Q apart)
         self.two = two_streams(cfg, T)
         self.ob = self.R <= 2 and not self.two  # (o's second copy fits: regions 2 and 3)
+        self.nw = window // 32 + self.qg  # (a sliding-window layer: groups every pass streams)
+        assert not ring or self.nw <= ring
         super().__init__()
 
     def workspace(self) -> dict[str, int]:
@@ -376,19 +471,26 @@ class PrefillAttnOperator(ArtcOperator):
         keys = [f"{mask64(lambda q, k, v=v: k >= v):016X}" for v in range(8)]
         return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
                             tri=f"{tri:016X}", keys=keys, ablate=self.ablate, TWO=self.two, OB=self.ob,
-                            CAUSAL=self.causal, PP=self.pp, PACK=self.pack)
+                            CAUSAL=self.causal, PP=self.pp, PACK=self.pack, WG=self.window // 32, GH=self.gh,
+                            GATE_AT=GATE_AT)
 
     @property
     def n_seg(self) -> int:
         """bf16 of the SEG argument (packed): per pass two slots (an object per stream)."""
         return self.T // (32 * self.qg) * SLOT
 
+    @property
+    def stage_groups(self) -> int:
+        """(a sliding-window layer) groups of a KV head's staging: the window's history, then the chunk's."""
+        return self.window // 32 + self.T // 32
+
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
         seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.pack else []
-        return [ArgSpec("in", (COLS * T // 8 * 2 * self.qc * SLOT // 2,), bfloat16),
+        stage = [ArgSpec("in", (self.kvh * self.stage_groups * GROUP // 2,), bfloat16)] if self.window else []
+        return [ArgSpec("in", (COLS * T // 8 * (1 if self.gh else 2) * self.qc * SLOT // 2,), bfloat16),
                 ArgSpec("in", (self.kvh * self.head_bytes // 2,), bfloat16),
-                ArgSpec("out", (panel_elems(T * self.H * HD),), bfloat16), *seg]
+                ArgSpec("out", (panel_elems(T * self.H * HD),), bfloat16), *seg, *stage]
 
     def seg(self, lo: np.ndarray, hi: np.ndarray, p0: int = 0) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk at p0: per token (T,) its segment's first and last key
@@ -414,7 +516,52 @@ class PrefillAttnOperator(ArtcOperator):
         if not self.causal:
             assert p0 == 0 and 0 < n <= self.T, (p0, n)
             return {QA_N: -(-n // 32)} | ({} if self.pack else {QA_NK: n - 32 * (-(-n // 32) - 1)})
+        if self.window:  # (the ring's pieces of the window's history and of the chunk's groups)
+            wg = self.window // 32
+            h, c = ring_pieces(p0 // 32 - wg, wg, self.ring), ring_pieces(p0 // 32, self.T // 32, self.ring)
+            T = self.T
+            return {QA_N: p0 // 32 + 1, QA_HA: GROUP // 2 * h[0], QA_HAN: h[1], QA_HB: GROUP // 2 * h[2], QA_HBN: h[3],
+                    f"{QA_CA}{T}": GROUP // 2 * c[0], f"{QA_CAN}{T}": c[1], f"{QA_CB}{T}": GROUP // 2 * c[2],
+                    f"{QA_CBN}{T}": c[3]}
         return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": GROUP // 2 * (p0 // 32 + 1)}
+
+    def _copy_fifos(self) -> tuple[list[ObjectFifo], list[ObjectFifo]]:
+        """(a sliding-window layer) Per KV head the copy path between the ring and the staging at column NPH h + 1 (its
+        memtile's free input channels: the KV head's join is at NPH h; ``copy_column``): a cache object at a time, shim
+        -> memtile -> shim (the fifos the sequence fills, and their forwards it drains)."""
+        obj = np.ndarray[(OBJ_ELEMS,), np.dtype[bfloat16]]
+        cp = [ObjectFifo(obj, name=f"pa_cp{h}", depth=2) for h in range(self.kvh)]
+        co = [cp[h].cons().forward(obj_type=obj, name=f"pa_co{h}", depth=2, tile=Tile(self.copy_column(h), 1))
+              for h in range(self.kvh)]
+        return cp, co
+
+    def copy_column(self, h: int) -> int:
+        """(a sliding-window layer) The column of KV head h's copy path."""
+        return self.nph * h + 1
+
+    def _copy(self, KV: object, S: object, cph: list, coh: list, *, into_stage: bool) -> None:
+        """(a sliding-window layer, in the runtime sequence) The window's history from the ring into the staging's head
+        (``into_stage``), or the chunk's groups from the staging into the ring; awaited."""
+        T, wg, kvh = self.T, self.window // 32, self.kvh
+        n_kv, n_s = arg_elems(self, 1), arg_elems(self, 3)
+        hb, hs, row = self.head_bytes // 2, self.stage_groups * GROUP // 2, OBJ_ELEMS // 8
+        names = (QA_HA, QA_HAN, QA_HB, QA_HBN) if into_stage else tuple(f"{n}{T}" for n in (QA_CA, QA_CAN, QA_CB, QA_CBN))
+        prm = [ScratchpadParameter(n, np.int32) for n in names]
+        tg = TaskGroup()
+        for h in range(kvh):
+            ring = TensorAccessPattern((n_kv,), h * hb, [1, AT.OBJS, 8, row], [0, OBJ_ELEMS, row, 1])  # (a group)
+            parts = [ChainPart(KV, ring, offset_parameter=prm[0], length_parameter=prm[1]),
+                     ChainPart(KV, ring, offset_parameter=prm[2], length_parameter=prm[3])]
+            n_g, g0 = (wg, 0) if into_stage else (T // 32, wg)
+            stage = TensorAccessPattern((n_s,), h * hs + g0 * GROUP // 2, [1, n_g, AT.OBJS * 8, row],
+                                        [0, GROUP // 2, row, 1])
+            if into_stage:
+                chained_fill(cph[h], KV, parts, tg)
+                coh[h].drain(S, stage, group=tg, wait=True)
+            else:
+                cph[h].fill(S, stage, group=tg)
+                chained_fill(coh[h], KV, parts, tg, wait=True)
+        tg.finish()
 
     def get_mlir_artifact(self) -> Module:
         if self.two:
@@ -430,7 +577,8 @@ class PrefillAttnOperator(ArtcOperator):
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [kv_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, kv_ty, ws_ty, np.int32])
-        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
+        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32,
+                                                   *([np.int32] if self.window else [])])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [kv_ty, ws_ty, np.int32])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         k_seg = Kernel(f"{p}_seg", "kernel.o", [kv_ty, ws_ty, np.int32]) if self.pack else None
@@ -450,6 +598,7 @@ class PrefillAttnOperator(ArtcOperator):
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([A_SET * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        cp, co = self._copy_fifos() if self.window else ([], [])
 
         def core(kv_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me, *seg):
             for _ in forever_():
@@ -465,19 +614,20 @@ class PrefillAttnOperator(ArtcOperator):
                     init(ws)
                     # read after this dispatch's first object: the host wrote it before the fills (non-causal: the
                     # prompt's groups; row: the prompt's keys in the last; packed: the core's row)
-                    n = n_p.read() + b * qg + (qg - 1) if causal else n_p.read()
+                    n = (self.nw if self.window else n_p.read() + b * qg + (qg - 1)) if causal else n_p.read()
                     last = row if causal or seg else row.read()
+                    ghi = (n_p.read() + b * qg + (qg - 2),) if self.window else ()  # (the pass's last group)
                     for g in range32(n):
                         for k in range(2):
                             kr = kv_h.acquire(1)
                             qk(qb, kr, ws, k)
                             kv_h.release(1)
-                        soft(ws, pw, n - 1 - g, last, g)
+                        soft(ws, pw, n - 1 - g, last, g, *ghi)
                         for half in range(2):
                             v = kv_h.acquire(1)
                             pv(v, ws, half)
                             kv_h.release(1)
-                    for i in range_(n_q):  # (the gates into the Q slots' buffer)
+                    for i in range_(0 if self.gh else n_q):  # (the gates into the Q slots' buffer; GH: in them)
                         a = kv_h.acquire(1)
                         qsel(a, qb, i, me)
                         kv_h.release(1)
@@ -493,12 +643,17 @@ class PrefillAttnOperator(ArtcOperator):
                           tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
         n_qs, n_kv, n_a = (arg_elems(self, i) for i in range(3))
-        hb, sl, blk = self.head_bytes // 2, SLOT // 2, 4 * qg * qc * SLOT  # (blk: a column's slots in a pass)
+        ts = 1 if self.gh else 2  # (slots per head and token group: [Q | sigmoid(gate)], or Q alone)
+        hb, sl, blk = self.head_bytes // 2, SLOT // 2, 4 * qg * qc * SLOT // 2 * ts  # (blk: a column's slots in a pass)
 
         n_seg = self.n_seg
 
         def seq(QS, KV, A, *rest):
-            *seg, kvh, oh = rest  # (packed: SEG)
+            if self.window:  # (the staging S, the copy paths' handles)
+                S, kvh, oh, cph, coh = rest
+                seg = []
+            else:
+                *seg, kvh, oh = rest  # (packed: SEG)
             sync_parameters()
             if any(a.startswith("ev_") for a in self.ablate):  # (the cores' counters: window cycles, lock stall)
                 for c in range(COLS):
@@ -515,6 +670,8 @@ class PrefillAttnOperator(ArtcOperator):
                                                        [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
                                                        [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]), group=tg,
                                 wait=True)
+            if self.window:  # (the window's history into the staging's head first)
+                self._copy(KV, S, cph, coh, into_stage=True)
             inflight = []  # (a pass: one task of up to four BDs per part, ``PASSES_IN_FLIGHT`` passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
@@ -524,30 +681,42 @@ class PrefillAttnOperator(ArtcOperator):
                     # columns [column NPH][token group 4 QG][head] one after the other in QS, a token group [Q |
                     # sigmoid(gate)][head])
                     q0, k0 = (b * COLS + nph * h) * blk + i * SLOT // 4, h * hb + i * SLOT // 4
-                    q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 4], [0, qc * SLOT, sl, 1]
+                    q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 4], [0, qc * sl * ts, sl, 1]
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str))]
                     if seg:  # (its half of the pass's SEG object)
                         parts.append(ChainPart(seg[0], TensorAccessPattern((n_seg,), b * SLOT + i * SLOT // 4,
                                                                            [1, 1, 2, SLOT // 8], [0, 0, SLOT // 8, 1])))
-                    parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, SLOT // 4],
-                                                                [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
-                    if more:
+                    if self.window:  # (the pass's NW groups from the staging)
+                        s0 = h * self.stage_groups * GROUP // 2 + i * SLOT // 4 + qg * b * GROUP // 2
+                        parts.append(ChainPart(S, TensorAccessPattern((arg_elems(self, 3),), s0,
+                                                                      [1, AT.OBJS * self.nw, 2, SLOT // 4],
+                                                                      [0, OBJ_ELEMS, SLOT // 2, 1])))
+                    else:
+                        parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, SLOT // 4],
+                                                                    [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
+                    if more and not self.window:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS * more, 2, SLOT // 4],
                                                                        [0, OBJ_ELEMS, SLOT // 2, 1]),
                                                offset_parameter=p_off))
-                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
+                    if not self.gh:  # (then the gate slots)
+                        parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) >= PASSES_IN_FLIGHT:
                     inflight.pop(0).finish()
             for tp in inflight:
                 tp.finish()
+            if self.window:  # (then the chunk's groups into the ring)
+                self._copy(KV, S, cph, coh, into_stage=False)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if pack else []),
+                           *([np.ndarray[(arg_elems(self, 3),), bf]] if self.window else []),
                            [kv3[h][i].prod(tile=Tile(nph * h + i, 0)) for h in range(n_kvh) for i in range(2)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)],
+                           *([[f.prod(tile=Tile(self.copy_column(h), 0)) for h, f in enumerate(cp)],
+                              [f.cons(tile=Tile(self.copy_column(h), 0)) for h, f in enumerate(co)]] if self.window else [])])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()
         pin_l1_buffers(module, fifo=lambda name, depth: next((v for k, v in lay.items() if name.startswith(k)), None),
@@ -576,7 +745,8 @@ class PrefillAttnOperator(ArtcOperator):
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, h_ty, ws_ty])
-        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32])
+        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32,
+                                                   *([np.int32] if self.window else [])])
         k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty])
         k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
         k_seg = Kernel(f"{p}_seg", "kernel.o", [h_ty, h_ty, ws_ty, np.int32]) if self.pack else None
@@ -597,6 +767,7 @@ class PrefillAttnOperator(ArtcOperator):
         o3 = [ObjectFifo(om_ty, name=f"pa_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([A_SET * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        cp, co = self._copy_fifos() if self.window else ([], [])
 
         def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me, *seg):
             for _ in forever_():
@@ -616,21 +787,22 @@ class PrefillAttnOperator(ArtcOperator):
                     init(ws)
                     # read after this dispatch's first object: the host wrote it before the fills (non-causal: the
                     # prompt's groups; row: the prompt's keys in the last; packed: the core's row)
-                    n = n_p.read() + b * qg + (qg - 1) if causal else n_p.read()
+                    n = (self.nw if self.window else n_p.read() + b * qg + (qg - 1)) if causal else n_p.read()
                     last = row if causal or seg else row.read()
+                    ghi = (n_p.read() + b * qg + (qg - 2),) if self.window else ()  # (the pass's last group)
                     for g in range32(n):
                         ka = a_h.acquire(1)
                         b_h.acquire(1)
                         qk(qb, ka, ws)
                         a_h.release(1)
                         b_h.release(1)
-                        soft(ws, pw, n - 1 - g, last, g)
+                        soft(ws, pw, n - 1 - g, last, g, *ghi)
                         va = a_h.acquire(1)
                         b_h.acquire(1)
                         pv(va, ws)
                         a_h.release(1)
                         b_h.release(1)
-                    for i in range_(n_q // 2):  # (the gates into the Q slots' buffer)
+                    for i in range_(0 if self.gh else n_q // 2):  # (the gates into the Q slots' buffer; GH: in them)
                         a = a_h.acquire(1)
                         b_h.acquire(1)
                         qsel(a, qb, i, me)
@@ -654,11 +826,16 @@ class PrefillAttnOperator(ArtcOperator):
                                       while_true=False))
         n_qs, n_kv, n_a = (arg_elems(self, i) for i in range(3))
         hb, sl = self.head_bytes // 2, SLOT // 2
-        blk = 4 * qg * qc * SLOT  # (a column's slots in a pass: per token group [its heads' Q | their sigmoid(gate)])
+        ts = 1 if self.gh else 2  # (slots per head and token group: [Q | sigmoid(gate)], or Q alone)
+        blk = 4 * qg * qc * SLOT // 2 * ts  # (a column's slots in a pass: per token group [its heads' Q | their sigmoid(gate)])
         n_seg = self.n_seg
 
         def seq(QS, KV, A, *rest):
-            *seg, kvh, oh = rest  # (packed: SEG)
+            if self.window:  # (the staging S, the copy paths' handles)
+                S, kvh, oh, cph, coh = rest
+                seg = []
+            else:
+                *seg, kvh, oh = rest  # (packed: SEG)
             sync_parameters()
             if any(a.startswith("ev_") for a in self.ablate):  # (the cores' counters: window cycles, lock stall)
                 for c in range(COLS):
@@ -673,6 +850,8 @@ class PrefillAttnOperator(ArtcOperator):
                                                        [min(MAX_BD_ITER, n_pass - b0), R, 4, A_SET],
                                                        [4 * qg * H * A_SET, g_st, qg * H * A_SET, 1]),
                                 group=tg, wait=True)
+            if self.window:  # (the window's history into the staging's head first)
+                self._copy(KV, S, cph, coh, into_stage=True)
             inflight = []  # (a pass: one task of up to four BDs per stream, ``PASSES_IN_FLIGHT`` passes in flight)
             for b in range(n_pass):
                 tp = TaskGroup()
@@ -683,31 +862,43 @@ class PrefillAttnOperator(ArtcOperator):
                     # | sigmoid(gate)] of its QC heads)
                     q0 = (b * COLS + nph * h) * blk + (2 * s + i) * SLOT // 8  # (its quarter of the slots)
                     k0, run = h * hb + s * SLOT // 4 + i * SLOT // 8, SLOT // 8
-                    q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 8], [0, qc * SLOT, SLOT // 2, 1]
+                    q_dims, q_str = [1, nph * 4 * qg, qc, SLOT // 8], [0, qc * SLOT // 2 * ts, SLOT // 2, 1]
                     parts = [ChainPart(QS, TensorAccessPattern((n_qs,), q0, q_dims, q_str))]
                     if seg:  # (its part of the pass's SEG object of the stream)
                         parts.append(ChainPart(seg[0], TensorAccessPattern((n_seg,), b * SLOT + s * SLOT // 2
                                                                            + i * SLOT // 4, [1, 1, 2, SLOT // 8],
                                                                            [0, 0, SLOT // 8, 1])))
-                    parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, run],
-                                                                [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
-                    if more:
+                    if self.window:  # (the pass's NW groups from the staging)
+                        s0 = h * self.stage_groups * GROUP // 2 + s * SLOT // 4 + i * SLOT // 8 + qg * b * GROUP // 2
+                        parts.append(ChainPart(S, TensorAccessPattern((arg_elems(self, 3),), s0,
+                                                                      [1, AT.OBJS * self.nw, 2, run],
+                                                                      [0, OBJ_ELEMS, SLOT // 2, 1])))
+                    else:
+                        parts += [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS, 2, run],
+                                                                    [0, OBJ_ELEMS, SLOT // 2, 1]), length_parameter=p_n)]
+                    if more and not self.window:
                         parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, AT.OBJS * more, 2, run],
                                                                        [0, OBJ_ELEMS, SLOT // 2, 1]),
                                                offset_parameter=p_off))
-                    parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
+                    if not self.gh:  # (then the gate slots)
+                        parts.append(ChainPart(QS, TensorAccessPattern((n_qs,), q0 + qc * sl, q_dims, q_str)))
                     chained_fill(f, QS, parts, tp, wait=True)
                 inflight.append(tp)
                 if len(inflight) >= PASSES_IN_FLIGHT:
                     inflight.pop(0).finish()
             for tp in inflight:
                 tp.finish()
+            if self.window:  # (then the chunk's groups into the ring)
+                self._copy(KV, S, cph, coh, into_stage=False)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if pack else []),
+                           *([np.ndarray[(arg_elems(self, 3),), bf]] if self.window else []),
                            [kv3[hs][i].prod(tile=Tile(c + i, 0)) for hs, c in streams.items() for i in range(2)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)],
+                           *([[f.prod(tile=Tile(self.copy_column(h), 0)) for h, f in enumerate(cp)],
+                              [f.cons(tile=Tile(self.copy_column(h), 0)) for h, f in enumerate(co)]] if self.window else [])])
         module = Program(NPU2(), rt, workers=workers).resolve_program()
         lay = self.l1_layout()
         pin_l1_buffers(module, fifo=lambda name, depth: next((v for k, v in lay.items() if name.startswith(k)), None),

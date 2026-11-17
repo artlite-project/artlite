@@ -28,6 +28,23 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     aie::store_v(pm, mn);
 }
 
+{% if WG %}
+// (a sliding-window layer) Keys before the rows' windows in the group {{ WG }} groups before the panel's diagonal one
+// (record rec = t % 4; the records before rec whole, in rec the keys j <= q: the complement of the causal triangle), or
+// a whole group (``full``: further back, or before position 0): -16384
+__attribute__((noinline)) void {{ p }}_wmask(float *__restrict s, int32_t full, int32_t rec)
+{
+    const aie::mask<64> keep = aie::mask<64>::from_uint64(0x{{ tri }}ull);  // lane 8 q + j: j > q (in the window)
+    const aie::vector<float, 64> ninf = aie::broadcast<float, 64>(-16384.0f);
+    for (int k = 0; k < 4; k++) {
+        if (full || k < rec)
+            aie::store_v(s + 64 * k, ninf);
+        else if (k == rec)
+            aie::store_v(s + 64 * k, aie::select(ninf, aie::load_v<64>(s + 64 * k), keep));
+    }
+}
+
+{% endif %}
 {% if CAUSAL %}
 // Masked keys of a diag group (row panel token group t, record rec = t % 4; dd < 0: the group lies after the panel's
 // queries): -16384 (P = 0 against any real row maximum)
@@ -220,10 +237,14 @@ __attribute__((noinline)) void {{ p }}_qk1(const bfloat16 *__restrict q, const b
         a1.mac(qh, aie::op_transpose(K1));
         a2.mac(qh, aie::op_transpose(K2));
         a3.mac(qh, aie::op_transpose(K3));
+{% if not GH %}
         a0.mac(ql, aie::op_transpose(K0));
         a1.mac(ql, aie::op_transpose(K1));
         a2.mac(ql, aie::op_transpose(K2));
         a3.mac(ql, aie::op_transpose(K3));
+{% else %}
+        (void)ql;  // (single Q panels: the lo panels hold the gates, d-block 0's)
+{% endif %}
     }
     aie::store_v(sc, a0.template to_vector<float>());
     aie::store_v(sc + 64, a1.template to_vector<float>());
@@ -268,8 +289,12 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, flo
             const al::BV qh = qs.pop(), ql = qs.pop(), K0 = ks.pop(), K1 = ks.pop();
             a.mac(qh, aie::op_transpose(K0));
             c.mac(qh, aie::op_transpose(K1));
+{% if not GH %}
             a.mac(ql, aie::op_transpose(K0));
             c.mac(ql, aie::op_transpose(K1));
+{% else %}
+            (void)ql;  // (single Q panels: the lo panels hold the gates, d-block 0's)
+{% endif %}
         }
         aie::store_v(sc + 256 * h, a.template to_vector<float>());
         aie::store_v(sc + 256 * h + 64, c.template to_vector<float>());
@@ -287,7 +312,7 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict kr, flo
 // non-causal, r the prompt's keys in its last group (diag 0): the keys after them; a row's
 // maximum m is raised (o, l rescaled, pass 1 again) on the pass's first group (g = 0) and when the group's exceeds it
 // by 2^16; P = 2^(s - m) as bfp16 panels, l += P
-void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int32_t r, int32_t g)
+void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int32_t r, int32_t g{{ ", int32_t ghi" if WG }})
 {
 {% if "soft" in ablate %}
     return;
@@ -313,6 +338,10 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw, int32_t diag, int3
         const int t = {{ QG }} * r + h % {{ QG }}, dd = diag - ({{ QG - 1 }} - (t >> 2));
         if (dd <= 0)
             {{ p }}_mask(s, dd, t & 3);
+{% if WG %}
+        else if (dd >= {{ WG }} || diag > ghi)  // (before the rows' windows; groups before position 0: ghi - diag < 0)
+            {{ p }}_wmask(s, dd > {{ WG }} || diag > ghi, t & 3);
+{% endif %}
 {% else %}
         if (diag == 0 && r < 32)
             {{ p }}_keys(s, r);
@@ -477,14 +506,20 @@ void {{ p }}_qsel(const bfloat16 *__restrict a, bfloat16 *__restrict q, int32_t 
 {% endif %}
 
 // Row panel h's output: o / l sigmoid(gate) as the attn_out GEMM's 32 A panels (8 queries x 8 dims; sg: the row panels'
-// gate slots)
+// gate slots{{ "; a gate per head: the 8 tokens' in the panel's Q slot, d-block 0's lo panel, over every dim" if GH }})
 void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const aie::vector<float, 8> ls = al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * h));
     const aie::vector<float, 16> inv = aie::inv(aie::concat(ls, aie::broadcast<float, 8>(1.0f)));
     const aie::vector<float, 64> iv = al::bcast8(inv.template extract<8>(0));
-{% if TWO %}
+{% if GH %}
+    const bfloat16 *__restrict gq = sg + {{ "72 * h" if TWO else (SLOT // 2) ~ " * h" }} + {{ GATE_AT }};  // (the slot's gates)
+    aie::vector<bfloat16, 8> g8;
+    for (int q = 0; q < 8; q++)
+        g8.set(gq[q], q);
+    const aie::vector<bfloat16, 64> gv = al::expand8(g8);  // (lane 8 q + e: token q's)
+{% elif TWO %}
     const bfloat16 *__restrict g = sg + 72 * h;  // (per d-block and panel [query 8][8] and 8 zeros)
 {% else %}
     const bfloat16 *__restrict g = sg + {{ SLOT // 2 }} * h;  // (per d-block [query 8][8] and 8 zeros)
@@ -492,7 +527,9 @@ void {{ p }}_fin(float *__restrict ws, const bfloat16 *__restrict sg, int32_t h,
     const float *__restrict o = AW(float, {{ w.o }}) + 2048 * h;
     al::BOut<> po((bfp16ebs8 *)out);
     for (int db = 0; db < {{ ND }}; db++) {
+{% if not GH %}
         const aie::vector<bfloat16, 64> gv = al::gather<8, 8>(g + {{ 144 if TWO else 72 }} * db, 8);
+{% endif %}
         const aie::vector<float, 64> y = al::mulff<64>(aie::load_v<64>(o + 64 * db), iv);
         po.push(al::mulc<64>(y, gv).template to_vector<bfp16ebs8>());
     }

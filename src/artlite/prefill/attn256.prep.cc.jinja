@@ -1,5 +1,9 @@
 
-// The prep cores' workspace (bytes): nrm [q_norm | k_norm] fp32, row (256 fp32), stage [db 32][row 8][8] fp32
+// The prep cores' workspace (bytes): nrm [q_norm | k_norm] fp32, row (256 fp32), stage [db 32][row 8][8] fp32.
+{% if not NORMS %}
+// No norms (a windowed spec's, Spark-X's): q times log2(e) / 16, k as it is, the first {{ ROT }} pairs (i, i + {{ ROT }})
+// rotated{{ "; a gate per head: a Q core's object [8 q rows of 256 | 8 rows of the column's " ~ GW ~ " gate values]" if GH }}
+{% endif %}
 #define PW(T, off) ((T *)((uint8_t *)ws + (off)))
 
 {% set sigmoid = km.table_pass(km.SIGMOID) %}
@@ -7,6 +11,31 @@
 
 namespace {
 
+{% if not NORMS %}
+{% set CSF = ROT == 32 %}{# (cos / sin rows: a full layer's fp32, a sliding-window layer's bf16) #}
+// x (256 bf16) -> row (fp32; Q: times log2(e) / 16, bf16 hi / lo products), its pairs (i, i + {{ ROT }}) of i < {{ ROT }}
+// rotated by cs [cos {{ ROT }} | sin {{ ROT }}] ({{ "fp32" if CSF else "bf16" }})
+template <bool Q>
+__attribute__((noinline)) void {{ p }}_rot(const bfloat16 *__restrict x, const {{ "float" if CSF else "bfloat16" }} *__restrict cs, float *__restrict row)
+{
+    for (int i = 0; i < {{ HD }}; i += 64) {
+        const aie::vector<float, 64> xf = aie::accum<accfloat, 64>(aie::load_v<64>(x + i)).template to_vector<float>();
+        aie::store_v(row + i, Q ? al::mul_hilo<64, {{ qs[0] }}f, {{ qs[1] }}f>(xf) : xf);
+    }
+    for (int i = 0; i < {{ ROT }}; i += 32) {
+        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ ROT }} + i);
+{% if CSF %}
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ ROT }} + i);
+{% else %}
+        const aie::vector<float, 32> c = aie::accum<accfloat, 32>(aie::load_v<32>(cs + i)).template to_vector<float>();
+        const aie::vector<float, 32> s = aie::accum<accfloat, 32>(aie::load_v<32>(cs + {{ ROT }} + i)).template to_vector<float>();
+{% endif %}
+        aie::store_v(row + i, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
+        aie::store_v(row + {{ ROT }} + i, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
+    }
+}
+
+{% else %}
 // x (256 bf16) -> row = x / rms(x) w (fp32), dims 0 .. 63 rotated by cs [cos 32 | sin 32] (NeoX pairs i, i + 32)
 __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
                                           const float *__restrict cs, float *__restrict row)
@@ -25,6 +54,7 @@ __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const fl
     aie::store_v(row, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
     aie::store_v(row + 32, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
 }
+{% endif %}
 
 // row (256 fp32) -> row r of the stage [db][r][8]
 __attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
@@ -56,6 +86,7 @@ __attribute__((noinline)) void {{ p }}_hiloi(const float *__restrict st, uint8_t
 
 extern "C" {
 
+{% if NORMS %}
 // The first object: q_norm, k_norm (256 fp32 each); q_norm times the scores' scale log2(e) / 16 (the rotation is
 // linear: the scale before it)
 void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
@@ -65,7 +96,41 @@ void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
     for (int i = 0; i < {{ HD }}; i += 64)
         aie::store_v(PW(float, {{ w.nrm }}) + i, al::mul_hilo<64, {{ qs[0] }}f, {{ qs[1] }}f>(aie::load_v<64>(PW(float, {{ w.nrm }}) + i)));
 }
+{% endif %}
 
+{% if GH %}
+// 8 tokens of q head h: q (the object [8 q rows | 8 gate rows of {{ GW }}]), cs -> out (a slot): per d-block the single Q
+// panel of q log2(e) / 16, rotated, and 72 zero bytes, but d-block 0's: the 8 tokens' sigmoid(gate h) as bf16 (``GATE_AT``)
+// and zeros. The gates clamped to the table's range, the table pass (kmath.SIGMOID: within 0.54 bf16 ULP)
+void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out,
+               int32_t h)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict row = PW(float, {{ w.row }});
+    float *__restrict st = PW(float, {{ w.stage }});
+    for (int r = 0; r < 8; r++) {
+        {{ p }}_rot<true>(q + {{ HD }} * r, {{ "(const float *)cs_" if CSF else "cs_" }} + {{ 2 * ROT }} * r, row);
+        {{ p }}_scatter(row, st, r);
+    }
+    {
+        al::BOut<> o((bfp16ebs8 *)out);
+        const al::BV z = aie::zeros<accfloat, 64>().template to_vector<bfp16ebs8>();
+        for (int db = 0; db < {{ ND }}; db++) {
+            o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st + 64 * db)).template to_vector<bfp16ebs8>());
+            o.push(z);
+        }
+    }
+    bfloat16 *__restrict t = (bfloat16 *)PW(float, {{ w.row }});  // (the gates: 32 lanes, 8 used)
+    aie::vector<bfloat16, 32> g = aie::zeros<bfloat16, 32>();
+    for (int r = 0; r < 8; r++)
+        g.set(q[{{ 8 * HD }} + {{ GW }} * r + h], r);
+    const aie::vector<bfloat16, 32> hi = aie::broadcast<bfloat16, 32>({{ tmax }}f), lo = aie::broadcast<bfloat16, 32>(-{{ tmax }}f);
+    aie::store_v(t, aie::min(aie::max(g, lo), hi));
+    {{ sigmoid }}<32>(t, t, t, t);
+    for (int r = 0; r < 8; r++)
+        out[{{ GATE_AT }} + r] = t[r];
+}
+{% else %}
 // 8 tokens of a q head: q (rows [q 256 | gate 256] bf16), cs (8 x [cos 32 | sin 32] fp32) -> out: per d-block the
 // Q panels hi, lo of q / rms(q) q_norm log2(e) / 16, rotated
 void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, float *__restrict ws, bfloat16 *__restrict out)
@@ -75,12 +140,18 @@ void {{ p }}_q(const bfloat16 *__restrict q, const bfloat16 *__restrict cs_, flo
     float *__restrict row = PW(float, {{ w.row }});
     float *__restrict st = PW(float, {{ w.stage }});
     for (int r = 0; r < 8; r++) {
+{% if NORMS %}
         {{ p }}_nr(q + {{ 2 * HD }} * r, PW(float, {{ w.nrm }}), cs + 64 * r, row);
+{% else %}
+        {{ p }}_rot<true>(q + {{ 2 * HD }} * r, {{ "cs" if CSF else "cs_" }} + {{ 2 * ROT }} * r, row);
+{% endif %}
         {{ p }}_scatter(row, st, r);
     }
     {{ p }}_hiloi(st, (uint8_t *)out);
 }
+{% endif %}
 
+{% if not GH %}
 // sigmoid(gate) of the 8 tokens in the panel order of the attention's output: per 8 dims db a block [query 8][8] and 8
 // zeros (72 values: the slot's layout of a Q panel pair), sg. The gates clamped to the table's range into the stage
 // (bf16 [8][256]), the table pass in place (kmath.SIGMOID: within 0.54 bf16 ULP), then the blocks
@@ -109,6 +180,7 @@ void {{ p }}_sg(const bfloat16 *__restrict q, float *__restrict ws, bfloat16 *__
         po += 72;
     }
 }
+{% endif %}
 
 // 8 tokens of a KV head's K (rows [half 0 | half 1] bf16), cs -> record ``half`` of a pair of cache records ([d-block][record
 // 2], out): the first's panels into the workspace, then per d-block the first's and the second's
@@ -120,7 +192,11 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
     float *__restrict row = PW(float, {{ w.row }});
     const float *__restrict st = PW(float, {{ w.stage }});
     for (int r = 0; r < 8; r++) {
+{% if NORMS %}
         {{ p }}_nr(k + {{ HD }} * r, PW(float, {{ w.nrm }}) + {{ HD }}, cs + 64 * r, row);
+{% else %}
+        {{ p }}_rot<false>(k + {{ HD }} * r, {{ "cs" if CSF else "cs_" }} + {{ 2 * ROT }} * r, row);
+{% endif %}
         {{ p }}_scatter(row, PW(float, {{ w.stage }}), r);
     }
     if (!half) {
