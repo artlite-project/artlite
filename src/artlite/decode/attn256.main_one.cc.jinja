@@ -2,6 +2,7 @@
 {% set exp2 = km.exp2(32, below="zero", inline=True) %}
 {{ exp2.src }}
 
+{% if not GATE_HEAD %}
 // A head's gates: sigmoid(g) = 1 / (1 + 2^(-g log2 e)) (bf16-level: the output is rounded to bf16; -g log2 e: al::log2e's
 // products of the bf16 g, negated)
 __attribute__((noinline)) void {{ p }}_gates(const bfloat16 *__restrict g, bfloat16 *__restrict out)
@@ -17,7 +18,23 @@ __attribute__((noinline)) void {{ p }}_gates(const bfloat16 *__restrict g, bfloa
         out += 32;
     }
 }
+{% endif %}
 
+{% if GATE_HEAD %}
+// A head's one gate g (``mgate`` of a gate per head): sigmoid(g) (as ``gates``) over its 256 dims (out)
+__attribute__((noinline)) void {{ p }}_gate1(bfloat16 g, bfloat16 *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> gb = aie::broadcast<bfloat16, 32>(g);
+    const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
+                                                 aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
+    const aie::vector<bfloat16, 32> v = aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>();
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < {{ HD // 32 }}; j++)
+        aie::store_v(out + 32 * j, v);
+}
+
+{% endif %}
 namespace {
 
 // An object of another core (the main core's begin): an F_ATT object: its q objects' gates and its o's R objects
@@ -48,7 +65,11 @@ __attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_
     const bfloat16 *__restrict pay = x + {{ 2 * META }};
     AIE_LOOP_NO_UNROLL
     for (int h = 0; h < {{ QC }}; h++)
+{% if GATE_HEAD %}
+        {{ p }}_gate1(pay[{{ QC * HD }} + h], gt + {{ HD }} * (8 * h + i));  // (the heads' gates after their q)
+{% else %}
         {{ p }}_gates(pay + {{ 2 * HD }} * h + {{ HD }}, gt + {{ HD }} * (8 * h + i));
+{% endif %}
 }
 
 // An R object -> a C object: of o (fp32 y / l [slot 8][8] of a head's k block: the gates' products, bf16), or a record's

@@ -93,6 +93,7 @@ step's V, ...: ``AttnShape.ext``) lie in the main core's memory: its workspace p
 panels (``mx_bytes``), idle in a sub-step.
 """
 
+import math
 from typing import Literal, NamedTuple, Protocol
 
 import numpy as np
@@ -140,6 +141,12 @@ M_POS, M_SPLIT, M_G0, M_GATT, M_GJ, M_SA, M_NTAIL = ATT.words("M_POS M_SPLIT M_G
 M_ANA = ATT.word("M_ANA", at=36)  # (one pass) the core's A objects through its held ones
 M_AMASK = ATT.block("M_AMASK", 4, at=38)  # (one pass) the rows' masks of the step's first two records (A_MK)
 M_ALANE = ATT.word("M_ALANE", at=42)  # (one pass) the slots' K lanes (A_LN)
+# (a windowed spec, ``AttnSpec.window``) the layer's kind (KIND_FULL, KIND_SWA), the record of the step's first slot's
+# window start (-1: none; the records before it in the first group: masked whole), the rows' masks of that record and
+# the next (per record rows 0 .. 3, 4 .. 7: a row's lanes before its window, A_WM)
+M_KIND, M_WREC = ATT.words("M_KIND M_WREC", at=43)
+M_WMASK = ATT.block("M_WMASK", 4, at=45)
+KIND_FULL, KIND_SWA = 0, 1
 
 HD = 256  # head_dim
 ND = HD // 8  # d-blocks (panels per record part)
@@ -175,7 +182,7 @@ SPLIT_CHAIN, SPLIT_ROUND, SPLIT_KV, SPLIT_NOREC = 1, 2, 4, 8
 # held ones; A_NKH: the sub-step group's K objects after the tails (a chain's first column, not split); A_NRM, A_VN, A_GS,
 # A_QA (one per octet): the addresses of the norms, the step's V, the gates, the Q panels; A_HP: the held objects (in
 # order), A_RW: the open records' rows (per tail object)
-STATE = WordMap("attention core state", 50)
+STATE = WordMap("attention core state", 56)
 _A = STATE.common
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
  A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = _A.words(
@@ -196,6 +203,11 @@ ONE = STATE.kind("one pass")
 A_KR, A_KN, A_KM, A_KB, A_BR = ONE.words("A_KR A_KN A_KM A_KB A_BR", at=A_WORDS)
 A_MK = ONE.block("A_MK", 4)
 A_LN = ONE.word("A_LN")
+ONE_WORDS = ONE.next_free()  # (the one-pass core's state words without a window)
+# (one pass, a windowed spec) the layer's kind, the window's first record and its masks (M_KIND, M_WREC, M_WMASK)
+WIN = STATE.kind("one pass window")
+A_KD, A_WR = WIN.words("A_KD A_WR", at=ONE_WORDS)
+A_WM = WIN.block("A_WM", 4)
 # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 ROLE_K, ROLE_V, ROLE_O = _A.values("ROLE_K ROLE_V ROLE_O", of="role")
 
@@ -203,7 +215,7 @@ ROLE_K, ROLE_V, ROLE_O = _A.values("ROLE_K ROLE_V ROLE_O", of="role")
 def consts() -> dict[str, int]:
     """The words and flags the attention core's kernels take (and the main core's, for the gates): the metadata words of its
     objects, its state words and the main core's gate words."""
-    return XMETA.consts(PHASE, ATT, FLAGS) | STATE.consts(ONE) | GATES.consts()
+    return XMETA.consts(PHASE, ATT, FLAGS) | STATE.consts(ONE, WIN) | GATES.consts()
 
 
 _SRC = templating.load("artlite/decode/attn256.cc.jinja")
@@ -217,6 +229,24 @@ _MAIN_SRC = templating.load("artlite/decode/attn256.main.cc.jinja")
 
 # The main core's part of one pass: the gates of the query rows, per step (the attention core's L1 holds none)
 _MAIN_ONE = templating.load("artlite/decode/attn256.main_one.cc.jinja")
+
+
+class AttnSpec(NamedTuple):
+    """What a model's attention asks of the core: ``norms``: q / k RMS-normed per head with weights from the F_ATT
+    object (qwen35's; else none, q scaled by log2(e) / 16 in the core); ``gate``: "dim", a sigmoid gate per dim (a q
+    object's [q | gate] per head), or "head", one per head (the q object's QC gates after its heads' q, each broadcast
+    over its head's dims by the main core); ``window``: the sliding-window layers' window (0: none; then the F_ATT
+    object's M_KIND says a layer's kind: a full layer's rotation of the first 32 pairs at fp32, a sliding-window layer's
+    of all 128 at bf16, the cache streamed from its window's first group, M_G0, the keys before a row's window masked,
+    M_WREC); ``branch``: branching steps (``M_BRANCH``). One pass only past qwen35's."""
+
+    norms: bool = True
+    gate: str = "dim"
+    window: int = 0
+    branch: bool = True
+
+
+QWEN = AttnSpec()  # (qwen35's)
 
 
 class Addr(NamedTuple):
@@ -233,10 +263,13 @@ class AttnShape:
     memory."""
 
     def __init__(self, cfg: AttnConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
-                 slots: int = SLOTS):
-        """slots: a step's slots at most (a design of 8: ``one``)."""
+                 slots: int = SLOTS, spec: AttnSpec = QWEN):
+        """slots: a step's slots at most (a design of 8: ``one``); spec: the model's attention (``AttnSpec``)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.one = slots == 8  # (module docstring "One pass")
+        self.spec = spec
+        assert spec == QWEN or self.one, spec
+        assert spec.gate in ("dim", "head") and (spec.window == 0 or spec.window % 8 == 0), spec
         self.smax = slots if self.one else SLOTS
         self.kvh = cfg.num_key_value_heads
         assert COLS % self.kvh == 0 and COLS // self.kvh >= 2 and 2 * HD * self.kvh <= xpay
@@ -278,7 +311,8 @@ class AttnShape:
         the gates there (unless the main core applies them), the norms and the step's V too where the octets' Q panels
         then fit the core's L1, else the Q panels that do not."""
         y = ("y", 4 * 32 * (ND + 1) * self.sets)
-        own = [("st", 4 * (STATE.size if self.one else A_WORDS)), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
+        st = (STATE.size if self.spec.window else ONE_WORDS) if self.one else A_WORDS
+        own = [("st", 4 * st), y, ("ml", 4 * 64 * self.sets), ("sc", 4 * 128 * self.sets),
                ("pp", self.ps)]
         self.gate_tab = not self.one and not self.main_gates  # (the sigmoid's table in the core's L1)
         fixed = 2 * self.a_bytes + XB + 2 * self.r_bytes + 64 + STACK + (SIGMOID.table_words().nbytes if self.gate_tab else 0)
@@ -397,7 +431,9 @@ class AttnShape:
         v = dict(p=p, a=Attr(self.workspace()), at=self.at(tail), QC=self.qc, NPH=self.nph, SETS=self.sets, NO=self.octets, SMAX=self.smax,
                  HD=HD, ND=ND, HOLD=HOLD, PS=self.ps, PO=self.po, REC_K=REC_K, REC_V=REC_V, ROWS_B=ROWS_B, eps=repr(self.eps),
                  C_LEN=self.c_len, META=META, NX_PER_NORM=nx_per_norm, OBJ=self.a_bytes, PAIR_K=2 * REC_K, NO_OBJ=32 * self.qc,
-                 GATE_MAIN=self.main_gates, PACKED8=packed8, ROUNDS=self.rounds,
+                 GATE_MAIN=self.main_gates, PACKED8=packed8, ROUNDS=self.rounds, NORMS=self.spec.norms,
+                 GATE_HEAD=self.spec.gate == "head", WINDOW=self.spec.window, BRANCH=self.spec.branch,
+                 KIND_SWA=KIND_SWA, LOG2E16=repr(float(np.float32(math.log2(math.e) / 16))),
                  SPLIT_ROUND=SPLIT_ROUND, SPLIT_NOREC=SPLIT_NOREC,
                  **consts())
         if self.one:
@@ -422,6 +458,23 @@ def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[i
             n = min(max(pos[s] - 8 * k + 1, 0), 8)
             w[2 * k + s // 4] |= ((0xFF << n) & 0xFF) << (8 * (s % 4))
     return word, w, sum((pos[s] % 8) << (3 * s) for s in range(8))
+
+
+def window_words(p: int, window: int) -> tuple[int, int, np.ndarray]:
+    """(a windowed spec) A sliding-window layer's F_ATT words of a step at p (row s: slot s at p + s, its keys
+    p + s - window + 1 .. p + s): the cache's first group streamed (``M_G0``: the group of the first slot's window
+    start), the record of that start (``M_WREC``: -1, every row's window from position 0 on), the rows' masks of it and
+    the next record (``M_WMASK``: per record rows 0 .. 3, 4 .. 7, a row's lanes before its window)."""
+    first = p - window + 1
+    w = np.zeros(4, np.uint32)
+    if first <= 0:
+        return 0, -1, w
+    r = first >> 3
+    for k in range(2):
+        for s in range(8):
+            n = min(max(first + s - 8 * (r + k), 0), 8)
+            w[2 * k + s // 4] |= ((1 << n) - 1) << (8 * (s % 4))
+    return first >> 5, r, w
 
 
 # ----------------------------------------------------------------------

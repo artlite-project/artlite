@@ -1,15 +1,18 @@
-"""The attention core of the gated attention of head_dim 256 (``decode.attn256``) on the NPU, in the qwen35 models'
-decode design (``models.qwen35.decode``) on random inputs, against ``tests/qwen35/ref.py``'s ``core_attention``."""
+"""The attention core of the gated attention of head_dim 256 (``decode.attn256``) on the NPU on random inputs: in the qwen35
+models' decode design (``models.qwen35.decode``) against ``tests/qwen35/ref.py``'s ``core_attention``; with Spark-X's
+spec (no norms, a gate per head, sliding-window layers, one pass) against the fp64 attention of what each slot sees."""
 
 import numpy as np
 import pytest
+from ml_dtypes import bfloat16
 
 from artlite.decode import attn256 as A1
 from artlite.decode import kv as KV
 from artlite.decode import protocol as PR
+from artlite.decode.attn256_design import Attn256DecodeOperator
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import QwenConfig
+from artlite.model_config import QwenConfig, SparkConfig, spark_gguf
 from artlite.operators.bfp16 import block_bytes, block_values
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
@@ -270,3 +273,206 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
 def interleave_bits(v: np.ndarray) -> np.ndarray:
     """bf16 values -> their bytes."""
     return np.ascontiguousarray(np.asarray(v, np.float32)).view(np.uint32).__rshift__(16).astype(np.uint16).view(np.uint8)
+
+
+# ----------------------------------------------------------------------
+# Spark-X's spec: no q / k norms, a gate per head, sliding-window layers
+# ----------------------------------------------------------------------
+
+SPARK = A1.AttnSpec(norms=False, gate="head", window=512, branch=False)
+
+
+class _SparkDesign(Attn256DecodeOperator):
+    PREFIX = "spkt"
+
+
+def _spark_tables(cfg: SparkConfig, kind: str, positions: list[int]) -> tuple[np.ndarray, np.ndarray, bytes]:
+    """The slots' angles as the core takes them (a full layer's 32 pairs fp32, a sliding-window layer's 128 bf16) and
+    the F_ATT payload's bytes: cos, sin (S, rot) of the values the core multiplies by."""
+    th = cfg.rope_theta(positions, kind).astype(np.float64)
+    c, s = np.cos(th).astype(np.float32), np.sin(th).astype(np.float32)
+    if kind == "swa":
+        c, s = bf16_round(c), bf16_round(s)
+        payload = np.concatenate([c, s], 1).astype(bfloat16).tobytes()
+    else:
+        payload = np.concatenate([c, s], 1).astype(np.float32).tobytes()
+    return c, s, payload
+
+
+def _rot(x: np.ndarray, c: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """NeoX pairs (i, i + rot) of x (..., 256) turned by cos c, sin s (rot,), fp64."""
+    r = len(c)
+    y = np.asarray(x, np.float64).copy()
+    a, b = y[..., :r].copy(), y[..., r:2 * r].copy()
+    y[..., :r], y[..., r:2 * r] = a * c - b * s, a * s + b * c
+    return y
+
+
+def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5) -> dict:
+    """One step of S slots at p of a Spark layer of ``kind`` on random inputs, one pass (``SPARK``): the cache of the
+    positions before p (K as stored, V bf16) in groups, a ring of ``ring`` groups (0: linear; a sliding-window layer's
+    window that crosses its end: two fills), streamed from the window's first group (``window_words``); per column the
+    o of its heads' slots and its emitted records."""
+    path = spark_gguf(size)
+    require(path)
+    cfg = SparkConfig.from_gguf(GGUFFile(path))
+    G = (p + S - 1) // 32 + 1
+    P = 32 * G
+    ash = A1.AttnShape(cfg, P, slots=8, spec=SPARK)
+    op = _SparkDesign(attn=ash, hidden=cfg.hidden_size, rows={"Q4_K": 16}, eps=cfg.rms_norm_eps, slots=8, packed=True,
+                      bcast=True)
+    dev = OverlayDevice(op)
+    rng = np.random.default_rng(seed)
+    qc, HD, T, nph, kvh = ash.qc, A1.HD, op.tile_bytes, ash.nph, cfg.num_key_value_heads
+    rp, rl = p // 8, (p + S - 1) // 8
+    swa = kind == "swa"
+    g0, wrec, wm = A1.window_words(p, cfg.sliding_window) if swa else (0, -1, np.zeros(4, np.uint32))
+    P8 = 32 * ((p + 7) // 32 + 1)  # (drawn for 8 slots: a step of any S sees the same cache)
+    kc = rng.standard_normal((kvh, P8, HD)).astype(np.float32)[:, :P]
+    vc = bf16_round(rng.standard_normal((kvh, P8, HD)).astype(np.float32))[:, :P]
+    kc[:, p:] = vc[:, p:] = 0
+    groups = [KV.kv_groups(kc[h], vc[h], T, 1, dmajor=True) for h in range(kvh)]  # (G, 2, T) each
+    kc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[0] for gr in groups]
+    vc_s = [KV.kv_from_groups(gr, HD, dmajor=True)[1] for gr in groups]
+    NR = ring or G  # (groups of a head's cache: group g at g % NR)
+    assert G - g0 <= NR
+    hb, rb = NR * 2 * T, 2 * T
+    dev.alloc("KV", kvh * (hb + rb) + T)
+    kvv = dev.view("KV")
+    for h in range(kvh):
+        for g in range(g0, G):
+            kvv[h * hb + (g % NR) * 2 * T:][:2 * T] = groups[h][g].reshape(-1)
+        rows = vc[h][8 * rp:8 * rp + 8].reshape(8, A1.ND, 8).transpose(1, 0, 2)
+        o = kvh * hb + h * rb + (rp & 1) * T
+        kvv[o:o + A1.ROWS_B] = interleave_bits(rows.reshape(-1))
+    dev.flush("KV")
+    # (drawn for 8 slots: a slot's inputs are the same in steps of any S)
+    q = bf16_round(rng.standard_normal((COLS, 8, qc, HD)).astype(np.float32))[:, :S]
+    gate = bf16_round(rng.standard_normal((COLS, 8, qc)).astype(np.float32))[:, :S]
+    kv = bf16_round(rng.standard_normal((8, kvh, 2 * HD)).astype(np.float32))[:S]  # [K | V] per KV head
+    c_, s_, payload = _spark_tables(cfg, kind, list(range(p, p + S)))
+    nt = ash.records(S)
+    per = 9 * PR.XB  # (per column: F_ATT, then its 8 q objects)
+    act = dev.alloc("ACT", COLS * per + S * PR.XB)
+    word, amask, lanes = A1.step_words(p, S)
+    ana = A1.OBJS * (G - g0) + nt
+    for c in range(COLS):
+        m = np.zeros(PR.META, np.int32)
+        m[PR.M_FLAGS], m[PR.M_NS], m[PR.M_SKIP], m[PR.M_NREL] = A1.F_ATT, S, 2 * S, ash.n_rel(c, 0, S)
+        m[A1.M_POS], m[A1.M_SPLIT], m[A1.M_NTAIL], m[A1.M_G0], m[A1.M_GATT], m[A1.M_GJ] = p, 0, nt, g0, 1 << 20, 0
+        m[PR.M_NASKIP], m[A1.M_ANA] = 0 if c % nph else ana, ana
+        m[A1.M_BRANCH], m[A1.M_ALANE] = word, lanes
+        m[A1.M_AMASK:A1.M_AMASK + 4] = amask.view(np.int32)
+        m[A1.M_KIND], m[A1.M_WREC] = A1.KIND_SWA if swa else A1.KIND_FULL, wrec
+        m[A1.M_WMASK:A1.M_WMASK + 4] = wm.view(np.int32)
+        o = c * per
+        act[o:o + 4 * PR.META] = m.view(np.uint8)
+        act[o + 4 * PR.META:o + 4 * PR.META + len(payload)] = np.frombuffer(payload, np.uint8)
+        for s in range(S):
+            q0 = o + (1 + s) * PR.XB + 4 * PR.META
+            act[q0:q0 + 2 * qc * HD] = interleave_bits(q[c, s].reshape(-1))
+            act[q0 + 2 * qc * HD:q0 + 2 * qc * HD + 2 * qc] = interleave_bits(gate[c, s])
+    for s in range(S):
+        k0 = COLS * per + s * PR.XB + 4 * PR.META
+        act[k0:k0 + 2 * kvh * 2 * HD] = interleave_bits(kv[s].reshape(-1))
+    dev.flush("ACT")
+    ob = qc * 32 * 8 * 16  # (o of a column's heads: [head][k block 32][slot 8][8] bf16)
+    nr = 2 * (A1.REC_V + A1.ROWS_B)
+    dev.alloc("OUT", COLS * ob)
+    dev.alloc("REC", COLS * nr)
+    seq = Sequence(op)
+    for c in range(0, COLS, nph):  # (one pass: a chain's first column's stream reaches its cores)
+        h = c // nph
+        base, rg = dev.address("KV", h * hb), dev.address("KV", kvh * hb + h * rb)
+        a, b = g0 % NR, (G - 1) % NR + 1
+        if b > a:
+            seq.fill("A", c, base + a * 2 * T, (b - a) * 2 * T)
+        else:  # (the window wraps the ring)
+            seq.fill("A", c, base + a * 2 * T, (NR - a) * 2 * T)
+            seq.fill("A", c, base, b * 2 * T)
+        for t in range(nt):
+            seq.fill("A", c, rg + ((rl if t else rp) & 1) * T, T)
+    for c in range(COLS):
+        seq.fill("X", c, dev.address("ACT", c * per), PR.XB)
+        seq.fill("X", c, dev.address("ACT", c * per + PR.XB), S * PR.XB)
+        seq.fill("X", c, dev.address("ACT", COLS * per), S * PR.XB)
+    for c in range(COLS):
+        seq.drain("C", c, dev.address("OUT", c * ob), ob)
+        role = ash.role(c)
+        n = nt * {A1.ROLE_K: A1.REC_K, A1.ROLE_V: A1.REC_V + A1.ROWS_B, A1.ROLE_O: 0}[role]
+        if n:
+            seq.drain("C", c, dev.address("REC", c * nr), n)
+    seq.sync(fills=True)
+    dev.dispatch(Transaction(dev, seq.words()))
+    dev.fetch("OUT")
+    dev.fetch("REC")
+    outs = dev.view("OUT").view(np.uint16).reshape(COLS, qc, 32, 8, 8)
+    o = np.stack([from_bf16_bits(outs[:, :, :, s].reshape(COLS, qc, HD)) for s in range(S)], 1)  # (COLS, S, qc, 256)
+    return {"cfg": cfg, "ash": ash, "o": o, "recs": dev.view("REC").reshape(COLS, -1).copy(), "q": q, "gate": gate,
+            "kv": kv, "kc_s": kc_s, "vc_s": vc_s, "vc": vc, "cs": (c_, s_), "swa": swa}
+
+
+def _spark_ref(r: dict, p: int, S: int, c: int, s: int) -> tuple[np.ndarray, np.ndarray]:
+    """fp64: o * sigmoid(gate) (qc, 256) of column c's heads at slot s (what the slot sees: the cache before p as stored,
+    the step's open records encoded from their rows up to its position, the step's earlier slots' K as the core
+    computed them), and the slot's K."""
+    cfg, ash, HD = r["cfg"], r["ash"], A1.HD
+    h = c // ash.nph
+    cs = (r["cs"][0][s].astype(np.float64), r["cs"][1][s].astype(np.float64))
+    pos = p + s
+    lo = max(0, pos - cfg.sliding_window + 1) if r["swa"] else 0
+    rows = {x: r["vc"][h][8 * x:8 * x + 8].copy() for x in {p // 8, (p + S - 1) // 8}}
+    for t in range(S):
+        rows[(p + t) // 8][(p + t) % 8] = r["kv"][t, h, HD:]
+    v_seen = r["vc_s"][h][:pos].copy()
+    for x in sorted(rows):
+        if 8 * x <= pos:
+            v_seen = np.concatenate([v_seen[:8 * x], _enc(rows[x], min(pos + 1 - 8 * x, 8))])[:pos + 1]
+    knew = [_rot(r["kv"][t, h, :HD], r["cs"][0][t].astype(np.float64), r["cs"][1][t].astype(np.float64))
+            for t in range(s + 1)]
+    K = np.concatenate([np.asarray(r["kc_s"][h][:p], np.float64), np.stack(knew)])[lo:pos + 1]
+    V = np.asarray(v_seen, np.float64)[lo:pos + 1]
+    qr = _rot(r["q"][c, s], *cs)
+    sc = qr @ K.T / 16
+    pr = np.exp(sc - sc.max(-1, keepdims=True))
+    o = (pr @ V) / pr.sum(-1, keepdims=True)
+    return o / (1 + np.exp(-np.asarray(r["gate"][c, s], np.float64)))[:, None], knew[-1]
+
+
+@pytest.mark.parametrize(("size", "kind", "p", "S", "ring"),
+                         [("4B", "swa", 0, 1, 0), ("4B", "swa", 5, 3, 0), ("4B", "swa", 511, 1, 0), ("4B", "swa", 512, 8, 0),
+                          ("4B", "swa", 540, 8, 0), ("4B", "swa", 1000, 8, 0), ("4B", "full", 1001, 8, 0),
+                          ("4B", "full", 30, 4, 0), ("1.7B", "swa", 1003, 8, 0), ("1.7B", "full", 700, 5, 0),
+                          ("4B", "swa", 1000, 8, 20), ("1.7B", "swa", 1500, 7, 18)])
+def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int) -> None:
+    """Spark's attention (``SPARK``): per column and slot o within bfp16 / bf16 rounding of the fp64 attention over what the
+    slot sees: a sliding-window layer's keys p + s - 511 .. p + s (its window's first group streamed first, the keys
+    before a row's window masked: rows whose window starts in the second group too), a full layer's all; the rotation of
+    the kind (128 bf16 pairs, 32 fp32); one gate per head; the relayed K records of the step's positions; a ring whose
+    window crosses its end read in two fills."""
+    r = _spark(size, kind, p, S, ring=ring)
+    ash, HD = r["ash"], A1.HD
+    for c in range(COLS):
+        for s in range(S):
+            want, _ = _spark_ref(r, p, S, c, s)
+            assert rel_max(r["o"][c, s], want) < 3e-2, (c, s, rel_max(r["o"][c, s], want))
+    rp, rl = p // 8, (p + S - 1) // 8
+    for c in range(0, COLS, ash.nph):  # (a chain's first column: the K records of the step's first and last positions)
+        h = c // ash.nph
+        knew = np.stack([_spark_ref(r, p, S, c, s)[1] for s in range(S)])
+        k_all = np.concatenate([r["kc_s"][h][:p], knew])
+        for i, x in enumerate([rp, rl]):
+            kg = np.zeros(((p + S - 1) // 32 + 1, 2, A1.OBJ_BYTES), np.uint8)
+            b_ = r["recs"][c, i * A1.REC_K:(i + 1) * A1.REC_K].reshape(A1.ND, 72)
+            kg[x // 4, 0, (x % 4) // 2 * 2 * A1.REC_K:][:2 * A1.REC_K].reshape(A1.ND, 2, 72)[:, x % 2] = b_
+            got = KV.kv_from_groups(kg, HD, dmajor=True)[0][8 * x:min(8 * x + 8, p + S)]
+            assert rel_max(got, k_all[8 * x:min(8 * x + 8, p + S)]) < 1e-2, (c, x)
+
+
+@pytest.mark.parametrize(("size", "kind", "p"), [("4B", "swa", 1000), ("1.7B", "full", 700), ("4B", "swa", 540),
+                                                ("1.7B", "swa", 1022)])
+def test_spark_slot_alone(size: str, kind: str, p: int) -> None:
+    """A step's first slot gets the numbers of a step of one at its position (bit for bit): its row depends on no later
+    slot's (later slots in its record or the next, a window's masks of rows past it)."""
+    a, b = _spark(size, kind, p, 8), _spark(size, kind, p, 1)
+    assert np.array_equal(a["o"][:, 0], b["o"][:, 0])

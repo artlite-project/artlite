@@ -33,7 +33,7 @@ class Attn256DecodeOperator(DecodeOverlayOperator):
     ATTN_ROW = 5
 
     def __init__(self, *, attn: AT.AttnShape | None, **kw: object):
-        assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == kw["tile_bytes"])
+        assert attn is None or (attn.c_len == C_LEN and attn.a_bytes == kw.get("tile_bytes", AT.OBJ_BYTES))
         self.attn = attn
         self._aws: dict[int, Buffer] = {}
         self.relay = attn is not None
