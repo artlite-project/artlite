@@ -100,7 +100,8 @@ QA_NK = "qa_nk"  # (non-causal) the prompt's keys in its last group (1 .. 32)
 QA_OFF = "qa_off"  # bf16 offset of the chunk's second cache group
 QA_CS_SWA = "qa_cs_swa"  # (a sliding-window layer's prep) bf16 offset of the chunk's rows in its cos / sin table
 # (a sliding-window layer's attention) the ring's two pieces (first slot as a bf16 offset, groups: ``ring_pieces``) of
-# the window's history before the chunk (into the staging's head) and (T's) of the chunk's groups (from the staging)
+# the window's history before the chunk (into the staging's head) and of the chunk's groups (from the staging): one name
+# for every size (only the ring's transfers read them, of one shape; a library reads at most 32 parameters)
 QA_HA, QA_HAN, QA_HB, QA_HBN = "qa_ha", "qa_han", "qa_hb", "qa_hbn"
 QA_CA, QA_CAN, QA_CB, QA_CBN = "qa_ca", "qa_can", "qa_cb", "qa_cbn"
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
@@ -413,7 +414,7 @@ class PrefillAttnOperator(ArtcOperator):
     read a linear staging S (per KV head WG = window / 32 groups of the window's history, then the chunk's, which the
     prep writes there: ``AttnPrepOperator(hist=)``); first the history's groups are copied from the ring into S's head
     (each KV head's column: shim -> memtile -> shim, its free channels; the ring's two pieces ``QA_HA`` ..), last the
-    chunk's groups from S into the ring (``QA_CA`` .., T's): a runtime sequence reads at most 32 parameters, so the
+    chunk's groups from S into the ring (``QA_CA`` ..): a runtime sequence reads at most 32 parameters, so the
     passes' windows (a ring's pieces per pass) read S at static offsets. Every pass streams NW = WG + QG groups ending at
     its last (the window of its first query and its own); the keys before each row's window masked (in the group WG
     before its diagonal one the complement of the causal triangle, before it whole) and the groups before position 0
@@ -429,7 +430,8 @@ class PrefillAttnOperator(ArtcOperator):
     pfx = kernel_prefix("qaa")
 
     def __init__(self, *, T: int, cfg: AttnConfig, head_bytes: int, ablate: tuple[str, ...] = (), causal: bool = True,
-                 pp: int = 1, pack: bool = False, window: int = 0, ring: int = 0, spec: AT.AttnSpec = AT.QWEN):
+                 pp: int = 1, pack: bool = False, window: int = 0, ring: int = 0, spec: AT.AttnSpec = AT.QWEN,
+                 stage: int = 0):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
         results); "ev_qk", "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters
         programmed (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or
@@ -440,6 +442,8 @@ class PrefillAttnOperator(ArtcOperator):
         self.T, self.cfg, self.head_bytes, self.causal, self.pp, self.pack = T, cfg, head_bytes, causal, pp, pack
         assert (window == 0) == (ring == 0) and window % 32 == 0 and (not window or (causal and not pack)), (window, ring)
         self.window, self.ring = window, ring
+        self._stage = stage  # (a sliding-window layer: the staging's groups per KV head, at least the history's and T's)
+        assert not stage or stage >= window // 32 + T // 32
         # (a gate per head, Spark-X's: QS holds the Q slots alone, single Q panels, the gates in d-block 0's lo panel:
         # ``AttnPrepOperator.tg_slots``)
         self.gh = spec.gate == "head"
@@ -481,8 +485,9 @@ class PrefillAttnOperator(ArtcOperator):
 
     @property
     def stage_groups(self) -> int:
-        """(a sliding-window layer) groups of a KV head's staging: the window's history, then the chunk's."""
-        return self.window // 32 + self.T // 32
+        """(a sliding-window layer) groups of a KV head's staging: the window's history, then the chunk's (``stage``: a
+        prefill's chunk sizes share one staging layout, its preps' per sub-chunk)."""
+        return self._stage or self.window // 32 + self.T // 32
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
@@ -519,10 +524,8 @@ class PrefillAttnOperator(ArtcOperator):
         if self.window:  # (the ring's pieces of the window's history and of the chunk's groups)
             wg = self.window // 32
             h, c = ring_pieces(p0 // 32 - wg, wg, self.ring), ring_pieces(p0 // 32, self.T // 32, self.ring)
-            T = self.T
             return {QA_N: p0 // 32 + 1, QA_HA: GROUP // 2 * h[0], QA_HAN: h[1], QA_HB: GROUP // 2 * h[2], QA_HBN: h[3],
-                    f"{QA_CA}{T}": GROUP // 2 * c[0], f"{QA_CAN}{T}": c[1], f"{QA_CB}{T}": GROUP // 2 * c[2],
-                    f"{QA_CBN}{T}": c[3]}
+                    QA_CA: GROUP // 2 * c[0], QA_CAN: c[1], QA_CB: GROUP // 2 * c[2], QA_CBN: c[3]}
         return {QA_N: p0 // 32 + 1, f"{QA_OFF}{self.T}": GROUP // 2 * (p0 // 32 + 1)}
 
     def _copy_fifos(self) -> tuple[list[ObjectFifo], list[ObjectFifo]]:
@@ -545,7 +548,7 @@ class PrefillAttnOperator(ArtcOperator):
         T, wg, kvh = self.T, self.window // 32, self.kvh
         n_kv, n_s = arg_elems(self, 1), arg_elems(self, 3)
         hb, hs, row = self.head_bytes // 2, self.stage_groups * GROUP // 2, OBJ_ELEMS // 8
-        names = (QA_HA, QA_HAN, QA_HB, QA_HBN) if into_stage else tuple(f"{n}{T}" for n in (QA_CA, QA_CAN, QA_CB, QA_CBN))
+        names = (QA_HA, QA_HAN, QA_HB, QA_HBN) if into_stage else (QA_CA, QA_CAN, QA_CB, QA_CBN)
         prm = [ScratchpadParameter(n, np.int32) for n in names]
         tg = TaskGroup()
         for h in range(kvh):
