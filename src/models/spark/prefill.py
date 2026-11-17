@@ -20,6 +20,15 @@ of the GEMMs' K (the 4B's 2560 in 3072: ``out_pitch``). Per layer L:
 
 The first layer's input norm (``in``) starts the chunk. The control code is assembled on the host from one library ELF
 and runs in pieces of whole layers (``prefill.chunks.ChunkPrefill``).
+
+With a DSpark drafter (``dspark``: ``dspark.DSparkOverlay``) the chunk also writes the drafter's records of its positions,
+the injection's rows in GEMMs on the drafter's image (DW): at each tap layer's start x normed by its row of ``fc_norm``
+as panels (FT, the ``in`` norm); after the last layer fc per tap (FY: a C slot each), their sum into a zero x normed by
+``enc.output_norm`` (g's panels FG: the ``add`` norms of 4 parts and 1); per drafter layer its ikv rows of g (FK) and
+the K / V prep of a sliding-window layer (``AttnPrepOperator(q=False, staged=True)``) into a linear staging (DS: per
+layer and KV head the chunk's groups), from which the host copies the groups a block's window can read into the
+drafter's rings (``run``'s ``rows_from``). Only a chunk that holds such rows runs them (its size's runlist variant
+("dspark", T)): +2.7% of a 1K prompt's TTFT on the 4B.
 """
 
 import numpy as np
@@ -71,11 +80,12 @@ class SparkPrefill(ChunkPrefill):
     KV_PAD = CHUNK  # (the overlay's padding past its last cache: a full layer's prep slices a sub-chunk's groups on)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
-    def __init__(self, overlay: SparkOverlay, *, sizes: tuple[int, ...] = SIZES):
+    def __init__(self, overlay: SparkOverlay, *, sizes: tuple[int, ...] = SIZES, dspark: object = None):
         ov = overlay
         super().__init__(overlay, sizes)
         self.layers = ov.layers
         self.kv_layers = list(ov.layers)
+        self.ds = dspark
         cfg = self.cfg
         self.window = cfg.sliding_window
         self.wg = self.window // 32
@@ -94,6 +104,16 @@ class SparkPrefill(ChunkPrefill):
             for k in ("full", "swa") for T in self.sizes}
         self.cs_rows = ov.max_positions + MAX_T
         self._starts: dict[int, list[int]] = {}  # (per chunk size: its layers' first items)
+        if dspark is not None:
+            dc, di = dspark.cfg, dspark.image
+            assert set(dc.taps) <= set(self.layers) and (dc.rope_base, dc.rope_dims) == (cfg.rope_base_swa,
+                                                                                         cfg.rope_dims_swa)
+            self.dstage = MAX_T // 32  # (the staging's groups per KV head: a chunk's)
+            self.dplans = {t: {**{(i, "fc"): PG.plan_phase(di, di.region(i, "fc"), t, pitch=self.d_pitch[t],
+                                                           ops=self._gemms) for i in range(len(dc.taps))},
+                               **{(L, "ikv"): PG.plan_phase(di, di.region(L, "ikv"), t, ops=self._gemms)
+                                  for L in dspark.layers}} for t in self.plans}
+            assert all(p.parts == 1 for o in self.dplans.values() for p in o.values())
         self._rows()
         self._library()
 
@@ -161,6 +181,12 @@ class SparkPrefill(ChunkPrefill):
             for n in ("o", "d"):
                 self.np_off[(L, n)] = k * 16 * H
                 k += 1
+        if self.ds is not None:  # (the drafter's: tap i's fc_norm, the sum's enc.output_norm)
+            for key in [("tap", i) for i in range(len(self.ds.cfg.taps))] + [("dfc", 0), ("dfc", 1)]:
+                self.np_off[key] = k * 16 * H
+                k += 1
+            pk = max(p.layout.pitch for o in self.dplans.values() for (L, n), p in o.items() if n == "ikv")
+            self.rb |= {"FX": 4 * H, "FZ": 4 * H, "FG": self.rb["PXN"], "FK": 2 * COLS * pk}
 
     def _np(self, key: object, op: object) -> str:
         o = self.np_off[key]
@@ -169,7 +195,11 @@ class SparkPrefill(ChunkPrefill):
     def _runlist(self, S: int) -> list[tuple]:
         return self._runlist_of(S * SUB)
 
-    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
+    def _more_runlists(self) -> dict[tuple[str, int], list[tuple]]:
+        """(with a drafter: each size's chunk with the drafter's records)"""
+        return {("dspark", T): self._runlist_of(T, drafter=True) for T in self.sizes} if self.ds is not None else {}
+
+    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False, drafter: bool = False) -> list[tuple]:
         assert not packed and not tree, "Spark-X: no packed chunks"
         t = self._t(T)
         S, plans, ov, sl, rb = T // t, self.plans[t], self.ov, self._sl, self.rb
@@ -180,9 +210,15 @@ class SparkPrefill(ChunkPrefill):
         n_in = self._norm(t, "in", 1)
         rl: list[tuple] = [(n_in, self._np("in", n_in), tok("PX", j * t, n_in, i=1), tok("PXN", j * t, n_in, i=2))
                            for j in range(S)]
-        self._starts[T] = starts = []
+        starts: list[int] = []
+        if not drafter:  # (a variant's layers start where its size's do)
+            self._starts[T] = starts
+        taps = self.ds.cfg.taps if drafter else ()
         for L in self.layers:
             starts.append(len(rl))
+            for i in (i for i, x in enumerate(taps) if x == L):  # (the drafter's tap: x normed by fc_norm[i])
+                rl += [(n_in, self._np(("tap", i), n_in), tok("PX", j * t, n_in, i=1),
+                        sl("FT", (i * self.ft_rows + j * t) * rb["PXN"], n_in, i=2)) for j in range(S)]
             kind = ov.layer_kind(L)
             p_in = plans[(L, "attn_in")]
             rg = 2 * COLS * p_in.layout.pitch
@@ -223,8 +259,72 @@ class SparkPrefill(ChunkPrefill):
                 n = self._norm(t, "add", k, cb)
                 rl += [(n, self._np((L, key), n), tok("PX", j * t, n, i=1), sl(dst, k * j * cb, n, i=2),
                         tok("PX", j * t, n, i=3), tok("PXN", j * t, n, i=4)) for j in range(S)]
+        if drafter:  # (in the last layer's piece)
+            rl += self._drafter_items(t, S)
         starts.append(len(rl))
         return rl
+
+    @property
+    def ft_rows(self) -> int:
+        """Rows of a tap's panels in FT (the largest chunk and its GEMMs' padding rows)."""
+        return MAX_T + 64
+
+    def _dprep(self, t: int, lay: PG.Layout) -> AP.AttnPrepOperator:
+        """The drafter's K / V prep of a sub-chunk of t tokens (``ikv``'s layout) into the staging."""
+        key = ("dspark", lay.key, t)
+        if key not in self._preps:
+            self._preps[key] = AP.AttnPrepOperator(
+                T=t, cfg=self.cfg, layout=lay, cs_positions=self.cs_rows, spec=self.ov.ash.spec, kind="swa",
+                head_bytes=self.dstage * AP.GROUP, q=False, staged=True)
+        return self._preps[key]
+
+    def _drafter_items(self, t: int, S: int) -> list[tuple]:
+        """The drafter's records of a chunk of S sub-chunks of t (module docstring)."""
+        sl, rb, ds = self._sl, self.rb, self.ds
+        n, plans = len(ds.cfg.taps), self.dplans[t]
+
+        def tok(buf: str, a: int, op: object, *, i: int, row: int = 0) -> str:
+            return sl(buf, a * (row or rb[buf]), op, i=i)
+
+        cb = max(self._c_slot(plans[(i, "fc")]) for i in range(n))
+        rl: list[tuple] = []
+        for i in range(n):  # (tap i's fc into its C slot n j + i)
+            rl += [(g.op, sl("FT", (i * self.ft_rows + j * t) * rb["PXN"], g.op, i=0), self._dw(g),
+                    sl("FY", (n * j + i) * cb, g.op, i=2)) for g in plans[(i, "fc")].gemms for j in range(S)]
+        parts = [4] * (n // 4) + [1] * (n % 4)  # (the norm adds 1, 2 or 4 parts)
+        assert len(parts) == 2, n
+        a = 0
+        for h, k in enumerate(parts):  # (into the zero x first; the last one's panels are g's)
+            nm = self._norm(t, "add", k, cb)
+            rl += [(nm, self._np(("dfc", h), nm), tok("FZ" if h == 0 else "FX", j * t, nm, i=1),
+                    sl("FY", (n * j + a) * cb, nm, i=2), tok("FX", j * t, nm, i=3), tok("FG", j * t, nm, i=4))
+                   for j in range(S)]
+            a += k
+        hb = self.dstage * AP.GROUP
+        grp = t // 32 * AP.GROUP
+        for L in ds.layers:
+            p = plans[(L, "ikv")]
+            rk = 2 * COLS * p.layout.pitch
+            rl += [(g.op, tok("FG", j * t, g.op, i=0), self._dw(g), tok("FK", j * t, g.op, i=2, row=rk))
+                   for g in p.gemms for j in range(S)]
+            prep = self._dprep(t, p.layout)
+            base, kvb = L * self.ov.ash.kvh * hb, arg_bytes(prep, 2)
+            rl += [(prep, tok("FK", j * t, prep, i=0, row=rk), sl("CSS", j * t * 2 * prep.cs_row, prep, i=1),
+                    f"DS[{base + j * grp}:{base + j * grp + kvb}]") for j in range(S)]
+        return rl
+
+    @staticmethod
+    def _dw(g: PG.Gemm) -> str:
+        """A drafter GEMM's weights: its tiles in the drafter's image."""
+        return f"DW[{g.w_off}:{g.w_off + g.op.w_bytes}]"
+
+    def _external(self) -> set[str]:
+        return {"DW"} if self.ds is not None else set()
+
+    def _buffers(self) -> dict[str, object]:
+        """(the drafter's weights: its device's)"""
+        out = self.ov.dev.buffers
+        return {**out, "DW": self.ds.dev.buffers["W"]} if self.ds is not None else out
 
     def _layer_starts(self, T: int) -> list[int]:
         return self._starts[T]
@@ -238,6 +338,9 @@ class SparkPrefill(ChunkPrefill):
             own[name] = max(own.get(name, 0), (self.sizes[-1] + 64) * r)
         own["NP"] = max(own.get("NP", 0), max(self.np_off.values()) + 16 * self.H)
         own["S"] = max(own.get("S", 0), self.ov.ash.kvh * self.stage * AP.GROUP)
+        if self.ds is not None:
+            own["FT"] = max(own.get("FT", 0), len(self.ds.cfg.taps) * self.ft_rows * self.rb["PXN"])
+            own["DS"] = max(own.get("DS", 0), (len(self.ds.layers) + 1) * self.ov.ash.kvh * self.dstage * AP.GROUP)
 
     def _bind(self) -> None:
         """The norms' parameter objects (NP), the cos / sin tables (CSF: a full layer's, CSS: a sliding-window
@@ -258,6 +361,16 @@ class SparkPrefill(ChunkPrefill):
             put((L, "o"), f"blk.{L}.ffn_norm.weight")
             put((L, "d"), f"blk.{self.layers[i + 1]}.attn_norm.weight" if i + 1 < len(self.layers)
                 else "output_norm.weight")
+        if self.ds is not None:
+            dg = self.ds.gguf
+            fcn = np.asarray(dg.tensor("fc_norm.weight").dequantize(), np.float32).reshape(-1, H)
+            enc = np.asarray(dg.tensor("enc.output_norm.weight").dequantize(), np.float32).reshape(-1)
+            for key, w in [*((("tap", i), fcn[i]) for i in range(len(fcn))), (("dfc", 0), enc), (("dfc", 1), enc)]:
+                o = self.np_off[key] // 2
+                v = residual_params(None, w, 1.0, H)
+                npb[o:o + v.size] = v.reshape(-1)
+            dev.view("FZ")[:] = 0
+            dev.flush("FZ")
         dev.flush("NP")
         for kind, name in (("swa", "CSS"), ("full", "CSF")):
             cs = AP.cs_table(self.cfg, self.cs_rows, kind).view(np.uint8).reshape(-1)
@@ -278,15 +391,39 @@ class SparkPrefill(ChunkPrefill):
             out |= self._prep(L, t).params(p0) | self.attn[(kind, T)].params(p0)
         return out
 
-    def run(self, x: np.ndarray, p0: int, T: int = 0) -> None:
+    def run(self, x: np.ndarray, p0: int, T: int = 0, *, rows_from: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches hold the positions before). Leaves the layers' K / V of the positions in the caches and
-        rings."""
+        rings; with a drafter, a chunk with positions from ``rows_from`` on its records of those in its rings
+        (``drafter_rows``)."""
         n = x.shape[0]
         T = self._size(n, p0, T)
+        lo = max(rows_from, p0 + n - self.ds.nr * 32 + 32) if self.ds is not None else p0 + n
         self._stage_px(x, T, np.float32)
-        self._launch(T, p0, self.params(T, p0))
+        self._launch(T, p0, self.params(T, p0), key=("dspark", T) if lo < p0 + n else None)
         self.ov.dev.stale = True  # (the chunk's configurations replaced the overlay's code pages: reloaded before a step)
+        if lo < p0 + n:
+            self.drafter_rows(p0, n, lo)
+
+    def drafter_rows(self, p0: int, n: int, lo: int) -> None:
+        """The staging's records of the last chunk (at p0, n positions) from position lo on into the drafter's rings
+        (their groups' slots), the drafter's open records from their panels (``vring``: record mode)."""
+        ds, dev, gb = self.ds, self.ov.dev, AP.GROUP
+        g0, g1 = max(lo, p0) // 32, -(-(p0 + n) // 32)
+        if g1 <= g0:
+            return
+        hb, kvh = self.dstage * gb, self.ov.ash.kvh
+        src, dst = dev.view("DS"), ds.dev.view("KV")
+        for L in ds.layers:
+            for h in range(kvh):
+                a = (L * kvh + h) * hb
+                dev.fetch("DS", a + (g0 - p0 // 32) * gb, (g1 - g0) * gb)
+                b = ds.kv_off[L] + h * ds.attn_steps.head_bytes(L)
+                for g in range(g0, g1):
+                    o = b + (g % ds.nr) * gb
+                    dst[o:o + gb] = src[a + (g - p0 // 32) * gb:][:gb]
+                    ds.dev.flush("KV", o, gb)
+        ds.vring.from_prefill.update(ds.layers)
 
     def hidden(self, i: int, n: int = 1) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of the last chunk's output residual (the LM head's input before its

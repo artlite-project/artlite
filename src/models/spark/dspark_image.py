@@ -1,7 +1,7 @@
 """The DSpark drafter's weights (``dspark.DSparkOverlay``): its matrices' tiles in a ``TileImage`` of Spark's (``image``:
 K chunks of 1024 columns, tiles of ``decode.attn256.OBJ_BYTES``; the BF16 files' matrices as BFP16 tiles), region-major.
 
-- "fc0" .. "fc4" (layer -2): fc's columns of tap i (the file's ``fc.weight`` read as rows of hidden columns: row 5 r + i
+- "fc" of layer i (tap i): fc's columns of tap i (the file's ``fc.weight`` read as rows of hidden columns: row 5 r + i
   of the view is row r's tap i, ``TileImage.view``), rows hidden / 8 c .., each normed by its row of ``fc_norm``;
 - per layer: "attn_in" (blocks "q", "k", "v", "g": Spark's ``image.attn_rows``), "attn_out", "gate_up" (GeGLU's gate and
   up rows), "down", as the model's; an injection's K and V are attn_in's rows (``ikv``: a view of the "k" and "v" blocks'
@@ -46,7 +46,7 @@ class DSparkImage(TileImage):
         self.view("fc.weight", H // 256)
         n = len(cfg.taps)
         for i in range(n):
-            self._add(-2, f"fc{i}", [("fc", ("fc.weight",), column_rows(H) * n + i)], H)
+            self._add(i, "fc", [("fc", ("fc.weight",), column_rows(H) * n + i)], H)
         rows = attn_rows(cfg)
         for L in self.layers:
             b = f"blk.{L}."

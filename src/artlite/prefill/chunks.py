@@ -134,6 +134,7 @@ class ChunkPrefill:
         self.runlists |= {("pack", T): self._runlist_of(T, packed=True) for T in self.pack_sizes}
         self.runlists |= {("tree", T): self._runlist_of(T, tree=True) for T in self.tree_sizes}
         self.runlists |= {("ring", T): self._runlist_of(T, packed=True, ring=True) for T in self.ring_sizes}
+        self.runlists |= self._more_runlists()
         self._sizes()
         self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
         self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)
@@ -152,6 +153,11 @@ class ChunkPrefill:
         chunk's)."""
         assert not packed and not tree, f"{type(self).__name__} has no packed chunks"
         return self._runlist(T // self.SUB)
+
+    def _more_runlists(self) -> dict[tuple[str, int], list[tuple]]:
+        """A model's variants of its chunks' runlists (key: (variant, size); its items per layer as the size's: the
+        size's pieces)."""
+        return {}
 
     def subs(self, T: int) -> int | float:
         """The sub-chunks of a chunk of size T for the time model (a ``SMALL`` size: the fraction T / SUB)."""

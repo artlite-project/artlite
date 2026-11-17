@@ -177,7 +177,9 @@ class AttnPrepOperator(ArtcOperator):
     panel per d-block and, in d-block 0's lo panel, the 8 tokens' sigmoid(g) as bf16 (``GATE_AT``): one slot per head
     and token group, no gate slot: ``tg_slots``). ``hist`` (a sliding-window layer): KV is the
     attention's staging (``PrefillAttnOperator``'s S: per KV head ``hist`` groups of the window's history, then the
-    chunk's), the chunk's records after the history at a static offset (no ``QA_KV``)."""
+    chunk's), the chunk's records after the history at a static offset (no ``QA_KV``). ``q`` False: K and V alone
+    (``layout`` of their blocks, no QS: a drafter's records, ``models.spark.dspark``); ``staged``: KV a staging whose
+    records start at the static offset ``hist`` groups (0 too)."""
 
     STACK = 3072
     GW = 16  # (a gate per head) gate values a Q core reads per row from the column's gate block (32 bytes: aligned rows)
@@ -189,16 +191,18 @@ class AttnPrepOperator(ArtcOperator):
     pfx = kernel_prefix("qap")
 
     def __init__(self, *, T: int, cfg: AttnConfig, layout: Layout, head_bytes: int, cs_positions: int,
-                 spec: AT.AttnSpec = AT.QWEN, kind: str = "full", hist: int = 0):
+                 spec: AT.AttnSpec = AT.QWEN, kind: str = "full", hist: int = 0, q: bool = True, staged: bool = False):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0, "whole cache groups"
         check_bd_iterations(T // 8, "AttnPrep")
-        assert {"q", "k", "v"} <= set(layout.off)
-        assert kind in ("full", "swa") and (kind == "full" or not spec.norms) and (not hist or kind == "swa"), (kind, hist)
-        self.spec, self.kind, self.hist = spec, kind, hist
+        assert ({"q"} if q else set()) | {"k", "v"} <= set(layout.off)
+        self.staged = staged or hist > 0
+        assert kind in ("full", "swa") and (kind == "full" or not spec.norms) and (not self.staged or kind == "swa"), \
+            (kind, hist)
+        self.spec, self.kind, self.hist, self.q = spec, kind, hist, q
         self.norms, self.gh = spec.norms, spec.gate == "head"
-        assert not self.gh or "g" in layout.off
+        assert not (q and self.gh) or "g" in layout.off
         self.rot = rot_pairs(kind)
         self.T, self.cfg, self.layout = T, cfg, layout
         self.nph, self.per = COLS // self.kvh, self.kvh * HD // COLS  # (a KV head's columns, its dims in one)
@@ -237,7 +241,7 @@ class AttnPrepOperator(ArtcOperator):
         return [ArgSpec("in", (T * self.layout.N,), bfloat16),
                 ArgSpec("in", (self.cs_positions * self.cs_row,), bfloat16),
                 *([ArgSpec("in", (2 * HD * 2,), bfloat16)] if self.norms else []),
-                ArgSpec("out", (self.n_qs,), bfloat16),
+                *([ArgSpec("out", (self.n_qs,), bfloat16)] if self.q else []),
                 ArgSpec("out", (self.kvh * self.head_bytes // 2,), bfloat16)]
 
     @property
@@ -250,7 +254,7 @@ class AttnPrepOperator(ArtcOperator):
         (default p0)."""
         r = p0 if cs_row is None else cs_row
         assert p0 % 32 == 0 and 0 <= r and r + self.T <= self.cs_positions
-        if self.hist:  # (the staging's static offsets; the kind's own CS parameter)
+        if self.staged:  # (the staging's static offsets; the kind's own CS parameter)
             return {QA_CS_SWA: self.cs_row * r}
         return {QA_CS: 128 * r, f"{QA_KV}{self.T}": GROUP // 2 * (p0 // 32)}
 
@@ -276,18 +280,21 @@ class AttnPrepOperator(ArtcOperator):
         k_k = Kernel(f"{p}_k", "kernel.o", [kv_ty, cs_ty, ws_ty, vr_ty, np.int32])
         k_v = Kernel(f"{p}_v", "kernel.o", [kv_ty, cs_ty, ws_ty, vr_ty, np.int32])
         p_cs = ScratchpadParameter(QA_CS_SWA if self.kind == "swa" else QA_CS, np.int32)
-        p_kv = None if self.hist else ScratchpadParameter(f"{QA_KV}{T}", np.int32)
+        p_kv = None if self.staged else ScratchpadParameter(f"{QA_KV}{T}", np.int32)
         n_tg = T // 8
+        q, cols = self.q, list(range(COLS)) if self.q else sorted(jobs)  # (K and V alone: the KV jobs' columns)
+        nq = qc if q else 0  # (Q cores of a column)
 
-        a3 = [ObjectFifo(in_ty if c in jobs else inq_ty, name=f"qp_a{c}", depth=2) for c in range(COLS)]
-        a1 = [a3[c].cons().split([rq * h for h in range(qc + (c in jobs))], tile=Tile(c, 1),
-                                 depths=[2] * (qc + (c in jobs)), obj_types=[row_ty] * qc + [kv_ty] * (c in jobs),
-                                 names=[f"qp_ah{c}_{h}" for h in range(qc + (c in jobs))]) for c in range(COLS)]
-        b = [ObjectFifo(cs_ty, name=f"qp_b{c}", depth=2) for c in range(COLS)]
-        o3 = [ObjectFifo(qs_ty, name=f"qp_o{c}", depth=2) for c in range(COLS)]
-        o1 = [o3[c].prod().join([SLOT // 2 * h for h in range(qc)], tile=Tile(c, 1), depths=[2] * qc,
-                                obj_types=[slot_ty] * qc, names=[f"qp_oh{c}_{h}" for h in range(qc)])
-              for c in range(COLS)]
+        a3 = {c: ObjectFifo((in_ty if c in jobs else inq_ty) if q else kv_ty, name=f"qp_a{c}", depth=2) for c in cols}
+        a1 = {c: a3[c].cons().split([rq * h for h in range(qc + (c in jobs))], tile=Tile(c, 1),
+                                    depths=[2] * (qc + (c in jobs)), obj_types=[row_ty] * qc + [kv_ty] * (c in jobs),
+                                    names=[f"qp_ah{c}_{h}" for h in range(qc + (c in jobs))]) if q else [a3[c]]
+              for c in cols}
+        b = {c: ObjectFifo(cs_ty, name=f"qp_b{c}", depth=2) for c in cols}
+        o3 = {c: ObjectFifo(qs_ty, name=f"qp_o{c}", depth=2) for c in cols} if q else {}
+        o1 = {c: o3[c].prod().join([SLOT // 2 * h for h in range(qc)], tile=Tile(c, 1), depths=[2] * qc,
+                                   obj_types=[slot_ty] * qc, names=[f"qp_oh{c}_{h}" for h in range(qc)])
+              for c in o3}
         k = {c: ObjectFifo(vr_ty, name=f"qp_k{c}", depth=2) for c in jobs}
 
         def core(a_h, b_h, o_h, prm, fn, ws, sg=None, head=None):
@@ -329,28 +336,36 @@ class AttnPrepOperator(ArtcOperator):
                     o_h.release(1)
 
         workers = []
-        for c in range(COLS):
-            for h in range(qc + (c in jobs)):
+        for c in cols:
+            for h in range(nq + (c in jobs)):
                 ws = Buffer(ws_ty, name=f"qp_ws{c}_{h}")
-                if h < qc:
+                if h < nq:
                     fn, args = core_q, [a1[c][h].cons(), b[c].cons(), o1[c][h].prod(), k_prm, k_q, k_sg, ws, h]
                 else:
                     args = [a1[c][h].cons(), b[c].cons(), k[c].prod(), k_prm, k_k if jobs[c][0] == "k" else k_v, ws]
                     fn = core_v
                 workers.append(Worker(fn, args, tile=Tile(c, 2 + h), stack_size=self.STACK,
                                       dynamic_objfifo_lowering=True, while_true=False))
-        n_cs, n_qs, n_kv = arg_elems(self, 1), arg_elems(self, 3 if norms else 2), arg_elems(self, 4 if norms else 3)
+        n_cs = arg_elems(self, 1)
+        n_qs = arg_elems(self, 3 if norms else 2) if q else 0
+        n_kv = arg_elems(self, len(self.get_arg_spec()) - 1)
         nph, per = self.nph, self.per
         blk = 4 * self.qg * qc * SLOT // 2 * self.tg_slots  # (bf16 of a column's slots in a pass)
         hb, g2, o2 = self.head_bytes // 2, GROUP // 2, AT.OBJ_BYTES // 2
 
         def seq(G, CS, *rest):
-            NRM, QS, KV, ah, bh, oh, khs = rest if norms else (None, *rest)
-            kh = dict(zip(k, khs))
+            rest = list(rest)
+            NRM = rest.pop(0) if norms else None
+            QS = rest.pop(0) if q else None
+            KV, ahs, bhs, *more = rest
+            ohs, khs = more if q else ([], more[0])
+            ah, bh, oh, kh = dict(zip(cols, ahs)), dict(zip(cols, bhs)), dict(zip(o3, ohs)), dict(zip(k, khs))
             sync_parameters()
             tg = TaskGroup()
-            for c in range(COLS):
-                if gh:  # (per head its q rows, then GW values of the gate block per row: the column's gates first)
+            for c in cols:
+                if not q:
+                    taps = []
+                elif gh:  # (per head its q rows, then GW values of the gate block per row: the column's gates first)
                     taps = [TensorAccessPattern((T * N,), c * pitch + lay.off[part] + (HD * h if part == "q" else 0),
                                                 [n_tg, 1, 8, HD if part == "q" else GW], [8 * N, 0, N, 1])
                             for h in range(qc) for part in ("q", "g")]
@@ -367,16 +382,17 @@ class AttnPrepOperator(ArtcOperator):
                                group=tg)
                 bh[c].fill(CS, TensorAccessPattern((n_cs,), 0, [1, 1, 1, T * self.cs_row], [0, 0, 0, 1]),
                            offset_parameter=p_cs, group=tg)
-                oh[c].drain(QS, TensorAccessPattern((n_qs,), c * blk,
-                                                    [1, n_tg // (4 * self.qg), blk // PREP_ROW, PREP_ROW],
-                                                    [0, COLS * blk, PREP_ROW, 1]), group=tg, wait=True)
+                if q:
+                    oh[c].drain(QS, TensorAccessPattern((n_qs,), c * blk,
+                                                        [1, n_tg // (4 * self.qg), blk // PREP_ROW, PREP_ROW],
+                                                        [0, COLS * blk, PREP_ROW, 1]), group=tg, wait=True)
                 if c not in jobs:
                     continue
                 kind, h = jobs[c]
                 # (the K or V object of group g + i: its 4 records)
                 tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2, [1, T // 32, 8, PREP_ROW],
                                           [0, g2, PREP_ROW, 1])
-                if self.hist:  # (the staging: after the window's history, static)
+                if self.staged:  # (the staging: after the window's history, static)
                     tap = TensorAccessPattern((n_kv,), h * hb + (kind == "v") * o2 + self.hist * g2,
                                               [1, T // 32, 8, PREP_ROW], [0, g2, PREP_ROW, 1])
                     kh[c].drain(KV, tap, group=tg, wait=True)
@@ -386,10 +402,10 @@ class AttnPrepOperator(ArtcOperator):
 
         rt = Runtime(seq, [np.ndarray[(T * N,), bf], np.ndarray[(n_cs,), bf],
                            *([np.ndarray[(2 * HD * 2,), bf]] if norms else []),
-                           np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(a3)],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(b)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)],
+                           *([np.ndarray[(n_qs,), bf]] if q else []), np.ndarray[(n_kv,), bf],
+                           [a3[c].prod(tile=Tile(c, 0)) for c in cols],
+                           [b[c].prod(tile=Tile(c, 0)) for c in cols],
+                           *([[o3[c].cons(tile=Tile(c, 0)) for c in cols]] if q else []),
                            [f.cons(tile=Tile(c, 0)) for c, f in k.items()]])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 

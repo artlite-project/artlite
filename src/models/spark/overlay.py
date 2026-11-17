@@ -361,10 +361,14 @@ class SparkOverlay(ModelOverlay):
                 for h in range(self.ash.kvh)]
         return [CacheRows(np.array(rows, np.int64), attn.OBJS * self.T, attn.POS_PER_GROUP)] if rows else []
 
+    @property
+    def window(self) -> int:
+        """The sliding-window layers' window (positions before a row)."""
+        return self.cfg.sliding_window
+
     def _window_groups(self, position: int) -> range:
         """The groups of the sliding-window layers' window before ``position`` and of the open records at it."""
-        return range(max(position - self.cfg.sliding_window, 0) // attn.POS_PER_GROUP,
-                     position // attn.POS_PER_GROUP + 1)
+        return range(max(position - self.window, 0) // attn.POS_PER_GROUP, position // attn.POS_PER_GROUP + 1)
 
     def snapshot(self, position: int) -> Snapshot:
         """(and the sliding-window layers' rings' groups of the window before ``position``: [layer][KV head][group]

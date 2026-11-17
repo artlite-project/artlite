@@ -5,7 +5,7 @@ own (``dspark_image.DSparkImage``), its head the first rows of each column of th
 (``decode.head``: the model's image laid out with them, ``SparkOverlay(head=True)``). One dispatch a round (``run``):
 
 - the injection of the model's last step's rows: their taps (the residual entering the layers ``taps``: the x of
-  those layers' attn_in in the model's ACT, read in place) -> fc0 .. fc4 (each tap normed by its row of ``fc_norm``)
+  those layers' attn_in in the model's ACT, read in place) -> fc of each tap (normed by its row of ``fc_norm``)
   into the main cores' residual (zero-loaded first), emitted as g; per layer ikv (g normed by ``enc.output_norm``: K, V)
   and the attention core's records of the rows' positions into the layer's ring (``AttnStep`` mode "insert": the step's
   groups streamed, no window, o into a sink);
@@ -17,7 +17,8 @@ own (``dspark_image.DSparkImage``), its head the first rows of each column of th
 An injection writes the records of all S slots of the model's step; those past the kept rows are the next block's
 positions, which it writes again. The caches: per layer and KV head a ring of ``nr`` groups (group g at g % nr: the
 block's window and its own groups; ``decode.attn256_steps``' "ra" / "rb" fills), the open records' rings
-(``decode.vring``). Transactions per (injected slots, block) are built at their first use and patched per round: the
+(``decode.vring``); a sequence's state (``snapshot``) holds the window's groups before a position, as the model's
+sliding-window layers'. Transactions per (injected slots, block) are built at their first use and patched per round: the
 two parts' F_ATT objects are the two buffers of ``AttentionSteps`` (b 0: the injection's, 1: the block's)."""
 
 import dataclasses
@@ -123,12 +124,17 @@ class DSparkOverlay(SparkOverlay):
     def layer_kind(self, L: int) -> str:
         return "swa"
 
+    @property
+    def window(self) -> int:
+        """(a block's: the positions before its anchor)"""
+        return self.cfg.window
+
     def ring_groups(self, L: int) -> int:
         return self.nr
 
     def _flags(self, L: int, name: str) -> int:
-        if name.startswith("fc"):
-            return F_NORM | F_RESID | (F_EMITR if name == f"fc{len(self.cfg.taps) - 1}" else 0)
+        if name == "fc":  # (tap L's: the last one emits the sum)
+            return F_NORM | F_RESID | (F_EMITR if L == len(self.cfg.taps) - 1 else 0)
         return FLAGS[name]
 
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
@@ -149,9 +155,9 @@ class DSparkOverlay(SparkOverlay):
         self.loadr = take("ACT", COLS * self.SLOTS * XB)  # (the block's residual slices: [column][slot])
         self.zero = take("ACT", COLS * self.SLOTS * XB)  # (the injection's: zero)
         for i in range(len(cfg.taps)):
-            self._add_meta((-2, f"fc{i}"))
+            self._add_meta((i, "fc"))
             tg = self.target.inp[(cfg.taps[i], "attn_in")][0]
-            assert self.inp[(-2, f"fc{i}")][0].K == tg.K, "fc's K group: the tap's x as the model's attn_in reads it"
+            assert self.inp[(i, "fc")][0].K == tg.K, "fc's K group: the tap's x as the model's attn_in reads it"
         self._add_inputs((0, "ikv"))
         for L in self.layers[1:]:
             self._add_meta((L, "ikv"))
@@ -186,8 +192,8 @@ class DSparkOverlay(SparkOverlay):
         self._pads = [(rg.off, self.H, rg.K)] if rg.K > self.H else []
 
     def _norm_key(self, L: int, name: str) -> object:
-        if name.startswith("fc"):
-            return ("fc", int(name[2:]))
+        if name == "fc":
+            return ("fc", L)
         return {"ikv": "enc", "lm": "output", "attn_in": (L, "attn_norm"), "gate_up": (L, "ffn_norm")}[name]
 
     # ------------------------------------------------------------------
@@ -249,7 +255,7 @@ class DSparkOverlay(SparkOverlay):
         for (L, name), regs in self.inp.items():
             if name == "sink":
                 continue
-            s = S if name.startswith("fc") or name == "ikv" else self.B
+            s = S if name in ("fc", "ikv") else self.B
             out += [(rg.off, gr.meta.view(np.uint8)) for rg, gr in zip(regs, self._groups(L, name, s), strict=True)]
         return out
 
@@ -278,14 +284,14 @@ class DSparkOverlay(SparkOverlay):
         super()._inputs(seq, rg, S, phase)
 
     def _inject(self, seq: Sequence, st: AttnStep) -> None:
-        """fc over the S rows' taps (each its own phase, normed; into the zero residual), g -> ikv, per layer K, V and
-        the records."""
+        """fc over the S rows' taps (a phase per tap, normed; into the zero residual), g -> ikv, per layer K, V and the
+        records."""
         dev, S, cfg = self.dev, st.S, self.cfg
         sp = self._sp(S)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.zero + c * self.SLOTS * XB), S * XB)
         for i, tap in enumerate(cfg.taps):
-            phase = (-2, f"fc{i}")
+            phase = (i, "fc")
             rg = self.inp[phase][0]
             self._weights(seq, phase, 0)
             nbytes, dims = input_fill(rg.K, sp, self.SLOTS)
