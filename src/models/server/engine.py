@@ -16,6 +16,7 @@ import numpy as np
 
 from artlite import portable
 
+from .. import structured
 from ..model import Model
 from ..npu_model import NpuModel
 from ..sampling import argmax
@@ -30,7 +31,8 @@ CACHE_RAM = 8192 << 20  # the prompt cache's host memory by default at most (lla
 
 class Engine:
     """The worker thread that owns the model: it opens and loads it (``load``: the ``Model`` and its ``NpuModel``),
-    runs one token through it (``warmup``), then runs the jobs one at a time in arrival order.
+    runs one token through it (``warmup``; it also builds structured output's vocabulary aside: ``vocab``), then runs
+    the jobs one at a time in arrival order.
 
     The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory - None: ``CACHE_RAM``, at most half of
     what is still available once the model is loaded (its weights and caches are host memory too), over ``share``
@@ -195,6 +197,15 @@ class Engine:
             return 0
         return p if head + rest < 0.9 * whole else 0
 
+    def vocab(self) -> structured.Vocab:
+        """The model's tokens for structured output (``structured.vocab``: built once, in the background after the
+        load; a request that comes first waits for it). ValueError: a tokenizer without them."""
+        tokenizer = self.model.tokenizer
+        if not hasattr(tokenizer, "vocabulary"):
+            raise ValueError("structured output is not supported by this model's tokenizer")
+        cfg = getattr(self.npu, "cfg", None)
+        return structured.vocab(tokenizer, int(getattr(cfg, "vocab_size", 0)), sorted(self.model.eos_token_ids))
+
     def waiting(self) -> int:
         """Jobs in the queue (not running)."""
         return len(self._queue)
@@ -249,6 +260,8 @@ class Engine:
         self._ready.set()
         if self._on_ready is not None:
             self._on_ready()
+        if self._warmup and self.npu.causal and hasattr(self.model.tokenizer, "vocabulary"):
+            threading.Thread(target=self.vocab, name="artlite-vocab", daemon=True).start()  # (structured output's)
         while True:
             with self._cv:
                 while not self._queue and not self._stopping:

@@ -82,6 +82,18 @@ def unicode_classes(cps: np.ndarray) -> np.ndarray:
     return out
 
 
+def special_ids(pieces: list[bytes], types: np.ndarray) -> list[int]:
+    """The special tokens of a GGUF vocabulary (its tokens' bytes and ``tokenizer.ggml.token_type``): the control ones and
+    the user-defined ones spelled ``<...>`` (Qwen's ``<tool_call>``, ``<think>``)."""
+    return [int(i) for i in np.flatnonzero((types == T_CONTROL) | (types == T_USER))
+            if types[i] == T_CONTROL or (pieces[i].startswith(b"<") and pieces[i].endswith(b">"))]
+
+
+def texts_of(names: list[str]) -> re.Pattern[str]:
+    """A pattern that finds any of the texts (longest first; none: never matches)."""
+    return re.compile("|".join(re.escape(t) for t in sorted(names, key=len, reverse=True)) or "(?!)")
+
+
 class BpeTokenizer:
     """``encode`` / ``decode`` as llama.cpp tokenizes for this vocabulary (special tokens parsed)."""
 
@@ -92,6 +104,11 @@ class BpeTokenizer:
         self.tokenizer = gigatoken.Tokenizer.from_json(bpe_tokenizer_json(gguf, PATTERNS.get(str(pre)),
                                                                           ignore_merges=pre in IGNORE_MERGES))
         types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
+        self.types = types
+        self._plain_json = lambda: bpe_tokenizer_json(gguf, PATTERNS.get(str(pre)), ignore_merges=pre in IGNORE_MERGES,
+                                                      special=False)
+        self._plain: gigatoken.Tokenizer | None = None
+        self._added: re.Pattern[str] | None = None
         self._split = SPLITS.get(str(pre))
         if self._split is not None:  # (the merges natively; the special tokens, longest first: llama.cpp's partition)
             names = gguf.strings("tokenizer.ggml.tokens")
@@ -114,6 +131,28 @@ class BpeTokenizer:
                 cps = np.frombuffer(part.encode("utf-32-le"), np.uint32)
                 out += self._bpe.encode(cps, self._split(cps, unicode_classes(cps))).tolist()
         return out
+
+    def encode_plain(self, text: str) -> list[int]:
+        """Token ids of ``text`` with no special tokens (their text encodes as text)."""
+        if self._split is not None:
+            cps = np.frombuffer(text.encode("utf-32-le"), np.uint32)
+            return self._bpe.encode(cps, self._split(cps, unicode_classes(cps))).tolist()
+        if self._added is None:  # (the control and user-defined tokens' texts: gigatoken's added tokens)
+            vocab = self.tokenizer.vocab
+            self._added = texts_of([vocab[int(i)].decode("utf-8", "replace")
+                                    for i in np.flatnonzero((self.types == T_CONTROL) | (self.types == T_USER))])
+        if not self._added.search(text):
+            return self.tokenizer.encode(text).tolist()
+        if self._plain is None:  # (gigatoken parses special tokens: a vocabulary without them)
+            self._plain = gigatoken.Tokenizer.from_json(self._plain_json())
+        return self._plain.encode(text).tolist()
+
+    def vocabulary(self) -> tuple[list[bytes], list[int]]:
+        """Every token's bytes as a generation's text has them (a control token's text too) and the special tokens: the
+        control ones and the user-defined ones spelled ``<...>`` (llguidance's llama.cpp adapter's rule)."""
+        vocab = self.tokenizer.vocab
+        pieces = [vocab.get(i, b"") for i in range(len(self.types))]
+        return pieces, special_ids(pieces, self.types)
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
         """The UTF-8 bytes of the tokens (control tokens only when ``special``)."""

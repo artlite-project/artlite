@@ -43,13 +43,29 @@ TEMPLATE = "{% if enable_thinking %}<think>{% endif %}"  # (/props: the UI shows
 TOOLS_TEMPLATE = TEMPLATE + "{# <tool_call> <function= <parameter= #}"  # (Qwen's tool-call syntax)
 
 
-class FakeTokenizer:
-    """Special tokens, then words with their leading white space; a new piece gets the next id."""
+CHARS = "\t\n\r" + "".join(map(chr, range(32, 127)))  # (``chars``: pieces of their own from the start)
 
-    def __init__(self) -> None:
-        self.pieces = list(SPECIAL)
+
+class FakeTokenizer:
+    """Special tokens, (``chars``: the ASCII characters, ``CHARS``,) then words with their leading white space; a new
+    piece gets the next id. Structured output's tokens (``vocabulary``) are those known when it asks; a text without
+    special tokens encodes greedily, the longest known piece first (``encode_plain``: a grammar's forced text)."""
+
+    def __init__(self, *, chars: bool = False) -> None:
+        self.pieces = list(SPECIAL) + (list(CHARS) if chars else [])
         self.ids = {p: i for i, p in enumerate(self.pieces)}
         self._special = re.compile("(" + "|".join(re.escape(s) for s in sorted(SPECIAL, key=len, reverse=True)) + ")")
+
+    def vocabulary(self) -> tuple[list[bytes], list[int]]:
+        return [p.encode() for p in self.pieces], list(range(len(SPECIAL)))
+
+    def encode_plain(self, text: str) -> list[int]:
+        out, i = [], 0
+        while i < len(text):
+            n = next((n for n in range(len(text) - i, 0, -1) if self.ids.get(text[i:i + n], 0) >= len(SPECIAL)), 0)
+            out.append(self.ids[text[i:i + n]] if n else self.id(text[i]))
+            i += max(n, 1)
+        return out
 
     def id(self, piece: str) -> int:
         if piece not in self.ids:
@@ -76,8 +92,8 @@ class FakeModel(Model):
 
     name = "Fake"
 
-    def __init__(self, *, reasoning: tuple[str, str] | None = None):
-        self.tokenizer = FakeTokenizer()
+    def __init__(self, *, reasoning: tuple[str, str] | None = None, chars: bool = False):
+        self.tokenizer = FakeTokenizer(chars=chars)
         self.eos_token_ids = (EOS,)
         self.reasoning = reasoning
         self.thinks = reasoning is not None
@@ -226,10 +242,22 @@ class FakeNpu(NpuModel):
         self.generated: list[int | None] = []
         self.position = 0
         self.seq: list[int] = []
-        self.replies: list[list[str]] = []
+        self._replies: list[list[str]] = []
         self.calls: list[tuple] = []
         self.fail: Exception | None = None  # what forward raises
         self._next: Iterator[int] = iter(())
+
+    @property
+    def replies(self) -> list[list[str]]:
+        return self._replies
+
+    @replies.setter
+    def replies(self, replies: list[list[str]]) -> None:
+        """(their pieces get their ids now: the tokens a request's mask sees)"""
+        for r in replies:
+            for p in r:
+                self.tok.id(p)
+        self._replies = replies
 
     def describe(self) -> str:
         return "fake"
@@ -356,11 +384,11 @@ class FakeNpu(NpuModel):
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)
 
 def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, audio: bool = False,
-         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, **kw: object
+         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, chars: bool = False, **kw: object
          ) -> tuple[FakeModel, FakeNpu, Engine]:
     """A fake model's engine, started: ``turns``: the model's ``turn`` and ``user_turn`` (its prompt cache's marks),
-    ``cache``: the prompt cache's options; ``kw``: the ``FakeNpu``'s."""
-    model = FakeAudio() if audio else FakeVision() if vision else FakeModel(reasoning=reasoning)
+    ``cache``: the prompt cache's options; ``chars``: the tokenizer's ``chars``; ``kw``: the ``FakeNpu``'s."""
+    model = FakeAudio() if audio else FakeVision() if vision else FakeModel(reasoning=reasoning, chars=chars)
     model.turn, model.user_turn = turns or (None, None)
     npu = FakeNpu(model, **kw)
     engine = Engine(load or (lambda: (model, npu)), warmup=False, **(cache or {}))

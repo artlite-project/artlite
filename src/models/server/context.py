@@ -8,8 +8,12 @@ import dataclasses
 import logging
 from typing import Any
 
+from starlette.concurrency import run_in_threadpool
+
+from .. import structured
 from ..sampling import TOP_K_ALL, Sampling
 from . import agents
+from .constraints import constraint_of
 from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable
 from .jobs import Job
@@ -25,9 +29,8 @@ SAMPLERS = ["penalties", "top_k", "temperature", "top_p", "min_p"]  # in the ord
 # sampler fields the NPU path does not have, with their neutral values (others are ignored with a log line)
 NEUTRAL: dict[str, object] = {
     "typical_p": 1.0, "typ_p": 1.0, "dry_multiplier": 0.0, "xtc_probability": 0.0, "mirostat": 0,
-    "dynatemp_range": 0.0, "top_n_sigma": -1.0, "ignore_eos": False, "logit_bias": None, "grammar": None,
-    "json_schema": None, "response_format": None, "thinking_budget_tokens": None, "speculative.n_min": 0,
-    "speculative.p_min": 0.0,
+    "dynatemp_range": 0.0, "top_n_sigma": -1.0, "ignore_eos": False, "logit_bias": None,
+    "thinking_budget_tokens": None, "speculative.n_min": 0, "speculative.p_min": 0.0, "guided_decoding_backend": None,
 }
 # llama-server's other sampler settings, as /props reports them (the parameters of samplers that are off)
 OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": -1.0, "xtc_probability": 0.0,
@@ -108,6 +111,25 @@ class ApiContext:
             if name in NEUTRAL and value not in (neutral, None, [], {}, ""):
                 self.warn_once((name, repr(value)), "%s = %r is not supported: ignored", name, value)
 
+    async def constrained(self, req: GenerationRequest, *, route: str = "chat") -> structured.Compiled | None:
+        """The request's structured output (``constraints.constraint_of``; none: the server's, ``--grammar``,
+        ``--json-schema``), compiled against the model's tokens (in a thread: the first request may wait for them). A
+        field that does not compile: a 400 that names it."""
+        got = constraint_of(req.constraint_fields(), route=route)
+        if got is None and self.options.constraint is not None:
+            got = (self.options.constraint, "--grammar / --json-schema")
+        if got is None:
+            return None
+        constraint, field = got
+        try:
+            v = await run_in_threadpool(self.engine.vocab)
+        except ValueError as e:
+            raise not_supported(str(e)) from None
+        try:
+            return await run_in_threadpool(structured.compiled, constraint, v)
+        except structured.ConstraintError as e:
+            raise bad_request(f"{field}: {e}") from None
+
     def request_sampling(self, req: GenerationRequest, think: bool) -> Sampling:
         s = self.sampling(think)
         given = {"temp": req.temperature, "top_k": req.top_k, "top_p": req.top_p, "min_p": req.min_p,
@@ -155,9 +177,10 @@ class ApiContext:
 
     def job(self, req: GenerationRequest, ids: list[int], *, think: bool, reasoning: bool = False,
             max_tokens: int | None = None, conv_id: str | None = None, tools: Calls | None = None,
-            answer_mark: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
+            answer_mark: bool = False, grammar: structured.Compiled | None = None
+            ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
-        ``Job.answer_mark``)."""
+        ``Job.answer_mark``; ``grammar``: the answer's structured output, ``constrained``)."""
         options = self.options
         loop, events = asyncio.get_running_loop(), asyncio.Queue()
 
@@ -177,12 +200,14 @@ class ApiContext:
             raise bad_request("n_probs (top_logprobs, logprobs) must be >= 0")
         if req.spec_n_max is not None and req.spec_n_max < 0:
             raise bad_request("speculative.n_max must be >= 0")
+        opened = (reasoning or grammar is not None) and self.prompts.inside(ids)
         j = Job(ids=ids, emit=emit, sampling=self.request_sampling(req, think), max_tokens=n, drafts=req.spec_n_max,
                 n_probs=n_probs, post_sampling=bool(req.post_sampling_probs),
                 seed=req.seed if req.seed is not None else options.seed, stop=self.stops(req), reasoning=reasoning,
-                inside=reasoning and self.prompts.inside(ids), think=think,
+                inside=reasoning and opened, opened=opened, think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
-                progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark)
+                progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark,
+                grammar=grammar)
         try:
             self.engine.submit(j)
         except RuntimeError as e:
@@ -199,6 +224,7 @@ class ApiContext:
         if "audio" in ((req.model_extra or {}).get("modalities") or []):
             raise not_supported("audio output is not supported by artlite-server")
         fns, calls = prompts.calls_of(req)
+        grammar = await self.constrained(req)
         if calls is not None:
             calls = dataclasses.replace(calls, vocab=await prompts.vocabulary())
         ids, think = await prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
@@ -208,4 +234,4 @@ class ApiContext:
         # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
         keeps = prompts.template_options(req.chat_template_kwargs)[1] and "preserve_thinking" in self.info.chat_template
         return self.job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens,
-                        conv_id=conv_id, tools=calls, answer_mark=not keeps)
+                        conv_id=conv_id, tools=calls, answer_mark=not keeps, grammar=grammar)

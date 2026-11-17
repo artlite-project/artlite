@@ -23,6 +23,9 @@ over the vocabulary: ``_native.screen_*``, which read the logits and the rows' n
 
 A row is only left out when its upper bound is below another row's exact value or lower bound.
 
+A mask (a constraint's tokens: ``models.sampling.Mask``) restricts every step to the tokens it allows: the k largest of
+those are as exact as an unmasked choice's.
+
 ``Screened`` is a step's logits as the overlays return them, a ``ScreenedRow`` per slot: ``top(k)`` its k largest
 logits (what ``models.sampling`` takes: fp32 sums of the file's weights against g, closer to the model than the cores'
 bf16 logits, whose argmax differs from the exact one's in ~0.5% of a generation's steps), ``at`` the exact logits of
@@ -94,37 +97,46 @@ class Screen:
         self.rows += len(ids)
         return _native.screen_exact(self.raw, np.ascontiguousarray(ids, np.int32), g)
 
-    def _above(self, bits: np.ndarray, gnorm: float, thr: float) -> np.ndarray:
-        """The rows whose upper bound reaches thr, ascending (int32; a copy)."""
-        n = _native.screen_above(bits, self.scale, self.bound, gnorm, thr, self._ids)
+    def _above(self, bits: np.ndarray, gnorm: float, thr: float, mask: np.ndarray | None = None) -> np.ndarray:
+        """The rows whose upper bound reaches thr (``mask``: of the allowed ones), ascending (int32; a copy)."""
+        n = _native.screen_above(bits, self.scale, self.bound, gnorm, thr, self._ids, mask)
         if n <= len(self._ids):
             return self._ids[:n].copy()
-        return np.flatnonzero(self._upper(bits, gnorm) >= thr).astype(np.int32)
+        up = self._upper(bits, gnorm) >= thr
+        if mask is not None:
+            up &= np.unpackbits(mask.view(np.uint8), count=self.n, bitorder="little").astype(bool)
+        return np.flatnonzero(up).astype(np.int32)
 
     def _upper(self, bits: np.ndarray, gnorm: float, ids: np.ndarray | slice = slice(None)) -> np.ndarray:
         """The upper bounds of the rows ``ids`` (fp32)."""
         return bits[ids].view(bfloat16).astype(np.float32) * self.scale[ids] + self.bound[ids] * np.float32(gnorm)
 
-    def candidates(self, screened: np.ndarray, g: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    def candidates(self, screened: np.ndarray, g: np.ndarray, k: int, mask: np.ndarray | None = None
+                   ) -> tuple[np.ndarray, np.ndarray]:
         """The rows computed exactly for the k largest logits of a slot (the module docstring's steps), from its
-        screened logits (n,) bf16 and the head's input g: their tokens (int32, in no order) and exact logits (fp32)."""
+        screened logits (n,) bf16 and the head's input g: their tokens (int32, in no order) and exact logits (fp32).
+        ``mask``: of the tokens a vocabulary bitmask allows (``models.sampling.Mask.bits``): every step among them, the
+        k largest of those as exact as an unmasked choice's."""
         bits, gnorm = screened.view(np.uint16), float(np.linalg.norm(g))
-        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), self.n))[1]
+        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), self.n), mask=mask)[1]
         e = self.exact(ids, g)
-        thr = max(float(e.max()), _native.screen_lower(bits, self.scale, self.bound, gnorm))
-        ids, e = self._more(bits, gnorm, thr, ids, e, g)
+        if not len(e):
+            return ids, e
+        thr = max(float(e.max()), _native.screen_lower(bits, self.scale, self.bound, gnorm, mask))
+        ids, e = self._more(bits, gnorm, thr, ids, e, g, mask)
         if k > 1:
             thr = float(e.max()) - WINDOW
             if len(e) >= k:
                 thr = max(thr, float(np.partition(e, -k)[-k]))
-            ids, e = self._more(bits, gnorm, thr, ids, e, g)
+            ids, e = self._more(bits, gnorm, thr, ids, e, g, mask)
         self.taken += 1
         return ids, e
 
-    def _more(self, bits: np.ndarray, gnorm: float, thr: float, ids: np.ndarray, e: np.ndarray, g: np.ndarray
-              ) -> tuple[np.ndarray, np.ndarray]:
-        """(ids, e) and the rows whose upper bound reaches thr (``ROWS`` at most: the highest upper bounds), exact."""
-        more = self._above(bits, gnorm, thr)
+    def _more(self, bits: np.ndarray, gnorm: float, thr: float, ids: np.ndarray, e: np.ndarray, g: np.ndarray,
+              mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """(ids, e) and the rows whose upper bound reaches thr (``ROWS`` at most: the highest upper bounds; ``mask``: of
+        the allowed ones), exact."""
+        more = self._above(bits, gnorm, thr, mask)
         more = more[~np.isin(more, ids)]
         if len(more) > ROWS:
             more = np.sort(more[np.argpartition(self._upper(bits, gnorm, more), -ROWS)[-ROWS:]])
@@ -132,15 +144,18 @@ class Screen:
             return ids, e
         return np.concatenate([ids, more]), np.concatenate([e, self.exact(more, g)])
 
-    def top(self, screened: np.ndarray, g: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    def top(self, screened: np.ndarray, g: np.ndarray, k: int, mask: np.ndarray | None = None
+            ) -> tuple[np.ndarray, np.ndarray]:
         """The k largest logits of a slot, fp32, descending (equal ones: the lower token first), and their tokens
         (int32): the exact ones (``candidates``), then, where fewer than k lie in the window, the largest screened ones
-        of the other tokens (their estimates), below them."""
-        ids, e = self.candidates(screened, g, k)
+        of the other tokens (their estimates), below them (``mask``: of the allowed tokens)."""
+        ids, e = self.candidates(screened, g, k, mask)
+        if not len(ids):
+            return e, ids
         order = np.lexsort((ids, -e))[:k]
         v, i = e[order], ids[order]
         if len(i) < min(k, self.n):
-            sv, si = _native.top_logits(screened.view(np.uint16), min(k + len(ids), self.n))
+            sv, si = _native.top_logits(screened.view(np.uint16), min(k + len(ids), self.n), mask=mask)
             keep = ~np.isin(si, ids)
             sv, si = sv[keep][:k - len(i)], si[keep][:k - len(i)]
             v = np.concatenate([v, np.minimum(sv * self.scale[si], np.nextafter(e.min(), np.float32(-np.inf)))])
@@ -185,8 +200,11 @@ class ScreenedRow:
             self._g = self.screen.input(self.x)
         return self._g
 
-    def top(self, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """The k largest logits, fp32, descending (equal ones: the lower token first), and their tokens (int32)."""
+    def top(self, k: int, mask: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """The k largest logits, fp32, descending (equal ones: the lower token first), and their tokens (int32);
+        ``mask``: of the tokens a vocabulary bitmask allows (``models.sampling.Mask.bits``), as exact."""
+        if mask is not None:
+            return self.screen.top(self.screened, self._input(), k, mask)
         if self._top is None or self._top[0] < k:
             self._top = (k, *self.screen.top(self.screened, self._input(), k))
         return self._top[1][:k], self._top[2][:k]

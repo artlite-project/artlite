@@ -13,7 +13,7 @@ struct Logits {
   bool bf16;
 };
 
-/// llama.cpp's penalties sampler (``models.common.Penalties``): the logit l of a recent token of c occurrences ->
+/// llama.cpp's penalties sampler (``models.sampling.Penalties``): the logit l of a recent token of c occurrences ->
 /// (l <= 0 ? l repeat : l / repeat) - presence - c frequency.
 struct Penalty {
   float repeat = 1.0f;
@@ -21,14 +21,18 @@ struct Penalty {
   float frequency = 0.0f;
 };
 
-/// The candidates of a choice (``models.common.Penalties.top``): the k largest logits after a soft cap (cap > 0: tanh(l
-/// / cap) cap) - the m at ``at`` (the recent tokens' logits, counts[i] occurrences each) penalized and ranked with the
-/// others -, descending (equal values: the others first, then the lower index), into values (fp32) and ids (their
-/// logits' indices; ``rows`` (n): the token of each logit). Returns how many (min(k, n)).
-size_t top_logits(Logits x, size_t k, float cap, const int32_t* at, const float* counts, size_t m, Penalty p,
-                  const int32_t* rows, float* values, int32_t* ids);
+/// A mask of allowed logits (``models.sampling.Mask.bits``): bit i % 32 of word i / 32 for logit i (llguidance's
+/// token bitmask), nullptr: every logit.
 
-/// The choice among n candidates, values descending (``models.common.Sampling.pick``): their softmax at ``temp``,
+/// The candidates of a choice (``models.sampling.Penalties.top``): the k largest logits after a soft cap (cap > 0:
+/// tanh(l / cap) cap) - the m at ``at`` (the recent tokens' logits, counts[i] occurrences each) penalized and ranked
+/// with the others -, descending (equal values: the others first, then the lower index), into values (fp32) and ids
+/// (their logits' indices; ``rows`` (n): the token of each logit); ``mask``: of the allowed logits only (the recent
+/// ones too). Returns how many (min(k, n, the allowed)).
+size_t top_logits(Logits x, size_t k, float cap, const int32_t* at, const float* counts, size_t m, Penalty p,
+                  const int32_t* rows, float* values, int32_t* ids, const uint32_t* mask = nullptr);
+
+/// The choice among n candidates, values descending (``models.sampling.Sampling.pick``): their softmax at ``temp``,
 /// the smallest prefix reaching probability top_p, of those the ones of at least min_p times the first's probability
 /// (the first always), one of them drawn by u (uniform in [0, 1)). Returns its index.
 size_t pick(const float* values, size_t n, float temp, float top_p, float min_p, double u);
@@ -47,13 +51,19 @@ float logsumexp(Logits x, float cap);
 /// bound[i] = sqrt(nv) / (1 - rho).
 void screen_stats(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* scale, float* bound);
 
-/// The largest lower bound of the logits of screened ones x (n bf16): max(scale[i] x[i] - gnorm bound[i]).
-float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n);
+/// The largest lower bound of the logits of screened ones x (n bf16): max(scale[i] x[i] - gnorm bound[i]) (``mask``:
+/// over the allowed ones; none: -inf).
+float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n,
+                   const uint32_t* mask = nullptr);
 
-/// The indices i with scale[i] x[i] + gnorm bound[i] >= thr, ascending, into ids (the first ``max`` of them). Returns
-/// how many there are.
+/// The indices i with scale[i] x[i] + gnorm bound[i] >= thr (``mask``: of the allowed ones), ascending, into ids (the
+/// first ``max`` of them). Returns how many there are.
 size_t screen_above(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n, float thr,
-                    int32_t* ids, size_t max);
+                    int32_t* ids, size_t max, const uint32_t* mask = nullptr);
+
+/// The allowed indices of a mask of n logits, ascending, into ids (the first ``max`` of them). Returns how many there
+/// are.
+size_t mask_ids(const uint32_t* mask, size_t n, int32_t* ids, size_t max);
 
 /// a[i] = min(scale[i] x[i], floor): the screened logits' estimates as fp32, ranked after the exact ones.
 void screen_dense(const uint16_t* x, const float* scale, size_t n, float floor, float* a);

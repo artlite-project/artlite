@@ -6,6 +6,7 @@ with Llama 3's split regex): both give the same ids. The chat template is the GG
 
 import json
 import os
+from collections.abc import Callable
 
 import gigatoken
 import numpy as np
@@ -13,6 +14,7 @@ import numpy as np
 from artlite.gguf_model import GGUFFile, bpe_tokenizer_json
 
 from ..templating import render_chat
+from ..tokenizer import texts_of
 
 LLAMA3_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
                   r"|[^\r\n\p{L}\p{N}]?\p{L}+"
@@ -26,15 +28,32 @@ BOS = "<|begin_of_text|>"
 
 class Tokenizer:
     """A gigatoken tokenizer (its native API), token ids as lists. Special tokens written in a text become
-    their ids (as llama.cpp's ``parse_special``); ``special``: their ids by name."""
+    their ids (as llama.cpp's ``parse_special``); ``special``: their ids by name; ``plain``: the tokenizer.json without
+    them (``encode_plain``)."""
 
-    def __init__(self, tokenizer: gigatoken.Tokenizer, special: dict[str, int]):
+    def __init__(self, tokenizer: gigatoken.Tokenizer, special: dict[str, int], plain: Callable[[], bytes]):
         self.tokenizer = tokenizer
         self.special = special
         self._special_ids = set(special.values())
+        self._plain_json = plain
+        self._plain: gigatoken.Tokenizer | None = None
+        self._texts = texts_of(list(special))
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text).tolist()
+
+    def encode_plain(self, text: str) -> list[int]:
+        """Token ids of ``text`` with no special tokens (their text encodes as text)."""
+        if not self._texts.search(text):
+            return self.encode(text)
+        if self._plain is None:
+            self._plain = gigatoken.Tokenizer.from_json(self._plain_json())
+        return self._plain.encode(text).tolist()
+
+    def vocabulary(self) -> tuple[list[bytes], list[int]]:
+        """Every token's bytes as a generation's text has them (a special token's text too) and the special tokens."""
+        vocab = self.tokenizer.vocab
+        return [vocab.get(i, b"") for i in range(self.tokenizer.vocab_size)], sorted(self._special_ids)
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
         """The UTF-8 bytes of the tokens (special tokens only when ``special``)."""
@@ -58,14 +77,16 @@ def load_tokenizer(model_path: str, tokenizer_path: str | None = None) -> Tokeni
         with open(tokenizer_path, "rb") as f:
             data = f.read()
         special = {t["content"]: t["id"] for t in json.loads(data).get("added_tokens", [])}
-        return Tokenizer(gigatoken.Tokenizer.from_json(data), special)
+        return Tokenizer(gigatoken.Tokenizer.from_json(data), special,
+                         lambda: json.dumps({**json.loads(data), "added_tokens": []}).encode())
     if not model_path.endswith(".gguf"):
         raise FileNotFoundError(f"no tokenizer.json next to {model_path}, and it is not a GGUF file")
     g = GGUFFile(model_path)
     types = np.asarray(g.meta["tokenizer.ggml.token_type"])
     special = json.loads(g.strings_json("tokenizer.ggml.tokens", np.flatnonzero(types != 1)))
     # (ignore_merges: as Llama 3's tokenizer.json and llama.cpp's llama3 vocabulary)
-    return Tokenizer(gigatoken.Tokenizer.from_json(bpe_tokenizer_json(g, LLAMA3_PATTERN, ignore_merges=True)), special)
+    return Tokenizer(gigatoken.Tokenizer.from_json(bpe_tokenizer_json(g, LLAMA3_PATTERN, ignore_merges=True)), special,
+                     lambda: bpe_tokenizer_json(g, LLAMA3_PATTERN, ignore_merges=True, special=False))
 
 
 def chat_prompt(gguf: GGUFFile, messages: list[dict[str, object]], *, date: str | None = None,

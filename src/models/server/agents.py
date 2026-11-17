@@ -9,6 +9,9 @@ Where the conversions differ from llama-server's:
 
 - an Anthropic message's blocks keep their order: tool results come before the text that follows them (llama-server
   puts a message's text first, a user turn between the calls and their results);
+- structured output: a Responses request's ``text.format`` and an Anthropic one's ``output_config.format`` (or its
+  deprecated ``output_format``: always exact) become the chat body's ``response_format`` (``constraints``); function
+  tools keep their ``strict``; a Responses ``tool_choice`` ``allowed_tools`` becomes the chat API's;
 - Anthropic's ``tool_choice`` ``tool`` names its function, ``none`` and ``disable_parallel_tool_use`` apply;
   ``thinking`` ``enabled`` and ``adaptive`` turn the model's thought on, ``disabled`` off (absent: the server's
   ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off; another level: the template's
@@ -222,7 +225,8 @@ def anthropic_chat(body: dict[str, Any], note: Note) -> dict[str, Any]:
             note(f"tools of type {t.get('type') if isinstance(t, dict) else t!r}")
             continue
         tools.append({"type": "function", "function": {"name": t.get("name"), "description": t.get("description"),
-                                                       "parameters": t.get("input_schema") or {}}})
+                                                       "parameters": t.get("input_schema") or {},
+                                                       **({"strict": t["strict"]} if "strict" in t else {})}})
     if tools:
         out["tools"] = tools
     choice = body.get("tool_choice")
@@ -249,8 +253,18 @@ def anthropic_chat(body: dict[str, Any], note: Note) -> dict[str, Any]:
             note("thinking.budget_tokens")
     if kwargs:
         out["chat_template_kwargs"] = kwargs
-    if (body.get("output_config") or {}).get("effort") is not None:
+    config = body.get("output_config") or {}
+    if config.get("effort") is not None:
         note("output_config.effort")
+    fmt = config.get("format")
+    if fmt is not None and body.get("output_format") is not None:
+        raise ValueError("output_format is output_config.format's deprecated spelling: give one of them")
+    fmt = fmt if fmt is not None else body.get("output_format")
+    if fmt is not None:  # (structured outputs: always exact, Anthropic's grammar)
+        if not isinstance(fmt, dict) or fmt.get("type") != "json_schema" or not isinstance(fmt.get("schema"), dict):
+            raise ValueError('output_config.format: {"type": "json_schema", "schema": {...}}')
+        out["response_format"] = {"type": "json_schema",
+                                  "json_schema": {"name": "output", "schema": fmt["schema"], "strict": True}}
     return out
 
 
@@ -427,14 +441,21 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
         if not isinstance(t, dict) or t.get("type") != "function":
             note(f"tools of type {t.get('type') if isinstance(t, dict) else t!r}")
             continue
-        tools.append({"type": "function", "function": {k: v for k, v in t.items() if k not in ("type", "strict")}})
+        tools.append({"type": "function", "function": {k: v for k, v in t.items() if k != "type"}})
     if tools:
         out["tools"] = tools
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
-        if choice.get("type") != "function":
-            raise ValueError(f"tool_choice of type {choice.get('type')!r} (auto, none, required or a function)")
-        out["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
+        kind = choice.get("type")
+        if kind == "function":
+            out["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
+        elif kind == "allowed_tools":  # (the chat API's spelling: its list in an object of its own)
+            allowed = [{"type": "function", "function": {"name": t.get("name")}} if isinstance(t, dict) and
+                       t.get("type") == "function" else t for t in choice.get("tools") or []]
+            out["tool_choice"] = {"type": "allowed_tools",
+                                  "allowed_tools": {"mode": choice.get("mode", "auto"), "tools": allowed}}
+        else:
+            raise ValueError(f"tool_choice of type {kind!r} (auto, none, required, a function or allowed_tools)")
     elif choice is not None:
         out["tool_choice"] = choice
     if body.get("max_output_tokens") is not None:
@@ -444,8 +465,15 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
             out[k] = body[k]
     if (body.get("reasoning") or {}).get("effort") is not None:
         out["reasoning_effort"] = body["reasoning"]["effort"]
-    if ((body.get("text") or {}).get("format") or {}).get("type", "text") != "text":
-        note("text.format")
+    fmt = (body.get("text") or {}).get("format")
+    if isinstance(fmt, dict) and fmt.get("type", "text") != "text":  # (the chat API's response_format)
+        if fmt["type"] == "json_object":
+            out["response_format"] = {"type": "json_object"}
+        elif fmt["type"] == "json_schema":
+            out["response_format"] = {"type": "json_schema", "json_schema": {
+                k: fmt[k] for k in ("name", "description", "schema", "strict") if k in fmt}}
+        else:
+            raise ValueError(f"text.format of type {fmt['type']!r} (text, json_object or json_schema)")
     return out
 
 

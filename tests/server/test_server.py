@@ -343,8 +343,9 @@ def test_tool_choice(tooled: tuple) -> None:
     msg = chat(client, "Q", tools=[TIME], tool_choice="none").json()["choices"][0]["message"]
     assert "tool_calls" not in msg and msg["content"].startswith("<tool_call>")
     assert model.rendered[1] is not None  # (the tools stay in the prompt)
-    npu.replies = [call_pieces("get_time")[1:]]  # (after the forced "<tool_call>\n<function=")
-    npu.replies[0][0] = "get_time>"
+    reply = call_pieces("get_time")[1:]  # (after the forced "<tool_call>\n<function=")
+    reply[0] = "get_time>"
+    npu.replies = [reply]
     r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice="required").json()
     assert [c["function"]["name"] for c in r["choices"][0]["message"]["tool_calls"]] == ["get_time"]
     assert ("<|assistant|><think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n</function>"

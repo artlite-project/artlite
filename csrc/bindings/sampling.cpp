@@ -24,6 +24,7 @@ using Ints = nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::c
 using Floats = nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using FloatsOut = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using IntsOut = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using Mask = nb::ndarray<const uint32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
 artlite::Logits logits_arg(const Vector& x) {
   const nb::dlpack::dtype d = x.dtype();
@@ -31,6 +32,13 @@ artlite::Logits logits_arg(const Vector& x) {
                     (d.code == uint8_t(nb::dlpack::dtype_code::Bfloat) && d.bits == 16 && d.lanes == 1);
   if (!bf16 && d != nb::dtype<float>()) throw artlite::Error("logits: bf16 (or their bits as int16 / uint16) or fp32");
   return {x.data(), x.shape(0), bf16};
+}
+
+// A mask of n logits (artlite::top_logits' ``mask``): a word per 32 of them, or none.
+const uint32_t* mask_arg(const std::optional<Mask>& mask, size_t n) {
+  if (!mask) return nullptr;
+  if (mask->shape(0) < (n + 31) / 32) throw artlite::Error("mask: a bit per logit (uint32 words)");
+  return mask->data();
 }
 
 // The first n of an array as a numpy array that owns it.
@@ -46,12 +54,13 @@ nb::ndarray<nb::numpy, T, nb::ndim<1>> owned(std::unique_ptr<T[]> a, size_t n) {
 namespace artlite::bindings {
 
 void bind_sampling(nb::module_& m) {
-  // --- Sampling (models.common) ---
+  // --- Sampling (models.sampling) ---
   m.def(
       "top_logits",
       [](Vector logits, size_t k, float cap, std::optional<Ints> at, std::optional<Floats> counts, float repeat,
-         float presence, float frequency, std::optional<Ints> rows) {
+         float presence, float frequency, std::optional<Ints> rows, std::optional<Mask> mask) {
         const artlite::Logits x = logits_arg(logits);
+        const uint32_t* bits = mask_arg(mask, x.n);
         const size_t m = at ? at->shape(0) : 0;
         if ((counts ? counts->shape(0) : 0) != m) throw artlite::Error("top_logits: a count per recent logit");
         if (rows && rows->shape(0) != x.n) throw artlite::Error("top_logits: a row per logit");
@@ -64,21 +73,34 @@ void bind_sampling(nb::module_& m) {
         {
           nb::gil_scoped_release release;
           n = artlite::top_logits(x, k, cap, m ? at->data() : nullptr, m ? counts->data() : nullptr, m,
-                                  {repeat, presence, frequency}, rows ? rows->data() : nullptr, values.get(), ids.get());
+                                  {repeat, presence, frequency}, rows ? rows->data() : nullptr, values.get(), ids.get(),
+                                  bits);
         }
         return std::make_pair(owned(std::move(values), n), owned(std::move(ids), n));
       },
       "logits"_a, "k"_a, "cap"_a = 0.0f, "at"_a = nb::none(), "counts"_a = nb::none(), "repeat"_a = 1.0f,
       "presence"_a = 0.0f, "frequency"_a = 0.0f, "rows"_a = nb::none(),
+      "mask"_a = nb::none(),
       nb::sig("def top_logits(logits: numpy.ndarray | object, k: int, cap: float = 0.0, "
               "at: numpy.ndarray[numpy.int32] | None = None, counts: numpy.ndarray[numpy.float32] | None = None, "
               "repeat: float = 1.0, presence: float = 0.0, frequency: float = 0.0, "
-              "rows: numpy.ndarray[numpy.int32] | None = None) -> tuple[numpy.ndarray[numpy.float32], "
-              "numpy.ndarray[numpy.int32]]"),
+              "rows: numpy.ndarray[numpy.int32] | None = None, mask: numpy.ndarray[numpy.uint32] | None = None) -> "
+              "tuple[numpy.ndarray[numpy.float32], numpy.ndarray[numpy.int32]]"),
       "The k largest of a vocabulary's logits (bf16 - a DLPack bfloat16 tensor or the bits as int16 / uint16 - or "
       "fp32) after a soft cap (cap > 0: tanh(l / cap) cap), the logits at ``at`` penalized (counts: their tokens' "
       "occurrences; repeat, presence, frequency: llama.cpp's penalties) and ranked with the others: their values "
-      "(fp32, descending) and ids (the logits' indices, or rows[index]): artlite::top_logits.");
+      "(fp32, descending) and ids (the logits' indices, or rows[index]); mask: of the logits whose bit is set only (bit "
+      "i % 32 of word i / 32): artlite::top_logits.");
+  m.def(
+      "mask_ids",
+      [](Mask mask, size_t n, IntsOut ids) {
+        const uint32_t* bits = mask_arg(mask, n);
+        return artlite::mask_ids(bits, n, ids.data(), ids.shape(0));
+      },
+      "mask"_a, "n"_a, "ids"_a,
+      nb::sig("def mask_ids(mask: numpy.ndarray[numpy.uint32], n: int, ids: numpy.ndarray[numpy.int32]) -> int"),
+      "The logits a mask of n allows (bit i % 32 of word i / 32), ascending, into ids (the first len(ids)); how many "
+      "there are: artlite::mask_ids.");
   m.def(
       "pick",
       [](Floats values, float temp, float top_p, float min_p, double u) {
@@ -129,30 +151,34 @@ void bind_sampling(nb::module_& m) {
       "artlite::screen_stats.");
   m.def(
       "screen_lower",
-      [](Vector logits, Floats scale, Floats bound, float gnorm) {
+      [](Vector logits, Floats scale, Floats bound, float gnorm, std::optional<Mask> mask) {
         const artlite::Logits x = logits_arg(logits);
         if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
           throw artlite::Error("screen_lower: bf16 logits, a scale and a bound per logit");
-        return artlite::screen_lower(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n);
+        return artlite::screen_lower(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n,
+                                     mask_arg(mask, x.n));
       },
-      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a,
+      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a, "mask"_a = nb::none(),
       nb::sig("def screen_lower(logits: numpy.ndarray | object, scale: numpy.ndarray[numpy.float32], "
-              "bound: numpy.ndarray[numpy.float32], gnorm: float) -> float"),
-      "The largest lower bound of a screened head's logits (bf16), max(scale x - gnorm bound): artlite::screen_lower.");
+              "bound: numpy.ndarray[numpy.float32], gnorm: float, mask: numpy.ndarray[numpy.uint32] | None = None) -> "
+              "float"),
+      "The largest lower bound of a screened head's logits (bf16), max(scale x - gnorm bound) (mask: of the allowed "
+      "ones): artlite::screen_lower.");
   m.def(
       "screen_above",
-      [](Vector logits, Floats scale, Floats bound, float gnorm, float thr, IntsOut ids) {
+      [](Vector logits, Floats scale, Floats bound, float gnorm, float thr, IntsOut ids, std::optional<Mask> mask) {
         const artlite::Logits x = logits_arg(logits);
         if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
           throw artlite::Error("screen_above: bf16 logits, a scale and a bound per logit");
         return artlite::screen_above(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n, thr,
-                                     ids.data(), ids.shape(0));
+                                     ids.data(), ids.shape(0), mask_arg(mask, x.n));
       },
-      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a, "thr"_a, "ids"_a,
+      "logits"_a, "scale"_a, "bound"_a, "gnorm"_a, "thr"_a, "ids"_a, "mask"_a = nb::none(),
       nb::sig("def screen_above(logits: numpy.ndarray | object, scale: numpy.ndarray[numpy.float32], "
-              "bound: numpy.ndarray[numpy.float32], gnorm: float, thr: float, ids: numpy.ndarray[numpy.int32]) -> int"),
-      "The indices of a screened head's logits (bf16) with scale x + gnorm bound >= thr, ascending, into ids (the "
-      "first len(ids)); how many there are: artlite::screen_above.");
+              "bound: numpy.ndarray[numpy.float32], gnorm: float, thr: float, ids: numpy.ndarray[numpy.int32], "
+              "mask: numpy.ndarray[numpy.uint32] | None = None) -> int"),
+      "The indices of a screened head's logits (bf16) with scale x + gnorm bound >= thr (mask: of the allowed ones), "
+      "ascending, into ids (the first len(ids)); how many there are: artlite::screen_above.");
   m.def(
       "screen_dense",
       [](Vector logits, Floats scale, float floor, FloatsOut a) {

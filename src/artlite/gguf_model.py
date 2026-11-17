@@ -558,17 +558,18 @@ class GGUFFile:
         self._hint("populate", off, nbytes)
 
 
-def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bool = False) -> bytes:
+def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bool = False,
+                       special: bool = True) -> bytes:
     """A Hugging Face tokenizer.json of a GGUF byte-level BPE vocabulary (``tokenizer.ggml.model == "gpt2"``), for
     ``gigatoken.Tokenizer.from_json``: the normal tokens (type 1) and the merges; the control and user-defined
-    tokens (types 3, 4) as added tokens, recognized in a text (llama.cpp's ``parse_special``); ``pattern`` the split
-    regex in its tokenizer.json form (one of the schemes gigatoken implements; None: no split, each text one piece,
-    the caller's pieces); ``ignore_merges``: a pre-token that is a token is not merged (Llama 3's tokenizer.json,
-    llama.cpp's llama3 vocabulary)."""
+    tokens (types 3, 4) as added tokens, recognized in a text (llama.cpp's ``parse_special``; ``special`` False: left
+    out, their text encodes as text); ``pattern`` the split regex in its tokenizer.json form (one of the schemes
+    gigatoken implements; None: no split, each text one piece, the caller's pieces); ``ignore_merges``: a pre-token
+    that is a token is not merged (Llama 3's tokenizer.json, llama.cpp's llama3 vocabulary)."""
     assert gguf.meta.get("tokenizer.ggml.model") == "gpt2", gguf.meta.get("tokenizer.ggml.model")
     types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
     key = "tokenizer.ggml.tokens"
-    added = json.loads(gguf.strings_json(key, np.flatnonzero((types == 3) | (types == 4))))  # {content: id}
+    added = json.loads(gguf.strings_json(key, np.flatnonzero((types == 3) | (types == 4)))) if special else {}
     byte_level = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": False, "use_regex": False}
     spec = {
         "version": "1.0", "truncation": None, "padding": None,

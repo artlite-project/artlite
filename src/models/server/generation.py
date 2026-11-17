@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..detokenizer import StreamDecoder
 from ..sampling import seed
+from ..structured import GrammarMask, thought_of
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
 from .textflow import ReasoningSplitter, StopMatcher
 
@@ -83,14 +84,21 @@ class Generation:
         self._report(how, d1, t_npu1, t_host1)
 
     def _forced_call(self) -> None:
-        """The forced call's opener (``Calls.force``): where it goes, and the mask of the calls' names."""
+        """The forced call's opener (``Calls.force``): where it goes; the mask of the answer's structured output
+        (``structured.GrammarMask``, after the thought), or of the calls' names."""
         job, model = self.job, self.model
         tools = job.tools
         self.force = tools.force if tools is not None else None
         thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
         self.early = model.tokenizer.encode(self.force) if self.force and not thought else []
         self.late = (tools.syntax.gap if job.inside else "") + self.force if self.force and thought else ""
-        self.mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
+        if job.grammar is not None:  # (the thought stays free)
+            thought = thought_of(model.reasoning, model.tokenizer, opened=job.opened, think=job.think,
+                                 ends=tools.syntax.ends if tools is not None else ())
+            self.mask = GrammarMask(self.engine.vocab(), job.grammar.grammar, thought=thought,
+                                    digits=job.grammar.json, name=job.name)
+        else:
+            self.mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
 
     def _progress(self, i: int) -> None:
         job = self.job

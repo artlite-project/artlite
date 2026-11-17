@@ -14,7 +14,7 @@ from ml_dtypes import bfloat16
 from artlite import _native
 from models.npu_model import NpuModel
 from models.overlay_model import OverlayModel
-from models.sampling import Penalties, Sampling, max_prob, seed, top_logits
+from models.sampling import Penalties, Sampling, max_prob, pack_mask, seed, top_logits
 
 VOCAB = 4096
 CAP = 30.0
@@ -199,17 +199,50 @@ def test_generate(model: type[NpuModel]) -> None:
 
 
 class Allowed:
-    """A mask of a fixed set of tokens; ``seen``: the tokens it was told."""
+    """A mask of a fixed set of tokens (a vocabulary bitmask of ``n``); ``seen``: the tokens it was told."""
 
-    def __init__(self, ids: list[int]):
-        self.ids = np.asarray(sorted(ids), np.int32)
+    def __init__(self, ids: list[int], n: int = VOCAB):
+        allowed = np.zeros(n, bool)
+        allowed[ids] = True
+        self._bits = pack_mask(allowed, (n + 31) // 32)
         self.seen: list[int] = []
 
-    def allowed(self) -> np.ndarray:
-        return self.ids
+    def bits(self) -> np.ndarray:
+        return self._bits
 
     def accept(self, token: int) -> None:
         self.seen.append(token)
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+@pytest.mark.parametrize("n", [1, 15, 17, 31, 33, 129, 4099, 128256])
+def test_masked_top_logits(n: int, dtype: str) -> None:
+    """``_native.top_logits``' mask: the k largest of the allowed logits (none to all of them, at lengths off a
+    vector's lanes, ties), the recent ones penalized only when allowed, a mask of the logits' order with ``rows``; the
+    allowed indices (``_native.mask_ids``)."""
+    rng = np.random.default_rng(n + 7)
+    for share in (0.0, 0.003, 0.3, 1.0):
+        x = np.round(rng.standard_normal(n) * 3).astype(np.float32)
+        x = bf16(x) if dtype == "bf16" else x
+        v = values(x)
+        allowed = rng.random(n) < share
+        allowed[rng.integers(n)] = share > 0
+        bits = pack_mask(allowed, (n + 31) // 32)
+        ids = np.flatnonzero(allowed)
+        order = ids[np.lexsort((ids, -v[ids].astype(np.float64)))]
+        got = np.empty(8, np.int32)
+        assert _native.mask_ids(bits, n, got) == len(ids) and np.array_equal(got[:min(8, len(ids))], ids[:8])
+        for k in (1, 8, 64):
+            got_v, got_i = _native.top_logits(x, k, mask=bits)
+            np.testing.assert_array_equal(got_i, order[:k])
+            np.testing.assert_array_equal(got_v, v[order[:k]])
+            at = rng.choice(n, min(n, 5), replace=False).astype(np.int32)  # (some allowed, some not)
+            got_v, got_i = _native.top_logits(x, k, 0.0, at, np.ones(len(at), np.float32), 2.0, mask=bits)
+            assert set(got_i.tolist()) <= set(ids.tolist()) and len(got_i) == min(k, len(ids))
+        rows = rng.permutation(n).astype(np.int32)  # (the logit at i is token rows[i]: the mask in the logits' order)
+        lb = pack_mask(allowed[rows], (n + 31) // 32)
+        got_v, got_i = _native.top_logits(x, 8, rows=rows, mask=lb)
+        assert set(got_i.tolist()) <= set(ids.tolist()) and len(got_i) == min(8, len(ids))
 
 
 @pytest.mark.parametrize("dtype", ["bf16-cap", "fp32", "bf16"])
@@ -239,3 +272,8 @@ def test_mask(dtype: str) -> None:
     v, i = Penalties(Sampling(top_k=64), (), Allowed([3, 9])).top(raw, 64, cap)
     assert sorted(i.tolist()) == [3, 9] and len(v) == 2
     assert list(Steps().generate(Steps().step(0), 4, Sampling(greedy=True), mask=Allowed([6, 7, 9]))) == [6] * 4
+    rows = np.random.default_rng(3).permutation(VOCAB).astype(np.int32)  # (a drafter's logits: another order)
+    where = np.argsort(rows).astype(np.int32)
+    v, i = Penalties(s, prompt, Allowed(allowed)).top(raw[rows], s.top_k, cap, rows=rows, where=where)
+    np.testing.assert_allclose(v, np.sort(full[allowed])[::-1][:s.top_k], rtol=1e-6, atol=1e-6)
+    assert set(i.tolist()) <= set(allowed)

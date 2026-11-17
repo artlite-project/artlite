@@ -33,6 +33,7 @@ dependencies = [
     "httpx>=0.28",  # artlite-server's router mode: the proxy to the models' servers
     "python-multipart>=0.0.20",  # artlite-server's /v1/audio/transcriptions (multipart forms)
     "websockets>=15.0",  # artlite-server's /v1/realtime (uvicorn's websocket protocol)
+    "llguidance>=1.9.1",
 ]
 
 [project.urls]

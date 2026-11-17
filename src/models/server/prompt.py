@@ -20,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ..model import MEDIA_MARKER
 from ..sequence import data_bytes, token_ids
+from ..structured import ends_inside
 from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
@@ -235,30 +236,35 @@ class PromptBuilder:
     def inside(self, ids: list[int]) -> bool:
         """Whether a prompt ends inside a thought (its last text is the model's open marker)."""
         model = self.ctx.engine.model
-        markers = model.reasoning
-        if markers is None:
-            return False
-        last = [int(t) for t in token_ids(ids)[-8:] if t >= 0]  # (a sequence's ids; an image's rows: none)
-        tail = model.tokenizer.decode_bytes(last, special=True).decode("utf-8", errors="replace")
-        return tail.rstrip().endswith(markers[0])
+        return model.reasoning is not None and ends_inside(model.tokenizer, token_ids(ids), model.reasoning[0])
 
     def calls_of(self, req: ChatRequest) -> tuple[list[dict[str, Any]], Calls | None]:
         """A request's functions for the template and how to read its answer's calls (None: as text: no tools, or
         ``tool_choice`` none). ``tool_choice`` required or a named function: the answer begins with a call (its opener
-        forced; a named function's call alone). A template that takes no tools: they are ignored (the web UI sends its
-        own)."""
+        forced; a named function's call alone); ``allowed_tools``: the calls are of its functions (the prompt keeps
+        them all, its cached prefix too), required or not. A template that takes no tools: they are ignored (the web
+        UI sends its own)."""
         syntax = self.ctx.syntax
         try:
             fns = functions(req.tools)
         except ValueError as e:
             raise bad_request(str(e)) from None
         choice = "auto" if req.tool_choice is None else req.tool_choice
-        name = None
+        name, allowed = None, None
+        if isinstance(choice, dict) and choice.get("type") == "allowed_tools":  # (a subset: the prompt keeps them all)
+            spec = choice.get("allowed_tools") if isinstance(choice.get("allowed_tools"), dict) else {}
+            mode, listed = spec.get("mode", "auto"), spec.get("tools")
+            if mode not in ("auto", "required") or not isinstance(listed, list):
+                raise bad_request('tool_choice allowed_tools: {"mode": "auto" or "required", "tools": [...]}')
+            allowed = {(t.get("function") or {}).get("name") for t in listed if isinstance(t, dict)}
+            if unknown := allowed - {f["function"]["name"] for f in fns}:
+                raise bad_request(f"tool_choice allowed_tools names {sorted(map(str, unknown))}, not among the tools")
+            choice = mode
         if isinstance(choice, dict):
             name = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
             if not isinstance(name, str):
-                raise bad_request('tool_choice: "auto", "none", "required" or {"type": "function", "function": '
-                                  '{"name": ...}}')
+                raise bad_request('tool_choice: "auto", "none", "required", {"type": "function", "function": '
+                                  '{"name": ...}} or {"type": "allowed_tools", ...}')
             if name not in {f["function"]["name"] for f in fns}:
                 raise bad_request(f"tool_choice names {name!r}, not one of the tools")
         elif choice not in ("auto", "none", "required"):
@@ -275,7 +281,8 @@ class PromptBuilder:
             return fns, None
         force = syntax.opener(name) if choice == "required" or name else None
         parallel = req.parallel_tool_calls is not False and name is None  # (a named function: that call alone)
-        return fns, Calls(syntax, fns, parallel=parallel, force=force)
+        callable_ = fns if allowed is None else [f for f in fns if f["function"]["name"] in allowed]
+        return fns, Calls(syntax, callable_, parallel=parallel, force=force)
 
     async def vocabulary(self) -> Vocabulary | None:
         """The model's tokens by their text (``tools.Vocabulary``: a few tenths of a second, in a thread, once), or

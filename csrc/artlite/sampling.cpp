@@ -1,4 +1,4 @@
-// Sampling on the host (``models.common``): the candidates of a choice in one pass over a vocabulary's logits, the
+// Sampling on the host (``models.sampling``): the candidates of a choice in one pass over a vocabulary's logits, the
 // choice, a draft's probability. One thread, AVX-512 (-march=znver5: CMakeLists.txt).
 //
 // The pass compares 32 bf16 (16 fp32) logits per instruction as ordered integer keys against a threshold, the k-th
@@ -38,9 +38,10 @@ uint64_t candidate(int32_t k, uint32_t i) { return uint64_t(uint32_t(k) ^ 0x8000
 uint32_t index_of(uint64_t c) { return ~uint32_t(c); }
 int32_t key_of(uint64_t c) { return int32_t(uint32_t(c >> 32) ^ 0x80000000u); }
 
-// The candidates of the k largest of x[0 .. n) (k >= 1), unsorted: at most max(4 k, 256), those k among them.
+// The candidates of the k largest of x[0 .. n) (k >= 1; ``mask``: of those whose bit is set, nullptr: all), unsorted: at
+// most max(4 k, 256), those k among them.
 template <class T>
-void scan(const T* x, size_t n, size_t k, std::vector<uint64_t>& c) {
+void scan(const T* x, size_t n, size_t k, const uint32_t* mask, std::vector<uint64_t>& c) {
   constexpr bool BF16 = sizeof(T) == 2;
   constexpr size_t L = 64 / sizeof(T);  // lanes of a vector
   const size_t cap = std::max<size_t>(4 * k, 256);
@@ -63,6 +64,13 @@ void scan(const T* x, size_t n, size_t k, std::vector<uint64_t>& c) {
     else
       return _mm512_cmpgt_epi32_mask(keys(v), t);
   };
+  auto allowed = [&](size_t i) -> uint32_t {  // (the mask's bits of the L logits from i, a multiple of L)
+    if (!mask) return ~0u;
+    if constexpr (BF16)
+      return mask[i / 32];
+    else
+      return (mask[i / 32] >> (i % 32)) & 0xFFFFu;
+  };
   auto push = [&](size_t i0, uint32_t m) {  // (lanes of a mask taken with an older threshold: the next keep drops them)
     for (; m; m &= m - 1) {
       const size_t i = i0 + std::countr_zero(m);
@@ -77,8 +85,10 @@ void scan(const T* x, size_t n, size_t k, std::vector<uint64_t>& c) {
   };
   size_t i = 0;
   for (; i + 4 * L <= n; i += 4 * L) {
-    const uint32_t m0 = above(_mm512_loadu_si512(x + i)), m1 = above(_mm512_loadu_si512(x + i + L)),
-                   m2 = above(_mm512_loadu_si512(x + i + 2 * L)), m3 = above(_mm512_loadu_si512(x + i + 3 * L));
+    const uint32_t m0 = above(_mm512_loadu_si512(x + i)) & allowed(i),
+                   m1 = above(_mm512_loadu_si512(x + i + L)) & allowed(i + L),
+                   m2 = above(_mm512_loadu_si512(x + i + 2 * L)) & allowed(i + 2 * L),
+                   m3 = above(_mm512_loadu_si512(x + i + 3 * L)) & allowed(i + 3 * L);
     if (!(m0 | m1 | m2 | m3)) continue;
     push(i, m0);
     push(i + L, m1);
@@ -87,7 +97,7 @@ void scan(const T* x, size_t n, size_t k, std::vector<uint64_t>& c) {
   }
   for (; i < n; i += L) {
     const size_t r = std::min(L, n - i);
-    const uint32_t lanes = r == 32 ? ~0u : (1u << r) - 1;
+    const uint32_t lanes = (r == 32 ? ~0u : (1u << r) - 1) & allowed(i);
     if constexpr (BF16)
       push(i, _mm512_mask_cmpgt_epi16_mask(lanes, keys(_mm512_maskz_loadu_epi16(lanes, x + i)), t));
     else
@@ -96,14 +106,14 @@ void scan(const T* x, size_t n, size_t k, std::vector<uint64_t>& c) {
   }
 }
 
-// The candidates of the k largest of the logits, best first.
-const std::vector<uint64_t>& best(Logits x, size_t k) {
+// The candidates of the k largest of the logits (``mask``: of the allowed ones), best first.
+const std::vector<uint64_t>& best(Logits x, size_t k, const uint32_t* mask = nullptr) {
   thread_local std::vector<uint64_t> c;
   c.clear();
   if (x.bf16)
-    scan(static_cast<const uint16_t*>(x.data), x.n, k, c);
+    scan(static_cast<const uint16_t*>(x.data), x.n, k, mask, c);
   else
-    scan(static_cast<const float*>(x.data), x.n, k, c);
+    scan(static_cast<const float*>(x.data), x.n, k, mask, c);
   if (c.size() > k) {
     std::nth_element(c.begin(), c.begin() + (k - 1), c.end(), std::greater<>());
     c.resize(k);
@@ -133,11 +143,11 @@ __m512 exp2_ps(__m512 t) {
 }  // namespace
 
 size_t top_logits(Logits x, size_t k, float cap, const int32_t* at, const float* counts, size_t m, Penalty p,
-                  const int32_t* rows, float* values, int32_t* ids) {
+                  const int32_t* rows, float* values, int32_t* ids, const uint32_t* mask) {
   k = std::min(k, x.n);
   if (!k) return 0;
   // the k + m largest hold the k largest of the others
-  const std::vector<uint64_t>& c = best(x, std::min(k + m, x.n));
+  const std::vector<uint64_t>& c = best(x, std::min(k + m, x.n), mask);
   auto capped = [&](size_t i) {
     const float v = logit(x, i);
     return cap > 0 ? std::tanh(v / cap) * cap : v;
@@ -155,6 +165,7 @@ size_t top_logits(Logits x, size_t k, float cap, const int32_t* at, const float*
   }
   if (m) {
     for (size_t j = 0; j < m; j++) {
+      if (mask && !(mask[size_t(at[j]) / 32] >> (size_t(at[j]) % 32) & 1)) continue;
       float v = capped(size_t(at[j]));
       v = v <= 0 ? v * p.repeat : v / p.repeat;
       v = v - p.presence - counts[j] * p.frequency;
@@ -264,6 +275,12 @@ inline __m512 bf16_ps(const uint16_t* x) {
   return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x))), 16));
 }
 
+// whether logit i is allowed by a mask (nullptr: all are), the mask's bits of the 16 logits from i (a multiple of 16)
+inline bool allowed(const uint32_t* mask, size_t i) { return !mask || (mask[i / 32] >> (i % 32) & 1); }
+inline __mmask16 lanes16(const uint32_t* mask, size_t i) {
+  return mask ? __mmask16(mask[i / 32] >> (i % 32)) : __mmask16(0xFFFF);
+}
+
 // the indices of mask k's lanes (from i) appended to ids[c ..] (the first max in all); the new count
 inline size_t append(__mmask16 k, size_t i, int32_t* ids, size_t c, size_t max) {
   if (c + 16 <= max) {
@@ -316,28 +333,43 @@ void screen_stats(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, f
   }
 }
 
-float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n) {
+float screen_lower(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n,
+                   const uint32_t* mask) {
   const __m512 g = _mm512_set1_ps(gnorm);
   __m512 lo = _mm512_set1_ps(-INFINITY);
   size_t i = 0;
   for (; i + 16 <= n; i += 16)
-    lo = _mm512_max_ps(lo, _mm512_fnmadd_ps(_mm512_loadu_ps(bound + i), g, _mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i))));
+    lo = _mm512_mask_max_ps(lo, lanes16(mask, i), lo,
+                            _mm512_fnmadd_ps(_mm512_loadu_ps(bound + i), g, _mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i))));
   float best = _mm512_reduce_max_ps(lo);
-  for (; i < n; i++) best = std::max(best, std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] - bound[i] * gnorm);
+  for (; i < n; i++)
+    if (allowed(mask, i)) best = std::max(best, std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] - bound[i] * gnorm);
   return best;
 }
 
 size_t screen_above(const uint16_t* x, const float* scale, const float* bound, float gnorm, size_t n, float thr,
-                    int32_t* ids, size_t max) {
+                    int32_t* ids, size_t max, const uint32_t* mask) {
   const __m512 g = _mm512_set1_ps(gnorm), t = _mm512_set1_ps(thr);
   size_t c = 0, i = 0;
   for (; i + 16 <= n; i += 16) {
     const __m512 up = _mm512_fmadd_ps(_mm512_loadu_ps(bound + i), g, _mm512_mul_ps(bf16_ps(x + i), _mm512_loadu_ps(scale + i)));
-    const __mmask16 k = _mm512_cmp_ps_mask(up, t, _CMP_GE_OQ);
+    const __mmask16 k = _mm512_mask_cmp_ps_mask(lanes16(mask, i), up, t, _CMP_GE_OQ);
     if (k) c = append(k, i, ids, c, max);
   }
   for (; i < n; i++)
-    if (std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] + bound[i] * gnorm >= thr) {
+    if (allowed(mask, i) && std::bit_cast<float>(uint32_t(x[i]) << 16) * scale[i] + bound[i] * gnorm >= thr) {
+      if (c < max) ids[c] = int32_t(i);
+      c++;
+    }
+  return c;
+}
+
+size_t mask_ids(const uint32_t* mask, size_t n, int32_t* ids, size_t max) {
+  size_t c = 0, i = 0;
+  for (; i + 16 <= n; i += 16)
+    if (const __mmask16 k = lanes16(mask, i)) c = append(k, i, ids, c, max);
+  for (; i < n; i++)
+    if (allowed(mask, i)) {
       if (c < max) ids[c] = int32_t(i);
       c++;
     }

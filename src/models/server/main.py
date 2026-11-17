@@ -22,7 +22,7 @@ import uvicorn
 
 from artlite import settings
 
-from .. import open_model
+from .. import open_model, structured
 from ..hostenv import memory_note, performance_mode, stale_install
 from ..model import Model
 from ..npu_model import NpuModel
@@ -84,6 +84,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         if pooling == "rank" and info.readouts.head is None:
             raise ValueError(f"{name}: rank pooling (--rerank) needs a reranker's file: this one has no classifier head "
                              f"(cls.output)")
+        constraint = structured.from_args(args)  # (compiled against the model's tokens by the first request)
     except (OSError, ValueError, NotImplementedError) as e:
         if report is not None:
             report({"error": f"{type(e).__name__}: {e}"})
@@ -91,6 +92,7 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
     n_ctx = capacity(args.ctx_size, info.n_ctx_train)
     options = Options.from_args(args, alias=args.alias or name, n_ctx=n_ctx, api_keys=keys, reasoning_effort=effort,
                                 penalties=penalties, pooling=pooling)
+    options.constraint = constraint
     options.ui, no_ui = web_ui(args)
     options.no_ui = no_ui or options.no_ui
 

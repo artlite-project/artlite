@@ -15,6 +15,7 @@ from artlite import _native
 
 from ..detokenizer import Detokenizer
 from ..sampling import LogitsLike, Sampling, logit_bits, top_logits
+from ..structured import Compiled
 from .tools import Calls
 
 Emit = Callable[[str, dict[str, Any]], None]  # (event, data) -> None: a job's events to its request
@@ -86,9 +87,11 @@ class Job:
     seed: int = -1  # < 0: random
     stop: list[str] = field(default_factory=list)
     reasoning: bool = False  # split the thoughts off (the model's ``reasoning`` markers)
-    inside: bool = False  # the prompt ends inside a thought (it opened one)
+    inside: bool = False  # the prompt ends inside a thought (it opened one) and the thoughts are split off
+    opened: bool = False  # the prompt ends inside a thought (whether or not the thoughts are split off)
     think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
+    grammar: Compiled | None = None  # the answer's structured output (after the thought: ``structured.GrammarMask``)
     cache_prompt: bool = True  # continue from the cached prefix
     answer_mark: bool = False  # the next prompt re-renders this answer's opener (its template drops earlier thoughts)
     progress: bool = False  # send prompt_progress events

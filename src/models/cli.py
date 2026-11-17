@@ -30,7 +30,7 @@ import numpy as np
 
 from artlite.model_config import MODELS_DIR, model_path
 
-from . import is_diffusers, open_model, open_pipeline
+from . import is_diffusers, open_model, open_pipeline, structured
 from .detokenizer import StreamDecoder
 from .hostenv import memory_note, performance_mode, stale_install
 from .lfm3a.host import asr_system
@@ -40,6 +40,7 @@ from .sampling import seed
 from .sd15.pipeline import check_request
 from .sd15.png import write_png
 from .sd15.sampling import SAMPLERS
+from .sequence import token_ids
 from .spec_options import add_spec_options, spec_options
 from .templating import TEMPLATE_RESERVED, template_option
 
@@ -80,6 +81,7 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--frequency-penalty", type=float, help="subtract this times their count from the logits of the "
                    "last --repeat-last-n tokens (default: the model's, 0)")
     p.add_argument("--greedy", action="store_true", help="always the most likely token")
+    structured.add_arguments(p)
     p.add_argument("-s", "--seed", type=int, default=1608560892, help="sampling seed")
     p.add_argument("--no-prefill", action="store_true", help="run the prompt as decode steps")
     p.add_argument("--no-lookup", action="store_true",
@@ -345,6 +347,17 @@ def main(argv: list[str] | None = None) -> None:
                  "frequency_penalty": args.frequency_penalty}
         sampling = dataclasses.replace(sampling, **{k: v for k, v in given.items() if v is not None},
                                        greedy=sampling.greedy or args.greedy)
+        constraint = structured.from_args(args)
+        mask = None
+        if constraint is not None:  # (the answer's: after the thought; not a raw prompt's)
+            v = structured.vocab(model.tokenizer, int(getattr(getattr(model, "cfg", None), "vocab_size", 0)),
+                                 sorted(model.eos_token_ids))
+            opened = not args.raw and model.reasoning is not None and \
+                structured.ends_inside(model.tokenizer, token_ids(ids), model.reasoning[0])
+            thought = structured.thought_of(model.reasoning, model.tokenizer, opened=opened,
+                                            think=args.think and not args.raw)
+            mask = structured.GrammarMask(v, structured.compiled(constraint, v).grammar, thought=thought,
+                                          digits=constraint.json)
     except jinja2.TemplateError as e:  # (the template refuses the prompt or a variable)
         fail(f"the chat template failed: {e}")
     except (OSError, ValueError, NotImplementedError) as e:
@@ -375,7 +388,7 @@ def main(argv: list[str] | None = None) -> None:
     t1 = time.perf_counter()
     npu_s, host_s, passes = npu.t_npu, npu.t_host, npu.dispatches
     n = 0
-    for token in npu.generate(logits, args.n_predict, sampling, ids):
+    for token in npu.generate(logits, args.n_predict, sampling, ids, mask):
         n += 1
         if token not in model.eos_token_ids:
             print(out.feed(token), end="", flush=True)

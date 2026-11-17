@@ -14,7 +14,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import _native
-from artlite.decode.screen import ROWS, ScreenedRow
+from artlite.decode.screen import SEEDS, ScreenedRow
 
 from .sequence import MEDIA, token_ids
 
@@ -131,10 +131,11 @@ Probs = Callable[[LogitsLike, int, float, tuple[np.ndarray, np.ndarray]], None]
 
 
 class Mask(Protocol):
-    """A constraint on a generation's tokens (a tool call's name: ``server.tools.NameMask``)."""
+    """A constraint on a generation's tokens (a grammar's: ``structured.GrammarMask``)."""
 
-    def allowed(self) -> np.ndarray | None:
-        """The tokens the next one may be (sorted ids), or None: any."""
+    def bits(self) -> np.ndarray | None:
+        """The tokens the next one may be as a vocabulary bitmask (uint32: bit i % 32 of word i // 32 for token i,
+        llguidance's), or None: any."""
         ...
 
     def accept(self, token: int) -> None:
@@ -205,9 +206,12 @@ class Penalties:
 
     def _top(self, logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray | None = None,
              where: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        allowed = self.mask.allowed() if self.mask is not None else None
-        if allowed is not None:
-            return self._top_of(logits, k, cap, allowed)
+        bits = self.mask.bits() if self.mask is not None else None
+        if bits is not None:
+            out = self._top_masked(logits, k, cap, bits, rows=rows, where=where)
+            if len(out[0]):
+                return out
+            # (no candidate: a mask that allows none of these logits; the grammar's mask follows the next token)
         if not self.counts:
             return top_logits(logits, k, cap, rows=rows)
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
@@ -217,13 +221,16 @@ class Penalties:
         return _native.top_logits(logit_bits(logits), k, cap, ids if where is None else where[ids], count, s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, rows)
 
-    def _top_screened(self, logits: ScreenedRow, k: int, cap: float, ids: np.ndarray, count: np.ndarray
-                      ) -> tuple[np.ndarray, np.ndarray]:
+    def _top_screened(self, logits: ScreenedRow, k: int, cap: float, ids: np.ndarray, count: np.ndarray,
+                      bits: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         """``_native.top_logits``' candidates of a screened head's row: the k largest logits of the other tokens, then
         the recent tokens' ``ids`` (``count`` occurrences each) penalized, the k largest of all (equal ones: in that
-        order); every one of them exact."""
+        order); every one of them exact. ``bits``: of the tokens a mask allows (the recent ones too)."""
         s = self.sampling
-        v, i = logits.top(k + len(ids))
+        if bits is not None:
+            ok = (bits[ids >> 5] >> (ids & 31).astype(np.uint32)) & 1 == 1
+            ids, count = ids[ok], count[ok]
+        v, i = logits.top(k + len(ids), bits)
         keep = ~np.isin(i, ids)
         v, i = _capped(v[keep][:k], cap), i[keep][:k]
         r = _capped(logits.at(ids), cap)
@@ -233,20 +240,42 @@ class Penalties:
         order = np.argsort(-v, kind="stable")[:k]
         return v[order], i[order]
 
-    def _top_of(self, logits: LogitsLike, k: int, cap: float, allowed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """The ``k`` largest penalized logits of the ``allowed`` tokens (sorted ids) and their ids (a screened row: the
-        allowed tokens' exact logits, or past ``ROWS`` of them its array's)."""
-        if isinstance(logits, ScreenedRow):
-            sub = logits.at(allowed) if len(allowed) <= ROWS else logits.dense()[allowed]
-        else:
-            sub = logits[allowed]
-        k = min(k, len(allowed))
-        if not self.counts:
-            return top_logits(sub, k, cap, rows=allowed)
+    def _top_masked(self, logits: LogitsLike, k: int, cap: float, bits: np.ndarray, *, rows: np.ndarray | None,
+                    where: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        """The ``k`` largest penalized logits of the tokens a mask allows (``bits``: a vocabulary bitmask) and their ids,
+        in one pass over the logits (``_native.top_logits``' mask); a screened row's exact (``ScreenedRow.top``'s
+        mask: as exact as an unmasked choice). ``rows``, ``where``: logits in another order (``top``)."""
+        s = self.sampling
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
         count = np.fromiter(self.counts.values(), np.float32, len(ids))
-        at = np.minimum(np.searchsorted(allowed, ids), len(allowed) - 1)
-        hit = allowed[at] == ids
-        s = self.sampling
-        return _native.top_logits(logit_bits(sub), k, cap, at[hit].astype(np.int32), count[hit], s.repeat_penalty,
-                                  s.presence_penalty, s.frequency_penalty, allowed)
+        if isinstance(logits, ScreenedRow) and rows is None and where is None:
+            few = _native.mask_ids(bits, len(logits), _few)
+            if not few:  # (none: the caller's fallback)
+                return np.empty(0, np.float32), np.empty(0, np.int32)
+            if few <= len(_few):  # (a few tokens allowed: their rows, exact)
+                allowed = _few[:few].copy()
+                sub = logits.at(allowed)
+                at = np.searchsorted(allowed, ids)
+                hit = (at < few) & (allowed[np.minimum(at, few - 1)] == ids)
+                return _native.top_logits(sub, k, cap, at[hit].astype(np.int32), count[hit], s.repeat_penalty,
+                                          s.presence_penalty, s.frequency_penalty, allowed)
+            return self._top_screened(logits, k, cap, ids, count, bits)
+        x = logit_bits(logits)
+        if rows is not None:  # (a mask of the logits' order)
+            bits = pack_mask(np.unpackbits(bits.view(np.uint8), bitorder="little")[rows], (len(x) + 31) // 32)
+        elif len(x) > 32 * len(bits):  # (logits past the vocabulary's tokens: none allowed)
+            bits = np.concatenate([bits, np.zeros((len(x) + 31) // 32 - len(bits), np.uint32)])
+        at = ids if where is None else where[ids]
+        return _native.top_logits(x, k, cap, at if len(at) else None, count if len(at) else None, s.repeat_penalty,
+                                  s.presence_penalty, s.frequency_penalty, rows, bits)
+
+
+_few = np.empty(SEEDS, np.int32)  # (a mask's few allowed tokens: exact rows of a screened head)
+
+
+def pack_mask(allowed: np.ndarray, words: int) -> np.ndarray:
+    """A vocabulary bitmask (``Mask.bits``: ``words`` uint32 words) of a bool per token."""
+    out = np.zeros(words * 4, np.uint8)
+    b = np.packbits(allowed, bitorder="little")[:words * 4]
+    out[:len(b)] = b
+    return out.view(np.uint32)

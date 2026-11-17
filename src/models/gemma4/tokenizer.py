@@ -109,6 +109,21 @@ class GemmaTokenizer:
             self._text(text[pos:], out)
         return out
 
+    def encode_plain(self, text: str) -> list[int]:
+        """Token ids of ``text`` with no special tokens (their text encodes as text)."""
+        out: list[int] = []
+        if text:
+            self._text(text, out)
+        return out
+
+    def vocabulary(self) -> tuple[list[bytes], list[int]]:
+        """Every token's bytes as a generation's text has them (a control token's text too; a byte token its byte) and
+        the special tokens: the control and unknown ones and the user-defined ones spelled ``<...>``."""
+        pieces = [self.decode_bytes([i], special=True) for i in range(len(self.tokens))]
+        special = [i for i, t in enumerate(self.types) if t in (T_CONTROL, T_UNKNOWN) or
+                   (t == T_USER and pieces[i].startswith(b"<") and pieces[i].endswith(b">"))]
+        return pieces, special
+
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
         """The UTF-8 bytes of the tokens (control tokens only when ``special``)."""
         out = bytearray()

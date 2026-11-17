@@ -329,7 +329,8 @@ def test_name_mask() -> None:
     fns = functions([tool("get"), tool("get_time"), tool("python")])
     mask = NameMask(QWEN_XML.parser(fns), Pieces(pieces), Vocabulary(Pieces(pieces), len(pieces)))
     ids = {p: i for i, p in enumerate(pieces)}
-    allowed = lambda: None if (a := mask.allowed()) is None else sorted(pieces[i] for i in a)
+    allowed = lambda: None if (b := mask.bits()) is None else sorted(
+        pieces[i] for i in np.flatnonzero(np.unpackbits(b.view(np.uint8), bitorder="little")[:len(pieces)]))
     assert allowed() is None
     mask.accept(ids[b"x"])
     assert allowed() is None
@@ -385,8 +386,9 @@ def test_name_mask_walks(family: str) -> None:
         for t in tok.encode(start):
             mask.accept(t)
         text = start
-        while (a := mask.allowed()) is not None:
-            assert len(a) and np.all(np.diff(a) > 0)
+        while (b := mask.bits()) is not None:
+            a = np.flatnonzero(np.unpackbits(b.view(np.uint8), bitorder="little"))
+            assert len(a)
             if target is None:
                 t = int(a[rng.randrange(len(a))])
             else:

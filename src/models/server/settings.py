@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from ..readouts import Readouts
+from ..structured import Constraint
 from . import cli_options, decisions
 
 PENALTIES = ("repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_penalty")  # (Sampling's, Options')
@@ -41,6 +42,7 @@ class Options:
     reasoning_effort: str | None = None  # the templates' reasoning_effort (None: the template's own)
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)  # under each request's
     cache_prompt: bool = True
+    constraint: Constraint | None = None  # a request's structured output when it asks for none (--grammar, --json-schema)
     embedding: bool = False  # the embedding routes (llama-server's --embedding; with pooling rank: rerank too)
     pooling: str | None = None  # the embeddings' pooling (--pooling, else the model file's; None: none)
     embd_normalize: int = 2  # the embeddings' normalization by default (models.readouts.normalize)

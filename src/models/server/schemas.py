@@ -49,6 +49,16 @@ class GenerationRequest(BaseModel):
     n_probs: int | None = None
     post_sampling_probs: bool | None = None
     spec_n_max: int | None = Field(None, alias="speculative.n_max")  # (llama-server's: draft tokens per step at most)
+    # structured output (``constraints``; vLLM's guided_* fields come as extras)
+    grammar: Any = None
+    json_schema: Any = None
+    response_format: Any = None
+    structured_outputs: Any = None
+
+    def constraint_fields(self) -> dict[str, Any]:
+        """The fields that may ask for structured output (``constraints.constraint_of``)."""
+        return {**(self.model_extra or {}), "grammar": self.grammar, "json_schema": self.json_schema,
+                "response_format": self.response_format, "structured_outputs": self.structured_outputs}
 
 
 class ChatRequest(GenerationRequest):

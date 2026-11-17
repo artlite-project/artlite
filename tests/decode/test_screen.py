@@ -11,7 +11,7 @@ from artlite import _native
 from artlite.decode import screen as SC
 from artlite.formats import q6h
 from artlite.gguf_model import QTensor
-from models.sampling import Penalties, Sampling, argmax, top_logits
+from models.sampling import Penalties, Sampling, argmax, pack_mask, top_logits
 
 from ..tensors import random_tensor
 
@@ -122,18 +122,31 @@ def test_sampling(head: tuple) -> None:
             assert np.array_equal(i[:m], wi[:m]) and np.allclose(v[:m], wv[:m], rtol=1e-5, atol=1e-5 * np.abs(wv).max())
 
         class Mask:
-            ids = np.sort(rng.choice(V, 300, replace=False))
+            def __init__(self, ids: np.ndarray):
+                allowed = np.zeros(V, bool)
+                allowed[ids] = True
+                self.mask = pack_mask(allowed, V // 32)
 
-            def allowed(self) -> np.ndarray:
-                return self.ids
+            def bits(self) -> np.ndarray:
+                return self.mask
 
             def accept(self, token: int) -> None:
                 pass
 
-        p = Penalties(Sampling(top_k=20), (), Mask())
-        v, i = p.top(row, 20)
-        wv, wi = p.top(e32, 20)
-        assert np.array_equal(i, wi) and np.abs(v - wv).max() < 1e-5 * np.abs(wv).max()  # (a mask's: every one exact)
+        p = Penalties(s, recent, Mask(np.empty(0, np.int64)))  # (none allowed: the unmasked choice)
+        assert len(p.top(row, 20)[1]) == 20
+        # (a mask's candidates as exact as an unmasked choice's: a few tokens, their rows; many, the masked screen)
+        order = np.argsort(-exact)
+        for ids in (rng.choice(V, 10, replace=False), rng.choice(V, 300, replace=False),
+                    np.concatenate([order[1:4], rng.choice(V, V // 2, replace=False)]), order[5:]):
+            for s2 in (Sampling(top_k=20), s):
+                p = Penalties(s2, recent, Mask(ids))
+                v, i = p.top(row, 20)
+                wv, wi = p.top(e32, 20)
+                # (exact: a few tokens' rows all, else those the window holds below the largest allowed logit)
+                m = int(np.cumprod(e32[wi] >= e32[ids].max() - SC.WINDOW).sum()) if len(ids) > 16 else len(wi)
+                assert (m or s2.penalized) and np.array_equal(i[:m], wi[:m]), (len(ids), s2)
+                assert not m or np.abs(v[:m] - wv[:m]).max() < 1e-5 * np.abs(wv).max()
 
 
 def test_native_passes() -> None:
@@ -156,6 +169,14 @@ def test_native_passes() -> None:
         out = np.empty(n, np.float32)
         _native.screen_dense(x.view(np.uint16), sc, 3.0, out)
         assert np.array_equal(out, np.minimum(a, np.float32(3.0)))
+        allowed = rng.random(n) < 0.3
+        mask = pack_mask(allowed, (n + 31) // 32)
+        lo = _native.screen_lower(x.view(np.uint16), sc, b, gn, mask)
+        want_lo = float((a.astype(np.float64) - b.astype(np.float64) * gn)[allowed].max()) if allowed.any() else -np.inf
+        assert lo == pytest.approx(want_lo, rel=1e-5)
+        ids = np.empty(n, np.int32)
+        got = _native.screen_above(x.view(np.uint16), sc, b, gn, -np.inf, ids, mask)
+        assert np.array_equal(ids[:got], np.flatnonzero(allowed))
 
 
 def test_stats(head: tuple) -> None:

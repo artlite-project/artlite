@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 
 from ..detokenizer import Detokenizer, StreamDecoder
+from ..sampling import pack_mask
 from .ids import alnum_id
 from .textflow import held
 
@@ -768,6 +769,7 @@ class Vocabulary:
 
     def __init__(self, tokenizer: Detokenizer, n: int):
         pairs = sorted((b, i) for i in range(n) if (b := tokenizer.decode_bytes([i])))
+        self.n = n
         self.texts = [b for b, _ in pairs]
         self.ids = np.fromiter((i for _, i in pairs), np.int32, len(pairs))
 
@@ -803,7 +805,7 @@ class NameMask:
     def accept(self, token: int) -> None:
         self.parser.parts([("content", self.text.feed(token))])
 
-    def allowed(self) -> np.ndarray | None:
+    def bits(self) -> np.ndarray | None:
         w = self.parser.naming()
         if w is None:
             return None
@@ -812,7 +814,10 @@ class NameMask:
             groups = [g for h in self.heads if len(h) > len(w) and h.startswith(w)
                       for g in self.vocab.fitting(h[len(w):])]
             ids = np.unique(np.concatenate(groups)) if groups else np.empty(0, np.int32)
-            self._memo[w] = ids if len(ids) else None  # (no head fits: the text left them, nothing to mask)
+            allowed = np.zeros(self.vocab.n, bool)
+            allowed[ids] = True
+            # (no head fits: the text left them, nothing to mask)
+            self._memo[w] = pack_mask(allowed, (self.vocab.n + 31) // 32) if len(ids) else None
         return self._memo[w]
 
 
