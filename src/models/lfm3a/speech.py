@@ -42,6 +42,7 @@ import numpy as np
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GenConfig
 
+from ..sampling import Mask
 from ..sequence import Sequence
 from ..templating import render_template
 
@@ -276,15 +277,16 @@ class Reply:
 
 def interleave(model: Any, audio: Any, tokens: dict[str, int], logits: np.ndarray | None, sampler: CodeSampler, *,
                max_tokens: int, max_frames: int, mode: str = "mixed", h: np.ndarray | None = None,
-               speech: bool = True, reply: Reply | None = None, stats: SpeechStats | None = None
-               ) -> Iterator[tuple[str, Any]]:
+               speech: bool = True, reply: Reply | None = None, stats: SpeechStats | None = None,
+               mask: Mask | None = None) -> Iterator[tuple[str, Any]]:
     """A voice reply after a prompt (module docstring): ("text", token id) and ("audio", samples) as they come, until
     ``<|im_end|>``, ``max_tokens`` text tokens or ``max_frames`` frames. ``mode``: how the prompt opened the reply -
     "mixed" (``<|mixed_start|>``), "audio" (``<|audio_start|>``: speech, then text), "text" (a text reply, which may
     switch to speech by itself unless ``speech`` is false); ``logits``: the prompt's last token's (a text slot first),
     ``h``: its hidden state ("audio": a frame first); ``tokens``: the special tokens' ids by name (``speech_tokens``);
-    ``reply``: filled with the reply's sequence. A speech segment's samples stream every ``CHUNK`` frames across the
-    text blocks, its tail at its end of audio."""
+    ``reply``: filled with the reply's sequence; ``mask``: the reply's text tokens' (``models.sampling.Mask``: its
+    tool calls' grammar, told the text tokens; the end and the switches to speech only where it may end). A speech
+    segment's samples stream every ``CHUNK`` frames across the text blocks, its tail at its end of audio."""
     st = stats if stats is not None else SpeechStats()
     rp = reply if reply is not None else Reply()
     t_end, im_end, a_out = tokens[TEXT_END], tokens[IM_END], tokens[AUDIO_OUT]
@@ -311,6 +313,10 @@ def interleave(model: Any, audio: Any, tokens: dict[str, int], logits: np.ndarra
         if mode == "text" or (inter and not speaking):  # (a text slot)
             row = np.array(logits, np.float32)
             row[banned] = -np.inf
+            if mask is not None and (bits := mask.bits()) is not None:
+                ok = np.unpackbits(bits.view(np.uint8), count=len(row), bitorder="little").astype(bool)
+                ok[[t_end, tokens[AUDIO_START], tokens[MIXED_START]]] = ok[im_end]  # (where the text may end)
+                row[~ok] = -np.inf
             tok = int(np.argmax(row))
             if tok == im_end or (not inter and tok == t_end):
                 break
@@ -324,6 +330,8 @@ def interleave(model: Any, audio: Any, tokens: dict[str, int], logits: np.ndarra
                 yield "text", tok
                 rp.text.append(tok)
                 ntext += 1
+                if mask is not None:
+                    mask.accept(tok)
             rp.ids.append(tok)
             t0 = time.perf_counter()
             logits = model.cap(model.steps([tok])[0])

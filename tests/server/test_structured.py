@@ -5,6 +5,7 @@ server's default (``Options.constraint``); the agents' APIs' spellings, ``allowe
 SDKs' helpers."""
 
 import json
+import math
 
 import llguidance
 import pydantic
@@ -15,7 +16,21 @@ from models.server.constraints import constraint_of
 from models.server.errors import ApiError
 from models.structured import Constraint, ConstraintError, add_arguments, compiled, from_args
 
-from .fakes import GEMMA, QWEN, TIME, TOOLS_TEMPLATE, WEATHER, call_pieces, chat, client_of, deltas, events, live, make
+from .fakes import (
+    GEMMA,
+    QWEN,
+    TIME,
+    TOOLS_TEMPLATE,
+    WEATHER,
+    call_pieces,
+    chat,
+    client_of,
+    deltas,
+    events,
+    live,
+    make,
+    rest_of,
+)
 
 SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "string"}}, "required": ["a"]}
 # (a schema the fake completes from any reply: greedy where none of its tokens is allowed takes the lowest allowed one,
@@ -191,8 +206,8 @@ def test_logprobs() -> None:
     """logprobs: the model's distribution before the mask (a token the grammar forbids among the top ones); with
     post_sampling_probs the sampler's candidates after it (only allowed tokens)."""
     with client_of(chars=True) as (_model, npu, _engine, client):
-        npu.replies = [["Nope"]]
-        r = chat(client, "Q", json_schema={"type": "boolean"}, temperature=0, logprobs=True, top_logprobs=3).json()
+        npu.replies = [["Nope"]]  # (a schema of options would be a decision: ``answers``)
+        r = chat(client, "Q", json_schema={"type": "integer"}, temperature=0, logprobs=True, top_logprobs=3).json()
         first = r["choices"][0]["logprobs"]["content"][0]
         assert first["top_logprobs"][0]["token"] == "Nope" and first["token"] != "Nope"
         npu.replies = [["Nope"]]
@@ -259,9 +274,7 @@ def test_allowed_tools() -> None:
     """allowed_tools: the prompt keeps every tool, the calls are the allowed ones' (required: one is forced); a name
     that is not a tool: a 400."""
     with client_of({"template": TOOLS_TEMPLATE}) as (model, npu, _engine, client):
-        reply = call_pieces("get_time")[1:]  # (after the forced "<tool_call>\n<function=")
-        reply[0] = "get_time>"
-        npu.replies = [reply]
+        npu.replies = [rest_of("<tool_call>\n<function=", "get_time")]
         choice = {"type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [
             {"type": "function", "function": {"name": "get_time"}}]}}
         r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice=choice).json()
@@ -270,6 +283,12 @@ def test_allowed_tools() -> None:
         choice["allowed_tools"]["tools"] = [{"type": "function", "function": {"name": "nope"}}]
         r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice=choice)
         assert r.status_code == 400 and "nope" in r.json()["error"]["message"]
+        choice["allowed_tools"]["tools"] = []  # (none allowed: required is an error, auto is none)
+        assert chat(client, "Q", tools=[WEATHER, TIME], tool_choice=choice).status_code == 400
+        choice["allowed_tools"]["mode"] = "auto"
+        npu.replies = [call_pieces("get_time")]
+        msg = chat(client, "Q", tools=[WEATHER, TIME], tool_choice=choice).json()["choices"][0]["message"]
+        assert "tool_calls" not in msg and "<tool_call>" not in msg["content"]
 
 
 def test_tool_options(tmp_path: object) -> None:
@@ -322,3 +341,44 @@ def test_sdks() -> None:
                                output_config={"format": {"type": "json_schema", "schema": {
                                    "type": "array", "uniqueItems": True}}})
         assert e.value.body["type"] == "error" and "uniqueItems" in e.value.body["error"]["message"]
+
+
+# ----------------------------------------------------------------------
+# Decisions: one of a few options, with logprobs (Halogen's shape)
+# ----------------------------------------------------------------------
+
+
+def test_decisions() -> None:
+    """A response format of options with logprobs: the most likely option as JSON, one top_logprobs entry per option
+    (their probabilities summing to 1) - options that part at one token from one prefill, deeper ones teacher-forced
+    from a checkpoint; a boolean, an object of one property, the stream; without logprobs or with tools: a
+    generation."""
+    with client_of() as (_model, npu, _engine, client):
+        rf = {"type": "json_schema", "json_schema": {"name": "spam", "schema": {"enum": ["no", "yes"]}}}
+        npu.replies = [['"', "y"]]  # (the model's own tokens: the quote, then the option)
+        r = chat(client, "Spam?", response_format=rf, logprobs=True).json()
+        c = r["choices"][0]
+        assert c["message"]["content"] == '"yes"' and c["finish_reason"] == "stop"
+        top = c["logprobs"]["content"][0]["top_logprobs"]
+        assert [t["token"] for t in top] == ["yes", "no"] and abs(sum(math.exp(t["logprob"]) for t in top) - 1) < 1e-6
+        assert npu.generated == []  # (no generation: a prompt's logits)
+        npu.replies = [["f"]]
+        r = chat(client, "Q", json_schema={"type": "boolean"}, logprobs=True).json()
+        assert r["choices"][0]["message"]["content"] == "false"
+        deep = {"type": "json_schema", "json_schema": {"name": "d", "schema": {"enum": ["ab", "ac", "bd"]}}}
+        npu.replies = [['"', "a", "c"]]  # (the quote, a, then c given a: decode steps)
+        r = chat(client, "Q", response_format=deep, logprobs=True).json()
+        c = r["choices"][0]
+        assert c["message"]["content"] == '"ac"' and c["logprobs"]["content"][0]["token"] == "ac"
+        assert {t["token"] for t in c["logprobs"]["content"][0]["top_logprobs"]} == {"ab", "ac", "bd"}
+        obj = {"type": "json_schema", "json_schema": {"name": "o", "schema": {
+            "type": "object", "properties": {"answer": {"oneOf": [{"const": 1}, {"const": 2}]}}, "required": ["answer"]}}}
+        npu.replies = [[" ", "2"]]  # (the common '{"answer":' runs with the prompt)
+        r = chat(client, "Q", response_format=obj, logprobs=True).json()
+        assert json.loads(r["choices"][0]["message"]["content"]) == {"answer": 2}
+        npu.replies = [['"', "n"]]
+        evs = events(chat(client, "Spam?", response_format=rf, logprobs=True, stream=True))
+        assert deltas(evs) == '"no"' and evs[-2]["choices"][0]["finish_reason"] == "stop"
+        npu.replies = [list('"yes"')]
+        r = chat(client, "Spam?", response_format=rf, temperature=0).json()  # (no logprobs: generated)
+        assert r["choices"][0]["message"]["content"] == '"yes"' and npu.generated

@@ -39,7 +39,7 @@ from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
 from ..model import Capabilities, Model
 from ..overlay_model import OverlayModel
-from ..sampling import Sampling
+from ..sampling import Mask, Sampling
 from ..sequence import Sequence, splice_media
 from ..templating import TEMPLATE_KEY, file_template, render_template
 from ..tokenizer import BpeTokenizer, chat_prompt
@@ -267,9 +267,10 @@ class Lfm(Model):
 
     def reply(self, tokens: list[int] | Sequence, *, mode: str = "mixed", seed: int | None = None,
               max_tokens: int = 1024, max_frames: int = 2048, reply: a_speech.Reply | None = None,
-              stats: a_speech.SpeechStats | None = None) -> Iterator[tuple[str, object]]:
+              stats: a_speech.SpeechStats | None = None, mask: Mask | None = None) -> Iterator[tuple[str, object]]:
         """``voice_reply``'s generation after the model's positions so far: ``tokens`` the prompt's rest (ending with
-        ``opener(mode)``) run first; the positions after it are the reply's (``reply``: its sequence)."""
+        ``opener(mode)``) run first; the positions after it are the reply's (``reply``: its sequence; ``mask``: its text
+        tokens', ``speech.interleave``)."""
         npu = self.npu_model()
         toks = a_speech.speech_tokens(self.gguf.strings("tokenizer.ggml.tokens"))
         logits, h = None, None
@@ -280,7 +281,7 @@ class Lfm(Model):
         sampler = a_speech.CodeSampler(self.audio.gen, seed)
         yield from a_speech.interleave(npu, self.audio, toks, logits, sampler, max_tokens=max_tokens,
                                        max_frames=max_frames, mode={"auto": "text"}.get(mode, mode), h=h,
-                                       speech=mode != "text", reply=reply, stats=stats)
+                                       speech=mode != "text", reply=reply, stats=stats, mask=mask)
 
     def chat_text(self, messages: list[dict[str, object]], *, think: bool = False,
                   tools: list[dict[str, object]] | None = None, preserve: bool = False,

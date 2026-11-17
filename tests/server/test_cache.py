@@ -117,7 +117,7 @@ def test_first_user_message() -> None:
 def test_ram_limit() -> None:
     """Within the RAM limit: the least recently used conversations cut back to their first checkpoint (held once:
     by the device's conversation when it shares it), then dropped."""
-    ram = 6000  # (bytes: the fake's 8 per position of records and of each checkpoint, 4 KB of a prompt end's logits)
+    ram = 10096  # (bytes: the fake's 8 per position of records and of each checkpoint, 8 KB of a prompt end's logits)
     with served(exact=True, turns=TURNS, cache={"cache_ram": ram}) as (model, npu, engine, client):
         system = {"role": "system", "content": words(20, "s")}
         at = model.chat([system, {"role": "user", "content": "q"}]).index(model.tokenizer.id("<|user|>"))

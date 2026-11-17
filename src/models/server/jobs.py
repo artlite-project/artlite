@@ -91,7 +91,8 @@ class Job:
     opened: bool = False  # the prompt ends inside a thought (whether or not the thoughts are split off)
     think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
-    grammar: Compiled | None = None  # the answer's structured output (after the thought: ``structured.GrammarMask``)
+    grammar: Compiled | None = None  # the answer's structured output and calls (after the thought: ``GrammarMask``)
+    ban: tuple[int, ...] = ()  # tokens never sampled (tool_choice none: a call's opener)
     cache_prompt: bool = True  # continue from the cached prefix
     answer_mark: bool = False  # the next prompt re-renders this answer's opener (its template drops earlier thoughts)
     progress: bool = False  # send prompt_progress events

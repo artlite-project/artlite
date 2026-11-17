@@ -26,13 +26,15 @@ The rules (docs/server.md, "Structured output"):
 - when the grammar is complete only the end-of-sequence tokens remain.
 
 A model's ``Vocab`` (``vocab``: built once per tokenizer, ~0.7 s and ~90 MB on a 248K vocabulary) gives llguidance every
-token's bytes, the control tokens and the user-defined ones spelled ``<...>`` marked special (llguidance's llama.cpp
-adapter's rule: a grammar names them ``<[id]>``, plain text never matches them), and an encoder that never turns text
-into special tokens. Compiled grammars are kept by their constraint (``compiled``: an agent sends the same tools every
+token's bytes, the control tokens marked special (llama.cpp's llguidance adapter's rule: a grammar names them
+``<[id]>``, text never matches them; the user-defined ones, the tags a model writes, are text), and an encoder that
+never turns text into special tokens. Compiled grammars are kept by their constraint (``compiled``: an agent sends the same tools every
 turn)."""
 
 import argparse
 import collections
+import concurrent.futures
+import copy
 import dataclasses
 import json
 import logging
@@ -330,11 +332,16 @@ class Vocab:
         """Whether a text is a special token's (a grammar names it ``<...>``)."""
         return text.encode() in self._names
 
+    def special_id(self, text: str) -> int | None:
+        """The special token whose text is ``text`` (a grammar names it ``<[id]>``), or None."""
+        return self._names.get(text.encode())
+
     def digit_bits(self, j: int) -> np.ndarray:
         """The tokens that begin with at least j digits (a bitmask)."""
         return self._digits[j]
 
 
+_aside = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="artlite-mask")  # (``GrammarMask.prefetch``)
 _vocabs: dict[int, tuple[object, Vocab]] = {}
 _vocab_lock = threading.Lock()
 
@@ -467,6 +474,24 @@ def thought_of(reasoning: tuple[str, str] | None, tokenizer: Any, *, opened: boo
     return Thought(reasoning[1], inside=opened, opener=None if opened else tokenizer.encode(reasoning[0])[0], ends=ends)
 
 
+class Ban:
+    """Tokens never sampled (``sampling.Mask``: ``tool_choice`` none, a call's opener)."""
+
+    def __init__(self, v: Vocab, ids: Sequence[int]):
+        allowed = np.ones(v.n, bool)
+        allowed[list(ids)] = False
+        self._bits = pack_mask(allowed, v.words)
+
+    def bits(self) -> np.ndarray:
+        return self._bits
+
+    def accept(self, token: int) -> None:
+        pass
+
+    def first_allowed(self, candidates: Sequence[int]) -> int:
+        return next((i for i, t in enumerate(candidates) if self._bits[t >> 5] >> (t & 31) & 1), -1)
+
+
 @dataclasses.dataclass(frozen=True)
 class Thought:
     """Where a generation's thought is (the answer's constraint starts after it): ``close``, the text that ends it
@@ -503,6 +528,66 @@ class GrammarMask:
             self.phase = "thought" if thought.inside else "maybe" if thought.opener is not None else "answer"
         self._in_string = self._escape = False
         self._run = 0  # (the digits ending the answer outside a string)
+        # (``prefetch``: the masks after the tokens accepted since, its drafts, computed aside; those tokens)
+        self._pre: tuple[concurrent.futures.Future, np.ndarray, list[int]] | None = None
+        self._since: list[int] = []
+
+    def fork(self) -> "GrammarMask":
+        """An independent copy (a drafter's: its guesses follow the grammar, this one does not move)."""
+        out = copy.copy(self)
+        out.matcher = self.matcher.deep_copy() if self.phase in ("answer", "maybe") else self.matcher
+        out._row, out._bits, out._pre, out._since = np.empty_like(self._row), None, None, []
+        return out
+
+    def valid_prefix(self, tokens: Sequence[int]) -> int:
+        """How many of ``tokens`` the grammar takes from here (drafts: a round's are cut there)."""
+        if self.phase in ("off", "thought") or not tokens:
+            return len(tokens)
+        if self.phase == "maybe" and tokens[0] == self.thought.opener:
+            return len(tokens)  # (a thought opens: free)
+        self._join()
+        return self.matcher.validate_tokens(list(tokens))
+
+    def first_allowed(self, candidates: Sequence[int]) -> int:
+        """The index of the first of ``candidates`` the grammar takes next, or -1 (a drafter's guesses, best first: a
+        check of each, not the whole vocabulary's mask)."""
+        if self.phase in ("off", "thought"):
+            return 0 if len(candidates) else -1
+        for i, t in enumerate(candidates):
+            if self.valid_prefix([int(t)]) == 1:
+                return i
+        return -1
+
+    def forced(self) -> list[int]:
+        """The tokens the grammar forces next (its canonical ones: a round's drafts that it keeps by construction)."""
+        if self.phase != "answer":
+            return []
+        self._join()
+        return self.matcher.compute_ff_tokens()
+
+    def prefetch(self, drafts: Sequence[int] = ()) -> None:
+        """Compute the next choices' masks aside while the NPU runs a step (one worker thread; llguidance drops the
+        GIL): the one after the tokens accepted so far, and after each of ``drafts`` in turn as far as the grammar takes
+        them, on a copy of the matcher; ``bits`` takes them as the step's tokens are accepted."""
+        if self.phase != "answer":
+            return
+        self._join()
+        fork = self.matcher.deep_copy()
+        rows = np.empty((len(drafts) + 1, self.v.words), np.int32)
+        d = list(drafts)
+
+        def run() -> int:
+            for i in range(len(d) + 1):
+                fork.unsafe_compute_mask_ptr(rows[i].ctypes.data, rows[i].nbytes)
+                if i == len(d) or not (rows[i, d[i] >> 5] >> (d[i] & 31)) & 1 or not fork.consume_token(d[i]):
+                    return i + 1
+            return len(d) + 1
+
+        self._pre, self._since = (_aside.submit(run), rows, d), []
+
+    def _join(self) -> int:
+        """Wait for the masks computed aside (the matcher's copy is done with); how many there are."""
+        return self._pre[0].result() if self._pre is not None else 0
 
     @property
     def active(self) -> bool:
@@ -513,8 +598,13 @@ class GrammarMask:
         if not self.active:
             return None
         if self._bits is None:
-            self.matcher.unsafe_compute_mask_ptr(self._row.ctypes.data, self._row.nbytes)
-            bits = self._row[0].view(np.uint32)
+            k, n = len(self._since), self._join()
+            if self._pre is not None and k < n and self._since == self._pre[2][:k]:  # (computed aside: ``prefetch``)
+                bits = self._pre[1][k].view(np.uint32)
+            else:
+                self._pre = None
+                self.matcher.unsafe_compute_mask_ptr(self._row.ctypes.data, self._row.nbytes)
+                bits = self._row[0].view(np.uint32)
             if self.phase == "maybe":
                 bits = bits.copy()
                 o = self.thought.opener
@@ -541,8 +631,12 @@ class GrammarMask:
         self._consume(token)
 
     def _consume(self, token: int) -> None:
+        self._join()
+        if self._pre is not None:
+            self._since.append(token)
         if not self.matcher.consume_token(token):
-            self.give_up(f"the grammar rejects token {token} ({self.v.pieces[token][:40]!r}): "
+            piece = self.v.pieces[token][:40] if token < len(self.v.pieces) else b"?"
+            self.give_up(f"the grammar rejects token {token} ({piece!r}): "
                          f"{_message(self.matcher.get_error()).splitlines()[0]}")
             return
         if self.digits:

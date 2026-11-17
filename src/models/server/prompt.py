@@ -25,7 +25,7 @@ from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
 from .schemas import ROLES, ChatRequest, Message
-from .tools import Calls, Vocabulary, call_arguments, functions
+from .tools import Calls, call_arguments, functions
 
 if TYPE_CHECKING:
     from .context import ApiContext
@@ -259,7 +259,9 @@ class PromptBuilder:
             allowed = {(t.get("function") or {}).get("name") for t in listed if isinstance(t, dict)}
             if unknown := allowed - {f["function"]["name"] for f in fns}:
                 raise bad_request(f"tool_choice allowed_tools names {sorted(map(str, unknown))}, not among the tools")
-            choice = mode
+            if not allowed and mode == "required":
+                raise bad_request("tool_choice allowed_tools: required, of no tool")
+            choice = mode if allowed else "none"  # (none allowed: no call, as none)
         if isinstance(choice, dict):
             name = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
             if not isinstance(name, str):
@@ -282,16 +284,10 @@ class PromptBuilder:
         force = syntax.opener(name) if choice == "required" or name else None
         parallel = req.parallel_tool_calls is not False and name is None  # (a named function: that call alone)
         callable_ = fns if allowed is None else [f for f in fns if f["function"]["name"] in allowed]
-        return fns, Calls(syntax, callable_, parallel=parallel, force=force)
-
-    async def vocabulary(self) -> Vocabulary | None:
-        """The model's tokens by their text (``tools.Vocabulary``: a few tenths of a second, in a thread, once), or
-        None without the vocabulary's size."""
-        ctx = self.ctx
-        async with ctx.vocab_lock:
-            if not ctx.vocab and ctx.info.n_vocab:
-                ctx.vocab.append(await run_in_threadpool(Vocabulary, ctx.engine.model.tokenizer, ctx.info.n_vocab))
-        return ctx.vocab[0] if ctx.vocab else None
+        strict = frozenset(t["function"]["name"] for t in req.tools or [] if isinstance(t, dict) and
+                           isinstance(t.get("function"), dict) and t["function"].get("strict") is True)
+        return fns, Calls(syntax, callable_, parallel=parallel, force=force,
+                          choice="auto" if force is None else "required", name=name, strict=strict)
 
     async def counted(self, req: ChatRequest) -> int:
         """The prompt tokens of a chat request."""

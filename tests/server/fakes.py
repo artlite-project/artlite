@@ -33,9 +33,10 @@ from models.server.decisions import Decisions
 from models.server.engine import Engine
 from models.server.settings import ModelInfo, Options
 
-VOCAB = 1024
+VOCAB = 2048
 SPECIAL = ["<s>", "</s>", "<|system|>", "<|user|>", "<|assistant|>", "<think>", "</think>", "<|channel>thought",
-           "<channel|>"]
+           "<channel|>", "<tool_call>", "</tool_call>"]  # (single tokens in a text; the first CONTROL control tokens, the
+CONTROL = 5  # rest user-defined: text a model writes, Qwen's tags)
 BOS, EOS = 0, 1
 QWEN = ("<think>", "</think>")
 GEMMA = ("<|channel>thought", "<channel|>")
@@ -51,18 +52,20 @@ class FakeTokenizer:
     piece gets the next id. Structured output's tokens (``vocabulary``) are those known when it asks; a text without
     special tokens encodes greedily, the longest known piece first (``encode_plain``: a grammar's forced text)."""
 
-    def __init__(self, *, chars: bool = False) -> None:
+    def __init__(self, *, chars: bool = True) -> None:
+        self.chars = chars
         self.pieces = list(SPECIAL) + (list(CHARS) if chars else [])
         self.ids = {p: i for i, p in enumerate(self.pieces)}
         self._special = re.compile("(" + "|".join(re.escape(s) for s in sorted(SPECIAL, key=len, reverse=True)) + ")")
 
     def vocabulary(self) -> tuple[list[bytes], list[int]]:
-        return [p.encode() for p in self.pieces], list(range(len(SPECIAL)))
+        pieces = [p.encode() for p in self.pieces]
+        return pieces + [b""] * (VOCAB - len(pieces)), list(range(CONTROL))
 
     def encode_plain(self, text: str) -> list[int]:
         out, i = [], 0
         while i < len(text):
-            n = next((n for n in range(len(text) - i, 0, -1) if self.ids.get(text[i:i + n], 0) >= len(SPECIAL)), 0)
+            n = next((n for n in range(len(text) - i, 0, -1) if self.ids.get(text[i:i + n], 0) >= CONTROL), 0)
             out.append(self.ids[text[i:i + n]] if n else self.id(text[i]))
             i += max(n, 1)
         return out
@@ -75,9 +78,16 @@ class FakeTokenizer:
         return self.ids[piece]
 
     def encode(self, text: str) -> list[int]:
+        """(with ``chars``, a word of a call's syntax - with ``<`` and ``=`` - that is no piece yet as its characters:
+        the tokens a grammar's vocabulary knows, as a model's tokenizer has them all: a forced call opener's)"""
         out = []
         for i, part in enumerate(self._special.split(text)):
-            out += [self.id(part)] if i % 2 else [self.id(w) for w in re.findall(r"\s*\S+|\s+", part)]
+            if i % 2:
+                out.append(self.id(part))
+                continue
+            for w in re.findall(r"\s*\S+|\s+", part):
+                syntax = self.chars and "<" in w and "=" in w and w not in self.ids
+                out += [self.id(c) for c in w] if syntax else [self.id(w)]
         return out
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
@@ -92,7 +102,7 @@ class FakeModel(Model):
 
     name = "Fake"
 
-    def __init__(self, *, reasoning: tuple[str, str] | None = None, chars: bool = False):
+    def __init__(self, *, reasoning: tuple[str, str] | None = None, chars: bool = True):
         self.tokenizer = FakeTokenizer(chars=chars)
         self.eos_token_ids = (EOS,)
         self.reasoning = reasoning
@@ -384,7 +394,7 @@ class FakeNpu(NpuModel):
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)
 
 def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, audio: bool = False,
-         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, chars: bool = False, **kw: object
+         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, chars: bool = True, **kw: object
          ) -> tuple[FakeModel, FakeNpu, Engine]:
     """A fake model's engine, started: ``turns``: the model's ``turn`` and ``user_turn`` (its prompt cache's marks),
     ``cache``: the prompt cache's options; ``chars``: the tokenizer's ``chars``; ``kw``: the ``FakeNpu``'s."""
@@ -446,12 +456,23 @@ WEATHER = {"type": "function", "function": {"name": "get_weather", "description"
 TIME = {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
 
 
+def call_text(name: str, **args: str) -> str:
+    """A Qwen tool call's text after its opener tag (the template's form)."""
+    params = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in args.items())
+    return f"\n<function={name}>\n{params}</function>\n"
+
+
 def call_pieces(name: str, **args: str) -> list[str]:
-    """A Qwen tool call as the fake model's pieces."""
-    out = ["<tool_call>", f"\n<function={name}>"]
-    for k, v in args.items():
-        out += [f"\n<parameter={k}>", f"\n{v}", "\n</parameter>"]
-    return out + ["\n</function>", "\n</tool_call>"]
+    """A Qwen tool call as the fake model's pieces: its tags special tokens, the text between them one character a
+    piece (what a call grammar forces comes in the vocabulary's canonical pieces: the fake's are characters)."""
+    return ["<tool_call>", *call_text(name, **args), "</tool_call>"]
+
+
+def rest_of(forced: str, name: str, **args: str) -> list[str]:
+    """A Qwen tool call's pieces after the text forced before it (``Calls.force``: its opener, its name's)."""
+    text = "<tool_call>" + call_text(name, **args)
+    assert text.startswith(forced), (forced, text)
+    return [*text[len(forced):], "</tool_call>"]
 
 @contextlib.contextmanager
 def live(engine: Engine, **app: object) -> Iterator[str]:

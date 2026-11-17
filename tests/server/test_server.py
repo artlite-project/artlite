@@ -51,6 +51,7 @@ from .fakes import (
     events,
     live,
     make,
+    rest_of,
 )
 
 
@@ -335,86 +336,84 @@ def test_tool_calls_parallel(tooled: tuple) -> None:
 
 
 def test_tool_choice(tooled: tuple) -> None:
-    """none: the call stays text; required and a named function: the call's opener is forced, after the thought when
-    the model thinks (the generation runs it and continues)."""
+    """none: the call's opener is never sampled (no call text in the content); required and a named function: the
+    call's opener is forced at the answer's start, or the call grammar holds the answer to the call after the thought
+    (a model that would write text writes the call: greedy, the lowest allowed token where none of its own is)."""
     model, npu, engine, client = tooled
-    raw = call_pieces("get_time")
-    npu.replies = [raw]
+    npu.replies = [call_pieces("get_time")]
     msg = chat(client, "Q", tools=[TIME], tool_choice="none").json()["choices"][0]["message"]
-    assert "tool_calls" not in msg and msg["content"].startswith("<tool_call>")
+    assert "tool_calls" not in msg and "<tool_call>" not in msg["content"]
     assert model.rendered[1] is not None  # (the tools stay in the prompt)
-    reply = call_pieces("get_time")[1:]  # (after the forced "<tool_call>\n<function=")
-    reply[0] = "get_time>"
-    npu.replies = [reply]
+    npu.replies = [rest_of("<tool_call>\n<function=", "get_time")]
     r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice="required").json()
     assert [c["function"]["name"] for c in r["choices"][0]["message"]["tool_calls"]] == ["get_time"]
     assert ("<|assistant|><think>\n\n</think>\n\n<tool_call>\n<function=get_time>\n</function>"
             in model.tokenizer.decode_bytes(npu.seq).decode())
-    npu.replies = [["Need", " Oslo", "</think>", "No", " call"], ["\n<parameter=city>", "\nOslo", "\n</parameter>",
-                                                                 "\n</function>", "\n</tool_call>"]]
-    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice={"type": "function", "function": {"name": "get_weather"}},
-             chat_template_kwargs={"enable_thinking": True}).json()
-    msg = r["choices"][0]["message"]
+    named = {"type": "function", "function": {"name": "get_weather"}}
+    npu.replies = [["Need", " Oslo", "</think>", "\n", "\n", *call_pieces("get_weather", city="Oslo")]]
+    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice=named, chat_template_kwargs={"enable_thinking": True})
+    msg = r.json()["choices"][0]["message"]
     assert msg["reasoning_content"] == "Need Oslo" and msg["content"] is None
     assert [(c["function"]["name"], c["function"]["arguments"]) for c in msg["tool_calls"]] == \
         [("get_weather", '{"city": "Oslo"}')]
-    text = model.tokenizer.decode_bytes(npu.seq).decode()
-    assert "Need Oslo</think>\n\n<tool_call>\n<function=get_weather>\n" in text and "No call" not in text
+    assert "Need Oslo</think>\n\n<tool_call>\n<function=get_weather>\n" in model.tokenizer.decode_bytes(npu.seq).decode()
     assert engine.cached == npu.seq[:npu.position]
-    npu.replies = [call_pieces("get_time")[2:] + ["\n"] + call_pieces("get_weather", city="X")]  # (a named call alone)
+    npu.replies = [["Need", "</think>", "No", " call"]]  # (text after the thought: the grammar writes the call)
+    r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice={"type": "function", "function": {"name": "get_time"}},
+             chat_template_kwargs={"enable_thinking": True}, temperature=0).json()
+    msg = r["choices"][0]["message"]
+    assert msg["content"] is None and [c["function"]["name"] for c in msg["tool_calls"]] == ["get_time"]
+    assert "No call" not in model.tokenizer.decode_bytes(npu.seq).decode()
+    npu.replies = [rest_of("<tool_call>\n<function=get_time>\n", "get_time") + ["\n"] +
+                   call_pieces("get_weather", city="X")]  # (a named call alone)
     r = chat(client, "Q", tools=[WEATHER, TIME], tool_choice={"type": "function", "function": {"name": "get_time"}})
     assert [c["function"]["name"] for c in r.json()["choices"][0]["message"]["tool_calls"]] == ["get_time"]
 
 
 def test_tool_choice_own_thought() -> None:
-    """A model that opens its thought itself (Gemma): the forced opener follows the thought, or the answer's first
-    text when it does not think."""
+    """A model that opens its thought itself (Gemma): required, its call after the thought, or at once when it does
+    not think (its thought's opener allowed beside the call's)."""
     model, npu, engine = make(reasoning=GEMMA)
     with TestClient(app_of(engine, template=TOOLS_TEMPLATE)) as client:
         assert engine.wait_ready(5)
         body = {"tools": [WEATHER], "tool_choice": "required", "chat_template_kwargs": {"enable_thinking": True}}
-        rest = call_pieces("get_weather", city="Rome")[1:]
-        rest[0] = "get_weather>"
-        npu.replies = [["<|channel>thought", "\n", "Hmm", "<channel|>", "Text"], rest]
+        npu.replies = [["<|channel>thought", "\n", "Hmm", "<channel|>", *call_pieces("get_weather", city="Rome")]]
         msg = chat(client, "Q", **body).json()["choices"][0]["message"]
         assert msg["reasoning_content"] == "Hmm" and msg["content"] is None
         assert [c["function"]["arguments"] for c in msg["tool_calls"]] == ['{"city": "Rome"}']
         assert "Hmm<channel|><tool_call>\n<function=get_weather>" in model.tokenizer.decode_bytes(npu.seq).decode()
-        npu.replies = [["Sure", ",", " later"], rest]
+        npu.replies = [call_pieces("get_weather", city="Rome")]
         msg = chat(client, "Q", **body).json()["choices"][0]["message"]
-        assert msg["content"] == "Sure" and [c["function"]["name"] for c in msg["tool_calls"]] == ["get_weather"]
+        assert msg["content"] is None and [c["function"]["name"] for c in msg["tool_calls"]] == ["get_weather"]
         assert engine.cached == npu.seq[:npu.position]
 
 
 def test_tool_call_names(tooled: tuple) -> None:
-    """A call's name is one of the functions': where the model writes another (none fits), the tokens that write a
-    function's name win; the arguments stay the model's."""
-    model, npu, _engine, client = tooled
-    for piece in ("get_time>", "\n<function=get_weather>"):  # (the vocabulary's: before the first request with tools)
-        model.tokenizer.id(piece)
-    npu.replies = [["none>", "\n</function>", "\n</tool_call>"]]  # (after the forced "<tool_call>\n<function=")
-    r = chat(client, "Hi!", tools=[WEATHER, TIME], tool_choice="required").json()
+    """A call's name is one of the functions' and its arguments their schema's: where the model writes another name
+    (greedy: the lowest allowed tokens), a function's call, whole, wins."""
+    _model, npu, _engine, client = tooled
+    npu.replies = [list("none>\n</function>\n") + ["</tool_call>"]]  # (after the forced "<tool_call>\n<function=")
+    r = chat(client, "Hi!", tools=[WEATHER, TIME], tool_choice="required", temperature=0).json()
     assert [(c["function"]["name"], c["function"]["arguments"]) for c in r["choices"][0]["message"]["tool_calls"]] == \
         [("get_time", "{}")]
-    npu.replies = [["Sure.", "\n\n", "<tool_call>", "\n<function=lookup>", "\n<parameter=city>", "\nOslo",
-                    "\n</parameter>", "\n</function>", "\n</tool_call>"]]
-    msg = chat(client, "Hi!", tools=[WEATHER, TIME]).json()["choices"][0]["message"]
+    npu.replies = [[*"Sure.\n\n", *call_pieces("lookup", city="Oslo")]]  # (its call alone: the rest dropped)
+    msg = chat(client, "Hi!", tools=[WEATHER, TIME], temperature=0, parallel_tool_calls=False).json()
+    msg = msg["choices"][0]["message"]
     assert msg["content"] == "Sure." and [(c["function"]["name"], c["function"]["arguments"])
-                                          for c in msg["tool_calls"]] == [("get_weather", '{"city": "Oslo"}')]
-    assert "<tool_call>\n<function=get_weather>\n<parameter=city>" in model.tokenizer.decode_bytes(npu.seq).decode()
+                                          for c in msg["tool_calls"]] == [("get_time", "{}")]
 
 
 def test_tool_calls_drafts() -> None:
-    """Steps of several tokens (a drafter): the forced opener and the end after a call wait for a step's end, so the
-    cache holds exactly the tokens of the answer."""
+    """Steps of several tokens (a drafter): the end after a call waits for a step's end, so the cache holds exactly
+    the tokens of the answer."""
     _model, npu, engine = make(reasoning=QWEN, drafts=3)
     with TestClient(app_of(engine, template=TOOLS_TEMPLATE)) as client:
         assert engine.wait_ready(5)
-        npu.replies = [["Need", " Oslo", "</think>", "\n\n", "Fine."], call_pieces("get_weather", city="Oslo")[2:]]
+        npu.replies = [["Need", " Oslo", "</think>", "\n\n", *call_pieces("get_weather", city="Oslo")]]
         r = chat(client, "Q", tools=[WEATHER], tool_choice={"type": "function", "function": {"name": "get_weather"}},
                  chat_template_kwargs={"enable_thinking": True}).json()
         msg = r["choices"][0]["message"]
-        assert msg["reasoning_content"] == "Need Oslo" and msg["content"] == "Fine."
+        assert msg["reasoning_content"] == "Need Oslo" and msg["content"] is None
         assert [c["function"]["arguments"] for c in msg["tool_calls"]] == ['{"city": "Oslo"}']
         assert engine.cached == npu.seq[:npu.position] and npu.position == len(engine.cached)
         reply = call_pieces("get_time") + ["\n"] + call_pieces("get_weather", city="X")

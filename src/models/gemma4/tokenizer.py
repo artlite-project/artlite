@@ -36,6 +36,8 @@ class GemmaTokenizer:
         # longest first, as llama.cpp's special-token cache
         names = sorted(self.special, key=len, reverse=True)
         self._special_re = re.compile("|".join(re.escape(n) for n in names))
+        users = sorted((n for n in names if self.types[self.special[n]] == T_USER), key=len, reverse=True)
+        self._user_re = re.compile("|".join(re.escape(n) for n in users) or "(?!)")
         self._bytes = {i: int(t[3:5], 16) for i, t in enumerate(self.tokens) if self.types[i] == T_BYTE}
 
     def _merge_ranks(self) -> dict[str, int]:
@@ -110,19 +112,25 @@ class GemmaTokenizer:
         return out
 
     def encode_plain(self, text: str) -> list[int]:
-        """Token ids of ``text`` with no special tokens (their text encodes as text)."""
+        """Token ids of ``text`` with no special tokens (``vocabulary``'s: their text encodes as text; the user-defined
+        ones, text, as the model writes them)."""
         out: list[int] = []
-        if text:
-            self._text(text, out)
+        pos = 0
+        for m in self._user_re.finditer(text):
+            if m.start() > pos:
+                self._text(text[pos:m.start()], out)
+            out.append(self.special[m.group()])
+            pos = m.end()
+        if pos < len(text):
+            self._text(text[pos:], out)
         return out
 
     def vocabulary(self) -> tuple[list[bytes], list[int]]:
         """Every token's bytes as a generation's text has them (a control token's text too; a byte token its byte) and
-        the special tokens: the control and unknown ones and the user-defined ones spelled ``<...>``."""
+        the special tokens: the control and unknown ones (the user-defined ones, ``<|tool_call>``, ``<|"|>``, are text a
+        model writes: ``models.tokenizer.special_ids``)."""
         pieces = [self.decode_bytes([i], special=True) for i in range(len(self.tokens))]
-        special = [i for i, t in enumerate(self.types) if t in (T_CONTROL, T_UNKNOWN) or
-                   (t == T_USER and pieces[i].startswith(b"<") and pieces[i].endswith(b">"))]
-        return pieces, special
+        return pieces, [i for i, t in enumerate(self.types) if t in (T_CONTROL, T_UNKNOWN)]
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
         """The UTF-8 bytes of the tokens (control tokens only when ``special``)."""

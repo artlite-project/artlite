@@ -147,9 +147,9 @@ class Conversation:
         self._text(self.after + self.turns.tool + text + self.turns.tool_end)
         self.after, self.results = "", True
 
-    def respond(self, mode: str, max_tokens: int, stats: Any, seed: int | None = None) -> Any:
+    def respond(self, mode: str, max_tokens: int, stats: Any, seed: int | None = None, mask: Any = None) -> Any:
         """The reply's ("text", token) and ("audio", samples) as they come (``Lfm.reply``; ``seed``: its speech codes'
-        sampling); its tokens and frames stay in the sequence."""
+        sampling; ``mask``: its text's, the tool calls' grammar); its tokens and frames stay in the sequence."""
         from ..lfm3a.speech import Reply
         if self.open:
             self._text(self.turns.user_end)
@@ -160,7 +160,7 @@ class Conversation:
         reply = Reply()
         try:
             yield from self.model.reply(self.seq[kept:], mode=mode, seed=seed, max_tokens=max_tokens, reply=reply,
-                                        stats=stats)
+                                        stats=stats, mask=mask)
         finally:
             self.seq = self.seq + reply.sequence(self.model.cfg.hidden_size)
             self.engine.ran(self.seq)

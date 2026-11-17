@@ -179,7 +179,9 @@ class NpuSpark(OverlayModel):
         self._inj = None
         x = d.block_rows(self._rows([token])[0], self._mask)
         self._dispatch(lambda: d.run(S, q, x, self.position))
-        out, conf = self.chain.walk(d.logits(), d.table.ids, d.h(), token, min(k, d.B), set(self.eos_token_ids))
+        fork = getattr(penalties.mask, "fork", None)  # (a grammar's: the chain's drafts follow it)
+        out, conf = self.chain.walk(d.logits(), d.table.ids, d.h(), token, min(k, d.B), set(self.eos_token_ids),
+                                    fork() if fork is not None else None)
         self._chains = tuple(np.cumprod(conf).tolist())
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)

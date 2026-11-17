@@ -13,7 +13,7 @@ import numpy as np
 
 from artlite.gguf_model import GGUFFile
 
-from .sampling import top_logits
+from .sampling import Mask, top_logits
 
 TOP_K = 32
 
@@ -35,9 +35,10 @@ class MarkovChain:
             self.gguf.willneed(name)
 
     def walk(self, logits: np.ndarray, ids: np.ndarray, h: np.ndarray, anchor: int, n: int,
-             stop: set[int] | frozenset[int] = frozenset()) -> tuple[list[int], np.ndarray]:
+             stop: set[int] | frozenset[int] = frozenset(), mask: Mask | None = None) -> tuple[list[int], np.ndarray]:
         """Up to n drafts after the anchor token (logits (block, rows) bf16 of the tokens ``ids``, h (block, hidden) the
-        rows normed), ending with a token of ``stop``, and their confidences (fp32)."""
+        rows normed), ending with a token of ``stop``, and their confidences (fp32); ``mask``: the drafts' (a grammar's,
+        forked: told each draft), a draft the best candidate it takes, the chain's end where it takes none of them."""
         drafts: list[int] = []
         conf = np.zeros(n, np.float32)
         prev = anchor
@@ -47,9 +48,18 @@ class MarkovChain:
             w1p = self.gguf.rows(self.TABLES[0], [prev], prefetch=False)[0]
             w2c = self.gguf.rows(self.TABLES[1], c, prefetch=False)
             col = v + w2c @ w1p
+            best = int(np.argmax(col))
+            if mask is not None:  # (the best candidate the grammar takes: each checked in order, no whole mask)
+                order = np.argsort(-col, kind="stable")
+                j = mask.first_allowed(c[order])
+                if j < 0:
+                    return drafts, conf[:i]
+                best = int(order[j])
             conf[i] = 1 / (1 + np.exp(-(self.conf[:hn] @ h[i] + self.conf[hn:] @ w1p + self.conf_b)))
-            prev = int(c[int(np.argmax(col))])
+            prev = int(c[best])
             drafts.append(prev)
+            if mask is not None:
+                mask.accept(prev)
             if prev in stop:
                 return drafts, conf[:i + 1]
         return drafts, conf

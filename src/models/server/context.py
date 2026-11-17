@@ -1,7 +1,7 @@
 """What the model server's routes share (``ApiContext``): the engine, the settings and the model file's (``Options``,
 ``ModelInfo``), the request rules - sampling and what a request must satisfy, the prompt's fit, how a request becomes
 a job - and the state of the whole server: the fields already warned about, the stored Responses, the spoken
-replies, the model's tool vocabulary. The prompts of chat requests: ``prompt.PromptBuilder``."""
+replies. The prompts of chat requests: ``prompt.PromptBuilder``."""
 
 import asyncio
 import dataclasses
@@ -12,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import structured
 from ..sampling import TOP_K_ALL, Sampling
-from . import agents
+from . import agents, call_grammar
 from .constraints import constraint_of
 from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable
@@ -21,7 +21,7 @@ from .prompt import PromptBuilder, system_first, takes_parts
 from .schemas import ChatRequest, GenerationRequest
 from .settings import PENALTIES, ModelInfo, Options
 from .speech import Replies
-from .tools import Calls, Vocabulary, syntax_of
+from .tools import Calls, syntax_of
 
 log = logging.getLogger("artlite.server")
 
@@ -44,8 +44,7 @@ class ApiContext:
     """The state of one model's server that its routes share: ``engine``, ``options``, ``info``, the template's
     properties (``syntax``: its tool calls, None: it takes no tools; ``typed``: content as text parts; ``first``: a
     system message only first), ``store`` (the Responses API's, for ``previous_response_id``), ``replies`` (the spoken
-    replies: their audio ids in later turns) and ``vocab`` (the model's tokens for the calls' names, built on the first
-    request with tools)."""
+    replies: their audio ids in later turns)."""
 
     def __init__(self, engine: Engine, options: Options, info: ModelInfo):
         self.engine, self.options, self.info = engine, options, info
@@ -55,8 +54,6 @@ class ApiContext:
         self.first = system_first(info.chat_template)
         self.store = agents.Store()
         self.replies = Replies()
-        self.vocab: list[Vocabulary] = []
-        self.vocab_lock = asyncio.Lock()
         self.prompts = PromptBuilder(self)
 
     def warn_once(self, key: tuple[str, str], message: str, *args: object) -> None:
@@ -111,24 +108,33 @@ class ApiContext:
             if name in NEUTRAL and value not in (neutral, None, [], {}, ""):
                 self.warn_once((name, repr(value)), "%s = %r is not supported: ignored", name, value)
 
-    async def constrained(self, req: GenerationRequest, *, route: str = "chat") -> structured.Compiled | None:
+    async def constrained(self, req: GenerationRequest, *, route: str = "chat", calls: Calls | None = None
+                          ) -> structured.Compiled | None:
         """The request's structured output (``constraints.constraint_of``; none: the server's, ``--grammar``,
-        ``--json-schema``), compiled against the model's tokens (in a thread: the first request may wait for them). A
-        field that does not compile: a 400 that names it."""
+        ``--json-schema``) and its tool calls (``calls``: their grammar, ``call_grammar.answer``, with a JSON response
+        format as the answer that is no call), compiled against the model's tokens (in a thread: the first request may
+        wait for them). A field that does not compile: a 400 that names it."""
         got = constraint_of(req.constraint_fields(), route=route)
         if got is None and self.options.constraint is not None:
             got = (self.options.constraint, "--grammar / --json-schema")
-        if got is None:
+        if got is None and calls is None:
             return None
-        constraint, field = got
+        v = await self.vocab()
+        constraint, field = got if got is not None else (None, "tools")
         try:
-            v = await run_in_threadpool(self.engine.vocab)
-        except ValueError as e:
-            raise not_supported(str(e)) from None
-        try:
+            if calls is not None:
+                constraint = call_grammar.answer(calls, v, constraint)
+                field = "tools" if got is None else f"tools with {field}"
             return await run_in_threadpool(structured.compiled, constraint, v)
         except structured.ConstraintError as e:
             raise bad_request(f"{field}: {e}") from None
+
+    async def vocab(self) -> structured.Vocab:
+        """The model's tokens for structured output (``Engine.vocab``: in a thread)."""
+        try:
+            return await run_in_threadpool(self.engine.vocab)
+        except ValueError as e:
+            raise not_supported(str(e)) from None
 
     def request_sampling(self, req: GenerationRequest, think: bool) -> Sampling:
         s = self.sampling(think)
@@ -177,10 +183,11 @@ class ApiContext:
 
     def job(self, req: GenerationRequest, ids: list[int], *, think: bool, reasoning: bool = False,
             max_tokens: int | None = None, conv_id: str | None = None, tools: Calls | None = None,
-            answer_mark: bool = False, grammar: structured.Compiled | None = None
+            answer_mark: bool = False, grammar: structured.Compiled | None = None, ban: tuple[int, ...] = ()
             ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
-        ``Job.answer_mark``; ``grammar``: the answer's structured output, ``constrained``)."""
+        ``Job.answer_mark``; ``grammar``: the answer's structured output, ``constrained``; ``ban``: tokens it never
+        has)."""
         options = self.options
         loop, events = asyncio.get_running_loop(), asyncio.Queue()
 
@@ -207,7 +214,7 @@ class ApiContext:
                 inside=reasoning and opened, opened=opened, think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
                 progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark,
-                grammar=grammar)
+                grammar=grammar, ban=ban)
         try:
             self.engine.submit(j)
         except RuntimeError as e:
@@ -224,9 +231,11 @@ class ApiContext:
         if "audio" in ((req.model_extra or {}).get("modalities") or []):
             raise not_supported("audio output is not supported by artlite-server")
         fns, calls = prompts.calls_of(req)
-        grammar = await self.constrained(req)
-        if calls is not None:
-            calls = dataclasses.replace(calls, vocab=await prompts.vocabulary())
+        grammar = await self.constrained(req, calls=calls)
+        ban: tuple[int, ...] = ()
+        if fns and calls is None and grammar is None and self.syntax is not None:  # (tool_choice none: no call text)
+            opener = self.engine.model.tokenizer.encode(getattr(self.syntax.parser_class, "OPEN", ""))
+            ban = tuple(opener) if len(opener) == 1 else ()  # (an opener of one token: Qwen's, Gemma's; Llama's: none)
         ids, think = await prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
                                           tools=fns)
         self.fits(ids, api)
@@ -234,4 +243,4 @@ class ApiContext:
         # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
         keeps = prompts.template_options(req.chat_template_kwargs)[1] and "preserve_thinking" in self.info.chat_template
         return self.job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens,
-                        conv_id=conv_id, tools=calls, answer_mark=not keeps, grammar=grammar)
+                        conv_id=conv_id, tools=calls, answer_mark=not keeps, grammar=grammar, ban=ban)

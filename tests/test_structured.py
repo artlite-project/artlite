@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from models import structured as S
-from models.sampling import Penalties, Sampling
+from models.sampling import Penalties, Sampling, seed
 
 SPECIAL = ["<|end|>", "<think>", "</think>", "<tool_call>", "</tool_call>"]
 WORDS = [b'{"', b'":', b'",', b'"}', b" {", b"true", b"false", b"null", b"name", b"city", b"123", b"45", b"```",
@@ -253,11 +253,12 @@ def test_sampling() -> None:
     """The sampler under a grammar's mask: greedy over random logits is the argmax of the allowed ones, a sampled
     choice is always allowed, and the answer parses."""
     rng = np.random.default_rng(0)
+    seed(0)
     for sampling in (Sampling(greedy=True), Sampling(temp=1.0, top_k=40)):
         m = mask_of(OBJ)
         p = Penalties(sampling, (), m)
         out = []
-        for _ in range(200):
+        for _ in range(2000):
             logits = rng.standard_normal(V.n).astype(np.float32) * 3
             a = allowed(m.bits())
             v, i = p.top(logits, sampling.k)
@@ -278,3 +279,108 @@ def test_cache() -> None:
     a = S.compiled(S.Constraint.json_schema({"type": "string"}), V)
     assert S.compiled(S.Constraint.json_schema({"type": "string"}), V) is a
     assert S.compiled(S.Constraint.json_schema({"type": "integer"}), V) is not a
+
+
+# ----------------------------------------------------------------------
+# The masks and the multi-token steps (``speculative.SpeculativeMixin``)
+# ----------------------------------------------------------------------
+
+
+def test_prefetch() -> None:
+    """Masks computed aside (``prefetch``: after the accepted tokens, after each draft in turn) are the masks computed
+    when they are taken, bit for bit, whatever part of the drafts the step keeps; ``fork`` moves alone; ``valid_prefix``
+    cuts drafts where the grammar refuses them; ``forced`` is the grammar's canonical next tokens."""
+    rng = np.random.default_rng(3)
+    text = TOK.encode_plain('{"name": "Bob 123", "n": 45, "x": 0.5}')
+    for keep in range(5):
+        a, b = mask_of(OBJ), mask_of(OBJ)
+        i = 0
+        while i < len(text):
+            drafts = text[i + 1:i + 4] if rng.random() < 0.7 else rng.integers(0, V.n, 3).tolist()
+            a.prefetch(drafts)
+            for j in range(min(keep, len(drafts)) + 1):
+                if i >= len(text):
+                    break
+                assert np.array_equal(a.bits(), b.bits()), (keep, i)
+                a.accept(text[i])
+                b.accept(text[i])
+                i += 1
+                if j < len(drafts) and drafts[j] != text[i - 1]:
+                    break
+    m = mask_of(OBJ)
+    walk(m, '{"name": "a"')
+    f = m.fork()
+    f.accept(TOK.encode_plain("}")[0])
+    assert f.complete and not m.complete  # (the fork moved alone)
+    assert m.valid_prefix(TOK.encode_plain(', "n": 1')) == len(TOK.encode_plain(', "n": 1'))
+    assert m.valid_prefix(TOK.encode_plain(', "q": 1')) < len(TOK.encode_plain(', "q": 1'))
+    fixed = S.Constraint.json_schema({"type": "object", "properties": {"alpha": {"type": "integer"}},
+                                      "required": ["alpha"]}, compact=True)
+    m = mask_of(fixed)
+    assert m.forced() == []  # (blanks may come first)
+    walk(m, "{")
+    assert b"".join(TOK.pieces[t] for t in m.forced()) == b'"alpha":'[:len(b"".join(TOK.pieces[t] for t in m.forced()))]
+    assert len(m.forced()) >= 2
+
+
+class TextModel:
+    """A model whose next token after position q is ``text[q + 1]`` (``test_drafts.Text``) over the toy vocabulary."""
+
+    @staticmethod
+    def make(text: list[int]) -> object:
+        from models.overlay_model import OverlayModel
+
+        class M(OverlayModel):
+            eos_token_ids = (END,)
+            capacity = 512
+            overlay = type("O", (), {"once_s": 0.0})()
+
+            def __init__(self) -> None:
+                self.text, self.position, self.calls = text, 0, []
+
+            def steps(self, tokens: list[int], *, logits: bool = True) -> np.ndarray:
+                from ml_dtypes import bfloat16
+                p = self.position
+                self.calls.append(list(tokens))
+                self.position += len(tokens)
+                out = np.full((len(tokens), V.n), -8.0, np.float32)
+                for i in range(len(tokens)):
+                    out[i, self.text[min(p + i + 1, len(self.text) - 1)]] = 8.0
+                return out.astype(bfloat16)
+
+            def _crossing(self) -> tuple[bool, ...]:
+                return (False,) * (self.DRAFTS + 1)
+
+            def first(self, n: int) -> np.ndarray:
+                self.position = n
+                out = np.full(V.n, -8.0, np.float32)
+                out[self.text[n]] = 8.0
+                return out
+
+        return M()
+
+
+def test_forced_drafts() -> None:
+    """A model that writes a JSON answer, greedy: the same tokens with and without drafts, with and without the
+    grammar; with it, the tokens the grammar forces (a fixed schema's keys) are drafts of their own, kept by
+    construction, and the answer takes fewer steps than tokens; the context's drafts the grammar refuses are cut."""
+    schema = {"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string",
+                                                                                    "enum": ["alpha", "beta"]},
+                                               "count": {"type": "integer"}}, "required": ["name", "kind", "count"]}
+    c = S.Constraint.json_schema(schema, compact=True)
+    answer = TOK.encode_plain('{"name":"Bob","kind":"alpha","count":12}')
+    prompt = TOK.encode_plain("Q: ")
+    text = prompt + answer + [END]
+    P = len(prompt)
+    greedy = Sampling(greedy=True)
+    plain = TextModel.make(text)
+    plain.lookup = False
+    want = list(plain.generate(plain.first(P), -1, greedy, text[:P]))
+    assert want == answer + [END]
+    for lookup in (False, True):
+        m = TextModel.make(text)
+        m.lookup = lookup
+        out = list(m.generate(m.first(P), -1, greedy, text[:P], mask_of(c)))
+        assert out == want and m.forced > 0 and len(m.calls) < len(out) - 1, (lookup, m.calls)
+        for call in m.calls:  # (every step's drafts the grammar's or kept: none refused)
+            assert len(call) <= m.DRAFTS + 1

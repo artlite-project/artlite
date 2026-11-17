@@ -204,14 +204,22 @@ class NpuGemma(OverlayModel):
         get too."""
         t0 = time.perf_counter()
         out: list[int] = []
-        recent = penalties.copy() if penalties is not None and penalties.active else None
+        recent = penalties.copy() if penalties is not None and (penalties.active or penalties.mask is not None) \
+            else None  # (the generation's penalties and its mask, forked: the guesses follow the grammar)
         while len(out) < n and token not in self.eos_token_ids:
             x = self.host.embed([token])[0]
             raw = self.drafter.step(x, h if not out else None, self.position)
             if recent is None:
                 token = self.drafter.token(raw)
-            else:
-                token = int(recent.top(raw, 1, self.softcap, rows=self.drafter.rows, where=self._draft_where)[1][0])
+            else:  # (a grammar's mask: the best of the few best guesses it takes, each checked, no whole mask)
+                grammar, recent.mask = recent.mask, None
+                ids = recent.top(raw, GUESSES if grammar is not None else 1, self.softcap, rows=self.drafter.rows,
+                                 where=self._draft_where)[1]
+                recent.mask = grammar
+                j = grammar.first_allowed(ids) if grammar is not None else 0
+                if j < 0:
+                    break
+                token = int(ids[j])
                 recent.accept(token)
             out.append(token)  # (its per-layer inputs: with the verifying step's others, in one pass)
         self.t_draft += time.perf_counter() - t0
@@ -230,6 +238,9 @@ class NpuGemma(OverlayModel):
         super()._kept(p, tokens, m, mtp, won)
         if self.drafter is not None:
             self._h = self.hidden_state(m - 1)
+
+
+GUESSES = 8  # a drafter's best guesses a grammar's mask checks in order (``NpuGemma.draft``)
 
 
 class Gemma(Model):

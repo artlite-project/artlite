@@ -181,7 +181,10 @@ class NpuModel:
         token = choose(logits)
         n = 1
         yield token
+        ahead = getattr(mask, "prefetch", None)
         while n != max_tokens and token not in self.eos_token_ids and self.position < self.capacity:
+            if ahead is not None:  # (the next mask computed while the step runs)
+                ahead()
             if probs is None:
                 token = sampling.pick(*self.top_k(token, sampling.k, penalties))
                 penalties.accept(token)

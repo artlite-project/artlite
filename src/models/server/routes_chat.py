@@ -1,18 +1,25 @@
 """OpenAI's chat completions (llama-server's shapes): ``/v1/chat/completions``, streamed (``ChatFormat``) or not, with
 ``reasoning_content``, tool calls, ``logprobs``, ``timings``, ``prompt_progress`` and ``usage``; a request with audio
-output goes to ``speech.chat_audio``."""
+output goes to ``speech.chat_audio``, one whose answer is one of a few options with ``logprobs`` to ``answers`` (their
+probabilities: ``decide``)."""
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Header, Request
+from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from . import answers
 from .app_base import sse
 from .context import ApiContext
+from .errors import unavailable
 from .ids import hex_id
+from .jobs import timings
 from .schemas import ChatRequest, Message
 from .speech import chat_audio
 from .streaming import Format, collect, stream_response, usage
@@ -63,6 +70,44 @@ class ChatFormat(Format):
         return [sse(c) for c in end] + ["data: [DONE]\n\n"]
 
 
+async def decide(ctx: ApiContext, req: ChatRequest, head: dict[str, Any]) -> dict[str, Any] | None:
+    """A decision's chat completion (``answers``: a response format of options, ``logprobs``; no tools, no thought), or
+    None: a generation."""
+    opts = answers.request_options({"logprobs": req.logprobs, "response_format": req.response_format,
+                                    "json_schema": req.json_schema})
+    if opts is None or req.tools:
+        return None
+    ctx.check(req)
+    ids, think = await ctx.prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort)
+    if think and ctx.engine.model.reasoning is not None and ctx.prompts.inside(ids):
+        return None  # (the template opened a thought: the answer comes after it)
+    ctx.fits(ids)
+    model, t0 = ctx.engine.model, time.perf_counter()
+    texts = [opts.text(v).encode() for v in opts.values]
+    await ctx.vocab()  # (the model's tokens: built aside, in a thread)
+    try:
+        logprobs = await asyncio.wrap_future(ctx.engine.answers(ids, texts, cache_prompt=req.cache_prompt is not False))
+    except RuntimeError as e:
+        raise unavailable(str(e)) from None
+    best = int(max(range(len(logprobs)), key=lambda i: logprobs[i]))
+    n_out = len(model.tokenizer.encode_plain(texts[best].decode()))
+    t = timings(cache_n=0, prompt_n=len(ids), prompt_s=time.perf_counter() - t0, predicted_n=n_out, predicted_s=0.0)
+    return answers.answer_body(opts, logprobs, head=head, timings=t,
+                               usage={"prompt_tokens": len(ids), "completion_tokens": n_out,
+                                      "total_tokens": len(ids) + n_out})
+
+
+async def decision_events(body: dict[str, Any]) -> AsyncIterator[str]:
+    """A decision as a stream: its message in one chunk, its end."""
+    choice = body["choices"][0]
+    chunk = {k: v for k, v in body.items() if k not in ("choices", "usage", "timings")}
+    yield sse({**chunk, "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": None, "delta": {
+        "role": "assistant", "content": choice["message"]["content"]}, "logprobs": choice["logprobs"]}]})
+    yield sse({**chunk, "object": "chat.completion.chunk", "choices": [{"index": 0, "finish_reason": "stop",
+                                                                         "delta": {}}], "usage": body["usage"]})
+    yield "data: [DONE]\n\n"
+
+
 def add_routes(api: APIRouter, ctx: ApiContext) -> None:
     """``/v1/chat/completions`` on ``api``."""
     engine, options = ctx.engine, ctx.options
@@ -76,9 +121,13 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
             msgs = await run_in_threadpool(lambda: ctx.prompts.messages_of(
                 [Message.model_validate(m) for m in ctx.replies.messages(body["messages"])]))
             return await chat_audio(engine, body, msgs, alias=options.alias, replies=ctx.replies)
-        j, events = await ctx.start(req, conv_id=x_conversation_id)
         cid, created, name = hex_id("chatcmpl-", 16), int(time.time()), options.alias
         head = {"created": created, "id": cid, "model": name, "system_fingerprint": options.build_info}
+        decision = await decide(ctx, req, head)  # (one of a few options, with logprobs: their probabilities)
+        if decision is not None:
+            return decision if not req.stream else StreamingResponse(decision_events(decision),
+                                                                     media_type="text/event-stream")
+        j, events = await ctx.start(req, conv_id=x_conversation_id)
         if not req.stream:
             blocks, done = await collect(j, events, request)
             calls = [{"id": b.call.id, "type": "function", "function": {"name": b.call.name, "arguments": b.text}}

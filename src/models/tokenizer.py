@@ -82,16 +82,23 @@ def unicode_classes(cps: np.ndarray) -> np.ndarray:
     return out
 
 
-def special_ids(pieces: list[bytes], types: np.ndarray) -> list[int]:
-    """The special tokens of a GGUF vocabulary (its tokens' bytes and ``tokenizer.ggml.token_type``): the control ones and
-    the user-defined ones spelled ``<...>`` (Qwen's ``<tool_call>``, ``<think>``)."""
-    return [int(i) for i in np.flatnonzero((types == T_CONTROL) | (types == T_USER))
-            if types[i] == T_CONTROL or (pieces[i].startswith(b"<") and pieces[i].endswith(b">"))]
+def special_ids(types: np.ndarray) -> list[int]:
+    """The special tokens of a GGUF vocabulary (``tokenizer.ggml.token_type``) for structured output: the control ones
+    (llama.cpp's llguidance adapter's rule; the user-defined ones - Qwen's ``<tool_call>``, ``<think>``, LFM3's
+    ``<parameter=`` - are text a model writes, as a grammar spells it)."""
+    return [int(i) for i in np.flatnonzero(types == T_CONTROL)]
 
 
-def texts_of(names: list[str]) -> re.Pattern[str]:
-    """A pattern that finds any of the texts (longest first; none: never matches)."""
-    return re.compile("|".join(re.escape(t) for t in sorted(names, key=len, reverse=True)) or "(?!)")
+@functools.cache
+def _texts(names: tuple[str, ...], group: bool) -> re.Pattern[str]:
+    body = "|".join(re.escape(t) for t in sorted(names, key=len, reverse=True)) or "(?!)"
+    return re.compile(f"({body})" if group else body)
+
+
+def texts_of(names: list[str], *, group: bool = False) -> re.Pattern[str]:
+    """A pattern that finds any of the texts (longest first; none: never matches; ``group``: as a group, ``split``
+    keeps them)."""
+    return _texts(tuple(names), group)
 
 
 class BpeTokenizer:
@@ -133,14 +140,21 @@ class BpeTokenizer:
         return out
 
     def encode_plain(self, text: str) -> list[int]:
-        """Token ids of ``text`` with no special tokens (their text encodes as text)."""
-        if self._split is not None:
-            cps = np.frombuffer(text.encode("utf-32-le"), np.uint32)
-            return self._bpe.encode(cps, self._split(cps, unicode_classes(cps))).tolist()
-        if self._added is None:  # (the control and user-defined tokens' texts: gigatoken's added tokens)
-            vocab = self.tokenizer.vocab
-            self._added = texts_of([vocab[int(i)].decode("utf-8", "replace")
-                                    for i in np.flatnonzero((self.types == T_CONTROL) | (self.types == T_USER))])
+        """Token ids of ``text`` with no special tokens (``vocabulary``'s: their text encodes as text; the user-defined
+        ones, text, as the model writes them)."""
+        if self._split is not None:  # (the user-defined tokens cut out, as ``encode`` cuts out all its added ones)
+            users = {t: i for t, i in self._special_ids.items() if self.types[i] == T_USER}
+            out: list[int] = []
+            for k, part in enumerate(texts_of(list(users), group=True).split(text)):
+                if k % 2:
+                    out.append(users[part])
+                elif part:
+                    cps = np.frombuffer(part.encode("utf-32-le"), np.uint32)
+                    out += self._bpe.encode(cps, self._split(cps, unicode_classes(cps))).tolist()
+            return out
+        if self._added is None:  # (the special tokens' texts)
+            pieces, special = self.vocabulary()
+            self._added = texts_of([pieces[i].decode("utf-8", "replace") for i in special])
         if not self._added.search(text):
             return self.tokenizer.encode(text).tolist()
         if self._plain is None:  # (gigatoken parses special tokens: a vocabulary without them)
@@ -148,11 +162,10 @@ class BpeTokenizer:
         return self._plain.encode(text).tolist()
 
     def vocabulary(self) -> tuple[list[bytes], list[int]]:
-        """Every token's bytes as a generation's text has them (a control token's text too) and the special tokens: the
-        control ones and the user-defined ones spelled ``<...>`` (llguidance's llama.cpp adapter's rule)."""
+        """Every token's bytes as a generation's text has them (a control token's text too) and the special tokens
+        (``special_ids``)."""
         vocab = self.tokenizer.vocab
-        pieces = [vocab.get(i, b"") for i in range(len(self.types))]
-        return pieces, special_ids(pieces, self.types)
+        return [vocab.get(i, b"") for i in range(len(self.types))], special_ids(self.types)
 
     def decode_bytes(self, ids: list[int], *, special: bool = False) -> bytes:
         """The UTF-8 bytes of the tokens (control tokens only when ``special``)."""

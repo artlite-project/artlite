@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..detokenizer import StreamDecoder
 from ..sampling import seed
-from ..structured import GrammarMask, thought_of
+from ..structured import Ban, GrammarMask, thought_of
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
 from .textflow import ReasoningSplitter, StopMatcher
 
@@ -92,13 +92,16 @@ class Generation:
         thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
         self.early = model.tokenizer.encode(self.force) if self.force and not thought else []
         self.late = (tools.syntax.gap if job.inside else "") + self.force if self.force and thought else ""
-        if job.grammar is not None:  # (the thought stays free)
+        self.mask = None
+        if job.grammar is not None:  # (the answer's and its calls'; the thought stays free)
             thought = thought_of(model.reasoning, model.tokenizer, opened=job.opened, think=job.think,
                                  ends=tools.syntax.ends if tools is not None else ())
             self.mask = GrammarMask(self.engine.vocab(), job.grammar.grammar, thought=thought,
                                     digits=job.grammar.json, name=job.name)
-        else:
-            self.mask = tools.mask(model.tokenizer) if tools is not None else None  # (the calls' names: the functions')
+            if tools is not None:  # (the grammar holds the answer to its call: no opener after the thought)
+                self.late = ""
+        elif job.ban:
+            self.mask = Ban(self.engine.vocab(), job.ban)
 
     def _progress(self, i: int) -> None:
         job = self.job

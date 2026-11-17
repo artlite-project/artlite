@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from models.server.agents import Blocks, Store, billing
 from models.server.tools import ToolCall
 
-from .fakes import QWEN, TOOLS_TEMPLATE, WEATHER, FakeModel, FakeNpu, app_of, call_pieces, chat, live, make
+from .fakes import QWEN, TOOLS_TEMPLATE, WEATHER, FakeModel, FakeNpu, app_of, call_pieces, chat, live, make, rest_of
 
 # a template that takes a system message only first, as Qwen's (the fake model renders the prompt its own way)
 FIRST = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}" \
@@ -180,17 +180,16 @@ def test_messages_conversion(agent: tuple) -> None:
 def test_messages_tool_choice(agent: tuple) -> None:
     """any: a call is forced; tool: that function's call alone; none: the call stays text; stop_sequences."""
     _model, npu, client = agent
-    rest = call_pieces("get_weather", city="Oslo")[1:]
-    rest[0] = "get_weather>"
-    npu.replies = [rest]
+    npu.replies = [rest_of("<tool_call>\n<function=", "get_weather", city="Oslo")]
     r = messages(client, "Q", tools=[TOOL], tool_choice={"type": "any"}).json()
     assert [c["type"] for c in r["content"]] == ["tool_use"] and r["stop_reason"] == "tool_use"
-    npu.replies = [call_pieces("get_weather", city="X")[2:] + ["\n"] + call_pieces("get_weather", city="Y")]
+    npu.replies = [rest_of("<tool_call>\n<function=get_weather>\n", "get_weather", city="X") + ["\n"] +
+                   call_pieces("get_weather", city="Y")]
     r = messages(client, "Q", tools=[TOOL], tool_choice={"type": "tool", "name": "get_weather"}).json()
     assert [c["input"] for c in r["content"]] == [{"city": "X"}]
-    npu.replies = [call_pieces("get_weather", city="X")]
-    r = messages(client, "Q", tools=[TOOL], tool_choice={"type": "none"}).json()
-    assert r["content"][0]["type"] == "text" and r["content"][0]["text"].startswith("<tool_call>")
+    npu.replies = [call_pieces("get_weather", city="X")]  # (greedy: where the opener is banned, the lowest token)
+    r = messages(client, "Q", tools=[TOOL], tool_choice={"type": "none"}, temperature=0).json()
+    assert all(c["type"] != "tool_use" and "<tool_call>" not in c.get("text", "") for c in r["content"])
     npu.replies = [["One", " STOP", " two"]]
     r = messages(client, "Q", stop_sequences=["STOP"]).json()
     assert r["content"] == [{"type": "text", "text": "One"}]
@@ -317,8 +316,7 @@ def test_responses_conversion(agent: tuple) -> None:
         {"type": "function_call", "name": "exec_command", "arguments": '{"cmd": "cat a"}', "call_id": "c2"},
         {"type": "function_call_output", "call_id": "c2", "output": [{"type": "input_text", "text": "x = 1"}]},
         {"role": "user", "content": "Go on."}]
-    rest = call_pieces("get_weather", city="Oslo")[2:]
-    npu.replies = [rest]
+    npu.replies = [rest_of("<tool_call>\n<function=get_weather>\n", "get_weather", city="Oslo")]
     tools = [FUNCTION, {"type": "namespace", "name": "multi_agent_v1", "tools": []}, {"type": "web_search"}]
     r = responses(client, items, instructions="You are Codex.\n", tools=tools, store=False,
                   tool_choice={"type": "function", "name": "get_weather"}, parallel_tool_calls=False)

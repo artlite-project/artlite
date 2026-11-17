@@ -27,15 +27,18 @@ from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
 
+from .. import structured
 from ..detokenizer import StreamDecoder
 from ..sequence import data_bytes
 from ..templating import file_template
+from . import call_grammar
 from .conversation import Conversation
 from .engine import Engine
 from .ids import hex_id
 from .speech import speaks, worker
-from .tools import functions, syntax_of
+from .tools import Calls, Syntax, functions, syntax_of
 
 log = logging.getLogger("artlite.server")
 
@@ -164,6 +167,23 @@ class LiveAsrSession(Session):
     async def clear(self, ev: dict[str, Any]) -> None:
         await self.event({"type": "input_audio_buffer.cleared"})
 
+    async def calls_grammar(self, syntax: Syntax | None) -> structured.Compiled | None:
+        """The grammar of the reply's tool calls (``call_grammar.answer``: the session's ``tool_choice``, as a chat
+        request's), or None: no tools, ``tool_choice`` none. ValueError: a choice it does not take, a strict tool's
+        schema that does not compile."""
+        if syntax is None:
+            return None
+        choice, names = self.session.get("tool_choice") or "auto", [f["function"]["name"] for f in self.fns]
+        name = choice.get("name") if isinstance(choice, dict) and choice.get("type") == "function" else None
+        if choice == "none":
+            return None
+        if choice not in ("auto", "required") and name not in names:
+            raise ValueError(f"tool_choice {choice!r}: auto, none, required or {{type: function, name}} of a tool")
+        calls = Calls(syntax, self.fns, parallel=name is None, choice="auto" if choice == "auto" else "required",
+                      name=name, strict=self.strict)
+        v = await run_in_threadpool(self.engine.vocab)
+        return await run_in_threadpool(structured.compiled, call_grammar.answer(calls, v), v)
+
     async def run(self) -> None:
         await self.event({"type": "session.created", "session": self.session})
         try:
@@ -233,6 +253,23 @@ class TranscriptionSession(Session):
         self.buf.clear()
         await self.event({"type": "input_audio_buffer.cleared"})
 
+    async def calls_grammar(self, syntax: Syntax | None) -> structured.Compiled | None:
+        """The grammar of the reply's tool calls (``call_grammar.answer``: the session's ``tool_choice``, as a chat
+        request's), or None: no tools, ``tool_choice`` none. ValueError: a choice it does not take, a strict tool's
+        schema that does not compile."""
+        if syntax is None:
+            return None
+        choice, names = self.session.get("tool_choice") or "auto", [f["function"]["name"] for f in self.fns]
+        name = choice.get("name") if isinstance(choice, dict) and choice.get("type") == "function" else None
+        if choice == "none":
+            return None
+        if choice not in ("auto", "required") and name not in names:
+            raise ValueError(f"tool_choice {choice!r}: auto, none, required or {{type: function, name}} of a tool")
+        calls = Calls(syntax, self.fns, parallel=name is None, choice="auto" if choice == "auto" else "required",
+                      name=name, strict=self.strict)
+        v = await run_in_threadpool(self.engine.vocab)
+        return await run_in_threadpool(structured.compiled, call_grammar.answer(calls, v), v)
+
     async def run(self) -> None:
         await self.event({"type": "session.created", "session": self.session})
         try:
@@ -269,6 +306,7 @@ class ConversationSession(Session):
                       "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "female"}}}
         self.conv = Conversation(engine, self.model)
         self.fns: list[dict[str, Any]] = []
+        self.strict: frozenset[str] = frozenset()  # (the strict tools: their schemas compile exactly)
         self.task: asyncio.Task | None = None  # (the response being generated)
         self.stop: threading.Event | None = None  # (its cancel)
         self.last: str | None = None  # (the last item's id)
@@ -327,6 +365,8 @@ class ConversationSession(Session):
         if "tools" in up:
             try:
                 self.fns = _responses_tools(up["tools"])
+                self.strict = frozenset(t.get("name") for t in up["tools"] or [] if isinstance(t, dict) and
+                                        t.get("strict") is True)
             except ValueError as e:
                 await self.error(f"session.update: {e}")
                 return
@@ -443,12 +483,19 @@ class ConversationSession(Session):
         mx = 4096 if mx in (None, "inf") else int(mx)
         syntax = syntax_of(self.template) if self.fns else None
         parser = syntax.parser(self.fns) if syntax is not None else None
+        try:
+            grammar = await self.calls_grammar(syntax)
+        except ValueError as e:
+            await self.error(f"tools: {e}")
+            return
 
         def produce(push: Callable[[tuple[str, Any]], None], stop: threading.Event) -> None:
             from ..lfm3a.speech import SpeechStats
             self.stop = stop
             dec, st = StreamDecoder(model.tokenizer), SpeechStats()
-            for kind, x in conv.respond(mode, mx, st):
+            mask = structured.GrammarMask(self.engine.vocab(), grammar.grammar, name="realtime") \
+                if grammar is not None else None
+            for kind, x in conv.respond(mode, mx, st, mask=mask):
                 if stop.is_set():
                     break
                 if kind == "text":
@@ -479,6 +526,23 @@ class ConversationSession(Session):
         if parser is not None:
             await out.parts(parser.flush())
         await out.finish(status, n_out)
+
+    async def calls_grammar(self, syntax: Syntax | None) -> structured.Compiled | None:
+        """The grammar of the reply's tool calls (``call_grammar.answer``: the session's ``tool_choice``, as a chat
+        request's), or None: no tools, ``tool_choice`` none. ValueError: a choice it does not take, a strict tool's
+        schema that does not compile."""
+        if syntax is None:
+            return None
+        choice, names = self.session.get("tool_choice") or "auto", [f["function"]["name"] for f in self.fns]
+        name = choice.get("name") if isinstance(choice, dict) and choice.get("type") == "function" else None
+        if choice == "none":
+            return None
+        if choice not in ("auto", "required") and name not in names:
+            raise ValueError(f"tool_choice {choice!r}: auto, none, required or {{type: function, name}} of a tool")
+        calls = Calls(syntax, self.fns, parallel=name is None, choice="auto" if choice == "auto" else "required",
+                      name=name, strict=self.strict)
+        v = await run_in_threadpool(self.engine.vocab)
+        return await run_in_threadpool(structured.compiled, call_grammar.answer(calls, v), v)
 
     async def run(self) -> None:
         await self.event({"type": "session.created", "session": self.session})

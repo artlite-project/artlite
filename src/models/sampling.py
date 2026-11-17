@@ -131,7 +131,8 @@ Probs = Callable[[LogitsLike, int, float, tuple[np.ndarray, np.ndarray]], None]
 
 
 class Mask(Protocol):
-    """A constraint on a generation's tokens (a grammar's: ``structured.GrammarMask``)."""
+    """A constraint on a generation's tokens (a grammar's: ``structured.GrammarMask``, which also forks for a drafter,
+    cuts drafts, gives forced tokens and computes masks ahead: ``speculative.SpeculativeMixin.generate``)."""
 
     def bits(self) -> np.ndarray | None:
         """The tokens the next one may be as a vocabulary bitmask (uint32: bit i % 32 of word i // 32 for token i,
@@ -140,6 +141,10 @@ class Mask(Protocol):
 
     def accept(self, token: int) -> None:
         """The sequence's next token."""
+        ...
+
+    def first_allowed(self, candidates: Sequence[int]) -> int:
+        """The index of the first of ``candidates`` the next token may be, or -1 (a drafter's guesses, best first)."""
         ...
 
 
@@ -171,9 +176,11 @@ class Penalties:
         return self.n > 0
 
     def copy(self) -> "Penalties":
-        """Another window of the same tokens (a draft's: without the mask)."""
+        """Another window of the same tokens (a drafter's guesses': the mask forked where it forks, ``GrammarMask.fork``:
+        they follow its grammar; else without it)."""
         out = copy.copy(self)
-        out.last, out.counts, out.mask = self.last.copy(), self.counts.copy(), None
+        fork = getattr(self.mask, "fork", None)
+        out.last, out.counts, out.mask = self.last.copy(), self.counts.copy(), fork() if fork is not None else None
         return out
 
     def accept(self, token: int) -> None:

@@ -54,6 +54,7 @@ class SpeculativeMixin:
     t_draft = 0.0  # seconds in the drafter's steps
     blocks = 0  # dispatches of a block drafter (its drafts of a round in one)
     drafted_ctx = accepted_ctx = 0  # the context's of them
+    forced = 0  # draft tokens a grammar forced (``Mask.forced``: kept by construction)
 
     @functools.cached_property
     def planner(self) -> Planner:
@@ -72,6 +73,8 @@ class SpeculativeMixin:
             out.append(f"{mtp} draft tokens ({cost}), {self.accepted - self.accepted_ctx} accepted")
         if self.drafted_ctx:
             out.append(f"{self.drafted_ctx} context draft tokens, {self.accepted_ctx} accepted")
+        if self.forced:
+            out.append(f"{self.forced} forced tokens")
         return "; ".join(out)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
@@ -180,6 +183,9 @@ class SpeculativeMixin:
         token = choose(logits)
         n = 1
         yield token
+        # (a grammar's mask: its forced tokens drafts of their own, the others cut where it refuses them, its masks
+        # computed while the step runs)
+        forced, valid, ahead = (getattr(mask, k, None) for k in ("forced", "valid_prefix", "prefetch"))
         ctx = Lookup(token_ids(prompt)) if self.lookup and most > 0 else None
         if ctx is not None:
             ctx.extend([token])
@@ -195,12 +201,30 @@ class SpeculativeMixin:
                 plan.place(self.position)
                 plan.crossing = self._crossing()
                 t0, w0 = time.perf_counter(), _native.turn_waited()  # (the planner's times: this process's own work)
-                m, d = ctx.draft(k) if ctx is not None else (0, [])
-                j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
-                mtp = j is None
-                d = self._mtp(token, k, penalties) if mtp else d[:j]
+                f = forced()[:k] if forced is not None and k > 0 else []
+                more: list[int] = []
+                if f:  # (the forced tokens first, none of the planner's counts; the context's drafts after them)
+                    m, mtp = 0, False
+                    if ctx is not None and k > len(f):
+                        ctx.extend(f)
+                        m, more = ctx.draft(k - len(f))
+                        ctx.n -= len(f)
+                        j = plan.choose(m, len(more), drafter=False) if more else 0
+                        more = more[:j or 0]
+                        if more and valid is not None:
+                            more = more[:valid(f + more) - len(f)]
+                    d = f + more
+                else:
+                    m, d = ctx.draft(k) if ctx is not None else (0, [])
+                    j = plan.choose(m, len(d), drafter=self._drafting and k > 0)
+                    mtp = j is None
+                    d = self._mtp(token, k, penalties) if mtp else d[:j]
+                    if valid is not None and d:
+                        d = d[:valid(d)]
                 sib = self._sibling() if mtp else None
                 p = self.position
+                if ahead is not None:
+                    ahead(d)
                 t1, w1 = time.perf_counter(), _native.turn_waited()
                 raw = self._verify([*self.carry, token, *d], mtp)
                 t2, w2 = time.perf_counter(), _native.turn_waited()
@@ -224,7 +248,15 @@ class SpeculativeMixin:
                 once = self.overlay.once_s
                 plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - once)
                 self.accepted += len(new) - 1
-                if mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
+                if f:
+                    kept = len(new) - 1
+                    self.forced += min(kept, len(f))
+                    self.drafted += len(d)
+                    if more:
+                        plan.accepted(m, len(more), max(kept - len(f), 0))
+                        self.drafted_ctx += len(more)
+                        self.accepted_ctx += max(kept - len(f), 0)
+                elif mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
                     plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
                     self._calibrate(len(new) - 1)
                 elif d:

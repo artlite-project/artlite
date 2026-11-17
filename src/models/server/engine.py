@@ -21,6 +21,7 @@ from ..model import Model
 from ..npu_model import NpuModel
 from ..sampling import argmax
 from ..sequence import Sequence
+from . import answers
 from .cache import PromptCache, common_prefix
 from .generation import Generation
 from .jobs import Call, Cancelled, Failed, Job
@@ -196,6 +197,37 @@ class Engine:
         if whole is None or rest is None or head is None:
             return 0
         return p if head + rest < 0.9 * whole else 0
+
+    def answers(self, ids: list[int] | Sequence, texts: list[bytes], *, cache_prompt: bool = True,
+                name: str = "decision") -> concurrent.futures.Future:
+        """The log-probabilities of a prompt's answers (``texts``: each answer's bytes, ``server.answers.score``), on the
+        worker after the queued jobs: the prompt through the prompt cache, the answers scored from its end."""
+        return self.run(lambda: self._answers(ids, texts, cache_prompt, name))
+
+    def _answers(self, ids: list[int] | Sequence, texts: list[bytes], cache_prompt: bool, name: str) -> list[float]:
+        npu, cache = self.npu, self.cache
+        t0 = time.perf_counter()
+        v = self.vocab()
+        # (the answers' common text with the prompt, as its tokens but the last, which may merge with what follows)
+        common = next((i for i in range(min(map(len, texts))) if len({t[i] for t in texts}) > 1), min(map(len, texts)))
+        lead = self.model.tokenizer.encode_plain(texts[0][:common].decode("utf-8", "ignore"))[:-1]
+        cut = len(b"".join(v.pieces[t] for t in lead))
+        ids, texts = ids + lead, [t[cut:] for t in texts]
+        try:
+            self.begin()
+            k, last, _ = cache.prepare(ids, enabled=cache_prompt)
+            logits = last if last is not None else npu.forward(ids[k:])
+            cache.checkpoint(ids, logits)
+            d0 = npu.dispatches
+            out = answers.score(npu, logits, texts, v)
+            steps = npu.dispatches - d0
+            cache.ran(ids)
+        except Exception:  # (the device's state is unknown: the caches start over)
+            self.recover()
+            raise
+        log.info(f"{name}: {len(texts)} answers after {len(ids)} tokens ({k} cached), {steps} steps, in "
+                 f"{time.perf_counter() - t0:.3f} s")
+        return out
 
     def vocab(self) -> structured.Vocab:
         """The model's tokens for structured output (``structured.vocab``: built once, in the background after the
