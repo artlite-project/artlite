@@ -78,6 +78,7 @@ MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32}  # (moe_in's blocks: ``deco
 CHAIN = 2  # columns per KV head
 KV_PAD = 8192  # positions past the caches (the last layer's): the prefill's slices of a cache
 KINDS = ("swa", "full")  # the cache kinds: token object t = SLOTS kind + a, of the sub-step from slot a on
+FORMATS = frozenset({"Q4_1_64", "BFP16"})  # the tile formats the overlay runs (the official file's and its router's)
 
 
 class FlintOverlay(AttentionOverlay):
@@ -100,6 +101,11 @@ class FlintOverlay(AttentionOverlay):
         missing = sorted(f for f in fmts if not gemv.supported(f, img.nsb))
         if missing:
             raise NotImplementedError(f"{', '.join(missing)} tiles: the decode GEMV has no kernels for them")
+        other = sorted(fmts - FORMATS)
+        if other:  # (unsloth's UD-Q4_K_XL: a layer step on its Q8_0 tiles of 8 rows does not end; its 6 formats need the
+            # main cores' kernels as pages beside the attention cores' own)
+            raise NotImplementedError(f"{gguf.path}: {', '.join(other)} tiles: Flint runs the official int4 file "
+                                      f"(model_config.flint_gguf(); its Q4_1 pairs as Q4_1_64), not yet other files")
         self.hd, self.nh = cfg.head_dim, cfg.q_per_kv
         self.q_heads = self.nh
         self.at = at = Attn(hds=(self.hd,), rot=(cfg.rot("swa"), cfg.rot("full")), chain=CHAIN, heads=self.nh,

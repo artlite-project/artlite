@@ -14,7 +14,8 @@ $ARTLITE_MODELS_DIR/RecursiveSI/flint-int4-gguf/       RecursiveSI/flint-int4-gg
                                                         stored as pairs of Q4_1 blocks; F32 router, norms, sinks)
 ```
 
-The models directory: [Installation](../install.md#models-directory).
+Other Flint files (unsloth's UD-Q4_K_XL, lmstudio-community's Q4_K_M: other tile formats) are refused for now. The
+models directory: [Installation](../install.md#models-directory).
 
 ## Thinking and tools
 

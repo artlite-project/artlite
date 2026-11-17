@@ -52,9 +52,12 @@ def q41(t: QTensor) -> Q41:
                f["m"].astype(np.float32))
 
 
-def q41_slice(g: GGUFFile, name: str, lo: int, hi: int) -> Q41:
-    """Rows lo .. hi of a Q4_1 tensor's (rows x K) view (an expert of a 3-D tensor: its F or H rows)."""
+def q41_slice(g: GGUFFile, name: str, lo: int, hi: int) -> Q41 | np.ndarray:
+    """Rows lo .. hi of a tensor's (rows x K) view (an expert of a 3-D tensor: its F or H rows): ``Q41`` for Q4_1, else
+    fp32 (another file's formats)."""
     t = g.tensor(name)
+    if t.qtype != "Q4_1":
+        return f32(g.rows(name, np.arange(lo, hi)))
     return q41(QTensor(name=name, qtype=t.qtype, rows=hi - lo, cols=t.cols, raw=np.asarray(t.raw[lo:hi])))
 
 
@@ -217,6 +220,9 @@ def head_logits(g: GGUFFile, cfg: FlintConfig, h: np.ndarray, rows: np.ndarray |
     logits = np.empty((h.shape[0], len(idx)), np.float32)
     for lo in range(0, len(idx), step):
         sel = idx[lo:lo + step]
+        if out.qtype != "Q4_1":
+            logits[:, lo:lo + len(sel)] = mm(hn, f32(g.rows(out.name, sel)), q8=q8)
+            continue
         raw = np.ascontiguousarray(out.raw[sel])
         logits[:, lo:lo + len(sel)] = mm(hn, q41(QTensor(name=out.name, qtype="Q4_1", rows=len(sel), cols=out.cols,
                                                          raw=raw)), q8=q8)
