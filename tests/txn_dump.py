@@ -444,7 +444,7 @@ def _qwen_dflash(ov: object, drafter: object, log: _Log, rng: np.random.Generato
     a block alone, rings wrapping past their window."""
     from types import SimpleNamespace
 
-    from models.qwen35.drafting import DFlashDrafting, Injection
+    from models.dflash import DFlashDrafting, Injection
 
     H = ov.H
     for rnd in range(2):

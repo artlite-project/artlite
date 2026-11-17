@@ -48,6 +48,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
+from ..dflash import DFlashDrafting
 from ..minicpmv import host as minicpmv_host
 from ..minicpmv import npu as minicpmv_npu
 from ..model import Model
@@ -61,7 +62,7 @@ from ..sequence import Sequence, token_ids
 from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
-from .drafting import DFlashDrafting, MtpDrafting
+from .drafting import MtpDrafting
 from .image import QwenImage
 from .overlay import QwenOverlay, slots_of
 from .prefill import QwenPrefill
@@ -278,6 +279,11 @@ class NpuQwen(OverlayModel):
         """The drafter's rows of the model's last step, while its taps are in place."""
         if self.flash is not None:
             self.flash.inject()
+
+    def _dflash_ahead(self, S: int, p: int) -> None:
+        """(``models.dflash``: the step's M-RoPE rows first, text positions from ``rope_next``)"""
+        self.overlay.rope[p:p + S] = self.rope_next + np.arange(S)[:, None]
+        self.overlay.patch_ahead(S, p)
 
     def _drop_carry(self) -> None:
         """(the pending injection without the sibling branch's rows)"""

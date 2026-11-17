@@ -20,6 +20,8 @@ from .protocol import C_LEN
 
 HEAD_ROWS = 65536  # a drafter head's fixed rows: the special tokens and the first ids of the vocabulary
 TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``HeadTable.see``), 64 per column
+DFLASH_HEAD_ROWS = 80000  # a DFlash2 drafter's: one pass a round, so 1.3 ms for the rare tokens that end a chain of
+# drafts (code, JSON)
 
 
 def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:

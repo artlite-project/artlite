@@ -48,7 +48,7 @@ speeds go to stderr.
 | `-s SEED`, `--seed` | sampling seed (default 1608560892) |
 | `--no-prefill` | run the prompt as decode steps |
 | `--no-lookup` | no draft tokens from the prompt, below |
-| `--spec-type auto\|none\|draft-mtp\|draft-dflash\|draft-dspark` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10)), `draft-dspark` a DSpark block drafter (Spark-X2.6); one asked for that the model does not have is an error |
+| `--spec-type auto\|none\|draft-mtp\|draft-dflash\|draft-dspark` | the model's drafter, below (llama-server's names): `auto` (default) the one found by its file name, `none` no drafter (its file is not loaded, Qwen3.8 27B's MTP layer is left out of the weights), `draft-mtp` an MTP drafter, `draft-dflash` a DFlash2 block drafter (Qwen3.8 27B: [qwen35](models/qwen35.md#multi-token-prediction-qwen38-27b-qwen36-35b-a3b-occamy-10); Flint: [flint](models/flint.md#drafting)), `draft-dspark` a DSpark block drafter (Spark-X2.6); one asked for that the model does not have is an error |
 | `-md FILE`, `--spec-draft-model` | the drafter's GGUF file in place of the one found by name (an MTP or a DFlash2 drafter, by its architecture) |
 | `--spec-draft-n-max N` | draft tokens per step at most, from the prompt or the drafter (default and at most: the step's slots - 1, 3 or Qwen3.8 27B's 7; 0: steps of one token, no drafter loaded) |
 | `--kv-k single`, `--kv-k hilo` | the KV cache's K precision (Llama, Qwen3, Gemma 4, LFM3), below |
@@ -80,7 +80,7 @@ Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and 
 fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
 far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
 model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's DFlash2 file, else its own MTP layer,
-Qwen3.6 35B-A3B's and Occamy's `mtp` files); each step takes the ones that pay at the model's measured step times, none where
+Flint's DFlash2 file, Qwen3.6 35B-A3B's and Occamy's `mtp` files); each step takes the ones that pay at the model's measured step times, none where
 nothing does. A draft is kept only where the model's own
 token at its position is that draft, so the text is the one without drafts (greedy: the same tokens, except at near
 ties on Qwen3.6 35B-A3B and Occamy, whose steps of several tokens sum their experts in another order). The summary on

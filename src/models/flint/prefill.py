@@ -40,12 +40,15 @@ from types import SimpleNamespace
 import numpy as np
 from ml_dtypes import bfloat16
 
+from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.moe.prefill import MoEPrefill
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
 from artlite.prefill import attn as PA
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
+from artlite.prefill.dflash import DFlashPrefill
+from artlite.prefill.drafter import DrafterPrefill
 from artlite.prefill.norm import PrefillNormOperator
 
 from .overlay import KINDS, KV_PAD, FlintOverlay
@@ -63,11 +66,14 @@ PHASES = {"dense": ("qkv", "o", "gate_up", "down"), "moe": ("qkv", "o")}  # (the
 # a flash attention pass streams; an MoE layer's experts per byte of their weights and of their rows
 CFG_S, WEIGHT_S, RECORD_S = 0.111e-3, 3.69e-11, 0.346e-6
 MOE_WEIGHT_S, MOE_ROW_S = 1 / 38e9, 1 / 38e9
+# a drafter's records (``DrafterPrefill.seconds``): a GEMM item, a norm per hidden unit, the prep per q head (qwen35's fits)
+GEMM_S, NORM_S, PREP_S = 0.056e-3, 43e-9, 17e-6
 
 
 class FlintPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches);
-    ``run`` runs one. ``qp``: the attention's Q as single (1, the default) or hi + lo panels (2); ``precise``: its P as
+    ``run`` runs one; ``dflash``: a DFlash2 drafter whose rows of the prompt a chunk writes (``prefill.dflash``). ``qp``:
+    the attention's Q as single (1, the default) or hi + lo panels (2); ``precise``: its P as
     hi + lo panels (``prefill.attn.Shape``'s ``qp``, ``pp``). Single Q and P: their hi + lo changed the next-token NLL
     after the prompt by nothing measurable (six 1K prompts, two of 32K: within an MoE model's noise; Flint's q / k norm
     weights reach 7.5, Qwen3's ~100) and cost the full layers' attention 1.2x at 30K; K follows the caches' ``kv_k``."""
@@ -76,7 +82,8 @@ class FlintPrefill(ChunkPrefill):
     SHARED_KV_RANGE = True  # (the attention's P_FO: one range for every size)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
-    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, qp: int = 1, precise: bool = False):
+    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, qp: int = 1, precise: bool = False,
+                 dflash: DFlashOverlay | None = None):
         ov = overlay
         s = PA.Shape(ov.hd, ov.nh // 2, ov.kp, ov.T, qp, 2 if precise else 1, per=2, sink=True)
         pq = 32 * s.blocks[0]  # (the flash attention's queries per pass: 64 passes a chunk at most)
@@ -103,6 +110,7 @@ class FlintPrefill(ChunkPrefill):
         self._k_parts: dict[tuple, int] = {}  # (per region shape and size: output projections in resident K parts)
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
         self.plans = self.sz[SUB].plans if SUB in self.sz else self.sz[max(self.sz)].plans
+        self.drafters: list[DrafterPrefill] = [DFlashPrefill(dflash, self)] if dflash is not None else []
         self.attn = {(k, T): self._attn(k, T) for k in kinds for T in self.sizes if T <= ATTN_T}
         # (a larger chunk's parts: part 0 the ATTN_T design, the others with parameters of their own)
         self.parts = {(k, j): self.attn[(k, ATTN_T)] if j == 0 and (k, ATTN_T) in self.attn else self._attn(k, ATTN_T, j)
@@ -196,6 +204,8 @@ class FlintPrefill(ChunkPrefill):
             self.rb["HP"] = 9 * self.img.region(dense[0], "down").K // 8
         if self.moe:
             self.rb |= self.moe.rows()
+        for d in self.drafters:
+            self.rb |= d.rows()
         self.np_off = {"in": 0}
         k = 1
         for L in self.layers:
@@ -229,9 +239,13 @@ class FlintPrefill(ChunkPrefill):
         ry, fp = o.rb_y, o.f_part
         rl: list[tuple] = [(o.pn0, tok("PX", j, o.pn0, i=0), self._np("in"), tok("PXN", j, o.pn0, i=2))
                            for j in range(S)]
+        for d in self.drafters:
+            rl += d.start_items(T, tok)
         starts, marks = [], []
         for i, L in enumerate(self.layers):
             starts.append(len(rl))
+            for d in self.drafters:  # (PX: the layer's input)
+                rl += d.tap_items(L, T, tok)
             kind = cfg.kinds[L]
             p_in = o.plans[(L, "qkv")]
             rg = 2 * COLS * p_in.layout.pitch
@@ -280,6 +294,8 @@ class FlintPrefill(ChunkPrefill):
                         sl("F", (P * j + g.part) * fp, g.op, i=2)) for g in down.gemms for j in range(S)]
                 rl += [(pn, tok("PX", j, pn, i=0), sl("F", P * j * fp, pn, i=1), nxt, tok("PX", j, pn, i=3),
                         tok("PXN", j, pn, i=4)) for j in range(S)]
+        for d in self.drafters:
+            rl += d.end_items(T, tok, lambda b, off, op, i: sl(b, off, op, i=i))
         self._starts[T] = [*starts, len(rl)]
         self._moe_marks[T] = marks
         return rl
@@ -293,8 +309,15 @@ class FlintPrefill(ChunkPrefill):
             if name in own:
                 own[name] = max(own[name], (self.sizes[-1] + 64) * r)
 
+    def _external(self) -> set[str]:
+        return set().union(*(d.external() for d in self.drafters))
+
+    def _buffers(self) -> dict[str, object]:
+        return self.ov.dev.buffers | {k: v for d in self.drafters for k, v in d.buffers().items()}
+
     def _bind(self) -> None:
-        """The norms' weights (NP), the q / k norms' weights (NW), the sinks (SK), the cos / sin tables (CSS, CSF)."""
+        """The norms' weights (NP), the q / k norms' weights (NW), the sinks (SK), the cos / sin tables (CSS, CSF); the
+        drafters' static buffers."""
         ov, dev, H = self.ov, self.ov.dev, self.H
 
         def vec(name: str) -> np.ndarray:
@@ -329,6 +352,8 @@ class FlintPrefill(ChunkPrefill):
             cs = PA.cs_table(inv, self.cs_rows).view(np.uint8).reshape(-1)
             dev.view(name)[:cs.size] = cs
             dev.flush(name)
+        for d in self.drafters:
+            d.static(dev, ov)
 
     # ------------------------------------------------------------------
     # Run
@@ -337,6 +362,8 @@ class FlintPrefill(ChunkPrefill):
     def params(self, T: int, p0: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk of size T at position p0."""
         out = self.moe.params(T) if self.moe else {}
+        for d in self.drafters:
+            out |= d.params(T, p0)
         for (k, _, pt), prep in self.sz[self._t(T)].preps.items():
             if pt == self._pt(T):
                 out |= prep.params(p0)
@@ -351,12 +378,16 @@ class FlintPrefill(ChunkPrefill):
         n, dev = x.shape[0], self.ov.dev
         T = self._size(n, p0, T)
         self._stage_px(x, T, bfloat16)
+        for d in self.drafters:
+            d.before(dev, p0, T)
         hooks = {}
         for L, (_, i_e, i_g) in self._moe_marks.get(T, ()):
             hooks[i_e] = functools.partial(self.moe.host_route, L, n=n, T=T, dev=dev, lib=self.lib)
             hooks[i_g] = functools.partial(self.moe.host_streams, L, n=n, T=T, dev=dev, lib=self.lib)
         self._launch(T, p0, self.params(T, p0), hooks or None)
         dev.stale = True  # (the chunk's configurations replaced the attention cores' code pages)
+        for d in self.drafters:
+            d.after(dev, p0, n, T)
 
     def _splits(self, T: int, p0: int, budget: float = PIECE_BUDGET_S) -> list[int]:
         """(an MoE layer: pieces from its shared expert and from its experts on: ``moe``)"""
@@ -396,6 +427,9 @@ class FlintPrefill(ChunkPrefill):
         if self.cfg.moe_layer(L):
             s += S * WEIGHT_S * sum(self.img.region(L, n).nbytes for n in ("moe_in", "sdown"))
             s += self.moe.layer_seconds(L, max(round(S * SUB), 1), weight_s=MOE_WEIGHT_S, row_s=MOE_ROW_S)
+        if L == self.layers[-1]:  # (the drafters' records after the last layer)
+            for d in self.drafters:
+                s += d.seconds(S, weight_s=WEIGHT_S, gemm_s=GEMM_S, norm_s=NORM_S, prep_s=PREP_S, cfg_s=CFG_S)
         return s
 
     def layer_configs(self, L: int) -> int:

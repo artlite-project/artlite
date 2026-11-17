@@ -89,7 +89,8 @@ class AttnOperator(ArtcOperator):
         its memtile to the cores of both columns (each taking its column's Q units and gates of both), else each column
         reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring);
         ``part``: the item's place in a larger chunk whose attention runs as items of T tokens, each at its own position
-        (its scratchpad parameters named with the suffix ``_<part>``; the cache holds the whole chunk's records before the
+        (its cores read the chunk's P_P8 and P_FQ plus the part's offsets, its fills' parameters are named with the suffix
+        ``_<part>``: a library's runtime sequence reads 32 at most; the cache holds the whole chunk's records before the
         first item: ``PrepOperator``)."""
         s = shape
         self.qb, self.cr = s.blocks
@@ -113,8 +114,16 @@ class AttnOperator(ArtcOperator):
         super().__init__()
 
     def _pn(self, name: str) -> str:
-        """A scratchpad parameter's name in this design (``part``)."""
-        return f"{name}_{self.part}" if self.part else name
+        """A scratchpad parameter's name in this design (``part``: its fills' own; the cores' the chunk's)."""
+        return f"{name}_{self.part}" if self.part and name in (P_FG, P_FO, P_SW) else name
+
+    def _offset(self, value: object, name: str) -> object:
+        """A core's read of the chunk's P_P8 / P_FQ as this part's (``part``: its queries T part positions on)."""
+        if not self.part:
+            return value
+        s = self.shape
+        k = self.part * self.T // 8 if name == P_P8 else self.part * (self.T // s.pg) * s.rg // self.cr
+        return plus_i32(value, k)
 
     @property
     def win(self) -> int:
@@ -251,7 +260,8 @@ class AttnOperator(ArtcOperator):
     def params(self, p0: int, lead: int = 0) -> dict[str, int]:
         """The scratchpad parameters of a chunk at p0 (packed: ``lead``, its first keys every row sees: 0 or a cache
         group, a prompt every segment continues; its rows a segment of their own)."""
-        return {self._pn(k): v for k, v in self._params(p0, lead).items()}
+        out = self._params(p0, lead)  # (a part: its fills' parameters; the cores read the chunk's)
+        return {self._pn(k): v for k, v in out.items() if not self.part or self._pn(k) != k}
 
     def _params(self, p0: int, lead: int) -> dict[str, int]:
         s = self.shape
@@ -350,11 +360,12 @@ class AttnOperator(ArtcOperator):
             elif self.nc:
                 init(ws, wo, p8.read(), bg, bb, hk.read())
             else:
-                init(ws, wo, p8.read(), bg, bb)
+                init(ws, wo, self._offset(p8.read(), P_P8), bg, bb)
             if self.swa:  # (the window's groups and the pass's)
                 n = gq * (self.wg + 1)
             else:
-                n = fq.read()  # (read after this dispatch's first object: the host wrote it before the fills)
+                # (read after this dispatch's first object: the host wrote it before the fills)
+                n = self._offset(fq.read(), P_FQ)
             if self.swa or self.nc:  # (non-causal: the prompt's groups, every pass)
                 pass
             elif self.ring:

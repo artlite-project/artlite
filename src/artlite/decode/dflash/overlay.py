@@ -84,6 +84,8 @@ from .core import (
     M_INJ,
     M_KEEP,
     M_POS,
+    MAX_CHUNK,
+    MAX_PADDING,
     ND,
     NE_BLOCK,
     NE_INJ,
@@ -157,13 +159,14 @@ class DFlashTarget(Protocol):
 
 
 class DFlashOverlay(ModelOverlay):
-    """The drafter ``gguf`` of the model on overlay ``target`` (``DFlashTarget``). ``load`` after the target's (its device,
-    weight and activation buffers); ``step`` runs a dispatch."""
+    """The drafter ``gguf`` of the model on overlay ``target`` (``DFlashTarget``; ``max_chunk``, ``max_padding``: its
+    prefill's chunks and their padding rows at most, ``DFlashShape``). ``load`` after the target's (its device, weight
+    and activation buffers); ``step`` runs a dispatch."""
 
     CONFIG = DFlashConfig
     IMAGE = DFlashImage
 
-    def __init__(self, target: DFlashTarget, gguf: GGUFFile):
+    def __init__(self, target: DFlashTarget, gguf: GGUFFile, *, max_chunk: int = MAX_CHUNK, max_padding: int = MAX_PADDING):
         self.target = target
         self.cfg = cfg = DFlashConfig.from_gguf(gguf)
         tc = target.cfg
@@ -174,7 +177,7 @@ class DFlashOverlay(ModelOverlay):
         if view is None or target.SLOTS > SLOTS_OF or not target.op.packed:
             raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of packed steps of at most {SLOTS_OF} tokens and "
                              f"a drafter head, not {target.gguf.path}")
-        self.shape = DFlashShape(cfg, a_bytes=target.T)
+        self.shape = DFlashShape(cfg, a_bytes=target.T, max_chunk=max_chunk, max_padding=max_padding)
         self.image = DFlashImage(gguf, cfg, kc=target.image.kc, payload=target.image.payload, tile_bytes=target.T)
         self.table = HeadTable(view, tc.vocab_size, lambda: target.dev)
         self.head = view.region(-1, "lm")
@@ -493,9 +496,8 @@ class DFlashOverlay(ModelOverlay):
                 seq.fill("X", c, dev.address("ACT", self.fatt), 2 * XB)
                 seq.fill("X", c, dev.address("ACT", self.norms + L * XB), XB)
                 seq.fill("X", c, dev.address("ACT", self._q(L, c)), S * XB)
-            rg = self.inp[(L, "aout")][0]
-            for c in range(COLS):  # o: the column's heads in aout's x
-                seq.drain("C", c, dev.address("ACT", rg.off + XB + 2 * S * QC * HD * c), 2 * S * QC * HD)
+            for c in range(COLS):  # o: the column's heads in aout's x (its K groups: Flint's two of 2048)
+                self._values_to(seq, c, (L, "aout"), e0=QC * HD * c, n=QC * HD, S=S, whole=True)
             self._phase_in(seq, (L, "aout"))
             self._y_drains(seq, L, 0)
             self._conv_out(seq, L, 0, (L, "fin"))

@@ -39,7 +39,7 @@ from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
 from artlite import txn
-from artlite.decode.dflash.core import HD, MAX_CHUNK, MAX_PADDING, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
+from artlite.decode.dflash.core import HD, ND, PAIR, POS_PER_GROUP, REC_K, ROWS_B
 from artlite.decode.dflash.host import angles
 from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.operators import templating
@@ -186,11 +186,11 @@ class DFlashPrefill(DrafterPrefill):
         shape, sizes = self.d.shape, self.pf.sizes
         if sizes[-1] // POS_PER_GROUP > shape.over:
             raise txn.HardwareLimitError(f"a chunk of {sizes[-1]} tokens writes {sizes[-1] // POS_PER_GROUP} cache objects past the "
-                                     f"DFlash2 ring, which holds {shape.over} (decode.dflash.core.MAX_CHUNK {MAX_CHUNK})")
+                                     f"DFlash2 ring, which holds {shape.over} (DFlashShape's max_chunk {shape.max_chunk})")
         gap = max(b - a for a, b in itertools.pairwise((0, *sizes)))
-        if gap > MAX_PADDING:
+        if gap > shape.max_padding:
             raise txn.HardwareLimitError(f"chunk sizes {sizes} leave up to {gap} padding rows, the DFlash2 ring keeps "
-                                     f"{MAX_PADDING} out of its window (decode.dflash.core.MAX_PADDING)")
+                                     f"{shape.max_padding} out of its window (DFlashShape's max_padding)")
 
     def _ops(self, t: int) -> SimpleNamespace:
         d, H = self.d, self.H

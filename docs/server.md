@@ -447,8 +447,9 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
 - **Models.** Each GGUF file of the directory that Artlite runs, named `<account>/<repository>:<quantization>`
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
-  says why. Drafters (`mtp-`, `<name>-mtp-`, z-lab's `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
+  says why. Drafters (`mtp-`, `<name>-mtp-`, the `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
   qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
+  Flint: its DFlash2 repository's;
   a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
   that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
   before the 4x one; LFM3-Audio-2B: its speech encoder, `/v1/models` lists the model's `audio` input).

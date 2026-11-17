@@ -46,7 +46,16 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 import numpy as np
 
 from artlite.decode.attn256 import OBJ_BYTES
-from artlite.decode.head import HEAD_ROWS, TABLE_ROWS, draft_cols, head_region, head_rows, head_tokens, lm_order
+from artlite.decode.head import (
+    DFLASH_HEAD_ROWS,
+    HEAD_ROWS,
+    TABLE_ROWS,
+    draft_cols,
+    head_region,
+    head_rows,
+    head_tokens,
+    lm_order,
+)
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
@@ -59,7 +68,6 @@ from artlite.operators.design import COLS
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
-DFLASH_HEAD_ROWS = 80000  # a DFlash2 drafter's: one pass a round, so 1.3 ms for the rare tokens that end a chain of drafts (code, JSON)
 
 
 def payload(hidden: int, moe: bool = False) -> int:

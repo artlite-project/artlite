@@ -125,9 +125,9 @@ class AttentionOverlay(ModelOverlay):
     OPS: ClassVar[tuple[str, ...]] = ("att",)  # the phases of the operator cores (the others are GEMV phases)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, kv_k: str,
-                 weights: WeightBuffer | None):
+                 weights: WeightBuffer | None, image: object = None):
         self.kp = kv.kv_precision(kv_k)
-        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights)
+        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         self.G = self.kp + 1  # (cache objects per group)
         self.at: Attn
         self.kinds: tuple[CacheKind, ...]

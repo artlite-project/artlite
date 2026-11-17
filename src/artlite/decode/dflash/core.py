@@ -57,8 +57,9 @@ HD, QC, QH = 128, 4, 8 * 128  # (a head's dims, the query heads per column, the 
 ND = HD // 8
 REC = Records(HD, 1)
 REC_K, REC_V, ROWS_B = REC.k_bytes, REC.v_bytes, REC.rows_bytes
-MAX_CHUNK = 2048  # a prefill chunk's positions at most
-MAX_PADDING = 256  # a prefill chunk's padding rows at most (they write records too: over the ring's oldest slots, not the window's)
+MAX_CHUNK = 2048  # a prefill chunk's positions at most (the default: ``DFlashShape``'s)
+MAX_PADDING = 256  # a prefill chunk's padding rows at most (they write records too: over the ring's oldest slots, not the
+# window's; the default)
 OPEN_BYTES = 4 * ROWS_B  # the open object's rows
 PAIR = 2 * REC_K  # a pair of records
 PO = 288  # an octet's P panels of 4 records
@@ -102,9 +103,11 @@ class DFlashShape:
     ``h8`` channels a column, ``xk`` k blocks of them, ``groups`` conv groups, ``dyn_rows`` dyn's rows per slot: whole C
     objects of its 4 groups; ``ne``, ``y_objs``, ``nobj_r``: D objects of a column's x, X objects of its y and of its res),
     the conv and attention workspaces, the ring of groups a window spans; ``a_bytes``: the objects' size (the model's tile
-    size: the drafter's head reads the model's LM tiles)."""
+    size: the drafter's head reads the model's LM tiles); ``max_chunk``, ``max_padding``: the model's prefill chunks' and
+    their padding rows' at most (the ring's room: Flint's chunks of up to 8192 tokens and 2048 of padding)."""
 
-    def __init__(self, cfg: DFlashConfig, *, a_bytes: int = OBJ_BYTES):
+    def __init__(self, cfg: DFlashConfig, *, a_bytes: int = OBJ_BYTES, max_chunk: int = MAX_CHUNK,
+                 max_padding: int = MAX_PADDING):
         assert cfg.head_dim == HD and cfg.kv_heads == COLS and cfg.heads == QC * COLS and cfg.hidden % (COLS * 32) == 0
         assert cfg.block == 8 and cfg.conv_kernel == 2 and cfg.conv_group == 16, cfg
         self.h8 = cfg.hidden // COLS
@@ -118,8 +121,9 @@ class DFlashShape:
         self.cfg, self.a_bytes = cfg, a_bytes
         self.window = cfg.window
         # (objects: a window's closed records in distinct ones, what a chunk's padding rows overwrite past them)
-        self.ring = -(-(cfg.window + 8 + MAX_PADDING) // POS_PER_GROUP) + 1
-        self.over = MAX_CHUNK // POS_PER_GROUP  # (objects past the ring that a prefill chunk's writes reach)
+        self.max_chunk, self.max_padding = max_chunk, max_padding
+        self.ring = -(-(cfg.window + 8 + max_padding) // POS_PER_GROUP) + 1
+        self.over = max_chunk // POS_PER_GROUP  # (objects past the ring that a prefill chunk's writes reach)
         self.sets = 2 * QC
         self.eps = cfg.rms_norm_eps
 

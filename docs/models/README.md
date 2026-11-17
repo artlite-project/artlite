@@ -35,6 +35,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |
 | dspark | 🤔 Ternary Bonsai 27B's drafter | | prism-ml Q4_1; vision |
 | dflash | ✅ Qwen3.8 27B's DFlash2 drafter | z-lab Q4_K_M | |
+| | ✅ Flint's DFlash2 drafter | incoai Q4_K_M | |
 | | ✅ Spark-X2.6 4B's and 1.7B's DSpark drafters | XHToken BF16 | |
 | | 🤔 MiniCPM-V 4.7 1B's DSpark drafter | | openbmb F16, Q4_K_M |
 | qwen3 | ✅ Qwen3 0.6B | unsloth Q4_1 | |
@@ -50,5 +51,5 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ d1-Omni-2B (decision model: [`/v1/systemone`](../server.md#decisions); audio clips, spoken questions) | LiquidAI Q8_0, its mmproj Q8_0 | |
 | spark2_5 | ✅ Spark-X2.6 4B | XHToken Q4_K_M, Q8_0, with its DSpark drafter; bartowski Q4_K_M, Q4_0 | Spark-X2.5 4B |
 | | ✅ Spark-X2.6 1.7B | XHToken Q4_K_M, Q8_0, with its DSpark drafter | |
-| flint | ✅ Flint (40B MoE, ~2.5B active) | RecursiveSI int4 (Q4_1 pairs, packed as Q4_1_64) | its DFlash2 drafter (incoai); unsloth UD-Q4_K_XL; the sliding-window layers' caches as rings |
+| flint | ✅ Flint (40B MoE, ~2.5B active) | RecursiveSI int4 (Q4_1 pairs, packed as Q4_1_64), with incoai's DFlash2 drafter (Q4_K_M) | unsloth UD-Q4_K_XL; the sliding-window layers' caches as rings |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |

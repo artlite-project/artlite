@@ -12,6 +12,8 @@ top-k 20).
 $ARTLITE_MODELS_DIR/RecursiveSI/flint-int4-gguf/       RecursiveSI/flint-int4-gguf
     flint-int4-q4_1.gguf                               (the official file: the model's own INT4 codes in groups of 64,
                                                         stored as pairs of Q4_1 blocks; F32 router, norms, sinks)
+$ARTLITE_MODELS_DIR/incoai/Flint-DFlash2-GGUF/         incoai/Flint-DFlash2-GGUF
+    Flint-DFlash2-Q4_K_M.gguf                          (its DFlash2 drafter, optional, the default where it is here)
 ```
 
 Other Flint files (unsloth's UD-Q4_K_XL, lmstudio-community's Q4_K_M: other tile formats) are refused for now. The
@@ -45,6 +47,17 @@ size: 22.26 GB (each pair of Q4_1 blocks shares one scale and offset: 144 bytes 
 no weight changed); nothing is written to disk. A decode step streams 0.97 GB of dense weights and the 6 experts of
 each MoE layer, 1.46 GB in all. The KV caches take 84.7 KB per position (K as hi + lo blocks; the sliding-window layers'
 caches grow with the positions): 2.8 GB at 32K; 24.3 GB of RAM at a 4K context.
+
+## Drafting
+
+Generation drafts with incoai's DFlash2 block drafter where its file is in the models directory (`--spec-type none`:
+without it; `artlite/decode/dflash/`). One dispatch of the drafter's own design, in a hardware context of its own,
+guesses a block of tokens after the next one from the model's rows at five layers of its last step (the drafter's
+taps); the model's next step checks the first 3 of them with the token (steps of up to 4 slots) and keeps the ones it
+agrees with, so the text is the one the model writes alone. The drafter's head is the first 33280 rows of the model's
+LM head, laid out for it at load (the head's rows reordered, no weight copied). Each slot of a step routes its own
+experts (~+33% of a one-token step), so drafts pay where the text is predictable: the generation runs the drafter's
+rounds while their measured tokens per second beat steps of one token, and steps of one where they do not.
 
 ## Speed and accuracy (Strix Halo)
 

@@ -282,6 +282,18 @@ FLINT_FILES = {"int4": "RecursiveSI/flint-int4-gguf/flint-int4-q4_1.gguf",
                "Q4_K_M": "lmstudio-community/flint-GGUF/flint-Q4_K_M.gguf"}
 
 
+def flint_dflash_of(model: str) -> str | None:
+    """The DFlash2 drafter (GGUF architecture ``dflash``) of a Flint model file: the Q4_K_M file of a repository
+    ``Flint-DFlash2-GGUF`` of any organization of the model's models directory (incoai's), or None."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(model))))
+    for org in sorted(os.listdir(root)) if os.path.isdir(root) else ():
+        x = os.path.join(root, org, "Flint-DFlash2-GGUF")
+        files = sorted(f for f in os.listdir(x) if f.endswith("-Q4_K_M.gguf")) if os.path.isdir(x) else []
+        if files:
+            return os.path.join(x, files[0])
+    return None
+
+
 def flint_gguf(quant: str = "int4") -> str:
     """A Flint file: ``quant`` "int4" (Recursive's official file: the model's trained INT4 codes, MLX's groups of 64
     stored as Q4_1 block pairs), or a community quantization ("UD-Q4_K_XL": unsloth's, "Q4_K_M": lmstudio's)."""

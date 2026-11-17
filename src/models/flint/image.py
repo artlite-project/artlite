@@ -24,6 +24,7 @@ experts' partials, ``decode.design``'s "MoE").
 
 import numpy as np
 
+from artlite.decode.head import TABLE_ROWS, draft_cols, head_rows, head_tokens, lm_order
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
 from artlite.decode.protocol import C_LEN
 from artlite.formats import FORMATS, q4
@@ -33,6 +34,8 @@ from artlite.moe.image import MoeImage
 from artlite.operators.design import COLS
 
 KC = 1024  # K chunk of a tile
+HEAD_SIZE = 32768  # the DFlash2 drafter's head's fixed rows (``decode.head``): its drafts as many and as often kept as with 80000
+# (code, math on the Flint-DFlash2 Q4_K_M), its round's reads 56 MB fewer (+2% decode on code)
 NORMS = {"qkv": "attn_norm", "gate_up": "ffn_norm", "moe_in": "ffn_norm"}  # a layer's normed phases: their RMSNorm
 
 
@@ -50,10 +53,15 @@ def qkv_rows(cfg: FlintConfig) -> dict[str, np.ndarray]:
 
 class FlintImage(MoeImage, NormedImage):
     """The weight image of a Flint GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
-    padded vocabulary; tile_bytes: the object size, default BFP16's: the router's planes)."""
+    padded vocabulary; tile_bytes: the object size, default BFP16's: the router's planes; head: the LM rows laid out
+    with a DFlash2 drafter's head, ``draft_cols`` rows per column, ``decode.head``: then ``order`` holds each token id's
+    LM row)."""
+
+    order: np.ndarray | None = None
+    draft_cols = 0
 
     def __init__(self, gguf: GGUFFile, cfg: FlintConfig | None = None, *, layers: list[int] | None = None,
-                 vocab: int | None = None, tile_bytes: int = 0):
+                 vocab: int | None = None, tile_bytes: int = 0, head: bool = False, head_size: int = HEAD_SIZE):
         cfg = cfg or FlintConfig.from_gguf(gguf)
         H, nkv = cfg.hidden_size, cfg.num_key_value_heads
         if vocab is None:
@@ -68,6 +76,15 @@ class FlintImage(MoeImage, NormedImage):
             self._layer(L)
         self.lm = "output.weight"
         rows = column_rows(self.vocab)
+        if head:  # (the ids: the padded vocabulary's, its padding rows empty; a truncated one in tests)
+            n_ids = self.vocab
+            self.draft_cols = draft_cols(n_ids, self.R[self.fmt(self.lm)], head_size)
+            F = COLS * self.draft_cols - TABLE_ROWS
+            self.fixed, self.table = (head_tokens(gguf, F) if n_ids >= cfg.vocab_size else
+                                      (np.arange(F), np.arange(F, F + TABLE_ROWS)))
+            self.vocab = n_ids + TABLE_ROWS
+            rows = head_rows(n_ids, self.fixed, self.table)
+            self.order = lm_order(rows, self.draft_cols)[:min(n_ids, cfg.vocab_size)]  # (the logits: the real ids')
         self._norm(-1, "lm")
         self._add(-1, "lm", [("lm", (self.lm,), np.where(rows < cfg.vocab_size, rows, -1))], H)
         self._place()

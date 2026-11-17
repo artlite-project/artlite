@@ -11,9 +11,9 @@ from artlite import txn
 from artlite.decode.dflash.core import MAX_CHUNK, MAX_PADDING, POS_PER_GROUP
 from artlite.prefill.dflash import DFlashPrefill
 from artlite.prefill.drafter import DrafterPrefill
+from models.dflash import DFlashDrafting, Injection
 from models.qwen35 import conv_state
 from models.qwen35.cursor import GdnCursor
-from models.qwen35.drafting import DFlashDrafting, Injection
 from models.qwen35.steps import PanelTable, StatePanel
 
 
@@ -98,7 +98,7 @@ def test_drafter_prefill_defaults() -> None:
 
 
 def _dflash_prefill(sizes: tuple[int, ...]) -> DFlashPrefill:
-    shape = SimpleNamespace(over=MAX_CHUNK // POS_PER_GROUP)
+    shape = SimpleNamespace(over=MAX_CHUNK // POS_PER_GROUP, max_chunk=MAX_CHUNK, max_padding=MAX_PADDING)
     p = object.__new__(DFlashPrefill)
     p.d, p.pf = SimpleNamespace(shape=shape), SimpleNamespace(sizes=sizes)
     return p

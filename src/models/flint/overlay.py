@@ -40,6 +40,7 @@ from artlite.decode import gemv
 from artlite.decode import phases as mp
 from artlite.decode.attn import Attn, rope_tables, score_bits
 from artlite.decode.attn_overlay import AttentionOverlay, CacheKind, CacheUse
+from artlite.decode.head import HeadView
 from artlite.decode.model import InputRegion
 from artlite.decode.protocol import (
     B_F32,
@@ -85,16 +86,19 @@ class FlintOverlay(AttentionOverlay):
     """A Flint GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices; the first
     one reads x), ``vocab``: LM rows (default: the padded vocabulary), ``max_positions``: the caches' capacity, ``kv_k``:
     the caches' K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's
-    buffer allocated ahead."""
+    buffer allocated ahead; ``head``: the LM rows laid out with a DFlash2 drafter's head (``FlintImage``; a
+    ``decode.dflash.overlay.DFlashTarget``)."""
 
     CONFIG, IMAGE = FlintConfig, FlintImage
+    KV_PAD = KV_PAD
     CHAIN = CHAIN
     OPS = ("att", "moe")  # (the operator cores' phases; "moe": the MoE transfers after moe_in and sdown)
     NORMED = frozenset({"qkv", "gate_up", "moe_in", "lm"})
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None):
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights)
+                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, head: bool = False):
+        image = FlintImage(gguf, layers=layers, vocab=vocab, head=True) if head and weights is None else None
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         assert cfg.num_key_value_heads * CHAIN == COLS
         fmts = img.formats()
@@ -186,6 +190,10 @@ class FlintOverlay(AttentionOverlay):
 
     def _attention_scale(self, L: int) -> tuple[int, int]:
         return score_bits(1 / math.sqrt(self.hd))
+
+    def drafter_view(self) -> HeadView | None:
+        """(a DFlash2 drafter's head: the first ``draft_cols`` rows of each column of the LM region)"""
+        return HeadView(self.image, self.image.draft_cols) if self.image.draft_cols else None
 
     def _qk_weights(self, L: int) -> dict[str, np.ndarray]:
         """(the q / k norms' weights per dim)"""
