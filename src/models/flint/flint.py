@@ -114,8 +114,9 @@ class NpuFlint(OverlayModel):
             if self.dflash is not None:
                 self.dflash.prepare(S)
         if self.dflash is not None:
-            self.dflash.dev.open()
+            self.dflash.dev.open()  # (its hardware context took the array: the model's code pages load again)
             self.dflash.prepare(0)
+            self.stale()
 
     def reset(self) -> None:
         """Forget the cached positions."""

@@ -43,6 +43,7 @@ def test_flint_dflash_text() -> None:
         ids = f.chat([{"role": "user", "content": CODE}])
         m.lookup = False  # (the drafter's rounds alone)
         logits = m.forward(ids)
+        m.prepare(len(ids))  # (after a dispatch: the drafter's context opens, the model's code pages load again)
         d0, a0 = m.drafted, m.accepted
         out[spec] = list(m.generate(logits, 200, Sampling(greedy=True), ids))
         if spec != "none":
