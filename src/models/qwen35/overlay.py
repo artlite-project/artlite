@@ -192,7 +192,6 @@ class QwenOverlay(ModelOverlay):
         self.ends = True  # (chunkwise) whether the step's chain ends its block: its state panels drain (``_variant``)
         self.gdn_steps, self.attn_steps, self.moe_steps = GdnTransfers(self), AttentionSteps(self), MoeTransfers(self)
         self.conv = ConvHandoff(self)  # (the conv states between the decode and the prefill)
-        self._order = None if img.order is None else self._id_runs(img.order)  # (``_logits``)
         if img.screen:
             self.screen = Screen(gguf, img.lm, self._f32("output_norm.weight"), cfg.rms_norm_eps,
                                  min(self.vocab, cfg.vocab_size))
@@ -714,24 +713,6 @@ class QwenOverlay(ModelOverlay):
     def _ahead_state(self) -> tuple:
         """(the ``rope`` rows the patch took in place of those ``rope`` holds now)"""
         return (*self._ring_state()[:-1], self._rope_used[2])
-
-    @staticmethod
-    def _id_runs(order: np.ndarray) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
-        """The buffer of ``_logits``'s copy and an LM order's runs of consecutive rows (id, its end, row)."""
-        cuts = [0, *(np.flatnonzero(np.diff(order) != 1) + 1).tolist(), len(order)]
-        return np.empty((8, len(order)), np.uint16), [(a, b, int(order[a])) for a, b in itertools.pairwise(cuts)]
-
-    def _npu_logits(self, S: int) -> np.ndarray:
-        """(an image whose LM rows are not in id order, ``QwenImage.order``: in id order, the ids' rows, in a buffer valid
-        until the next dispatch as the NPU's; an MTP drafter's table rows left out)"""
-        if self._order is None:
-            return super()._npu_logits(S)
-        self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
-        x = self.dev.view("LOGITS")[:2 * S * self.vocab].view(np.uint16).reshape(S, self.vocab)
-        out, runs = self._order
-        for a, b, r in runs:
-            out[:S, a:b] = x[:, r:r + b - a]
-        return out[:S].view(bfloat16)
 
     def _lm_phase(self, seq: Sequence) -> None:
         if self.image.column_major:

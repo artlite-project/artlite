@@ -308,11 +308,12 @@ def _rot(x: np.ndarray, c: np.ndarray, s: np.ndarray) -> np.ndarray:
     return y
 
 
-def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5) -> dict:
+def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5, block: bool = False) -> dict:
     """One step of S slots at p of a Spark layer of ``kind`` on random inputs, one pass (``SPARK``): the cache of the
     positions before p (K as stored, V bf16) in groups, a ring of ``ring`` groups (0: linear; a sliding-window layer's
     window that crosses its end: two fills), streamed from the window's first group (``window_words``); per column the
-    o of its heads' slots and its emitted records."""
+    o of its heads' slots and its emitted records. ``block``: a drafter's block (every row the window before p and the
+    step whole)."""
     path = spark_gguf(size)
     require(path)
     cfg = SparkConfig.from_gguf(GGUFFile(path))
@@ -326,7 +327,8 @@ def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5
     qc, HD, T, nph, kvh = ash.qc, A1.HD, op.tile_bytes, ash.nph, cfg.num_key_value_heads
     rp, rl = p // 8, (p + S - 1) // 8
     swa = kind == "swa"
-    g0, wrec, wm = A1.window_words(p, cfg.sliding_window) if swa else (0, -1, np.zeros(4, np.uint32))
+    g0, wrec, wm, late = A1.window_words(p, cfg.sliding_window, block=block) if swa else (
+        0, -1, np.zeros(4, np.uint32), np.zeros(2, np.uint32))
     P8 = 32 * ((p + 7) // 32 + 1)  # (drawn for 8 slots: a step of any S sees the same cache)
     kc = rng.standard_normal((kvh, P8, HD)).astype(np.float32)[:, :P]
     vc = bf16_round(rng.standard_normal((kvh, P8, HD)).astype(np.float32))[:, :P]
@@ -354,7 +356,7 @@ def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5
     nt = ash.records(S)
     per = 9 * PR.XB  # (per column: F_ATT, then its 8 q objects)
     act = dev.alloc("ACT", COLS * per + S * PR.XB)
-    word, amask, lanes = A1.step_words(p, S)
+    word, amask, lanes = A1.step_words(p, S, block=block)
     ana = A1.OBJS * (G - g0) + nt
     for c in range(COLS):
         m = np.zeros(PR.META, np.int32)
@@ -365,6 +367,8 @@ def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5
         m[A1.M_AMASK:A1.M_AMASK + 4] = amask.view(np.int32)
         m[A1.M_KIND], m[A1.M_WREC] = A1.KIND_SWA if swa else A1.KIND_FULL, wrec
         m[A1.M_WMASK:A1.M_WMASK + 4] = wm.view(np.int32)
+        m[A1.M_WLATE:A1.M_WLATE + 2] = late.view(np.int32)
+        m[A1.M_WHOLE] = int(block)
         o = c * per
         act[o:o + 4 * PR.META] = m.view(np.uint8)
         act[o + 4 * PR.META:o + 4 * PR.META + len(payload)] = np.frombuffer(payload, np.uint8)
@@ -409,18 +413,18 @@ def _spark(size: str, kind: str, p: int, S: int, *, ring: int = 0, seed: int = 5
     outs = dev.view("OUT").view(np.uint16).reshape(COLS, qc, 32, 8, 8)
     o = np.stack([from_bf16_bits(outs[:, :, :, s].reshape(COLS, qc, HD)) for s in range(S)], 1)  # (COLS, S, qc, 256)
     return {"cfg": cfg, "ash": ash, "o": o, "recs": dev.view("REC").reshape(COLS, -1).copy(), "q": q, "gate": gate,
-            "kv": kv, "kc_s": kc_s, "vc_s": vc_s, "vc": vc, "cs": (c_, s_), "swa": swa}
+            "kv": kv, "kc_s": kc_s, "vc_s": vc_s, "vc": vc, "cs": (c_, s_), "swa": swa, "block": block}
 
 
 def _spark_ref(r: dict, p: int, S: int, c: int, s: int) -> tuple[np.ndarray, np.ndarray]:
     """fp64: o * sigmoid(gate) (qc, 256) of column c's heads at slot s (what the slot sees: the cache before p as stored,
     the step's open records encoded from their rows up to its position, the step's earlier slots' K as the core
-    computed them), and the slot's K."""
+    computed them; a block's: the window before p, the step's records and K whole), and the slot's K."""
     cfg, ash, HD = r["cfg"], r["ash"], A1.HD
     h = c // ash.nph
     cs = (r["cs"][0][s].astype(np.float64), r["cs"][1][s].astype(np.float64))
-    pos = p + s
-    lo = max(0, pos - cfg.sliding_window + 1) if r["swa"] else 0
+    pos = p + S - 1 if r["block"] else p + s
+    lo = max(0, (p - cfg.sliding_window) if r["block"] else pos - cfg.sliding_window + 1) if r["swa"] else 0
     rows = {x: r["vc"][h][8 * x:8 * x + 8].copy() for x in {p // 8, (p + S - 1) // 8}}
     for t in range(S):
         rows[(p + t) // 8][(p + t) % 8] = r["kv"][t, h, HD:]
@@ -429,28 +433,34 @@ def _spark_ref(r: dict, p: int, S: int, c: int, s: int) -> tuple[np.ndarray, np.
         if 8 * x <= pos:
             v_seen = np.concatenate([v_seen[:8 * x], _enc(rows[x], min(pos + 1 - 8 * x, 8))])[:pos + 1]
     knew = [_rot(r["kv"][t, h, :HD], r["cs"][0][t].astype(np.float64), r["cs"][1][t].astype(np.float64))
-            for t in range(s + 1)]
+            for t in range(pos - p + 1)]
     K = np.concatenate([np.asarray(r["kc_s"][h][:p], np.float64), np.stack(knew)])[lo:pos + 1]
     V = np.asarray(v_seen, np.float64)[lo:pos + 1]
     qr = _rot(r["q"][c, s], *cs)
     sc = qr @ K.T / 16
     pr = np.exp(sc - sc.max(-1, keepdims=True))
     o = (pr @ V) / pr.sum(-1, keepdims=True)
-    return o / (1 + np.exp(-np.asarray(r["gate"][c, s], np.float64)))[:, None], knew[-1]
+    return o / (1 + np.exp(-np.asarray(r["gate"][c, s], np.float64)))[:, None], knew[s]
 
 
-@pytest.mark.parametrize(("size", "kind", "p", "S", "ring"),
-                         [("4B", "swa", 0, 1, 0), ("4B", "swa", 5, 3, 0), ("4B", "swa", 511, 1, 0), ("4B", "swa", 512, 8, 0),
-                          ("4B", "swa", 540, 8, 0), ("4B", "swa", 1000, 8, 0), ("4B", "full", 1001, 8, 0),
-                          ("4B", "full", 30, 4, 0), ("1.7B", "swa", 1003, 8, 0), ("1.7B", "full", 700, 5, 0),
-                          ("4B", "swa", 1000, 8, 20), ("1.7B", "swa", 1500, 7, 18), ("1.7B", "swa", 505, 8, 0)])
-def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int) -> None:
+@pytest.mark.parametrize(("size", "kind", "p", "S", "ring", "block"),
+                         [("4B", "swa", 0, 1, 0, False), ("4B", "swa", 5, 3, 0, False), ("4B", "swa", 511, 1, 0, False),
+                          ("4B", "swa", 512, 8, 0, False), ("4B", "swa", 540, 8, 0, False), ("4B", "swa", 1000, 8, 0, False),
+                          ("4B", "full", 1001, 8, 0, False), ("4B", "full", 30, 4, 0, False),
+                          ("1.7B", "swa", 1003, 8, 0, False), ("1.7B", "full", 700, 5, 0, False),
+                          ("4B", "swa", 1000, 8, 20, False), ("1.7B", "swa", 1500, 7, 18, False),
+                          ("1.7B", "swa", 505, 8, 0, False),
+                          ("4B", "swa", 300, 7, 0, True), ("4B", "swa", 543, 7, 20, True), ("1.7B", "swa", 540, 7, 0, True),
+                          ("1.7B", "swa", 1021, 7, 20, True), ("4B", "swa", 3, 7, 0, True)])
+def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int, block: bool) -> None:
     """Spark's attention (``SPARK``): per column and slot o within bfp16 / bf16 rounding of the fp64 attention over what the
     slot sees: a sliding-window layer's keys p + s - 511 .. p + s (its window's first group streamed first, the keys
     before a row's window masked: rows whose window starts in the second group too), a full layer's all; the rotation of
     the kind (128 bf16 pairs, 32 fp32); one gate per head; the relayed K records of the step's positions; a ring whose
-    window crosses its end read in two fills; a step whose later slots' windows start past position 0 (505)."""
-    r = _spark(size, kind, p, S, ring=ring)
+    window crosses its end read in two fills; a step whose later slots' windows start past position 0 (505); a drafter's
+    block (``block``: every row the keys p - 512 .. p + S - 1, windows from a group's last key (543: 31 + 512) and of a
+    record past the group's first (540, 1021), the step across two records)."""
+    r = _spark(size, kind, p, S, ring=ring, block=block)
     ash, HD = r["ash"], A1.HD
     for c in range(COLS):
         for s in range(S):

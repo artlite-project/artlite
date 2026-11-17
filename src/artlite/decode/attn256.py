@@ -143,9 +143,14 @@ M_AMASK = ATT.block("M_AMASK", 4, at=38)  # (one pass) the rows' masks of the st
 M_ALANE = ATT.word("M_ALANE", at=42)  # (one pass) the slots' K lanes (A_LN)
 # (a windowed spec, ``AttnSpec.window``) the layer's kind (KIND_FULL, KIND_SWA), the record of the step's first slot's
 # window start (-1: none; the records before it in the first group: masked whole), the rows' masks of that record and
-# the next (per record rows 0 .. 3, 4 .. 7: a row's lanes before its window, A_WM)
+# the next (per record rows 0 .. 3, 4 .. 7: a row's lanes before its window, A_WM), the rows whose window starts past
+# the stream's first group (per set of rows 0 .. 3, 4 .. 7 their lanes, A_WL: ``window_words``), whether the step's
+# rows see its records whole (a drafter's block: every slot P V over a record's V encoded from all the step's rows, A_WH;
+# 0: each slot's from the rows up to its own, ``attn256.one``'s ``tobj``)
 M_KIND, M_WREC = ATT.words("M_KIND M_WREC", at=43)
 M_WMASK = ATT.block("M_WMASK", 4, at=45)
+M_WLATE = ATT.block("M_WLATE", 2, at=49)
+M_WHOLE = ATT.word("M_WHOLE", at=51)
 KIND_FULL, KIND_SWA = 0, 1
 
 HD = 256  # head_dim
@@ -182,7 +187,7 @@ SPLIT_CHAIN, SPLIT_ROUND, SPLIT_KV, SPLIT_NOREC = 1, 2, 4, 8
 # held ones; A_NKH: the sub-step group's K objects after the tails (a chain's first column, not split); A_NRM, A_VN, A_GS,
 # A_QA (one per octet): the addresses of the norms, the step's V, the gates, the Q panels; A_HP: the held objects (in
 # order), A_RW: the open records' rows (per tail object)
-STATE = WordMap("attention core state", 56)
+STATE = WordMap("attention core state", 60)
 _A = STATE.common
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_TP, A_TC, A_S, A_P, A_I, A_EIDX, A_ROLE, A_QS,
  A_KS, A_XL, A_QR, A_G0, A_GATT, A_GJ, A_NO, A_SA, A_NTAIL, A_SOFT, A_NKH, A_NRM, A_VN, A_GS) = _A.words(
@@ -204,10 +209,13 @@ A_KR, A_KN, A_KM, A_KB, A_BR = ONE.words("A_KR A_KN A_KM A_KB A_BR", at=A_WORDS)
 A_MK = ONE.block("A_MK", 4)
 A_LN = ONE.word("A_LN")
 ONE_WORDS = ONE.next_free()  # (the one-pass core's state words without a window)
-# (one pass, a windowed spec) the layer's kind, the window's first record and its masks (M_KIND, M_WREC, M_WMASK)
+# (one pass, a windowed spec) the layer's kind, the window's first record, its masks, the late rows and the whole
+# records (M_KIND, M_WREC, M_WMASK, M_WLATE, M_WHOLE)
 WIN = STATE.kind("one pass window")
 A_KD, A_WR = WIN.words("A_KD A_WR", at=ONE_WORDS)
 A_WM = WIN.block("A_WM", 4)
+A_WL = WIN.block("A_WL", 2)
+A_WH = WIN.word("A_WH")
 # A_ROLE: a chain's first core (its K records), its last (V panels, rows), between
 ROLE_K, ROLE_V, ROLE_O = _A.values("ROLE_K ROLE_V ROLE_O", of="role")
 
@@ -441,41 +449,50 @@ class AttnShape:
         return _SRC.render(**v) + (_MAIN_SRC.render(**v) if self.main_gates else "")
 
 
-def step_words(p: int, S: int, branch: tuple[int, int] | None = None) -> tuple[int, np.ndarray, int]:
+def step_words(p: int, S: int, branch: tuple[int, int] | None = None, *, block: bool = False
+               ) -> tuple[int, np.ndarray, int]:
     """(one pass) A step's F_ATT words that follow its slots' positions (p, S slots; ``branch``: its last L slots follow slot c,
     at p + c + 1 .., inside the 8 positions of c's record): the branch word (``M_BRANCH``: its first lane in its record | L << 8
     | its record past the step's first << 12, or 0), the rows' masks of the step's first two records (``M_AMASK``: per
-    record rows 0 .. 3, 4 .. 7, a row's lanes past its position: slot s's p + s, a branch slot's its own), the slots' K lanes
-    (``M_ALANE``: their positions' lanes, 3 bits each)."""
+    record rows 0 .. 3, 4 .. 7, a row's lanes past its position: slot s's p + s, a branch slot's its own; ``block``: every
+    row's past the last slot's, a drafter's block that sees itself whole), the slots' K lanes (``M_ALANE``: their positions'
+    lanes, 3 bits each)."""
     c, L = branch or (-1, 0)
     sc = S - L
     q = p % 8 + c + 1  # (the branch's first position, from the step's first record's)
     word = q % 8 | L << 8 | q // 8 << 12 if branch else 0
     pos = [p % 8 + (s if s < sc else c + 1 + s - sc) for s in range(8)]
+    seen = [p % 8 + S - 1] * 8 if block else pos
     w = np.zeros(4, np.uint32)
     for k in range(2):
         for s in range(8):
-            n = min(max(pos[s] - 8 * k + 1, 0), 8)
+            n = min(max(seen[s] - 8 * k + 1, 0), 8)
             w[2 * k + s // 4] |= ((0xFF << n) & 0xFF) << (8 * (s % 4))
     return word, w, sum((pos[s] % 8) << (3 * s) for s in range(8))
 
 
-def window_words(p: int, window: int) -> tuple[int, int, np.ndarray]:
+def window_words(p: int, window: int, *, block: bool = False) -> tuple[int, int, np.ndarray, np.ndarray]:
     """(a windowed spec) A sliding-window layer's F_ATT words of a step at p (row s: slot s at p + s, its keys
-    p + s - window + 1 .. p + s): the cache's first group streamed (``M_G0``: the group of the first slot's window
+    p + s - window + 1 .. p + s; ``block``: every row's from p - window, a drafter's block of rows that see the window
+    before its first and the block): the cache's first group streamed (``M_G0``: the group of the first slot's window
     start, or of position 0), the record of that start (``M_WREC``: -1, every row's window from position 0 on), the
     rows' masks of it and the next record (``M_WMASK``: per record rows 0 .. 3, 4 .. 7, a row's lanes before its
-    window: a later slot's window may start past position 0 where the first slot's does not)."""
-    first = p - window + 1
-    w = np.zeros(4, np.uint32)
-    if first + 7 <= 0:
-        return 0, -1, w
-    r = max(first, 0) >> 3
-    for k in range(2):
-        for s in range(8):
-            n = min(max(first + s - 8 * (r + k), 0), 8)
+    window: a later slot's window may start past position 0 where the first slot's does not), the rows whose window
+    starts past the first group (``M_WLATE``: per set of rows 0 .. 3, 4 .. 7 their lanes; such a row takes its
+    reference from the second group, ``m0``)."""
+    starts = np.full(8, p - window) if block else p - window + 1 + np.arange(8)
+    w, late = np.zeros(4, np.uint32), np.zeros(2, np.uint32)
+    if starts[-1] <= 0:
+        return 0, -1, w, late
+    first = max(int(starts[0]), 0)
+    r, g0 = first >> 3, first >> 5
+    for s in range(8):
+        for k in range(2):
+            n = min(max(int(starts[s]) - 8 * (r + k), 0), 8)
             w[2 * k + s // 4] |= ((1 << n) - 1) << (8 * (s % 4))
-    return max(first, 0) >> 5, r, w
+        if starts[s] >= 32 * (g0 + 1):
+            late[s // 4] |= 0xFF << (8 * (s % 4))
+    return g0, r, w, late
 
 
 # ----------------------------------------------------------------------

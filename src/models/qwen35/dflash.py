@@ -16,7 +16,7 @@ A dispatch holds up to two parts:
 
   then, normed by output_norm, gate (``selector_hidden``, the selector's 256 dims) and lm: the head, the first rows of the model's
   LM head per column in the model's weight buffer (``QwenImage.mtp_view``: the fixed tokens and the table of the sequence's own,
-  ``draft.HeadTable``).
+  ``decode.head.HeadTable``).
 
 The selector runs on the host (``Selector``): per position the top 16 logits, their rows of the file's ``selector_successor`` /
 ``selector_predecessor`` (dequantized on demand from the mapped file, read ahead after the load), a greedy walk; in a generation's
@@ -40,6 +40,7 @@ from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
 from artlite.decode.attn256 import F_ATT
+from artlite.decode.head import HeadTable
 from artlite.decode.image import Region
 from artlite.decode.model import InputRegion, ModelOverlay, host_bytes
 from artlite.decode.protocol import (
@@ -99,7 +100,6 @@ from .dflash_core import (
 )
 from .dflash_host import Selector, angles
 from .dflash_image import DFlashImage
-from .draft import HeadTable
 from .image import tensor_f32
 from .overlay import KV_PAD, QwenOverlay
 

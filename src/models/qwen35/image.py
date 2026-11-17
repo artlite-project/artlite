@@ -57,12 +57,11 @@ of 2 chunks), so that the helper cores' x panels have room for the MoE's side ch
 (``decode.design``'s "MoE").
 """
 
-import math
-
 import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode.attn256 import OBJ_BYTES
+from artlite.decode.head import HEAD_ROWS, TABLE_ROWS, draft_cols, head_region, head_rows, head_tokens, lm_order
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows, group_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
@@ -74,20 +73,7 @@ from artlite.operators.design import COLS
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
-HEAD_ROWS = 65536  # a drafter head's fixed rows: the special tokens and the first ids of the vocabulary
 DFLASH_HEAD_ROWS = 80000  # a DFlash2 drafter's: one pass a round, so 1.3 ms for the rare tokens that end a chain of drafts (code, JSON)
-TABLE_ROWS = 512  # its rows of the sequence's own tokens past them (``draft.HeadTable.see``), 64 per column
-
-
-def head_tokens(gguf: GGUFFile, rows: int = HEAD_ROWS, table: int = TABLE_ROWS) -> tuple[np.ndarray, np.ndarray]:
-    """A drafter head's fixed tokens (rows,) and its table's before any sequence (table,), ascending: the control and
-    user-defined tokens (GGUF token types 3, 4), the first other ids to fill the rows, then the next ones (never the
-    unused ids, type 5)."""
-    types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
-    special = np.flatnonzero((types == 3) | (types == 4))
-    other = np.flatnonzero((types != 3) & (types != 4) & (types != 5))
-    n = rows - len(special)
-    return np.union1d(special, other[:n]), other[n:n + table]
 
 
 def tensor_f32(gguf: GGUFFile, name: str) -> np.ndarray:
@@ -178,14 +164,8 @@ class QwenImage(TileImage):
         self._place()
 
     def _draft_cols(self, R: int, rows: int) -> int:
-        """The drafter head's rows per column: whole tiles of R rows and whole C objects, at least ``rows`` fixed ones and the
-        table's (``TABLE_ROWS``) or as many as the image's ids hold (0: none)."""
-        m = math.lcm(R, C_LEN)
-        P = -(-(rows + TABLE_ROWS) // (COLS * m)) * m
-        while P and COLS * P - TABLE_ROWS > self.n_ids:
-            P -= m
-        assert not P or self.n_ids % (COLS * C_LEN) == 0, "the LM rows of an MTP model: whole C objects per column"
-        return P
+        """The drafter head's rows per column (``head.draft_cols``)."""
+        return draft_cols(self.n_ids, R, rows)
 
     def head_rows(self) -> np.ndarray:
         """The LM rows' tokens (COLS, vocab / COLS): column c's are vocab / 8 c .. (-1: a padding row); with an MTP
@@ -193,18 +173,11 @@ class QwenImage(TileImage):
         if not self.draft_cols:
             rows = column_rows(self.vocab)
             return np.where(rows < self.cfg.vocab_size, rows, -1)
-        other = np.setdiff1d(np.arange(self.n_ids), self.fixed)
-        return np.concatenate([self.fixed.reshape(COLS, -1), self.table.reshape(COLS, -1), other.reshape(COLS, -1)], 1)
+        return head_rows(self.n_ids, self.fixed, self.table)
 
     def _order(self) -> np.ndarray:
         """The LM row of each token id (``n_ids``,): its fixed or other row (the table's repeat them)."""
-        rows = self.head_rows()
-        per = rows.shape[1]
-        own = np.ones(per, bool)
-        own[self.draft_cols - TABLE_ROWS // COLS:self.draft_cols] = False
-        out = np.empty(self.n_ids, np.int64)
-        out[rows[:, own]] = np.arange(COLS * per).reshape(COLS, per)[:, own]
-        return out
+        return lm_order(self.head_rows(), self.draft_cols)
 
     def gu_rows(self) -> set[int]:
         """The rows per tile of the gate / up phases' tiles: the dense layers' gate_up (a split block's both), an MoE
@@ -338,12 +311,8 @@ class MtpView:
         self.layers = [image.mtp_layer]
         self.tile_bytes, self.R, self.kc, self.n_norm = image.tile_bytes, image.R, image.kc, image.n_norm
         self.fixed, self.table = image.fixed, image.table
-        lm = image.region(-1, "lm")
-        b = lm.block("lm")
         P = image.draft_cols
-        assert lm.kc_group == lm.n_kc, "a row tile's K chunks consecutive: the head's rows a prefix of each column"
-        head = Region(-1, "lm", [Block(b.name, b.tensors, b.rows[:, :P], b.fmt, b.R, b.G)], lm.n_kc, lm.kc_group,
-                      lm.tile_bytes, lm.kc, offset=lm.offset, col_stride=lm.col_stride)
+        head = head_region(image.region(-1, "lm"), P)
         self.regions = [r for r in image.regions if r.layer == image.mtp_layer]
         self.vocab = COLS * P
         self._index = {(r.layer, r.name): r for r in self.regions} | {(-1, "lm"): head}

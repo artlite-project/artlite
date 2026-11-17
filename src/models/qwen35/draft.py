@@ -25,20 +25,19 @@ draft) rewrites the rows the last round's drafts wrote, then one-slot steps (the
 """
 
 import dataclasses
-from collections import OrderedDict
-from collections.abc import Callable, Iterable
 
 import numpy as np
 
 from artlite.decode.attn256 import OBJ_BYTES
+from artlite.decode.head import HEAD_ROWS, TABLE_ROWS, HeadTable, head_tokens
 from artlite.decode.image import column_rows
 from artlite.decode.protocol import interleave, norm_objects
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.operators.design import COLS
-from artlite.overlay import OverlayDevice, Sequence
+from artlite.overlay import Sequence
 
-from .image import HEAD_ROWS, TABLE_ROWS, QwenImage, head_tokens
+from .image import QwenImage
 from .overlay import QwenOverlay
 
 
@@ -93,60 +92,6 @@ def draft_formats(gguf: GGUFFile) -> tuple[str, ...]:
 def draft_gate_up(gguf: GGUFFile) -> frozenset[int]:
     """The rows per tile of a drafter file's gate / up tiles: its model's design takes them (``QwenOverlay(gu=)``)."""
     return frozenset(_draft_image(gguf).gu_rows())
-
-
-class HeadTable:
-    """A drafter head's tokens: ``ids`` (the token of each logit) and its table of the sequence's own (module docstring), of a
-    ``view`` of the image (``DraftImage``, ``QwenImage.mtp_view``) for a model of ``vocab_size`` tokens; ``device``: the device that
-    holds the view's weights."""
-
-    def __init__(self, view: object, vocab_size: int, device: Callable[[], OverlayDevice]):
-        self.view, self.device = view, device
-        self.ids = view.head_rows().reshape(-1)
-        self._per = view.vocab // COLS  # (a column's logits)
-        self.rows = np.flatnonzero(np.arange(view.vocab) % self._per >= len(view.fixed) // COLS)  # (the table's logits)
-        self._fixed = np.zeros(vocab_size, bool)
-        self._fixed[view.fixed] = True
-        idle = sorted(zip(self.ids[self.rows].tolist(), self.rows.tolist()), reverse=True)
-        self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
-
-    def see(self, ids: Iterable[int]) -> None:
-        """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
-        recently seen ones outside the fixed rows (the least recently seen leaves), the head's rows of those that
-        enter packed into the weight image (the next step's)."""
-        a = np.fromiter(ids, np.int64)
-        a = a[(a >= 0) & (a < len(self._fixed))]
-        a = a[~self._fixed[a]]
-        if not a.size:
-            return
-        u, last = np.unique(a[::-1], return_index=True)
-        order = u[np.argsort(-last)][-len(self.rows):].tolist()  # (the last ones, by their last occurrence)
-        lru = self._lru
-        for t in order:
-            if t in lru:
-                lru.move_to_end(t)  # (they stay: the others leave first)
-        new = [t for t in order if t not in lru]
-        for t in new:
-            lru[t] = lru.popitem(last=False)[1]
-        for t in order:
-            lru.move_to_end(t)
-        if new:
-            self._write([lru[t] for t in new], new)
-
-    def _write(self, rows: list[int], tokens: list[int]) -> None:
-        """The head's logits ``rows`` are the ``tokens``' now: their row tiles packed again, flushed."""
-        view, dev = self.view, self.device()
-        r = view.region(-1, "lm")
-        b = r.block("lm")
-        tiles = set()
-        for i, t in zip(rows, tokens, strict=True):
-            c, j = divmod(i, self._per)
-            self.ids[i] = b.rows[c, j] = t
-            tiles.add((c, j // (b.R * b.G)))
-        w = dev.view("W")
-        for c, rt in sorted(tiles):
-            for off, n in view.repack(w, r, b, c, rt):
-                dev.flush("W", off, n)
 
 
 class _DraftConfig:

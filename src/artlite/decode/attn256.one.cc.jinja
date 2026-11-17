@@ -278,13 +278,15 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
         {{ p }}_psoft(ws, r & 3, o, pp + {{ PO }} * o);
     {{ p }}_pkeep(pp, {{ PO }}, pf, 72, {{ QC }}, 0, 8);
     const int nb = br && r == r0 + ((br >> 12) & 1) ? (br >> 8) & 15 : 0, lb = br & 7, nc = lc - j0 + 1;  // (the branch's slots here)
+    // (a step that sees its records whole: the record's V from all the step's rows, P V of every slot at once)
+    const int whole = {% if WINDOW %}st[{{ A_WH }}]{% else %}0{% endif %};
     AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < nc + nb; i++) {  // (the chain's slots of the record, then the branch's: its row at its lane first)
+    for (int i = whole ? nc - 1 : 0; i < nc + nb; i++) {  // (the chain's slots of the record, then the branch's: its row at its lane first)
         const int b = i - nc, j = b < 0 ? j0 + i : lb + b, s = b < 0 ? P0 + j - p : sc + b;
         if (b >= 0)
             {{ p }}_rowput(rows + 8 * j, AP(bfloat16, {{ A_VN }}) + {{ HD }} * s);
         {{ p }}_venc(rows, v, j + 1, 1);
-        {{ p }}_pkeep(pf, 72, pp, {{ PO }}, {{ QC }}, s, b < 0 && j == lc ? sc : s + 1);
+        {{ p }}_pkeep(pf, 72, pp, {{ PO }}, {{ QC }}, whole ? 0 : s, b < 0 && j == lc ? sc : s + 1);
         {{ p }}_pvs(v, v, pp, AW(float, {{ a.y }}));
     }
     AIE_LOOP_NO_UNROLL
@@ -383,11 +385,10 @@ __attribute__((noinline, minsize)) void {{ p }}_wmask(int32_t *__restrict ws, in
 {% endif %}
 {% if WINDOW %}
 // (a sliding-window layer) The lanes of a set's rows (slots 4 h .. 4 h + 3) whose window starts past the first group of
-// the stream (in its second: slots s >= 32 (g0 + 1) - (p - window + 1)), as a mask word; none in a full layer
+// the stream (in its second), as a mask word: the host's (A_WL; none in a full layer)
 [[clang::always_inline]] inline uint32_t {{ p }}_late(const int32_t *__restrict st, int h)
 {
-    const int t = 32 * (st[{{ A_G0 }}] + 1) - (st[{{ A_P }}] - {{ WINDOW - 1 }}) - 4 * h;
-    return st[{{ A_KD }}] != {{ KIND_SWA }} || t >= 4 ? 0u : t <= 0 ? ~0u : ~0u << (8 * t);
+    return (uint32_t)st[{{ A_WL }} + h];
 }
 
 {% endif %}
@@ -485,7 +486,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% if WINDOW %}
     st[{{ A_G0 }}] = m[{{ M_G0 }}];
     AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < 6; i++)  // (the kind, the window's first record, its masks)
+    for (int i = 0; i < 9; i++)  // (the kind, the window's first record, its masks, the late rows, whole records)
         st[{{ A_KD }} + i] = m[{{ M_KIND }} + i];
 {% endif %}
     al::copy<{{ 2 * HD + 64 * SMAX }}, 16>(AP(float, {{ A_NRM }}), (const float *)(x + {{ 2 * META }}));

@@ -67,17 +67,24 @@ class Drain(NamedTuple):
     index: int
 
 
+# how a windowed spec's sliding-window layers attend in a step (``AttnStep.mode``): "step" (row s at p + s: its window and
+# the slots up to its own), "block" (a drafter's block: every row the window before the first slot's and the step's slots
+# whole), "insert" (records only: the step's first group streamed, no window, the rows' outputs for a sink)
+MODES = ("step", "block", "insert")
+
+
 @dataclasses.dataclass(eq=False)
 class AttnStep:
     """The transaction of a step of S slots (its attentions' sub-steps ``subs``: first slot, slots, how the chains divide
     their caches' groups; ``b``: which of its two buffers; ``fatt``: its F_ATT objects' fills as (BD word index, layer,
-    column, sub-step): the second buffer's step is a copy that reads that buffer's objects) with the records of the BDs
-    that its position patches: ``fills``, ``tails``, ``drains`` and their arrays (``patch``)."""
+    column, sub-step): the second buffer's step is a copy that reads that buffer's objects; ``mode``: ``MODES``) with the
+    records of the BDs that its position patches: ``fills``, ``tails``, ``drains`` and their arrays (``patch``)."""
 
     S: int
     subs: tuple[tuple[int, int, int], ...]
     tr: Transaction | None = None
     b: int = 0
+    mode: str = "step"  # (a windowed spec's sliding-window layers: ``MODES``)
     fatt: list[tuple[int, int, int, int]] = dataclasses.field(default_factory=list)
     fills: list[Fill] = dataclasses.field(default_factory=list)
     tails: list[Tail] = dataclasses.field(default_factory=list)
@@ -203,22 +210,27 @@ class AttentionSteps:
     # The transfers
     # ------------------------------------------------------------------
 
-    def build(self, seq: Sequence, st: AttnStep, L: int, S: int, run: list[tuple[int, str]] | None = None) -> None:
+    def build(self, seq: Sequence, st: AttnStep, L: int, S: int, run: list[tuple[int, str]] | None = None, *,
+              phase: str = "attn_in", out: str = "attn_out") -> None:
         """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them);
-        ``run``: the weights after it (a column-major image), after the last sub-step's cache reads."""
+        ``run``: the weights after it (a column-major image), after the last sub-step's cache reads. ``phase``: the
+        phase of the attention's input (another than attn_in: K and V alone, a drafter's injection; its rows' q objects
+        as they are), ``out``: the phase whose x takes o (``x_slot``)."""
         ov = self.ov
         dev, ash = ov.dev, ov.ash
         nph = ash.nph
         per = ash.kvh * attn.HD // COLS  # (K and V rows of a column: its part of KV head per c // HD)
-        gh = ash.spec.gate == "head"  # (the heads' gate logits after K and V: one C object, its first QC values)
-        ov._weights(seq, (L, "attn_in"), 0)
+        qkv = phase == "attn_in"
+        gh = ash.spec.gate == "head" and qkv  # (the heads' gate logits after K and V: one C object, its first QC values)
+        ov._weights(seq, (L, phase), 0)
         seq.sync()
-        ov._inputs(seq, ov.inp[(L, "attn_in")][0], S, (L, "attn_in"))
+        ov._inputs(seq, ov.inp[(L, phase)][0], S, (L, phase))
         for c in range(COLS):  # [q + gate | K part | V part (| gates)] per slot -> its q object, the slot's raw K, V object
             h, e0 = divmod(per * c, attn.HD)
             q0 = ov.q_object(L, c, 0) + 4 * META
-            seq.drain("C", c, dev.address("ACT", q0), S * ash.qc * 2 * (1 if gh else 2) * attn.HD,
-                      (C_LEN // 2, S, XB // 4, C_LEN // 2))
+            if qkv:
+                seq.drain("C", c, dev.address("ACT", q0), S * ash.qc * 2 * (1 if ash.spec.gate == "head" else 2) * attn.HD,
+                          (C_LEN // 2, S, XB // 4, C_LEN // 2))
             raw = ov.rawkv[L] + 4 * META
             for part in (0, 1):
                 seq.drain("C", c, dev.address("ACT", raw + 2 * (2 * attn.HD * h + attn.HD * part + e0)), S * 2 * per,
@@ -245,9 +257,9 @@ class AttentionSteps:
                     self._cache(seq, st, L, u + 1)
                 if last and not rnd:
                     ov._weight_run(seq, run, blocks=slice(1 if ov.a_bds > nf + attn.TAILS else 0, None))
-                self._outputs(seq, st, L, S, u)
+                self._outputs(seq, st, L, S, u, out)
                 if rnd:
-                    self._outputs(seq, st, L, S, u + 1)
+                    self._outputs(seq, st, L, S, u + 1, out)
             if rnd and u == len(st.subs) - 1:  # (then the columns' own objects: they keep no order with a shared stream's)
                 seq.wait_fills("A", tuple(range(nph)))
                 if run:
@@ -293,9 +305,9 @@ class AttentionSteps:
                 seq.fill("X", c, dev.address("ACT", ov.q_object(L, c, a)), n * XB)
             seq.fill("X", c, dev.address("ACT", ov.rawkv[L] + a * XB), n * XB)
 
-    def _outputs(self, seq: Sequence, st: AttnStep, L: int, S: int, u: int) -> None:
-        """o (the column's heads in attn_out's x at the sub-step's slots; split: the chain's last column's of the chain's, a
-        round's of its half), then the records (addresses: ``set_position``)."""
+    def _outputs(self, seq: Sequence, st: AttnStep, L: int, S: int, u: int, out: str = "attn_out") -> None:
+        """o (the column's heads in the x of phase ``out`` at the sub-step's slots; split: the chain's last column's of the
+        chain's, a round's of its half), then the records (addresses: ``set_position``)."""
         ov = self.ov
         dev, ash, nph, qc = ov.dev, ov.ash, ov.ash.nph, ov.ash.qc
         a, n, split = st.subs[u]
@@ -305,8 +317,8 @@ class AttentionSteps:
             if not split or c % nph == nph - 1:
                 h0, nh = (((kh * nph + 2 * (c // nph)) * qc, 2 * qc) if rnd else
                           (qc * (c - nph + 1), nph * qc) if split else (qc * c, qc))
-                sp = ov._sp(S, (L, "attn_out"))
-                at, left, _ = ov.x_slot((L, "attn_out"), attn.HD * h0, S)
+                sp = ov._sp(S, (L, out))
+                at, left, _ = ov.x_slot((L, out), attn.HD * h0, S)
                 assert left >= 4 * sp * 128 * nh
                 sw, m = 4 * sp, sp if ash.one else n  # (words of an x k block: [slot sp][8] bf16; the slots out)
                 seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * m * 32 * nh,
@@ -397,13 +409,20 @@ class AttentionSteps:
         a32, a8 = ov.dev.view("ACT").view(np.int32), ov.dev.view("ACT")
         fo = ov.fobj[st.b][:, :, :U]  # ([layer][column][sub-step])
         kinds = np.array([self.kind(L) == "swa" for L in ov.fatt])
-        assert not ov.ash.spec.branch
-        _, amask, lanes = attn.step_words(p, st.S)  # (a step without branches: its rows' masks, its slots' K lanes)
+        assert not ov.ash.spec.branch and (st.mode == "step" or kinds.all()), st.mode
+        # (a step without branches: its rows' masks, its slots' K lanes)
+        _, amask, lanes = attn.step_words(p, st.S, block=st.mode == "block")
         a32[fo[..., None] + attn.M_AMASK + np.arange(4)] = amask.view(np.int32)
         a32[fo + attn.M_ALANE] = lanes
         grs, su = [], None
+        none = (0, -1, np.zeros(4, np.uint32), np.zeros(2, np.uint32))
         for swa in (False, True):
-            first, wrec, wm = attn.window_words(p, self.window) if swa else (0, -1, np.zeros(4, np.uint32))
+            if not swa:
+                first, wrec, wm, late = none
+            elif st.mode == "insert":  # (the records' groups alone)
+                first, wrec, wm, late = (p >> 5, *none[1:])
+            else:
+                first, wrec, wm, late = attn.window_words(p, self.window, block=st.mode == "block")
             w, gr, su = att_words(ov.ash, st.subs, p, first=first)
             grs.append(gr)
             sel = fo[kinds == swa]  # ([layer][column][sub-step])
@@ -413,6 +432,8 @@ class AttentionSteps:
             if swa:
                 a32[sel + attn.M_WREC] = wrec
                 a32[sel[..., None] + attn.M_WMASK + np.arange(4)] = wm.view(np.int32)
+                a32[sel[..., None] + attn.M_WLATE + np.arange(2)] = late.view(np.int32)
+                a32[sel + attn.M_WHOLE] = int(st.mode == "block")
             pay = np.ascontiguousarray(cs["swa" if swa else "full"], np.uint8).reshape(-1)
             for o in 4 * sel.reshape(-1) + 4 * META:  # (each object's payload: a slice, not an index per byte)
                 a8[o:o + pay.size] = pay

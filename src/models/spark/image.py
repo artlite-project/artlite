@@ -11,7 +11,9 @@ Per-column rows (layer L, column c; NPH = 8 / KV heads columns per KV head, QC =
   (bartowski's files) as its BF16 copy (``_own``: one BFP16 plane, as the official files' BF16 gates);
 - "attn_out" (``attn_output``), "down": rows hidden / 8 c ..; "gate_up" (normed by ``ffn_norm``):
   ``decode.image.gate_up_rows`` (GeGLU's gate and up rows);
-- "lm" (normed by ``output_norm``): rows vocab / 8 c .. of ``output``, or of the tied ``token_embd``.
+- "lm" (normed by ``output_norm``): rows vocab / 8 c .. of ``output``, or of the tied ``token_embd``; with a DSpark
+  drafter's head (``head``: ``decode.head``) per column its share of the head's fixed tokens, of its table's, then of
+  the other ids (``order``: the LM row of each token id).
 
 An input of part of a K chunk (the 4B's hidden 2560: attn_in, gate_up, lm; the 1.7B's ffn 6656: down) is padded to whole
 chunks with zero super-blocks (``decode.image``). Column-major (each normed phase's norm-weight objects, data region
@@ -22,6 +24,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.decode.attn256 import OBJ_BYTES
+from artlite.decode.head import HEAD_ROWS, TABLE_ROWS, draft_cols, head_rows, head_tokens, lm_order
 from artlite.decode.image import TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import MAX_K, NX_PER_NORM, OBJ_K, norm_objects
@@ -51,20 +54,33 @@ def contiguous(image: TileImage) -> bool:
 
 class SparkImage(TileImage):
     """The weight image of a spark2_5 GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
-    vocabulary)."""
+    vocabulary; head: the LM rows laid out with a drafter's head, ``draft_cols`` rows per column)."""
+
+    order: np.ndarray | None = None  # (the LM row of each token id when they are not in id order)
+    draft_cols = 0
 
     def __init__(self, gguf: GGUFFile, cfg: SparkConfig | None = None, *, layers: list[int] | None = None,
-                 vocab: int | None = None):
+                 vocab: int | None = None, head: bool = False):
         self.cfg = cfg = cfg or SparkConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H = cfg.hidden_size
-        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=OBJ_BYTES, vocab=cfg.vocab_size if vocab is None else vocab)
+        self.n_ids = cfg.vocab_size if vocab is None else vocab  # (the token ids of the LM rows: 0 .. ids - 1)
+        super().__init__(gguf, kc=KC, payload=MAX_K, tile_bytes=OBJ_BYTES, vocab=self.n_ids)
         assert cfg.num_attention_heads % COLS == 0 and cfg.num_key_value_heads * cfg.head_dim % (COLS * 64) == 0, cfg
         assert H % (64 * COLS) == 0 and self.vocab % (COLS * 64) == 0, cfg
         for L in self.layers:
             self._layer(L)
         self.lm = "token_embd.weight" if cfg.tied else "output.weight"
-        self._add(-1, "lm", [("lm", (self.lm,), column_rows(self.vocab))], H)
+        rows = column_rows(self.vocab)
+        if head:
+            self.draft_cols = draft_cols(self.n_ids, self.R[self.fmt(self.lm)], HEAD_ROWS)
+            F = COLS * self.draft_cols - TABLE_ROWS
+            self.fixed, self.table = (head_tokens(gguf, F) if self.n_ids == cfg.vocab_size else
+                                      (np.arange(F), np.arange(F, F + TABLE_ROWS)))
+            self.vocab = self.n_ids + TABLE_ROWS
+            rows = head_rows(self.n_ids, self.fixed, self.table)
+            self.order = lm_order(rows, self.draft_cols)
+        self._add(-1, "lm", [("lm", (self.lm,), rows)], H)
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
         self.column_major = contiguous(self)
         if self.column_major:  # (each normed phase's norm-weight objects before its tiles)

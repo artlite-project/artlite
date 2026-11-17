@@ -846,6 +846,71 @@ class DFlashConfig:
 
 
 @dataclass(frozen=True)
+class DSparkConfig:
+    """A DSpark block drafter of Spark-X (XHToken's ``<model>-DSpark-GGUF``: GGUF architecture ``dflash`` with a Markov
+    head, ``markov_w1``; XHToken's llama.cpp fork's ``src/models/dflash.cpp``), from the metadata of its file:
+    ``layers`` sliding-window layers of the model's shape (``hidden``, ``ffn`` with GeGLU, ``heads`` query heads with a
+    sigmoid output gate each over ``kv_heads`` KV heads of ``head_dim``, no q / k norms; RoPE on ``rope_dims`` dims,
+    base ``rope_base``), a block of ``block`` rows (the anchor, then ``mask_token``) that sees the ``window`` positions
+    before its anchor and itself whole; ``taps``: the model's layers whose inputs feed its cache (fc of their
+    concatenation, ``fc_norm`` per tap); the Markov head of ``rank`` dims (``markov_w1`` / ``markov_w2``, vocab x rank) and
+    the confidence head (``conf_proj``: hidden + rank -> 1)."""
+
+    layers: int
+    hidden: int
+    ffn: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    block: int
+    window: int
+    taps: tuple[int, ...]
+    mask_token: int
+    vocab_size: int
+    rank: int
+    rms_norm_eps: float
+    rope_base: float
+    rope_dims: int
+
+    @property
+    def hidden_size(self) -> int:
+        return self.hidden
+
+    @property
+    def num_hidden_layers(self) -> int:
+        return self.layers
+
+    @property
+    def intermediate_size(self) -> int:
+        return self.ffn
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> DSparkConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch == "dflash" and "markov_w1.weight" in gguf, f"{gguf.path}: not a DSpark drafter"
+        m = gguf.arch_meta
+        hd = int(m("attention.key_length"))
+        w1 = gguf.tensor("markov_w1.weight")
+        return cls(layers=int(m("block_count")), hidden=int(m("embedding_length")), ffn=int(m("feed_forward_length")),
+                   heads=int(m("attention.head_count")), kv_heads=int(m("attention.head_count_kv")), head_dim=hd,
+                   block=int(m("block_size")), window=int(m("attention.sliding_window")),
+                   taps=tuple(int(x) for x in m("target_layers")),
+                   mask_token=int(gguf.meta["tokenizer.ggml.mask_token_id"]), vocab_size=w1.rows, rank=w1.cols,
+                   rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")),
+                   rope_base=float(m("rope.freq_base_swa", 10000.0)), rope_dims=int(m("rope.dimension_count_swa", hd)))
+
+    def rope_theta(self, positions: np.ndarray | range | list) -> np.ndarray:
+        """(n, rope_dims / 2) float32 angles of positions (``SparkConfig.rope_theta``'s)."""
+        scale = np.float32(np.power(np.float32(self.rope_base), np.float32(-2.0 / self.rope_dims)))
+        th = np.asarray(positions, np.float32).reshape(-1)
+        out = np.empty((th.shape[0], self.rope_dims // 2), np.float32)
+        for i in range(self.rope_dims // 2):
+            out[:, i] = th
+            th = (th * scale).astype(np.float32)
+        return out
+
+
+@dataclass(frozen=True)
 class ClipConfig:
     """A vision encoder and projector, from the metadata of its GGUF file (architecture ``clip``; llama.cpp's
     ``tools/mtmd/clip.cpp``): ``projector`` (``clip.projector_type``: "minicpmv4_7", "qwen3vl_merger"), the ViT

@@ -75,8 +75,10 @@ def ring_groups(window: int) -> int:
 class SparkOverlay(ModelOverlay):
     """A Spark-X GGUF model on the decode overlay of 8 slots. ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the full layers' caches' capacity,
-    ``weights``: the image's buffer allocated ahead (its image's layers and vocabulary), ``formats``: tile formats the
-    design runs besides the image's (a drafter's), ``image``: an image laid out already (``ModelOverlay``'s)."""
+    ``weights``: the image's buffer allocated ahead (its image's layers and vocabulary), ``formats``, ``gu``: tile
+    formats and gate / up rows per tile the design runs besides the image's (a drafter's: ``dspark.DSparkOverlay.needs``),
+    ``head``: the LM rows with a drafter's head (``SparkImage``), ``image``: an image laid out already
+    (``ModelOverlay``'s)."""
 
     CONFIG, IMAGE = SparkConfig, SparkImage
     NORMED = frozenset(NORMS)
@@ -84,11 +86,13 @@ class SparkOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 image: SparkImage | None = None):
+                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None):
+        if image is None and weights is None:
+            image = SparkImage(gguf, layers=layers, vocab=vocab, head=head)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
-        gu = {R for r in img.regions if r.name == "gate_up" for b in r.blocks for R in (b.R, b.R2) if R}
+        gu = {R for r in img.regions if r.name == "gate_up" for b in r.blocks for R in (b.R, b.R2) if R} | set(gu)
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=8, spec=attn_spec(cfg))
         self.max_positions = self.ash.max_positions
         self.nr = ring_groups(cfg.sliding_window)

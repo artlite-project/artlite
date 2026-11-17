@@ -33,6 +33,7 @@ from ..operators.util import rup
 from ..overlay import OverlayDevice, Sequence, Transaction, WeightBuffer
 from ..txn import HardwareLimitError
 from . import phases as mp
+from .head import LogitsOrder
 from .image import TileImage
 from .protocol import (
     BC_COL,
@@ -236,6 +237,7 @@ class ModelOverlay:
         self._once_t = 0.0  # (the one-time work before the step's ``_run``)
         self._ran_keys: set[StepKey] = set()
         self._pads: list[tuple[int, int, int]] | None = None  # (``_clear_pads``)
+        self._lm_order: LogitsOrder | None = None  # (``_npu_logits``)
         self._dirty: set[int] = set()  # (the packed-slot layouts whose padding a step of more slots wrote over)
 
     @property
@@ -547,9 +549,15 @@ class ModelOverlay:
 
     def _npu_logits(self, S: int) -> np.ndarray:
         """The cores' logits of the last step (S, vocab) bf16: the LM rows of the vocabulary (an image's rows padded to
-        whole C objects per column are cut off)."""
+        whole C objects per column are cut off); of an image whose LM rows are not in id order (``order``: a drafter
+        head's, ``decode.head``) in id order, the ids' rows, in a buffer valid until the next dispatch as the NPU's (the
+        head's table rows left out)."""
         self.dev.fetch("LOGITS", 0, 2 * S * self.vocab)
         x = self.dev.view("LOGITS")[:2 * S * self.vocab].view(bfloat16).reshape(S, self.vocab)
+        if (order := getattr(self.image, "order", None)) is not None:
+            if self._lm_order is None:
+                self._lm_order = LogitsOrder(order, self.SLOTS)
+            return self._lm_order(x.view(np.uint16)).view(bfloat16)
         return x[:, :min(self.vocab, self.cfg.vocab_size)]
 
     def _lm_x(self, S: int) -> np.ndarray:
