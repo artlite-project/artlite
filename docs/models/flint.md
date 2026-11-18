@@ -67,7 +67,7 @@ while they beat steps of one token. Short chat prompts, 400 tokens greedy, again
 
 | | 1K | 8K | 32K | 64K |
 |---|---|---|---|---|
-| time to the first token (`artlite-bench`, essays) | 0.81 s | 3.87 s | 23.7 s | 70.1 s |
+| time to the first token (`artlite-bench`, random tokens) | 0.81 s | 3.76 s | 21.5 s | 61.4 s |
 | generation (greedy, 256 tokens, essay summary) | 31.4 tokens/s | | 19.3 tokens/s | |
 | the same with the DFlash2 drafter (steps of up to 4 tokens) | 36.5 tokens/s | | 21.6 tokens/s | |
 

@@ -222,11 +222,10 @@
     {
       "model": "Flint",
       "quant": "int4",
-      "ttft_s": {"1024": 0.806, "8192": 3.87, "32768": 23.7, "65536": 70.1},
-      "prefill_tps": {"1024": 1270, "32768": 1385},
+      "ttft_s": {"1024": 0.811, "8192": 3.76, "32768": 21.5, "65536": 61.4},
+      "prefill_tps": {"1024": 1262, "32768": 1525},
       "decode_tps": {"1024": 31.4, "32768": 19.3},
-      "mtp": {"drafter": "DFlash2", "decode_tps": {"1024": 36.5, "32768": 21.6}, "tokens_per_step": {"1024": 4, "32768": 4}},
-      "notes": {"ttft_s": {"65536": "the median of 3 runs: another process's CPU load overlapped the third (75.8 s)"}}
+      "mtp": {"drafter": "DFlash2", "decode_tps": {"1024": 36.5, "32768": 21.6}, "tokens_per_step": {"1024": 4, "32768": 4}}
     }
   ]
 }

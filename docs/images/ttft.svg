@@ -686,12 +686,12 @@
 <line x1="168.8" y1="1268.5" x2="168.8" y2="1272.5" class="axis"/>
 <text x="168.8" y="1284.5" text-anchor="middle">64k</text>
 <line x1="185.4" y1="1268.5" x2="185.4" y2="1272.5" class="axis"/>
-<polyline points="69.0,1210.5 118.9,1172.9 152.1,1129.4 168.8,1103.4" class="l0"/>
-<circle cx="69.0" cy="1210.5" r="3.5" class="d0"><title>Artlite int4, 1k tokens: 0.806 s</title></circle>
-<circle cx="118.9" cy="1172.9" r="3.5" class="d0"><title>Artlite int4, 8k tokens: 3.87 s</title></circle>
-<circle cx="152.1" cy="1129.4" r="3.5" class="d0"><title>Artlite int4, 32k tokens: 23.7 s</title></circle>
-<circle cx="168.8" cy="1103.4" r="3.5" class="d0"><title>Artlite int4, 64k tokens: 70.1 s</title></circle>
-<text x="175.8" y="1107.4" class="halo">70.1 s</text>
+<polyline points="69.0,1210.4 118.9,1173.6 152.1,1131.7 168.8,1106.6" class="l0"/>
+<circle cx="69.0" cy="1210.4" r="3.5" class="d0"><title>Artlite int4, 1k tokens: 0.811 s</title></circle>
+<circle cx="118.9" cy="1173.6" r="3.5" class="d0"><title>Artlite int4, 8k tokens: 3.76 s</title></circle>
+<circle cx="152.1" cy="1131.7" r="3.5" class="d0"><title>Artlite int4, 32k tokens: 21.5 s</title></circle>
+<circle cx="168.8" cy="1106.6" r="3.5" class="d0"><title>Artlite int4, 64k tokens: 61.4 s</title></circle>
+<text x="175.8" y="1110.6" class="halo">61.4 s</text>
 <text x="86.9" y="1090.5" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 86.9 1090.5)">10 tok/s</text>
 <text x="84.7" y="1130.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 84.7 1130.9)">100 tok/s</text>
 <text x="109.1" y="1161.9" text-anchor="middle" class="muted small halo" transform="rotate(-45.0 109.1 1161.9)">1k tok/s</text>

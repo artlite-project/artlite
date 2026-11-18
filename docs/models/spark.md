@@ -57,7 +57,7 @@ matrix products skip the padding).
 
 ## Speed and accuracy (Strix Halo)
 
-Prompts (`artlite-bench`, time to the first token, with the drafter's rows; essays):
+Prompts (`artlite-bench`, time to the first token, with the drafter's rows; random tokens):
 
 | | 1K | 8K | 32K | 64K |
 |---|---|---|---|---|
