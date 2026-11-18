@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from artlite.decode import kv
+from artlite.decode.attn_overlay import CacheKind
 from artlite.decode.vring import tails
 
 CHAIN = 4  # (Gemma's: the columns of a KV head)
@@ -78,6 +79,24 @@ def test_fill(g0: int, n: int) -> None:
     """The A fill of a range reads its groups' objects (3 per group) in group order; an empty range one object."""
     a0, n0 = kv.fill(g0, n)
     assert list(range(a0, a0 + n0)) == ([3 * g + i for g in range(g0, g0 + n) for i in range(3)] if n else [0])
+
+
+@pytest.mark.parametrize("wrap", [10, 16])
+def test_ring_fills(wrap: int) -> None:
+    """A ring's (``CacheKind.wrap``) two fills of a range read its groups' slots' objects in group order, each fill at
+    least one object, wherever the range wraps; an empty range two objects; offsets map to the slots."""
+    kind = CacheKind(hd=128, pg=64, groups=8 + wrap, guard=8, window=513, wrap=wrap)
+    G = 3
+    for g0 in range(3 * wrap):
+        for n in range(10):
+            f = kind.fills(g0, n, G)
+            assert len(f) == 2 and all(k >= 1 for _, k in f), (g0, n, f)
+            got = [x for a, k in f for x in range(a, a + k)]
+            assert got == ([G * (g % wrap) + i for g in range(g0, g0 + n) for i in range(G)] if n else [0, 0]), (g0, n)
+    gb = G * 9216
+    assert kind.at(5 * gb + 100, gb) == 5 * gb + 100 and kind.at((wrap + 3) * gb + 7, gb) == 3 * gb + 7
+    linear = CacheKind(hd=128, pg=64, groups=40)
+    assert linear.fills(3, 4, G) == (kv.fill(3, 4),) and linear.at(30 * gb, gb) == 30 * gb
 
 
 @pytest.mark.parametrize("hd", [256, 512])

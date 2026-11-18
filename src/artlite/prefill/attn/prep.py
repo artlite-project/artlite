@@ -26,7 +26,7 @@ from ...operators.design import COLS, MAX_BD_ITER
 from ...operators.kernel_source import kernel_prefix
 from ...operators.util import Attr, bf16_hilo, regions
 from ..gemm import Layout
-from .shape import P_CS, P_KV, Shape
+from .shape import P_CS, P_KV, P_KVR, Shape
 
 _PREP = templating.load("artlite/prefill/attn/prep.cc.jinja")
 
@@ -78,15 +78,17 @@ class PrepOperator(ArtcOperator):
     pfx = kernel_prefix("pap")
 
     def __init__(self, *, T: int, shape: Shape, layout: Layout, kv_bytes: int, cs_positions: int, kv_pad: int = 0,
-                 norm: bool = False, eps: float = 1e-6, kv0: int = 0):
-        """``kv0``: the bytes of a KV head's cache before its group 0 (a sliding-window cache's guard)."""
+                 norm: bool = False, eps: float = 1e-6, kv0: int = 0, wrap: int = 0):
+        """``kv0``: the bytes of a KV head's cache before its group 0 (a sliding-window cache's guard); ``wrap``: the cache
+        a ring of that many groups (``decode.attn_overlay.CacheKind.wrap``: group g at slot g % wrap, a chunk within one
+        turn of it), its offset ``P_KVR`` (the other caches' ``P_KV`` in the same programs)."""
         s = shape
         assert T % s.pg == 0 and T // s.pg <= 64 and {"q", "k", "v"} <= set(layout.off)
         assert s.qh in (2, 3, 4) and s.used % 1152 == 0 and s.per in (1, 2)
         assert s.per == 1 or (s.qh in (2, 4) and s.hd % (2 * 64) == 0), "two columns per KV head: a column's 2 or 4 heads"
         assert not s.gate or (s.per == 2 and "g" in layout.off), "the gates: the cores two columns of a KV head free"
         self.T, self.shape, self.layout, self.kv_bytes, self.cs_positions = T, s, layout, kv_bytes, cs_positions
-        self.kv_pad, self.norm, self.eps, self.kv0 = kv_pad, norm, eps, kv0
+        self.kv_pad, self.norm, self.eps, self.kv0, self.wrap = kv_pad, norm, eps, kv0, wrap
         self.nq = [-(-s.qh // 2), s.qh // 2]  # (the Q cores' heads)
         super().__init__()
 
@@ -128,7 +130,11 @@ class PrepOperator(ArtcOperator):
         """The scratchpad parameters of a chunk at position p0 (a group start)."""
         s = self.shape
         assert p0 % s.pg == 0 and p0 + self.T <= self.cs_positions
-        return {P_CS: 2 * s.hd * p0, P_KV: s.group // 2 * (p0 // s.pg)}
+        g = p0 // s.pg
+        if self.wrap:
+            assert g % self.wrap + self.T // s.pg <= self.wrap, (p0, self.T, "a chunk across the ring's wrap")
+            return {P_CS: 2 * s.hd * p0, P_KVR: s.group // 2 * (g % self.wrap)}
+        return {P_CS: 2 * s.hd * p0, P_KV: s.group // 2 * g}
 
     def get_mlir_artifact(self) -> Module:
         return self._pair_design() if self.shape.per == 2 else self._column_design()
@@ -150,7 +156,7 @@ class PrepOperator(ArtcOperator):
         k_k = Kernel(f"{p}_k", "kernel.o", [row_ty, cs_ty, ws_ty, kg_ty, np.int32])
         k_v = Kernel(f"{p}_v", "kernel.o", [row_ty, vg_ty, np.int32])
         k_prm = Kernel(f"{p}_prm", "kernel.o", [cs_ty, ws_ty]) if self.norm else None
-        p_cs, p_kv = ScratchpadParameter(P_CS, np.int32), ScratchpadParameter(P_KV, np.int32)
+        p_cs, p_kv = ScratchpadParameter(P_CS, np.int32), ScratchpadParameter(P_KVR if self.wrap else P_KV, np.int32)
         n_tg, rg, n_grp = T // 8, s.rg, T // s.pg
 
         # per column and token group [Q core 0's rows | Q core 1's | K rows | V rows], split in the memtile
@@ -258,7 +264,7 @@ class PrepOperator(ArtcOperator):
         k_v = Kernel(f"{p}_v", "kernel.o", [row_ty, vg_ty, np.int32])
         k_g = Kernel(f"{p}_g", "kernel.o", [gi_ty, go_ty]) if s.gate else None
         k_prm = Kernel(f"{p}_prm", "kernel.o", [cs_ty, ws_ty]) if self.norm else None
-        p_cs, p_kv = ScratchpadParameter(P_CS, np.int32), ScratchpadParameter(P_KV, np.int32)
+        p_cs, p_kv = ScratchpadParameter(P_CS, np.int32), ScratchpadParameter(P_KVR if self.wrap else P_KV, np.int32)
         n_tg, rg, n_grp = T // 8, s.rg, T // s.pg
         gate = s.gate
 

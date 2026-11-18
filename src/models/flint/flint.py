@@ -58,16 +58,23 @@ class NpuFlint(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("hilo",
     "single"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``;
     ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``; with a drafter: laid out with its head);
-    ``dflash``: a DFlash2 drafter's file (module docstring)."""
+    ``dflash``: a DFlash2 drafter's file (module docstring); ``wrap``: the sliding-window caches' ring (``FlintOverlay``)."""
 
     STEP_COST = (1.0, 1.32, 1.65, 1.98)  # (steps of 1 .. 4 slots at 1K: 31.4 ms for one slot; each slot's experts)
     drafter = None
 
+    @property
+    def recurrent(self) -> bool:
+        """(sliding-window caches as rings, ``FlintOverlay``'s past ``WRAP`` groups: the sequence goes back only to a
+        checkpoint, which holds their windows)"""
+        return self.overlay.wraps
+
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
-                 dflash: str | None = None):
+                 dflash: str | None = None, wrap: int | None = None):
         self.gguf = gguf
-        self.overlay = FlintOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, head=dflash is not None)
+        self.overlay = FlintOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, head=dflash is not None,
+                                    wrap=wrap)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         # (the drafter's rings hold a chunk's writes past them and its padding rows: the prefill's largest chunk, gap)

@@ -39,6 +39,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
     QwenConfig,
     decision_mmproj,
+    flint_gguf,
     gemma_gguf,
     lfm3_gguf,
     lfm3a_mmproj,
@@ -263,6 +264,38 @@ def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
             ov.step(x, e, p, logits=lg)
 
         _run_plain(ov, log, step, lm=False)
+
+    return run
+
+
+def _flint(path: str, wrap: int) -> Callable[[Callable[[object], _Log]], None]:
+    """Flint: plain steps; with its sliding-window caches a ring of ``wrap`` groups (``CacheKind.wrap``): steps of 1 .. 4
+    slots across the ring's wraps (1024 and 2048 positions), a snapshot and its restore, a reset."""
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.flint.overlay import FlintOverlay
+
+        ov = FlintOverlay(GGUFFile(path), max_positions=2560 if wrap else 4096, **({"wrap": wrap} if wrap else {}))
+        log = attach(ov.op)
+        if not wrap:
+            _run_plain(ov, log, lambda x, p, lg: ov.step(x, p, logits=lg))
+            return
+        rng = np.random.default_rng(3)
+        ov.load()
+        p, i, snap = 0, 0, None
+        while p + 4 <= 2300:
+            S = (1, 4, 3, 2, 4)[i % 5] if p < 200 or 980 < p < 1100 or p > 2000 else 4
+            log.label = f"S={S} p={p}"
+            ov.step(_x(rng, S, ov.H), p, logits=i % 4 == 0)
+            if p >= 1100 and snap is None:
+                snap = (p + S, ov.snapshot(p + S))
+            p, i = p + S, i + 1
+        ov.restore(snap[1])
+        log.label = f"restored S=1 p={snap[0]}"
+        ov.step(_x(rng, 1, ov.H), snap[0])
+        ov.reset()
+        for p in range(0, 40, 4):
+            log.label = f"after reset S=4 p={p}"
+            ov.step(_x(rng, 4, ov.H), p)
 
     return run
 
@@ -566,6 +599,8 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "spark-4B-Q4_K_M": (spark_gguf("4B"), _spark),
     "spark-1.7B-Q4_K_M": (spark_gguf("1.7B"), _spark),
     "spark-4B-bartowski-Q4_K_M": (spark_gguf("4B", "Q4_K_M", "bartowski"), _spark),
+    "flint-int4": (flint_gguf(), lambda p: _flint(p, 0)),
+    "flint-int4-ring": (flint_gguf(), lambda p: _flint(p, 16)),
 }
 
 

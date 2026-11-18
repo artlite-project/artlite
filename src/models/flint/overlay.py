@@ -21,7 +21,10 @@ and the LM head (normed: ``output_norm``) -> LOGITS [slot][vocab] bf16.
 The KV caches (KV): per layer and KV head linear groups of kp + 1 objects of the tile size T (``decode.kv``: 64 positions per
 group at head_dim 128), a sliding-window layer's after a guard of the window's groups (8: keys p - 512 .. p are in the 8
 groups before p's at most); then per layer and KV head a ring of two slots of T bytes with the exact V values of the open
-records (``decode.vring``). The full layers have no positional encoding (their kind's rotated pairs: none).
+records (``decode.vring``). The full layers have no positional encoding (their kind's rotated pairs: none). Past ``WRAP``
+groups of capacity a sliding-window layer's cache is a ring of ``WRAP`` groups (``CacheKind.wrap``: its window read in
+two fills, the prefill's chunks never across its wrap, its guard a copy of the ring's last groups when a chunk's window
+reaches back over the wrap): 1.0 GB for any context instead of 15.8 GB at 256K.
 
 The step's transaction is built once per S and pattern of sub-steps (and LM head or not) and patched per step: each
 column's range of each layer's cache per sub-step (A: address, length), a chain end's tail objects (A: the ring slots of
@@ -78,6 +81,8 @@ FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down"
 MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32}  # (moe_in's blocks: ``decode.design``)
 CHAIN = 2  # columns per KV head
 KV_PAD = 8192  # positions past the caches (the last layer's): the prefill's slices of a cache
+WRAP = 256  # groups of a sliding-window cache's ring (16384 positions: two of the prefill's largest chunks, so a prompt from
+# position 0 runs its chunks whole), past which capacity it is one
 KINDS = ("swa", "full")  # the cache kinds: token object t = SLOTS kind + a, of the sub-step from slot a on
 FORMATS = frozenset({"Q4_1_64", "BFP16"})  # the tile formats the overlay runs (the official file's and its router's)
 
@@ -87,7 +92,8 @@ class FlintOverlay(AttentionOverlay):
     one reads x), ``vocab``: LM rows (default: the padded vocabulary), ``max_positions``: the caches' capacity, ``kv_k``:
     the caches' K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's
     buffer allocated ahead; ``head``: the LM rows laid out with a DFlash2 drafter's head (``FlintImage``; a
-    ``decode.dflash.overlay.DFlashTarget``)."""
+    ``decode.dflash.overlay.DFlashTarget``); ``wrap``: the sliding-window caches' ring (groups; 0: linear; default: ``WRAP``
+    past that capacity)."""
 
     CONFIG, IMAGE = FlintConfig, FlintImage
     KV_PAD = KV_PAD
@@ -96,7 +102,8 @@ class FlintOverlay(AttentionOverlay):
     NORMED = frozenset({"qkv", "gate_up", "moe_in", "lm"})
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, head: bool = False):
+                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, head: bool = False,
+                 wrap: int | None = None):
         image = FlintImage(gguf, layers=layers, vocab=vocab, head=True) if head and weights is None else None
         super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
         cfg, img = self.cfg, self.image
@@ -121,8 +128,10 @@ class FlintOverlay(AttentionOverlay):
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)  # (groups before a sliding-window cache's first one)
         full = -(-max_positions // self.pg)
         self.max_positions = full * self.pg
-        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.guard + full, guard=self.guard,
-                                window=cfg.sliding_window),
+        wrap = (WRAP if full > WRAP else 0) if wrap is None else wrap
+        assert not wrap or self.guard < wrap < full, (wrap, full)
+        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.guard + (wrap or full), guard=self.guard,
+                                window=cfg.sliding_window, wrap=wrap),
                       CacheKind(hd=self.hd, pg=self.pg, groups=full))
         self.uses = {L: CacheUse(kind=KINDS.index(cfg.kinds[L]), source=L, ring=L) for L in self.layers}
         self.period = PAIR
@@ -305,4 +314,4 @@ class FlintOverlay(AttentionOverlay):
         return np.concatenate([self._read_input(rg, slot, rg.K) for rg in self.inp[(L, "o")]])
 
 
-__all__ = ["KV_PAD", "FlintOverlay"]
+__all__ = ["KV_PAD", "WRAP", "FlintOverlay"]

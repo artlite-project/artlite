@@ -78,7 +78,7 @@ class AttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
                  ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
-                 bcast: bool = True, causal: bool = True, part: int = 0):
+                 bcast: bool = True, causal: bool = True, part: int = 0, wrap: int = 0):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
@@ -91,7 +91,8 @@ class AttnOperator(ArtcOperator):
         ``part``: the item's place in a larger chunk whose attention runs as items of T tokens, each at its own position
         (its cores read the chunk's P_P8 and P_FQ plus the part's offsets, its fills' parameters are named with the suffix
         ``_<part>``: a library's runtime sequence reads 32 at most; the cache holds the whole chunk's records before the
-        first item: ``PrepOperator``)."""
+        first item: ``PrepOperator``); ``wrap`` (sliding window): the cache a ring of that many groups, ``P_SW`` the chunk's
+        slot (``PrepOperator(wrap=)``)."""
         s = shape
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
@@ -102,7 +103,8 @@ class AttnOperator(ArtcOperator):
         assert 4 * self.qb * s.qh % 4 == 0  # (a pass's Q units: whole B objects of 4)
         assert self.pq <= 72, "a pass's segment starts in its object's first 72 values (stream B's walk)"
         self.T, self.shape, self.kv_bytes, self.kv_pad, self.ablate = T, s, kv_bytes, kv_pad, tuple(ablate)
-        self.part = part
+        self.part, self.wrap = part, wrap
+        assert not wrap or swa, "a ring: a sliding window's cache"
         self.n_pass = T // self.pq
         self.mode = AttnMode.make(s, T=T, m=self.m, window=window, ring=ring, swa=swa, kv0=kv0, bcast=bcast,
                                   causal=causal)
@@ -268,7 +270,8 @@ class AttnOperator(ArtcOperator):
         assert not self.nc, "non-causal: set_params"
         assert p0 % s.pg == 0 and lead in (0, s.pg) and (self.win or not lead)
         if self.swa:
-            return {P_P8: p0 // 8, P_SW: s.group // 2 * (p0 // s.pg)}
+            g = p0 // s.pg
+            return {P_P8: p0 // 8, P_SW: s.group // 2 * (g % self.wrap if self.wrap else g)}
         fg = p0 // s.pg + 1
         if self.ring:
             assert fg - 1 + lead // s.pg <= self.ring, (p0, lead, self.ring, "a history the memory tiles hold")

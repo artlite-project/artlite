@@ -100,6 +100,7 @@ class FlintPrefill(ChunkPrefill):
         self.kv_bytes = {cfg.kinds[L]: ov.kv_bytes(L) for L in self.layers}  # (per KV head, a guard included)
         self.kv0 = {"swa": ov.guard * s.group, "full": 0}
         self.win = {"swa": cfg.sliding_window, "full": 0}
+        self.wrap = {"swa": ov.kinds[0].wrap, "full": 0}  # (a ring's chunks: within one turn of it, ``fits``)
         kinds = sorted(self.kv_bytes)
         moe = [L for L in self.layers if cfg.moe_layer(L)]
         self.moe = MoEPrefill(img, layers=moe, sizes=self.sizes, sub=SUB, eps=cfg.rms_norm_eps, gating="sigmoid") \
@@ -125,7 +126,7 @@ class FlintPrefill(ChunkPrefill):
     def _attn(self, kind: str, T: int, part: int = 0) -> PA.AttnOperator:
         """The flash attention of a kind over T tokens (``part``: a larger chunk's)."""
         return PA.AttnOperator(T=T, shape=self.shape, kv_bytes=self.kv_bytes[kind], kv_pad=self.pad, sub=self._pt(T),
-                               swa=self.win[kind], kv0=self.kv0[kind], part=part)
+                               swa=self.win[kind], kv0=self.kv0[kind], part=part, wrap=self.wrap[kind])
 
     def _attns(self, kind: str, T: int) -> list[PA.AttnOperator]:
         """The flash attention items of a chunk of size T (one, or its parts of ATTN_T tokens)."""
@@ -175,7 +176,7 @@ class FlintPrefill(ChunkPrefill):
                 if (k, lay.key, pt) not in preps:
                     preps[(k, lay.key, pt)] = PA.PrepOperator(
                         T=pt, shape=self.shape, layout=lay, kv_bytes=self.kv_bytes[k], cs_positions=self.cs_rows,
-                        kv_pad=self.prep_pad, norm=True, eps=eps, kv0=self.kv0[k])
+                        kv_pad=self.prep_pad, norm=True, eps=eps, kv0=self.kv0[k], wrap=self.wrap[k])
         return SimpleNamespace(
             plans=plans, d_pitch=dp, f_part=f_part, rb_y=2 * COLS * dp, preps=preps,
             pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out, cols=cols),
@@ -371,6 +372,12 @@ class FlintPrefill(ChunkPrefill):
                     out |= at.params(p0 + j * at.T)
         return out
 
+    def fits(self, T: int, p0: int) -> bool:
+        """(and within one turn of a sliding-window ring: its window's history before the chunk is the ring's or its
+        guard's, ``FlintOverlay.mirror``)"""
+        w = self.wrap["swa"]
+        return super().fits(T, p0) and (not w or (p0 // self.group) % w + T // self.group <= w)
+
     def run(self, x: np.ndarray, p0: int, T: int = 0) -> None:
         """A chunk of size T (default: the smallest that holds x): x (n, hidden) the embeddings of positions p0 .. p0 +
         n - 1 (the caches hold the positions before). Leaves the layers' K / V of the positions in the caches and the
@@ -378,6 +385,7 @@ class FlintPrefill(ChunkPrefill):
         n, dev = x.shape[0], self.ov.dev
         T = self._size(n, p0, T)
         self._stage_px(x, T, bfloat16)
+        self.ov.mirror(p0)
         for d in self.drafters:
             d.before(dev, p0, T)
         hooks = {}

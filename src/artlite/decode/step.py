@@ -16,12 +16,14 @@ from ..overlay import Transaction
 
 
 class Fill(NamedTuple):
-    """A column's range of a layer's cache in a sub-step (A): the BD's first word in the transaction."""
+    """A column's range of a layer's cache in a sub-step (A): the BD's first word in the transaction; ``piece``: of a ring's
+    two fills (``CacheKind.fills``)."""
 
     at: int
     layer: int
     column: int
     sub: int
+    piece: int = 0
 
 
 class Tail(NamedTuple):
@@ -61,13 +63,14 @@ class StepPlan:
 
 @dataclass(frozen=True)
 class FillTable:
-    """The cache fills as arrays: BD word index, cache kind, sub-step, the column's place in its chain, the byte offset in
-    KV of group 0 of the KV head's cache."""
+    """The cache fills as arrays: BD word index, cache kind, sub-step, the column's place in its chain, the fill's piece,
+    the byte offset in KV of group 0 of the KV head's cache."""
 
     at: np.ndarray
     kind: np.ndarray
     sub: np.ndarray
     place: np.ndarray
+    piece: np.ndarray
     base: np.ndarray
 
 
@@ -108,8 +111,8 @@ class PatchTables:
 
 class PositionWords(NamedTuple):
     """What the token objects of a step at p give its patches, per cache kind and sub-step ``u``: ``pu[kind, u]`` its first
-    position and slots; ``fo[kind, u, j]`` the A fill of chain column j (first object, objects); ``ro[kind, u, i]`` its
-    i-th record (the base, offset and bytes of its drain)."""
+    position and slots; ``fo[kind, u, j, f]`` the A fill f of chain column j (first object, objects:
+    ``attn_overlay.CacheKind.fills``); ``ro[kind, u, i]`` its i-th record (the base, offset and bytes of its drain)."""
 
     pu: np.ndarray
     fo: np.ndarray

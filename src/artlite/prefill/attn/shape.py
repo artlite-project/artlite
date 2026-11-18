@@ -22,6 +22,7 @@ P_G0 = "pa_g0"  # bf16 offset of the chunk's first group (``AttnOperator(ring=)`
 P_FH = "pa_fh"  # the history's chunks of CR records (``AttnOperator(ring=)``: the cores')
 P_HK = "pa_hk"  # the chunk's first keys every row sees (packed: a lead, ``AttnOperator.params``)
 P_SW = "pa_sw"  # (sliding window) bf16 offset of the chunk's first cache group from a KV head's group 0
+P_KVR = "pa_kvr"  # (a ring's prep, ``PrepOperator(wrap=)``) bf16 offset of the chunk's first cache group's slot
 
 
 

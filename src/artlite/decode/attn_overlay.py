@@ -58,7 +58,7 @@ from .attn import (
     Attn,
     U,
 )
-from .model import CacheRows, ModelOverlay
+from .model import CacheRows, ModelOverlay, Snapshot, host_bytes
 from .protocol import (
     C_LEN,
     F_POST,
@@ -95,13 +95,37 @@ class CacheKind:
     """One kind of KV cache of an overlay (e.g. a sliding-window one and a full one): ``hd`` the head dim of its layers,
     ``pg`` the positions of a group, ``groups`` the groups of a KV head's cache (a ``guard`` included: the groups before
     the first position's, which a sliding window's prefill attention reads from there on), ``window`` the attention
-    window in positions (0: none)."""
+    window in positions (0: none), ``wrap`` the groups of a sliding-window cache kept as a ring (group g at slot g % wrap,
+    its guard a copy of the slots before slot 0: ``slot``, ``fills``; 0: linear)."""
 
     hd: int
     pg: int
     groups: int
     guard: int = 0
     window: int = 0
+    wrap: int = 0
+
+    def slot(self, g: int) -> int:
+        """The slot of group g (a ring: g % wrap)."""
+        return g % self.wrap if self.wrap else g
+
+    def at(self, off: int, gb: int) -> int:
+        """A byte offset from group 0 of a KV head's linear cache (groups of gb bytes) -> its offset in this cache."""
+        return (off // gb) % self.wrap * gb + off % gb if self.wrap else off
+
+    def fills(self, g0: int, n: int, G: int) -> tuple[tuple[int, int], ...]:
+        """The A fills (first object, objects) of a column's range of the cache (groups g0 .., n of them; G objects per
+        group): one (``kv.fill``), or of a ring two, split where the range wraps, else before its last object (the
+        transaction's tasks the same at every position); an empty range: two objects the core skips."""
+        if not self.wrap:
+            return (kv.fill(g0, n, G - 1),)
+        if n == 0:
+            return (0, 1), (0, 1)
+        a = g0 % self.wrap
+        assert n <= self.wrap, (n, self.wrap)
+        if a + n <= self.wrap:
+            return (G * a, G * n - 1), (G * (a + n) - 1, 1)
+        return (G * a, G * (self.wrap - a)), (0, G * (n - self.wrap + a))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -195,8 +219,11 @@ class AttentionOverlay(ModelOverlay):
         return self.ring_off[L] + 2 * h * self.T
 
     def cache_rows(self) -> list[CacheRows]:
+        """(linear caches: a ring's groups are a snapshot's, ``snapshot``)"""
         out = []
         for k, kind in enumerate(self.kinds):
+            if kind.wrap:
+                continue
             offs = [self.kv_base(L, h) for L in self.kv_off if self.uses[L].kind == k for h in range(self.kv_heads)]
             if offs:
                 out.append(CacheRows(np.array(offs, np.int64), self.G * self.T, kind.pg))
@@ -344,7 +371,8 @@ class AttentionOverlay(ModelOverlay):
             if u and own:
                 seq.sync()  # (sub-step u - 1's records in DDR: this one reads them)
             for c in range(COLS):  # (its range of the cache and a chain end's tail objects, patched per step)
-                st.fills.append(Fill(seq.fill("A", c, dev.address("KV", self.kv_off[src]), T), L, c, u))
+                st.fills += [Fill(seq.fill("A", c, dev.address("KV", self.kv_off[src]), T), L, c, u, f)
+                             for f in range(2 if kind.wrap else 1)]
                 if c % chain == chain - 1:  # (one object each: the slots of its records, ``_tails``)
                     st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[src]), T), L, c, u, t)
                                  for t in range(tails(n))]
@@ -438,7 +466,7 @@ class AttentionOverlay(ModelOverlay):
         chain, S, act = self.CHAIN, st.S, self.dev.view("ACT")
         K = len(self.kinds)
         pu = np.zeros((K, U, 2), np.int64)
-        fo = np.zeros((K, U, chain, 2), np.int64)
+        fo = np.zeros((K, U, chain, 2, 2), np.int64)
         ro = np.zeros((K, U, 6, 3), np.int64)
         for k, kind in enumerate(self.kinds):
             cs = self._rope(k, p, S).view(np.uint8).reshape(-1)
@@ -453,29 +481,33 @@ class AttentionOverlay(ModelOverlay):
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)
                 m[M_NS], m[M_POS], m[M_TOK_A] = n, p + a, a
+                fills = [kind.fills(g0, ng, self.G) for g0, ng in r]
                 for c in range(COLS):  # (every KV head's columns: the same ranges)
                     g0, ng = r[c % chain]
-                    no = kv.fill(g0, ng, self.kp)[1] + (tails(n) if c % chain == chain - 1 else 0)
+                    no = sum(x[1] for x in fills[c % chain]) + (tails(n) if c % chain == chain - 1 else 0)
                     m[M_TOK_G0 + c], m[M_TOK_NA + c], me[M_TOK_NG + c] = g0 * kind.pg, self.G * ng | no << 16, no
                 pu[k, u] = p + a, n
-                fo[k, u] = [kv.fill(*rj, self.kp) for rj in r]
-                rec = kv.records(p=p + a, S=n, hd=kind.hd, a_bytes=self.T, kp=self.kp)
+                for j, fj in enumerate(fills):
+                    fo[k, u, j, :len(fj)] = fj
+                gb = self.G * self.T
+                rec = [(b, kind.at(off, gb) if b == 0 else off, nb)
+                       for b, off, nb in kv.records(p=p + a, S=n, hd=kind.hd, a_bytes=self.T, kp=self.kp)]
                 ro[k, u, :len(rec)] = rec
         return PositionWords(pu, fo, ro)
 
     def _patch_tables(self, st: StepPlan) -> PatchTables:
         """A step's cache fills, tail fills and record drains as arrays."""
         uses, chain = self.uses, self.CHAIN
-        f = np.array([(x.at, uses[x.layer].kind, x.sub, x.column % chain,
+        f = np.array([(x.at, uses[x.layer].kind, x.sub, x.column % chain, x.piece,
                        self.kv_base(uses[x.layer].source, x.column // chain)) for x in st.fills],
-                     np.int64).reshape(-1, 5)
+                     np.int64).reshape(-1, 6)
         layers = tuple(dict.fromkeys(x.layer for x in st.tails))
         t = np.array([(x.at, uses[x.layer].kind, x.sub, x.obj, self.kv_base(uses[x.layer].source, x.column // chain),
                        self.ring(uses[x.layer].source, x.column // chain), uses[x.layer].source == x.layer,
                        layers.index(x.layer)) for x in st.tails], np.int64).reshape(-1, 8)
         r = np.array([(x.handle[0], uses[x.layer].kind, x.sub, x.i, self.kv_base(x.layer, x.head),
                        self.ring(x.layer, x.head)) for x in st.recs], np.int64).reshape(-1, 6)
-        return PatchTables(FillTable(f[:, 0], f[:, 1], f[:, 2], f[:, 3], f[:, 4]),
+        return PatchTables(FillTable(f[:, 0], f[:, 1], f[:, 2], f[:, 3], f[:, 4], f[:, 5]),
                            TailTable(t[:, 0], t[:, 1], t[:, 2], t[:, 3], t[:, 4], t[:, 5], t[:, 6].astype(bool),
                                      t[:, 7], layers),
                            RecTable(r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4:6]))
@@ -511,8 +543,8 @@ class AttentionOverlay(ModelOverlay):
         mode = np.array([modes[L][0] for L in tt.layers], bool)
         rec = mode[tt.layer] & (tt.obj == 0) & ((tt.sub == 0) | ~tt.own)
         q0, n = pu[tt.kind, tt.sub, 0], pu[tt.kind, tt.sub, 1]
-        vrec = np.array([[self.v_offset(k, int(x)) for x in row] for k, row in enumerate(pu[:, :, 0])],
-                        np.int64)[tt.kind, tt.sub]
+        vrec = np.array([[self.kinds[k].at(self.v_offset(k, int(x)), self.G * T) for x in row]
+                         for k, row in enumerate(pu[:, :, 0])], np.int64)[tt.kind, tt.sub]
         slot = np.where(tt.obj == 0, q0 >> 3, (q0 + n - 1) >> 3) & 1
         address = self.dev.address("KV") + np.where(rec, tt.base + vrec, tt.ring + slot * T)
         self._bd_words(st.tr.words, tt.at, address, np.full(len(rec), T, np.int64))
@@ -546,7 +578,7 @@ class AttentionOverlay(ModelOverlay):
         if st.patch is None:
             st.patch = self._patch_tables(st)
         t, kv0 = st.patch, dev.address("KV")
-        f = words.fo[t.fills.kind, t.fills.sub, t.fills.place]  # (first object, objects)
+        f = words.fo[t.fills.kind, t.fills.sub, t.fills.place, t.fills.piece]  # (first object, objects)
         self._bd_words(st.tr.words, t.fills.at, kv0 + t.fills.base + f[:, 0] * T, f[:, 1] * T)
         if not self._tails(st, p, words.pu, ahead):
             return False
@@ -566,15 +598,84 @@ class AttentionOverlay(ModelOverlay):
         rotated, normed as the model's attention norms it)."""
         kind = self.kinds[self.uses[layer].kind]
         pos = np.asarray(positions)
-        n, G, T = int(pos.max()) // kind.pg + 1, self.G, self.T  # (the groups that hold the positions)
+        G, T = self.G, self.T
+        g0, g1 = int(pos.min()) // kind.pg, int(pos.max()) // kind.pg + 1  # (the groups that hold the positions)
+        assert not kind.wrap or g1 - g0 <= kind.wrap, "positions a ring still holds"
+        slots = np.array([kind.slot(g) for g in range(g0, g1)])
         self.dev.fetch("KV", self.kv_off[layer], self.kv_heads * self.kv_bytes(layer))
         ks, vs = [], []
         for h in range(self.kv_heads):
             b = self.kv_base(layer, h)
-            k, v = kv.kv_from_groups(self.dev.view("KV")[b:b + n * G * T].reshape(n, G, T), kind.hd)
-            ks.append(k[pos])
-            vs.append(v[pos])
+            groups = self.dev.view("KV")[b:b + (int(slots.max()) + 1) * G * T].reshape(-1, G, T)[slots]
+            k, v = kv.kv_from_groups(groups, kind.hd)
+            ks.append(k[pos - g0 * kind.pg])
+            vs.append(v[pos - g0 * kind.pg])
         return np.stack(ks), np.stack(vs)
+
+    # ------------------------------------------------------------------
+    # Rings (``CacheKind.wrap``)
+    # ------------------------------------------------------------------
+
+    @property
+    def wraps(self) -> bool:
+        """Whether a cache is a ring (the sequence then goes back only to a snapshot: ``snapshot``)."""
+        return any(k.wrap for k in self.kinds)
+
+    def _ring_groups(self, position: int) -> list[tuple[int, CacheKind, int, int]]:
+        """Per own-cache layer of a ring: (layer, kind, first group, end group) of the groups that the windows of
+        ``position`` and later read (its group and the guard's before it)."""
+        out = []
+        for L in self.kv_off:
+            kind = self.kinds[self.uses[L].kind]
+            if kind.wrap:
+                g1 = position // kind.pg + 1
+                out.append((L, kind, max(0, g1 - 1 - kind.guard), g1))
+        return out
+
+    def snapshot(self, position: int) -> Snapshot:
+        """(and of each ring the groups its windows read from ``position`` on: ``extra["rings"]``)"""
+        snap = super().snapshot(position)
+        gb, kvv, parts = self.G * self.T, self.dev.view("KV"), []
+        for L, kind, g0, g1 in self._ring_groups(position):
+            a = host_bytes((self.kv_heads, g1 - g0, gb))
+            for h in range(self.kv_heads):
+                for i, g in enumerate(range(g0, g1)):
+                    o = self.kv_base(L, h) + kind.slot(g) * gb
+                    self.dev.fetch("KV", o, gb)
+                    a[h, i] = kvv[o:o + gb]
+            parts.append((L, g0, a))
+        if parts:
+            snap.extra["rings"] = parts
+        return snap
+
+    def restore(self, snapshot: Snapshot) -> None:
+        """(the rings' groups too)"""
+        super().restore(snapshot)
+        gb, kvv = self.G * self.T, self.dev.view("KV")
+        for L, g0, a in snapshot.extra.get("rings", ()):
+            kind = self.kinds[self.uses[L].kind]
+            for h in range(self.kv_heads):
+                for i in range(a.shape[1]):
+                    o = self.kv_base(L, h) + kind.slot(g0 + i) * gb
+                    kvv[o:o + gb] = a[h, i]
+                    self.dev.flush("KV", o, gb)
+
+    def mirror(self, p0: int) -> None:
+        """Before a prefill chunk at p0 (a group start) whose window reaches back over a ring's wrap (its first group in
+        the ring's first ``guard`` slots): each ring's guard as a copy of its last slots, so that the chunk's attention
+        reads the window's history before slot 0 in one run (``CacheKind.wrap``)."""
+        gb, kvv = self.G * self.T, self.dev.view("KV")
+        for L in self.kv_off:
+            kind = self.kinds[self.uses[L].kind]
+            g0 = p0 // kind.pg
+            if not kind.wrap or g0 < kind.wrap or g0 % kind.wrap >= kind.guard:
+                continue
+            n = kind.guard * gb
+            for h in range(self.kv_heads):
+                b = self.kv_base(L, h)
+                self.dev.fetch("KV", b + kind.wrap * gb - n, n)
+                kvv[b - n:b] = kvv[b + kind.wrap * gb - n:b + kind.wrap * gb]
+                self.dev.flush("KV", b - n, n)
 
     def residual(self, slot: int = 0) -> np.ndarray:
         """The last step's residual stream after the last layer (the LM header's update), bf16 values as fp32."""

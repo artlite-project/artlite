@@ -45,8 +45,10 @@ decode overlay of 4 token slots (`artlite.decode`) with the attention cores of G
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size: 22.26 GB (each pair of Q4_1 blocks shares one scale and offset: 144 bytes per row and 256 columns instead of 160,
 no weight changed); nothing is written to disk. A decode step streams 0.97 GB of dense weights and the 6 experts of
-each MoE layer, 1.46 GB in all. The KV caches take 84.7 KB per position (K as hi + lo blocks; the sliding-window layers'
-caches grow with the positions): 2.8 GB at 32K; 24.3 GB of RAM at a 4K context.
+each MoE layer, 1.46 GB in all. The KV caches take 84.7 KB per position (K as hi + lo blocks); past 16384 positions of
+capacity the sliding-window layers' caches are rings of 16384 positions (1.0 GB) and the full layers' take 24.2 KB per
+position: 1.8 GB at 32K, 7.4 GB at 256K (22.2 GB as linear caches); 24.3 GB of RAM at a 4K context. With the rings a
+conversation goes back only to a checkpoint (artlite-server takes them: the rings' windows, ~35 MB each).
 
 ## Drafting
 
