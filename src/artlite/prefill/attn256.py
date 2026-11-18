@@ -34,9 +34,15 @@ with ``pp`` 2: the readout models'), o += P V; at the pass's end o / l sigmoid(g
 panels. Within 0.7% of the exact attention of its own operands (hi + lo P: its output's own rounding, against 1.5-3x of
 it), ~1% rms of llama.cpp's attn_gated.
 
+Two streams: a row panel's o in a 16 KB region of its own (P V loads and stores each o in place: in one region they
+conflicted, 532 cycles per group against 305 scheduled), the softmax in two passes over both row panels' 512 scores
+(pass 1's P and f in a buffer of their own), and the row sums l on the MMUL: P V adds P E^T (E a panel of 1 / 8), the
+sum of the bfp16 P that o takes.
+
 Time (T = 512, per layer alone, at p0 = 0 / 4K / 16K): the 27B 1.38 / 6.89 / 22.1 ms (its compute compiled out at
-16K: 20.6, the KV re-streams of the 32-query passes at the DDR ceiling), the 1B 0.97 / 2.47 / 7.23 (5.99: the cores'
-QK binds), the 35B-A3B (two streams) 1.12 / 3.44 / 10.6 (8.8).
+16K: 20.6, the KV re-streams of the 32-query passes at the DDR ceiling). The 1B (T = 2048 at p0 = 64K / 123K) 50.5 / 93.1
+ms (44.2 / 80.6 with every kernel compiled out: the DDR's 55-57 GB/s), per 32-key group and core ~1370 cycles: QK 590,
+the softmax 308, P V 354.
 """
 
 import math
@@ -105,6 +111,8 @@ QA_CS_SWA = "qa_cs_swa"  # (a sliding-window layer's prep) bf16 offset of the ch
 QA_HA, QA_HAN, QA_HB, QA_HBN = "qa_ha", "qa_han", "qa_hb", "qa_hbn"
 QA_CA, QA_CAN, QA_CB, QA_CBN = "qa_ca", "qa_can", "qa_cb", "qa_cbn"
 PW = 2 * 512  # bytes of the attention softmax's scratch (P and f)
+PW_TWO = 4 * 320  # (two streams) the scratch's bytes: the row panels' P panels, hi + lo P's lo from 640
+PF_TWO = 2 * 2 * 512 * 2  # (two streams) the softmax's pass 1 output: P, f of both row panels' 512 scores, bf16
 GATE_AT = PANEL_BYTES // 2  # (a gate per head) bf16 index in a Q slot of its 8 tokens' sigmoid(gate): d-block 0's lo panel
 
 
@@ -481,15 +489,27 @@ class PrefillAttnOperator(ArtcOperator):
 
     def workspace(self) -> dict[str, int]:
         R = self.R
-        sizes = [("sc", R * 1024), ("m", R * 256), ("b", R * 256), ("l", R * 256)] + \
-            ([("lh", 96 * self.qg), ("lv", 256 * self.qg), ("jl", 128)] if self.pack else []) + [("o", R * 8192)]
+        pk = [("lh", 96 * self.qg), ("lv", 256 * self.qg), ("jl", 128)] if self.pack else []
+        if self.two:  # (regions 2 and 3, ``l1_layout``: o of row panel 0, the Q slots, the scores ..., o of row panel 1
+            # in the last 8 KB: PV loads and stores each panel's o in a region of its own)
+            w = regions([("o", 8192), ("q", R * SLOT), ("sc", R * 1024), ("m", R * 256), ("b", R * 256),
+                         ("l", R * 256), *pk])
+            assert R == 2 and w["size"] <= 3 * REGION // 2, w
+            return {**w, "o1": 3 * REGION // 2, "size": 2 * REGION}
+        sizes = [("sc", R * 1024), ("m", R * 256), ("b", R * 256), ("l", R * 256)] + pk + [("o", R * 8192)]
         return regions(sizes + [("ob", R * 8192)] if self.ob else sizes)
+
+    @property
+    def o_stride(self) -> int:
+        """fp32 from one row panel's o to the next's in the workspace."""
+        w = self.workspace()
+        return (w["o1"] - w["o"]) // 4 if self.two else 2048
 
     def get_kernel_src(self) -> str:
         p = self.pfx
         tri = mask64(lambda q, k: k > q)
         keys = [f"{mask64(lambda q, k, v=v: k >= v):016X}" for v in range(8)]
-        return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT,
+        return _ATTN.render(p=p, w=Attr(self.workspace()), R=self.R, QG=self.qg, HD=HD, ND=ND, SLOT=SLOT, OPS=self.o_stride,
                             tri=f"{tri:016X}", keys=keys, ablate=self.ablate, TWO=self.two, OB=self.ob,
                             CAUSAL=self.causal, PP=self.pp, PACK=self.pack, WG=self.window // 32, GH=self.gh,
                             GATE_AT=GATE_AT)
@@ -755,19 +775,19 @@ class PrefillAttnOperator(ArtcOperator):
         before the pass's, then the halves of their sigmoid(gate) slots: each core copies its own pair (``qsel``)."""
         p, T, H, qc, qg, R = self.pfx, self.T, self.H, self.qc, self.qg, self.R
         bf = np.dtype[bfloat16]
-        q_ty = np.ndarray[(R * SLOT // 2,), bf]
         h_ty = np.ndarray[(SLOT // 2,), bf]  # (half a K or V object, the halves of two slots)
         o_ty = np.ndarray[(A_SET,), bf]  # 32 A panels
         om_ty = np.ndarray[(4 * A_SET,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
-        pw_ty = np.ndarray[(PW // 4,), np.dtype[np.float32]]
+        pw_ty = np.ndarray[(PW_TWO // 4,), np.dtype[np.float32]]
+        pf_ty = np.ndarray[(PF_TWO // 2,), bf]
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty])
-        k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, q_ty, np.int32, np.int32])
-        k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, h_ty, ws_ty])
-        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, np.int32, np.int32, np.int32,
+        k_qsel = Kernel(f"{p}_qsel", "kernel.o", [h_ty, ws_ty, np.int32, np.int32])  # (the Q slots: in the workspace)
+        k_qk = Kernel(f"{p}_qk", "kernel.o", [h_ty, ws_ty])
+        k_soft = Kernel(f"{p}_soft", "kernel.o", [ws_ty, pw_ty, pf_ty, np.int32, np.int32, np.int32,
                                                    *([np.int32] if self.window else [])])
-        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty])
-        k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, q_ty, np.int32, o_ty])
+        k_pv = Kernel(f"{p}_pv", "kernel.o", [h_ty, ws_ty, pw_ty])  # (P: in the softmax's scratch)
+        k_fin = Kernel(f"{p}_fin", "kernel.o", [ws_ty, np.int32, o_ty])
         k_seg = Kernel(f"{p}_seg", "kernel.o", [h_ty, h_ty, ws_ty, np.int32]) if self.pack else None
         p_n, p_off = ScratchpadParameter(QA_N, np.int32), ScratchpadParameter(f"{QA_OFF}{T}", np.int32)
         causal, pack = self.causal, self.pack
@@ -788,13 +808,13 @@ class PrefillAttnOperator(ArtcOperator):
                                 obj_types=[o_ty] * 4, names=[f"pa_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
         cp, co = self._copy_fifos() if self.window else ([], [])
 
-        def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, qb, n_p, row, me, *seg):
+        def core(a_h, b_h, o_h, init, qsel, qk, soft, pv, fin, ws, pw, pf, n_p, row, me, *seg):
             for _ in forever_():
                 for b in range_(n_pass):
                     for i in range_(n_q // 2):
                         a = a_h.acquire(1)
                         b_h.acquire(1)  # (b's object follows a's: l1_layout)
-                        qsel(a, qb, i, me)
+                        qsel(a, ws, i, me)
                         a_h.release(1)
                         b_h.release(1)
                     if seg:  # (packed: the pass's SEG objects)
@@ -812,24 +832,24 @@ class PrefillAttnOperator(ArtcOperator):
                     for g in range32(n):
                         ka = a_h.acquire(1)
                         b_h.acquire(1)
-                        qk(qb, ka, ws)
+                        qk(ka, ws)
                         a_h.release(1)
                         b_h.release(1)
-                        soft(ws, pw, n - 1 - g, last, g, *ghi)
+                        soft(ws, pw, pf, n - 1 - g, last, g, *ghi)
                         va = a_h.acquire(1)
                         b_h.acquire(1)
-                        pv(va, ws)
+                        pv(va, ws, pw)
                         a_h.release(1)
                         b_h.release(1)
                     for i in range_(0 if self.gh else n_q // 2):  # (the gates into the Q slots' buffer; GH: in them)
                         a = a_h.acquire(1)
                         b_h.acquire(1)
-                        qsel(a, qb, i, me)
+                        qsel(a, ws, i, me)
                         a_h.release(1)
                         b_h.release(1)
                     for h in range(R):
                         o = o_h.acquire(1)
-                        fin(ws, qb, h, o)
+                        fin(ws, h, o)
                         o_h.release(1)
 
         workers = []
@@ -838,8 +858,8 @@ class PrefillAttnOperator(ArtcOperator):
             for r in range(4):
                 workers.append(Worker(core, [kv[h, 0].cons(), kv[h, 1].cons(), o1[c][r].prod(), k_init, k_qsel, k_qk,
                                              k_soft, k_pv, k_fin, Buffer(ws_ty, name=f"pa_ws{c}_{r}"),
-                                             Buffer(pw_ty, name=f"pa_pw{c}_{r}"),
-                                             Buffer(q_ty, name=f"pa_qb{c}_{r}"), p_n, r if causal or pack else p_nk,
+                                             Buffer(pw_ty, name=f"pa_pw{c}_{r}"), Buffer(pf_ty, name=f"pa_pf{c}_{r}"),
+                                             p_n, r if causal or pack else p_nk,
                                              (c % nph) * 4 + r, *([k_seg] if pack else [])],
                                       tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True,
                                       while_true=False))
@@ -932,11 +952,11 @@ class PrefillAttnOperator(ArtcOperator):
         pinned buffers' bounds and overlaps are checked where they are pinned (``pin_l1_buffers``)."""
         kv, o, q, w = SLOT, ND * PANEL_BYTES, self.R * SLOT, self.workspace()
         pw = self.STACK + 2 * kv + o
-        if self.two:  # (the two streams' objects i in region i, b's after a's: the kernels read both from a's pointer; the
-            # Q slots, then the gates, and the scores in region 2, o in 3)
+        if self.two:  # (the two streams' objects i in region i, b's after a's: the kernels read both from a's pointer, K in
+            # region 0 and V in 1; pass 1's output in 1; the workspace in regions 2 and 3: row panel 0's o in 2, 1's in 3)
             return {"pa_ka": [self.STACK, REGION], "pa_kb": [self.STACK + kv, REGION + kv],
-                    "pa_or": [self.STACK + 2 * kv, REGION + 2 * kv], "pa_qb": [2 * REGION], "pa_pw": [pw],
-                    "pa_ws": [3 * REGION - w["o"]]}  # (o of the workspace at the start of region 3)
+                    "pa_or": [self.STACK + 2 * kv, REGION + 2 * kv], "pa_pw": [pw], "pa_pf": [REGION + 2 * kv + o],
+                    "pa_ws": [2 * REGION]}
         ws = (2 * REGION - w["o"] if self.ob else 2 * REGION)
         return {"pa_kv": [self.STACK, self.STACK + kv], "pa_or": [self.STACK + 2 * kv, REGION + q], "pa_qb": [REGION],
                 "pa_pw": [pw], "pa_ws": [ws]}
