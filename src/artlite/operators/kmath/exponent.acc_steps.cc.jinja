@@ -21,6 +21,13 @@
 {% endmacro %}
 {% macro poly(N, P, f) %}
 {% set s = "" if shift else " * 0x1p-64f" %}
+{% if quad %}
+    const aie::vector<bfloat16, {{ N }}> pf = aie::mul({{ P }}, {{ f }}).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, {{ N }}> pf2 = aie::mul(pf, {{ f }}).template to_vector<bfloat16>();
+    aie::accum<accfloat, {{ N }}> r = aie::mul({{ P }}, {{ "one" if shift else "aie::broadcast<bfloat16, " ~ N ~ ">(0x1p-64f)" }});
+    r = aie::mac(r, pf, aie::broadcast<bfloat16, {{ N }}>({{ c[0] }}f{{ s }}));
+    return aie::mac(r, pf2, aie::broadcast<bfloat16, {{ N }}>({{ c[1] }}f{{ s }}));
+{% else %}
     const aie::vector<bfloat16, {{ N }}> hi = aie::mac(aie::mul({{ f }}, aie::broadcast<bfloat16, {{ N }}>({{ c[2] }}f{{ s }})),
                                                aie::broadcast<bfloat16, {{ N }}>({{ c[1] }}f{{ s }}), one)
                                           .template to_vector<bfloat16>();
@@ -29,4 +36,5 @@
     aie::accum<accfloat, {{ N }}> r = aie::mul({{ P }}, {{ "one" if shift else "aie::broadcast<bfloat16, " ~ N ~ ">(0x1p-64f)" }});
     r = aie::mac(r, pf, aie::broadcast<bfloat16, {{ N }}>({{ c[0] }}f{{ s }}));
     return aie::mac(r, pf2, hi);
+{% endif %}
 {% endmacro %}

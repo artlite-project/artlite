@@ -204,6 +204,48 @@ def test_attn_prefill(size: str, T: int, pp: int) -> None:
         assert rel_max(A, gold) < 3e-2, t0
 
 
+def test_attn_split() -> None:
+    """The split attention (``attn256_split``: a pair of cores per six row panels, 96-query passes) after AttnPrep with
+    its passes, over two chunks: the output panels against the exact attention of the cores' own operands (the Q slots'
+    hi panels: single Q, the cache, sigmoid(gate): within the tolerances of ``test_attn_prefill``) and llama.cpp's
+    attn_gated."""
+    from artlite.prefill import attn256_split as SP
+
+    T, n2 = 192, 45
+    s = _Setup("1B", T, n2)
+    prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS, qg=SP.QG)
+    attn = SP.SplitAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes)
+    fused = FusedOperator(name="attn_split", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
+                          input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
+    _fill_cs(fused, s.cfg)
+    fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
+    fused.get_buffer("KV")[:] = 0
+    H, hd = s.cfg.num_attention_heads, AT.HD
+    for t0, n in [(0, T), (T, n2)]:
+        _run(fused, prep.params(t0) | attn.params(t0), s.G(t0, n))
+        A = bfp16.from_panels(fused.get_buffer("A"), T, H * hd).reshape(T, H, hd)[:n]
+        slots = _qs_slots(fused, T, 1, SP.QG)
+        hi = slots[:, :, 0].reshape(COLS, T // 8, 1, AP.ND, 2, 8, 9)[..., 0, :, :]  # (the hi panels: single Q)
+        q = np.moveaxis(bfp16.block_values(hi), -3, -2).reshape(COLS, T // 8, 1, 8, hd)
+        q = q.transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n] * (16 / np.log2(np.e))
+        sg = _gate_sigmoid(slots[:, :, 1]).transpose(0, 2, 1, 3, 4).reshape(H, T, hd)[:, :n]
+        kv = fused.get_buffer("KV").view(np.uint8).reshape(s.kvh, -1, AT.OBJS, 9280)
+        want = np.zeros((n, H, hd))
+        for h in range(s.kvh):
+            K, V = (np.asarray(x, np.float64)[:t0 + n] for x in KV.kv_from_groups(kv[h, :(t0 + n + 31) // 32], AT.HD, dmajor=True))
+            for g in range(H // s.kvh * h, H // s.kvh * (h + 1)):
+                sc = q[g].astype(np.float64) @ K.T / 16
+                sc[np.arange(t0, t0 + n)[:, None] < np.arange(t0 + n)[None]] = -np.inf
+                pr = np.exp(sc - sc.max(-1, keepdims=True))
+                want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
+        eq = rel_max(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
+        print(f"split T {T} chunk at {t0}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+        assert rel_max(A, want) < 1.5e-2, t0
+        assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2, t0
+        gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[t0:t0 + n]
+        assert rel_max(A, gold) < 3e-2, t0
+
+
 @pytest.mark.parametrize(("size", "T", "n", "pp"), [("d3-lite", 128, 99, 1), ("d3-lite", 96, 70, 1), ("d3-lite", 128, 99, 2),
                                                    ("d3-lite", 96, 70, 2)])
 def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:

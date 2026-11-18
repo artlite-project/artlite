@@ -78,7 +78,9 @@ sampler's 20 candidates, 0.2 - 0.3 ms): the choices are those of the exact fp32 
 from it in the most likely token of ~0.5% of the steps). `ARTLITE_LM_SCREEN=0` reads the whole head on the NPU.
 
 The prompt runs in chunks of up to 2048 tokens (the 35B-A3B: 4096, its experts' weights streamed once per chunk;
-layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the prefill (`qwen35/prefill.py`):
+MiniCPM-V: 2304, its full attention split between pairs of cores, `artlite/prefill/attn256_split.py`, which stream
+the cache two thirds as often; layer-major, in sub-chunks of 256; short prompts in chunks of 64 or 128) through the
+prefill (`qwen35/prefill.py`):
 the prefill GEMMs, which read the same weight image, the Gated DeltaNet scan and the flash attention. A chunk's K / V,
 GDN states and conv states land in the decode's buffers; a chunk runs as dispatches of whole layers, each within the
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start

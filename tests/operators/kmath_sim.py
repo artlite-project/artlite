@@ -112,8 +112,9 @@ def _exp2_f32(x: np.ndarray, prec: str, below: str) -> np.ndarray:
     return _ldexp_bits(p, n)
 
 
-def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int) -> np.ndarray:
-    k1, k2, k3 = (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in kmath.ACC_C)
+def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int, prec: str = "bf16") -> np.ndarray:
+    k1, k2, k3 = (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in (*kmath.ACC_Q, 0.0)) if prec == "quad" \
+        else (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in kmath.ACC_C)
     a = _f32(a)
     v = bf16(a)
     if below == "clamp" and above == "none":  # (f from the clamped v)
@@ -128,9 +129,11 @@ def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int) -> np.ndarray:
         if above == "clamp":
             v = np.minimum(v, np.float32(255))
     p = _f32(np.exp2(v.astype(np.float64) - 128))  # (a non-negative integer power: vexp2 exact)
-    hi = bf16(mac(mul(f, k3), k2, 1.0))
     pf = bf16(mul(p, f))
     pf2 = bf16(mul(pf, f))
+    if prec == "quad":
+        return mac(mac(mul(p, 2.0 ** (shift - 64)), pf, k1), pf2, k2)
+    hi = bf16(mac(mul(f, k3), k2, 1.0))
     return mac(mac(mul(p, 2.0 ** (shift - 64)), pf, k1), pf2, hi)
 
 
@@ -264,7 +267,7 @@ def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
             if p["prec"] == "chord":
                 return vexp2(a)
             return mac(mul(vexp2(a), kmath.CHORD2_C[0]), vexp2(add(a, 0.5)), kmath.CHORD2_C[1])
-        return _exp2_acc(x, p["below"], p["above"], p["shift"])
+        return _exp2_acc(x, p["below"], p["above"], p["shift"], p["prec"])
     if fn.func == "recip":
         return _recip(x, p["domain"], p["steps"])
     if fn.func == "act":

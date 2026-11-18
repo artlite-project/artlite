@@ -25,6 +25,7 @@ CASES = {  # id: the function and its arguments
     "exp2-b192-sat": ("exp2", {"lanes": 32, "bias": 192, "above": "clamp"}),
     "exp2-b192-bounded": ("exp2", {"lanes": 32, "bias": 192, "below": "bounded"}),
     "exp2-b192-s64": ("exp2", {"lanes": 32, "bias": 192, "shift": 64}),
+    "exp2-b192-quad": ("exp2", {"lanes": 32, "bias": 192, "below": "bounded", "prec": "quad"}),
     "exp2-chord": ("exp2", {"lanes": 32, "bias": 0, "prec": "chord"}),
     "exp2-chord2": ("exp2", {"lanes": 32, "bias": 0, "prec": "chord2"}),
     "recip-n2": ("recip", {"lanes": 32, "unroll": True}),

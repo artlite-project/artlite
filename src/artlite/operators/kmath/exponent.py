@@ -12,6 +12,7 @@ LN2 = (0.69140625, 0.001739501953125)  # ln 2 as bf16 hi + lo
 TAYLOR = tuple(np.float32(1) / np.float32(k) for k in (720, 120, 24, 6, 2, 1, 1))  # e^t to t^6, highest first
 CUBIC = (0.24022650695910071, 0.0555041086648216, 0.69314718055994531)  # 2^f ~ 1 + f (c1 + f (c2 + c3 f)): c2, c3, c1
 ACC_C = (0.69140625, 0.2412109375, 0.0625)  # 2^f ~ 1 + c1 f + f^2 (c2 + c3 f), bf16 (fitted in this order)
+ACC_Q = (0.703125, 0.240234375)  # ("quad") 2^f ~ 1 + c1 f + c2 f^2, bf16: 0.53 bf16 ULP (relative minimax, then rounded)
 # CHORD2_SCALE 2^x ~ c1 vexp2(x) + c2 vexp2(x + 1/2): c1 = 1 (the caller's 1.0 register shared), c2 = 1 / sqrt 2 (the
 # chords' errors, half a period apart, cancel: the SD 1.5 UNet's error 1.19e-2; the pair minimax for |x| <= 2, 1.28e-2)
 CHORD2_C = (1.0, 0.70703125)
@@ -75,17 +76,18 @@ def exp2_f32(lanes: int, *, prec: str, below: str, above: str, shift: int, inlin
 
 def exp2_acc(lanes: int, *, prec: str, below: str, above: str, shift: int, inline: bool) -> Fn:
     """The bias-192 form: A = x + 192 an fp32 accumulator (``exp2``'s arguments); ``parts``: ``reduce``, ``poly``."""
-    check("prec", prec, ("bf16",))
+    check("prec", prec, ("bf16", "quad"))
     check("below", below, ("clamp", "bounded", "none"))
     check("above", above, ("none", "clamp"))
     check("shift", shift, (0, 64))
+    quad = prec == "quad"
     local = f"exp2_a{lanes}" + {"clamp": "", "bounded": "_bounded", "none": "_unclamped"}[below]
-    local += ("_sat" if above == "clamp" else "") + (f"_s{shift}" if shift else "")
-    variables = {"N": lanes, "below": below, "above": above, "shift": shift, "c": ACC_C}
+    local += ("_sat" if above == "clamp" else "") + (f"_s{shift}" if shift else "") + ("_q" if quad else "")
+    variables = {"N": lanes, "below": below, "above": above, "shift": shift, "c": ACC_Q if quad else ACC_C, "quad": quad}
     below_doc = _BELOW_ACC.get((below, above)) or _BELOW_ACC[below, "none"].replace("-inf included", "finite")
     # (arguments the result is defined for: the residual forms make a NaN of an infinite one)
     lo = {"clamp": -np.inf if above == "none" else -2.0 ** 100, "bounded": -2.0 ** 15, "none": 128.5}[below]
-    poly = f"exp2_a{lanes}_poly" + (f"_s{shift}" if shift else "")
+    poly = f"exp2_a{lanes}_poly" + (f"_s{shift}" if shift else "") + ("_q" if quad else "")
     parts = {  # (the same for the inlined whole)
         "reduce": make(local + "_reduce", "exponent.acc_reduce.cc.jinja", variables={**variables, "whole": local},
                        inline=True, lanes=lanes, arg="accum", ret=""),
@@ -96,8 +98,8 @@ def exp2_acc(lanes: int, *, prec: str, below: str, above: str, shift: int, inlin
     return make(local + ("_i" if inline else ""), "exponent.acc.cc.jinja", inline=inline, lanes=lanes, arg="accum",
                 ret="accum", func="exp2",
                 params={"bias": 192, "prec": prec, "below": below, "above": above, "shift": shift},
-                domain=(128.5, 255.5), valid=(lo, 2.0 ** 100 if above == "clamp" else 255.5), ulp=0.26, parts=parts,
-                variables={**variables, "bound": bound(0.26, None), "below_doc": below_doc,
+                domain=(128.5, 255.5), valid=(lo, 2.0 ** 100 if above == "clamp" else 255.5), ulp=0.6 if quad else 0.26,
+                parts=parts, variables={**variables, "bound": bound(0.6 if quad else 0.26, None), "below_doc": below_doc,
                            "above_doc": " x from 63.5 on: v = 255, f = 1/2 (~2^63)." if above == "clamp" else ""})
 
 
@@ -114,7 +116,9 @@ def exp2(lanes: int, *, bias: int | None = None, prec: str = "bf16", below: str 
     (exactly 0 from x <= -127), "int" (the exponent clamped as an integer: no fp32 max; arguments above -2^22).
 
     ``bias=192``: A = x + 192 an fp32 accumulator -> an fp32 accumulator, bf16-level, x in [-63.5, 63.5) (vexp2 builds
-    2^round(x): no fp32 vector arithmetic, pipelines); ``below``: "clamp" (x below -63.5, masked lanes too: ~2^-63),
+    2^round(x): no fp32 vector arithmetic, pipelines); ``prec`` "bf16" (a cubic of the fraction: 0.26 bf16 ULP) or
+    "quad" (a quadratic: 0.53 ULP, two vector products and a rounding fewer: a softmax's P, rounded to bfp16 after);
+    ``below``: "clamp" (x below -63.5, masked lanes too: ~2^-63),
     "bounded" (A >= -2^15, masked lanes as -16384: |2^x| < 2^-49 below, its sign not kept; one bf16 max less) or
     "none" (the caller keeps A >= 128.5); ``above``: "none" (the caller keeps A < 255.5) or "clamp" (saturates at
     ~2^63); ``shift`` 64: 2^(x + 64) (a softmax's scale cancels; one constant register less). Its ``parts``:

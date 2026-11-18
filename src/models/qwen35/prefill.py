@@ -2,7 +2,9 @@
 buffers (``overlay.QwenOverlay``: the weight image, the norm weights, the GDN states and conv states, the KV caches), so
 the decode continues from the state the chunk leaves.
 
-A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256) runs layer-major in S = T / ``SUB`` sub-chunks (a ``SMALL``
+A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256; ``SPLIT_T`` where the split attention applies:
+``attn256_split``, a chat model's prefill with a q head per column and two KV heads, its AttnPreps per ``SPLIT_PREP``
+tokens) runs layer-major in S = T / ``SUB`` sub-chunks (a ``SMALL``
 size: one sub-chunk of operators of its own size, for short prompts): each operator of a layer runs over the
 sub-chunks back to back on buffer slices a sub-chunk apart (consecutive runs of one operator share its configuration:
 the ConfigureOps, ~75 ms of the 27B's chunk, are paid per chunk instead of per sub-chunk), the flash attention once over
@@ -69,6 +71,7 @@ from artlite.operators.design import COLS
 from artlite.operators.fused.layout import parse_name
 from artlite.operators.util import arg_bytes
 from artlite.prefill import attn256 as AP
+from artlite.prefill import attn256_split as SPA
 from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
 from artlite.prefill.dflash import DFlashPrefill
@@ -85,6 +88,8 @@ SUB = 256  # tokens per sub-chunk (the operators' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each)
 MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
+SPLIT_T = 2304  # a chunk size of the split attention (``SPA.SplitAttnOperator``: 24 passes of 96, 9 sub-chunks)
+SPLIT_PREP = 384  # tokens per AttnPrep of a split chunk (whole 96-query passes; a BD repeats per 8 tokens, at most 64 times)
 MAX_T = MOE_SIZES[-1]
 PAD_ROWS = 32  # a GEMM's padding rows past a sub-chunk (GemmQd: 288 for 256)
 # the time model's constants (``layer_seconds``; fitted to the chunk times of the 1B, 9B and 27B Q4_K_M, T = 256 ..
@@ -99,6 +104,7 @@ MOE_WEIGHT_S, MOE_ROW_S = 1 / 38e9, 1 / 38e9
 # the flash attention per cached position and sub-chunk: the larger of its cache bytes at ATTN_BW (each pass streams
 # the history, K and V of every KV head) and the cores' cycles per 32-key group and row panel (two streams / one)
 ATTN_BW, ATTN_CYC_TWO, ATTN_CYC_ONE, CORE_HZ = 58e9, 1020, 1500, 1.81e9
+ATTN_CYC_SPLIT = 1770  # (the split attention: cycles per 32-key group of a 96-query pass)
 
 
 class QwenPrefill(ChunkPrefill):
@@ -114,6 +120,10 @@ class QwenPrefill(ChunkPrefill):
         hi + lo panels (``attn_prefill.PrefillAttnOperator``'s ``pp``; d3-lite's attention error 9e-3 -> 4e-3, the
         output's own rounding: the readout models); pack: packed chunks of every size (``run_packed``)."""
         default = MOE_SIZES if overlay.cfg.moe else SIZES
+        # (the split attention's chunks where it applies: a chat model's prefill alone)
+        self.split = SPA.applies(overlay.cfg) and not precise and not pack and draft is None and dflash is None
+        if self.split:
+            default += (SPLIT_T,)
         super().__init__(overlay, sizes or default)
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
         cfg, img = self.cfg, self.img
@@ -146,8 +156,9 @@ class QwenPrefill(ChunkPrefill):
         # (a DFlash2 drafter's rows of the prompt: ``prefill.dflash``)
         self.fp = DFlashPrefill(dflash, self) if dflash is not None else None
         self.drafters: list[DrafterPrefill] = [d for d in (self.dp, self.fp) if d is not None]
-        self.attn = {T: AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
-                                               pp=2 if precise else 1)
+        self.attn = {T: SPA.SplitAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes) if self._split(T) else
+                     AP.PrefillAttnOperator(T=T, cfg=cfg, head_bytes=overlay.ash.head_bytes, causal=cfg.causal,
+                                            pp=2 if precise else 1)
                      for T in self.sizes} if self.att else {}
         pack = pack and not cfg.moe and draft is None and dflash is None  # (a dense model's prefill alone)
         self.pack_sizes = self.sizes if pack else ()
@@ -237,8 +248,16 @@ class QwenPrefill(ChunkPrefill):
                 self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF,
                          gc_rows=3 if tree else self.max_t))
 
+    def _split(self, T: int, packed: bool = False) -> bool:
+        """Whether a chunk of size T runs the split attention."""
+        return self.split and T == SPLIT_T and not packed
+
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
-        """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``)"""
+        """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``; a split
+        chunk's: per ``SPLIT_PREP`` tokens, the split attention's passes)"""
+        if self._split(T):
+            return self._op(AP.AttnPrepOperator, lay, T=SPLIT_PREP, head_bytes=self.ov.ash.head_bytes,
+                            cs_positions=self.ov.max_positions + SUB, qg=SPA.QG)
         return self._op(AP.AttnPrepOperator, lay, T=self._t(T), head_bytes=self.ov.ash.head_bytes,
                         cs_positions=self.ov.max_positions + SUB)
 
@@ -306,10 +325,11 @@ class QwenPrefill(ChunkPrefill):
                 kv0, hb = ov.kv_off[L], ov.ash.kvh * ov.ash.head_bytes
                 qn = f"PQN[{self.qn_off[L]}:{self.qn_off[L] + 4 * 2 * AP.HD}]"
                 qs_g = COLS * 2 * prep.qc * AP.SLOT  # (bytes of a token group's Q slots: QS pass-major)
-                grp = t // 32 * AP.GROUP  # (a sub-chunk's cache groups)
-                rl += [(prep, tok("G", j, prep, i=0, row=g_rb), sl("PCS", j * t * 256, prep, i=1), qn,
-                        sl("QS", j * t // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")
-                       for j in range(S)]
+                u = prep.T  # (tokens per prep: a sub-chunk, or ``SPLIT_PREP``)
+                grp = u // 32 * AP.GROUP  # (its cache groups)
+                rl += [(prep, sl("G", j * u * g_rb, prep, i=0), sl("PCS", j * u * 256, prep, i=1), qn,
+                        sl("QS", j * u // 8 * qs_g, prep, i=3), f"KV[{kv0 + j * grp}:{kv0 + j * grp + hb}]")
+                       for j in range(T // u if T >= SUB else 1)]
                 rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + hb}]", sl("A", 0, attn, i=2),
                            *([sl("SEG", 0, attn, i=3)] if packed or tree else [])))
             else:
@@ -623,7 +643,9 @@ class QwenPrefill(ChunkPrefill):
             p0 += round(S * SUB) // 2
         passes = SUB / (32 * at.qg)  # (per sub-chunk)
         dma = passes * at.kvh * (AP.AT.REC_K + AP.AT.REC_V) / 8 / ATTN_BW
-        cores = passes * at.R * (ATTN_CYC_TWO if at.two else ATTN_CYC_ONE) / 32 / CORE_HZ
+        cyc = ATTN_CYC_SPLIT if isinstance(at, SPA.SplitAttnOperator) else \
+            at.R * (ATTN_CYC_TWO if at.two else ATTN_CYC_ONE)
+        cores = passes * cyc / 32 / CORE_HZ
         return max(dma, cores) * sum(min(1.0, S - j) * (p0 + SUB * j) for j in range(math.ceil(S)))
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:

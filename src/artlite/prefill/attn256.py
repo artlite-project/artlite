@@ -178,6 +178,7 @@ class AttnPrepOperator(ArtcOperator):
     KV (one layer's cache: the KV heads' of ``attn.AttnShape.head_bytes``). Parameters: ``QA_CS`` = 128 x the table row
     of the first token (default p0), ``QA_KV`` (T's) = GROUP / 2 * p0 / 32 (``params``).
 
+    ``qg``: QS's passes of 32 qg queries (default ``pass_groups``; the split attention's ``attn256_split.QG``).
     ``spec`` (``decode.attn256.AttnSpec``) and ``kind``: Spark-X's attention: no norms (q times log2(e) / 16 by hi / lo
     products, k as it is), the rotation of the kind (a full layer's 32 pairs, a sliding-window layer's 128: CS rows of
     [cos 128 | sin 128] bf16, ``cs_table(kind=)``), a gate per head (``spec.gate`` "head": a Q core's object [its head's
@@ -199,7 +200,8 @@ class AttnPrepOperator(ArtcOperator):
     pfx = kernel_prefix("qap")
 
     def __init__(self, *, T: int, cfg: AttnConfig, layout: Layout, head_bytes: int, cs_positions: int,
-                 spec: AT.AttnSpec = AT.QWEN, kind: str = "full", hist: int = 0, q: bool = True, staged: bool = False):
+                 spec: AT.AttnSpec = AT.QWEN, kind: str = "full", hist: int = 0, q: bool = True, staged: bool = False,
+                 qg: int = 0):
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * AT.ROT and COLS % (2 * self.kvh) == 0
         assert T % 32 == 0, "whole cache groups"
@@ -217,7 +219,7 @@ class AttnPrepOperator(ArtcOperator):
         self.qc = cfg.num_attention_heads // COLS
         assert 1 <= self.qc <= 3, "a core per q head and the KV core in a column"
         self.head_bytes, self.cs_positions = head_bytes, cs_positions
-        self.qg = pass_groups(cfg, T)
+        self.qg = qg or pass_groups(cfg, T)  # (QS's passes: ``qg`` the attention's, e.g. ``attn256_split.QG``)
         assert T % (32 * self.qg) == 0
         super().__init__()
 

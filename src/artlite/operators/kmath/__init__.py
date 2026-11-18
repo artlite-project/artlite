@@ -25,13 +25,13 @@ The package: ``fn`` (``Fn``, the renderer of the templates, the contract checks)
 
 from .acttable import GELU, GELU_ERF, SIGMOID, SILU, TABLES, ActTable, bf16_values, silu64
 from .composite import ATANH_C, EXPM1_C, expm1, expneg, sigmoid, silu, softplus
-from .exponent import ACC_C, CHORD2_C, CHORD2_SCALE, CUBIC, LN2, TAYLOR, exp2
+from .exponent import ACC_C, ACC_Q, CHORD2_C, CHORD2_SCALE, CUBIC, LN2, TAYLOR, exp2
 from .fn import KM, LANES, Fn
 from .gather import act, silu_tanh, table_pass
 from .reciprocal import recip
 
 __all__ = [
-    "ACC_C", "ATANH_C", "CHORD2_C", "CHORD2_SCALE", "CUBIC", "EXPM1_C", "GELU", "GELU_ERF", "KM", "LANES", "LN2",
+    "ACC_C", "ACC_Q", "ATANH_C", "CHORD2_C", "CHORD2_SCALE", "CUBIC", "EXPM1_C", "GELU", "GELU_ERF", "KM", "LANES", "LN2",
     "SIGMOID", "SILU", "TABLES", "TAYLOR", "ActTable", "Fn", "act", "bf16_values", "exp2", "expm1", "expneg", "recip",
     "sigmoid", "silu", "silu64", "silu_tanh", "softplus", "table_pass",
 ]
