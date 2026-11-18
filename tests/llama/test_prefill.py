@@ -333,6 +333,84 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     assert all(v < 0.06 for v in worst.values()), worst
 
 
+@pytest.mark.slow
+def test_prefill_sequences() -> None:
+    """Two sequences on one device, each prefilled into caches of its own (``select``: prompts that end inside a record,
+    so the next step reads the open record's V panels: record mode), then decode steps: one sequence alone at first
+    (from its ring by then), then both in joint steps (the other's first one still in record mode), some with a second
+    slot: every slot's logits and LM-head input, and each sequence's caches at the end, are those of the sequence alone
+    (its prefill, then steps of one), bit for bit."""
+    from artlite.decode.step import Part
+    from artlite.gguf_model import GGUFFile
+    from models.llama.overlay import LlamaOverlay
+    from models.llama.prefill import LlamaPrefill
+    from models.llama.tokenizer import load_tokenizer
+
+    from ..common import essay
+
+    path = llama_path("Q4_K_M", "1B")
+    g = GGUFFile(path)
+    layers, NP, G = [0, 1, 2, 3], (67, 141), 40  # (the prompts' tokens, the generated ones)
+    ids = load_tokenizer(path).encode(essay("apple.txt"))
+    xs = [np.asarray(g.rows("token_embd.weight", ids[400 * s:400 * s + n + G]), np.float32) for s, n in enumerate(NP)]
+    ov = LlamaOverlay(g, layers=layers, vocab=2048, max_positions=1024, sequences=2)
+    ov.load()
+    pf = LlamaPrefill(ov).compile().bind()
+
+    def prompt(s: int, seq: int) -> None:  # (sequence ``seq`` starts over with prompt s)
+        ov.select(seq)
+        ov.reset()
+        t = 0
+        for T in pf.plan(0, NP[s]):
+            m = min(T, NP[s] - t)
+            pf.run(xs[s][t:t + m], t, T)
+            t += m
+        assert t == NP[s]
+
+    def slots(n: int) -> list[np.ndarray]:
+        lg = np.asarray(ov._npu_logits(n)).view(np.uint16)
+        return [np.concatenate([lg[i], ov.hidden(-1, i).view(np.uint32)], dtype=np.int64) for i in range(n)]
+
+    def caches(s: int, seq: int) -> list[np.ndarray]:
+        ov.select(seq)
+        return [a for L in layers for a in ov.read_kv(L, range(NP[s] + G))]
+
+    want, kept = [], []
+    for s in range(2):  # (alone, as sequence 0: the prefill, then steps of one)
+        prompt(s, 0)
+        row = []
+        for p in range(NP[s], NP[s] + G):
+            ov.step(xs[s][p:p + 1], p)
+            row.append(slots(1)[0])
+        want.append(row)
+        kept.append(caches(s, 0))
+
+    prompt(0, 0)
+    prompt(1, 1)
+    assert all(0 in ov._vrings[s].from_prefill for s in range(2)), "both sequences' caches as their prefills left them"
+    pos = list(NP)
+    ov.select(0)
+    for _ in range(3):  # (sequence 0 alone: its rings hold its open record from here on)
+        ov.step(xs[0][pos[0]:pos[0] + 1], pos[0])
+        assert np.array_equal(slots(1)[0], want[0][pos[0] - NP[0]])
+        pos[0] += 1
+    step = 0
+    while min(p - n for p, n in zip(pos, NP)) < G:
+        take = [(s, min(1 + (step + s) % 3 // 2, NP[s] + G - pos[s])) for s in ((1, 0) if step % 2 else (0, 1))]
+        take = [(s, n) for s, n in take if n]
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        ov.step(np.concatenate([xs[s][pos[s]:pos[s] + n] for s, n in take]), parts)
+        got = slots(sum(n for _, n in take))
+        at = [(s, pos[s] + k - NP[s]) for s, n in take for k in range(n)]
+        bad = [(s, i) for x, (s, i) in zip(got, at, strict=True) if not np.array_equal(x, want[s][i])]
+        assert not bad, f"joint step {step} {parts}: (sequence, generated token) {bad} differ from the sequence alone"
+        for s, n in take:
+            pos[s] += n
+        step += 1
+    for s in range(2):
+        assert all(np.array_equal(a, b) for a, b in zip(caches(s, s), kept[s], strict=True)), f"caches of sequence {s}"
+
+
 def test_chunk_params_to_the_end() -> None:
     """Every chunk size at every start the planner may give it (``fits``: within the caches) takes its runtime
     parameters (Llama 1B at 4096 positions, the largest chunk among its sizes; no dispatch). A

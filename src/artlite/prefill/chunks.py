@@ -1,6 +1,7 @@
 """What the models' prefills share (``ChunkPrefill``; the models': ``qwen35.prefill``, ``gemma4.prefill``,
 ``llama.prefill``): a prompt chunk of T tokens (multiples of ``SUB`` up to ``MAX_T``) through the layers on the decode
-overlay's buffers, so that the decode continues from the caches and states the chunk leaves.
+overlay's buffers, so that the decode continues from the caches and states the chunk leaves (of an overlay that holds
+several sequences: the selected one's, ``ModelOverlay.select``; a program's items are kept per sequence).
 
 A chunk runs layer-major in S = T / SUB sub-chunks: each operator of a layer runs over the sub-chunks back to back on
 buffer slices SUB tokens apart (consecutive runs of one operator share its configuration: a ConfigureOp per layer and
@@ -122,7 +123,7 @@ class ChunkPrefill:
         self.span = 0  # (a packed chunk's longest segment)
         self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
-        self._items: dict[int | tuple[str, int], list] = {}
+        self._items: dict[tuple[int | tuple[str, int], int], list] = {}  # (a program's items, per sequence: ``_program``)
         self._static_s: dict[tuple[int, float], float] = {}  # (``_layer_static`` by layer and sub-chunks)
         self.dispatches = 0  # (the last chunk's)
         self.bound = False
@@ -230,8 +231,10 @@ class ChunkPrefill:
         return set()
 
     def _buffers(self) -> dict[str, Any]:
-        """The device buffers the items address by name: the overlay's (the prefill's own among them)."""
-        return self.ov.dev.buffers
+        """The device buffers the items address by name: the overlay's (the prefill's own among them; a sequence's
+        buffers under their plain names: the selected one's, ``ModelOverlay.select``)."""
+        dev = self.ov.dev
+        return dev.buffers | {name: dev.buffers[b] for name, b in dev.alias.items()}
 
     def _stage_px(self, x: np.ndarray, T: int, dtype: type, *, zero: np.ndarray | None = None) -> None:
         """The chunk's input: x (n, hidden) as the first rows of the residual stream PX in ``dtype`` (``bfloat16`` or
@@ -270,10 +273,11 @@ class ChunkPrefill:
 
     def _program(self, key: int | tuple[str, int]) -> list[tuple[int, list[int]]]:
         """The items of a chunk's program (``key``: its size, or ("pack" / "tree", size)): (library entry, device
-        addresses of its arguments' slices)."""
-        if key not in self._items:
-            self._items[key] = self.lib.items(self.runlists[key], self._buffers())
-        return self._items[key]
+        addresses of its arguments' slices), in the selected sequence's buffers."""
+        k = (key, self.ov.seq)
+        if k not in self._items:
+            self._items[k] = self.lib.items(self.runlists[key], self._buffers())
+        return self._items[k]
 
     # ------------------------------------------------------------------
     # Compile, run
@@ -433,7 +437,8 @@ class ChunkPrefill:
         """Dispatch a chunk's program (its inputs written; ``key``: a packed or tree chunk's, ``_program``): the
         scratchpad ``params``, the pieces of ``_splits`` (and one from each item index of ``hooks`` on, its host
         function called before it); the cache layers' rings then hold no rows of the chunk's last record
-        (``kv_layers``: record mode)."""
+        (``kv_layers``: record mode), and the overlay's device is stale (``OverlayDevice.set_prologue``: its cores'
+        code pages come back before its next dispatch, whoever runs it)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
         budget = PEER_PIECE_S if _native.turn_peers() else PIECE_BUDGET_S  # (another process's requests wait less)
@@ -442,7 +447,8 @@ class ChunkPrefill:
             self._est[cut] = self._splits(T, p0, budget)
         self.dispatches = self.lib.run(self._program(T if key is None else key),
                                        splits=[*self._est[cut], *(hooks or {})],
-                                       bufs=list(self._buffers().values()), hooks=hooks)
+                                       bufs=list({id(b): b for b in self._buffers().values()}.values()), hooks=hooks)
+        self.ov.dev.stale = True  # (another hardware context ran: the overlay's code pages again before its next dispatch)
         self.ov.vring.from_prefill.update(self.kv_layers)
 
     # ------------------------------------------------------------------

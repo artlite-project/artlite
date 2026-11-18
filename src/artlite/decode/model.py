@@ -324,6 +324,7 @@ class ModelOverlay:
             dev.alloc_all({"W": img.nbytes, **sizes})
             if img.pack(dev.view("W"), threads=threads):
                 dev.flush("W")
+        dev.alias = self._alias()
         act = dev.view("ACT")
         for c in range(COLS):
             for s in range(self.SLOTS):
@@ -342,6 +343,10 @@ class ModelOverlay:
         positions before its own, written by then (zeroing them would flush the whole cache: milliseconds)."""
         self.vring.clear()
 
+    def _alias(self) -> dict[str, str]:
+        """The plain names of ``SEQ`` as the selected sequence's buffers (``OverlayDevice.alias``)."""
+        return {b: self.seq_name(b, self.seq) for b in self.SEQ} if self.seq else {}
+
     @staticmethod
     def seq_name(buf: str, s: int) -> str:
         """The name of sequence s's buffer ``buf`` (of ``SEQ``) on the device (sequence 0's: ``buf``)."""
@@ -355,7 +360,8 @@ class ModelOverlay:
             raise ValueError(f"sequence {s} of {self.sequences}")
         if s != self.seq:
             self.seq, self.vring, self._ahead = s, self._vrings[s], None
-            self.dev.alias = {b: self.seq_name(b, s) for b in self.SEQ} if s else {}
+            if self.dev is not None:  # (before ``load``: its device takes the selection)
+                self.dev.alias = self._alias()
 
     def ready(self) -> None:
         """Until the weight image is packed (``WeightBuffer``)."""
@@ -487,8 +493,9 @@ class ModelOverlay:
 
     def _join(self, parts: tuple[Part, ...]) -> tuple:
         """The sub-steps of a step of several sequences' slots (``parts``; the key of its transaction): each part's own
-        (``subs``) from its first slot on. A model whose overlay runs such steps supplies it and ``_set_parts``."""
-        raise NotImplementedError(f"{type(self).__name__}: a step's slots are one sequence's")
+        (``subs``) from its first slot on. A model whose overlay runs such steps (``SEQ``) supplies it and
+        ``_set_parts``; their transactions are built at their first use (``prepare`` builds one sequence's)."""
+        raise NotImplementedError
 
     def _set_position(self, st: Any, p: int, ahead: bool = False) -> bool:
         """A step's position-dependent objects and transfers (the patches of its transaction ``st``). ``ahead``: while
@@ -657,8 +664,10 @@ class ModelOverlay:
         slots in their order): its transaction (built at its first use), patched (or patched ahead, while the previous
         step ran: ``AHEAD``); then, while it runs, the next step's (S slots at position + S, each part's after its
         own, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or None."""
-        parts = None if isinstance(position, int) else tuple(position)
+        parts = tuple(position) if isinstance(position, (tuple, list)) else None
         if parts is not None:
+            if not self.SEQ:
+                raise NotImplementedError(f"{type(self).__name__}: a step's slots are one sequence's")
             assert sum(q.n for q in parts) == S and len({q.seq for q in parts}) == len(parts), parts
             assert all(q.n > 0 and 0 <= q.seq < self.sequences for q in parts), parts
             position = parts

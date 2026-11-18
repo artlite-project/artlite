@@ -156,7 +156,8 @@ def test_llama_decode_sequences(case: str, kv_k: str) -> None:
 
     - alternated (``select``: a step of 1 .. 4 slots of one, then of the next: no copies between them);
     - in joint steps (``step``'s parts: one sequence 5 positions behind, one joining at the 20th step, slots dealt at
-      random, a sequence's second slot too: sub-steps of every pattern up to a sequence per slot);
+      random, a sequence's second slot too: sub-steps of every pattern up to a sequence per slot), at the end one slot
+      each in the same order step after step: those steps run as they were patched while the step before ran;
 
     and each sequence's caches and open record's ring are then those of the sequence alone."""
     quant, size, layers = CASES[case]
@@ -218,21 +219,36 @@ def test_llama_decode_sequences(case: str, kv_k: str) -> None:
     fresh()  # joint steps
     rng = np.random.default_rng(0)
     pos, steps, patterns = [0] * NSEQ, 0, set()
+    patched: list[bool] = []  # (per patch of a joint step: whether ahead, while the step before ran)
+    set_parts = ov._set_parts
+    ov._set_parts = lambda st, parts, ahead=False: (patched.append(ahead), set_parts(st, parts, ahead))[1]
+    nxt, fixed, turns, mark = None, 0, 0, None  # (the end's steps: their count, those not the step before's next)
     while min(pos) < N:
         take = [[s, 1] for s in range(NSEQ) if pos[s] < N and not (s == 1 and steps < 5) and not (s == 2 and steps < 20)]
-        spare = SLOTS - len(take)
-        for t in take:  # (a second slot of its own)
-            if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
-                t[1] += 1
-                spare -= 1
-        rng.shuffle(take)
+        end = max(pos) >= N - 8  # (the end: one slot each in order, the same parts until a sequence is through)
+        if not end:
+            spare = SLOTS - len(take)
+            for t in take:  # (a second slot of its own)
+                if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
+                    t[1] += 1
+                    spare -= 1
+            rng.shuffle(take)
         parts = tuple(Part(s, pos[s], n) for s, n in take)
+        if end:
+            mark = len(patched) if mark is None else mark
+            fixed += 1
+            turns += parts != nxt
+        nxt = tuple(Part(s, p + n, n) for s, p, n in parts)
         patterns.add(ov._join(parts))
         ov.step(np.concatenate([xs[s][pos[s]:pos[s] + n] for s, n in take]), parts)
         check(slots(sum(n for _, n in take)), [(s, pos[s] + k) for s, n in take for k in range(n)], f"step {steps}")
         for s, n in take:
             pos[s] += n
         steps += 1
+    ov._set_parts = set_parts
+    # (a step of the parts' next positions runs as it was patched while the step before ran: patched again only
+    # where the parts are others)
+    assert fixed - turns >= 8 and patched[mark:].count(False) == turns, (fixed, turns, patched[mark:])
     assert max(len(u) for u in patterns) == SLOTS, "a step of a sequence per slot"
     for s in range(NSEQ):
         assert all(np.array_equal(a, b) for a, b in zip(caches(s), kept[s], strict=True)), f"joint steps: caches of {s}"

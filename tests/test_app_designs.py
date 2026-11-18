@@ -85,12 +85,14 @@ def _qwen_drafts(path: str, dflash: bool) -> None:
     if not dflash:
         ov = QwenOverlay(gguf, max_positions=4096, drafts=True)
         parallel_compile.compile_all([ov.op, QwenPrefill(ov, draft=QwenDraft(ov)).lib])
+        ov.op.page_store()
         return
     if (file := qwen_dflash_of(path)) is None:
         pytest.skip(f"no DFlash2 drafter of {path}")
     ov = QwenOverlay(gguf, max_positions=4096, image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False), drafts=True)
     drafter = DFlashOverlay(ov, GGUFFile(file))
     parallel_compile.compile_all([ov.op, drafter.op, QwenPrefill(ov, draft=None, dflash=drafter).lib])
+    ov.op.page_store()
 
 
 def _lfm(path: str) -> None:
