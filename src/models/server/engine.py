@@ -292,7 +292,7 @@ class Engine:
         self._ready.set()
         if self._on_ready is not None:
             self._on_ready()
-        if self._warmup and self.npu.causal and hasattr(self.model.tokenizer, "vocabulary"):
+        if self._warmup and self.npu.causal and self.npu.generates and hasattr(self.model.tokenizer, "vocabulary"):
             threading.Thread(target=self.vocab, name="artlite-vocab", daemon=True).start()  # (structured output's)
         while True:
             with self._cv:
@@ -329,12 +329,13 @@ class Engine:
     def _warm(self) -> None:
         """A short prompt and one step (as llama-server's warmup): the first request's dispatches find their HW
         contexts and transactions ready (the prompt's tokens through the prefill: a few, Qwen's chunks take 3 at
-        least; ``NpuModel.prepare``: the steps of drafts); a non-causal model's: a readout (it runs no steps)."""
+        least; ``NpuModel.prepare``: the steps of drafts); a non-causal model's and a readout model's: a readout (they
+        run no steps)."""
         t0 = time.perf_counter()
         npu = self.npu
         ids = self.model.encode("The quick brown fox jumps over the lazy dog.")
         npu.reset()
-        if npu.causal:
+        if npu.causal and npu.generates:
             npu.prepare(len(ids))
             logits = npu.forward(ids)
             npu.top_k(argmax(logits), 1)

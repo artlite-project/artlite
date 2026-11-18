@@ -102,7 +102,8 @@ class SparkOverlay(ModelOverlay):
         # Q4_K_M, whose Q5_K page overflows the slot beside a resident Q4_K by 1.2 KB)
         self.op = SparkDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, attn=self.ash,
                                       eps=cfg.rms_norm_eps, paged=paged_formats(gguf, fmts, wide=gu_win),
-                                      gu_win=gu_win, split=img.split, tails=any(r.half for r in img.regions))
+                                      gu_win=gu_win, split=img.split, tails=any(r.half for r in img.regions),
+                                      tail_pairs=any(b.pt for r in img.regions for b in r.blocks))
         self.attn_steps = AttentionSteps(self)
         self._plan()
 

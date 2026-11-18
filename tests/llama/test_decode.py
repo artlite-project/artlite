@@ -8,11 +8,12 @@ vocabulary, against the overlay's arithmetic on the host (ref.LlamaNpuRef), in b
   the cache), against the reference attending to the cache as stored.
 
 Files: 1B Q4_K_M (head_dim 64, 4 query heads per KV head; layer 0's V / down Q6_K), 1B Q5_K_M (13-row Q5_K tiles), 1B
-Q6_K (12-row tiles of 10112 B), 3B Q4_K_M (head_dim 128, 3 query heads per KV head), 8B Q4_K_S (hidden 4096, Q4_K,
-Q5_K and Q6_K tiles; down in 7 K groups), 1B BF16 (8-row BFP16 tiles of 9216 B), 1B Q4_0 (Q4_0 of 16 rows, layer 0's
-down Q4_1 of 14), 1B Q4_1 (16 rows, 10240 B); Qwen3 0.6B Q4_1 (2 query heads per KV head, q / k norms with weights
-per dim: layer 0's k_norm up to 96.5), Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 tiles of 9216 B) and Qwen3-Embedding-4B
-Q4_K_M (hidden 2560 and ffn 9728 in K chunks padded with zero super-blocks; 4 query heads per KV head at head_dim 128).
+Q6_K (12-row tiles of 10112 B), 3B Q4_K_M (head_dim 128, 3 query heads per KV head), 8B Q4_K_S (hidden 4096, Q4_K, Q5_K
+and Q6_K tiles; down in 7 K groups), 1B BF16 (8-row BFP16 tiles of 9216 B), 1B Q4_0 (Q4_0 of 16 rows, layer 0's down
+Q4_1 of 14), 1B Q4_1 (16 rows, 10240 B); Qwen3 0.6B Q4_1 (2 query heads per KV head, q / k norms with weights per dim:
+layer 0's k_norm up to 96.5), Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 tiles of 9216 B) and Qwen3-Embedding-4B Q4_K_M
+(hidden 2560: half regions, ``llama.image``; ffn 9728 in K chunks padded with zero super-blocks; 4 query heads per KV
+head at head_dim 128), whose half regions also against its padded image (``test_llama_decode_tails``).
 """
 
 
@@ -28,6 +29,7 @@ from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import llama_gguf
 from artlite.operators.design import COLS
+from models.llama.image import LlamaImage
 from models.llama.overlay import LlamaOverlay
 
 from ..common import as_torch, essay, to_torch
@@ -102,6 +104,42 @@ def test_llama_decode_steps(case: str, kv_k: str) -> None:
         keep(f"ring.{L}", torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
     print({k: round(v, 4) for k, v in worst.items()})
     assert all(v < TOL for v in worst.values()), worst
+
+
+@pytest.mark.parametrize("pairs", [False, True], ids=["halves", "pairs"])
+def test_llama_decode_tails(pairs: bool) -> None:
+    """Qwen3-Embedding-4B's half regions (``llama.image``: inputs of the hidden size 2560) on the design of 4 slots:
+    without pairs the tiles and every sum's order are the padded image's (its last half chunk's zero super-blocks
+    times the helper's copy of x), so steps of 1 .. 4 slots give its logits and LM-head inputs bit for bit; with pairs
+    (gate / up's and the LM head's row tiles: a pair's second sums its tail first) steps of 1 .. 4 slots give those of
+    steps of one, bit for bit (``test_llama_decode_steps``: within the reference's noise)."""
+    quant, size, layers = CASES["qwen3_emb4b_Q4_K_M"]
+    g = _gguf(quant, size)
+    ids = _tokens(136)
+    x = ref.LlamaNpuRef(g, layers, VOCAB, kp=KV_K["hilo"]).embed(ids)
+
+    def run(image: LlamaImage, steps: tuple[int, ...]) -> list[np.ndarray]:
+        ov = LlamaOverlay(g, layers=layers, vocab=VOCAB, max_positions=256, kv_k="hilo", image=image)
+        assert ov.op.tails == any(r.half for r in image.regions)
+        assert ov.op.tail_pairs == any(b.pt for r in image.regions for b in r.blocks)
+        ov.load()
+        out, p, i = [], 0, 0
+        while p < len(ids):
+            n = min(steps[i % len(steps)], len(ids) - p)
+            i += 1
+            lg = np.asarray(ov.step(x[p:p + n], p)).view(np.uint16)
+            out += [np.concatenate([lg[s], ov.hidden(-1, s).view(np.uint32)], dtype=np.int64) for s in range(n)]
+            p += n
+        ov.dev = None
+        return out
+
+    img = LlamaImage(g, layers=layers, vocab=VOCAB, pairs=pairs)
+    assert {(r.name, b.name) for r in img.regions for b in r.blocks if b.pt} == \
+        ({("gate_up", "gu"), ("lm", "lm")} if pairs else set())
+    want = run(img, (1,)) if pairs else run(LlamaImage(g, layers=layers, vocab=VOCAB, tails=False), STEPS)
+    got = run(img, STEPS)
+    bad = [p for p in range(len(ids)) if not np.array_equal(want[p], got[p])]
+    assert not bad, f"{len(bad)} of {len(ids)} positions differ: {bad[:8]}"
 
 
 def test_llama_decode_after_suspend() -> None:

@@ -8,6 +8,7 @@ with the layout the kernels expect (module docstring of gemm/gemm_q.py).
 
 import itertools
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,9 +18,15 @@ from artlite.formats import FORMATS
 from artlite.gemm.gemm_q import GemmQOperator
 from artlite.gemm.gemm_qd import GemmQdOperator
 from artlite.gemm.geometry import LINE, line_window
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import decision_gguf, minicpmv_gguf, qwen3_gguf
 from artlite.operators.design import COLS
+from artlite.prefill import gemm as PG
+from models.llama.image import LlamaImage
+from models.qwen35.image import QwenImage
 
 from .. import dma_model as dm
+from ..model_files import require
 
 TILE_BYTES = {"Q4_0": 18496, "Q4_1": 20480, "Q4_K": 18496, "BFP16": 18432}
 
@@ -526,3 +533,42 @@ def test_gemm_qd_l1_layout(fmt: str, R: int, S: int, kc: int, kw: dict) -> None:
     for m in (16, 32, 48):
         op._l1_bytes(geo.with_m(m), op._plan_l1(geo.with_m(m)))
         assert (op.geo, op.plan) == (geo, plan)
+
+
+HALF_FILES = {"embedding-4B": (qwen3_gguf, "embedding-4B", (0, 4)), "kev": (decision_gguf, "kev", (0, 3)),
+              "minicpmv-1B": (minicpmv_gguf, None, (0, 3)), "d3-lite": (decision_gguf, "d3-lite", (0, 3))}
+
+
+@pytest.mark.parametrize("pairs", [False, True], ids=["unpaired", "pairs"])
+@pytest.mark.parametrize("name", HALF_FILES)
+def test_gemm_half_plans(name: str, pairs: bool) -> None:
+    """The prefill's GEMMs of a file's half regions (``decode.image.Region.half``; Qwen3-Embedding-4B's qkv: Q4_K and a
+    planar Q6_K v, gate_up; Kev-4B's gdn_in and attn_in: planar Q8_0, gate_up; ``pairs``: gate / up in pass pairs;
+    MiniCPM-V 1B's and d3-lite's down of 3584: Q4_K / Q6_K, planar Q8_0) as ``prefill.gemm.plan_phase`` plans them at
+    256 tokens, each region on its own (region-major: the tile indices the image's), against the walks of its
+    ``Region.tile`` and ``tail_half``."""
+    fn, key, layers = HALF_FILES[name]
+    path = fn(key) if key else fn()
+    require(path)
+    g = GGUFFile(path)
+    img = (LlamaImage if name == "embedding-4B" else QwenImage)(g, layers=list(layers), vocab=COLS * 64, pairs=pairs)
+    stub = SimpleNamespace(cfg=img.cfg, region=img.region)  # (gate / up's C: down's K_in)
+    n = 0
+    for r in img.regions:
+        if not r.half or r.name == "lm":
+            continue
+        region = Region(r.layer, r.name, r.blocks, r.n_kc, r.kc_group, r.tile_bytes, r.kc, half=True)
+        region.col_stride = region.col_bytes
+        pitch = PG.d_pitch(img, 256) if r.name in PG.OUT else 0
+        for gm in PG.plan_phase(stub, region, 256, pitch=pitch).gemms:
+            op = gm.op
+            assert op.tail == 2 and op.k_tiles == 8 * (2 * r.n_kc - 1) and op.ptail == (pairs and r.name == "gate_up")
+            op.region = region
+            n += 1
+            df = op.flow
+            dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
+            assert sum(map(len, df.b_chain(0))) <= 14
+            _check_weights(op, df)
+            _check_activations(op, df)
+            _check_outputs(op, df)
+    assert n >= (4 if name in ("embedding-4B", "kev") else 2)

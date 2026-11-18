@@ -39,6 +39,7 @@ from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
 from ..model import Capabilities, Model
 from ..overlay_model import OverlayModel
+from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Mask, Sampling
 from ..sequence import Sequence, splice_media
 from ..templating import TEMPLATE_KEY, file_template, render_template
@@ -58,17 +59,21 @@ KEEP_VIDEOS = 2  # (videos whose sequences are kept)
 class NpuLfm(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("single",
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``;
-    ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``)."""
+    ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``); ``readout``: a readout model (d1's
+    decision models, ``models.readouts.readout_model``): no text generation (``generates``: its image holds no LM
+    head)."""
 
     recurrent = True  # (the conv histories hold the whole sequence)
     STEP_COST = (1.0, 1.02, 1.05, 1.06)  # (decode steps at 1K: QAD-Q4_0 20.2 ms for one slot, Q4_K_M 21.3)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
-                 prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None):
+                 prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
+                 readout: bool = False):
         self.gguf = gguf
         self.overlay = LfmOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal  # (d1's decision models: readouts of whole prompts, no decode steps)
+        self.generates = not readout
         self.eos_token_ids = self.cfg.eos_token_ids
         self.prefill = LfmPrefill(self.overlay, sizes=sizes) if prefill else None
         self._open(threads=threads)
@@ -172,7 +177,9 @@ class Lfm(Model):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = LfmConfig.from_gguf(self.gguf)
-        self.weights = WeightBuffer(LfmImage(self.gguf, self.cfg))
+        self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
+        # (a readout model's image: no LM head)
+        self.weights = WeightBuffer(LfmImage(self.gguf, self.cfg, vocab=None if self.generates else READOUT_VOCAB))
         self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.bos = int(self.gguf.meta["tokenizer.ggml.bos_token_id"])
@@ -386,5 +393,6 @@ class Lfm(Model):
                         banned=self.banned)
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLfm:
-        self._npu = NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
+        self._npu = NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
+                           readout=not self.generates)
         return self._npu

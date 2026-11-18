@@ -335,6 +335,9 @@ def main(argv: list[str] | None = None) -> None:
         text = prompt_text(args)
         template = template_option(args.chat_template, args.chat_template_file)
         model = open_model(args.model, chat_template=template, **options)
+        if not model.generates:
+            raise NotImplementedError(f"{os.path.basename(args.model)}: an embedding, rerank or decision model, "
+                                      f"without text generation (artlite-server's routes read it out)")
         if "reasoning_effort" in variables:  # (the template's spelling of a level: ``Model.efforts``)
             variables["reasoning_effort"] = model.efforts.get(variables["reasoning_effort"], variables["reasoning_effort"])
         asr = bool(args.audio) and not args.video and args.prompt is None and not args.file

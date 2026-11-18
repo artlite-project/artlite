@@ -134,8 +134,9 @@ class QwenPrefill(ChunkPrefill):
         self.pitch = {name: PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att))
                       if ls}
         self.d_pitch = PG.d_pitch(img, SUB)
-        # the norms' panel rows: the hidden size padded to whole K chunks (the padding columns never written: zero)
-        self.kh = -(-cfg.hidden_size // img.kc) * img.kc
+        # the norms' panel rows: the K of the GEMMs that read them (``Region.K_in``: the hidden size, or padded to whole
+        # K chunks, the padding columns never written: zero)
+        self.kh = PG.input_k(img, ("gdn_in", "attn_in", "gate_up", "moe_in"))
         self._out_pitch = self.kh if self.kh != cfg.hidden_size else 0
         # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the items that start its pieces: the shared
         # expert's, the gathered norm's, the expert GEMMs'))
@@ -195,7 +196,7 @@ class QwenPrefill(ChunkPrefill):
         def plan(L: int, name: str) -> PG.PhasePlan:
             region = img.region(L, name)
             pitch = self.pitch.get(name, dpt) if name != "gate_up" else 0
-            key = (name, region.K, region.kc_group, tuple(b.formats for b in region.blocks), t)
+            key = (name, region.K_in, region.kc_group, tuple(b.formats for b in region.blocks), t)
             if key not in self._k_parts:
                 self._k_parts[key] = PG.resident_k_part(img, region, t, pitch=pitch)
             plan = PG.plan_phase(img, region, t, pitch=pitch, ops=self._gemms, k_part=self._k_parts[key])
@@ -268,7 +269,7 @@ class QwenPrefill(ChunkPrefill):
         if self.moe:
             self.rb |= self.moe.rows()
         else:  # (down's K: the ffn padded to whole K chunks)
-            self.rb["HP"] = 9 * self.img.region(self.layers[0], "down").K // 8
+            self.rb["HP"] = 9 * PG.input_k(self.img, ("down",)) // 8
             split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
             if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
                 self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
@@ -649,12 +650,12 @@ class QwenPrefill(ChunkPrefill):
         return max(dma, cores) * sum(min(1.0, S - j) * (p0 + SUB * j) for j in range(math.ceil(S)))
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
-        """(per sub-chunk the GEMMs by the bytes of their weights and their items, the norms by the hidden size, the GDN
-        ops by the v heads, the attention prep by the q heads; the flash attention (``attention_seconds``); CFG_S per
-        ConfigureOp)"""
+        """(per sub-chunk the GEMMs by the bytes of the weights they read (``Region.read_bytes``) and their items, the
+        norms by the hidden size, the GDN ops by the v heads, the attention prep by the q heads; the flash attention
+        (``attention_seconds``); CFG_S per ConfigureOp)"""
         cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
-        wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
+        wbytes = sum(self.img.region(L, name).read_bytes for name in self._phases(L))
         acts = [p.act for name in self._phases(L) if (p := self.plans[(L, name)]).act is not None]
         if acts:  # (a split gate / up block: its rows through GU, written and read, like weight bytes; an item more)
             wbytes += 2 * SUB * self.rb["GU"]

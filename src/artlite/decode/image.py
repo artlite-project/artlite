@@ -197,6 +197,11 @@ class Region:
     def nbytes(self) -> int:
         return self.cols * self.col_bytes
 
+    @property
+    def read_bytes(self) -> int:
+        """Bytes of tiles a prefill GEMM over the input reads (a ``half`` region's: half a tail tile per row tile)."""
+        return self.cols * self.n_rt * (2 * self.n_kc - 1) * self.tile_bytes // 2 if self.half else self.nbytes
+
     def block_of(self, rt: int) -> Block:
         """The block of row tile rt."""
         return next(b for b in reversed(self.blocks) if self.rt0[b.name] <= rt)

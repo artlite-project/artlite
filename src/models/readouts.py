@@ -11,7 +11,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from artlite.decode.protocol import C_LEN
 from artlite.gguf_model import GGUFFile
+from artlite.operators.design import COLS
 
 POOLING = ("none", "mean", "cls", "last", "rank")  # (a GGUF's ``pooling_type``: llama.cpp's LLAMA_POOLING_TYPE_*)
 
@@ -25,8 +27,16 @@ def pooling_of(meta: Mapping[str, object], arch: str) -> str | None:
 def readout_model(meta: Mapping[str, object], arch: str) -> bool:
     """Whether a model file is read out, not generated from: an embedding or rerank model (``pooling_of``) or a decision
     model (``{arch}.decision.type``). Its prompts are short and prefill only, so its prefill takes the precise variants
-    of its operators (``NpuModel``'s ``precise``)."""
+    of its operators (``NpuModel``'s ``precise``), and its rows' scores (a classifier head's, an option label's logit)
+    are the host's: its weight image holds no LM head (``READOUT_VOCAB`` rows), it generates no text
+    (``Model.generates``)."""
     return pooling_of(meta, arch) is not None or meta.get(f"{arch}.decision.type") is not None
+
+
+# the LM rows of a readout model's weight image: a C object's per column (the decode's LM phase, which a readout's steps
+# run for its input, the readout's row, reads them; the file's head never reaches the NPU: Qwen3-Embedding-4B 157 MB,
+# Kev-4B 432 MB less of it)
+READOUT_VOCAB = COLS * C_LEN
 
 
 def rows_of(pooling: str, n: int) -> np.ndarray:

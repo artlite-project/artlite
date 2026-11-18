@@ -56,7 +56,7 @@ from ..npu_model import Checkpoint
 from ..overlay_model import OverlayModel, Readout
 from ..qwen3vl import host as qwen3vl_host
 from ..qwen3vl import npu as qwen3vl_npu
-from ..readouts import readout_model
+from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Mask, Penalties, Probs, Sampling
 from ..sequence import Sequence, token_ids
 from ..spec_options import drafter_type
@@ -89,7 +89,7 @@ class NpuQwen(OverlayModel):
                  dflash: str | None = None, readout: bool = False):
         """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); readout: a readout model
         (``models.readouts.readout_model``): the prefill's precise variants and packed chunks (``QwenPrefill``'s
-        ``precise``, ``pack``)."""
+        ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head)."""
         self.gguf = gguf
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
@@ -102,6 +102,7 @@ class NpuQwen(OverlayModel):
                                    drafts=mtp is not None or bool(dflash) or (own and bool(cfg.nextn_layers)))
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal
+        self.generates = not readout
         self.eos_token_ids = self.cfg.eos_token_ids
         own = own and self.overlay.image.mtp_layer >= 0
         self.drafter = QwenDraft(self.overlay, mtp) if mtp is not None else QwenDraft(self.overlay) if own else None
@@ -409,7 +410,10 @@ class Qwen(Model):
                  draft_model: str | None = None):
         self.gguf = GGUFFile(path)
         self.cfg = QwenConfig.from_gguf(self.gguf)
-        kind = drafter_type(spec_type, draft_model, ("draft-mtp", "draft-dflash"), self.name)
+        self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
+        # (a readout model drafts nothing: its prompts only)
+        kind = (drafter_type(spec_type, draft_model, ("draft-mtp", "draft-dflash"), self.name) if self.generates
+                else "none")
         if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
         self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
@@ -419,7 +423,9 @@ class Qwen(Model):
             raise ValueError(f"{path}: no DFlash2 drafter (a <repository>-DFlash2-GGUF of Q4_K_M) in the models directory")
         # (the MTP drafter, ``NpuQwen``'s: "" the file's own block, else a qwen35moe model's MTP file; a file; None)
         self.mtp = None if self.dflash is not None or kind == "none" else draft_model or ""
-        image = QwenImage(self.gguf, self.cfg, mtp=self.mtp == "")
+        # (a readout model's image: no LM head, its half regions unpaired; ``qwen35.image``)
+        image = QwenImage(self.gguf, self.cfg, mtp=self.mtp == "", vocab=None if self.generates else READOUT_VOCAB,
+                          pairs=self.generates)
         if self.mtp == "" and image.mtp_layer < 0 and not (self.cfg.moe and qwen_mtp_of(path)):
             if kind == "draft-mtp":
                 raise ValueError(f"{path}: no MTP drafter (no MTP block in the file, no mtp-*.gguf beside it)")
@@ -476,5 +482,5 @@ class Qwen(Model):
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
         self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
-                            dflash=self.dflash, readout=readout_model(self.gguf.meta, self.gguf.arch))
+                            dflash=self.dflash, readout=not self.generates)
         return self._npu

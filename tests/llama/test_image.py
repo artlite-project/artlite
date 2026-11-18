@@ -1,7 +1,7 @@
 """The Llama config and weight image (``model_config.LlamaConfig``, models/llama/image.py; Qwen3's too), on the host
 (no NPU): the config from the GGUF metadata, the layout of a file (every row of every matrix in exactly one column's
-block, Q / K heads in rotate-half order, the padded vocabulary, the regions in step order) and the packed image's tiles
-and norm-weight objects at their places."""
+block, Q / K heads in rotate-half order, the padded vocabulary, the regions in step order), the packed image's tiles
+and norm-weight objects at their places, Qwen3-Embedding-4B's half regions."""
 
 
 import numpy as np
@@ -14,6 +14,7 @@ from artlite.model_config import LlamaConfig, llama_gguf, qwen3_gguf
 from artlite.operators.design import COLS
 from models.llama.image import KC, LlamaImage
 
+from ..decode.image_checks import check_tails, check_unpaired
 from ..model_files import require
 
 SIZES = {"1B": (16, 2048, 8192, 32, 64, 32.0), "3B": (28, 3072, 8192, 24, 128, 32.0),
@@ -128,3 +129,22 @@ def test_pack_image() -> None:
             col = cols[c].reshape(-1, T)
             for kc in range(r.n_kc):
                 assert np.array_equal(col[r.tile(r.rt0[b.name] + t, kc)], ref[0, kc]), (r.layer, r.name, b.name, kc)
+
+
+@pytest.mark.parametrize("pairs", [False, True])
+@pytest.mark.parametrize("name", ["embedding-4B", "reranker-4B"])
+def test_pack_tails(name: str, pairs: bool) -> None:
+    """Qwen3-Embedding-4B's and -Reranker-4B's hidden 2560 (``llama.image``): qkv, gate_up and the LM head are half
+    regions (``TAILS``); with ``pairs`` gate / up's Q4_K blocks and the LM head's (Q6_KH) in pairs of row tiles, the
+    other blocks (qkv's Q4_K and Q6_K, down) as in the padded image (``image_checks.check_tails``); without, every tile
+    as the padded image's."""
+    path = qwen3_gguf(name)
+    require(path)
+    g = GGUFFile(path)
+    img = LlamaImage(g, layers=[0, 3], vocab=COLS * 64 * 3, pairs=pairs)
+    pad = LlamaImage(g, layers=[0, 3], vocab=COLS * 64 * 3, tails=False)
+    assert {(r.name, b.name) for r in img.regions for b in r.blocks if b.pt} == \
+        ({("gate_up", "gu"), ("lm", "lm")} if pairs else set())
+    check_tails(img, pad, {"qkv", "gate_up", "lm"})
+    if not pairs:
+        check_unpaired(img, pad)

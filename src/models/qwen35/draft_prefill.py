@@ -55,6 +55,7 @@ class DraftPrefill(DrafterPrefill):
     def _ops(self, t: int) -> SimpleNamespace:
         img, H, eps = self.d.image, self.H, self.eps
         r = img.region(self.L, "eh")
+        assert not r.half and H % r.kc == 0, "eh_proj's [enorm half | hnorm half]: whole K chunks each"
         eh = PG.plan_phase(img, r, t, pitch=self.d_pitch, ops=self.pf._gemms, k_part=r.n_kc // 2)
         assert eh.parts == 2, "eh_proj as [enorm half | hnorm half]"
         return SimpleNamespace(
@@ -116,7 +117,7 @@ class DraftPrefill(DrafterPrefill):
     def seconds(self, Ss: float, *, weight_s: float, gemm_s: float, norm_s: float, prep_s: float, cfg_s: float) -> float:
         """Estimated time of a chunk's records (``QwenPrefill.layer_seconds``' constants; Ss sub-chunks)."""
         img = self.d.image
-        wbytes = sum(img.region(self.L, name).nbytes for name in ("eh", "attn_in"))
+        wbytes = sum(img.region(self.L, name).read_bytes for name in ("eh", "attn_in"))
         heads = self.d.cfg.num_attention_heads
         return Ss * (weight_s * wbytes + 3 * gemm_s + 4 * norm_s * self.H + prep_s * heads) + 6 * cfg_s
 

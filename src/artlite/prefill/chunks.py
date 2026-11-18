@@ -458,11 +458,12 @@ class ChunkPrefill:
         raise NotImplementedError
 
     def _layer_static(self, L: int, S: float) -> float:
-        """``layer_seconds`` without the attention's: the GEMMs by the bytes of their weights (the norms and the prep
-        included), ``CFG_S`` per ConfigureOp (cached: the planner asks for every layer and size)."""
+        """``layer_seconds`` without the attention's: the GEMMs by the bytes of the weights they read (the norms and the
+        prep included; ``Region.read_bytes``), ``CFG_S`` per ConfigureOp (cached: the planner asks for every layer and
+        size)."""
         key = (L, S)
         if key not in self._static_s:
-            wbytes = sum(self.img.region(L, name).nbytes for name in self._phases(L))
+            wbytes = sum(self.img.region(L, name).read_bytes for name in self._phases(L))
             self._static_s[key] = S * self.WEIGHT_S * wbytes + self.CFG_S * self.layer_configs(L)
         return self._static_s[key]
 

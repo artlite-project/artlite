@@ -281,7 +281,7 @@ class GemmaDraft:
                 for h in range(AT.KV_HEADS):  # (its q object, whose metadata words are the F_ATT object)
                     self.att[(L, h)] = take(XB)
                 continue
-            K = img.region(L, name).K
+            K = img.region(L, name).K_in
             kp = bool(FLAGS[name] & F_KPAIR)
             self.inp[(L, name)] = _Phase(name, L, take(post_region_bytes(K) if kp else region_bytes(K)), K, 2 if kp else 1)
         self.nbytes = n

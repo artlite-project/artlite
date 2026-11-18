@@ -48,7 +48,7 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None, wh
     """The router GEMM of T tokens (module docstring); C in bf16 units: per token COLS router_pitch fp32 values.
     ``whole``: the token chunks' count a scratchpad parameter (``chunk_param``: one design for any T)."""
     b = region.block("router")
-    assert b.fmt == "BFP16" and (not gated(region) or region.block("sgate").fmt == "BFP16")
+    assert not region.half and b.fmt == "BFP16" and (not gated(region) or region.block("sgate").fmt == "BFP16")
     passes, pitch = router_passes(region), 2 * router_pitch(region)  # (pitch: bf16 units)
     kw = {"fmt": "BFP16", "rows": b.R, "M": T, "K": region.K, "N": COLS * pitch, "tile_bytes": region.tile_bytes,
           "col_bytes": region.col_stride, "passes": passes,
@@ -67,6 +67,7 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
     silu(gate) up as bfp16 panels of ``width`` (the shared expert's) columns, column c's from width / COLS c on.
     ``whole``: as ``router``'s."""
     b = region.block("sgu")
+    assert not region.half, "an MoE layer's input of whole K chunks"
     per = width // COLS  # (outputs per column)
     pl = planar(b.fmt, b.R, region.kc)
     # (tiles and outputs per pass: 4 x [8 gate | 8 up] rows, 32 outputs; planar: a SiLU group, 64)

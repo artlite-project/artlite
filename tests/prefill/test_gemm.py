@@ -120,6 +120,22 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("spark-tails", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark-tails", "Q8_0", "4B", (0,), 0, "attn_in", 64),
          ("spark-bartowski-tails", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
          ("spark-bartowski-tails", "Q4_0", "4B", (0,), 0, "gate_up", 256),
+         # (the Qwen3-4B family's and Kev-4B's half regions: "-halves" a readout model's image (every tail tile read for
+         # its first half), "-tails" a decoding model's (gate / up in pass pairs); qkv's Q4_K and planar Q6_K, gdn_in's
+         # and attn_in's planar Q8_0)
+         ("qwen3-halves", "", "embedding-4B", (0, 4), 0, "qkv", 256),
+         ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "qkv", 64),
+         ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
+         ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "gate_up", 1024),
+         ("qwen3-tails", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
+         ("kev-halves", "", "", (0, 3), 0, "gdn_in", 256), ("kev-halves", "", "", (0, 3), 0, "gdn_in", 64),
+         ("kev-halves", "", "", (0, 3), 3, "attn_in", 256), ("kev-halves", "", "", (0, 3), 0, "gate_up", 256),
+         ("kev-tails", "", "", (0, 3), 0, "gate_up", 1024),
+         # (down half a chunk short in one K group: MiniCPM-V 1B's and d3-lite's ffn 3584, unpaired; gate / up's rows
+         # of 3584)
+         ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "down", 256), ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 3, "down", 64),
+         ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "gate_up", 256),
+         ("d3-lite-halves", "", "", (0, 3), 0, "down", 256), ("d3-lite-halves", "", "", (0, 3), 0, "gate_up", 256),
          # Flint's official file: Q4_1_64 (tile-major, the compact header); o's K 4096, down's 6144
          ("flint", "int4", "", (0, 2), 0, "qkv", 256), ("flint", "int4", "", (0, 2), 2, "qkv", 64),
          ("flint", "int4", "", (0, 2), 0, "o", 256), ("flint", "int4", "", (0, 2), 0, "gate_up", 256),
@@ -128,32 +144,44 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
 _images: dict[tuple, tuple] = {}
 
 
+def _base(model: str) -> str:
+    """A case's model without its layout suffix ("-tails": half regions and the image's pairs; "-halves": without
+    pairs)."""
+    return model.removesuffix("-tails").removesuffix("-halves")
+
+
 def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[GGUFFile, object, np.ndarray]:
-    """The model's image of the layers (a truncated vocabulary), packed."""
+    """The model's image of the layers (a truncated vocabulary), packed; its half regions as the suffix says (none
+    without one: padded to whole chunks)."""
+    base = _base(model)
     path = {"llama": lambda: llama_gguf(quant, size), "qwen35": lambda: qwen_gguf(quant, size),
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
-            "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
+            "kev": lambda: decision_gguf("kev"), "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
             "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski"),
-            "flint": lambda: flint_gguf(quant)}[model.removesuffix("-tails")]()
+            "flint": lambda: flint_gguf(quant)}[base]()
     require(path)
-    key = (path, layers, model.endswith("-tails"))
+    key = (path, layers, model)
     if key not in _images:
         _images.clear()
         g = GGUFFile(path)
-        if model in ("llama", "qwen3"):
+        layout = {"tails": model != base}
+        if base in ("llama", "qwen3"):
             from models.llama.image import LlamaImage as Image
-        elif model in ("qwen35", "occamy", "d3-lite", "swift"):
+        elif base in ("qwen35", "occamy", "d3-lite", "swift", "kev"):
             from models.qwen35.image import QwenImage as Image
-        elif model == "lfm":
+        elif base == "lfm":
             from models.lfm.image import LfmImage as Image
-        elif model.startswith("spark"):
+        elif base.startswith("spark"):
             from models.spark.image import SparkImage as Image
-        elif model == "flint":
+        elif base == "flint":
             from models.flint.image import FlintImage as Image
         else:
             from models.gemma4.image import GemmaImage as Image
-        img = Image(g, layers=list(layers), vocab=COLS * 64,
-                    **({"tails": model.endswith("-tails")} if model.startswith("spark") else {}))
+        if base in ("llama", "qwen3", "qwen35", "occamy", "d3-lite", "swift", "kev"):
+            layout["pairs"] = model.endswith("-tails")
+        elif not base.startswith("spark"):
+            layout = {}
+        img = Image(g, layers=list(layers), vocab=COLS * 64, **layout)
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W)
         _images[key] = (g, img, W)
@@ -165,7 +193,7 @@ def _plan(model: str, img: object, region: object, T: int) -> PG.PhasePlan:
     pitch = PG.d_pitch(img, T) if region.name in PG.OUT else 0
     if model == "gemma4":
         from models.gemma4.prefill import plan_gemm
-    elif model in ("llama", "qwen3"):
+    elif _base(model) in ("llama", "qwen3"):
         from models.llama.prefill import plan_gemm
     elif model == "lfm":
         from models.lfm.prefill import plan_gemm
@@ -257,9 +285,9 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
 
     variants = {level: outputs(level) for level in (0, None, LEVEL)}
     C, Cb = variants[0]
-    if model.endswith("-tails"):  # (the padded image's GEMMs on A's columns and zeros: bit for bit, the k-tiles
-        # less exact zeros)
-        _, pimg, PW = _image(model.removesuffix("-tails"), quant, size, layers)
+    if model != _base(model):  # (the padded image's GEMMs on A's columns and zeros: bit for bit, the k-tiles less
+        # exact zeros)
+        _, pimg, PW = _image(_base(model), quant, size, layers)
         ppp = _plan(model, pimg, pimg.region(layer, phase), T)
         pops = list(dict.fromkeys(gm.op for gm in ppp.gemms))
         plib = Library("t_prefill_gemm_pad", [*pops, *map(_twin, pops)]).compile().load()
@@ -274,7 +302,9 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
             assert torch.equal(Pb[:T, cols].view(torch.int16), Cb[:T, cols].view(torch.int16)), "the padded image's"
         else:
             P = sum(_run(plib, gm.op, Ap[:gm.op.M], PW, gm.w_off, gm.a_off)[:T].float() for gm in ppp.gemms)
-            assert torch.equal(P.view(torch.int32), C.view(torch.int32)), "the padded image's output"
+            n = C.shape[1]  # (gate / up's rows: down's K, a half region's of fewer columns; the padded image's zero past)
+            assert torch.equal(P[:, :n].view(torch.int32), C.view(torch.int32)), "the padded image's output"
+            assert not P[:, n:].any()
         _image(model, quant, size, layers)
 
     def agree(f: object) -> None:

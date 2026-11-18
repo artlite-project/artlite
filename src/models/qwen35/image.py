@@ -33,14 +33,18 @@ tiles, data region "<name>_norm") when every region's decode K groups are whole 
 (``contiguous``: the 9B, MiniCPM-V), so that a decode step streams a column's weights between two attentions as one run;
 else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its down's 17 chunk-major in groups of 5).
 
-down's K is the ffn padded to whole K chunks (MiniCPM-V's 3584 -> 4096: zero super-blocks, ``decode.image``), and so
-is the hidden size of the phases that read it where it is part of a chunk (Kev-4B's 2560 -> 3072: the overlay keeps those
-inputs' padding zero, ``ModelOverlay._clear_pads``; the prefill's norms write rows of the padded K). The
-activation objects' payload (``payload``: the K groups) is the hidden state rounded up to whole 4 KB state panels of the
-GDN cores, at least 4096 elements (27B 6144, 9B and MiniCPM-V 4096): down takes its K chunks in groups (27B 1 of 17, 9B
-4 of 12, MiniCPM-V 4 of 4); an MoE model's is the hidden state's (Qwen3.6-35B-A3B 2048: gdn_out and attn_out in groups
-of 2 chunks), so that the helper cores' x panels have room for the MoE's side chunk next to its experts' partials
-(``decode.design``'s "MoE").
+An input half a chunk short of whole chunks in one K group (``decode.image.Region.half`` regions, ``tails``; a dense
+model's) is the hidden size where it is so (Kev-4B's 2560: gdn_in, attn_in, gate_up, the LM head) and down's ffn
+(MiniCPM-V's and d3-lite's 3584 in 4 chunks): those phases' inputs are of that K, the prefill's GEMMs read 2.5 of 3 (3.5
+of 4) of a row tile's tiles; a model that decodes (``pairs``) holds gate / up's 16-row Q4_K / Q4_0 blocks (the prefill
+reads them in pass pairs: ``prefill.gemm.pair_tails``) and the LM head's (no prefill reads it) in pairs of row tiles
+that share the tile of the last 512 columns, a readout model's (its prompts only) and the other blocks' tiles keep that
+tile's second half as zero super-blocks. A down of another K of part of a chunk is padded to whole K chunks with zero
+super-blocks (``decode.image``). The activation objects' payload (``payload``: the K groups) is the hidden state rounded
+up to whole 4 KB state panels of the GDN cores, at least 4096 elements (27B 6144, 9B and MiniCPM-V 4096): down takes its
+K chunks in groups (27B 1 of 17, 9B 4 of 12, MiniCPM-V 4 of 4); an MoE model's is the hidden state's (Qwen3.6-35B-A3B
+2048: gdn_out and attn_out in groups of 2 chunks), so that the helper cores' x panels have room for the MoE's side chunk
+next to its experts' partials (``decode.design``'s "MoE").
 """
 
 import numpy as np
@@ -64,10 +68,13 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe.image import MoeImage
 from artlite.operators.design import COLS
+from artlite.prefill.gemm import pair_tails
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
 NORMS = {"gdn_in": "attn_norm", "attn_in": "attn_norm", "gate_up": "post_attention_norm", "moe_in": "post_attention_norm",
          "lm": "output_norm"}
+# (``tails``: a dense model's regions of the hidden's input, and down's: the ffn half a chunk short in one K group)
+TAILS = frozenset({"gdn_in", "attn_in", "gate_up", "down", "lm"})
 
 
 def payload(hidden: int, moe: bool = False) -> int:
@@ -98,18 +105,23 @@ class QwenImage(MoeImage, TileImage):
     SCREEN = True  # (the model's own LM head may be screened: ``screen``)
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
-                 vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True):
+                 vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True, tails: bool = True,
+                 pairs: bool = True):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
-        (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block)."""
+        (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block); tails: a dense model's
+        regions of the hidden's input half regions where it is half a chunk short, pairs: their pairs of row tiles
+        (module docstring)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
         self.n_ids = cfg.vocab_size if vocab is None else vocab  # (the token ids of the LM rows: 0 .. ids - 1)
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
+        self.paired = pairs
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
-        super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab)
+        super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab,
+                         tails=TAILS if tails and not cfg.moe else frozenset())
         assert H % (64 * COLS) == 0 and I % (64 * COLS) == 0
         assert cfg.ssm_k_heads % COLS == 0 and cfg.num_attention_heads % COLS == 0
         assert cfg.num_key_value_heads * cfg.head_dim % (COLS * 64) == 0
@@ -147,6 +159,11 @@ class QwenImage(MoeImage, TileImage):
                     self._add_data(r.layer, r.name + "_norm", self.n_norm * self.tile_bytes)
                 self.regions.append(r)
         self._place()
+
+    def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:
+        """(``paired``) The LM head's (the prefill reads none), the regions' the prefill reads in pairs
+        (``pair_tails``)."""
+        return self.paired and (region == "lm" or pair_tails(region, fmt, R))
 
     def _draft_cols(self, R: int, rows: int) -> int:
         """The drafter head's rows per column (``head.draft_cols``)."""

@@ -111,18 +111,18 @@ other programs):
 
 | file | request | prompt tokens | NPU | iGPU | energy a request, NPU / iGPU (the shortest, the longest prompt) |
 |---|---|---|---|---|---|
-| vllm-sr d3-lite (0.8B, Q8_0) | a question | 103 / 256 / 1024 | 32 / 39 / 113 ms | 24 / 37 / 168 ms | 0.26 / 1.0 J, 1.4 / 6.2 J |
-| | 8 questions about one state | 2315 | 282 ms | 338 ms | 0.56 / 1.4 J a question |
+| vllm-sr d3-lite (0.8B, Q8_0) | a question | 103 / 256 / 1024 | 31 / 37 / 109 ms | 24 / 37 / 168 ms | 0.26 / 1.0 J, 1.4 / 6.2 J |
+| | 8 questions about one state | 2315 | 271 ms | 338 ms | 0.56 / 1.4 J a question |
 | vllm-sr d3-nano (2B, Q8_0) | a question | 103 / 256 / 1024 | 50 / 57 / 186 ms | 42 / 74 / 315 ms | 0.8 / 1.7 J, 3.2 / 11 J |
-| Kev-4B (Q4_K_M) | a question | 32 / 184 / 952 | 90 / 125 / 453 ms | 46 / 145 / 744 ms | 0.4 / 2.0 J, 6.0 / 25 J |
-| | 8 questions about one state | 1732 | 278 ms | 1379 ms | 0.48 / 5.8 J a question |
+| Kev-4B (Q4_K_M) | a question | 32 / 184 / 952 | 83 / 116 / 425 ms | 46 / 145 / 744 ms | 0.4 / 2.0 J, 6.0 / 25 J |
+| | 8 questions about one state | 1732 | 265 ms | 1379 ms | 0.48 / 5.8 J a question |
 | Decision-2.0-Kai (0.6B, Q8_0) | a question | 79 / 268 / 1036 | 31 / 56 / 159 ms | 17 / 34 / 129 ms | 0.22 / 0.66 J, 2.0 / 4.6 J |
 | LiquidAI d1-2B (Q4_0) | a question | 64 / 256 / 1024 | 33 / 49 / 149 ms | 22 / 69 / 298 ms | 0.36 / 0.73 J, 3.3 / 10 J |
 | | 8 questions about one state | 482 (one sequence; the iGPU: 1833, each alone) | 84 ms | 490 ms | 0.23 / 1.8 J a question |
 | Qwen3-Embedding-0.6B (Q8_0) | a query / a passage | 30 / 433 | 27 / 55 ms | 12 / 51 ms | 0.16 / 0.50 J, 0.72 / 1.9 J |
 | | 8 passages a request | 3434 | 11.1K tokens/s | 8.0K tokens/s | 0.72 / 1.9 J a passage |
-| Qwen3-Embedding-4B (Q4_K_M) | a query / a passage | 30 / 433 | 79 / 216 ms | 50 / 326 ms | 0.9 / 2.0 J, 4.4 / 11 J |
-| | 8 passages a request | 3434 | 2.1K tokens/s | 1.1K tokens/s | 4.0 / 13 J a passage |
+| Qwen3-Embedding-4B (Q4_K_M) | a query / a passage | 30 / 433 | 74 / 202 ms | 50 / 326 ms | 0.9 / 2.0 J, 4.4 / 11 J |
+| | 8 passages a request | 3434 | 2.2K tokens/s | 1.1K tokens/s | 4.0 / 13 J a passage |
 | Qwen3-Reranker-0.6B (Q8_0) | 20 pairs of ~510 tokens | 10194 | 26.1 pairs/s | 17.1 pairs/s | 0.60 / 2.5 J a pair |
 
 - **Energy**: the NPU answers with 2-5x less energy above idle (8-12x for several questions about one state), drawing
@@ -131,7 +131,7 @@ other programs):
   lower); from ~256 tokens on the two are even, and longer prompts, batches and several questions about one state
   (packed into shared prefill chunks on the NPU) go faster on the NPU, up to 6x.
 - A decision model with full attention over the whole prompt (vllm-d3, d1) runs a prompt in one chunk of the next size:
-  one just past a size pays the next one (d3-lite, 260 tokens: 62 ms, 39 at 256). d1 reads a state's questions in one
+  one just past a size pays the next one (d3-lite, 260 tokens: 60 ms, 37 at 256). d1 reads a state's questions in one
   sequence (its runner's way), the state once: 4.4x faster than each question alone on the NPU.
 
 Decisions about pictures (each side with the model's mmproj, its vision encoder on the same device; every request's

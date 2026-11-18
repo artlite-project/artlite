@@ -1,6 +1,6 @@
 # Qwen3 on the NPU
 
-Qwen3 0.6B, its embedding and reranker models (Qwen3-Embedding-0.6B and -4B, Qwen3-Reranker-0.6B) and vllm-sr's
+Qwen3 0.6B, its embedding and reranker models (Qwen3-Embedding-0.6B and -4B, Qwen3-Reranker-0.6B and -4B) and vllm-sr's
 decision model Decision-2.0-Kai-0.6B (GGUF architectures `qwen3` and `vllm-decision2`) run on Llama's path: the same
 layers, with q and k RMS-normed per head (a weight per dim) before RoPE. Running them: [artlite-cli](../cli.md),
 [artlite-server](../server.md) (embeddings, rerank, `/classify`, `/v1/systemone`).
@@ -13,6 +13,7 @@ $ARTLITE_MODELS_DIR/
   Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
   Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf
   ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+  giladgd/Qwen3-Reranker-4B-GGUF/Qwen3-Reranker-4B.Q4_K_M.gguf
   vllm-sr/Decision-2.0-Kai-0.6B/Decision-2.0-Kai-0.6B-Q8_0.gguf   (converted, below)
 ```
 
@@ -39,25 +40,31 @@ chat template has Qwen3's thinking mode (`--think`); sampling follows the model 
 - The KV cache holds K as bfp16 hi + lo by default (`--kv-k hilo`; 96 KB per position): with one block per 8 dims
   (`--kv-k single`, 64 KB) the KL against the same file on the CPU goes from 0.0037 to 0.0085 on a chat.
 - A file of Q8_0 alone (the embedding, reranker and decision files) takes 8-row tiles of 9216 bytes.
-- Qwen3-Embedding-4B's hidden size (2560) and ffn (9728) are not whole K chunks of 1024: their projections run in
-  chunks padded with zero weights.
+- The 4B models' hidden size (2560) is two and a half K chunks of 1024: the projections that read it (q / k / v,
+  gate / up, the LM head) take inputs of 2560, and the prompt's GEMMs read 2.5 of a row's 3 tiles (13-16% faster at
+  1024 tokens). In a model that generates, the last tile's second half is the next row's (gate / up and the LM head:
+  a decode step streams 2.43 instead of 2.66 GB, 46.0 instead of 50.0 ms at 1K and 61.9 instead of 65.9 at 8K, measured
+  on Qwen3-Embedding-4B's file, the Qwen3-4B family's shapes). The ffn (9728) runs in chunks padded with zero weights.
+- An embedding, reranker or decision file holds no LM head on the NPU: it generates no text (artlite-server reads it
+  out), and its weights take 176 MB less (0.6B: 0.50 instead of 0.68 GB; 4B: 155 MB less, 2.51 GB).
 
 Qwen3 0.6B Q4_1: time to first token at 1K / 8K / 32K prompt tokens 0.095 / 1.41 / 16.7 s; decode 8.6 ms per token
 after 1K, 69.0 ms after 32K (116.3 / 14.5 tokens/s). Quality vs the CPU model on the same weights, teacher-forced: KL
 0.0037 on a chat (through the prefill), 0.0037 after a 4800-token essay.
 
-Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 27
-ms, a 430-token passage's in 55 ms, batches of 8 passages 11.1K tokens/s; Qwen3-Embedding-4B Q4_K_M 79 ms, 216 ms, 2.1K
-tokens/s; Qwen3-Reranker-0.6B Q8_0 25.6 pairs/s of ~510 tokens; Decision-2.0-Kai-0.6B 31 / 56 / 159 ms per question of
-79 / 268 / 1036 tokens ([against the iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
+Through artlite-server, warm, each request's texts new: Qwen3-Embedding-0.6B Q8_0 a 30-token text's embedding in 27 ms,
+a 430-token passage's in 55 ms, batches of 8 passages 11.1K tokens/s; Qwen3-Embedding-4B Q4_K_M 74 ms, 202 ms, 2.2K
+tokens/s; Qwen3-Reranker-0.6B Q8_0 25.6 pairs/s of ~510 tokens (4B Q4_K_M 5.1 pairs/s); Decision-2.0-Kai-0.6B 31 / 56 /
+159 ms per question of 79 / 268 / 1036 tokens ([against the
+iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
 
 Against llama.cpp on the same files (CPU): the embeddings within a cosine of 0.997-0.999 (4B: 0.994-0.999; its CPU and
 Vulkan builds: 0.9995, 0.997; an exact fp32 model of the 0.6B file: 0.999 on its most sensitive texts, llama.cpp's own
 8-bit activations), the same share of target passages among the 30 test queries' top 10 (72%; 4B 73%, CPU 74%); the
-rerank scores within 0.18 (logits within 1.2), the target passage first as often (93%); Kai's answers 314 of 320 the
-same, probabilities within 0.07 (median 0.006), accuracy on four classification sets within one question of 50. The
-prefill's GEMMs take bfp16 weights and activations (8-bit mantissas per block of 8), so a row is within ~0.15% of the
-CPU's where llama.cpp's own builds differ by 0.05%; these models' attention takes its softmax weights as two blocks
-each (hi + lo: its error is then its output's own rounding).
+rerank scores within 0.18 (logits within 1.2; 4B: 0.11, 0.91), the target passage first as often (93%; 4B 97%); Kai's
+answers 314 of 320 the same, probabilities within 0.07 (median 0.006), accuracy on four classification sets within one
+question of 50. The prefill's GEMMs take bfp16 weights and activations (8-bit mantissas per block of 8), so a row is
+within ~0.15% of the CPU's where llama.cpp's own builds differ by 0.05%; these models' attention takes its softmax
+weights as two blocks each (hi + lo: its error is then its output's own rounding).
 
 NPU code: `src/models/llama/` (the model object `Qwen3`: `qwen3.py`).

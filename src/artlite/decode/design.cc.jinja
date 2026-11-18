@@ -958,7 +958,7 @@ __attribute__((noinline)) int {{ p }}_gusplit(int32_t *__restrict ws, int S, int
     return part ? k : 0;
 }
 {% endif %}
-{% if tails %}
+{% if tail_pairs %}
 
 // (B_PT blocks, ``decode.image.Region``) Row tile nrt's place in the pairs of its block bn (S_PT): 2 a pair's second (its
 // tail came with the first's), 1 a pair's first (its tail tile's second half: nrt + 1's), else 0
@@ -1326,14 +1326,15 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     float *__restrict yh = yt + {{ p }}_hy(st[{{ S_FMT }}]);  // (a row-split tile: the helper's rows)
     for (int i = 0; i < 64; i += 32)
         aie::store_v(yh + i, aie::add(aie::load_v<32>(yh + i), aie::load_v<32>(r + i)));
-{% elif tails %}
+{% elif tail_pairs %}
     const int kc = st[{{ S_KC }}], more = kc + 1 < st[{{ S_G }}] - (st[{{ S_PT }}] >> 1);  // (a pair's second: its tail came
     // before)
     const int pf = st[{{ S_PT }}] & 1;
     if (more || !pf)  // (a pair's tail tile: the helper's rows are the next row tile's, ``ynext``)
+{% set v = 64 if SLOTS == 8 else 32 %}
         AIE_LOOP_UNROLL_FULL
-        for (int i = 0; i < {{ YN }}; i += 64)
-            aie::store_v(yt + i, aie::add(aie::load_v<64>(yt + i), aie::load_v<64>(r + i)));
+        for (int i = 0; i < {{ YN }}; i += {{ v }})
+            aie::store_v(yt + i, aie::add(aie::load_v<{{ v }}>(yt + i), aie::load_v<{{ v }}>(r + i)));
 {% elif SLOTS == 8 %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YN }}; i += 64)
@@ -1346,7 +1347,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     st[{{ S_NM }}] = 0;
     const int tl = st[{{ S_TL }}] - 1;
     st[{{ S_TL }}] = tl;
-{% if tails %}
+{% if tail_pairs %}
     if (more) {
         st[{{ S_KC }}] = kc + 1;
         return;
@@ -1369,7 +1370,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     const int fw = st[{{ S_B }} + 3 * b + 1], R = {{ p }}_rows(fw & 255);
 {% endif %}
     const int bn = b + 1 < st[{{ S_NB }}] && nrt >= st[{{ S_B }} + 3 * b] ? b + 1 : (nrt ? b : 0);  // (the next row tile's)
-{% if tails %}
+{% if tail_pairs %}
     {{ p }}_pplace(st, bn, nrt);
 {% endif %}
 {% if moe %}
@@ -1468,7 +1469,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     int add = nv0 > 0 ? {{ p }}_slots(ws, S, flags, fw, nv0, row0 + r0, n, hres, 0) : 0;
     if (nv1 > 0)
         add += {{ p }}_slots(ws, S, flags, fw, nv1, row0 + r0 + 16, n + add, hres, 1);
-{% if tails %}
+{% if tail_pairs %}
     {{ p }}_ynext(yt, r, pf);
 {% else %}
     AIE_LOOP_UNROLL_FULL
@@ -1483,9 +1484,13 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
         if (nv1 > 0)
             add += {{ p }}_slot(ws, s, flags, fw, nv1, row0 + r0 + 16, n + add, 1);
     }
+{% if tail_pairs %}
+    {{ p }}_ynext(yt, r, pf);
+{% else %}
     AIE_LOOP_UNROLL_FULL  // (zv's rolled loop: ~10 cycles a store, on every row tile)
     for (int i = 0; i < {{ YT }}; i += 16)
         aie::store_v(yt + i, aie::zeros<float, 16>());
+{% endif %}
 {% endif %}
 {% else %}
     if (flags & {{ F_GU }})
@@ -1498,7 +1503,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
 {% endif %}
 {% if SLOTS == 8 %}
     const int add = {{ p }}_slots(ws, S, flags, fw, nv, row0 + r0, n, hres);
-{% if tails %}
+{% if tail_pairs %}
     {{ p }}_ynext(yt, r, pf);
 {% else %}
     AIE_LOOP_UNROLL_FULL
@@ -1510,9 +1515,13 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++)
         add = {{ p }}_slot(ws, s, flags, fw, nv, row0 + r0, n);
+{% if tail_pairs %}
+    {{ p }}_ynext(yt, r, pf);
+{% else %}
     AIE_LOOP_UNROLL_FULL
     for (int i = 0; i < {{ YT }}; i += 16)
         aie::store_v(yt + i, aie::zeros<float, 16>());
+{% endif %}
 {% endif %}
 {% endif %}
     st[{{ S_STG }}] = n + add;
@@ -1769,7 +1778,7 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     for (int i = 0; i < {{ 3 * NBLK }}; i++)
         st[{{ S_B }} + i] = m[{{ M_B }} + i];
     st[{{ S_FMT }}] = m[{{ M_B + 1 }}] & {{ 255 + B_G2 + B_G4 if moe else 255 }};  // (the first row tile's)
-{% if tails %}
+{% if tail_pairs %}
     st[{{ S_PT }}] = (m[{{ M_B + 1 }}] & {{ B_PT }}) && m[{{ M_B }}] > 1;  // (the first row tile: a pair's first)
 {% endif %}
     st[{{ S_TL }}] = m[{{ M_NT }}];

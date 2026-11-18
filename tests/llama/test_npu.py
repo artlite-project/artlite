@@ -42,13 +42,15 @@ def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
 def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
     path = llama_path(quant, size)
     model = open_model(path, kv_k=kv_k)
+    assert model.generates == (size != "qwen3:embedding-0.6B")
     messages = [{"role": "user", "content": PROMPT}]
     prompt = model.chat(messages) if model.cfg.neox else \
         model.tokenizer.encode(chat_prompt(model.gguf, messages, date=DATE))
     seq = prompt + model.tokenizer.encode(TEXT)
     first = len(prompt) - 1  # (the prompt's tokens before its last run without logits)
     want = _cpu_logits(path, seq, first)
-    npu = model.load(capacity=256)
+    # (an embedding model's file, whose app holds no LM head: its Q8_0 tiles of 8 rows on an image that does)
+    npu = model.load(capacity=256) if model.generates else NpuLlama(GGUFFile(path), capacity=256, kv_k=kv_k)
     for batch in (1, 4):
         got = npu.forced_logits(seq, first, batch=batch)
         kl, agree = kl_agree(want, got)

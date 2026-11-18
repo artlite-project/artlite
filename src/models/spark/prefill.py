@@ -90,7 +90,7 @@ class SparkPrefill(ChunkPrefill):
         self.window = cfg.sliding_window
         self.wg = self.window // 32
         self.stage = self.wg + MAX_T // 32  # (the staging's groups per KV head: one layout for every size)
-        self.kmax = max(r.K_in for r in self.img.regions if r.name == "attn_in")  # (the panels' K: the GEMMs' A)
+        self.kmax = PG.input_k(self.img, ("attn_in", "gate_up"))  # (the panels' K: the GEMMs' A)
         self._norm_ops: dict[tuple, ResidualNormOperator] = {}
         self._k_parts: dict[tuple, int] = {}
         self._gemms: dict[tuple, object] = {}

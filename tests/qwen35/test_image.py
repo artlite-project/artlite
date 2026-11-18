@@ -1,8 +1,8 @@
-"""The qwen35 weight image (models/qwen35/image.py), on the host (no NPU): the layout of a GGUF file (every row of
-every matrix in exactly one column's block, the GDN heads' column partition, MiniCPM-V's padded vocabulary and down K,
-column-major where the decode's K groups allow it; an MoE file's router planes, shared expert and expert slabs) and the
-packed image's tiles and norm-weight objects at their places (the C++ packer against the slots' ``pack_tile``:
-decode/test_gemv.py), an MoE's experts against the oracle's matrices (``ref.experts``)."""
+"""The qwen35 weight image (models/qwen35/image.py), on the host (no NPU): the layout of a GGUF file (every row of every
+matrix in exactly one column's block, the GDN heads' column partition, MiniCPM-V's padded vocabulary and down K,
+column-major where the decode's K groups allow it; an MoE file's router planes, shared expert and expert slabs; Kev-4B's
+half regions) and the packed image's tiles and norm-weight objects at their places (the C++ packer against the slots'
+``pack_tile``: decode/test_gemv.py), an MoE's experts against the oracle's matrices (``ref.experts``)."""
 
 import os
 
@@ -19,7 +19,8 @@ from artlite.operators import bfp16
 from artlite.operators.design import COLS
 from models.qwen35.image import KC, NORMS, QwenImage, gdn_v_heads
 
-from ..model_files import require
+from ..decode.image_checks import check_tails, check_unpaired
+from ..model_files import require, size_gguf
 from ..moe.ref import experts
 
 S = 9280
@@ -282,3 +283,27 @@ def test_gate_up_windows() -> None:
 def _bfp16_rows(tile: np.ndarray) -> np.ndarray:
     """A BFP16 tile of 1024 columns -> its 8 rows' values (8, 1024) ([k8][row][exp, 8 int8])."""
     return bfp16.block_values(tile[:128 * 8 * 9].reshape(128, 8, 9)).transpose(1, 0, 2).reshape(8, 1024)
+
+
+TAIL_CASES = [("kev", False), ("kev", True), ("1B", True), ("d3-lite", True)]
+
+
+@pytest.mark.parametrize(("size", "pairs"), TAIL_CASES, ids=[f"{s}-{'pairs' if p else 'halves'}" for s, p in TAIL_CASES])
+def test_pack_tails(size: str, pairs: bool) -> None:
+    """Kev-4B's hidden 2560 (``qwen35.image``): gdn_in, attn_in, gate_up and the LM head are half regions (``TAILS``);
+    with ``pairs`` gate / up's Q4_K blocks and the LM head's in pairs of row tiles, the other blocks (gdn_in's and
+    attn_in's Q8_0) as in the padded image (``image_checks.check_tails``); without, every tile as the padded image's.
+    MiniCPM-V 1B's and d3-lite's ffn 3584: down a half region, unpaired (every tile as the padded image's)."""
+    path = size_gguf(size)
+    require(path)
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    layers = [cfg.gdn_layers[0], cfg.attention.index(True)]
+    img = QwenImage(g, cfg, layers=layers, vocab=COLS * 64 * 3, pairs=pairs)
+    pad = QwenImage(g, cfg, layers=layers, vocab=COLS * 64 * 3, tails=False)
+    kev = size == "kev"
+    assert {(r.name, b.name) for r in img.regions for b in r.blocks if b.pt} == \
+        ({("gate_up", "gu"), ("lm", "lm")} if pairs and kev else set())
+    check_tails(img, pad, {"gdn_in", "attn_in", "gate_up", "lm"} if kev else {"down"})
+    if not (pairs and kev):
+        check_unpaired(img, pad)

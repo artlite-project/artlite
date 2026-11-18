@@ -99,6 +99,9 @@ class ApiContext:
         """What every generation request must satisfy; fields the NPU path ignores are logged."""
         if self.info.decision is not None:  # (as llama-server: its output modalities are only "decisions")
             raise not_supported("This model is a decision model without text generation, use /v1/systemone")
+        if not self.info.generates:  # (an embedding or rerank model: its NPU image holds no LM head)
+            raise not_supported("This model is an embedding / rerank model without text generation, use its routes "
+                                "(--embedding, --rerank)")
         if req.n not in (None, 1):
             raise bad_request("n > 1 is not supported: one sequence at a time")
         if req.model and req.model != self.options.alias:  # (as llama-server: any)

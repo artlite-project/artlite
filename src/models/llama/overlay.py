@@ -20,11 +20,13 @@ objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``)
 head_dim 64, 64 at 128 for objects of ~9.3 KB; then per layer and KV head a ring of two slots of T bytes with the
 exact V values of the open records (``decode.vring``). Phase inputs are packed (``decode.protocol.packed_slots``).
 
-A hidden size that is not a whole number of K chunks (Qwen3-Embedding-4B's 2560) pads the K of the phases that read
-the residual stream (qkv, gate_up, the LM head) with zero super-blocks (``decode.image``); their inputs' padding k
-must be zero too, since the helper's norm squares every input element: a step of more slots writes a layout whose
-real k reach into the padding of the fewer-slot layouts, which the next step of fewer slots clears first
-(``_clear_pads``).
+A hidden size half a chunk short of whole K chunks (the Qwen3-4B family's 2560) makes the phases that read the residual
+stream (qkv, gate_up, the LM head) half regions (``llama.image``): their inputs are the hidden size, the helper copies
+the last half chunk's x panels into its half of the chunk (``decode.design``'s ``tails``), whose tiles hold zero
+super-blocks there or a pair's second row tile (``tail_pairs``). A hidden size of another part of a chunk would pad
+those phases' K with zero super-blocks (``decode.image``); their inputs' padding k must be zero too, since the helper's
+norm squares every input element: a step of more slots writes a layout whose real k reach into the padding of the
+fewer-slot layouts, which the next step of fewer slots clears first (``_clear_pads``).
 
 The step's transaction is built once per S and pattern of sub-steps (and LM head or not) and patched per step: the
 token objects, each column's range of each layer's cache per sub-step (A: address, length), its tail objects (A: the
@@ -83,16 +85,18 @@ class LlamaOverlay(AttentionOverlay):
     """A Llama GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices),
     ``vocab``: LM rows (default: the padded vocabulary), ``max_positions``: the caches' capacity, ``kv_k``: the caches'
     K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's buffer
-    allocated ahead. One cache kind, one column per KV head, one ring state for every layer (key 0 of ``vring``: every
-    step runs every layer)."""
+    allocated ahead, ``image``: an image laid out already (``ModelOverlay``'s; default ``LlamaImage``'s layout). One
+    cache kind, one column per KV head, one ring state for every layer (key 0 of ``vring``: every step runs every
+    layer)."""
 
     CONFIG, IMAGE = LlamaConfig, LlamaImage
     AHEAD = True
     NORMED = frozenset({"qkv", "gate_up", "lm"})
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None):
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights)
+                 max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None,
+                 image: LlamaImage | None = None):
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = check_formats(img)
         self.hd, self.nh = cfg.head_dim, cfg.q_per_kv
@@ -102,7 +106,9 @@ class LlamaOverlay(AttentionOverlay):
         gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R}
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                       eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16} or img.split,
-                                      paged=paged_formats(gguf, fmts), split=img.split)
+                                      paged=paged_formats(gguf, fmts), split=img.split,
+                                      tails=any(r.half for r in img.regions),
+                                      tail_pairs=any(b.pt for r in img.regions for b in r.blocks))
         self.pg = at.pg[self.hd]  # positions per cache group
         groups = -(-max_positions // self.pg)
         self.max_positions = groups * self.pg

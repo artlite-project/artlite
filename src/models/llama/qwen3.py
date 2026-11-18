@@ -15,7 +15,7 @@ from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
 from ..model import Model
-from ..readouts import readout_model
+from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LlamaImage
@@ -42,7 +42,9 @@ class Qwen3(Model):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = LlamaConfig.from_gguf(self.gguf)
-        image = LlamaImage(self.gguf, self.cfg)
+        self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
+        # (a readout model's image: no LM head, its half regions unpaired; ``llama.image``)
+        image = LlamaImage(self.gguf, self.cfg, vocab=None if self.generates else READOUT_VOCAB, pairs=self.generates)
         check_formats(image)
         self.weights = WeightBuffer(image)
         self.tokenizer = BpeTokenizer(self.gguf)
@@ -64,4 +66,4 @@ class Qwen3(Model):
 
     def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
         return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                        readout=readout_model(self.gguf.meta, self.gguf.arch))
+                        readout=not self.generates)

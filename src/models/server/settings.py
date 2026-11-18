@@ -85,6 +85,12 @@ class ModelInfo:
     decision: str | None = None  # its decision type (``{arch}.decision.type``; None: not a decision model)
     decisions: decisions.Decisions | None = None  # (its decision context made ahead: else on the first request)
 
+    @property
+    def generates(self) -> bool:
+        """Whether the model generates text: not a readout model's file (an embedding, rerank or decision model:
+        ``models.readouts.readout_model``, whose NPU image holds no LM head)."""
+        return self.readouts.pooling is None and self.decision is None
+
     @classmethod
     def from_gguf(cls, path: str) -> ModelInfo:
         from artlite.gguf_model import GGUFFile

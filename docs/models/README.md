@@ -42,6 +42,7 @@ architecture, tokenizer and chat template come from its metadata.
 | | ✅ Qwen3-Embedding-0.6B ([embeddings](../server.md#embeddings-and-rerank)) | Qwen Q8_0 | |
 | | ✅ Qwen3-Embedding-4B ([embeddings](../server.md#embeddings-and-rerank)) | Qwen Q4_K_M | |
 | | ✅ Qwen3-Reranker-0.6B ([rerank](../server.md#embeddings-and-rerank)) | ggml-org Q8_0 | |
+| | ✅ Qwen3-Reranker-4B ([rerank](../server.md#embeddings-and-rerank)) | giladgd Q4_K_M | |
 | vllm-decision2 | ✅ vllm-sr Decision-2.0-Kai-0.6B (decision model: [`/v1/systemone`](../server.md#decisions)) | Q8_0 by llama.cpp's converter from vllm-sr's checkpoint | |
 | lfm3 | ✅ LFM3-1.7B | LiquidAI QAD-Q4_0, Q4_K_M, Q8_0 | the sliding-window layers' caches as rings; LiquidAI BF16 |
 | | ✅ d1-2B (decision model: [`/v1/systemone`](../server.md#decisions)) | LiquidAI Q4_0, Q4_K_M, Q8_0, its mmproj Q8_0 (images, videos) | |

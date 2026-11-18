@@ -38,6 +38,7 @@ from artlite.decode.image import TileImage
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import (
     QwenConfig,
+    decision_gguf,
     decision_mmproj,
     flint_gguf,
     gemma_gguf,
@@ -584,8 +585,10 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "llama-3B-Q4_K_M": (llama_gguf("Q4_K_M", "3B"), lambda p: _llama(p, "single")),
     "llama-8B-Q4_K_S": (llama_gguf("Q4_K_S", "8B"), lambda p: _llama(p, "single")),
     "qwen3-0.6B-Q4_1": (qwen3_gguf("0.6B"), lambda p: _llama(p, "hilo")),
+    "qwen3-embedding-4B-Q4_K_M": (qwen3_gguf("embedding-4B"), lambda p: _llama(p, "hilo")),  # (half regions in pairs)
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
+    "kev-4B": (decision_gguf("kev"), _qwen),  # (half regions in pairs, a design of 4 slots)
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),

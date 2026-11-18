@@ -1,8 +1,15 @@
 """The weight image of a Llama 3.x or Qwen3 model (``decode.image.TileImage``): the file's tile formats over K chunks of
-1024 columns (``KC``, every model and format: 4 super-blocks of 256 columns; a hidden or ffn size of part of a chunk,
-Qwen3-Embedding-4B's 2560 and 9728, padded with zero super-blocks: the overlay and the prefill keep those inputs'
-padding zero), objects of the size that streams the fewest bytes for the file's formats (``formats.choose_tile_bytes``:
-9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0, 9216 for Q8_0 alone).
+1024 columns (``KC``, every model and format: 4 super-blocks of 256 columns), objects of the size that streams the
+fewest bytes for the file's formats (``formats.choose_tile_bytes``: 9280 for Q4_K_M, Q4_K_S, Q5_K_M and Q4_0, 9216 for
+Q8_0 alone).
+
+A hidden size half a chunk short of whole chunks (the Qwen3-4B family's 2560: qkv, gate_up and the LM head, ``TAILS``)
+makes those regions ``decode.image.Region.half`` regions (``tails``): their inputs are the hidden size, the prefill's
+GEMMs read 2.5 of a row tile's 3 tiles. A model that decodes (``pairs``) holds gate / up's 16-row Q4_K / Q4_0 blocks
+(which the prefill reads in pass pairs: ``prefill.gemm.pair_tails``) and the LM head's (which no prefill reads) in pairs
+of row tiles that share the tile of the last 512 columns; a readout model's (its prompts only) and the other blocks'
+tiles keep that tile's second half as zero super-blocks. An ffn of part of a chunk (the 4B's 9728: down) is padded to
+whole chunks with zero super-blocks.
 
 Column-major (as ``gemma4.image``): a column's regions in step order, each normed phase's norm-weight objects (data
 region "<name>_norm": the RMSNorm weights, ``decode.image.NormedImage``) before its tiles, so that a decode step
@@ -30,22 +37,27 @@ from artlite.decode.screen import screened
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
+from artlite.prefill.gemm import pair_tails
 
 KC = 1024  # K chunk of a tile
 NORMS = {"qkv": "attn_norm", "gate_up": "ffn_norm"}  # a layer's normed phases: their RMSNorm weights
+TAILS = frozenset({"qkv", "gate_up", "lm"})  # (``tails``: the regions of the hidden's input)
 
 
 class LlamaImage(NormedImage):
     """The weight image of a Llama GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
-    padded vocabulary; tile_bytes: the object size, default chosen from the file's formats)."""
+    padded vocabulary; tile_bytes: the object size, default chosen from the file's formats; tails: the hidden's regions
+    half regions where it is half a chunk short, pairs: their pairs of row tiles, module docstring)."""
 
     def __init__(self, gguf: GGUFFile, cfg: LlamaConfig | None = None, *, layers: list[int] | None = None,
-                 vocab: int | None = None, tile_bytes: int = 0):
+                 vocab: int | None = None, tile_bytes: int = 0, tails: bool = True, pairs: bool = True):
         cfg = cfg or LlamaConfig.from_gguf(gguf)
         H, I = cfg.hidden_size, cfg.intermediate_size
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
-        super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab)
+        self.paired = pairs
+        super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab,
+                         tails=TAILS if tails else frozenset())
         assert cfg.num_key_value_heads == COLS, f"one KV head per column: {cfg.num_key_value_heads} KV heads"
         assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
         for L in self.layers:
@@ -57,6 +69,11 @@ class LlamaImage(NormedImage):
         self.screen = screened(self.qtype(lm), self.formats())
         self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1), *(("Q6_KH",) if self.screen else ()))], H)
         self._place()
+
+    def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:
+        """(``paired``) The LM head's (the prefill reads none), the regions' the prefill reads in pairs
+        (``pair_tails``)."""
+        return self.paired and (region == "lm" or pair_tails(region, fmt, R))
 
     def norms(self, L: int, name: str) -> tuple[str, None]:
         """(w1, None) tensor names of a normed phase: plain inputs (pre-norm residual updates)."""

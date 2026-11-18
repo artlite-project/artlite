@@ -285,6 +285,10 @@ first as often), not to its digits: the prefill's weights and activations are 8-
 within a cosine of 0.994-0.999 of llama.cpp's CPU result (its CPU and Vulkan builds: 0.997-0.9995; an exact fp32 model:
 0.999) and a rerank score within 0.18. Model pages: [Qwen3](models/qwen3.md).
 
+An embedding or rerank model's file (one with a pooling type: Qwen3-Embedding, Qwen3-Reranker) generates no text: its
+weights go to the NPU without the LM head, which its readouts never take (Qwen3-Embedding-4B's 157 MB), and its text
+routes (chat, completions, Messages, Responses) answer 501 (Qwen3-Embedding-0.6B's weights: 0.50 instead of 0.68 GB).
+
 ## Decisions
 
 Any chat model also gives the probabilities of a few options, as a chat request: [Structured
@@ -297,7 +301,8 @@ as llama-server does (TypeSafe's System One API): a `state` (text, a JSON value 
 prompt, no token generated: a choice's `choice`, `probabilities` and `confidence`, a score's expected level `score`,
 `legend`, `probabilities` and `confidence`, a noul's probability of true `noul`; `usage.input_tokens` counts every
 question's prompt. `/v1/models` reports such a model's `output_modalities` as `["decisions"]`, and its text routes (chat,
-completions, Messages, Responses, transcriptions) answer 501, as llama-server's.
+completions, Messages, Responses, transcriptions) answer 501, as llama-server's; its weights go to the NPU without the
+LM head (an option label's logit is the host's, from the file's row: Kev-4B's weights 430 MB less, d3-nano's 575 MB).
 
 ```bash
 artlite-server -m ggml-org/vllm-d3-lite-GGUF/vllm-d3-lite-Q8_0.gguf
@@ -313,7 +318,7 @@ question), computed on the host from the prompt's output rows. Of the published 
 (ggml-org's Q8_0), ggml-org's Kev-4B (Q4_K_M), Decision-2.0-Kai-0.6B (llama.cpp's converter run on vllm-sr's
 checkpoint: vllm-sr's own GGUF is a fork's format), LiquidAI's d1-2B (Q4_0, Q4_K_M, Q8_0) and d1-Omni-2B (Q8_0) run. A vllm-d3 model reads a prompt whole (its attention is non-causal): one prefill chunk of
 at most 2048 tokens (a longer prompt: 400), and it generates no text (d3-lite: a question of 103 / 256 / 1024 prompt
-tokens in 32 / 39 / 113 ms, HTTP included); other types' questions share the state's tokens through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
+tokens in 31 / 37 / 109 ms, HTTP included); other types' questions share the state's tokens through the prompt cache. A request's questions run packed as embeddings' texts do: a vllm-d3 model's whole prompts;
 on a causal Qwen3.5 model the state once, then the questions packed after it, each continuing the state's Gated
 DeltaNet and attention state, or the questions' whole prompts packed, whichever the estimates say is faster (Kev-4B, 8
 questions of 64 tokens after a 256-token state: 387 ms, 1006 one after another; S0's requests of 4-8 questions after

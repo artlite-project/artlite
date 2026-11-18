@@ -41,7 +41,7 @@ class NpuLlama(OverlayModel):
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``
     (default ``prefill.SIZES``); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``); ``readout``:
     a readout model (``models.readouts.readout_model``): the prefill's precise variants and packed chunks
-    (``LlamaPrefill``'s ``precise``, ``pack``)."""
+    (``LlamaPrefill``'s ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head)."""
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
@@ -50,6 +50,7 @@ class NpuLlama(OverlayModel):
         self.overlay = LlamaOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
+        self.generates = not readout
         self.prefill = LlamaPrefill(self.overlay, sizes=sizes, precise=readout, pack=readout) if prefill else None
         self._open(threads=threads)
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)

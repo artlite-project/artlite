@@ -146,13 +146,22 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             self.slot = len(tokens) - 1
         return out
 
+    def _generating(self) -> None:
+        """NotImplementedError for a readout model (``generates``)."""
+        if not self.generates:
+            raise NotImplementedError(f"{type(self).__name__}: a readout model's (embeddings, rerank, decisions: no LM "
+                                      f"head on the NPU), no text generation: its rows through outputs / readouts")
+
     def step(self, token: int, *, logits: bool = True) -> np.ndarray | None:
         """Run ``token`` at the next position: the logits (vocab,) fp32 of the next token, or None (``logits=False``)."""
+        if logits:
+            self._generating()
         out = self.steps([token], logits=logits)
         return None if out is None else self.cap(out[0])
 
     def top_k(self, token: int, k: int, penalties: Penalties | None = None) -> tuple[np.ndarray, np.ndarray]:
         """(from the overlay's bf16 logits: the soft cap on the candidates alone)"""
+        self._generating()
         raw = self.steps([token])[0]
         return top_logits(raw, k, self.softcap) if penalties is None else penalties.top(raw, k, self.softcap)
 
@@ -256,6 +265,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         token's (vocab,) fp32; ``progress``: as ``forward``'s, after each chunk and each group of steps; ``readout``:
         gathers output rows (``outputs``: every token a chunk can take in chunks); ``sets``: a non-causal prompt's
         (``outputs``)."""
+        if logits:
+            self._generating()
         self._abandon()
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
@@ -444,6 +455,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def forced_logits(self, tokens: list[int], first: int = 0, *, batch: int = 1) -> np.ndarray:
         """Teacher-forced logits (len(tokens) - first, vocab) fp32 of tokens[first:], from position 0, ``batch`` tokens
         per dispatch (quality tooling)."""
+        self._generating()
         self.reset()
         self.prompt(tokens[:first])
         # (a screened head's rows as arrays: every logit exact)

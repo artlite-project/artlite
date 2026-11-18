@@ -98,14 +98,16 @@ Nothing is written to disk. The prefill's buffers (a chunk's activations) take 0
 vllm-sr's d3-lite (Qwen3.5-0.8B's shapes) and d3-nano (2B) answer questions about a state with the logits of the
 options' label tokens at a prompt's last token ([artlite-server's `/v1/systemone`](../server.md#decisions); no text
 generation). Their full-attention layers are non-causal (`qwen35.attention.causal` false): a prompt runs whole in one
-prefill chunk (up to 2048 tokens) whose attention passes see all of its tokens, the padding after them masked; the
-Gated DeltaNet layers stay recurrent. Every tensor of ggml-org's files is Q8_0 (8-row tiles; gate / up in passes of
-half a group). On 320 questions (SST-2, AG News, BoolQ and MNLI rows, questions about essay passages) their choices
-are llama.cpp's (CPU) on 318 and their accuracy the same within one question of 50, the probabilities within 0.08 of its
-(median 0.002-0.003: the prefill's bfp16 GEMMs; llama.cpp's own CPU and Vulkan builds are 0.02 apart); a question takes
-32 ms at 103 tokens, 39 ms at 256 and 113 ms at 1024 through the server (d3-lite; d3-nano 50 / 57 / 186 ms; the iGPU
-with llama.cpp's Vulkan build: 24 / 37 / 168 ms and 42 / 74 / 315 ms, at ~4x the energy above idle:
-[NPU vs iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
+prefill chunk (up to 2048 tokens) whose attention passes see all of its tokens, the padding after them masked; the Gated
+DeltaNet layers stay recurrent. Every tensor of ggml-org's files is Q8_0 (8-row tiles; gate / up in passes of half a
+group; d3-lite's down, of its ffn 3584, reads 3.5 of a row's 4 tiles), and the weights go to the NPU without the LM head
+(an option label's logit is the host's: 0.59 instead of 0.87 GB, d3-nano 1.56 instead of 2.14). On 320 questions (SST-2,
+AG News, BoolQ and MNLI rows, questions about essay passages) their choices are llama.cpp's (CPU) on 318 and their
+accuracy the same within one question of 50, the probabilities within 0.08 of its (median 0.002-0.003: the prefill's
+bfp16 GEMMs; llama.cpp's own CPU and Vulkan builds are 0.02 apart); a question takes 31 ms at 103 tokens, 37 ms at 256
+and 109 ms at 1024 through the server (d3-lite; d3-nano 50 / 57 / 186 ms; the iGPU with llama.cpp's Vulkan build: 24 /
+37 / 168 ms and 42 / 74 / 315 ms, at ~4x the energy above idle: [NPU vs
+iGPU](../npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
 
 With their mmproj (`--mmproj`; the router pairs it by itself) the d3 models read pictures in a request's state
 ([Decisions](../server.md#decisions)): their Qwen3-VL towers are Qwen3.5-0.8B's (12 layers of 768, 12 heads) and
@@ -119,11 +121,12 @@ takes 68 / 216 / 487 ms through the server (d3-nano 104 / 428 / 1071 ms; the iGP
 ms at 3-4x the energy above idle), 8 questions about a 512 x 512 picture 342 ms (d3-nano 561; the iGPU 854, 2273).
 
 Kev-4B (Qwen3.5-4B's shapes, causal) answers with its classifier head (`cls.output`) on the rows at the options' end
-tokens and at the question's last token. Its hidden size, 2560, is not a whole number of K chunks: the projections that
-read the residual stream take K chunks padded with zero weights (the image is 3.6 GB for the 2.8 GB file). On the same
+tokens and at the question's last token. Its hidden size, 2560, is two and a half K chunks of 1024: the projections that
+read the residual stream take inputs of 2560 (the prompt's GEMMs read 2.5 of a row's 3 tiles: 2.77 instead of 3.16 GB
+of weights a pass), and its weights go to the NPU without the LM head (3.16 GB for the 2.8 GB file). On the same
 320 questions its choices are llama.cpp's on 317 and its accuracy the same within one question of 50 (median |dp|
-0.0035); a question takes 90 ms at 32 tokens, 125 at 184 and 453 at 952 through the server, 8 questions about one
-state 278 ms (the iGPU: 46 / 145 / 744 ms, 1379 ms), at 4-12x less energy above idle.
+0.0035); a question takes 83 ms at 32 tokens, 116 at 184 and 425 at 952 through the server, 8 questions about one
+state 265 ms (the iGPU: 46 / 145 / 744 ms, 1379 ms), at 4-12x less energy above idle.
 
 ## Mixture of experts (Qwen3.6-35B-A3B)
 

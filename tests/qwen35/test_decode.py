@@ -632,7 +632,7 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B", "swift"])
+@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B", "swift", "kev"])
 @pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "split4", "s7", "lazy8"])
 def test_overlay_slice(size: str, mode: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
@@ -646,7 +646,9 @@ def test_overlay_slice(size: str, mode: str) -> None:
     (0.5-0.9% on average, 3.4% at most). Occamy (its Q3_K experts in these layers) within the 35B-A3B's bounds: its
     routing flips move a layer's output by up to ~2% (``test_moe_slice``). Qwen3.8-27B on its design of 8 slots (x as
     single bfp16 rows, ``decode.gemv``) also by steps of seven committed tokens (s7) and of eight tokens of which three
-    are accepted (lazy8)."""
+    are accepted (lazy8). Kev-4B (its hidden 2560: half regions, gate / up's and the LM head's row tiles in pairs on its
+    design of 4 slots) within the 9B's bounds (the padded image's at s1: 3.0% at most, 0.85% on average per layer; the
+    pairs' 2.2%, 0.79%)."""
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
@@ -678,7 +680,7 @@ def test_overlay_slice(size: str, mode: str) -> None:
         t += acc
     assert any(split for key in ov._steps for _, _, split in key[3]) == (mode.startswith("split") and not ov.ash.one)
     top, mean = {"9B": (4e-2, 1.5e-2), "1B": (1.2e-1, 4e-2), "35B-A3B": (5e-2, 1.5e-2), "occamy": (5e-2, 1.5e-2),
-                 "3.8-27B": (5.6e-2, 2.1e-2), "swift": (5.6e-2, 2.1e-2)}[size]
+                 "3.8-27B": (5.6e-2, 2.1e-2), "swift": (5.6e-2, 2.1e-2), "kev": (4e-2, 1.5e-2)}[size]
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
@@ -720,6 +722,61 @@ def test_drafts_exact(size: str) -> None:
     one, rounds = run(False), run(True)
     bad = [q for q in sorted(one) if not np.array_equal(one[q], rounds[q])]
     assert not bad, f"{len(bad)} of {P} positions differ: {bad[:8]}"
+
+
+@pytest.mark.parametrize(("size", "pairs"), [("kev", False), ("kev", True), ("1B", False)],
+                         ids=["kev-halves", "kev-pairs", "1B-halves"])
+def test_overlay_tails(size: str, pairs: bool) -> None:
+    """Kev-4B's half regions (``qwen35.image``: gdn_in, attn_in, gate_up, the LM head with inputs of the hidden size
+    2560) on its design of 4 slots: without pairs the tiles and every sum's order are the padded image's (its last half
+    chunk's zero super-blocks times the helper's copy of x), so steps of 1 .. 4 committed slots over the layers up to
+    the first full-attention layer give its residual after every layer and its logits bit for bit; with pairs (gate /
+    up's and the LM head's row tiles: a pair's second sums its tail first) they give those of steps of one, bit for bit,
+    and within ~1% of the padded image's (the sums' order: ``test_overlay_slice``'s bounds against llama.cpp). MiniCPM-V
+    1B's down of 3584 (a half region of its ffn, unpaired): its padded image's bit for bit."""
+    from models.qwen35.overlay import QwenOverlay
+
+    path = size_gguf(size)
+    require(path)
+    g = GGUFFile(path)
+    cfg = QwenConfig.from_gguf(g)
+    layers = list(range(cfg.attention_layers[0] + 1))
+    P, steps = 72, (1, 4, 3, 2, 4, 1, 3)
+    tokens = [int(t) for t in np.random.default_rng(7).integers(0, 50000, P)]
+
+    def run(image: QwenImage, steps: tuple[int, ...]) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=P + 64, image=image)
+        assert ov.SLOTS == 4 and ov.op.tails == any(r.half for r in image.regions)
+        assert ov.op.tail_pairs == any(b.pt for r in image.regions for b in r.blocks)
+        ov.load()
+        bits, hs, t, i = [], [], 0, 0
+        while t < P:
+            S = min(steps[i % len(steps)], P - t)
+            i += 1
+            lg = np.asarray(ov.step(g.rows("token_embd.weight", tokens[t:t + S]), t)).view(np.uint16)
+            for s in range(S):
+                h = [ov.hidden(L, slot=s) for L in [*layers[1:], -1]]
+                hs.append(np.stack(h))
+                bits.append(np.concatenate([lg[s], *(v.view(np.uint32) for v in h)], dtype=np.int64))
+            ov.accept(S)
+            t += S
+        ov.dev = None
+        return bits, hs
+
+    img = QwenImage(g, cfg, layers=layers, vocab=COLS * 64, pairs=pairs)
+    pad = QwenImage(g, cfg, layers=layers, vocab=COLS * 64, tails=False)
+    assert any(r.half for r in img.regions)
+    assert {(r.name, b.name) for r in img.regions for b in r.blocks if b.pt} == \
+        ({("gate_up", "gu"), ("lm", "lm")} if pairs else set())
+    want, _ = run(img, (1,)) if pairs else run(pad, steps)
+    got, gh = run(img, steps)
+    bad = [p for p in range(P) if not np.array_equal(want[p], got[p])]
+    assert not bad, f"{len(bad)} of {P} positions differ: {bad[:8]}"
+    if pairs:
+        _, ph = run(pad, (1,))
+        err = max(rel_max(a[i], b[i]) for a, b in zip(gh, ph, strict=True) for i in range(len(a)))
+        print(f"pairs against the padded image: residuals within {err:.4f}")
+        assert err < 2e-2, err
 
 
 @pytest.mark.parametrize("first", [0, 10])

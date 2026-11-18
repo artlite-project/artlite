@@ -18,8 +18,8 @@ Per model and depth (`-d`), in llama-bench's order:
 
 | test | |
 |---|---|
-| `pp<n>` | a prompt of n tokens (`-p`), as `artlite-cli` runs it: prefill chunks, then the last token's logits |
-| `tg<n>` | n generated tokens (`-n`), each one decode step |
+| `pp<n>` | a prompt of n tokens (`-p`), as `artlite-cli` runs it: prefill chunks, then the last token's logits (an embedding, rerank or decision model's: its last row, as the server reads it out) |
+| `tg<n>` | n generated tokens (`-n`), each one decode step (not an embedding, rerank or decision model's: `-n 0`) |
 | `pp<n>+tg<m>` | both, timed together (`-pg`) |
 | `... @ d<n>` | after a prompt of n tokens, which is not timed and runs again before every repetition |
 

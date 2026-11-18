@@ -8,8 +8,9 @@ The tests, per model and depth (``-d``) in llama-bench's order: ``pp<n>`` runs a
 which is not timed and runs again before every repetition. Each test runs once untimed (the warmup: a prompt from
 position 0, one generated token), then ``-r`` times from an empty KV cache; t/s = (prompt + generated tokens) /
 time, averaged over the repetitions. The tokens are random, starting with the model's BOS if it has one. A prompt
-runs as ``artlite-cli`` runs it (``NpuModel.forward``: prefill chunks, then the last token's logits); a generated
-token is one decode step and the top logit of the next (``NpuModel.top_k``).
+runs as ``artlite-cli`` runs it (``NpuModel.forward``: prefill chunks, then the last token's logits; a readout model's,
+which generates no tokens, as its readouts run: ``NpuModel.outputs`` of the last row); a generated token is one decode
+step and the top logit of the next (``NpuModel.top_k``).
 
 Unlike llama-bench, which creates a context per test, each model is loaded once, with one KV cache sized for its
 largest test (``auto_capacity``; ``n_ctx`` in the results). The results go to stdout (``-o``) and stderr (``-oe``)
@@ -201,13 +202,17 @@ def measure(npu: NpuModel, test: Test, tokens: Callable[[int, int], list[int]], 
         if progress is not None:
             sys.stderr.write(f"{progress}{what}\n")
 
+    if test.n_gen and not npu.generates:
+        raise NotImplementedError("an embedding, rerank or decision model generates no tokens: prompts only (-n 0)")
+    run = npu.forward if npu.generates else lambda t: npu.outputs(t, [-1])
+
     for n in (test.n_depth, test.n_prompt):
         npu.prepare(n)  # (compiles before anything is timed)
     if warmup:
         npu.reset()
         if test.n_prompt:
             say("warmup prompt run")
-            npu.forward(tokens(test.n_prompt, 0))
+            run(tokens(test.n_prompt, 0))
         if test.n_gen:
             say("warmup generation run")
             npu.top_k(tokens(1, npu.position)[0], 1)
@@ -216,12 +221,12 @@ def measure(npu: NpuModel, test: Test, tokens: Callable[[int, int], list[int]], 
         npu.reset()
         if test.n_depth:
             say(f"depth run {r}/{reps}")
-            npu.forward(tokens(test.n_depth, 0))
+            run(tokens(test.n_depth, 0))
         prompt, gen = tokens(test.n_prompt, test.n_depth), tokens(test.n_gen, test.n_depth + test.n_prompt)
         t0 = time.perf_counter_ns()
         if prompt:
             say(f"prompt run {r}/{reps}")
-            npu.forward(prompt)
+            run(prompt)
         if gen:
             say(f"generation run {r}/{reps}")
         for token in gen:

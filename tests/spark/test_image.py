@@ -9,11 +9,12 @@ import numpy as np
 import pytest
 from ml_dtypes import bfloat16
 
-from artlite.decode.image import group_rows, pack_rows
-from artlite.gguf_model import GGUFFile, QTensor
+from artlite.decode.image import pack_rows
+from artlite.gguf_model import GGUFFile
 from artlite.operators.design import COLS
 from models.spark.image import KC, NORMS, SparkImage
 
+from ..decode.image_checks import check_tails
 from . import ref
 
 FILES = {"4B": ("4B", "Q4_K_M", "XHToken"), "1.7B": ("1.7B", "Q4_K_M", "XHToken"), "4B-Q8_0": ("4B", "Q8_0", "XHToken"),
@@ -108,58 +109,16 @@ def test_pack_image(name: str) -> None:
     print(f"{name}: {full.nbytes / 1e6:.0f} MB packed in {time.perf_counter() - t0:.2f} s")
 
 
-def _tail(t: QTensor) -> QTensor:
-    """A tensor's last 512 columns as a tensor of their own (contiguous rows)."""
-    raw = t.raw if t.raw.dtype == np.uint8 else t.raw.view(np.uint8)
-    per = raw.shape[1] // (t.cols // 256)  # (bytes per super-block of a row)
-    return QTensor(name=t.name, qtype=t.qtype, rows=t.rows, cols=512,
-                   raw=np.ascontiguousarray(raw[:, per * (t.cols // 256 - 2):]))
-
-
 @pytest.mark.parametrize("name", ["4B", "bartowski-4B", "bartowski-4B-Q4_0", "4B-Q8_0"])
 def test_pack_tails(name: str) -> None:
     """SparkImage(tails=True): the hidden's regions (attn_in, gate_up, lm) are half regions, the LM head's block and
     gate / up's of the formats the prefill reads in pairs (``prefill.gemm.pair_tails``) in pairs of row tiles (5 tiles
-    each: 2 p's chunks 0, 1, the tail tile, 2 p + 1's chunks 0, 1; an odd block's last row tile in 3 tiles, as an
-    unpaired block's), every tile index of a column used once; packed, a row tile's chunks 0, 1 as pack_rows packs them,
-    a pair's tail tile its last 512 columns as row groups of 2 (``group_rows``: a single's second half zero rows), an
-    unpaired block's (attn_in's; bartowski's gate / up of two formats: a split block's parts) as in the padded image."""
+    each: 2 p's chunks 0, 1, the tail tile, 2 p + 1's chunks 0, 1), the other blocks (attn_in's; bartowski's gate / up
+    of two formats: a split block's parts) as in the padded image (``image_checks.check_tails``)."""
     g = ref.gguf(*FILES[name])
     img = SparkImage(g, layers=[1, 3], vocab=COLS * 64 * 3, tails=True)
     pad = SparkImage(g, layers=[1, 3], vocab=COLS * 64 * 3, tails=False)
-    T = img.tile_bytes
-    out = np.zeros(img.nbytes, np.uint8)
-    img.pack(out)
-    rng = np.random.default_rng(0)
-    for r, rp in zip(img.regions, pad.regions, strict=True):
-        if r.data:
-            continue
-        assert r.half == (r.name in ("attn_in", "gate_up", "lm")) and r.K_in == (2560 if r.half else r.K)
-        assert sorted(r.tile(rt, kc) for rt in range(r.n_rt) for kc in range(r.n_kc) if r.tail_half(rt) == 0
-                      or kc < r.n_kc - 1) == list(range(r.n_t)), (r.layer, r.name)
-        singles = sum(b.tiles % 2 if b.pt else b.tiles for b in r.blocks)
-        assert r.n_t == (r.n_rt - singles) // 2 * 5 + 3 * singles if r.half else r.n_t == rp.n_t
-        for b in r.blocks:
-            assert b.pt == (r.half and not b.fmt2 and img.pairs(r.name, b.name, b.fmt, b.R))
-            cols = rng.choice(COLS, 2, replace=False)
-            for fmt, R, prt, names, rows in b.parts(img.tensor(b.tensors[0]).rows)[:3]:
-                ts = [img.tensor(n) for n in names]
-                for c in cols:
-                    col = out[r.offset + c * r.col_stride:][:r.col_bytes].reshape(-1, T)
-                    n = rows.shape[1] // R
-                    for j in sorted({0, min(1, n - 1), n - 1, int(rng.integers(n))}):
-                        rt = r.rt0[b.name] + prt + j
-                        want = pack_rows(ts, rows[c, j * R:(j + 1) * R], fmt, R, T, r.n_kc)
-                        for kc in range(r.n_kc - b.pt):
-                            assert np.array_equal(col[r.tile(rt, kc)], want[0, kc]), (r.layer, r.name, fmt, j, kc)
-                        if b.pt:
-                            j0 = j - j % 2
-                            pr = np.full(2 * R, -1, np.int64)
-                            for e in range(min(2, n - j0)):
-                                pr[e * R:(e + 1) * R] = rows[c, (j0 + e) * R:(j0 + e + 1) * R]
-                            tail = pack_rows([_tail(t) for t in ts], group_rows(pr[None], R, 2)[0], fmt, R, T, 1, G=2)
-                            assert r.tail_half(rt) == j % 2
-                            assert np.array_equal(col[r.tile(rt, r.n_kc - 1)], tail[0, 0]), (r.layer, r.name, fmt, j)
+    check_tails(img, pad, {"attn_in", "gate_up", "lm"})
 
 
 def test_padded_k_is_zero() -> None:

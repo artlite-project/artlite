@@ -213,14 +213,15 @@ class DFlashOverlay(ModelOverlay):
     def _add_meta(self, phase: tuple[int, str]) -> None:
         """A phase that reads another's x: its K groups' metadata objects only."""
         r = self.region(*phase)
-        self.inp[phase] = [InputRegion(self._take("ACT", XB), k0 * r.kc, g * r.kc) for k0, g in mp.group_chunks(r)]
+        self.inp[phase] = [InputRegion(self._take("ACT", XB), k0 * r.kc, mp.group_K(r, k0, g))
+                           for k0, g in mp.group_chunks(r)]
 
     def _add_inputs(self, phase: tuple[int, str], *, post: bool = False, extra: int = 0) -> None:
         r = self.region(*phase)
         assert not post
         regs = []
         for k0, g in mp.group_chunks(r):
-            K = g * r.kc
+            K = mp.group_K(r, k0, g)
             regs.append(InputRegion(self._take("ACT", XB + 2 * self.SLOTS * K + extra), k0 * r.kc, K))
         self.inp[phase] = regs
 

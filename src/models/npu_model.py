@@ -53,6 +53,8 @@ class NpuModel:
     group = 1  # ``rewind`` and a ``restore`` without a checkpoint land on its multiples
     causal = True  # False: a prompt's every token sees all of them (vllm-d3's decision models): one chunk from position
     # 0, no decode steps (``readouts`` only)
+    generates = True  # False: a readout model's (``models.readouts.readout_model``: its image holds no LM head): its
+    # prompts' rows only (``outputs``, ``readouts``), no logits, no tokens
     DRAFTS = 0  # draft tokens per step at most (0: steps of one token)
 
     def prepare(self, prompt_len: int) -> None:

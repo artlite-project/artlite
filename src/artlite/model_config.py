@@ -108,12 +108,14 @@ def minicpmv_mmproj(compression: int = 16) -> str:
 QWEN3_FILES = {"0.6B": "unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_1.gguf",
                "embedding-0.6B": "Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf",
                "embedding-4B": "Qwen/Qwen3-Embedding-4B-GGUF/Qwen3-Embedding-4B-Q4_K_M.gguf",
-               "reranker-0.6B": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"}
+               "reranker-0.6B": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf",
+               "reranker-4B": "giladgd/Qwen3-Reranker-4B-GGUF/Qwen3-Reranker-4B.Q4_K_M.gguf"}
 
 
 def qwen3_gguf(name: str = "0.6B") -> str:
     """A GGUF file of the ``qwen3`` architecture: Qwen3 0.6B (``"0.6B"``: unsloth's Q4_1), Qwen's Qwen3-Embedding 0.6B
-    (Q8_0) and 4B (Q4_K_M), ggml-org's Qwen3-Reranker-0.6B (Q8_0)."""
+    (Q8_0) and 4B (Q4_K_M), ggml-org's Qwen3-Reranker-0.6B (Q8_0), giladgd's Qwen3-Reranker-4B (Q4_K_M: llama.cpp's
+    converter, its classifier head; other 4B conversions of before it have none)."""
     return os.path.join(MODELS_DIR, QWEN3_FILES[name])
 
 

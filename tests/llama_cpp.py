@@ -60,13 +60,19 @@ def llama_embeddings(model: str, texts: list[str], pooling: str) -> list[list[fl
 def llama_server_decisions(model: str, mmproj: str, bodies: list[dict], args: tuple[str, ...] = ()) -> list[dict]:
     """llama-server's ``/v1/systemone`` responses to request bodies on the CPU (``-ngl 0``, the vision encoder ``mmproj``
     on the CPU too; one slot: each question alone, as it reads them); ``args``: more options."""
+    return llama_server_requests(model, "/v1/systemone", bodies, ("--mmproj", mmproj, "--no-mmproj-offload", *args))
+
+
+def llama_server_requests(model: str, route: str, bodies: list[dict], args: tuple[str, ...] = ()) -> list[dict]:
+    """llama-server's responses of ``route`` to request bodies on the CPU (``-ngl 0``, one slot); ``args``: more
+    options (``--rerank``, a vision encoder's ``--mmproj``)."""
     exe = llama_cpp_bin("llama-server")
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
-    p = subprocess.Popen([exe, "-m", model, "--mmproj", mmproj, "--port", str(port), "-np", "1", "-c", "8192", "-b", "8192",
-                          "-ub", "8192", "-ngl", "0", "--no-mmproj-offload", "--no-webui", *args],
+    p = subprocess.Popen([exe, "-m", model, "--port", str(port), "-np", "1", "-c", "8192", "-b", "8192", "-ub", "8192",
+                          "-ngl", "0", "--no-webui", *args],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(600):
@@ -81,7 +87,7 @@ def llama_server_decisions(model: str, mmproj: str, bodies: list[dict], args: tu
             time.sleep(0.5)
         out = []
         for body in bodies:
-            req = urllib.request.Request(url + "/v1/systemone", json.dumps(body).encode(), {"Content-Type": "application/json"})
+            req = urllib.request.Request(url + route, json.dumps(body).encode(), {"Content-Type": "application/json"})
             with urllib.request.urlopen(req) as r:
                 out.append(json.load(r))
         return out

@@ -247,6 +247,10 @@ section 8's (join offsets, memtile channels, chained fills within 14 shim BDs, z
 - A GemmQd stays within 64 passes per block.
 - A bigger Worker `stack_size` costs L1 the operator's budget must still fit.
 - Test fixtures: the overlay's capacity must hold a chunk plus its padding (`max_positions`).
+- A K half a chunk short of whole chunks (a hidden of 2560, an ffn of 3584 at kc 1024: the image's `Region.half`
+  regions, `tails`): the GEMMs read rows of `K_in`, so the buffers their A panels come from (the norms' `out_pitch`, HP)
+  have rows of `prefill.gemm.input_k` of the regions that read them, never the padded K (a padded pitch misreads every
+  row after the first, silently); the regions that read one buffer are half regions together or none of them.
 - A script or test that calls the prefill's `run` itself (not `OverlayModel.prompt`) marks the overlay stale before
   its next dispatch (`OverlayModel.stale`, or `dev.stale = True`): the chunk's configurations replace the overlay's code
   pages, so a paged overlay (Qwen3.6-35B-A3B, Occamy) runs stale pages and hangs (TDR) at its second dispatch after a

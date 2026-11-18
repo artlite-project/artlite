@@ -1,11 +1,12 @@
 """``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B; LFM3): a
 readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
-bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits), and pooled embeddings
+bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits; a readout model's
+image holds no LM head: its rows alone, no logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
 end token, as the file asks): cosine >= 0.999 for mean pooling, >= 0.995 for one row (last: llama.cpp's own two CPU
 paths, ``llama-embedding`` and ``goldens/qwen35_dump.cpp``, are 0.998 apart on MiniCPM-V's row of a 30-token text; the NPU
 0.996 - 0.999 on these files: the prefill's bfp16 weights and activations). Packed readouts (Qwen3-Embedding-0.6B,
-Kev-4B, d3-lite): against each input alone."""
+Kev-4B, d3-lite): against each input alone. Rerank (Qwen3-Reranker-0.6B, -4B): against llama-server's scores."""
 
 import os
 
@@ -19,8 +20,8 @@ from models.model import Model
 from models.npu_model import NpuModel
 from models.readouts import Readouts, pool, rows_of
 
-from .common import cached_ref, essay, model_key, to_torch
-from .llama_cpp import lib_identity, llama_embeddings
+from .common import cached_ref, essay, essays, model_key
+from .llama_cpp import lib_identity, llama_embeddings, llama_server_requests
 from .model_files import require
 from .numerics import kl_rows
 
@@ -39,7 +40,7 @@ def loaded(request: pytest.FixtureRequest) -> tuple[str, Model, NpuModel]:
 
 
 def test_rows(loaded: tuple[str, Model, NpuModel]) -> None:
-    path, model, npu = loaded
+    _, model, npu = loaded
     ids = model.encode(essay("addiction.txt") * 3)
     big = npu.prefill.sizes[-1]
     for n in (64, 99, big + 1, big + 2):  # (a chunk, a padded one; full chunks and a tail of 1-2 tokens)
@@ -51,16 +52,18 @@ def test_rows(loaded: tuple[str, Model, NpuModel]) -> None:
         assert np.array_equal(rows, every[[0, n // 2, n - 1]]), n
         assert np.isfinite(every).all()
         npu.reset()
+        if not npu.generates:  # (a readout model's: no LM head, ``models.readouts.READOUT_VOCAB``)
+            with pytest.raises(NotImplementedError):
+                npu.forward(toks)
+            continue
         want = torch.from_numpy(npu.forward(toks))  # (its last logits: the LM head on the chunk's last row, or a decode step's)
-        got = to_torch(npu.overlay.logits_of(rows[-1])).float()
+        got = torch.from_numpy(npu.cap(npu.overlay.logits_of(rows[-1])))  # (a screened head's as ``forward``'s)
         plan = npu.prefill.plan(0, n)
         # (a post-norm model's step row is its LM header's updated residual in bf16, not the header's sum: LFM3's)
         if plan == npu.prefill.plan(0, n, steps=False) and (sum(plan) >= n or not getattr(npu.overlay.op, "post", 0)):
             assert torch.equal(got, want), n  # (the same row through the same LM head)
-        else:  # (the prompt path's tail is a decode step, the readout's a chunk: two paths, test_rewind's KL bound;
-            # Q8_0's weights: exact codes in the decode's GEMV, bfp16 panels in the prefill's GEMMs, KL 0.0095)
-            bound = 0.012 if path == qwen3_gguf("embedding-0.6B") else 0.002
-            assert got.argmax() == want.argmax() and kl_rows(want, got) < bound, n
+        else:  # (the prompt path's tail is a decode step, the readout's a chunk: two paths, test_rewind's KL bound)
+            assert got.argmax() == want.argmax() and kl_rows(want, got) < 0.002, n
 
 
 # (mean pooling's bound where it is not 0.999: LFM3's rows 0.9990 - 0.9998 from the fp32 CPU model's, llama.cpp's 0.9997 -
@@ -167,3 +170,42 @@ def test_readouts_lead(packed: tuple[str, Model, NpuModel]) -> None:
     assert min(cos) > 0.999
     assert np.array_equal(after, after_want)
 
+
+
+RERANKERS = [qwen3_gguf("reranker-0.6B"), qwen3_gguf("reranker-4B")]
+
+
+@pytest.mark.parametrize("path", RERANKERS, ids=os.path.basename)
+def test_rerank(path: str) -> None:
+    """A reranker's scores (``Readouts``: its classifier head on the last row of each pair's rerank prompt; 4B: half
+    regions, no LM head) of 8 essay passages for a query, packed (``NpuModel.readouts``), against llama-server's
+    ``/v1/rerank`` on the CPU (cached): the logits within 1.5 of its (the NPU 0.9 - 1.2 at most over 600 pairs of 30
+    queries), the same best passage and the order alike (Spearman >= 0.9)."""
+    require(path)
+    model = open_model(path)
+    assert not model.generates
+    readouts = Readouts.of(path)
+    text = essays()
+    docs = [text[i:i + 1200] for i in range(0, 8 * 9000, 9000)]
+    query = "What does the author say about how startups should treat their first users?"
+    body = {"query": query, "documents": docs}
+    ref = cached_ref(path, "rerank", (model_key(path), body, lib_identity()),
+                     lambda: llama_server_requests(path, "/v1/rerank", [body], ("--rerank",))[0])
+    want = np.zeros(len(docs))
+    for e in ref["results"]:
+        want[e["index"]] = e["relevance_score"]
+    npu = model.load(capacity=8192)
+    inputs = [readouts.rerank_ids(model.tokenizer.encode, model.encode(""), query, d) for d in docs]
+    rows = npu.readouts(inputs, [rows_of("rank", len(ids)) for ids in inputs])
+    got = np.array([readouts.head.score(r[0]) for r in rows])
+
+    def logit(s: np.ndarray) -> np.ndarray:
+        s = np.clip(s, 1e-9, 1 - 1e-9)
+        return np.log(s / (1 - s))
+
+    d = np.abs(logit(got) - logit(want))
+    rank = (np.argsort(np.argsort(got)), np.argsort(np.argsort(want)))
+    rho = float(np.corrcoef(*rank)[0, 1])
+    print(f"{os.path.basename(path)}: scores {np.round(got, 3)} vs {np.round(want, 3)}; |dlogit| max {d.max():.3f}, "
+          f"Spearman {rho:.3f}")
+    assert d.max() < 1.5 and got.argmax() == want.argmax() and rho >= 0.9

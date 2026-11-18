@@ -99,6 +99,15 @@ def pair_tails(name: str, fmt: str, R: int) -> bool:
     return name == "gate_up" and fmt in ("Q4_K", "Q4_0") and R == 16
 
 
+def input_k(image: TileImage, names: tuple[str, ...]) -> int:
+    """The input K (``Region.K_in``) of every layer's regions ``names``: the row of their GEMMs' A panels, which the
+    norms (or the gate / up epilogue) write for all of them (a hidden size half a chunk short: the half regions' K, or
+    every one padded to whole chunks)."""
+    ks = {r.K_in for r in image.regions if r.name in names}
+    assert len(ks) == 1, f"{names}: inputs of one K, not {sorted(ks)}"
+    return ks.pop()
+
+
 def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOperator] | None = None
             ) -> GemmQOperator:
     """GemmQ or GemmQd of the operator keywords ``kw`` by the tokens and format (``planar.gemm_mac_rows``), paced as its
@@ -301,7 +310,7 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
         op = gemm_op(kw, T, "gu", ops)
         gemms.append(Gemm(op, region.offset - op.hdr_skip, c="GU"))
     # (one object per distinct activation, as the GEMMs)
-    key = ("act", T, groups, W, image.region(region.layer, "down").K, act)
+    key = ("act", T, groups, W, image.region(region.layer, "down").K_in, act)
     if ops is None or key not in ops:
         act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-2], act=act)
         if ops is not None:
@@ -332,6 +341,8 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         passes = b.tiles // tp
         ffn = image.cfg.intermediate_size // COLS
         assert passes * width == ffn
+        down_k = image.region(region.layer, "down").K_in  # (C's rows: down's A, ``input_k``)
+        assert ffn * COLS <= down_k
         ng = -(-passes // 64)
         gemms = []
         # (a block of row tile pairs: pass pairs of tp pairs each, ``pair_tails``)
@@ -339,7 +350,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
         for i in range(ng):  # (GEMMs of consecutive passes; of pass pairs)
             p0, p1 = passes * i // ng // (1 + b.pt) * (1 + b.pt), passes * (i + 1) // ng // (1 + b.pt) * (1 + b.pt)
             oc = [[ffn * c + width * p for p in range(p0, p1)] for c in range(COLS)]
-            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": -(-ffn * COLS // KC) * KC, "tile_bytes": S,
+            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": K, "N": down_k, "tile_bytes": S,
                   "col_bytes": region.col_stride, "passes": p1 - p0, "out_cols": oc, "kc": KC,
                   "kc_group": region.kc_group, "silu": True, "act": act, "c_bfp16": True,
                   "blocks": ((tp * p0, p1 - p0),), "lines": LINES}

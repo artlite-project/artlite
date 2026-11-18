@@ -138,6 +138,7 @@ class ExpertGemmOperator(GemmQdOperator):
     def of(cls, kind: str, region: object, *, cap: int, out: int, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
         """The operator of a layer's slab region ("exp_gu" / "exp_down")."""
         (b,) = region.blocks
+        assert not region.half, "an expert's input of whole K chunks"
         return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=b.tiles, G=b.G, K=region.K, tile_bytes=region.tile_bytes,
                    kc=region.kc, kc_group=region.kc_group, cap=cap, out=out, **({"ablate": ablate} if ablate else {}))
 

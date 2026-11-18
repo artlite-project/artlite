@@ -90,7 +90,7 @@ def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[
         region.n_kc // down_chunks in (2, 4) else 0
     if region.name in PG.OUT:
         cache = {} if k_parts is None else k_parts
-        key = (region.name, region.K, region.kc_group, tuple(b.fmt for b in region.blocks), T, pitch, k)
+        key = (region.name, region.K_in, region.kc_group, tuple(b.fmt for b in region.blocks), T, pitch, k)
         if key not in cache:
             cache[key] = PG.resident_k_part(img, region, T, pitch=pitch, k_part=k)
         k = cache[key]
@@ -136,8 +136,9 @@ class LlamaPrefill(ChunkPrefill):
         self.kv_bytes = ov.kv_bytes(ov.layers[0])  # (a KV head's cache of a layer: the same for every layer)
         self.shape = s
         self.group = s.pg
-        # the norms' panel rows: the hidden size padded to whole K chunks (the padding columns never written: zero)
-        self.kh = -(-ov.H // ov.image.kc) * ov.image.kc
+        # the norms' panel rows: the K of the GEMMs that read them (``Region.K_in``: the hidden size, or padded to whole
+        # K chunks, the padding columns never written: zero)
+        self.kh = PG.input_k(ov.image, ("qkv", "gate_up"))
         self._out_pitch = self.kh if self.kh != ov.H else 0
         self.cs_rows = ov.max_positions + MAX_T
         self.pad = KV_PAD // s.pg * s.group  # (the KV arguments past a layer's caches: the overlay's padding)
@@ -233,10 +234,9 @@ class LlamaPrefill(ChunkPrefill):
         parameter objects."""
         cfg, H, s = self.cfg, self.H, self.shape
         pitch, dp = max(o.pitch for o in self.ops.values()), max(o.d_pitch for o in self.ops.values())
-        kc = self.img.kc  # (the GEMMs' A rows: K padded to whole chunks, ``LlamaPrefill.kh``)
+        # (the GEMMs' A rows: of their K, ``Region.K_in``: the norms' ``kh``, down's ffn padded to whole chunks)
         self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
-                   "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp,
-                   "HP": 9 * -(-cfg.intermediate_size // kc) * kc // 8}
+                   "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp, "HP": 9 * PG.input_k(self.img, ("down",)) // 8}
         split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
         if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
             self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
