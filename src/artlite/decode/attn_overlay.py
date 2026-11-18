@@ -16,10 +16,16 @@ head, a layer's cache is linear groups of ``G`` = kp + 1 objects of T bytes (``d
 after its guard; then per layer and KV head a ring of two slots of T bytes with the exact V values of the open records
 (``decode.vring``).
 
-A step is built once per pattern of sub-steps (and LM head or not: ``_build``) and patched per step (``_set_position``):
+A step is built once per pattern of sub-steps (and LM head or not: ``_build``) and patched per step (``_set_parts``):
 the token objects, each column's range of each layer's cache per sub-step (A: address, length), a chain end's tail
 objects (A: the ring slots of the sub-step's open records, or after a prefill the V panels of the first: record mode,
 ``_ring_modes``) and the record drains (D: address, length): ``decode.step``.
+
+Several sequences in a step (``decode.step.Part``; a model with ``SEQ``): a sequence's slots are sub-steps of their
+own (``_join``), each with its sequence's caches and rings (their buffers' addresses), its own positions (the token
+object's, the slots' RoPE rows) and its sequence's record mode; the cores run a sub-step as in a step of that sequence
+alone, so every slot's numbers are those of a step of one, and the step's time is the weights' stream once plus a pass
+over each sequence's caches.
 
 What a model supplies: its ``phases`` and their flags (``_flags``), the layout of its buffers (``_plan``: with
 ``_plan_caches`` and, for post-norm models, ``_plan_headers``), its GEMV outputs (``_outputs``), what the attention
@@ -79,6 +85,7 @@ from .protocol import (
 from .step import (
     Fill,
     FillTable,
+    Part,
     PatchTables,
     PositionWords,
     Rec,
@@ -86,6 +93,7 @@ from .step import (
     StepPlan,
     Tail,
     TailTable,
+    slots_of,
 )
 from .vring import PAIR, substeps, tails
 
@@ -149,9 +157,9 @@ class AttentionOverlay(ModelOverlay):
     OPS: ClassVar[tuple[str, ...]] = ("att",)  # the phases of the operator cores (the others are GEMV phases)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, kv_k: str,
-                 weights: WeightBuffer | None, image: object = None):
+                 weights: WeightBuffer | None, image: object = None, sequences: int = 1):
         self.kp = kv.kv_precision(kv_k)
-        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
+        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         self.G = self.kp + 1  # (cache objects per group)
         self.at: Attn
         self.kinds: tuple[CacheKind, ...]
@@ -452,48 +460,60 @@ class AttentionOverlay(ModelOverlay):
         assert len(out) <= U, (p, S)
         return out
 
-    def _rope(self, kind: int, p: int, S: int) -> np.ndarray:
-        """The RoPE tables ((SLOTS, 2 rot) fp32, ``decode.attn.rope_tables``) of a cache kind's layers for positions
-        p .. p + S - 1."""
+    def _join(self, parts: tuple[Part, ...]) -> tuple:
+        """(a model whose ``subs`` are every kind's: each part's from its first slot on, a sequence per sub-step)"""
+        out, a0 = [], 0
+        for q in parts:
+            out += [(a0 + a, n) for a, n in self.subs(q.position, q.n)]
+            a0 += q.n
+        return tuple(out)
+
+    def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
+        """The RoPE tables ((SLOTS, 2 rot) fp32, ``decode.attn.rope_tables``) of a cache kind's layers for the slots'
+        ``positions``."""
         raise NotImplementedError
 
     def _token_words(self, st: StepPlan, p: int) -> None:
         """The words of the model's own in the token objects of a step at p (before they are flushed)."""
 
-    def _token_objects(self, st: StepPlan, p: int) -> PositionWords:
+    def _token_objects(self, st: StepPlan, parts: tuple[Part, ...]) -> PositionWords:
         """The step's token objects (per cache kind and sub-step: its positions, the columns' ranges, the step's RoPE
         tables; each slot's object copies the table, one of no sub-step has no objects)."""
-        chain, S, act = self.CHAIN, st.S, self.dev.view("ACT")
+        chain, act = self.CHAIN, self.dev.view("ACT")
+        seq, pos, head = slots_of(parts)
         K = len(self.kinds)
-        pu = np.zeros((K, U, 2), np.int64)
-        fo = np.zeros((K, U, chain, 2, 2), np.int64)
-        ro = np.zeros((K, U, 6, 3), np.int64)
+        pu = np.zeros((K, SLOTS, 2), np.int64)
+        fo = np.zeros((K, SLOTS, chain, 2, 2), np.int64)
+        ro = np.zeros((K, SLOTS, 6, 3), np.int64)
+        su = np.zeros((K, SLOTS), np.int64)
+        first = np.zeros((K, SLOTS), bool)
         for k, kind in enumerate(self.kinds):
-            cs = self._rope(k, p, S).view(np.uint8).reshape(-1)
+            cs = self._rope(k, pos).view(np.uint8).reshape(-1)
             for a in range(SLOTS):
                 o = st.tok + (SLOTS * k + a) * XB
                 act[o + 4 * META:o + 4 * META + cs.size] = cs
                 m = act[o:o + 4 * META].view(np.int32)
                 m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[M_TOK_NA:M_TOK_NA + COLS] = 0, 0, 0
             for u, (a, n) in enumerate(self._kind_subs(st.subs, k)):
-                r = self.ranges(k, p + a)
+                p = pos[a]  # (the sub-step's first position: its slots are one sequence's, consecutive)
+                r = self.ranges(k, p)
                 o = st.tok + (SLOTS * k + a) * XB
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)
-                m[M_NS], m[M_POS], m[M_TOK_A] = n, p + a, a
+                m[M_NS], m[M_POS], m[M_TOK_A] = n, p, a
                 fills = [kind.fills(g0, ng, self.G) for g0, ng in r]
                 for c in range(COLS):  # (every KV head's columns: the same ranges)
                     g0, ng = r[c % chain]
                     no = sum(x[1] for x in fills[c % chain]) + (tails(n) if c % chain == chain - 1 else 0)
                     m[M_TOK_G0 + c], m[M_TOK_NA + c], me[M_TOK_NG + c] = g0 * kind.pg, self.G * ng | no << 16, no
-                pu[k, u] = p + a, n
+                pu[k, u], su[k, u], first[k, u] = (p, n), seq[a], head[a]
                 for j, fj in enumerate(fills):
                     fo[k, u, j, :len(fj)] = fj
                 gb = self.G * self.T
                 rec = [(b, kind.at(off, gb) if b == 0 else off, nb)
-                       for b, off, nb in kv.records(p=p + a, S=n, hd=kind.hd, a_bytes=self.T, kp=self.kp)]
+                       for b, off, nb in kv.records(p=p, S=n, hd=kind.hd, a_bytes=self.T, kp=self.kp)]
                 ro[k, u, :len(rec)] = rec
-        return PositionWords(pu, fo, ro)
+        return PositionWords(pu, fo, ro, su, first)
 
     def _patch_tables(self, st: StepPlan) -> PatchTables:
         """A step's cache fills, tail fills and record drains as arrays."""
@@ -512,46 +532,56 @@ class AttentionOverlay(ModelOverlay):
                                      t[:, 7], layers),
                            RecTable(r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4:6]))
 
-    def tail_mode(self, src: int, *, before: bool) -> bool:
+    def tail_mode(self, src: int, *, before: bool, seq: int | None = None) -> bool:
         """Whether a step's tail objects of a layer attending to the cache of ``src`` are the open record's V panels (the
         prefill wrote it, and the step did not run ``src``'s attention before the layer's: ``before`` False), not its ring
-        slots."""
-        return self.uses[src].ring in self.vring.from_prefill and not before
+        slots; of sequence ``seq`` (None: the selected one)."""
+        vring = self.vring if seq is None else self._vrings[seq]
+        return self.uses[src].ring in vring.from_prefill and not before
 
-    def _ring_modes(self) -> dict[int, tuple[int, bool]]:
+    def _ring_modes(self, seq: int | None = None) -> dict[int, tuple[int, bool]]:
         """Per attention layer the step runs (from ``start`` on): (the mode of its tail objects, ``tail_mode``; whether the
-        step runs the layer's cache's before it: a layer that shares a cache of a layer after ``start``)."""
+        step runs the layer's cache's before it: a layer that shares a cache of a layer after ``start``); of sequence
+        ``seq`` (None: the selected one)."""
         out = {}
         for L, use in self.uses.items():
             if L >= self.start:
                 before = use.source != L and use.source >= self.start
-                out[L] = (int(self.tail_mode(use.source, before=before)), before)
+                out[L] = (int(self.tail_mode(use.source, before=before, seq=seq)), before)
         return out
 
-    def _tails(self, st: StepPlan, p: int, pu: np.ndarray, ahead: bool) -> bool:
+    def _tails(self, st: StepPlan, parts: tuple[Part, ...], words: PositionWords, kv0: np.ndarray, ahead: bool) -> bool:
         """The step's tail fills (per sub-step a chain end's objects: the ring slots of the records of its first and last
-        positions, or after a prefill for the first sub-step's first the record's V panels: of a layer with its own
-        cache, the others from the ring) and the F_ATT objects' M_ATREC. pu: per cache kind and sub-step (first position,
-        slots). ``ahead``: False when M_ATREC changes (the running step reads those objects)."""
-        tt, T, S = st.patch.tails, self.T, st.S
-        modes = self._ring_modes()
-        wanted = [(L, a, m if a == 0 or self.uses[L].source != L else 0)
-                  for L, (m, _) in modes.items() for a in range(SLOTS)]
+        positions, or after a prefill for a sequence's first sub-step's first the record's V panels: of a layer with its
+        own cache, the others from the ring) and the F_ATT objects' M_ATREC. ``words``: the token objects' (per cache
+        kind and sub-step its first position, slots and sequence); ``kv0``: per sequence the address of its KV.
+        ``ahead``: False when M_ATREC changes (the running step reads those objects)."""
+        tt, T, pu = st.patch.tails, self.T, words.pu
+        seq, _, head = slots_of(parts)
+        modes = {q.seq: self._ring_modes(q.seq) for q in parts}
+        seq += [seq[-1]] * (SLOTS - len(seq))  # (a slot past the step's: as the last part's)
+        head += [False] * (SLOTS - len(head))
+        wanted = [(L, a, m if head[a] or self.uses[L].source != L else 0)
+                  for a in range(SLOTS) for L, (m, _) in modes[seq[a]].items()]
         changes = [(L, a, ma) for L, a, ma in wanted if self._trec.get((L, a), 0) != ma]
         if ahead and changes:
             return False
-        mode = np.array([modes[L][0] for L in tt.layers], bool)
-        rec = mode[tt.layer] & (tt.obj == 0) & ((tt.sub == 0) | ~tt.own)
+        mode = np.zeros((self.sequences, len(tt.layers)), bool)
+        for s, md in modes.items():
+            mode[s] = [md[L][0] for L in tt.layers]
+        own = words.su[tt.kind, tt.sub]  # (the sub-step's sequence)
+        rec = mode[own, tt.layer] & (tt.obj == 0) & (words.first[tt.kind, tt.sub] | ~tt.own)
         q0, n = pu[tt.kind, tt.sub, 0], pu[tt.kind, tt.sub, 1]
         vrec = np.array([[self.kinds[k].at(self.v_offset(k, int(x)), self.G * T) for x in row]
                          for k, row in enumerate(pu[:, :, 0])], np.int64)[tt.kind, tt.sub]
         slot = np.where(tt.obj == 0, q0 >> 3, (q0 + n - 1) >> 3) & 1
-        address = self.dev.address("KV") + np.where(rec, tt.base + vrec, tt.ring + slot * T)
+        address = kv0[own] + np.where(rec, tt.base + vrec, tt.ring + slot * T)
         self._bd_words(st.tr.words, tt.at, address, np.full(len(rec), T, np.int64))
-        for L, (m, before) in modes.items():
-            if not m and not before:  # (from the ring: the rows before p, or those of the step's positions too)
-                use = self.uses[L]
-                self.vring.check(use.ring, p, p if use.source == L else p + S)
+        for q in parts:
+            for L, (m, before) in modes[q.seq].items():
+                if not m and not before:  # (from the ring: the rows before p, or those of the step's positions too)
+                    use = self.uses[L]
+                    self._vrings[q.seq].check(use.ring, q.position, q.position if use.source == L else q.position + q.n)
         act = self.dev.view("ACT")
         for L, a, ma in changes:  # (the F_ATT objects of the sub-steps from slot a on)
             for h in range(self.kv_heads):
@@ -561,31 +591,40 @@ class AttentionOverlay(ModelOverlay):
             self._trec[(L, a)] = ma
         return True
 
-    def _ran(self, p: int, S: int) -> None:
+    def _ran(self, p: int, S: int, seq: int | None = None) -> None:
         """After a step: the rings of the own-cache layers it ran hold the rows of its open records."""
+        vring = self.vring if seq is None else self._vrings[seq]
         for key in {use.ring for L, use in self.uses.items() if L >= self.start and use.source == L}:
-            self.vring.ran(key, p, S)
+            vring.ran(key, p, S)
 
     def _set_position(self, st: StepPlan, p: int, ahead: bool = False) -> bool:
+        """(the selected sequence's S slots at p)"""
+        assert st.subs == self.subs(p, st.S), (p, st.S, st.subs)
+        return self._set_parts(st, (Part(self.seq, p, st.S),), ahead)
+
+    def _set_parts(self, st: StepPlan, parts: tuple[Part, ...], ahead: bool = False) -> bool:
         """The token objects (per cache kind and sub-step: its positions, the columns' ranges, the step's RoPE tables; st's
-        copy) and the step's cache transfers."""
-        S, dev, T = st.S, self.dev, self.T
-        assert 0 <= p and p + S <= self.max_positions, (p, S)
-        assert st.subs == self.subs(p, S), (p, S, st.subs)
-        words = self._token_objects(st, p)
-        self._token_words(st, p)
+        copy) and the step's cache transfers, each sub-step's in its sequence's KV."""
+        dev, T = self.dev, self.T
+        assert all(0 <= q.position and q.position + q.n <= self.max_positions for q in parts), parts
+        assert len(parts) == 1 or st.subs == self._join(parts), (parts, st.subs)
+        words = self._token_objects(st, parts)
+        self._token_words(st, parts[0].position)
         dev.flush("ACT", st.tok, self._tok_bytes)
         if st.patch is None:
             st.patch = self._patch_tables(st)
-        t, kv0 = st.patch, dev.address("KV")
+        t, kv0 = st.patch, np.zeros(self.sequences, np.int64)
+        for q in parts:
+            kv0[q.seq] = dev.address(self.seq_name("KV", q.seq), own=True)
         f = words.fo[t.fills.kind, t.fills.sub, t.fills.place, t.fills.piece]  # (first object, objects)
-        self._bd_words(st.tr.words, t.fills.at, kv0 + t.fills.base + f[:, 0] * T, f[:, 1] * T)
-        if not self._tails(st, p, words.pu, ahead):
+        self._bd_words(st.tr.words, t.fills.at, kv0[words.su[t.fills.kind, t.fills.sub]] + t.fills.base + f[:, 0] * T,
+                       f[:, 1] * T)
+        if not self._tails(st, parts, words, kv0, ahead):
             return False
         # (the record drains: from the KV head's group 0 or ring, offset, bytes)
         r = words.ro[t.recs.kind, t.recs.sub, t.recs.i]
         base = np.take_along_axis(t.recs.base, r[:, :1], 1)[:, 0]
-        self._bd_words(st.tr.words, t.recs.at, kv0 + base + r[:, 1], r[:, 2])
+        self._bd_words(st.tr.words, t.recs.at, kv0[words.su[t.recs.kind, t.recs.sub]] + base + r[:, 1], r[:, 2])
         st.tr.flush()
         return True
 

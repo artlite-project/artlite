@@ -271,8 +271,8 @@ class GemmaOverlay(AttentionOverlay):
     def passes(self, p: int, S: int) -> int:
         return max(len(x) for x in self.subs(p, S))
 
-    def _rope(self, kind: int, p: int, S: int) -> np.ndarray:
-        return AT.rope_tables(self.cfg, list(range(p, p + S)), self.at.rot, swa=kind == 0)
+    def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
+        return AT.rope_tables(self.cfg, positions, self.at.rot, swa=kind == 0)
 
     # ------------------------------------------------------------------
     # Run

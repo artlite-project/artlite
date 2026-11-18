@@ -279,9 +279,9 @@ class FlintOverlay(AttentionOverlay):
         """(both kinds: one head dim)"""
         return self._substeps(p, S, self.hd)
 
-    def _rope(self, kind: int, p: int, S: int) -> np.ndarray:
+    def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
         kn = KINDS[kind]
-        return rope_tables(self.inv_freq[kn], range(p, p + S), self.cfg.rot(kn))
+        return rope_tables(self.inv_freq[kn], positions, self.cfg.rot(kn))
 
     # ------------------------------------------------------------------
     # Run

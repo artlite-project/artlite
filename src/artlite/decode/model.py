@@ -7,6 +7,11 @@ sub-steps (``StepKey``; built at its first use or ahead: ``prepare``) and its ve
 step's x and logits, the LM head alone (``logits_of``); a sequence's state as host copies (a prompt cache's:
 ``read_records`` / ``write_records``, the KV caches' records of positions; ``snapshot`` / ``restore``, the rest).
 
+Several sequences on the device (``sequences``): each has its own buffers of ``SEQ`` (its caches) and its ``VRing``;
+``select`` makes one the overlay's (its buffers under their plain names: what a step of one sequence, a prompt and the
+state copies work on), and a step's slots may be several sequences' (``decode.step.Part``: a step's ``position`` as its
+parts, of a model whose overlay joins them, ``_join``): one stream of the weights for all of them.
+
 A model's overlay supplies its config and image classes (``CONFIG``, ``IMAGE``), its design (``op``), its phases and
 their flags (``_flags``; the metadata words of its own: ``_meta``), its static objects (``_load``), the layout of its
 buffers (``_plan``: ``_layout``'s buffers, ``loadr``, the phases' input regions, its attention's; then ``_sizes``), a
@@ -50,6 +55,7 @@ from .protocol import (
     region_bytes,
 )
 from .screen import Screen, Screened
+from .step import Part
 from .vring import VRing
 
 
@@ -174,15 +180,15 @@ class StepKey(NamedTuple):
 @dataclass(frozen=True)
 class AheadStep:
     """A step patched while the previous one ran (``ModelOverlay._run``): the step runs as it is when it has this key (of
-    buffer 0), position and ring state; ``b``: the buffer it is in."""
+    buffer 0), position (several sequences' step: its parts) and ring state; ``b``: the buffer it is in."""
 
     key: StepKey
-    position: int
+    position: int | tuple[Part, ...]
     ring_state: tuple
     st: Any
     b: int
 
-    def matches(self, key: StepKey, position: int, ring_state: tuple) -> bool:
+    def matches(self, key: StepKey, position: int | tuple[Part, ...], ring_state: tuple) -> bool:
         return self.key == key and self.position == position and self.ring_state == ring_state
 
 
@@ -201,12 +207,17 @@ class ModelOverlay:
     # the phases whose input the helper norms (a hidden size of part of a K chunk: their inputs' padding k kept zero,
     # ``_clear_pads``)
     NORMED: ClassVar[frozenset[str]] = frozenset()
+    # the buffers each sequence has its own of (``sequences``: sequence s > 0's as ``seq_name``); (): the model's
+    # overlay holds one sequence
+    SEQ: ClassVar[tuple[str, ...]] = ()
     rings = (0, 0)  # (byte offset, bytes) in KV of the attention layers' rings (``vring``), set by ``_plan``
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None, vocab: int | None, weights: WeightBuffer | None,
-                 image: TileImage | None = None):
+                 image: TileImage | None = None, sequences: int = 1):
         if self.AHEAD and "ahead" not in inspect.signature(self._set_position).parameters:
             raise TypeError(f"{type(self).__name__}.AHEAD: its _set_position takes no `ahead`")
+        if sequences < 1 or (sequences > 1 and not self.SEQ):
+            raise ValueError(f"{sequences} sequences: {type(self).__name__} holds one")
         self.gguf = gguf
         self.cfg = cfg = weights.image.cfg if weights is not None else self.CONFIG.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
@@ -222,7 +233,11 @@ class ModelOverlay:
         self.start = self.layers[0]  # (the layer whose input is x: ``_mode``)
         self.inp: dict[tuple[int, str], list[InputRegion]] = {}  # phase -> its K groups' input regions
         self.dev: OverlayDevice | None = None
-        self.vring = VRing()  # (the attention layers' rings: which open records they hold, which caches a prefill wrote)
+        self.sequences, self.seq = sequences, 0  # (the sequences the device holds; the selected one: ``select``)
+        # (the attention layers' rings: which open records they hold, which caches a prefill wrote; per sequence, ``vring``
+        # the selected one's)
+        self._vrings = [VRing() for _ in range(sequences)]
+        self.vring = self._vrings[0]
         self._layout: dict[str, int] = {}  # (buffer -> bytes so far: ``_take``)
         self._steps: dict[StepKey, Any] = {}  # (a step's transaction, built at its first use)
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
@@ -298,6 +313,7 @@ class ModelOverlay:
         static objects. ``also``: buffers of the overlay's device that others use (a prefill's own, a drafter's on the
         model's device), allocated with the overlay's (``OverlayDevice.alloc_all``)."""
         img, sizes = self.image, {**self.sizes, **(also or {})}
+        sizes |= {self.seq_name(b, s): self.sizes[b] for b in self.SEQ for s in range(1, self.sequences)}
         if self.weights is not None or self.w_of is not None:
             device, buf = self.weights.buffer() if self.w_of is None else (self.w_of.dev.device, self.w_of.dev.buffers["W"])
             self.dev = dev = OverlayDevice(self.op, device=device)
@@ -322,9 +338,24 @@ class ModelOverlay:
         """The model's static objects (ACT is flushed after)."""
 
     def reset(self) -> None:
-        """A new sequence. The KV caches keep their bytes: a step or chunk reads only the positions before its own,
-        written by then (zeroing them would flush the whole cache: milliseconds)."""
+        """A new sequence (the selected one starts over). The KV caches keep their bytes: a step or chunk reads only the
+        positions before its own, written by then (zeroing them would flush the whole cache: milliseconds)."""
         self.vring.clear()
+
+    @staticmethod
+    def seq_name(buf: str, s: int) -> str:
+        """The name of sequence s's buffer ``buf`` (of ``SEQ``) on the device (sequence 0's: ``buf``)."""
+        return f"{buf}.{s}" if s else buf
+
+    def select(self, s: int) -> None:
+        """Make sequence s the overlay's: its buffers of ``SEQ`` under their plain names (``OverlayDevice.alias``) and
+        its ``vring``, which a step of one sequence, a prompt's chunks and the state copies (``snapshot``,
+        ``read_records``, ...) work on. No copy: every sequence's caches stay on the device."""
+        if not 0 <= s < self.sequences:
+            raise ValueError(f"sequence {s} of {self.sequences}")
+        if s != self.seq:
+            self.seq, self.vring, self._ahead = s, self._vrings[s], None
+            self.dev.alias = {b: self.seq_name(b, s) for b in self.SEQ} if s else {}
 
     def ready(self) -> None:
         """Until the weight image is packed (``WeightBuffer``)."""
@@ -454,20 +485,31 @@ class ModelOverlay:
         """The passes over a KV cache of a step at p .. p + S - 1."""
         return len(self.subs(p, S))
 
+    def _join(self, parts: tuple[Part, ...]) -> tuple:
+        """The sub-steps of a step of several sequences' slots (``parts``; the key of its transaction): each part's own
+        (``subs``) from its first slot on. A model whose overlay runs such steps supplies it and ``_set_parts``."""
+        raise NotImplementedError(f"{type(self).__name__}: a step's slots are one sequence's")
+
     def _set_position(self, st: Any, p: int, ahead: bool = False) -> bool:
         """A step's position-dependent objects and transfers (the patches of its transaction ``st``). ``ahead``: while
         the previous step runs (``AHEAD``), only objects of st's own buffer: False when the step needs more (it is
         patched again before it runs); True: patched."""
         raise NotImplementedError
 
-    def _ran(self, p: int, S: int) -> None:
-        """After a step of S slots at p: the rings it wrote (``vring``)."""
+    def _set_parts(self, st: Any, parts: tuple[Part, ...], ahead: bool = False) -> bool:
+        """``_set_position`` of a step of several sequences' slots: each sub-step's objects and transfers by its
+        sequence and position."""
+        raise NotImplementedError
 
-    def _ring_state(self) -> tuple:
+    def _ran(self, p: int, S: int, seq: int | None = None) -> None:
+        """After a step of S slots at p (of sequence ``seq``; None: the selected one): the rings it wrote."""
+
+    def _ring_state(self, seq: int | None = None) -> tuple:
         """What ``_set_position`` reads besides the position (a step patched ahead runs only if it is unchanged: a
-        prefill, a reset or a rewind in between patch it again)."""
-        return (frozenset(self.vring.from_prefill),
-                tuple(sorted((L, tuple(sorted(d.items()))) for L, d in self.vring.slots.items())))
+        prefill, a reset or a rewind in between patch it again), of sequence ``seq`` (None: the selected one)."""
+        vring = self.vring if seq is None else self._vrings[seq]
+        return (frozenset(vring.from_prefill),
+                tuple(sorted((L, tuple(sorted(d.items()))) for L, d in vring.slots.items())))
 
     def _ahead_state(self) -> tuple:
         """``_ring_state`` as the step just patched ahead assumed it (``AHEAD``: what the patch took for values the model
@@ -610,20 +652,39 @@ class ModelOverlay:
         """One-time work of the next step since ``t0`` (``time.perf_counter``): left out of its time (``once_s``)."""
         self._once_t += time.perf_counter() - t0
 
-    def _run(self, S: int, position: int, logits: bool) -> np.ndarray | None:
-        """Dispatch the step of S slots at ``position`` (its inputs written): its transaction (built at its first use),
-        patched (or patched ahead, while the previous step ran: ``AHEAD``); then, while it runs, the next step's (S slots
-        at position + S, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or
-        None."""
+    def _run(self, S: int, position: int | tuple[Part, ...], logits: bool) -> np.ndarray | None:
+        """Dispatch the step of S slots at ``position`` (its inputs written; several sequences' slots: its parts, the
+        slots in their order): its transaction (built at its first use), patched (or patched ahead, while the previous
+        step ran: ``AHEAD``); then, while it runs, the next step's (S slots at position + S, each part's after its
+        own, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or None."""
+        parts = None if isinstance(position, int) else tuple(position)
+        if parts is not None:
+            assert sum(q.n for q in parts) == S and len({q.seq for q in parts}) == len(parts), parts
+            assert all(q.n > 0 and 0 <= q.seq < self.sequences for q in parts), parts
+            position = parts
+
+        def subs(at: int | tuple[Part, ...]) -> tuple:
+            return self.subs(at, S) if parts is None else self._join(at)
+
+        def state(at: int | tuple[Part, ...], ahead: bool = False) -> tuple:
+            if parts is None:
+                return self._ahead_state() if ahead else self._ring_state()
+            return tuple(self._ring_state(q.seq) for q in at)
+
+        def patch(st: Any, at: int | tuple[Part, ...], ahead: bool = False) -> bool:
+            if parts is None:
+                return self._set_position(st, at, ahead=True) if ahead else self._set_position(st, at)
+            return self._set_parts(st, at, ahead=ahead)
+
         self._clear_pads(self._sp(S))
-        key = self._key(S, logits, self.subs(position, S))
+        key = self._key(S, logits, subs(position))
         before, t = self._once_t, time.perf_counter()
         b = 0  # (the buffer of the step that runs)
-        if self._ahead is not None and self._ahead.matches(key, position, self._ring_state()):
+        if self._ahead is not None and self._ahead.matches(key, position, state(position)):
             st, b = self._ahead.st, self._ahead.b
         else:
             st = self._transaction(key)
-            self._set_position(st, position)
+            patch(st, position)
         self._ahead = None
         # (one-time: the work before the step, and its patch's: all of it at the transaction's first run)
         self.once_s = before + (time.perf_counter() - t if key not in self._ran_keys else self._once_t - before)
@@ -632,13 +693,20 @@ class ModelOverlay:
         self.ready()
         self.dev.submit(st.tr)
         try:
-            self._ran(position, S)
-            p = position + S
-            if self.AHEAD and p + S <= self.max_positions:
-                nkey = StepKey(S, logits, self._variant_ahead(p, S), self.subs(p, S), 1 - b)
+            if parts is None:
+                self._ran(position, S)
+                nxt_at = position + S
+            else:
+                for q in parts:
+                    self._ran(q.position, q.n, q.seq)
+                nxt_at = tuple(Part(q.seq, q.position + q.n, q.n) for q in parts)
+            runs = ((nxt_at, S),) if parts is None else tuple((q.position, q.n) for q in nxt_at)
+            if self.AHEAD and all(p + n <= self.max_positions for p, n in runs):
+                variant = self._variant_ahead(nxt_at, S) if parts is None else self._variant()
+                nkey = StepKey(S, logits, variant, subs(nxt_at), 1 - b)
                 nxt = self._transaction(nkey)
-                if self._set_position(nxt, p, ahead=True):
-                    self._ahead = AheadStep(nkey._replace(b=0), p, self._ahead_state(), nxt, 1 - b)
+                if patch(nxt, nxt_at, ahead=True):
+                    self._ahead = AheadStep(nkey._replace(b=0), nxt_at, state(nxt_at, ahead=True), nxt, 1 - b)
                 self._once_t = 0.0  # (while the step runs: none of the next step's time)
         finally:
             self.dev.wait()

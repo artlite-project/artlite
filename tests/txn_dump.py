@@ -239,6 +239,41 @@ def _llama(path: str, kv_k: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
+def _llama_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    """Three sequences on the device: alternated steps (``select``), then joint steps (parts of 1 .. 2 slots at
+    positions of their own, every split of the slots), one starting over in between."""
+    def run(attach: Callable[[object], _Log]) -> None:
+        from artlite.decode.step import Part
+        from models.llama.overlay import LlamaOverlay
+
+        ov = LlamaOverlay(GGUFFile(path), sequences=3)
+        log = attach(ov.op)
+        rng = np.random.default_rng(0)
+        ov.load()
+        pos = [0, 0, 0]
+        for i, S in enumerate((1, 4, 3, 2, 4, 1, 2, 3, 4, 4, 1, 3)):
+            s = i % 3
+            log.label = f"sequence {s} S={S} p={pos[s]}"
+            ov.select(s)
+            ov.step(_x(rng, S, ov.H), pos[s], logits=i % 4 != 2)
+            pos[s] += S
+        for i in range(48):
+            take = [(s, 1 + (i + s) % 2) for s in ((0, 1, 2), (2, 0), (1,), (1, 2, 0), (0, 2))[i % 5]][:4]
+            while sum(n for _, n in take) > 4:
+                take[-1] = (take[-1][0], take[-1][1] - 1)
+            parts = tuple(Part(s, pos[s], n) for s, n in take)
+            log.label = f"joint {i}: {parts}"
+            ov.step(_x(rng, sum(n for _, n in take), ov.H), parts, logits=i % 5 != 3)
+            for s, n in take:
+                pos[s] += n
+            if i == 20:  # (sequence 1 starts over)
+                ov.select(1)
+                ov.reset()
+                pos[1] = 0
+
+    return run
+
+
 def _lfm(path: str) -> Callable[[Callable[[object], _Log]], None]:
     def run(attach: Callable[[object], _Log]) -> None:
         from models.lfm.overlay import LfmOverlay
@@ -583,6 +618,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "llama-1B-Q4_K_M": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "single")),
     "llama-1B-Q4_K_M-hilo": (llama_gguf("Q4_K_M", "1B"), lambda p: _llama(p, "hilo")),
     "llama-3B-Q4_K_M": (llama_gguf("Q4_K_M", "3B"), lambda p: _llama(p, "single")),
+    "llama-3B-Q4_K_M-sequences": (llama_gguf("Q4_K_M", "3B"), _llama_sequences),
     "llama-8B-Q4_K_S": (llama_gguf("Q4_K_S", "8B"), lambda p: _llama(p, "single")),
     "qwen3-0.6B-Q4_1": (qwen3_gguf("0.6B"), lambda p: _llama(p, "hilo")),
     "qwen3-embedding-4B-Q4_K_M": (qwen3_gguf("embedding-4B"), lambda p: _llama(p, "hilo")),  # (half regions in pairs)

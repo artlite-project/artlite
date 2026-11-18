@@ -5,6 +5,10 @@ those records as arrays (``PatchTables``), built once per transaction at its fir
 A step's transaction is built once per pattern of sub-steps and patched per step: each column's range of each layer's
 cache (A: address, length), a chain end's tail objects (A: the ring slots of the sub-step's open records, or the V
 panels of the first after a prefill) and the record drains (D: address, length).
+
+A step's slots may be several sequences' (``Part``: the device holds each one's caches, ``ModelOverlay.select``): a
+sequence's slots are sub-steps of their own, so a sub-step's patches take its sequence's buffers and its own position,
+and the transaction is the one a single sequence builds for the same pattern of sub-steps.
 """
 
 from dataclasses import dataclass, field
@@ -13,6 +17,21 @@ from typing import NamedTuple
 import numpy as np
 
 from ..overlay import Transaction
+
+
+class Part(NamedTuple):
+    """A sequence's slots of a step: ``n`` consecutive positions from ``position`` on of sequence ``seq`` (a step's
+    parts take its slots in order)."""
+
+    seq: int
+    position: int
+    n: int
+
+
+def slots_of(parts: tuple[Part, ...]) -> tuple[list[int], list[int], list[bool]]:
+    """Per slot of a step of ``parts``: its sequence, its position, whether it is its part's first."""
+    return ([q.seq for q in parts for _ in range(q.n)], [q.position + i for q in parts for i in range(q.n)],
+            [i == 0 for q in parts for i in range(q.n)])
 
 
 class Fill(NamedTuple):
@@ -110,10 +129,13 @@ class PatchTables:
 
 
 class PositionWords(NamedTuple):
-    """What the token objects of a step at p give its patches, per cache kind and sub-step ``u``: ``pu[kind, u]`` its first
+    """What the token objects of a step give its patches, per cache kind and sub-step ``u``: ``pu[kind, u]`` its first
     position and slots; ``fo[kind, u, j, f]`` the A fill f of chain column j (first object, objects:
-    ``attn_overlay.CacheKind.fills``); ``ro[kind, u, i]`` its i-th record (the base, offset and bytes of its drain)."""
+    ``attn_overlay.CacheKind.fills``); ``ro[kind, u, i]`` its i-th record (the base, offset and bytes of its drain);
+    ``su[kind, u]`` its sequence; ``first[kind, u]`` whether it is its sequence's first sub-step of the step."""
 
     pu: np.ndarray
     fo: np.ndarray
     ro: np.ndarray
+    su: np.ndarray
+    first: np.ndarray

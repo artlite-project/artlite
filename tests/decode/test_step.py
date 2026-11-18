@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from artlite.decode.model import AheadStep, HostRecords, ModelOverlay, Snapshot, StepKey, nbytes_of
+from artlite.decode.step import Part, slots_of
 from artlite.decode.vring import RingStateError, VRing
 
 
@@ -16,6 +17,23 @@ def test_step_key_and_ahead_state() -> None:
     assert not ahead.matches(key, 41, (frozenset(), ()))  # another position
     assert not ahead.matches(key._replace(logits=False), 40, (frozenset(), ()))  # another step
     assert not ahead.matches(key, 40, (frozenset({0}), ()))  # another ring state: patched again
+    parts = (Part(0, 40, 2), Part(2, 7, 1))  # (several sequences' step: its parts in place of the position)
+    joint = AheadStep(key, parts, ((frozenset(), ()),) * 2, object(), 1)
+    assert joint.matches(key, (Part(0, 40, 2), Part(2, 7, 1)), ((frozenset(), ()),) * 2)
+    assert not joint.matches(key, (Part(0, 40, 2), Part(1, 7, 1)), ((frozenset(), ()),) * 2)  # another sequence
+    assert not joint.matches(key, 40, ((frozenset(), ()),) * 2)
+
+
+def test_parts_slots() -> None:
+    """A step's parts give each slot its sequence and position, the parts' first slots marked."""
+    seq, pos, head = slots_of((Part(2, 30, 2), Part(0, 5, 1)))
+    assert (seq, pos, head) == ([2, 2, 0], [30, 31, 5], [True, False, True])
+
+
+def test_sequences_need_buffers() -> None:
+    """An overlay whose model keeps nothing per sequence on the device (``SEQ``) holds one."""
+    with pytest.raises(ValueError, match="holds one"):
+        ModelOverlay(None, layers=None, vocab=None, weights=None, sequences=2)
 
 
 def test_snapshot_bytes() -> None:

@@ -33,6 +33,12 @@ token objects, each column's range of each layer's cache per sub-step (A: addres
 ring slots of the sub-step's open records, or after a prefill the V panels of the first: record mode) and the record
 drains (D: address, length). A column's weights between two attentions are one run of the (column-major) image: one A
 task.
+
+Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
+step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own. Every slot's logits are
+those of a step of one of its sequence, bit for bit. Four sequences of one token take 15.0 / 39.5 / 86.7 ms where a
+step of one takes 12.6 / 34.1 / 79.5 (Llama 3.2 1B / 3B, 3.1 8B at 1K positions): 3.4x - 3.7x the tokens per second;
+at 16K positions 35.1 / 110.7 ms against 17.7 / 51.8 (1B / 3B: 2.0x / 1.9x), each sequence's own pass over its caches.
 """
 
 import math
@@ -56,7 +62,7 @@ from artlite.decode.protocol import (
     packed_slots,
 )
 from artlite.decode.screen import Screen
-from artlite.decode.step import StepPlan
+from artlite.decode.step import Part, StepPlan
 from artlite.decode.vring import PAIR
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
@@ -85,18 +91,19 @@ class LlamaOverlay(AttentionOverlay):
     """A Llama GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices),
     ``vocab``: LM rows (default: the padded vocabulary), ``max_positions``: the caches' capacity, ``kv_k``: the caches'
     K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's buffer
-    allocated ahead, ``image``: an image laid out already (``ModelOverlay``'s; default ``LlamaImage``'s layout). One
-    cache kind, one column per KV head, one ring state for every layer (key 0 of ``vring``: every step runs every
-    layer)."""
+    allocated ahead, ``image``: an image laid out already (``ModelOverlay``'s; default ``LlamaImage``'s layout),
+    ``sequences``: the sequences whose caches the device holds (``ModelOverlay.select``). One cache kind, one column
+    per KV head, one ring state for every layer (key 0 of ``vring``: every step runs every layer)."""
 
     CONFIG, IMAGE = LlamaConfig, LlamaImage
     AHEAD = True
+    SEQ = ("KV",)
     NORMED = frozenset({"qkv", "gate_up", "lm"})
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None,
-                 image: LlamaImage | None = None):
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
+                 image: LlamaImage | None = None, sequences: int = 1):
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
         fmts = check_formats(img)
         self.hd, self.nh = cfg.head_dim, cfg.q_per_kv
@@ -195,17 +202,19 @@ class LlamaOverlay(AttentionOverlay):
     def subs(self, p: int, S: int) -> tuple[tuple[int, int], ...]:
         return self._substeps(p, S, self.hd)
 
-    def _rope(self, kind: int, p: int, S: int) -> np.ndarray:
-        return rope_tables(self.inv_freq, range(p, p + S), self.hd // 2)
+    def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
+        return rope_tables(self.inv_freq, positions, self.hd // 2)
 
     # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
-        - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
-        until the next step), or without ``logits`` None (only the caches are updated)."""
+        - 1 of the selected sequence (the positions before are cached), or of several sequences' slots: ``position``
+        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next positions).
+        Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without
+        ``logits`` None (only the caches are updated)."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS

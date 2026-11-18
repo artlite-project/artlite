@@ -235,6 +235,8 @@ class OverlayDevice:
         self._insts = self.device.alloc_insts_buffer(max_instruction_bytes)
         self._loaded = np.zeros(0, np.uint32)  # (the words load() wrote)
         self.buffers: dict[str, object] = {}
+        # (names that stand for other buffers: a model's selected sequence's, ``decode.model.ModelOverlay.select``)
+        self.alias: dict[str, str] = {}
         self._submitted: tuple[Transaction, float] | None = None  # (``submit``: the running one, its start)
         self._prologue: Transaction | None = None
         self.stale = False  # (``set_prologue``)
@@ -294,31 +296,36 @@ class OverlayDevice:
         self.buffers[name] = buffer
         return buffer.map()
 
+    def named(self, name: str) -> object:
+        """The buffer a name stands for (``alias``: another one's, else its own)."""
+        return self.buffers[self.alias.get(name, name)]
+
     def view(self, name: str) -> np.ndarray:
-        return self.buffers[name].map()
+        return self.named(name).map()
 
     def flush(self, name: str, offset: int = 0, nbytes: int | None = None) -> None:
         """Host writes of a buffer range -> DDR."""
-        b = self.buffers[name]
+        b = self.named(name)
         b.sync_to_device(b.size - offset if nbytes is None else nbytes, offset)
 
     def flush_lines(self, name: str, offsets: np.ndarray) -> None:
         """Host writes of a buffer's scattered bytes (byte offsets, in any order) -> DDR, line by line: per S and
         position the steps rewrite a few bytes of buffers whose whole span would take milliseconds to flush."""
-        self.buffers[name].sync_lines(np.unique(np.asarray(offsets, np.int64).ravel() & ~63))
+        self.named(name).sync_lines(np.unique(np.asarray(offsets, np.int64).ravel() & ~63))
 
     def flush_at(self, name: str, lines: np.ndarray) -> None:
         """``flush_lines`` of line offsets given without repeats (int64)."""
-        self.buffers[name].sync_lines(lines.ravel())
+        self.named(name).sync_lines(lines.ravel())
 
     def fetch(self, name: str, offset: int = 0, nbytes: int | None = None) -> None:
         """Drop the CPU's cached copy of a buffer range the NPU wrote."""
-        b = self.buffers[name]
+        b = self.named(name)
         b.sync_from_device(b.size - offset if nbytes is None else nbytes, offset)
 
-    def address(self, name: str, offset: int = 0) -> int:
-        """Device address of a byte of a buffer (for ``Sequence.fill`` / ``drain``)."""
-        return txn.device_address(self.buffers[name], offset, self._prog._ctx)
+    def address(self, name: str, offset: int = 0, *, own: bool = False) -> int:
+        """Device address of a byte of a buffer (for ``Sequence.fill`` / ``drain``); ``own``: of the buffer of that
+        name itself, whatever the name stands for (``alias``)."""
+        return txn.device_address(self.buffers[name] if own else self.named(name), offset, self._prog._ctx)
 
     def load(self, words: np.ndarray) -> None:
         """Make ``words`` the transaction of the following dispatches (``dispatch()``)."""
