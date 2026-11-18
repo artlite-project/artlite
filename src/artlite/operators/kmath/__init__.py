@@ -20,7 +20,7 @@ comment): tests/operators/test_kmath.py checks them on the NPU against the varia
 The package: ``fn`` (``Fn``, the renderer of the templates, the contract checks), ``exponent`` (``exp2``: three forms),
 ``reciprocal``, ``composite`` (exp, expneg, expm1, softplus, sigmoid: fp32 or a bf16 gate, silu), ``acttable`` (the gather tables' host fit),
 ``gather`` (the tables' kernels: ``table_pass``, ``act``, ``silu_tanh``), ``rows`` (a head's row:
-``rms_norm``, ``rope``). Each function's C++ is a template file
+``rms_norm``, ``rope``), ``softmax`` (a softmax's P in two passes: ``p_pass1``, ``p_pass2``). Each function's C++ is a template file
 ``<module>.<part>.cc.jinja`` next to its module.
 """
 
@@ -31,9 +31,10 @@ from .fn import KM, LANES, Fn
 from .gather import act, silu_tanh, table_pass
 from .reciprocal import recip
 from .rows import rms_norm, rope
+from .softmax import p_pass1, p_pass2
 
 __all__ = [
     "ACC_C", "ACC_Q", "ATANH_C", "CHORD2_C", "CHORD2_SCALE", "CUBIC", "EXPM1_C", "GELU", "GELU_ERF", "KM", "LANES", "LN2",
-    "SIGMOID", "SILU", "TABLES", "TAYLOR", "ActTable", "Fn", "act", "bf16_values", "exp", "exp2", "expm1", "expneg", "recip",
-    "rms_norm", "rope", "sigmoid", "silu", "silu64", "silu_tanh", "softplus", "table_pass",
+    "SIGMOID", "SILU", "TABLES", "TAYLOR", "ActTable", "Fn", "act", "bf16_values", "exp", "exp2", "expm1", "expneg",
+    "p_pass1", "p_pass2", "recip", "rms_norm", "rope", "sigmoid", "silu", "silu64", "silu_tanh", "softplus", "table_pass",
 ]

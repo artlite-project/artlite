@@ -1,0 +1,53 @@
+// Pass 2 of a softmax's P (kmath.p_pass2): N steps of two 32-lane records' P, f -> {{ poly }} -> their P panel{{ " as hi, lo panels (the lo ones from pp + %d)" % lo if lo is not none else "" }}{{ ", l += P (l0 at l, l1 at l + %d)" % lsum if lsum is not none else "" }}
+template <int N>
+{{ attr }} void {{ name }}({% if split %}const bfloat16 *__restrict pP, const bfloat16 *__restrict pF{% else %}const bfloat16 *__restrict p0, const bfloat16 *__restrict p1{% endif %}, {{ "float *__restrict l, " if lsum is not none }}uint8_t *__restrict pp)
+{
+{% if rounding %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% endif %}
+    al::BOut<> po((bfp16ebs8 *)pp);
+{% if lo is not none %}
+    al::BOut<> pol((bfp16ebs8 *)(pp + {{ lo }}));
+    const al::BV nI = al::neg_eye();
+{% endif %}
+{% if lsum is not none %}
+    aie::accum<accfloat, 32> l0(aie::load_v<32>(l)), l1(aie::load_v<32>(l + {{ lsum }}));
+{% endif %}
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < N; t++) {
+{% if split %}
+        aie::accum<accfloat, 32> r[2];
+        AIE_LOOP_UNROLL_FULL
+        for (int u = 0; u < 2; u++) {
+            r[u] = {{ poly }}(aie::load_v<32>(pP + 32 * u), aie::load_v<32>(pF + 32 * u));
+        }
+        const aie::accum<accfloat, 32> r0 = r[0], r1 = r[1];
+{% else %}
+        const aie::accum<accfloat, 32> r0 = {{ poly }}(aie::load_v<32>(p0), aie::load_v<32>(p0 + 32));
+        const aie::accum<accfloat, 32> r1 = {{ poly }}(aie::load_v<32>(p1), aie::load_v<32>(p1 + 32));
+{% endif %}
+{% if lsum is not none %}
+        l0 = aie::add(l0, r0);
+        l1 = aie::add(l1, r1);
+{% endif %}
+{% if lo is not none %}
+        al::BV h, lo;
+        al::split_hilo(aie::concat(r0, r1), nI, h, lo);
+        po.push(h);
+        pol.push(lo);
+{% else %}
+        po.push(aie::concat(r0, r1).template to_vector<bfp16ebs8>());
+{% endif %}
+{% if split %}
+        pP += 64;
+        pF += 64;
+{% else %}
+        p0 += 64;
+        p1 += 64;
+{% endif %}
+    }
+{% if lsum is not none %}
+    aie::store_v(l, l0.template to_vector<float>());
+    aie::store_v(l + {{ lsum }}, l1.template to_vector<float>());
+{% endif %}
+}

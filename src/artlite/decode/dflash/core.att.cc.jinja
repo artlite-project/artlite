@@ -54,8 +54,9 @@ __attribute__((noinline)) void {{ p }}_qk1(const uint8_t *__restrict k, const ui
 
 {# P's 2^x in two steps (bias 192; masked scores -16384) #}
 {% set e192 = km.exp2(32, bias=192, below="bounded", above="clamp") %}
-{{ e192.parts.reduce.src }}
-{{ e192.parts.poly.src }}
+{% set p1, p2 = km.p_pass1(e192, layout="inplace"), km.p_pass2(e192, layout="inplace", lsum=32 * (ND + 1), rounding=True) %}
+{{ p1.src }}
+{{ p2.src }}
 
 {% include "artlite/decode/attn256.pv4.cc.jinja" %}
 // y += P V of the 4 octets (two calls) of pairs v, vb and their P panels (pp: [octet 4][P 4])
@@ -66,41 +67,6 @@ __attribute__((noinline)) void {{ p }}_pvs(const uint8_t *v, const uint8_t *vb, 
                    (float __aie_dm_resource_d *)(y + {{ 128 * (ND + 1) }}));
 }
 
-// P = 2^(s - m) of 4 records' scores of the 4 octets: P panels at pp, l += P (two passes: each pipelined)
-template <int N>
-__attribute__((noinline)) void {{ p }}_pexp1(float *__restrict s)
-{
-    AIE_LOOP_UNROLL(2)
-    for (int t = 0; t < N; t++) {
-        aie::accum<accfloat, 32> A(aie::load_v<32>(s));
-        aie::vector<bfloat16, 32> P, f;
-        {{ e192.parts.reduce }}(A, P, f);
-        aie::store_v((bfloat16 *)s, P);
-        aie::store_v((bfloat16 *)(s + 16), f);
-        s += 32;
-    }
-}
-
-template <int N>
-__attribute__((noinline)) void {{ p }}_pexp2(const bfloat16 *__restrict p0, const bfloat16 *__restrict p1, float *__restrict l, uint8_t *__restrict pp)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    al::BOut<> po((bfp16ebs8 *)pp);
-    aie::accum<accfloat, 32> l0(aie::load_v<32>(l)), l1(aie::load_v<32>(l + {{ 32 * (ND + 1) }}));
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < N; t++) {
-        const aie::accum<accfloat, 32> r0 = {{ e192.parts.poly }}(aie::load_v<32>(p0), aie::load_v<32>(p0 + 32));
-        const aie::accum<accfloat, 32> r1 = {{ e192.parts.poly }}(aie::load_v<32>(p1), aie::load_v<32>(p1 + 32));
-        l0 = aie::add(l0, r0);
-        l1 = aie::add(l1, r1);
-        po.push(aie::concat(r0, r1).template to_vector<bfp16ebs8>());
-        p0 += 64;
-        p1 += 64;
-    }
-    aie::store_v(l, l0.template to_vector<float>());
-    aie::store_v(l + {{ 32 * (ND + 1) }}, l1.template to_vector<float>());
-}
-
 __attribute__((noinline, minsize)) void {{ p }}_soft4(int32_t *__restrict ws, uint8_t *__restrict pp)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -108,8 +74,8 @@ __attribute__((noinline, minsize)) void {{ p }}_soft4(int32_t *__restrict ws, ui
     float *__restrict y = AW(float, {{ a.y }}) + {{ 32 * ND }};
     AIE_LOOP_NO_UNROLL
     for (int o = 0; o < {{ QC }}; o++) {
-        {{ p }}_pexp1<8>(sc);
-        {{ p }}_pexp2<4>((const bfloat16 *)sc, (const bfloat16 *)(sc + 128), y, pp);
+        {{ p1 }}<8>(sc);
+        {{ p2 }}<4>((const bfloat16 *)sc, (const bfloat16 *)(sc + 128), y, pp);
         sc += 256;
         y += {{ 64 * (ND + 1) }};
         pp += {{ PO }};

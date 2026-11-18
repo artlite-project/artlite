@@ -234,9 +234,9 @@ def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
         err = np.abs(out - ref)[keep] / mag[keep]
         bound = 2.0 ** -15.8
     same = out == em
-    if func == "rope":
+    if func == "rope":  # (the rotated dims: the others are copies)
         ulps = np.abs(out.astype(np.float64) - em) / np.spacing(np.abs(em)).astype(np.float64)
-        assert same.mean() >= 0.99 and ulps.max() <= 2, f"{same.mean():.4f} as the model, max {ulps.max()} ULP apart"
+        assert same[keep].mean() >= 0.99 and ulps.max() <= 2, f"{same[keep].mean():.4f} as the model, max {ulps.max()} ULP apart"
     else:
         assert same.all(), f"{(~same).sum()} results differ from the model; at {np.argwhere(~same)[:4]}: {out[~same][:4]} vs {em[~same][:4]}"
     print(f"\n{fn.name}: max error {err.max():.3g}")

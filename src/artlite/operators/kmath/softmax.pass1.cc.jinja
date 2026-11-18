@@ -1,0 +1,32 @@
+// Pass 1 of a softmax's P (kmath.p_pass1): N steps of 32 A = s - m + 192 -> {{ reduce }}'s P = 2^(round(s - m) + 64), f =
+// the rest{{ ", P and f to pP, pF" if split else ", [P 32 | f 32] in each step's place" }}{{ "; whether every bf16(A) < 209 (s < m + 16)" if track }}
+template <int N>
+{{ attr }} {{ "bool" if track else "void" }} {{ name }}({% if split %}const float *__restrict sl, bfloat16 *__restrict pP, bfloat16 *__restrict pF{% else %}float *__restrict s{% endif %})
+{
+{% if track %}
+    aie::vector<bfloat16, 32> mx = aie::broadcast<bfloat16, 32>(128.0f);  // (the clamp's constant)
+{% endif %}
+    AIE_LOOP_UNROLL(2)
+    for (int t = 0; t < N; t++) {
+        aie::accum<accfloat, 32> A(aie::load_v<32>({{ "sl" if split else "s" }}));
+{% if track %}
+        mx = aie::max(mx, A.template to_vector<bfloat16>());
+{% endif %}
+        aie::vector<bfloat16, 32> P, f;
+        {{ reduce }}(A, P, f);
+{% if split %}
+        aie::store_v(pF, f);
+        aie::store_v(pP, P);
+        sl += 32;
+        pP += 32;
+        pF += 32;
+{% else %}
+        aie::store_v((bfloat16 *)s, P);
+        aie::store_v((bfloat16 *)(s + 16), f);
+        s += 32;
+{% endif %}
+    }
+{% if track %}
+    return aie::lt(mx, aie::broadcast<bfloat16, 32>(209.0f)).full();
+{% endif %}
+}

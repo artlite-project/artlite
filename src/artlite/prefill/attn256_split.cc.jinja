@@ -12,8 +12,9 @@
 
 {% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="bounded", prec="quad") %}
 {{ exp2.src }}
-{{ e192.parts.reduce.src }}
-{{ e192.parts.poly.src }}
+{% set p1, p2 = km.p_pass1(e192, track=True), km.p_pass2(e192) %}
+{{ p1.src }}
+{{ p2.src }}
 
 namespace {
 
@@ -29,27 +30,6 @@ __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int
         else if (k == rec)
             aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf, tri));
     }
-}
-
-// pass 1 over N row panels' 256 N scores, 32 lanes a step: the first step of kmath.exp2 (P = 2^(round(s - m) + 64)
-// exactly, f = s - m - round(s - m); masked keys -16384: P ~ 0) -> pP, pF; whether every bf16(A) <= 208 (s <= m + 16)
-extern "C++" template <int N>
-__attribute__((noinline)) bool {{ p }}_pass1(const float *__restrict sl, bfloat16 *__restrict pP, bfloat16 *__restrict pF)
-{
-    aie::vector<bfloat16, 32> mx = aie::broadcast<bfloat16, 32>(128.0f);  // (the clamp's constant)
-    AIE_LOOP_UNROLL(2)
-    for (int t = 0; t < 8 * N; t++) {
-        aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
-        mx = aie::max(mx, A.template to_vector<bfloat16>());
-        aie::vector<bfloat16, 32> P, f;
-        {{ e192.parts.reduce }}(A, P, f);
-        aie::store_v(pF, f);
-        aie::store_v(pP, P);
-        sl += 32;
-        pP += 32;
-        pF += 32;
-    }
-    return aie::lt(mx, aie::broadcast<bfloat16, 32>(209.0f)).full();
 }
 
 // A row panel's maxima rise: rm = the group's row maxima of s = A - b, mn = max(m, rm), alpha = 2^(m - mn) (B rescales
@@ -108,25 +88,6 @@ __attribute__((noinline)) void {{ p }}_qkt(const bfloat16 *__restrict q, const b
             dq[k] = sq[k];
         dq += 36;
         sq += 36;
-    }
-}
-
-// pass 2 over N row panels: their 4 N P panels as bfp16 into pp
-extern "C++" template <int N>
-__attribute__((noinline)) void {{ p }}_pass2(const bfloat16 *__restrict pP, const bfloat16 *__restrict pF,
-                                             uint8_t *__restrict pp)
-{
-    al::BOut<> po((bfp16ebs8 *)pp);
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < 4 * N; t++) {
-        aie::accum<accfloat, 32> r[2];
-        AIE_LOOP_UNROLL_FULL
-        for (int u = 0; u < 2; u++) {
-            r[u] = {{ e192.parts.poly }}(aie::load_v<32>(pP + 32 * u), aie::load_v<32>(pF + 32 * u));
-        }
-        po.push(aie::concat(r[0], r[1]).template to_vector<bfp16ebs8>());
-        pP += 64;
-        pF += 64;
     }
 }
 
@@ -290,17 +251,17 @@ void {{ p }}_asoft(float *__restrict wa, float *__restrict mb, float *__restrict
     bfloat16 *__restrict bF = bP + {{ 256 * (R - PA) }};
     float *__restrict pa = ab + {{ 256 * (R - PA) }};
     int32_t *__restrict flag = (int32_t *)(pa + {{ 64 * R }});
-    if (g != 0 && {{ p }}_pass1<{{ PA }}>(sc, pf, pf + {{ 256 * PA }}) &&
-        {{ p }}_pass1<{{ R - PA }}>(sc + {{ 256 * PA }}, bP, bF)) {
+    if (g != 0 && {{ p1 }}<{{ 8 * PA }}>(sc, pf, pf + {{ 256 * PA }}) &&
+        {{ p1 }}<{{ 8 * (R - PA) }}>(sc + {{ 256 * PA }}, bP, bF)) {
         *flag = 0;
     } else {
         for (int h = 0; h < {{ R }}; h++)
             {{ p }}_araise(sc + 256 * h, mb + 64 * h, mb + {{ R * 64 }} + 64 * h, pa + 64 * h);
-        {{ p }}_pass1<{{ PA }}>(sc, pf, pf + {{ 256 * PA }});
-        {{ p }}_pass1<{{ R - PA }}>(sc + {{ 256 * PA }}, bP, bF);
+        {{ p1 }}<{{ 8 * PA }}>(sc, pf, pf + {{ 256 * PA }});
+        {{ p1 }}<{{ 8 * (R - PA) }}>(sc + {{ 256 * PA }}, bP, bF);
         *flag = 1;
     }
-    {{ p }}_pass2<{{ PA }}>(pf, pf + {{ 256 * PA }}, (uint8_t *)ab + {{ AB_PP }});  // (row panels 0 .. {{ PA - 1 }}'s P panels for B)
+    {{ p2 }}<{{ 4 * PA }}>(pf, pf + {{ 256 * PA }}, (uint8_t *)ab + {{ AB_PP }});  // (row panels 0 .. {{ PA - 1 }}'s P panels for B)
 {% if "ev_asoft" in ablate %}
     event1();
 {% endif %}
@@ -335,7 +296,7 @@ void {{ p }}_bsoft(const float *__restrict ab, float *__restrict wb, float *__re
             {{ p }}_rescale({{ p }}_o(wb, o4, h), lp + 64 * h, pa + 64 * h);
     uint8_t *__restrict pw = LP(uint8_t, {{ R * 256 }});
     al::copy<{{ PA * 144 }}, 16>((bfloat16 *)pw, (const bfloat16 *)((const uint8_t *)ab + {{ AB_PP }}));  // (A's panels)
-    {{ p }}_pass2<{{ R - PA }}>(pP, pP + {{ 256 * (R - PA) }}, pw + {{ 288 * PA }});
+    {{ p2 }}<{{ 4 * (R - PA) }}>(pP, pP + {{ 256 * (R - PA) }}, pw + {{ 288 * PA }});
 {% for t in range(R // 2) %}
     {{ p }}_lsum(pw + {{ 576 * t }}, lp + {{ 128 * t }});
 {% endfor %}

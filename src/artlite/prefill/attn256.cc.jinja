@@ -11,8 +11,13 @@
 
 {% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="bounded") %}
 {{ exp2.src }}
-{{ e192.parts.reduce.src }}
-{{ e192.parts.poly.src }}
+{% set p1, p2 = km.p_pass1(e192, track=True), km.p_pass2(e192, lsum=32, lo=320 if PP == 2 else none) %}
+{{ p1.src }}
+{{ p2.src }}
+{% if TWO %}
+{% set tp2 = km.p_pass2(e192, lo=640 if PP == 2 else none) %}
+{{ tp2.src }}
+{% endif %}
 
 namespace {
 
@@ -90,109 +95,6 @@ __attribute__((noinline)) void {{ p }}_keys(float *__restrict s, int32_t nk)
             aie::store_v(s + 64 * k, aie::select(aie::load_v<64>(s + 64 * k), ninf,
                                                  aie::mask<64>::from_uint64(0x{{ keys[v] }}ull)));
 {% endfor %}
-    }
-}
-
-{% endif %}
-// pass 1 of P = 2^(s - m) over a head's 4 panels of A = s + 192 - m, 32 lanes a step: the first step of kmath.exp2
-// (P = 2^(round(s - m) + 64) exactly, f = s - m - round(s - m); masked keys -16384: P ~ 0) -> pP, pF; whether
-// every bf16(A) <= 208 (s <= m + 16)
-template <int STEPS>
-[[clang::always_inline]] inline bool {{ p }}_pexp1(const float *__restrict sl, bfloat16 *__restrict pP,
-                                                   bfloat16 *__restrict pF)
-{
-    aie::vector<bfloat16, 32> mx = aie::broadcast<bfloat16, 32>(128.0f);  // (the clamp's constant)
-    AIE_LOOP_UNROLL(2)
-    for (int t = 0; t < STEPS; t++) {
-        aie::accum<accfloat, 32> A(aie::load_v<32>(sl));
-        mx = aie::max(mx, A.template to_vector<bfloat16>());
-        aie::vector<bfloat16, 32> P, f;
-        {{ e192.parts.reduce }}(A, P, f);
-        aie::store_v(pF, f);
-        aie::store_v(pP, P);
-        sl += 32;
-        pP += 32;
-        pF += 32;
-    }
-    return aie::lt(mx, aie::broadcast<bfloat16, 32>(209.0f)).full();
-}
-
-__attribute__((noinline)) bool {{ p }}_pass1(const float *__restrict s, float *__restrict pw)
-{
-    return {{ p }}_pexp1<8>(s, (bfloat16 *)pw, (bfloat16 *)pw + 256);
-}
-
-// pass 2, a panel a step: the second step of kmath.exp2 (2^-64 P 2^f, bias 192): the panel's P as bfp16 into pp{{ " (hi; lo from pp + 320: the exact split on the MMUL)" if PP == 2 else "" }}, l += P
-__attribute__((noinline)) void {{ p }}_pass2(const float *__restrict pw, float *__restrict pl, uint8_t *__restrict pp)
-{
-    const bfloat16 *__restrict pP = (const bfloat16 *)pw;
-    const bfloat16 *__restrict pF = (const bfloat16 *)pw + 256;
-    al::BOut<> po((bfp16ebs8 *)pp);
-{% if PP == 2 %}
-    al::BOut<> pol((bfp16ebs8 *)(pp + 320));
-    const al::BV nI = al::neg_eye();
-{% endif %}
-    aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < 4; t++) {
-        aie::accum<accfloat, 32> r[2];
-        AIE_LOOP_UNROLL_FULL
-        for (int u = 0; u < 2; u++) {
-            r[u] = {{ e192.parts.poly }}(aie::load_v<32>(pP + 32 * u), aie::load_v<32>(pF + 32 * u));
-        }
-        l0 = aie::add(l0, r[0]);
-        l1 = aie::add(l1, r[1]);
-{% if PP == 2 %}
-        al::BV h, lo;
-        al::split_hilo(aie::concat(r[0], r[1]), nI, h, lo);
-        po.push(h);
-        pol.push(lo);
-{% else %}
-        po.push(aie::concat(r[0], r[1]).template to_vector<bfp16ebs8>());
-{% endif %}
-        pP += 64;
-        pF += 64;
-    }
-    aie::store_v(pl, l0.template to_vector<float>());
-    aie::store_v(pl + 32, l1.template to_vector<float>());
-}
-
-{% if TWO %}
-// (two streams) pass 1 over both row panels' 512 scores (A in sc: [panel 2][record 4][8 x 8]) -> pf: P [512], f [512]
-// bf16; whether every bf16(A) <= 208
-__attribute__((noinline)) bool {{ p }}_tpass1(const float *__restrict s, bfloat16 *__restrict pf)
-{
-    return {{ p }}_pexp1<{{ 8 * R }}>(s, pf, pf + {{ 256 * R }});
-}
-
-// (two streams) pass 2 over both row panels: their 8 P panels as bfp16 into pp{{ " (hi; lo from pp + 640: the exact split on the MMUL)" if PP == 2 else "" }} (P V adds
-// their row sums to l)
-__attribute__((noinline)) void {{ p }}_tpass2(const bfloat16 *__restrict pf, uint8_t *__restrict pp)
-{
-    const bfloat16 *__restrict pP = pf;
-    const bfloat16 *__restrict pF = pf + {{ 256 * R }};
-    al::BOut<> po((bfp16ebs8 *)pp);
-{% if PP == 2 %}
-    al::BOut<> pol((bfp16ebs8 *)(pp + 640));
-    const al::BV nI = al::neg_eye();
-{% endif %}
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < {{ 4 * R }}; t++) {
-        aie::accum<accfloat, 32> r[2];
-        AIE_LOOP_UNROLL_FULL
-        for (int u = 0; u < 2; u++) {
-            r[u] = {{ e192.parts.poly }}(aie::load_v<32>(pP + 32 * u), aie::load_v<32>(pF + 32 * u));
-        }
-{% if PP == 2 %}
-        al::BV h, lo;
-        al::split_hilo(aie::concat(r[0], r[1]), nI, h, lo);
-        po.push(h);
-        pol.push(lo);
-{% else %}
-        po.push(aie::concat(r[0], r[1]).template to_vector<bfp16ebs8>());
-{% endif %}
-        pP += 64;
-        pF += 64;
     }
 }
 
@@ -393,22 +295,22 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict pw,{% if TWO %} bfloat
         float *__restrict pm = AW(float, {{ w.m }}) + 64 * h;
         float *__restrict pl = AW(float, {{ w.l }}) + 64 * h;
 {% if not TWO %}
-        if (!{{ p }}_pass1(s, pw) || g == 0) {
+        if (!{{ p1 }}<8>(s, (bfloat16 *)pw, (bfloat16 *)pw + 256) || g == 0) {
             {{ p }}_raise(s, AW(float, {{ w.o }}) + {{ OPS }} * h, pl, pm, AW(float, {{ w.b }}) + 64 * h, pw);
-            {{ p }}_pass1(s, pw);
+            {{ p1 }}<8>(s, (bfloat16 *)pw, (bfloat16 *)pw + 256);
         }
-        {{ p }}_pass2(pw, pl, (uint8_t *)s);
+        {{ p2 }}<4>((const bfloat16 *)pw, (const bfloat16 *)pw + 256, pl, (uint8_t *)s);
 {% endif %}
     }
 {% if TWO %}
     // (both panels' P in one pass each; a raise for both when a row of either exceeds the bound: pw its scratch)
-    if (!{{ p }}_tpass1(AW(float, {{ w.sc }}), pf) || g == 0) {
+    if (!{{ p1 }}<{{ 8 * R }}>(AW(float, {{ w.sc }}), pf, pf + {{ 256 * R }}) || g == 0) {
         for (int h = 0; h < {{ R }}; h++)
             {{ p }}_raise(AW(float, {{ w.sc }}) + 256 * h, AW(float, {{ w.o }}) + {{ OPS }} * h, AW(float, {{ w.l }}) + 64 * h,
                           AW(float, {{ w.m }}) + 64 * h, AW(float, {{ w.b }}) + 64 * h, pw);
-        {{ p }}_tpass1(AW(float, {{ w.sc }}), pf);
+        {{ p1 }}<{{ 8 * R }}>(AW(float, {{ w.sc }}), pf, pf + {{ 256 * R }});
     }
-    {{ p }}_tpass2(pf, (uint8_t *)pw);
+    {{ tp2 }}<{{ 4 * R }}>(pf, pf + {{ 256 * R }}, (uint8_t *)pw);
 {% endif %}
 {% if "ev_soft" in ablate %}
     event1();

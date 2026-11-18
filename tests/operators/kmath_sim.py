@@ -334,10 +334,10 @@ def rms_norm(fn: kmath.Fn, x: np.ndarray, w: np.ndarray | None) -> np.ndarray:
     """``kmath.rms_norm``: rows x (bf16 values [rows, n]) -> fp32 x / rms(x) (times w)."""
     n, eps = fn.params["n"], fn.params["eps"]
     x = bf16(x)
-    sq = mul(x, x).reshape(-1, n // 64, 64)
-    ss = sq[:, 0]
+    xs = x.reshape(-1, n // 64, 64)
+    ss = mul(xs[:, 0], xs[:, 0])
     for k in range(1, n // 64):
-        ss = add(ss, sq[:, k])  # (mac_square: per lane, in order)
+        ss = mac(ss, xs[:, k], xs[:, k])  # (mac_square: per lane, in order)
     iv = inv_rms(reduce_add(ss), n, eps)[:, None]
     ih, il = split(iv)
     y = mac(mul(x, ih), x, il)
