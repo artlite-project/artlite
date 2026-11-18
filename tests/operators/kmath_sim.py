@@ -17,7 +17,7 @@ unflushed product), a bf16 conversion; a zero's sign is not modelled.
 import numpy as np
 import torch
 
-from artlite.operators import kmath
+from artlite.operators import bfp16, kmath
 
 
 def _ftz(x: np.ndarray) -> np.ndarray:
@@ -120,9 +120,8 @@ def _exp2_f32(x: np.ndarray, prec: str, below: str) -> np.ndarray:
     return _ldexp_bits(p, n)
 
 
-def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int, prec: str = "bf16") -> np.ndarray:
-    k1, k2, k3 = (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in (*kmath.ACC_Q, 0.0)) if prec == "quad" \
-        else (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in kmath.ACC_C)
+def _exp2_acc_reduce(a: np.ndarray, below: str, above: str) -> tuple[np.ndarray, np.ndarray]:
+    """The bias-192 exp2's first step (``reduce``): A -> P = 2^(round(y) + 64) (exact), f the fraction (bf16)."""
     a = _f32(a)
     v = bf16(a)
     if below == "clamp" and above == "none":  # (f from the clamped v)
@@ -136,13 +135,45 @@ def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int, prec: str = "bf
             v = np.maximum(v, np.float32(128))
         if above == "clamp":
             v = np.minimum(v, np.float32(255))
-    p = _f32(np.exp2(v.astype(np.float64) - 128))  # (a non-negative integer power: vexp2 exact)
+    return _f32(np.exp2(v.astype(np.float64) - 128)), f  # (a non-negative integer power: vexp2 exact)
+
+
+def _exp2_acc_poly(p: np.ndarray, f: np.ndarray, shift: int, prec: str) -> np.ndarray:
+    """Its second step (``poly``): P, f -> 2^y (2^(y + 64) for ``shift`` 64), an fp32 accumulator's value."""
+    k1, k2, k3 = (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in (*kmath.ACC_Q, 0.0)) if prec == "quad" \
+        else (np.float64(bf16(np.float32(c * 2.0 ** (shift - 64)))) for c in kmath.ACC_C)
     pf = bf16(mul(p, f))
     pf2 = bf16(mul(pf, f))
     if prec == "quad":
         return mac(mac(mul(p, 2.0 ** (shift - 64)), pf, k1), pf2, k2)
     hi = bf16(mac(mul(f, k3), k2, 1.0))
     return mac(mac(mul(p, 2.0 ** (shift - 64)), pf, k1), pf2, hi)
+
+
+def _exp2_acc(a: np.ndarray, below: str, above: str, shift: int, prec: str = "bf16") -> np.ndarray:
+    return _exp2_acc_poly(*_exp2_acc_reduce(a, below, above), shift, prec)
+
+
+def softmax_passes(e192: kmath.Fn, a: np.ndarray, *, lsum: bool = False, lo: bool = False) -> dict[str, np.ndarray]:
+    """``kmath.p_pass1`` then ``p_pass2`` (``e192``'s parts) of the scores a [T, 2, 32] (A = s - m + 192, fp32; step t's
+    records u = 0, 1): ``r`` the P values 2^y (fp32, as the accumulators hold them), ``hi`` the P panels [T, 72] bytes
+    (bfp16ebs8 of each step's 64 values, ``bfp16.blocks``), ``lo`` (``lo``) the panels of x - hi (``al::split_hilo``: x -
+    hi is exact), ``l`` (``lsum``) the sums of each record's P over the steps [2, 32] (the accumulators' adder, in step
+    order), ``below209``: every bf16(A) < 209 (pass 1's ``track``)."""
+    p = e192.params
+    r = _exp2_acc_poly(*_exp2_acc_reduce(a, p["below"], p["above"]), p["shift"], p["prec"])
+    t = r.shape[0]
+    x = r.reshape(t, 8, 8)
+    hi = bfp16.block_bytes(x)
+    out = {"r": r, "hi": hi.reshape(t, 72), "below209": np.bool_(np.all(bf16(a) < 209))}
+    if lo:
+        out["lo"] = bfp16.block_bytes(add(x, -bfp16.block_values(hi))).reshape(t, 72)
+    if lsum:
+        s = np.zeros(r.shape[1:], np.float32)
+        for step in r:
+            s = add(s, step)
+        out["l"] = s
+    return out
 
 
 def vexp2(a: np.ndarray) -> np.ndarray:
@@ -331,8 +362,10 @@ def inv_rms(ss: np.ndarray, n: int, eps: float) -> np.ndarray:
 
 
 def rms_norm(fn: kmath.Fn, x: np.ndarray, w: np.ndarray | None) -> np.ndarray:
-    """``kmath.rms_norm``: rows x (bf16 values [rows, n]) -> fp32 x / rms(x) (times w)."""
-    n, eps = fn.params["n"], fn.params["eps"]
+    """``kmath.rms_norm``: rows x (bf16 values [rows, n]) -> fp32 x / rms(x) (times w); n: the rows' (a run-time n:
+    the same values as the compile-time form's: 1 / n is a bf16 when a power of two, and ``mulc`` and ``mulff`` agree
+    on it)."""
+    n, eps = x.shape[-1], fn.params["eps"]
     x = bf16(x)
     xs = x.reshape(-1, n // 64, 64)
     ss = mul(xs[:, 0], xs[:, 0])
@@ -357,10 +390,11 @@ def rot2(a: np.ndarray, b: np.ndarray, c: np.ndarray, s: np.ndarray) -> tuple[np
     return o0, o1
 
 
-def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray) -> np.ndarray:
+def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray, rot: int | None = None, dist: int | None = None) -> np.ndarray:
     """``kmath.rope``: fp32 rows [rows, n] with their pairs (i, i + dist), i < rot, rotated by cos cs[i] and sin
-    cs[rot + i] (a bf16 table's values as given: bf16)."""
-    rot, dist = fn.params["rot"], fn.params["dist"]
+    cs[rot + i] (a bf16 table's values as given: bf16); ``rot``, ``dist``: a run-time extent's arguments."""
+    rot = fn.params["rot"] if rot is None else rot
+    dist = fn.params["dist"] if dist is None else dist
     out = _f32(row).copy()
     c, s = _f32(cs[:rot]), _f32(cs[rot:2 * rot])
     a, b = out[:, :rot], out[:, dist:dist + rot]

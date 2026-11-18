@@ -1,3 +1,4 @@
+{% from "artlite/gemm/gemm_q.epilogue.cc.jinja" import times_up %}
 {% if act == "silu" %}
 {% set act_t = km.silu_tanh(walk=(2, 128)) %}
 {% else %}
@@ -9,7 +10,7 @@ extern "C" {
 
 // 8 tokens' parts of {{ G }} groups (x: [token 8][group {{ G }}][gate {{ W }} | up {{ W }}] bf16, each part's first 64 the
 // group's outputs) -> {{ 8 * G }} panels (8 tokens x 8 outputs) of h = bf16({{ act }}(gate) up) as bfp16ebs8 (the gate / up
-// epilogue's of the GEMMs: ``gemm_q``'s times_up): the panels' [gate 64 | up 64] gathered into s, the act of the gates
+// epilogue's of the GEMMs: ``gemm_q.epilogue``'s times_up): the panels' [gate 64 | up 64] gathered into s, the act of the gates
 // into y (SiLU: silu_tanh; a GELU form: kmath.act through the table's two copies), then times up
 void {{ p }}_act(const bfloat16 *__restrict x, bfloat16 *__restrict s, bfloat16 *__restrict y, bfloat16 *__restrict out,
                  {{ "int32_t zero" if act == "silu" else "const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd" }})
@@ -27,16 +28,7 @@ void {{ p }}_act(const bfloat16 *__restrict x, bfloat16 *__restrict s, bfloat16 
         }
     }
     {{ act_t }}<{{ 512 * G }}>(s, y, {{ "zero" if act == "silu" else "tab_ab, tab_cd" }});
-    const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)s + 64;
-    const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)y;
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> o((bfp16ebs8 *)out);
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int i = 0; i < {{ 8 * G }}; i++) {
-        const aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
-        o.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
-        pu += 128;
-        py += 64;
-    }
+{{ times_up("s", "y", "out", 8 * G) }}
 }
 
 }  // extern "C"

@@ -1,10 +1,22 @@
+// The panels of _iq3_signs: LW the scale panel (rows 0, 1: -1, -2, -4, -8 in k 0 .. 3 / 4 .. 7), LX's exponent
+[[clang::always_inline]] inline void {{ p }}_iq3_panels(v64bfp16ebs8 &LW, v64bfp16ebs8 &LX)
+{
+    v16int32 lw = broadcast_zero_to_v16int32();
+    lw = upd_elem(lw, 0, (int)0xF8FCFEFF);
+    lw = upd_elem(lw, 3, (int)0xF8FCFEFF);
+    LW.mantissa = (v64int8)lw;
+    LW.exponent = al::e8(125);
+    LX.exponent = al::e8(0x85);
+}
+
 // The signs and scales of 16 rows' sign / scale words v of a group ([r 16][l 4]): m = the signs [l][r 16]
 // (bit j of byte r: value 8 l + j of row r negative; m = c ^ (c << 1) of the field c, XOR as (c | t) - (c & t): the
 // subtraction a vaddsub (LLVM folds a plain one into an XOR, 5 operations));
 // s = (2 ls + 1) / 4 [r 16] (an MMUL: the bytes' bit 7 against a panel of -2^l at 2^-8, from 0.25)
-[[clang::always_inline]] inline void {{ p }}_iq3_signs(v64int8 v, v64bfp16ebs8 LX, v64bfp16ebs8 LW, v2int32 all,
+[[clang::always_inline]] inline void {{ p }}_iq3_signs(v64int8 v, v64bfp16ebs8 LX, v64bfp16ebs8 LW,
                                                       v64int8 &m, v8int32 &s)
 {
+    const v2int32 all = (v2int32)~0ULL;  // (vaddsub: subtract in every lane)
     const aie::vector<int8, 64> V(v);
     LX.mantissa = (v64int8)aie::bit_and(V, aie::broadcast<int8, 64>(-128));
     const aie::vector<bfloat16, 64> sv = aie::accum<accfloat, 64>(

@@ -1,3 +1,4 @@
+{% from "artlite/formats/common.macros.cc.jinja" import store_chain with context %}
 // ---- Q5_K (R = {{ R5 }} rows, row group 1 = rows 8 .. and junk): scale planes [pair 2][row R][8 words: sc lo nibbles
 // (sb 2 p), (2 p + 1) | mn lo | mn lo | crumbs (2 p) | (2 p + 1) (nibble i = c_sc + 4 c_mn) | d pair | -dmin pair] | codes
 // [sb][plane 5][row R][32 B]: the low nibbles of step s (plane s), then qh (nibble of lane l: bit s = the high bit h
@@ -110,13 +111,7 @@ __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x, 1, {{ p }}_wu(pw + {{ o + 192 }}, {{ 0x89 - st }}), 0, C1);
         }
 {% endfor %}
-{% if slots == 8 %}
-        aie::store_v(pc, {{ p }}_c8(C0));
-        aie::store_v(pc + 64, {{ p }}_c8(C1));
-{% else %}
-        aie::store_v(pc, {{ p }}_sum2(C0));
-        aie::store_v(pc + 32, {{ p }}_sum2(C1));
-{% endif %}
+        {{ store_chain(2, 64, 32) | indent(8) }}
         pw += 512;
         pc += {{ 2 * L }};
     }

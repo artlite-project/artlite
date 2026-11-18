@@ -1,3 +1,4 @@
+{% from "artlite/formats/common.macros.cc.jinja" import store_acc with context %}
 // ---- Q3_K ({{ R3 }} rows, 3 row groups; rows past R: junk): header words [sb][h 2] the low nibbles of u = sc + 32 | [sb] the
 // high crumbs (nibble s = c(s) + 4 c(s + 8)) | [sb pair] d | codes [sb][word 3 p + t 24] (quad p: the signed nibbles A, B,
 // C = q(t) + 8 bit_t(q(3)) of blocks t = 0 .. 2), word-major. Core H: super-blocks 2 H, 2 H + 1; per super-block u its
@@ -101,8 +102,7 @@ __attribute__((noinline)) void {{ p }}_q3k_mm(const uint8_t *__restrict xp, cons
             C1 = mac_8x8_8x8T(x2, 1, W2, 0, C1);
             C0 = mac_8x8_8x8T(x1, 1, W1, 0, C0);
             C1 = mac_8x8_8x8T(x3, 1, W3, 0, C1);
-            aie::store_v(pc, {{ p }}_sum2(C0));
-            aie::store_v(pc + 128, {{ p }}_sum2(C1));
+            {{ store_acc("sum2", 2, 128) | indent(12) }}
             pc += 256;
         }
     }
@@ -155,8 +155,7 @@ __attribute__((noinline)) void {{ p }}_q3k_mm8(const uint8_t *__restrict xp, con
         C1 = mac_8x8_8x8T(x2, 1, W2, 0, C1);
         C0 = mac_8x8_8x8T(x1, 1, W1, 0, C0);
         C1 = mac_8x8_8x8T(x3, 1, W3, 0, C1);
-        aie::store_v(pc, {{ p }}_c8(C0));
-        aie::store_v(pc + 64, {{ p }}_c8(C1));
+        {{ store_acc("c8", 2, 64) | indent(8) }}
         pc += 128;
     }
 }

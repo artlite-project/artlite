@@ -141,7 +141,7 @@ __attribute__((noinline)) void {{ p }}_iq1g(const uint16_t *__restrict li, const
                                             const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
                                             uint8_t *__restrict u)
 {
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v64int8 z = broadcast_zero_to_v64int8(), km1 = broadcast_to_v64int8(-1), k8 = broadcast_to_v64int8(8);
     const v64int8 k63 = broadcast_to_v64int8(63), k65 = broadcast_to_v64int8(65);
     const v16uint16 __aie_dm_resource_a *__restrict pi = (const v16uint16 __aie_dm_resource_a *)li;

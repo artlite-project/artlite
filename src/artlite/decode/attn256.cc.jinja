@@ -154,19 +154,8 @@ __attribute__((noinline)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bf
     al::v_put(dst, src, {{ ND }});
 }
 
-// rows, those from position n on as zeros -> the record's V panels (al::v_enc; dup: each panel twice, a pair of records
-// [d-block][record 2] of it for ``pv`` of a lone record)
-__attribute__((noinline)) void {{ p }}_venc(const bfloat16 *__restrict rows, uint8_t *__restrict rec, int n, int dup)
-{
-    al::BOut<> o((bfp16ebs8 *)rec);
-    const aie::mask<64> keep = aie::mask<64>::from_uint64(n < 8 ? (1ull << (8 * n)) - 1 : ~0ull);
-    AIE_PREPARE_FOR_POSTPIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT({{ ND }})
-    for (int i = 0; i < {{ ND }} << dup; i++) {
-        const aie::vector<bfloat16, 64> pd = aie::select(aie::zeros<bfloat16, 64>(), aie::load_v<64>(rows + 64 * (i >> dup)), keep);
-        o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
-    }
-}
+{% set VENC_ATTRS = "noinline" %}
+{% include "artlite/decode/attn256.venc.cc.jinja" %}
 
 // The rows of a set whose positions past their own are in record r (scores masked): lanes of row q (q < 4: query row 4
 // set + q, slot (4 set + q) / QR at position p + slot) at positions 8 r + j > p + slot

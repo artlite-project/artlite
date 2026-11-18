@@ -317,7 +317,6 @@ void {{ p }}_bl(const bfloat16 *__restrict g, const bfloat16 *__restrict w, floa
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
     const al::BV nI = al::neg_eye();
-    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> ol((bfp16ebs8 *)out + {{ C }});  // (C / 8 panels of 8 blocks)
     const bfloat16 *__restrict pg = g + {{ C }} * kc;
@@ -326,8 +325,8 @@ void {{ p }}_bl(const bfloat16 *__restrict g, const bfloat16 *__restrict w, floa
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
         aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
         const aie::accum<accfloat, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>());
-        const aie::vector<bfloat16, 64> wh = xw.template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 64> wl = aie::msc(xw, wh, one).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 64> wh, wl;
+        al::split2<64>(xw, wh, wl);
         al::BV h, l;
         al::split_hilo(aie::mac(aie::mac(aie::mac(aie::mul(wh, vh), wh, vl), wl, vh), wl, vl), nI, h, l);
         o.push(h);

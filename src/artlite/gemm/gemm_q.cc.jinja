@@ -7,21 +7,7 @@ namespace {
 {% set gact = km.act(km.TABLES[act], table_arg=True, walk=(2, 128)) %}
 {{ gact.src }}
 {% endif %}
-{# the gate/up epilogues' last loop: h = y up (y in the scratch, up the C tile's up halves) -> hout as bfp16 panels #}
-{% macro times_up(mp_) %}
-    {
-        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *)cacc + 64;
-        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *)scratch;
-        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)hout);
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int i = 0; i < {{ mp_ * n // 128 }}; i++) {
-            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
-            out.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
-            pu += 128;
-            py += 64;
-        }
-    }
-{%- endmacro %}
+{% from "artlite/gemm/gemm_q.epilogue.cc.jinja" import times_up %}
 
 }  // namespace
 
@@ -165,19 +151,11 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
 
 {% endif %}
 {% endif %}
-{% if silu and act == "silu" %}
-// gate/up epilogue: C 8x8 sub-block pairs (2 t, 2 t + 1) of a tile are 8 gate and 8 up rows (acc: [gate
-// 64 | up 64] per 128 values); h = silu(gate) * up -> hout (m x {{ n // 2 }}, 8x8 sub-blocks; as bfp16ebs8 panels (8 tokens x 8 outputs)).
-// Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
-// cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
-// (II 4 per 64 values: ``times_up``).
+{% macro gate_up(name, params, act, args) %}
 {% set parts = 2 if csplit else sxp %}
 {% set mp = m // parts %}
-{% set silu_t = km.silu_tanh(walk=(2, 128)) %}
-{{ silu_t.src }}
-
-void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
-                  int32_t zero{{ ", int32_t c_part" if c_parts == 2 else "" }})
+void {{ p }}_{{ name }}(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
+                  {{ params }}{{ ", int32_t c_part" if c_parts == 2 else "" }})
 {
 {% if "act" in ablate %}
     return;
@@ -199,8 +177,8 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     const bfloat16 *__restrict cacc = cacc_;
     bfloat16 *__restrict hout = hout_;
 {% endif %}
-    {{ silu_t }}<{{ mp * n // 2 }}>(cacc, scratch, zero);
-{{ times_up(mp) }}
+    {{ act }}<{{ mp * n // 2 }}>(cacc, scratch, {{ args }});
+{{ times_up("cacc", "scratch", "hout", mp * n // 128) }}
 {% if parts > 1 %}
     }
 {% endif %}
@@ -208,45 +186,25 @@ void {{ p }}_silu(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, 
     event1();
 {% endif %}
 }
+{%- endmacro %}
+
+{% if silu and act == "silu" %}
+// gate/up epilogue: C 8x8 sub-block pairs (2 t, 2 t + 1) of a tile are 8 gate and 8 up rows (acc: [gate
+// 64 | up 64] per 128 values); h = silu(gate) * up -> hout (m x {{ n // 2 }}, 8x8 sub-blocks; as bfp16ebs8 panels (8 tokens x 8 outputs)).
+// Three pipelined loops through the scratch (GemmQ: the second C tile, idle here), 1627 instead of 3008
+// cycles per pass at m = n = 64, no spills: kmath.silu_tanh's two (the gate halves into the scratch), then times up
+// (II 4 per 64 values: ``times_up``).
+{% set silu_t = km.silu_tanh(walk=(2, 128)) %}
+{{ silu_t.src }}
+
+{{ gate_up("silu", "int32_t zero", silu_t, "zero") }}
 
 {% endif %}
 {% if silu and act != "silu" %}
 // gate/up epilogue (GELU: Gemma's tanh form, Spark-X's erf): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
 // panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
 // table, in two 16 KB regions), then times up.
-{% set parts = 2 if csplit else sxp %}
-{% set mp = m // parts %}
-void {{ p }}_{{ act }}(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
-                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd{{ ", int32_t c_part" if c_parts == 2 else "" }})
-{
-{% if "act" in ablate %}
-    return;
-{% endif %}
-{% if "ev_act" in ablate %}
-    event0();
-{% endif %}
-    aie::set_rounding(aie::rounding_mode::conv_even);
-{% if c_parts == 2 %}
-    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};  // (the C object's part: a pass of two, or a pass's half)
-{% endif %}
-{% if parts > 1 %}
-    AIE_LOOP_NO_UNROLL
-    for (int part = 0; part < {{ parts }}; part++) {
-    const bfloat16 *__restrict cacc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
-    bfloat16 *__restrict hout = hout_ + part * {{ mp * n // 2 * 9 // 16 }};
-{% else %}
-    const bfloat16 *__restrict cacc = cacc_;
-    bfloat16 *__restrict hout = hout_;
-{% endif %}
-    {{ gact }}<{{ mp * n // 2 }}>(cacc, scratch, tab_ab, tab_cd);
-{{ times_up(mp) }}
-{% if parts > 1 %}
-    }
-{% endif %}
-{% if "ev_act" in ablate %}
-    event1();
-{% endif %}
-}
+{{ gate_up(act, "const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd", gact, "tab_ab, tab_cd") }}
 
 {% endif %}
 {% if pair %}

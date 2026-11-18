@@ -43,27 +43,14 @@ __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const fl
 // row (256 fp32) -> row r of the stage [db][r][8]
 __attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
 {
-    float *__restrict d = st + 8 * r;
-    for (int db = 0; db < {{ ND }}; db++) {
-        aie::store_v(d, aie::load_v<8>(row));
-        row += 8;
-        d += 64;
-    }
+    al::stage_row<{{ ND }}>(row, st, r);
 }
 
 // stage -> per d-block the hi panel, then the lo panel (a panel: the 8 rows' blocks of 8 dims; Q and the K records:
 // one stream for the attention's MMUL)
 __attribute__((noinline)) void {{ p }}_hiloi(const float *__restrict st, uint8_t *__restrict out)
 {
-    const al::BV nI = al::neg_eye();
-    al::BOut<> o((bfp16ebs8 *)out);
-    for (int db = 0; db < {{ ND }}; db++) {
-        al::BV h, l;
-        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
-        o.push(h);
-        o.push(l);
-        st += 64;
-    }
+    al::encode_hilo<{{ ND }}, true>(st, out);
 }
 
 }  // namespace
@@ -197,13 +184,6 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
     }
 }
 
-// The V panel of d-block db of 8 tokens' rows (bf16): per dim of the 8 a block over the positions
-[[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
-{
-    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
-    return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
-}
-
 // 8 tokens of a KV head's V (rows bf16) -> record ``half`` of a pair of cache records ([d-block][record 2], out): the
 // first's panels into the workspace, then per d-block the first's and the second's
 void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, float *__restrict ws,
@@ -214,7 +194,7 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
         al::BOut<> o((bfp16ebs8 *)ws);
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int db = 0; db < {{ ND }}; db++)
-            o.push({{ p }}_vpan(v, db));
+            o.push(al::vpan<{{ HD }}>(v, db));
         return;
     }
     al::BIn<> a((const bfp16ebs8 *)ws);
@@ -222,7 +202,7 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int db = 0; db < {{ ND }}; db++) {
         o.push(a.pop());
-        o.push({{ p }}_vpan(v, db));
+        o.push(al::vpan<{{ HD }}>(v, db));
     }
 }
 

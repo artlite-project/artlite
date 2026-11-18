@@ -27,13 +27,11 @@ template <int P>
     u = aie::mac(u, d{{ i }}, w);
 {% endfor %}
     const aie::vector<float, 64> uf = u.template to_vector<float>();
-    const aie::vector<bfloat16, 64> uh = aie::accum<accfloat, 64>(uf).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 64> ul = aie::accum<accfloat, 64>(
-        aie::sub(uf, aie::accum<accfloat, 64>(uh).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 64> uh, ul;
+    al::split2<64>(uf, uh, ul);
 {% if scale %}
-    const aie::vector<bfloat16, 64> xh = aie::accum<accfloat, 64>(x).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 64> xl = aie::accum<accfloat, 64>(
-        aie::sub(x, aie::accum<accfloat, 64>(xh).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 64> xh, xl;
+    al::split2<64>(aie::accum<accfloat, 64>(x), xh, xl);
     aie::accum<accfloat, 64> acc = aie::mac(aie::mac(aie::mul(xh, sh), xh, sl), xl, sh);
     acc = aie::mac(aie::mac(aie::mac(acc, uh, ah), uh, al), ul, ah);
 {% else %}
@@ -67,10 +65,10 @@ template <int P>
     // (v sh + v sl, v = vh + vl: the four products in one accumulator)
     const aie::vector<bfloat16, 64> vh = al::expand8(ih.template extract<8>(0)), vl = al::expand8(il.template extract<8>(0));
     const aie::vector<float, 64> b = aie::mac(aie::mac(aie::mac(aie::mul(vh, sh), vl, sh), vh, sl), vl, sl).template to_vector<float>();
-    const aie::vector<bfloat16, 64> h = aie::accum<accfloat, 64>(b).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 64> h, l;
+    al::split2<64>(b, h, l);
     aie::store_v(hi, h);
-    aie::store_v(lo, aie::accum<accfloat, 64>(aie::sub(b, aie::accum<accfloat, 64>(h).template to_vector<float>()))
-                         .template to_vector<bfloat16>());
+    aie::store_v(lo, l);
 }
 
 }  // namespace

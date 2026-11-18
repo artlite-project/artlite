@@ -129,16 +129,6 @@ template <int N>
                                    aie::concat(aie::load_v<8>(p + 6 * N), aie::load_v<8>(p + 7 * N))));
 }
 
-// x (64 fp32) -> panels hi, lo (bfp16 of the 8 x 8 block, 8 values per block along the lanes' fast axis) pushed at out
-[[clang::always_inline]] inline void {{ p }}_push2(aie::accum<accfloat, 64> x, const al::BV &nI, uint8_t *out)
-{
-    al::BV h, l;
-    al::split_hilo(x, nI, h, l);
-    al::BOut<> po((bfp16ebs8 *)out);
-    po.push(h);
-    po.push(l);
-}
-
 // The chunk's Gram blocks of its K / Q panels (kp, qp: [ib 16][tb 2][hi, lo]) on the MMUL (three products each):
 // g = K K^T 00, 10, 11, Q K^T 00, 10, 11 ([t][s] fp32), and the K^T panels kt ([ib][tb][hi, lo] of the [i 8][t 8]
 // blocks: I (K hi + K lo)^T exactly, then split)
@@ -196,7 +186,7 @@ __attribute__((noinline)) void {{ p }}_gram(const uint8_t *__restrict kp, const 
             al::MM8 t(aie::zeros<accfloat, 64>());
             t.mac(I, TR(h));
             t.mac(I, TR(l));
-            {{ p }}_push2(t.to_accum(), nI, po);
+            al::push2(t.to_accum(), nI, po);
             po += {{ 2 * PAN }};
         }
     }
@@ -304,13 +294,13 @@ __attribute__((noinline)) void {{ p }}_lm(const float *__restrict gt, const floa
             aie::store_v(lb + 32 * b, h);
             aie::store_v(lb + 128 + 32 * b, lo);
         } else
-            {{ p }}_push2(aie::accum<accfloat, 64>(aie::sub(aie::zeros<float, 64>(), l)), nI, pn + {{ 2 * PAN }});
+            al::push2(aie::accum<accfloat, 64>(aie::sub(aie::zeros<float, 64>(), l)), nI, pn + {{ 2 * PAN }});
 {% if PACK %}
-        {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower & ~cut)), nI,
-                      pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
+        al::push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower & ~cut)), nI,
+                    pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
 {% else %}
-        {{ p }}_push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower)), nI,
-                      pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
+        al::push2(aie::accum<accfloat, 64>(aie::select(aie::zeros<float, 64>(), aie::add(q, al::mulff<64>(e, q)), lower)), nI,
+                    pn + {{ 6 * PAN }} + {{ 2 * PAN }} * b);
 {% endif %}
     }
 }
@@ -350,18 +340,18 @@ __attribute__((noinline)) void {{ p }}_tinv(const bfloat16 *__restrict lb, float
             qh += 16;
         }
         const aie::accum<accfloat, 16> acc = aie::add(aie::add(a0, a1), a2);
-        const aie::vector<float, 16> x = acc.template to_vector<float>();
-        const aie::vector<bfloat16, 16> h = acc.template to_vector<bfloat16>();
-        aie::store_v(tr + 16 * t, x);
+        aie::vector<bfloat16, 16> h, l;
+        al::split2<16>(acc, h, l);
+        aie::store_v(tr + 16 * t, acc.template to_vector<float>());
         aie::store_v(rb + 16 * t, h);
-        aie::store_v(rb + 128 + 16 * t, aie::accum<accfloat, 16>(aie::sub(x, aie::accum<accfloat, 16>(h).template to_vector<float>())).template to_vector<bfloat16>());
+        aie::store_v(rb + 128 + 16 * t, l);
     }
     const al::BV nI = al::neg_eye();
     AIE_LOOP_NO_UNROLL
     for (int b = 0; b < 2; b++) {
         const float *__restrict pr = tr + 8 * b;
         aie::vector<float, 64> v = {{ p }}_blk<16>(pr);
-        {{ p }}_push2(aie::accum<accfloat, 64>(v), nI, pn + {{ 4 * PAN }} * b);
+        al::push2(aie::accum<accfloat, 64>(v), nI, pn + {{ 4 * PAN }} * b);
     }
 }
 
@@ -423,15 +413,6 @@ __attribute__((noinline)) void {{ p }}_decay(const float *__restrict si, float *
     }
 }
 
-// C += A (hi + lo) B (hi + lo)^T: three products (a, b: two panels each, hi then lo)
-[[clang::always_inline]] inline void {{ p }}_mm3(al::MM8 &c, const al::BV &ah, const al::BV &al_, const al::BV &bh,
-                                               const al::BV &bl)
-{
-    c.mac(ah, TR(bh));
-    c.mac(ah, TR(bl));
-    c.mac(al_, TR(bh));
-}
-
 // A j-block of the chunk: R^T = beta (V^T - Gamma X^T); U^T(0) = R^T(0) T00^T; U^T(1) = (R^T(1) - U^T(0) L10^T)
 // T11^T; O^T = Gamma Y^T + U^T M^T (bf16, transposed into the chunk's output rows o: the block's 8 columns); U'^T =
 // (1 + E15) U^T as panels up ([tb][hi, lo]). xy (256 fp32), vt (128 bf16): the j-block's; pn: [T00 | -L10 | T11 |
@@ -450,7 +431,7 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
         {
             const aie::vector<float, 64> x = aie::load_v<64>(xy);
             const aie::vector<float, 64> v = aie::accum<accfloat, 64>(aie::load_v<64>(vt)).template to_vector<float>();
-            {{ p }}_push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(fv), aie::sub(aie::sub(v, x), al::mulff<64>(aie::load_v<64>(fv + 64), x)))), nI, rp);
+            al::push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(fv), aie::sub(aie::sub(v, x), al::mulff<64>(aie::load_v<64>(fv + 64), x)))), nI, rp);
         }
         {
             const aie::vector<float, 64> x = aie::load_v<64>(xy + 64);
@@ -462,26 +443,26 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
             al::BIn<> rs((const bfp16ebs8 *)rp);
             const al::BV rh = rs.pop(), rl = rs.pop(), th = ps.pop(), tl = ps.pop();
             al::MM8 u(aie::zeros<accfloat, 64>());
-            {{ p }}_mm3(u, rh, rl, th, tl);
+            al::mm3(u, rh, rl, th, tl);
             aie::store_v(uf0, u.to_accum().template to_vector<float>());
-            {{ p }}_push2(u.to_accum(), nI, u0p);
+            al::push2(u.to_accum(), nI, u0p);
         }
         {
             al::BIn<> ps((const bfp16ebs8 *)(pn + {{ 2 * PAN }}));
             al::BIn<> us((const bfp16ebs8 *)u0p);
             const al::BV uh = us.pop(), ul = us.pop(), lh = ps.pop(), ll = ps.pop();
             al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(r1)));
-            {{ p }}_mm3(c, uh, ul, lh, ll);
-            {{ p }}_push2(c.to_accum(), nI, rp);
+            al::mm3(c, uh, ul, lh, ll);
+            al::push2(c.to_accum(), nI, rp);
         }
         {
             al::BIn<> ps((const bfp16ebs8 *)(pn + {{ 4 * PAN }}));
             al::BIn<> rs((const bfp16ebs8 *)rp);
             const al::BV rh = rs.pop(), rl = rs.pop(), th = ps.pop(), tl = ps.pop();
             al::MM8 u(aie::zeros<accfloat, 64>());
-            {{ p }}_mm3(u, rh, rl, th, tl);
+            al::mm3(u, rh, rl, th, tl);
             aie::store_v(uf1, u.to_accum().template to_vector<float>());
-            {{ p }}_push2(u.to_accum(), nI, u1p);
+            al::push2(u.to_accum(), nI, u1p);
         }
         {
             const aie::vector<float, 64> y = aie::load_v<64>(xy + 128);
@@ -489,7 +470,7 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
             al::BIn<> ps((const bfp16ebs8 *)(pn + {{ 6 * PAN }}));
             al::BIn<> us((const bfp16ebs8 *)u0p);
             const al::BV uh = us.pop(), ul = us.pop(), mh = ps.pop(), ml = ps.pop();
-            {{ p }}_mm3(c, uh, ul, mh, ml);
+            al::mm3(c, uh, ul, mh, ml);
             const aie::vector<bfloat16, 64> a = aie::transpose(c.to_accum().template to_vector<bfloat16>(), 8, 8);
             AIE_LOOP_UNROLL_FULL
             for (int t = 0; t < 8; t++)
@@ -501,9 +482,9 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
             al::BIn<> ps((const bfp16ebs8 *)(pn + {{ 8 * PAN }}));
             al::BIn<> us((const bfp16ebs8 *)u0p);  // (U^T(0) then U^T(1): u0p, u1p adjacent)
             const al::BV ah = us.pop(), al_ = us.pop(), mh = ps.pop(), ml = ps.pop();
-            {{ p }}_mm3(c, ah, al_, mh, ml);
+            al::mm3(c, ah, al_, mh, ml);
             const al::BV bh = us.pop(), bl = us.pop(), nh = ps.pop(), nl = ps.pop();
-            {{ p }}_mm3(c, bh, bl, nh, nl);
+            al::mm3(c, bh, bl, nh, nl);
             const aie::vector<bfloat16, 64> a = aie::transpose(c.to_accum().template to_vector<bfloat16>(), 8, 8);
             AIE_LOOP_UNROLL_FULL
             for (int t = 0; t < 8; t++)
@@ -514,11 +495,11 @@ __attribute__((noinline)) void {{ p }}_solve(const float *__restrict xy, const b
 {% endif %}
         {
             const aie::vector<float, 64> u = aie::load_v<64>(uf0);
-            {{ p }}_push2(aie::accum<accfloat, 64>(aie::add(u, al::mulff<64>(aie::load_v<64>(fv + 128), u))), nI, up);
+            al::push2(aie::accum<accfloat, 64>(aie::add(u, al::mulff<64>(aie::load_v<64>(fv + 128), u))), nI, up);
         }
         {
             const aie::vector<float, 64> u = aie::load_v<64>(uf1);
-            {{ p }}_push2(aie::accum<accfloat, 64>(aie::add(u, al::mulff<64>(aie::load_v<64>(fv + 320), u))), nI, up + {{ 2 * PAN }});
+            al::push2(aie::accum<accfloat, 64>(aie::add(u, al::mulff<64>(aie::load_v<64>(fv + 320), u))), nI, up + {{ 2 * PAN }});
         }
     }
 }
@@ -543,8 +524,8 @@ __attribute__((noinline)) void {{ p }}_update(const float *__restrict si, float 
             al::MM8 c(aie::accum<accfloat, 64>(aie::load_v<64>(pi)));
             pi += 64;
             const al::BV k0h = ks.pop(), k0l = ks.pop(), k1h = ks.pop(), k1l = ks.pop();
-            {{ p }}_mm3(c, u0h, u0l, k0h, k0l);
-            {{ p }}_mm3(c, u1h, u1l, k1h, k1l);
+            al::mm3(c, u0h, u0l, k0h, k0l);
+            al::mm3(c, u1h, u1l, k1h, k1l);
             aie::store_v(po, c.to_accum().template to_vector<float>());
             po += 64;
         }

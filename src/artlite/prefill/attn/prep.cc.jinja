@@ -27,27 +27,13 @@ __attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const 
 // row (HD fp32) -> row r of the stage [db][r][8]
 __attribute__((noinline)) void {{ p }}_scatter(const float *__restrict row, float *__restrict st, int r)
 {
-    float *__restrict d = st + 8 * r;
-    for (int db = 0; db < {{ ND }}; db++) {
-        aie::store_v(d, aie::load_v<8>(row));
-        row += 8;
-        d += 64;
-    }
+    al::stage_row<{{ ND }}>(row, st, r);
 }
 
 // the stage -> [hi panels ND | lo panels ND]
 __attribute__((noinline)) void {{ p }}_hilo(const float *__restrict st, uint8_t *__restrict out)
 {
-    const al::BV nI = al::neg_eye();
-    al::BOut<> ho((bfp16ebs8 *)out);
-    al::BOut<> lo((bfp16ebs8 *)(out + {{ 72 * ND }}));
-    for (int db = 0; db < {{ ND }}; db++) {
-        al::BV h, l;
-        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
-        ho.push(h);
-        lo.push(l);
-        st += 64;
-    }
+    al::encode_hilo<{{ ND }}, false>(st, out);
 }
 
 // 8 tokens of head h of the core's nq (rows of nq HD bf16), cs (8 x [cos | sin] fp32) -> unit h of out: the Q panels
@@ -68,11 +54,7 @@ __attribute__((noinline)) void {{ p }}_qh(const bfloat16 *__restrict q, const bf
 {% if QP == 2 %}
     {{ p }}_hilo(st, (uint8_t *)out + {{ QUNIT }} * h);
 {% else %}
-    al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ QUNIT }} * h));
-    for (int db = 0; db < {{ ND }}; db++) {
-        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
-        st += 64;
-    }
+    al::encode_panel<{{ ND }}>(st, (uint8_t *)out + {{ QUNIT }} * h);
 {% endif %}
 }
 
@@ -113,11 +95,7 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
 {% if KP == 2 %}
     {{ p }}_hilo(st, rec);
 {% else %}
-    al::BOut<> o((bfp16ebs8 *)rec);
-    for (int db = 0; db < {{ ND }}; db++) {
-        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
-        st += 64;
-    }
+    al::encode_panel<{{ ND }}>(st, rec);
 {% endif %}
 }
 
@@ -141,10 +119,8 @@ void {{ p }}_v(const bfloat16 *__restrict v, bfloat16 *__restrict out, int32_t r
     aie::set_rounding(aie::rounding_mode::conv_even);
     al::BOut<> o((bfp16ebs8 *)((uint8_t *)out + {{ 72 * ND }} * r));
     AIE_PREPARE_FOR_POSTPIPELINING
-    for (int db = 0; db < {{ ND }}; db++) {
-        const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
-        o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
-    }
+    for (int db = 0; db < {{ ND }}; db++)
+        o.push(al::vpan<{{ HD }}>(v, db));
 }
 
 }  // extern "C"

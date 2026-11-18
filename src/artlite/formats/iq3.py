@@ -28,7 +28,7 @@ import numpy as np
 
 from ..operators import templating
 from . import k23
-from .common import TAB, TAB_BYTES, DqKernels, Slot, TileFormat, dq_kernel, i32
+from .common import TAB, TAB_BYTES, DqKernels, Slot, TileFormat, dq_kernel, i32, unit_windows
 
 
 def grid_words() -> np.ndarray:
@@ -140,17 +140,9 @@ class Iq3Slot(Slot):
 
     def qd_template_vars(self, op: object) -> dict[str, object]:
         U, I, S, _ = self.unit(op.R)
-        R, T = op.R, op.tiles
-
-        def seg(q0: int, q1: int) -> list[tuple[int, int, int]]:  # (tile, first row, end) of compacted rows q0 .. q1
-            return [(t, max(q0, R * t), min(q1, R * (t + 1))) for t in range(q0 // R, min(T, -(-q1 // R)))]
-
-        def mask(lo: int, hi: int) -> int:  # (bytes lo .. hi - 1 of 64)
-            return ((1 << hi) - 1) & ~((1 << lo) - 1)
-
         ws = self._ws(op)
         return {"UP": op.unit_pitch, "U3": U, "I3": I, "S3": S, "LS": self.list_bytes(op.n), "WU": ws["WU"],
-                "WL": ws["WL"], "seg": seg, "mask": mask}
+                "WL": ws["WL"], **unit_windows(op.R, op.tiles)}
 
     def mmv_slots(self, fmt: str) -> tuple[int, ...]:
         return (4, 8)

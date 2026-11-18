@@ -1,8 +1,11 @@
-// The pairs (i, i + {{ dist }}) of an fp32 row rotated, i < {{ rot }} (kmath.rope): by cos at cs + i, sin at cs + {{ rot }} + i{% if T == "bfloat16" %} (bf16: a c - b s
+// The pairs (i, i + {{ dlabel }}) of an fp32 row rotated, i < {{ label }} (kmath.rope): by cos at cs + i, sin at cs + {{ rot }} + i{% if T == "bfloat16" %} (bf16: a c - b s
 // and a s + b c as the four products of a's and b's bf16 parts with c and s in one accumulator){% else %} (al::rot2){% endif %}
 
-{{ attr }} void {{ name }}(float *__restrict row, const {{ T }} *__restrict cs)
+{{ attr }} void {{ name }}(float *__restrict row, const {{ T }} *__restrict cs{{ ", int rot" if rr }}{{ ", int dist" if dr }})
 {
+{% if pragma %}
+    {{ pragma }}
+{% endif %}
     for (int i = 0; i < {{ rot }}; i += 32) {
         const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ dist }} + i);
 {% if T == "bfloat16" %}

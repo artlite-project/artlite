@@ -41,11 +41,14 @@ __attribute__((noinline)) void {{ p }}_k23al(const uint8_t *src, uint8_t *__rest
 }
 
 // y += hilo(Y) d (N lanes [slot][r]: 32 or 64; d: the 8 rows' bf16)
-template <unsigned N>
+template <unsigned N, bool MSC = false>
 [[clang::always_inline]] inline void {{ p }}_k23d(float *__restrict y, aie::accum<accfloat, N> Y, const bfloat16 *d)
 {
-    const aie::vector<bfloat16, N> h = Y.template to_vector<bfloat16>();
-    const aie::vector<bfloat16, N> l = aie::msc(Y, h, aie::broadcast<bfloat16, N>(1.0f)).template to_vector<bfloat16>();
+    aie::vector<bfloat16, N> h, l;
+    if constexpr (MSC)
+        al::split2_msc<N>(Y, h, l);
+    else
+        al::split2<N>(Y, h, l);
     const aie::vector<bfloat16, N> D = aie::load_v<8>(d).template grow_replicate<N>();
     aie::store_v(y, aie::mac(aie::mac(aie::accum<accfloat, N>(aie::load_v<N>(y)), h, D), l, D).template to_vector<float>());
 }
@@ -135,9 +138,10 @@ __attribute__((noinline)) void {{ p }}_k23scg(const bfloat16 *__restrict c, cons
         pc += CS;
         ps += SS;
     }
-    {{ p }}_k23d(y, Y0, dg);
-    {{ p }}_k23d(y + 64, Y1, dg + 8);
-    {{ p }}_k23d(y + 128, Y2, dg + 16);
+    // (G 3: the lo parts as msc schedule shorter: 110 cycles against 117)
+    {{ p }}_k23d<64, G == 3>(y, Y0, dg);
+    {{ p }}_k23d<64, G == 3>(y + 64, Y1, dg + 8);
+    {{ p }}_k23d<64, G == 3>(y + 128, Y2, dg + 16);
     if constexpr (G == 4)
         {{ p }}_k23d(y + 192, Y3, dg + 24);
 }

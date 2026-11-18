@@ -67,7 +67,7 @@ void {{ p }}_dq(const uint8_t *__restrict b, bfloat16 *__restrict ws, uint8_t *_
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int t0 = {{ "half * %d" % (n_mac // 16) if halves > 1 else "0" }};
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> out((bfp16ebs8 *)stage);
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v64int8 eight = broadcast_to_v64int8(8);
     // one loop over (tile t, k-step ks): the codes by 64 B, the next tile a unit on; the scales of group 2 kt + ks / 4
     const v64uint8 __aie_dm_resource_a *__restrict pc = (const v64uint8 __aie_dm_resource_a *)(b + {{ UP }} * t0 + 512 * kt);

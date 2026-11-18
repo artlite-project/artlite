@@ -159,7 +159,7 @@ __attribute__((noinline)) void {{ p }}_dupdate(const float *__restrict si, float
             al::split2<64>(v, vh, vl);
             al::MM8 c(aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 64>(v), vh, ch), vh, cl), vl, ch));
             const al::BV kh = ks.pop(), kl = ks.pop();
-            {{ p }}_mm3(c, uh, ul, kh, kl);
+            al::mm3(c, uh, ul, kh, kl);
             aie::store_v(po, c.to_accum().template to_vector<float>());
             po += 64;
         }
@@ -177,6 +177,6 @@ __attribute__((noinline)) void {{ p }}_uprep(const float *__restrict u, const fl
     al::MM8 t(aie::zeros<accfloat, 64>());
     t.mac(I, TR(h));
     t.mac(I, TR(l));
-    {{ p }}_push2(t.to_accum(), nI, up);
+    al::push2(t.to_accum(), nI, up);
 }
 

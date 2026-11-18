@@ -180,7 +180,7 @@ __attribute__((noinline)) void {{ p }}_iq3sg(const uint8_t *__restrict lo, const
                                              const uint8_t *__restrict mk, const uint32_t *__restrict tab_ab,
                                              const uint32_t *__restrict tab_cd, uint8_t *__restrict u)
 {
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v64int8 four = broadcast_to_v64int8(4), eight = broadcast_to_v64int8(8);
     const v64uint8 __aie_dm_resource_a *__restrict pl = (const v64uint8 __aie_dm_resource_a *)lo;
     const v64uint8 __aie_dm_resource_d *__restrict ph = (const v64uint8 __aie_dm_resource_d *)hb;

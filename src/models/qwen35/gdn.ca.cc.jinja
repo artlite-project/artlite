@@ -53,25 +53,6 @@ __attribute__((noinline)) void {{ p }}_cp4k(void *__restrict dst, const void *__
 }
 {% endif %}
 
-// C += A (hi + lo) B (hi + lo)^T: three products
-[[clang::always_inline]] inline void {{ p }}_mm3(al::MM8 &c, const al::BV &ah, const al::BV &al_, const al::BV &bh,
-                                               const al::BV &bl)
-{
-    c.mac(ah, TR(bh));
-    c.mac(ah, TR(bl));
-    c.mac(al_, TR(bh));
-}
-
-// x (64 fp32) -> panels hi, lo at out
-[[clang::always_inline]] inline void {{ p }}_push2(aie::accum<accfloat, 64> x, const al::BV &nI, uint8_t *out)
-{
-    al::BV h, l;
-    al::split_hilo(x, nI, h, l);
-    al::BOut<> po((bfp16ebs8 *)out);
-    po.push(h);
-    po.push(l);
-}
-
 // an 8 x 8 block of rows at stride N -> 64 lanes [r][c]
 template <int N, typename T>
 [[clang::always_inline]] inline aie::vector<T, 64> {{ p }}_blk(const T *__restrict p)

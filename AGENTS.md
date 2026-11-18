@@ -150,11 +150,12 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a template; arrays through the gather LUT:
   `km.act(km.SILU)`, `km.table_pass`; a head's norm and rope: `km.rms_norm`, `km.rope`; a softmax's P:
   `km.p_pass1`, `km.p_pass2`), `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles, vectors from 128-bit
-  pieces: `al::concat`, `al::gather`), `design.py` (`COLS`, `ROWS`, `range32`: Worker loops with an i32 induction
-  variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels), `l1_layout.py` (`pin_l1_buffers`),
-  `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`). Words a kernel and the host share (metadata,
-  state, command words, flags) are declared in `words.py` layouts and reach a template as that layout's `consts()`, never
-  by a name prefix of a module's globals.
+  pieces: `al::concat`, `al::gather`; an fp32 value's bf16 hi / lo parts: `al::split2`; the attention preps' stage
+  rows and panels: `al::stage_row`, `al::encode_hilo`, `al::vpan`), `design.py` (`COLS`, `ROWS`, `range32`: Worker
+  loops with an i32 induction variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels),
+  `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`).
+  Words a kernel and the host share (metadata, state, command words, flags) are declared in `words.py` layouts and
+  reach a template as that layout's `consts()`, never by a name prefix of a module's globals.
 - A new operator lives with what it serves (an `artlite` subsystem, or its model's package: Layers) and is tested in
   `tests/<package>/test_<module>.py`. Tests need no compile plumbing: pytest plans the selected tests in a subprocess
   and builds their designs in the background.

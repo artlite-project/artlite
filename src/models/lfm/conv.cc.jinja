@@ -44,9 +44,8 @@ __attribute__((noinline, minsize)) void {{ p }}_cstep(int32_t *__restrict ws, co
                 acc = aie::mac(acc, aie::load_v<64>(w + {{ 2 * CH }} * k + 64 * v), r);
                 acc = aie::mac(acc, aie::load_v<64>(w + {{ 2 * CH }} * k + {{ CH }} + 64 * v), r);
             }
-            const aie::vector<bfloat16, 64> ah = acc.template to_vector<bfloat16>();
-            const aie::vector<bfloat16, 64> al = aie::accum<accfloat, 64>(
-                aie::sub(acc.template to_vector<float>(), aie::accum<accfloat, 64>(ah).template to_vector<float>())).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 64> ah, al;
+            al::split2<64>(acc, ah, al);
             const aie::vector<bfloat16, 64> c = aie::load_v<64>(bc + 64 * (4 * ({{ CH // 64 }} + v) + s));
             const aie::vector<bfloat16, 64> o = aie::mac(aie::mul(ah, c), al, c).template to_vector<bfloat16>();
             AIE_LOOP_UNROLL_FULL

@@ -33,7 +33,7 @@ import numpy as np
 
 from ..operators import templating
 from . import k23
-from .common import TAB, TAB_BYTES, DqKernels, Slot, TileFormat, dq_kernel, i32
+from .common import TAB, TAB_BYTES, DqKernels, Slot, TileFormat, dq_kernel, i32, unit_windows
 from .iq3 import Iq3Slot
 
 UNIT = 2304  # bytes of a super-block's unit (A + B)
@@ -132,15 +132,7 @@ class Iq3sSlot(Slot):
                          ex_ty=ex_ty, tables=(tab_ty, grid_halves()))
 
     def qd_template_vars(self, op: object) -> dict[str, object]:
-        R, T = op.R, op.tiles
-
-        def seg(q0: int, q1: int) -> list[tuple[int, int, int]]:  # (tile, first row, end) of compacted rows q0 .. q1
-            return [(t, max(q0, R * t), min(q1, R * (t + 1))) for t in range(q0 // R, min(T, -(-q1 // R)))]
-
-        def mask(lo: int, hi: int) -> int:  # (bytes lo .. hi - 1 of 64)
-            return ((1 << hi) - 1) & ~((1 << lo) - 1)
-
-        return {"UP": op.unit_pitch, "seg": seg, "mask": mask, **self._ws(op)}
+        return {"UP": op.unit_pitch, **unit_windows(op.R, op.tiles), **self._ws(op)}
 
     def mmv_slots(self, fmt: str) -> tuple[int, ...]:
         return (4, 8)

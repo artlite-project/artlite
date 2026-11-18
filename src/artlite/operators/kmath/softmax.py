@@ -35,10 +35,13 @@ def p_pass2(e192: Fn, *, layout: str = "split", lsum: int | None = None, lo: int
     """Pass 2 of N steps, each two 32-lane records (P, f of ``p_pass1``) -> ``e192``'s poly -> one bfp16 P panel pushed
     at pp (``lo``: hi and lo panels, the lo ones from pp + ``lo`` bytes: the exact split on the MMUL). A template
     ``<N>``: ``layout`` "split" ``(pP, pF, [l,] pp)``, the records at pP / pF + 32 u; "inplace" ``(p0, p1, [l,] pp)``,
-    the two records' [P 32 | f 32] steps of two streams. ``lsum``: l += P per record, l0 at l and l1 at l + ``lsum``
-    (fp32, kept in registers over the pass). ``rounding``: sets conv_even (else the caller has)."""
+    the two records' [P 32 | f 32] steps of two streams (with ``lsum``, without ``lo``: the decode cores' form; without
+    lsum its panels came out wrong on the NPU). ``lsum``: l += P per record, l0 at l and l1 at l + ``lsum`` (fp32, kept
+    in registers over the pass). ``rounding``: sets conv_even (else the caller has)."""
     _e192(e192)
     check("layout", layout, ("split", "inplace"))
+    if layout == "inplace" and (lsum is None or lo is not None):
+        raise ValueError("kmath: p_pass2 inplace takes lsum and no lo (the decode cores' form)")
     local = (f"pp2_{layout}" + (f"_l{lsum}" if lsum is not None else "") + (f"_h{lo}" if lo is not None else "")
              + ("_r" if rounding else "") + "__" + e192.name.removeprefix(KM + "_"))
     return make(local + ("_i" if inline else ""), "softmax.pass2.cc.jinja", inline=inline, deps=(e192.parts["poly"],),

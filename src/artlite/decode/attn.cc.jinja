@@ -11,57 +11,33 @@ struct {{ p }}_AWin {
     [[clang::always_inline]] ~{{ p }}_AWin() { if constexpr (K == {{ WIN }}) event1(); }
 };
 
+{# One copy of the head's norm and rotation for every kind of layer: the head dim and the rotated pairs are arguments
+   (kmath's run-time extents) where the kinds differ, compile-time numbers where they do not. The V norm (rot 0) shares
+   the copy #}
+{% set hd_rt = HDS | length > 1 %}
+{% set rot_rt = ROT | length > 1 or V_NORM %}
 {% if QK_NORM %}
-// x (hd bf16) -> out (hd fp32) = x / rms(x){{ " w" if QK_W else "" }}, then the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot,
-// fp32). (One copy for every head dim: runtime trip counts, not a hot loop)
+{% set nrm = km.rms_norm(HDS if hd_rt else HDS[0], eps=eps | float, weight=QK_W, lanes=32 if QK_W else 64, minsize=True) %}
+{{ nrm.src }}
+{% endif %}
+{% set rots = ROT if ROT | length > 1 else (ROT[0], 0) if V_NORM else ROT[0] %}
+{% set rope = km.rope(rots, dist=[HDS[0] // 2, HDS[1] // 2] if hd_rt else HDS[0] // 2, minsize=True) %}
+{{ rope.src }}
+
+// x (hd bf16) -> out (hd fp32){{ " = x / rms(x)" + (" w" if QK_W else "") if QK_NORM }}, then the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot,
+// fp32)
 __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict out,
                                              int hd, int rot{% if QK_W %}, const float *__restrict w{% endif %})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < hd; i += 64)
-        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
-    const float sum = aie::reduce_add(ss.template to_vector<float>());
-{% if QK_W %}
-    const float inv = al::inv_rms<{{ HDS[0] }}>(sum, {{ eps }}f);  // (one head dim)
-    aie::vector<bfloat16, 32> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts, times w; 32 lanes:
-    al::bf16_hilo<32>(inv, ih, il);    // program memory)
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < hd; i += 32) {
-        const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x + i);
-        aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>(), aie::load_v<32>(w + i)));
-    }
+{% if QK_NORM %}
+    {{ nrm }}(x, {{ "w, " if QK_W }}out{{ ", hd" if hd_rt }});
 {% else %}
-    const float inv = al::inv_rms(sum, {{ by_hd(INV_HD) }}, {{ eps }}f);
-    aie::vector<bfloat16, 64> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts)
-    al::bf16_hilo<64>(inv, ih, il);
     AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < hd; i += 64) {
-        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
-        aie::store_v(out + i, aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>());
-    }
-{% endif %}
-{% else %}
-// x (hd bf16) -> out (hd fp32), the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot, fp32)
-__attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict out,
-                                             int hd, int rot)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < hd; i += 32)
+    for (int i = 0; i < {{ "hd" if hd_rt else HDS[0] }}; i += 32)
         aie::store_v(out + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
 {% endif %}
-    const int half = hd >> 1;
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < rot; i += 32) {
-        const aie::vector<float, 32> a = aie::load_v<32>(out + i), b = aie::load_v<32>(out + half + i);
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + rot + i);
-        aie::accum<accfloat, 32> o0, o1;
-        al::rot2(a, b, c, s, o0, o1);
-        aie::store_v(out + i, o0.template to_vector<float>());
-        aie::store_v(out + half + i, o1.template to_vector<float>());
-    }
+    {{ rope }}(out, cs{{ ", rot" if rot_rt }}{{ ", hd >> 1" if hd_rt }});
 }
 
 {# 2^x of 64 lanes, one copy for the softmax and the merge (two records or two partials at a time, two independent
@@ -894,9 +870,8 @@ __attribute__((noinline)) void {{ p }}_qpan(const float *__restrict q, uint8_t *
         p2 += 8;
         p3 += 8;
         v = aie::select(aie::zeros<float, 32>(), v, valid);
-        const aie::vector<bfloat16, 32> h = aie::accum<accfloat, 32>(v).template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 32> l = aie::accum<accfloat, 32>(
-            aie::sub(v, aie::accum<accfloat, 32>(h).template to_vector<float>())).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 32> h, l;
+        al::split2<32>(v, h, l);
         o.push(al::hilo4(aie::mac(aie::mac(aie::mul(h, c_hi), l, c_hi), h, c_lo), nI));
     }
 }

@@ -52,13 +52,6 @@ void {{ p }}_k(const bfloat16 *__restrict k, const bfloat16 *__restrict cs_, flo
     }
 }
 
-// The V panel of d-block db of 8 tokens' rows: per dim of the 8 a block over the positions
-[[clang::always_inline]] inline al::BV {{ p }}_vpan(const bfloat16 *__restrict v, int db)
-{
-    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(v + 8 * db, {{ HD }});  // [position][dim]
-    return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
-}
-
 // 8 tokens of a KV head's V -> record ``half`` of a pair of records
 void {{ p }}_v(const bfloat16 *__restrict v, float *__restrict ws, bfloat16 *__restrict out, int32_t half)
 {
@@ -66,14 +59,14 @@ void {{ p }}_v(const bfloat16 *__restrict v, float *__restrict ws, bfloat16 *__r
     if (!half) {
         al::BOut<> o((bfp16ebs8 *)ws);
         for (int db = 0; db < {{ ND }}; db++)
-            o.push({{ p }}_vpan(v, db));
+            o.push(al::vpan<{{ HD }}>(v, db));
         return;
     }
     al::BIn<> a((const bfp16ebs8 *)ws);
     al::BOut<> o((bfp16ebs8 *)out);
     for (int db = 0; db < {{ ND }}; db++) {
         o.push(a.pop());
-        o.push({{ p }}_vpan(v, db));
+        o.push(al::vpan<{{ HD }}>(v, db));
     }
 }
 

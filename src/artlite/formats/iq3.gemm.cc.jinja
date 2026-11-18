@@ -62,14 +62,8 @@ __attribute__((noinline)) void {{ p }}_sbs(const uint8_t *__restrict pw, uint8_t
                                            const bfloat16 *__restrict dc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    v16int32 lw = broadcast_zero_to_v16int32();  // (the signs' scale panel: _iq3_signs)
-    lw = upd_elem(lw, 0, (int)0xF8FCFEFF);
-    lw = upd_elem(lw, 3, (int)0xF8FCFEFF);
     v64bfp16ebs8 LW, LX;
-    LW.mantissa = (v64int8)lw;
-    LW.exponent = al::e8(125);
-    LX.exponent = al::e8(0x85);
-    const v2int32 all = (v2int32)~0ULL;
+    {{ p }}_iq3_panels(LW, LX);
     const v64int8 __aie_dm_resource_a *__restrict pv = (const v64int8 __aie_dm_resource_a *)pw;
     v64int8 __aie_dm_resource_b *__restrict po = (v64int8 __aie_dm_resource_b *)pm;
     const bfloat16 __aie_dm_resource_c *__restrict pd = (const bfloat16 __aie_dm_resource_c *)dc;
@@ -78,7 +72,7 @@ __attribute__((noinline)) void {{ p }}_sbs(const uint8_t *__restrict pw, uint8_t
     for (int it = 0; it < {{ n // 2 }}; it++) {  // (group i, 16-row block) = (it / {{ n // 16 }}, it % {{ n // 16 }})
         v64int8 m;
         v8int32 sv;
-        {{ p }}_iq3_signs(*pv++, LX, LW, all, m, sv);
+        {{ p }}_iq3_signs(*pv++, LX, LW, m, sv);
         *po++ = m;
         aie::store_v(ps, aie::mul(aie::vector<bfloat16, 16>((v16bfloat16)sv), aie::load_v<16>(pd)).template to_vector<bfloat16>());
         ps += 16;
@@ -143,7 +137,7 @@ __attribute__((noinline)) void {{ p }}_iq3g(const uint8_t *__restrict li, const 
                                             const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
                                             uint8_t *__restrict u)
 {
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v32uint8 __aie_dm_resource_a *__restrict pi = (const v32uint8 __aie_dm_resource_a *)li;
     const v8int32 __aie_dm_resource_b *__restrict pm = (const v8int32 __aie_dm_resource_b *)mk;
     v64int8 __aie_dm_resource_c *__restrict pu = (v64int8 __aie_dm_resource_c *)u;

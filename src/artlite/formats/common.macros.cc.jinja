@@ -1,0 +1,29 @@
+{# The epilogue of the decode GEMV kernels: the accumulators C0 .. C<n-1> as bf16 rows, stored at pc, pc + pitch, ...
+   (``pc``: the C++ expression of the first row's address): the 8-slot designs' ``c8`` (a row of 64 = bf16(C)) or the
+   4-slot designs' ``sum2`` (a row of 32 = bf16(C[hi rows] + C[lo rows])). Imported with context (``p``, ``slots``);
+   a call's lines start at column 0: ``{{ store_chain(...) | indent(8) }}``. #}
+{% macro store_acc(fin, n, pitch, pc="pc") -%}
+{% for k in range(n) %}
+{{ "" if loop.first else "
+" }}aie::store_v({{ pc }}{{ " + " ~ k * pitch if k else "" }}, {{ p }}_{{ fin }}(C{{ k }}));
+{%- endfor %}
+{%- endmacro %}
+
+{# The decode GEMV kernels' gather tables: the table copies' addresses of the core half H (``TAB``) as the pointers
+   tab_ab and tab_cd, through a volatile word at scr + 8000 (copy ``cd`` for tab_cd; with ``cd_f1``, the template
+   parameter F selects: copy cd, or copy cd_f1 when F is 1). #}
+{% macro table_bases(cd=1, cd_f1=None) -%}
+volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
+ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
+{% if cd_f1 is none %}
+ta[1] = H ? {{ TAB[1][cd] }} : {{ TAB[0][cd] }};
+{% else %}
+ta[1] = F != 1 ? (H ? {{ TAB[1][cd] }} : {{ TAB[0][cd] }}) : (H ? {{ TAB[1][cd_f1] }} : {{ TAB[0][cd_f1] }});
+{% endif %}
+const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+{%- endmacro %}
+
+{# The same by the design's slots: ``c8`` at pitch8 (8 slots), ``sum2`` at pitch2 (default pitch8). #}
+{% macro store_chain(n, pitch8, pitch2=None, pc="pc") -%}
+{{ store_acc("c8", n, pitch8, pc) if slots == 8 else store_acc("sum2", n, pitch8 if pitch2 is none else pitch2, pc) }}
+{%- endmacro %}

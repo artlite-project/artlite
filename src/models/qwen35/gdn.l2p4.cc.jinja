@@ -21,7 +21,7 @@ __attribute__(({{ cold }})) void {{ p }}_l2panels(const float *__restrict y, flo
     py = y;
     uint8_t *__restrict po = out;
     for (int ib = 0; ib < 16; ib++) {
-        {{ p }}_push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(py), ib8)), nI, po);
+        al::push2(aie::accum<accfloat, 64>(al::mulff<64>(aie::load_v<64>(py), ib8)), nI, po);
         py += 64;
         po += {{ 2 * PAN }};
     }

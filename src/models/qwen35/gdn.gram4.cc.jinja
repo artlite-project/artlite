@@ -29,7 +29,7 @@ __attribute__(({{ cold }})) void {{ p }}_gram(const uint8_t *__restrict k, const
         al::MM8 t(aie::zeros<accfloat, 64>());
         t.mac(I, TR(h));
         t.mac(I, TR(l));
-        {{ p }}_push2(t.to_accum(), nI, po);
+        al::push2(t.to_accum(), nI, po);
         po += {{ 2 * PAN }};
     }
 }

@@ -371,9 +371,8 @@ __attribute__((noinline)) void {{ p }}_pupd(const bfloat16 *__restrict wp, int32
 [[clang::always_inline]] inline aie::vector<float, 32> {{ p }}_rvw(aie::vector<bfloat16, 32> r, aie::vector<float, 32> a,
                                                                   aie::vector<bfloat16, 32> iv_hi, aie::vector<bfloat16, 32> iv_lo)
 {
-    const aie::vector<bfloat16, 32> a_hi = aie::accum<accfloat, 32>(a).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> a_lo = aie::accum<accfloat, 32>(
-        aie::sub(a, aie::accum<accfloat, 32>(a_hi).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> a_hi, a_lo;
+    al::split2<32>(a, a_hi, a_lo);
     return aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 32>(r), a_hi, iv_hi), a_hi, iv_lo), a_lo, iv_hi).template to_vector<float>();
 }
 
@@ -407,13 +406,14 @@ template <int SP, bool MIR>
         const aie::vector<bfloat16, 32> wp0((v32bfloat16)broadcast_elem_128(p2, 0)), wp1((v32bfloat16)broadcast_elem_128(p2, 1));
         const aie::vector<float, 32> n0 = {{ p }}_rvw(r0, aie::mul(v0, wp0).template to_vector<float>(), iv_hi, iv_lo);
         const aie::vector<float, 32> n1 = {{ p }}_rvw(r1, aie::mul(v1, wp1).template to_vector<float>(), iv_hi, iv_lo);
-        const aie::vector<bfloat16, 32> h0 = aie::accum<accfloat, 32>(n0).template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 32> h1 = aie::accum<accfloat, 32>(n1).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 32> h0, l0, h1, l1;
+        al::split2<32>(n0, h0, l0);
+        al::split2<32>(n1, h1, l1);
         sq = aie::mac_square(aie::mac_square(sq, h0), h1);
         aie::store_v(nb, h0);
-        aie::store_v(nb + 32, aie::accum<accfloat, 32>(aie::sub(n0, aie::accum<accfloat, 32>(h0).template to_vector<float>())).template to_vector<bfloat16>());
+        aie::store_v(nb + 32, l0);
         aie::store_v(nb + 64, h1);
-        aie::store_v(nb + 96, aie::accum<accfloat, 32>(aie::sub(n1, aie::accum<accfloat, 32>(h1).template to_vector<float>())).template to_vector<bfloat16>());
+        aie::store_v(nb + 96, l1);
         nb += 128;
     }
 }
@@ -469,9 +469,8 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
     aie::vector<float, 32> iv = aie::load_v<32>(ivv);
     if constexpr (MIR)
         iv = aie::concat(iv.template extract<8>(0), iv.template extract<8>(0), iv.template extract<8>(0), iv.template extract<8>(0));
-    const aie::vector<bfloat16, 32> iv_hi = aie::accum<accfloat, 32>(iv).template to_vector<bfloat16>();
-    const aie::vector<bfloat16, 32> iv_lo = aie::accum<accfloat, 32>(
-        aie::sub(iv, aie::accum<accfloat, 32>(iv_hi).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> iv_hi, iv_lo;
+    al::split2<32>(iv, iv_hi, iv_lo);
     AIE_LOOP_NO_UNROLL
     for (int g = 0; g < {{ POST_K // 128 }}; g++) {
         {{ p }}_hpn<SP, MIR>((const bfloat16 __aie_dm_resource_a *)(x + 256 * SP * g), (const bfloat16 __aie_dm_resource_b *)(wp + 128 * g),
@@ -1111,8 +1110,8 @@ __attribute__((minsize)) void {{ p }}_nbegin(const uint8_t *__restrict a, int32_
             const aie::vector<bfloat16, 8> h8 = aie::load_v<8>(w + 8 * g), l8 = aie::load_v<8>(w + 32 + 8 * g);
             const aie::vector<bfloat16, 32> wh = h8.template grow_replicate<32>(), wl = l8.template grow_replicate<32>();
             const aie::accum<accfloat, 32> c = aie::mac(aie::mac(aie::mul(ih, wh), ih, wl), il, wh);  // (1 / rms w)
-            const aie::vector<bfloat16, 32> ch = c.template to_vector<bfloat16>();
-            const aie::vector<bfloat16, 32> cl = aie::msc(c, ch, one).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> ch, cl;
+            al::split2<32>(c, ch, cl);
             const aie::vector<bfloat16, 32> pv = aie::load_v<32>(pl + 32 * g);
             const aie::accum<accfloat, 32> y = aie::mac(aie::mac(aie::mul(aie::load_v<32>(pl + {{ 4 * SLOTS * 8 }} + 32 * g), one),
                                                                  pv, ch), pv, cl);

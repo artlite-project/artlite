@@ -68,13 +68,36 @@ template <int N, int V, typename T>
 // fp32 arithmetic through bf16 hi / lo splits (the vector unit multiplies bf16 into fp32)
 // ---------------------------------------------------------------------------------------------
 
+// The bf16 hi / lo parts of fp32 x: x = hi + lo to ~2^-16 (x - hi is exact in fp32); of an accumulator, the second
+// form, or split2_msc (the lo part as one msc(x, hi, 1): the same values) where that one schedules better
+template <unsigned N>
+[[clang::always_inline]] inline void split2(aie::vector<float, N> x, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
+{
+    hi = aie::accum<accfloat, N>(x).template to_vector<bfloat16>();
+    lo = aie::accum<accfloat, N>(aie::sub(x, aie::accum<accfloat, N>(hi).template to_vector<float>())).template to_vector<bfloat16>();
+}
+
+template <unsigned N>
+[[clang::always_inline]] inline void split2(aie::accum<accfloat, N> x, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
+{
+    hi = x.template to_vector<bfloat16>();
+    lo = aie::accum<accfloat, N>(aie::sub(x.template to_vector<float>(), aie::accum<accfloat, N>(hi).template to_vector<float>()))
+             .template to_vector<bfloat16>();
+}
+
+template <unsigned N>
+[[clang::always_inline]] inline void split2_msc(aie::accum<accfloat, N> x, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
+{
+    hi = x.template to_vector<bfloat16>();
+    lo = aie::msc(x, hi, aie::broadcast<bfloat16, N>(1.0f)).template to_vector<bfloat16>();
+}
+
 // x * c for an exact bf16 c without the emulated fp32 multiply (~2^-16 rel. error)
 template <unsigned N>
 [[clang::always_inline]] inline aie::accum<accfloat, N> mulc(aie::vector<float, N> x, aie::vector<bfloat16, N> c)
 {
-    aie::vector<bfloat16, N> hi = aie::accum<accfloat, N>(x).template to_vector<bfloat16>();
-    aie::vector<float, N> r = aie::sub(x, aie::accum<accfloat, N>(hi).template to_vector<float>());
-    aie::vector<bfloat16, N> lo = aie::accum<accfloat, N>(r).template to_vector<bfloat16>();
+    aie::vector<bfloat16, N> hi, lo;
+    split2<N>(x, hi, lo);
     return aie::mac(aie::mul(hi, c), lo, c);
 }
 
@@ -84,9 +107,8 @@ template <unsigned N, float Hi, float Lo>
 {
     const aie::vector<bfloat16, N> l_hi = aie::broadcast<bfloat16, N>(Hi);
     const aie::vector<bfloat16, N> l_lo = aie::broadcast<bfloat16, N>(Lo);
-    aie::vector<bfloat16, N> hi = aie::accum<accfloat, N>(x).template to_vector<bfloat16>();
-    aie::vector<float, N> r = aie::sub(x, aie::accum<accfloat, N>(hi).template to_vector<float>());
-    aie::vector<bfloat16, N> lo = aie::accum<accfloat, N>(r).template to_vector<bfloat16>();
+    aie::vector<bfloat16, N> hi, lo;
+    split2<N>(x, hi, lo);
     return aie::mac(aie::mac(aie::mul(hi, l_hi), lo, l_hi), hi, l_lo).template to_vector<float>();
 }
 
@@ -101,12 +123,9 @@ template <unsigned N>
 template <unsigned N>
 [[clang::always_inline]] inline aie::vector<float, N> mulff(aie::vector<float, N> a, aie::vector<float, N> b)
 {
-    aie::vector<bfloat16, N> a_hi = aie::accum<accfloat, N>(a).template to_vector<bfloat16>();
-    aie::vector<bfloat16, N> a_lo = aie::accum<accfloat, N>(
-        aie::sub(a, aie::accum<accfloat, N>(a_hi).template to_vector<float>())).template to_vector<bfloat16>();
-    aie::vector<bfloat16, N> b_hi = aie::accum<accfloat, N>(b).template to_vector<bfloat16>();
-    aie::vector<bfloat16, N> b_lo = aie::accum<accfloat, N>(
-        aie::sub(b, aie::accum<accfloat, N>(b_hi).template to_vector<float>())).template to_vector<bfloat16>();
+    aie::vector<bfloat16, N> a_hi, a_lo, b_hi, b_lo;
+    split2<N>(a, a_hi, a_lo);
+    split2<N>(b, b_hi, b_lo);
     return aie::mac(aie::mac(aie::mul(a_hi, b_hi), a_hi, b_lo), a_lo, b_hi).template to_vector<float>();
 }
 
@@ -122,14 +141,6 @@ template <int N, unsigned L>
         in += L;
         out += L;
     }
-}
-
-// The bf16 hi / lo parts of fp32 x
-template <unsigned N>
-[[clang::always_inline]] inline void split2(aie::vector<float, N> x, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
-{
-    hi = aie::accum<accfloat, N>(x).template to_vector<bfloat16>();
-    lo = aie::accum<accfloat, N>(aie::sub(x, aie::accum<accfloat, N>(hi).template to_vector<float>())).template to_vector<bfloat16>();
 }
 
 // A rotation of fp32 pairs: o0 = a c - b s, o1 = a s + b c, each the six products of two mulff in one accumulator
@@ -153,10 +164,7 @@ template <unsigned N>
 template <unsigned N>
 [[clang::always_inline]] inline void bf16_hilo(float v, aie::vector<bfloat16, N> &hi, aie::vector<bfloat16, N> &lo)
 {
-    const aie::vector<float, N> f = aie::broadcast<float, N>(v);
-    hi = aie::accum<accfloat, N>(f).template to_vector<bfloat16>();
-    lo = aie::accum<accfloat, N>(aie::sub(f, aie::accum<accfloat, N>(hi).template to_vector<float>()))
-             .template to_vector<bfloat16>();
+    split2<N>(aie::broadcast<float, N>(v), hi, lo);
 }
 
 // 1 / sqrt(ms + eps) in lanes 0 .. K - 1 (the others 0): one scalar invsqrt per lane
@@ -293,6 +301,13 @@ template <int K, int E, typename T>
 [[clang::always_inline]] inline auto gather(const T *p, int pitch)
 {
     return detail::gather<E>(p, pitch, std::make_integer_sequence<int, K>());
+}
+
+// The gather bases of a table's two copies: lanes 4 n, 4 n + 1 hold tab_ab, lanes 4 n + 2, 4 n + 3 tab_cd (the
+// pointers stay the callers' values: a gather's memory operand needs a base that traces to a pointer)
+[[clang::always_inline]] inline v16int32 table_b16(const uint32_t *tab_ab, const uint32_t *tab_cd)
+{
+    return ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -535,6 +550,82 @@ template <int MIN = 32>
         const aie::vector<bfloat16, 64> pd = aie::select(aie::zeros<bfloat16, 64>(), aie::load_v<64>(rows + 64 * db), keep);
         o.push(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>());
     }
+}
+
+// row (ND * 8 fp32) -> row r of the stage [d-block ND][r 8][8]
+template <int ND>
+[[clang::always_inline]] inline void stage_row(const float *__restrict row, float *__restrict st, int r)
+{
+    float *__restrict d = st + 8 * r;
+    for (int db = 0; db < ND; db++) {
+        aie::store_v(d, aie::load_v<8>(row));
+        row += 8;
+        d += 64;
+    }
+}
+
+// the stage [d-block ND][r 8][8] -> per d-block the hi panel and the lo panel: one stream (hi, lo per d-block), or
+// two ([hi panels ND | lo panels ND], the lo ones at out + 72 ND)
+template <int ND, bool INTERLEAVED>
+[[clang::always_inline]] inline void encode_hilo(const float *__restrict st, uint8_t *__restrict out)
+{
+    const BV nI = neg_eye();
+    BOut<> ho((bfp16ebs8 *)out);
+    if constexpr (INTERLEAVED) {
+        for (int db = 0; db < ND; db++) {
+            BV h, l;
+            split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+            ho.push(h);
+            ho.push(l);
+            st += 64;
+        }
+    } else {
+        BOut<> lo((bfp16ebs8 *)(out + 72 * ND));
+        for (int db = 0; db < ND; db++) {
+            BV h, l;
+            split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(st)), nI, h, l);
+            ho.push(h);
+            lo.push(l);
+            st += 64;
+        }
+    }
+}
+
+// the stage [d-block ND][r 8][8] -> per d-block the single bfp16 panel
+template <int ND>
+[[clang::always_inline]] inline void encode_panel(const float *__restrict st, uint8_t *__restrict out)
+{
+    BOut<> o((bfp16ebs8 *)out);
+    for (int db = 0; db < ND; db++) {
+        o.push(aie::accum<accfloat, 64>(aie::load_v<64>(st)).template to_vector<bfp16ebs8>());
+        st += 64;
+    }
+}
+
+// The V panel of d-block db of 8 tokens' rows (bf16, HD per row): per dim of the 8 a block over the positions
+template <int HD>
+[[clang::always_inline]] inline BV vpan(const bfloat16 *__restrict v, int db)
+{
+    const aie::vector<bfloat16, 64> pd = gather<8, 8>(v + 8 * db, HD);  // [position][dim]
+    return aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)).template to_vector<bfp16ebs8>();
+}
+
+// C += A (hi + lo) B (hi + lo)^T: three products (a, b: hi and lo panels)
+[[clang::always_inline]] inline void mm3(MM8 &c, const BV &ah, const BV &al_, const BV &bh, const BV &bl)
+{
+    c.mac(ah, aie::op_transpose(bh));
+    c.mac(ah, aie::op_transpose(bl));
+    c.mac(al_, aie::op_transpose(bh));
+}
+
+// x (64 fp32) -> the panels hi, lo (bfp16 of the 8 x 8 block, 8 values per block along the lanes' fast axis) pushed at out
+[[clang::always_inline]] inline void push2(aie::accum<accfloat, 64> x, const BV &nI, uint8_t *out)
+{
+    BV h, l;
+    split_hilo(x, nI, h, l);
+    BOut<> po((bfp16ebs8 *)out);
+    po.push(h);
+    po.push(l);
 }
 
 // y = yi + yi (a0 - 1) + yw a1 over n >= MIN blocks of 32 lanes (yi, y: one buffer, read before written; a0 - 1, a1

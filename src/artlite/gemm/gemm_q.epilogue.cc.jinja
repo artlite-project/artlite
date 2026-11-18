@@ -1,0 +1,17 @@
+{# The gate / up epilogues' last loop: h = y up as bfp16 panels (II 4 per 64 values): up = the C tile's up halves (cacc +
+   64, [gate 64 | up 64] per 128 values), y = the activation of the gates, hout = the output, each a C++ pointer name;
+   trips steps of 64 values. ``gemm_q``'s epilogues and the prefill's ``gate_up``. #}
+{% macro times_up(cacc, y, hout, trips) %}
+    {
+        const bfloat16 __aie_dm_resource_a *__restrict pu = (const bfloat16 __aie_dm_resource_a *){{ cacc }} + 64;
+        const bfloat16 __aie_dm_resource_d *__restrict py = (const bfloat16 __aie_dm_resource_d *){{ y }};
+        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> o((bfp16ebs8 *){{ hout }});
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < {{ trips }}; i++) {
+            aie::vector<bfloat16, 64> hv = aie::mul(aie::load_v<64>(py), aie::load_v<64>(pu)).template to_vector<bfloat16>();
+            o.push(aie::accum<accfloat, 64>(hv).template to_vector<bfp16ebs8>());
+            pu += 128;
+            py += 64;
+        }
+    }
+{%- endmacro %}

@@ -278,7 +278,7 @@ class Attn:
                            CONV=conv is not None, CONV_FLAG=conv.flag if conv else 0, X=X, PAGED=pg is not None, PG=pg,
                            PAGER=paging.source(p, wake=pg.wake, request=True) if pg is not None else "",
                            CONV_BEGIN=conv.begin_src(p) if conv else "", CONV_TOK=conv.token_src(A_WORDS) if conv else "",
-                           NH_POW2=self.heads in (1, 2, 4, 8), INV_HD={hd: f"1.0f / {hd}" for hd in hds},
+                           NH_POW2=self.heads in (1, 2, 4, 8),
                            lnh=lambda nh: f"{nh} == 8 ? 3 : ({nh} == 4 ? 2 : 1)" if self.heads == 8 else f"{nh} == 4 ? 2 : 1",
                            SINKS=self.sinks, MOE=self.moe, HEADS=self.heads, ROWS=max(self.rows(hd) for hd in hds),
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),

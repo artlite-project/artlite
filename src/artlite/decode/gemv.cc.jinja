@@ -59,7 +59,9 @@ template <typename T>
     return aie::add(a.template extract<32>(0), a.template extract<32>(1)).template to_vector<bfloat16>();
 }
 
-// T (exact integers, [i][r]) times D ([i][r] = d_r) exactly in fp32 -> tab: bf16 hi, lo (64 each)
+// T (exact integers, [i][r]) times D ([i][r] = d_r) exactly in fp32 -> tab: bf16 hi, lo (64 each). (_td and _mo split
+// inline, not through al::split2_msc: through it the tables' loops of Q2_K / Q4_K / Q5_K pipeline differently, up to
+// +208 B and +14 cycles)
 [[clang::always_inline]] inline void {{ p }}_td(v64accfloat T, aie::vector<bfloat16, 64> D, bfloat16 *__restrict tab)
 {
     const aie::accum<accfloat, 64> TD = aie::mul(aie::accum<accfloat, 64>(T).template to_vector<bfloat16>(), D);

@@ -38,8 +38,8 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pew, b
         for (int i = 0; i < {{ D }}; i += 32) {
             const aie::vector<bfloat16, 32> wh = aie::load_v<32>(w + i), wl = aie::load_v<32>(w + {{ D }} + i);
             const aie::accum<accfloat, 32> c = aie::mac(aie::mac(aie::mul(ihk, wh), ihk, wl), ilk, wh);
-            const aie::vector<bfloat16, 32> ch = c.template to_vector<bfloat16>();
-            const aie::vector<bfloat16, 32> cl = aie::msc(c, ch, one).template to_vector<bfloat16>();
+            aie::vector<bfloat16, 32> ch, cl;
+            al::split2<32>(c, ch, cl);
             const aie::vector<bfloat16, 32> pv = aie::load_v<32>(p + {{ D }} * k + i);
             const aie::accum<accfloat, 32> r = aie::mac(aie::mac(aie::mul(aie::load_v<32>(e + {{ D }} * k + i), one), pv, ch),
                                                         pv, cl);

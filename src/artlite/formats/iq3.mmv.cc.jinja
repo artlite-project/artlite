@@ -1,3 +1,4 @@
+{% from "artlite/formats/common.macros.cc.jinja" import table_bases with context %}
 // ---- IQ3_XXS ({{ RI3 }} rows, 3 row groups; rows past R: junk): per super-block a unit of {{ U3 }} B, [indices [i][h][l'
 // 2][g][r 8][2] | sign / scale words [i][row] (byte l: the sign field c l | bit l of ls) | d [row] bf16] (odd super-blocks
 // in the reverse order of the three). Core H: super-blocks 2 H, 2 H + 1; per super-block u, in 4 loops (a weight panel
@@ -15,14 +16,8 @@
 __attribute__((noinline)) void {{ p }}_iq3_ss(const uint8_t *__restrict w, v16int32 *__restrict mk, bfloat16 *__restrict sct)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    v16int32 lw = broadcast_zero_to_v16int32();  // (panel rows 0, 1: -1, -2, -4, -8 in k 0 .. 3 / 4 .. 7)
-    lw = upd_elem(lw, 0, (int)0xF8FCFEFF);
-    lw = upd_elem(lw, 3, (int)0xF8FCFEFF);
     v64bfp16ebs8 LW, LX;
-    LW.mantissa = (v64int8)lw;
-    LW.exponent = al::e8(125);
-    LX.exponent = al::e8(0x85);
-    const v2int32 all = (v2int32)~0ULL;  // (vaddsub: subtract in every lane)
+    {{ p }}_iq3_panels(LW, LX);
     uintptr_t o = (uintptr_t)w;
     bfloat16 *__restrict ps = sct;
     AIE_PREPARE_FOR_POSTPIPELINING
@@ -31,8 +26,8 @@ __attribute__((noinline)) void {{ p }}_iq3_ss(const uint8_t *__restrict w, v16in
         {{ p }}_k23w2(o, {{ 4 * RI3 }}, A, B);
         v64int8 ma, mb;
         v8int32 sa, sb;
-        {{ p }}_iq3_signs((v64int8)A, LX, LW, all, ma, sa);
-        {{ p }}_iq3_signs((v64int8)B, LX, LW, all, mb, sb);
+        {{ p }}_iq3_signs((v64int8)A, LX, LW, ma, sa);
+        {{ p }}_iq3_signs((v64int8)B, LX, LW, mb, sb);
         mk[0] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_lo);
         mk[1] = ::shuffle((v16int32)ma, (v16int32)mb, T128_2x4_hi);
         *(v8int32 *)ps = sa;
@@ -51,7 +46,7 @@ __attribute__((noinline)) void {{ p }}_iq3_w(const uint8_t *__restrict ix, const
                                              const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
                                              uint8_t *__restrict wp)
 {
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v32uint8 __aie_dm_resource_a *__restrict pi = (const v32uint8 __aie_dm_resource_a *)ix;
     const v16int32 __aie_dm_resource_b *__restrict pm = (const v16int32 __aie_dm_resource_b *)mk;
     v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
@@ -80,10 +75,7 @@ __attribute__((noinline)) void {{ p }}_iq3(uint8_t *__restrict a, const uint8_t 
     bfloat16 *sct = (bfloat16 *)(scr + 7168), *dg = (bfloat16 *)(scr + 7936);
     // (the table copies' addresses through a volatile word: constants at the call would specialize _iq3_w, and the
     // gathers' memory operands need pointers, AIEPostSelectOptimize asserts on immediates)
-    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
-    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
-    ta[1] = H ? {{ TAB[1][1] }} : {{ TAB[0][1] }};
-    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+    {{ table_bases() | indent(4) }}
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         uint8_t *un = a + {{ U3 }} * (2 * H + u);  // (the super-block's unit: [ix | ss | d], odd ones [d | ss | ix])

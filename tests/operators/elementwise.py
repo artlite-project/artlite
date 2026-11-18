@@ -204,11 +204,11 @@ void {{ kname }}({{ "bfloat16" if fn.func == "rms_norm" else "float" }} *__restr
     aie::set_rounding(aie::rounding_mode::conv_even);
     for (int r = 0; r < {{ ts // n }}; r++) {
 {% if fn.func == "rms_norm" %}
-        {{ fn }}(input + {{ n }} * r, {{ (kname ~ "_w, ") if fn.params.weight }}output + {{ n }} * r);
+        {{ fn }}(input + {{ n }} * r, {{ (kname ~ "_w, ") if fn.params.weight }}output + {{ n }} * r{{ (", " ~ n) if fn.params.n is not integer }});
 {% else %}
         for (int i = 0; i < {{ n }}; i += 32)
             aie::store_v(output + {{ n }} * r + i, aie::load_v<32>(input + {{ n }} * r + i));
-        {{ fn }}(output + {{ n }} * r, {{ kname }}_cs);
+        {{ fn }}(output + {{ n }} * r, {{ kname }}_cs{{ (", " ~ rot) if fn.params.rot is not integer }}{{ (", " ~ dist) if fn.params.dist is not integer }});
 {% endif %}
     }
 }
@@ -217,10 +217,11 @@ void {{ kname }}({{ "bfloat16" if fn.func == "rms_norm" else "float" }} *__restr
 
 class RowOperator(StreamOperator):
     """A kmath row function (``kmath.rms_norm``: bf16 rows -> fp32, ``kmath.rope``: fp32 rows rotated) on rows of
-    ``n`` values, its constant arguments (``w``, ``cs``: numpy arrays) in the kernel."""
+    ``n`` values, its constant arguments (``w``, ``cs``: numpy arrays) in the kernel; ``rot`` and ``dist``: the
+    arguments of a rope of run-time extents (``n`` is a norm's)."""
 
-    def __init__(self, *, size: int, fn: kmath.Fn, n: int, **tables: np.ndarray):
-        self.fn, self.n, self.tables = fn, n, tables
+    def __init__(self, *, size: int, fn: kmath.Fn, n: int, rot: int = 0, dist: int = 0, **tables: np.ndarray):
+        self.fn, self.n, self.rot, self.dist, self.tables = fn, n, rot, dist, tables
         dt = bfloat16 if fn.func == "rms_norm" else np.float32
         super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(dt,), dtypes_out=(np.float32,))
         assert self.tile % n == 0, (self.tile, n)
@@ -229,13 +230,80 @@ class RowOperator(StreamOperator):
     def kernel_name(self) -> str:
         return "kmrow_" + self.fn.name.removeprefix(kmath.KM + "_")
 
+    @property
+    def stack_size(self) -> int | None:
+        return 0x800  # (a 64-lane norm with a weight and a run-time n: ~1.1 KB)
+
     def get_kernel_src(self) -> str:
         def table(a: np.ndarray) -> dict[str, object]:
             if a.dtype == bfloat16:
                 return {"ctype": "bfloat16", "vals": [f"bfloat16({float(v)!r}f)" for v in a]}
             return {"ctype": "float", "vals": [f"{float(v)!r}f" for v in a.astype(np.float32)]}
-        return _ROW.render(fn=self.fn, kname=self.kernel_name, ts=self.tile, n=self.n,
+        return _ROW.render(fn=self.fn, kname=self.kernel_name, ts=self.tile, n=self.n, rot=self.rot, dist=self.dist,
                            tables={k: table(v) for k, v in self.tables.items()})
+
+
+_SOFTMAX = JINJA_ENV.from_string(r"""
+{{ p1.src }}
+{{ p2.src }}
+
+extern "C"
+void {{ name }}(float *__restrict input, float *__restrict output)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    uint8_t *__restrict pp = (uint8_t *)output;
+{% if lsum %}
+    float *__restrict l = (float *)(pp + {{ l_off }});
+    aie::store_v(l, aie::zeros<float, 32>());
+    aie::store_v(l + {{ lsum }}, aie::zeros<float, 32>());
+{% endif %}
+{% if split %}
+    alignas(64) bfloat16 pP[{{ n }}], pF[{{ n }}];
+    {{ "((int32_t *)(pp + %d))[0] = " % flag_off if track }}{{ p1 }}<{{ n // 32 }}>(input, pP, pF);
+    {{ p2 }}<{{ n // 64 }}>(pP, pF, {{ "l, " if lsum }}pp);
+{% else %}
+    alignas(64) float s[{{ n }}];
+    for (int i = 0; i < {{ n }}; i += 32)
+        aie::store_v(s + i, aie::load_v<32>(input + i));
+    {{ p1 }}<{{ n // 32 }}>(s);
+    {{ p2 }}<{{ n // 64 }}>((const bfloat16 *)s, (const bfloat16 *)(s + {{ n // 2 }}), {{ "l, " if lsum }}pp);
+{% endif %}
+}
+""")
+
+
+class SoftmaxOperator(StreamOperator):
+    """``kmath.p_pass1`` then ``p_pass2`` of ``e192`` (a bias-192 exp2 of 32 lanes) on one tile of ``size`` scores A (fp32,
+    in the order of the layout: "split" step t's records at 64 t + 32 u; "inplace" the records of u = 0, 1 in two halves,
+    step t at 32 t of its half) -> the output's bytes: the P panels (``hi``: 72 B per step of 64 scores), at ``lo_off``
+    the panels of x - hi (``lo``), at ``l_off`` the sums l (``lsum``: 2 x 32 fp32) and at ``flag_off`` pass 1's
+    ``track`` result (int32). ``rounding``: pass 2 sets the rounding mode itself."""
+
+    def __init__(self, *, size: int, e192: kmath.Fn, layout: str = "split", track: bool = False, lsum: bool = False,
+                 lo: bool = False, rounding: bool = False):
+        assert size % 64 == 0, size
+        self.e192, self.layout, self.track, self.lsum, self.lo = e192, layout, track, lsum, lo
+        self.lo_off = -(-72 * size // 64 // 64) * 64
+        self.l_off = self.lo_off * (2 if lo else 1)
+        self.flag_off = self.l_off + 256
+        assert self.flag_off + 4 <= 4 * size, (size, self.flag_off)  # (the output's bytes: size fp32)
+        self.p1 = kmath.p_pass1(e192, layout=layout, track=track)
+        self.p2 = kmath.p_pass2(e192, layout=layout, lsum=32 if lsum else None, lo=self.lo_off if lo else None,
+                                rounding=rounding)
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(np.float32,), dtypes_out=(np.float32,))
+
+    @property
+    def kernel_name(self) -> str:
+        return f"kmsoft_{self.p1.name.removeprefix(kmath.KM + '_')}_{self.p2.name.removeprefix(kmath.KM + '_')}_{self.size}"
+
+    @property
+    def stack_size(self) -> int | None:
+        return 0x2000  # (the pass-1 arrays: 4 B per score)
+
+    def get_kernel_src(self) -> str:
+        return _SOFTMAX.render(p1=self.p1, p2=self.p2, name=self.kernel_name, n=self.size, split=self.layout == "split",
+                               track=self.track, lsum=32 if self.lsum else None, l_off=self.l_off,
+                               flag_off=self.flag_off)
 
 
 class InvOperator(StreamOperator):

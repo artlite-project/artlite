@@ -241,6 +241,19 @@ def table_copies(table: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return (table[0], table[1]) if table.ndim == 2 else (table, table)
 
 
+def unit_windows(R: int, T: int) -> dict[str, Callable]:
+    """The template functions of a unit's compacted rows (T tiles of R rows): ``seg(q0, q1)``, the (tile, first row,
+    end) of compacted rows q0 .. q1, and ``mask(lo, hi)``, the mask of bytes lo .. hi - 1 of 64."""
+
+    def seg(q0: int, q1: int) -> list[tuple[int, int, int]]:
+        return [(t, max(q0, R * t), min(q1, R * (t + 1))) for t in range(q0 // R, min(T, -(-q1 // R)))]
+
+    def mask(lo: int, hi: int) -> int:
+        return ((1 << hi) - 1) & ~((1 << lo) - 1)
+
+    return {"seg": seg, "mask": mask}
+
+
 def dq_kernel(op: object, kernel: KernelFn, B_l1_ty: object, ws_ty: object, D_ty: object,
               extra: list | None = None) -> object:
     """GemmQd's ``dq(b, ws, d, sb, kt, [half,] *extra)``."""

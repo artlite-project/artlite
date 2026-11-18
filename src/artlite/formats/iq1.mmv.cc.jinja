@@ -1,3 +1,4 @@
+{% from "artlite/formats/common.macros.cc.jinja" import store_acc, store_chain, table_bases with context %}
 // ---- IQ1_S / IQ1_M (formats/iq1.py: 32 rows, 4 row groups; F 0 / 1): per super-block a unit of {{ UNIT1["IQ1_S"] }} /
 // {{ UNIT1["IQ1_M"] }} B, IQ1_S [MK [e // 16][A 16 | B 16] the grid masks (panel order e = [i 8][l 4][g 4][r 8]) | SC the scales
 // and the deltas | D [row] bf16], IQ1_M [LO [e] index low bytes | HB [q][bit][word 16] the indices' bits 8 .. 10 and the
@@ -143,7 +144,7 @@ __attribute__((noinline)) void {{ p }}_iq1_g(const uint16_t *__restrict off, con
                                              const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd,
                                              uint8_t *__restrict mk)
 {
-    const v16int32 b16 = ::sel(broadcast_s32((long)tab_ab), broadcast_s32((long)tab_cd), 0xCCCC);
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
     const v64int8 z = broadcast_zero_to_v64int8(), km1 = broadcast_to_v64int8(-1);
     const v16uint16 __aie_dm_resource_a *__restrict po = (const v16uint16 __aie_dm_resource_a *)off;
     v64int8 __aie_dm_resource_c *__restrict pk = (v64int8 __aie_dm_resource_c *)mk;
@@ -222,17 +223,7 @@ __attribute__((noinline)) void {{ p }}_iq1_x(const uint8_t *__restrict xp, const
             W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + o + 192);
             C3 = l ? mac_8x8_8x8T(X, 1, W, 1, C3) : mul_8x8_8x8T(X, 1, W, 1);
         }
-{% if slots == 8 %}
-        aie::store_v(pc, {{ p }}_c8(C0));
-        aie::store_v(pc + {{ L }}, {{ p }}_c8(C1));
-        aie::store_v(pc + {{ 2 * L }}, {{ p }}_c8(C2));
-        aie::store_v(pc + {{ 3 * L }}, {{ p }}_c8(C3));
-{% else %}
-        aie::store_v(pc, {{ p }}_sum2(C0));
-        aie::store_v(pc + {{ L }}, {{ p }}_sum2(C1));
-        aie::store_v(pc + {{ 2 * L }}, {{ p }}_sum2(C2));
-        aie::store_v(pc + {{ 3 * L }}, {{ p }}_sum2(C3));
-{% endif %}
+        {{ store_chain(4, L) | indent(8) }}
         pw += 512;
         pc += {{ 4 * L }};
     }
@@ -267,10 +258,7 @@ __attribute__((noinline)) void {{ p }}_iq1_pmx(const uint8_t *__restrict mk, con
             W.mantissa = __builtin_aie2p_vaddsub8(z, __builtin_aie2p_vsel8(z, k1, ext_v2int32(m, 5)), ext_v2int32(m, 7));
             C3 = l ? mac_8x8_8x8T(X, 1, W, 1, C3) : mul_8x8_8x8T(X, 1, W, 1);
         }
-        aie::store_v(pc, {{ p }}_c8(C0));
-        aie::store_v(pc + {{ L }}, {{ p }}_c8(C1));
-        aie::store_v(pc + {{ 2 * L }}, {{ p }}_c8(C2));
-        aie::store_v(pc + {{ 3 * L }}, {{ p }}_c8(C3));
+        {{ store_acc("c8", 4, L) | indent(8) }}
         pc += {{ 4 * L }};
     }
 }
@@ -310,10 +298,7 @@ __attribute__((noinline)) void {{ p }}_iq1_px(const uint8_t *__restrict mk, cons
                                                   __builtin_aie2p_vsel8(z, k8, ext_v2int32(s1, 1)), ext_v2int32(s1, 3));
             C3 = l ? mac_8x8_8x8T(X, 1, W, 1, C3) : mul_8x8_8x8T(X, 1, W, 1);
         }
-        aie::store_v(pc, {{ p }}_c8(C0));
-        aie::store_v(pc + {{ L }}, {{ p }}_c8(C1));
-        aie::store_v(pc + {{ 2 * L }}, {{ p }}_c8(C2));
-        aie::store_v(pc + {{ 3 * L }}, {{ p }}_c8(C3));
+        {{ store_acc("c8", 4, L) | indent(8) }}
         pc += {{ 4 * L }};
     }
 }
@@ -358,10 +343,7 @@ __attribute__((noinline)) void {{ p }}_iq1(uint8_t *__restrict a, const uint8_t 
     uint16_t *off = (uint16_t *)(scr + 2048);
     // (the table's addresses through a volatile word: constants at the call would specialize _iq1_w, and the gathers'
     // memory operands need pointers; every lane at the first copy, the second D further: _iq1_off)
-    volatile int32_t *ta = (volatile int32_t *)(scr + 8000);
-    ta[0] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
-    ta[1] = H ? {{ TAB[1][0] }} : {{ TAB[0][0] }};
-    const uint32_t *tab_ab = (const uint32_t *)(intptr_t)ta[0], *tab_cd = (const uint32_t *)(intptr_t)ta[1];
+    {{ table_bases(0) | indent(4) }}
     aie::store_v(zy, aie::zeros<float, 32>());
 {% if slots == 8 %}
     aie::store_v(zy + 32, aie::zeros<float, 32>());

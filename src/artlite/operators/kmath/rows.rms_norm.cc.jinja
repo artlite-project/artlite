@@ -1,12 +1,20 @@
-// out = x / rms(x){{ " w" if weight }} of {{ n }} bf16 -> fp32 (kmath.rms_norm, eps {{ eps }}): 1 / rms by al::inv_rms, x times its bf16
+// out = x / rms(x){{ " w" if weight }} of {{ label }} bf16 -> fp32 (kmath.rms_norm, eps {{ eps }}): 1 / rms by al::inv_rms, x times its bf16
 // parts (x is bf16: x / rms to 2^-16){{ ", times w (al::mulff)" if weight }}
-{{ attr }} void {{ name }}(const bfloat16 *__restrict x, {{ "const float *__restrict w, " if weight }}float *__restrict out)
+{{ attr }} void {{ name }}(const bfloat16 *__restrict x, {{ "const float *__restrict w, " if weight }}float *__restrict out{{ ", int n" if rt }})
 {
+{% if rt %}
+    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
+    {{ pragma }}
+    for (int i = 0; i < n; i += 64)
+        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
+    const float inv = al::inv_rms(aie::reduce_add(ss.template to_vector<float>()), {{ inv_n }}, {{ eps }}f);
+{% else %}
     aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
 {% for i in range(64, n, 64) %}
     ss = aie::mac_square(ss, aie::load_v<64>(x + {{ i }}));
 {% endfor %}
     const float inv = al::inv_rms<{{ n }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+{% endif %}
     aie::vector<bfloat16, {{ L }}> ih, il;
     al::bf16_hilo<{{ L }}>(inv, ih, il);
 {% if pragma %}

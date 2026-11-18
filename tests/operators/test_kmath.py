@@ -9,11 +9,11 @@ import pytest
 import torch
 from ml_dtypes import bfloat16
 
-from artlite.operators import kmath
+from artlite.operators import bfp16, kmath
 from artlite.operators.kernel_source import KernelSource
 
 from . import kmath_sim
-from .elementwise import InvOperator, KmOperator, RowOperator, VtanhOperator
+from .elementwise import InvOperator, KmOperator, RowOperator, SoftmaxOperator, VtanhOperator
 
 CASES = {  # id: the function and its arguments
     "exp2": ("exp2", {"lanes": 32}),
@@ -177,7 +177,7 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
         assert r.max() <= fn.rel, f"max rel. error {r.max():.3g} at {dom[np.argmax(r)]}"
 
 
-ROWS = {  # id: a row function's arguments
+ROWS = {  # id: a row function's arguments; and for run-time extents the values they take in the run
     "rms-256-w": ("rms_norm", {"n": 256, "eps": 1e-6, "weight": True}),
     "rms-256-w-min1": ("rms_norm", {"n": 256, "eps": 1e-6, "weight": True, "loop": "min1"}),
     "rms-128-w-l64": ("rms_norm", {"n": 128, "eps": 1e-5, "weight": True, "lanes": 64}),
@@ -187,6 +187,10 @@ ROWS = {  # id: a row function's arguments
     "rope-64": ("rope", {"rot": 64}),
     "rope-64-d128": ("rope", {"rot": 64, "dist": 128}),
     "rope-128-bf16": ("rope", {"rot": 128, "table": "bf16"}),
+    "rms-rt-512": ("rms_norm", {"n": (256, 512), "eps": 1e-6, "minsize": True}, {"n": 512}),
+    "rms-rt-256-w-l64": ("rms_norm", {"n": (256, 512), "eps": 1e-6, "weight": True, "lanes": 64}, {"n": 256}),
+    "rope-rt-64": ("rope", {"rot": (64, 32), "dist": 128}, {"rot": 64}),
+    "rope-rt-32-d256": ("rope", {"rot": (64, 32), "dist": (128, 256)}, {"rot": 32, "dist": 256}),
 }
 
 
@@ -195,12 +199,13 @@ def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
     """A row function on 256 rows of random values (rows of scales 2^-20 .. 2^20): bit-exact against its model
     (kmath_sim; rope: 99% of its results, the rest within 2 ULP: the model's MACs after a cancellation), and within its
     bound of the exact result (rms_norm: 2^-15 relative per element; rope: 2^-15.8 of |a| + |b| per pair)."""
-    func, kwargs = ROWS[case]
+    func, kwargs, *at = ROWS[case]
+    at = at[0] if at else {}
     fn = getattr(kmath, func)(**kwargs)
     for op, r in request.getfixturevalue("inv_results").items():
         kmath_sim.load_inv(op, r)
     rng = np.random.default_rng(1)
-    n = kwargs.get("n", 256)
+    n = at.get("n", kwargs.get("n", 256)) if func == "rms_norm" else max(256, 2 * at.get("dist", 0))  # (rows hold dist + rot)
     rows = 72 if n == 192 else 256  # (a tile of whole rows)
     scale = np.exp2(rng.uniform(-20, 20, (rows, 1)))
     x = (rng.standard_normal((rows, n)) * scale).astype(np.float32)
@@ -216,15 +221,15 @@ def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
         err = np.abs(out[keep] - ref[keep]) / np.abs(ref[keep])
         bound = 2.0 ** -15
     else:
-        rot = kwargs["rot"]
+        rot = at.get("rot", kwargs["rot"])
+        d = at.get("dist", fn.params["dist"])
         th = rng.uniform(0, 2 * np.pi, rot)
         cs, sn = np.cos(th).astype(np.float32), np.sin(th).astype(np.float32)
         if kwargs.get("table") == "bf16":
             cs, sn = kmath_sim.bf16(cs), kmath_sim.bf16(sn)
         tables = {"cs": np.concatenate([cs, sn]).astype(bfloat16 if kwargs.get("table") == "bf16" else np.float32)}
-        out = RowOperator(size=rows * n, fn=fn, n=n, **tables).compile().run(x.ravel()).reshape(rows, n)
-        em = kmath_sim.rope(fn, x, np.concatenate([cs, sn]))
-        d = fn.params["dist"]
+        out = RowOperator(size=rows * n, fn=fn, n=n, rot=rot, dist=d, **tables).compile().run(x.ravel()).reshape(rows, n)
+        em = kmath_sim.rope(fn, x, np.concatenate([cs, sn]), rot, d)
         a, b = x[:, :rot].astype(np.float64), x[:, d:d + rot].astype(np.float64)
         ref = x.astype(np.float64).copy()
         ref[:, :rot], ref[:, d:d + rot] = a * cs - b * sn, a * sn + b * cs
@@ -241,3 +246,61 @@ def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
         assert same.all(), f"{(~same).sum()} results differ from the model; at {np.argwhere(~same)[:4]}: {out[~same][:4]} vs {em[~same][:4]}"
     print(f"\n{fn.name}: max error {err.max():.3g}")
     assert err.max() <= bound, f"max error {err.max():.3g}"
+
+
+SOFTMAX = {  # id: the exp2 of bias 192's arguments, the passes' (SoftmaxOperator's)
+    "inplace-decode": ({"below": "bounded", "above": "clamp"}, {"layout": "inplace", "lsum": True, "rounding": True}),
+    "split-track-lo": ({"below": "bounded"}, {"track": True, "lsum": True, "lo": True}),
+    "split-quad": ({"below": "bounded", "prec": "quad"}, {}),
+    "split-clamp-lsum": ({}, {"lsum": True}),
+    "inplace-unclamped": ({"below": "none"}, {"layout": "inplace", "lsum": True}),
+}
+
+
+@pytest.mark.parametrize("case", list(SOFTMAX))
+def test_kmath_softmax(case: str) -> None:
+    """A softmax's two passes (``p_pass1``, ``p_pass2``) on 1024 scores A = y + 192 per run (y <= 0: s - m; y up to 20 in
+    the last run: pass 1's ``track`` flag; masked scores: -16384, -1e30 where the exp2 clamps): the P panels (bfp16),
+    the l sums and (``lo``) the lo panels bit-exact against their model (``kmath_sim.softmax_passes``: the exp2's parts,
+    ``bfp16.blocks``' rounding, the accumulators' adder; the lo panels up to 2% of their bytes: the MMUL's subtraction, not modelled bit for bit),
+    and the panels' values within 2^-6 of the block maximum of 2^y, the sums within 2^-7 of their exact value."""
+    e_kw, kw = SOFTMAX[case]
+    e192 = kmath.exp2(32, bias=192, **e_kw)
+    n, steps = 1024, 1024 // 64
+    op = SoftmaxOperator(size=n, e192=e192, **kw).compile()
+    rng = np.random.default_rng(3)
+    floor = -63.0 if e_kw.get("below") == "none" else -64.0  # ("none": A >= 128.5 is the caller's)
+    masked = {"bounded": -16384.0, "none": None}.get(e_kw.get("below"), -1e30)
+    for run in range(3):
+        y = rng.uniform(floor, 0.0, (steps, 2, 32)).astype(np.float32)
+        y[rng.random(y.shape) < 0.05] = 0.0
+        if masked is not None and run >= 1:
+            y[rng.random(y.shape) < 0.1] = masked
+        if run == 2:
+            y[0, 0, :4] = rng.uniform(18.0, 20.0, 4)
+        a = (y + np.float32(192)).astype(np.float32)
+        flat = (a if kw.get("layout", "split") == "split" else a.transpose(1, 0, 2)).reshape(-1)
+        raw = op.run(flat).view(np.uint8)
+        em = kmath_sim.softmax_passes(e192, a, lsum=op.lsum, lo=op.lo)
+        hi = raw[:72 * steps].reshape(steps, 72)
+        assert np.array_equal(hi, em["hi"]), f"run {run}: {(hi != em['hi']).sum()} panel bytes differ from the model"
+        if op.lsum:
+            sums = raw[op.l_off:op.l_off + 256].view(np.float32).reshape(2, 32)
+            assert np.array_equal(sums, em["l"]), f"run {run}: l differs from the model at {np.argwhere(sums != em['l'])[:4]}"
+        if op.lo:
+            lo = raw[op.lo_off:op.lo_off + 72 * steps].reshape(steps, 72)
+            assert (lo != em["lo"]).mean() <= 0.02, f"run {run}: {(lo != em['lo']).mean():.4f} of the lo bytes differ"
+            x = em["r"].reshape(steps, 8, 8).astype(np.float64)
+            both = bfp16.block_values(hi.reshape(steps, 8, 9)) + bfp16.block_values(lo.reshape(steps, 8, 9))
+            assert (np.abs(both - x) / x.max(-1, keepdims=True)).max() <= 2.0 ** -13, f"run {run}: hi + lo"
+        if op.track:
+            assert bool(raw[op.flag_off:op.flag_off + 4].view(np.int32)[0]) == bool(em["below209"]), f"run {run}: track"
+            # the values against the exact 2^y
+        ex = np.exp2(y.astype(np.float64)).reshape(steps, 8, 8)
+        hv = bfp16.block_values(hi.reshape(steps, 8, 9)).astype(np.float64)
+        err = np.abs(hv - ex) / ex.max(-1, keepdims=True)
+        assert err.max() <= 2.0 ** -6, f"run {run}: panel value error {err.max():.3g} of the block maximum"
+        if op.lsum:
+            ref = np.exp2(y.astype(np.float64)).sum(0)
+            rel = np.abs(sums - ref) / ref
+            assert rel.max() <= 2.0 ** -7, f"run {run}: l error {rel.max():.3g}"

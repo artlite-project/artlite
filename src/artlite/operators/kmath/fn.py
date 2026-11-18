@@ -51,11 +51,15 @@ class Fn:
 
 
 def make(local: str, template: str, *, variables: dict[str, object], inline: bool, deps: tuple[Fn, ...] = (),
-         **meta: object) -> Fn:
+         minsize: bool = False, **meta: object) -> Fn:
     """An Fn named ``km_<local>`` from the package's template file ``template``, rendered with ``variables`` and its
-    ``name`` and ``attr`` (inlined, or one out-of-line copy per core); ``deps``: the functions it calls."""
+    ``name`` and ``attr`` (inlined, or one out-of-line copy per core; ``minsize``: compiled for size, as the loops of a
+    ``minsize`` caller are: an inlined callee's loops are optimized before the inlining, by its own attributes);
+    ``deps``: the functions it calls."""
     name = f"{KM}_{local}"
     attr = "[[clang::always_inline]] inline" if inline else "__attribute__((noinline))"
+    if minsize:
+        attr = "[[clang::always_inline]] inline __attribute__((minsize))" if inline else "__attribute__((noinline, minsize))"
     body = _ENV.get_template(template).render(**variables, name=name, attr=attr).strip("\n")
     own = "namespace {\n\n" + body + "\n\n}  // namespace\n"
     srcs = dict.fromkeys(d.src for d in deps)  # (each once, in order)
