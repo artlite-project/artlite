@@ -183,7 +183,7 @@ ROWS = {  # id: a row function's arguments
     "rms-128-w-l64": ("rms_norm", {"n": 128, "eps": 1e-5, "weight": True, "lanes": 64}),
     "rms-512": ("rms_norm", {"n": 512, "eps": 1e-6}),
     "rms-192": ("rms_norm", {"n": 192, "eps": 1e-6}),
-    "rope-32-sn": ("rope", {"rot": 32, "sin": "ptr"}),
+    "rope-32": ("rope", {"rot": 32}),
     "rope-64": ("rope", {"rot": 64}),
     "rope-64-d128": ("rope", {"rot": 64, "dist": 128}),
     "rope-128-bf16": ("rope", {"rot": 128, "table": "bf16"}),
@@ -222,10 +222,8 @@ def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
         if kwargs.get("table") == "bf16":
             cs, sn = kmath_sim.bf16(cs), kmath_sim.bf16(sn)
         tables = {"cs": np.concatenate([cs, sn]).astype(bfloat16 if kwargs.get("table") == "bf16" else np.float32)}
-        if kwargs.get("sin") == "ptr":
-            tables = {"cs": cs, "sn": sn}
         out = RowOperator(size=rows * n, fn=fn, n=n, **tables).compile().run(x.ravel()).reshape(rows, n)
-        em = kmath_sim.rope(fn, x, np.concatenate([cs, sn]), sn)
+        em = kmath_sim.rope(fn, x, np.concatenate([cs, sn]))
         d = fn.params["dist"]
         a, b = x[:, :rot].astype(np.float64), x[:, d:d + rot].astype(np.float64)
         ref = x.astype(np.float64).copy()

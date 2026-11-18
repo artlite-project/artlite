@@ -5,29 +5,16 @@
 
 namespace {
 
-// x (256 bf16 stride 128) -> fp32 out = x / rms(x) w, then the NeoX rotation of all HD dims (cs, sn: 64 fp32 each)
+{% set nrm, rope = km.rms_norm(HD, eps=eps | float, weight=True), km.rope(HD // 2) %}
+{{ nrm.src }}
+{{ rope.src }}
+// x ({{ HD }} bf16) -> fp32 out = x / rms(x) w, rotated by cs [cos {{ HD // 2 }} | sin {{ HD // 2 }}] (NeoX pairs i, i + {{ HD // 2 }})
 __attribute__((noinline)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
-                                                 const float *__restrict cs, const float *__restrict sn,
-                                                 float *__restrict out)
+                                                 const float *__restrict cs, float *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
-    ss = aie::mac_square(ss, aie::load_v<64>(x + 64));
-    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
-    aie::vector<bfloat16, 32> ih, il;  // (x is bf16: x / rms = x ih + x il, mulff's products less x's lo part, 0)
-    al::split2<32>(aie::broadcast<float, 32>(inv), ih, il);
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < {{ HD }}; i += 32) {
-        const aie::vector<bfloat16, 32> xb = aie::load_v<32>(x + i);
-        aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>(), aie::load_v<32>(w + i)));
-    }
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
-        const aie::vector<float, 32> a = aie::load_v<32>(out + i), b = aie::load_v<32>(out + {{ HD // 2 }} + i);
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(sn + i);
-        aie::store_v(out + i, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
-        aie::store_v(out + {{ HD // 2 }} + i, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
-    }
+    {{ nrm }}(x, w, out);
+    {{ rope }}(out, cs);
 }
 
 // Scores of a pair of K records ([d-block][record 2]) against two octets (their rows' Q panels, [d-block][octet 2]), from the rows'
@@ -312,14 +299,14 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
     if (!inj) {
         AIE_LOOP_NO_UNROLL
         for (int h = 0; h < {{ QC }}; h++)
-            {{ p }}_norm_rope(pay + {{ HD }} * h, nrm, cs, cs + {{ HD // 2 }}, AW(float, {{ a.y }}) + {{ HD }} * (8 * h + s));
+            {{ p }}_norm_rope(pay + {{ HD }} * h, nrm, cs, AW(float, {{ a.y }}) + {{ HD }} * (8 * h + s));
     } else if (s >= st[{{ A_KEEP }}]) {
         return;
     }
     const bfloat16 *__restrict kv = pay + (inj ? 0 : {{ QC * HD }});
     const int q = st[{{ A_P }}] + s, slot = (q >> 3) & 1, j = q & 7;
     float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
-    {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, cs + {{ HD // 2 }}, kf);
+    {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, kf);
     bfloat16 *__restrict rows = (bfloat16 *)a;
     {{ p }}_krow(kf, rows + {{ ROWS_B // 2 }} * slot + 8 * j);
     al::v_put<{{ ND }}>(rows + {{ ROWS_B // 2 }} * (2 + slot) + 8 * j, kv + {{ HD }}, {{ ND }});

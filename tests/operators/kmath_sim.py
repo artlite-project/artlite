@@ -357,13 +357,21 @@ def rot2(a: np.ndarray, b: np.ndarray, c: np.ndarray, s: np.ndarray) -> tuple[np
     return o0, o1
 
 
-def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray, sn: np.ndarray | None) -> np.ndarray:
+def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray) -> np.ndarray:
     """``kmath.rope``: fp32 rows [rows, n] with their pairs (i, i + dist), i < rot, rotated by cos cs[i] and sin
-    (sn[i], or cs[rot + i]); a bf16 table's values as given (bf16)."""
+    cs[rot + i] (a bf16 table's values as given: bf16)."""
     rot, dist = fn.params["rot"], fn.params["dist"]
     out = _f32(row).copy()
-    c, s = _f32(cs[:rot]), _f32(sn[:rot] if fn.params["sin"] == "ptr" else cs[rot:2 * rot])
-    out[:, :rot], out[:, dist:dist + rot] = rot2(out[:, :rot], out[:, dist:dist + rot], c, s)
+    c, s = _f32(cs[:rot]), _f32(cs[rot:2 * rot])
+    a, b = out[:, :rot], out[:, dist:dist + rot]
+    if fn.params["table"] == "bf16":  # (four products: c, s bf16)
+        (ah, al), (bh, bl) = split(a), split(b)
+        n = lambda v: -np.asarray(v, np.float64)
+        o0 = mac(mac(mac(mul(ah, c), al, c), n(bh), s), n(bl), s)
+        o1 = mac(mac(mac(mul(ah, s), al, s), bh, c), bl, c)
+    else:
+        o0, o1 = rot2(a, b, c, s)
+    out[:, :rot], out[:, dist:dist + rot] = o0, o1
     return out
 
 

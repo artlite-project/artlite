@@ -208,7 +208,7 @@ void {{ kname }}({{ "bfloat16" if fn.func == "rms_norm" else "float" }} *__restr
 {% else %}
         for (int i = 0; i < {{ n }}; i += 32)
             aie::store_v(output + {{ n }} * r + i, aie::load_v<32>(input + {{ n }} * r + i));
-        {{ fn }}(output + {{ n }} * r, {{ kname }}_cs{{ (", " ~ kname ~ "_sn") if fn.params.sin == "ptr" }});
+        {{ fn }}(output + {{ n }} * r, {{ kname }}_cs);
 {% endif %}
     }
 }
@@ -217,7 +217,7 @@ void {{ kname }}({{ "bfloat16" if fn.func == "rms_norm" else "float" }} *__restr
 
 class RowOperator(StreamOperator):
     """A kmath row function (``kmath.rms_norm``: bf16 rows -> fp32, ``kmath.rope``: fp32 rows rotated) on rows of
-    ``n`` values, its constant arguments (``w``, ``cs``, ``sn``: numpy arrays) in the kernel."""
+    ``n`` values, its constant arguments (``w``, ``cs``: numpy arrays) in the kernel."""
 
     def __init__(self, *, size: int, fn: kmath.Fn, n: int, **tables: np.ndarray):
         self.fn, self.n, self.tables = fn, n, tables

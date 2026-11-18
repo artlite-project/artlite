@@ -1,18 +1,22 @@
-// The pairs (i, i + {{ dist }}) of an fp32 row rotated, i < {{ rot }} (kmath.rope, al::rot2): by cos at cs + i, sin at {{ "sn + i" if sn else "cs + %d + i" % rot }}{{ " (bf16)" if T == "bfloat16" }}
-{{ attr }} void {{ name }}(float *__restrict row, const {{ T }} *__restrict cs{{ ", const " ~ T ~ " *__restrict sn" if sn }})
+// The pairs (i, i + {{ dist }}) of an fp32 row rotated, i < {{ rot }} (kmath.rope): by cos at cs + i, sin at cs + {{ rot }} + i{% if T == "bfloat16" %} (bf16: a c - b s
+// and a s + b c as the four products of a's and b's bf16 parts with c and s in one accumulator){% else %} (al::rot2){% endif %}
+
+{{ attr }} void {{ name }}(float *__restrict row, const {{ T }} *__restrict cs)
 {
     for (int i = 0; i < {{ rot }}; i += 32) {
         const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ dist }} + i);
-{% set s = "sn + i" if sn else "cs + %d + i" % rot %}
 {% if T == "bfloat16" %}
-        const aie::vector<float, 32> c = aie::accum<accfloat, 32>(aie::load_v<32>(cs + i)).template to_vector<float>();
-        const aie::vector<float, 32> s = aie::accum<accfloat, 32>(aie::load_v<32>({{ s }})).template to_vector<float>();
+        aie::vector<bfloat16, 32> ah, al, bh, bl;
+        al::split2<32>(a, ah, al);
+        al::split2<32>(b, bh, bl);
+        const aie::vector<bfloat16, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ rot }} + i);
+        aie::store_v(row + i, aie::msc(aie::msc(aie::mac(aie::mul(ah, c), al, c), bh, s), bl, s).template to_vector<float>());
+        aie::store_v(row + {{ dist }} + i, aie::mac(aie::mac(aie::mac(aie::mul(ah, s), al, s), bh, c), bl, c).template to_vector<float>());
 {% else %}
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>({{ s }});
-{% endif %}
         aie::accum<accfloat, 32> o0, o1;
-        al::rot2<32>(a, b, c, s, o0, o1);
+        al::rot2<32>(a, b, aie::load_v<32>(cs + i), aie::load_v<32>(cs + {{ rot }} + i), o0, o1);
         aie::store_v(row + i, o0.template to_vector<float>());
         aie::store_v(row + {{ dist }} + i, o1.template to_vector<float>());
+{% endif %}
     }
 }

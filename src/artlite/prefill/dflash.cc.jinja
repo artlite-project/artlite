@@ -4,24 +4,15 @@
 
 namespace {
 
+{% set nrm, rope = km.rms_norm(HD, eps=eps | float, weight=True, lanes=64), km.rope(HD // 2) %}
+{{ nrm.src }}
+{{ rope.src }}
 // x (HD bf16) -> row = x / rms(x) w (fp32), rotated by cs [cos HD / 2 | sin HD / 2] (NeoX pairs i, i + HD / 2)
 __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict w,
                                           const float *__restrict cs, float *__restrict row)
 {
-    aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
-    ss = aie::mac_square(ss, aie::load_v<64>(x + 64));
-    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
-    const aie::vector<float, 64> iv = aie::broadcast<float, 64>(inv);
-    for (int i = 0; i < {{ HD }}; i += 64) {
-        const aie::vector<float, 64> xf = aie::accum<accfloat, 64>(aie::load_v<64>(x + i)).template to_vector<float>();
-        aie::store_v(row + i, al::mulff<64>(al::mulff<64>(xf, iv), aie::load_v<64>(w + i)));
-    }
-    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
-        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ HD // 2 }} + i);
-        aie::store_v(row + i, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
-        aie::store_v(row + {{ HD // 2 }} + i, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
-    }
+    {{ nrm }}(x, w, row);
+    {{ rope }}(row, cs);
 }
 
 }  // namespace

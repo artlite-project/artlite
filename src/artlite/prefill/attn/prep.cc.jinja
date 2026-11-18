@@ -4,22 +4,16 @@
 
 namespace {
 
+{% set rope = km.rope(HD // 2) %}
+{{ rope.src }}
 {% if NORM %}
-// x (HD bf16) -> row = x / rms(x) w (fp32: x times 1 / rms's hi and lo parts, times w), the pairs (i, i + HD / 2)
-// rotated by cs [cos HD / 2 | sin HD / 2]
+{% set nrm = km.rms_norm(HD, eps=eps | float, weight=True, lanes=64) %}
+{{ nrm.src }}
+// x (HD bf16) -> row = x / rms(x) w (fp32), the pairs (i, i + HD / 2) rotated by cs [cos HD / 2 | sin HD / 2]
 __attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict w, const float *__restrict cs,
                                             float *__restrict row)
 {
-    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-    for (int i = 0; i < {{ HD }}; i += 64)
-        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
-    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
-    aie::vector<bfloat16, 64> ih, il;
-    al::bf16_hilo<64>(inv, ih, il);
-    for (int i = 0; i < {{ HD }}; i += 64) {
-        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
-        aie::store_v(row + i, al::mulff<64>(aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>(), aie::load_v<64>(w + i)));
-    }
+    {{ nrm }}(x, w, row);
 {% else %}
 // x (HD bf16) -> row (fp32), the pairs (i, i + HD / 2) rotated by cs [cos HD / 2 | sin HD / 2]
 __attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict row)
@@ -27,14 +21,7 @@ __attribute__((noinline)) void {{ p }}_rope(const bfloat16 *__restrict x, const 
     for (int i = 0; i < {{ HD }}; i += 32)
         aie::store_v(row + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
 {% endif %}
-    for (int i = 0; i < {{ HD // 2 }}; i += 32) {
-        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ HD // 2 }} + i);
-        aie::accum<accfloat, 32> o0, o1;
-        al::rot2(a, b, c, s, o0, o1);
-        aie::store_v(row + i, o0.template to_vector<float>());
-        aie::store_v(row + {{ HD // 2 }} + i, o1.template to_vector<float>());
-    }
+    {{ rope }}(row, cs);
 }
 
 // row (HD fp32) -> row r of the stage [db][r][8]

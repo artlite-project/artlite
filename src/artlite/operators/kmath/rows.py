@@ -11,7 +11,7 @@ One numeric form each, the cheapest of the equally accurate ones (measured with 
 times 1 / rms as two products of the bf16 x with 1 / rms's bf16 parts (x times the fp32 1 / rms through ``al::mulff``
 gives the same values: x's lo part is 0), the sum of squares written out (a loop of 2 / 4 ``mac_square`` costs 80 / 128
 B more and 10-35 cycles); the rotation ``al::rot2`` (each operand split once, a pair's output one rounding: four
-``al::mulff`` are as accurate, 16 B more and two more vector operations per 32 lanes). What stays a choice trades
+``al::mulff`` are as accurate, 16 B more and two more vector operations per 32 lanes; of a bf16 table four products). What stays a choice trades
 program memory against cycles: the lanes of the norm's loop and its pragma (with a weight, n = 256: 32 lanes and no
 hardware loop 224 B / 306 cycles, 64 lanes 288 B / 189, a 64-lane hardware loop 608 B / 110; without one 32 lanes, a
 hardware loop: 288 B / 72 cycles)."""
@@ -42,17 +42,17 @@ def rms_norm(n: int, *, eps: float, weight: bool = False, lanes: int = 32, loop:
                 variables={"n": n, "eps": repr(float(eps)), "weight": weight, "L": lanes, "pragma": PRAGMAS[loop]})
 
 
-def rope(rot: int, *, dist: int | None = None, sin: str = "after", table: str = "fp32", inline: bool = True) -> Fn:
+def rope(rot: int, *, dist: int | None = None, table: str = "fp32", inline: bool = True) -> Fn:
     """The rotation of the pairs (i, i + ``dist``) of an fp32 row, i < ``rot`` (multiples of 32; ``dist``: default
-    ``rot``, NeoX's halves), in place by ``al::rot2``: a function ``(row, cs)``, cos at cs + i and sin at cs + rot + i
-    (``sin`` "after"), or ``(row, cs, sn)``, sin at sn + i ("ptr"); ``table`` "fp32" or "bf16" (cos, sin as bf16)."""
+    ``rot``, NeoX's halves), in place: a function ``(row, cs)``, cos at cs + i and sin at cs + rot + i; ``table`` "fp32"
+    (``al::rot2``) or "bf16" (a bf16 table: four products per output, a's and b's bf16 parts times c and s: rot2's
+    values, its products of c's and s's lo parts 0)."""
     dist = rot if dist is None else dist
-    check("sin", sin, ("after", "ptr"))
     check("table", table, ("fp32", "bf16"))
     if rot <= 0 or rot % 32 or dist < rot or dist % 32:
         raise ValueError(f"kmath: rope of rot = {rot}, dist = {dist} (multiples of 32, dist >= rot)")
-    local = (f"rope_{rot}" + (f"_d{dist}" if dist != rot else "") + ("_sp" if sin == "ptr" else "")
-             + ("_tb" if table == "bf16" else "") + ("_i" if inline else ""))
+    local = (f"rope_{rot}" + (f"_d{dist}" if dist != rot else "") + ("_tb" if table == "bf16" else "")
+             + ("_i" if inline else ""))
     return make(local, "rows.rope.cc.jinja", inline=inline, lanes=32, arg="ptr", ret="ptr", func="rope",
-                params={"rot": rot, "dist": dist, "sin": sin, "table": table},
-                variables={"rot": rot, "dist": dist, "sn": sin == "ptr", "T": "bfloat16" if table == "bf16" else "float"})
+                params={"rot": rot, "dist": dist, "table": table},
+                variables={"rot": rot, "dist": dist, "T": "bfloat16" if table == "bf16" else "float"})

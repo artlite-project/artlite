@@ -3,30 +3,22 @@
 // vn [8][HD] bf16
 #define PW(T, off) ((T *)((uint8_t *)ws + (off)))
 
+{# a head's row x / rms(x): one copy (the K / Q rows' and the V rows'); their rotation inlined #}
+{% set nrm = km.rms_norm(HD, eps=eps | float, inline=False) %}
+{{ nrm.src }}
+{% if ROT %}
+{% set rope = km.rope(ROT, dist=HD // 2) %}
+{{ rope.src }}
+{% endif %}
+
 namespace {
 
 // x (HD bf16) -> row = x / rms(x) (fp32), the pairs (i, i + HD / 2) of i < ROT rotated by cs [cos ROT | sin ROT]
 __attribute__((noinline)) void {{ p }}_nr(const bfloat16 *__restrict x, const float *__restrict cs, float *__restrict row)
 {
-    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-    for (int i = 0; i < {{ HD }}; i += 64)
-        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
-    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
-    aie::vector<bfloat16, 64> ih, il;  // (x bf16: x 1 / rms as its two products with 1 / rms's parts)
-    al::bf16_hilo<64>(inv, ih, il);
-    for (int i = 0; i < {{ HD }}; i += 64) {
-        const aie::vector<bfloat16, 64> xv = aie::load_v<64>(x + i);
-        aie::store_v(row + i, aie::mac(aie::mul(xv, ih), xv, il).template to_vector<float>());
-    }
+    {{ nrm }}(x, row);
 {% if ROT %}
-    for (int i = 0; i < {{ ROT }}; i += 32) {
-        const aie::vector<float, 32> a = aie::load_v<32>(row + i), b = aie::load_v<32>(row + {{ HD // 2 }} + i);
-        const aie::vector<float, 32> c = aie::load_v<32>(cs + i), s = aie::load_v<32>(cs + {{ ROT }} + i);
-        aie::accum<accfloat, 32> o0, o1;
-        al::rot2(a, b, c, s, o0, o1);
-        aie::store_v(row + i, o0.template to_vector<float>());
-        aie::store_v(row + {{ HD // 2 }} + i, o1.template to_vector<float>());
-    }
+    {{ rope }}(row, cs);
 {% endif %}
 }
 
@@ -130,7 +122,7 @@ void {{ p }}_v(const bfloat16 *__restrict v, const bfloat16 *__restrict cs_, flo
     float *__restrict row = PW(float, {{ w.row }});
     bfloat16 *__restrict vn = PW(bfloat16, {{ w.vn }});
     for (int r = 0; r < 8; r++) {
-        {{ p }}_nr0(v + {{ HD }} * r, row);
+        {{ nrm }}(v + {{ HD }} * r, row);
         for (int i = 0; i < {{ HD }}; i += 32)
             aie::store_v(vn + {{ HD }} * r + i, aie::accum<accfloat, 32>(aie::load_v<32>(row + i)).template to_vector<bfloat16>());
     }

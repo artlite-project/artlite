@@ -7,32 +7,24 @@
 namespace {
 
 {% if NORMS %}
-// 256 bf16 x -> fp32 out = x / rms(x) * w, then the NeoX rotation of dims 0 .. 63 (cs, sn: 32 fp32 each)
+{% set nrm, rope = km.rms_norm(HD, eps=eps | float, weight=True), km.rope(32) %}
+{{ nrm.src }}
+{{ rope.src }}
+// 256 bf16 x -> fp32 out = x / rms(x) w, its dims 0 .. 63 rotated by cs [cos 32 | sin 32]
 __attribute__((noinline, minsize)) void {{ p }}_norm_rope(const bfloat16 *__restrict x, const float *__restrict w,
-                                                 const float *__restrict cs, const float *__restrict sn,
-                                                 float *__restrict out)
+                                                         const float *__restrict cs, float *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    aie::accum<accfloat, 64> ss = aie::zeros<accfloat, 64>();
-    for (int i = 0; i < {{ HD }}; i += 64)
-        ss = aie::mac_square(ss, aie::load_v<64>(x + i));
-    const float inv = al::inv_rms<{{ HD }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
-    aie::vector<bfloat16, 32> ih, il;  // (x is bf16: x / rms = x ih + x il, mulff's products less x's lo part, 0)
-    al::split2<32>(aie::broadcast<float, 32>(inv), ih, il);
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < {{ HD }}; i += 32) {
-        const aie::vector<bfloat16, 32> xb = aie::load_v<32>(x + i);
-        aie::store_v(out + i, al::mulff<32>(aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>(), aie::load_v<32>(w + i)));
-    }
-    const aie::vector<float, 32> a = aie::load_v<32>(out), b = aie::load_v<32>(out + 32);
-    const aie::vector<float, 32> c = aie::load_v<32>(cs), s = aie::load_v<32>(sn);
-    aie::store_v(out, aie::sub(al::mulff<32>(a, c), al::mulff<32>(b, s)));
-    aie::store_v(out + 32, aie::add(al::mulff<32>(a, s), al::mulff<32>(b, c)));
+    {{ nrm }}(x, w, out);
+    {{ rope }}(out, cs);
 }
 {% else %}
+{% set rope, rope_b = km.rope(32), km.rope(HD // 2, table="bf16") %}
+{{ rope.src }}
+{{ rope_b.src }}
 // 256 bf16 x -> fp32 out = x scale (scale's bf16 parts: two products), rotated as the layer's kind: a full layer's NeoX
 // pairs (i, i + 32) of dims 0 .. 63 by fp32 cos, sin (tab: [cos 32 | sin 32]), a sliding-window layer's (i, i + 128) of
-// every dim by bf16 ones ([cos 128 | sin 128] bf16: each product of fp32 x and bf16 c as x's hi and lo parts times c)
+// every dim by bf16 ones (tab: [cos 128 | sin 128] bf16)
 __attribute__((noinline, minsize)) void {{ p }}_rope(const bfloat16 *__restrict x, float scale, const uint8_t *__restrict tab,
                                                 int swa, float *__restrict out)
 {
@@ -44,25 +36,10 @@ __attribute__((noinline, minsize)) void {{ p }}_rope(const bfloat16 *__restrict 
         const aie::vector<bfloat16, 32> xb = aie::load_v<32>(x + i);
         aie::store_v(out + i, aie::mac(aie::mul(xb, sh), xb, sl).template to_vector<float>());
     }
-    if (swa) {
-        const bfloat16 *__restrict t = (const bfloat16 *)tab;
-        AIE_LOOP_NO_UNROLL
-        for (int i = 0; i < {{ HD // 2 }}; i += 32) {
-            aie::vector<bfloat16, 32> ah, alo, bh, blo;
-            al::split2<32>(aie::load_v<32>(out + i), ah, alo);
-            al::split2<32>(aie::load_v<32>(out + {{ HD // 2 }} + i), bh, blo);
-            const aie::vector<bfloat16, 32> c = aie::load_v<32>(t + i), sn = aie::load_v<32>(t + {{ HD // 2 }} + i);
-            aie::store_v(out + i, aie::msc(aie::msc(aie::mac(aie::mul(ah, c), alo, c), bh, sn), blo, sn).template to_vector<float>());
-            aie::store_v(out + {{ HD // 2 }} + i,
-                         aie::mac(aie::mac(aie::mac(aie::mul(ah, sn), alo, sn), bh, c), blo, c).template to_vector<float>());
-        }
-        return;
-    }
-    const float *__restrict cs = (const float *)tab;
-    aie::accum<accfloat, 32> o0, o1;
-    al::rot2<32>(aie::load_v<32>(out), aie::load_v<32>(out + 32), aie::load_v<32>(cs), aie::load_v<32>(cs + 32), o0, o1);
-    aie::store_v(out, o0.template to_vector<float>());
-    aie::store_v(out + 32, o1.template to_vector<float>());
+    if (swa)
+        {{ rope_b }}(out, (const bfloat16 *)tab);
+    else
+        {{ rope }}(out, (const float *)tab);
 }
 {% endif %}
 
@@ -519,7 +496,7 @@ __attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * s;
     AIE_LOOP_NO_UNROLL
     for (int h = 0; h < {{ QC }}; h++)
-        {{ p }}_norm_rope(pay + {{ 2 * HD }} * h, nrm, cs, cs + 32, AW(float, {{ a.y }}) + {{ HD }} * (8 * h + s));
+        {{ p }}_norm_rope(pay + {{ 2 * HD }} * h, nrm, cs, AW(float, {{ a.y }}) + {{ HD }} * (8 * h + s));
 {% else %}
 {% if WINDOW %}
     const int swa = st[{{ A_KD }}] == {{ KIND_SWA }};
@@ -559,7 +536,7 @@ __attribute__((minsize)) void {{ p }}_akv(const bfloat16 *__restrict x, int32_t 
     const float *__restrict nrm = AP(float, {{ A_NRM }});
     const float *__restrict cs = nrm + {{ 2 * HD }} + 64 * s;
     float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
-    {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, cs + 32, kf);
+    {{ p }}_norm_rope(kv, nrm + {{ HD }}, cs, kf);
 {% else %}
     float *__restrict kf = AW(float, {{ a.sc }});  // (the scores' region, before the cache)
 {% if WINDOW %}

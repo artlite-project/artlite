@@ -142,9 +142,6 @@ def prm_object(kind: Kind, c: float) -> np.ndarray:
 
 _PREP = templating.load("models/gemma4/attn_prefill.prep.cc.jinja")
 
-_NR0 = templating.load("models/gemma4/attn_prefill.nr0.cc.jinja")
-
-
 class GemmaPrepOperator(ArtcOperator):
     """The attention prep of T tokens of one layer kind (module docstring). Runtime sequence: G (the qkv GEMM's
     output, ``layout``), CS (the kind's ``cs_table`` of every position, as bf16 pairs), PRM (``prm_object``), QS (per
@@ -174,8 +171,7 @@ class GemmaPrepOperator(ArtcOperator):
         p = self.pfx
         k = self.kind
         args = {"p": p, "HD": k.hd, "ND": k.nd, "ROT": k.rot, "eps": repr(self.cfg.rms_norm_eps), "KP": k.kp}
-        return _NR0.render(**args) + _PREP.render(w=Attr(self.workspace()), HALVES=not k.swa,
-                                                                         **args)
+        return _PREP.render(w=Attr(self.workspace()), HALVES=not k.swa, **args)
 
     @property
     def n_cs(self) -> int:
