@@ -86,9 +86,9 @@ class SparkOverlay(ModelOverlay):
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None, tails: bool = True):
+                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None):
         if image is None and weights is None:
-            image = SparkImage(gguf, layers=layers, vocab=vocab, head=head, tails=tails)
+            image = SparkImage(gguf, layers=layers, vocab=vocab, head=head)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)

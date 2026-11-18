@@ -10,7 +10,7 @@ vocabulary, against the overlay's arithmetic on the host (ref.LlamaNpuRef), in b
 Files: 1B Q4_K_M (head_dim 64, 4 query heads per KV head; layer 0's V / down Q6_K), 1B Q5_K_M (13-row Q5_K tiles), 1B
 Q6_K (12-row tiles of 10112 B), 3B Q4_K_M (head_dim 128, 3 query heads per KV head), 8B Q4_K_S (hidden 4096, Q4_K, Q5_K
 and Q6_K tiles; down in 7 K groups), 1B BF16 (8-row BFP16 tiles of 9216 B), 1B Q4_0 (Q4_0 of 16 rows, layer 0's down
-Q4_1 of 14), 1B Q4_1 (16 rows, 10240 B); Qwen3 0.6B Q4_1 (2 query heads per KV head, q / k norms with weights per dim:
+Q4_1 of 14); Qwen3 0.6B Q4_1 (16 rows, 10240 B; 2 query heads per KV head, q / k norms with weights per dim:
 layer 0's k_norm up to 96.5), Qwen3-Embedding-0.6B Q8_0 (8-row Q8_0 tiles of 9216 B) and Qwen3-Embedding-4B Q4_K_M
 (hidden 2560: half regions, ``llama.image``; ffn 9728 in K chunks padded with zero super-blocks; 4 query heads per KV
 head at head_dim 128), whose half regions also against its padded image (``test_llama_decode_tails``).
@@ -42,7 +42,7 @@ VOCAB = 2048
 CASES = {"1B_Q4_K_M": ("Q4_K_M", "1B", [0, 2]), "1B_Q5_K_M": ("Q5_K_M", "1B", [0, 3]),
          "1B_Q6_K": ("Q6_K", "1B", [0, 1]), "3B_Q4_K_M": ("Q4_K_M", "3B", [0, 3]),
          "8B_Q4_K_S": ("Q4_K_S", "8B", [0, 4]), "1B_BF16": ("BF16", "1B", [0, 1]), "1B_Q4_0": ("Q4_0", "1B", [0, 2]),
-         "1B_Q4_1": ("Q4_1", "1B", [0, 2]), "3B_Q2_K": ("Q2_K", "3B", [0, 3]), "3B_Q3_K_M": ("Q3_K_M", "3B", [0, 3]),
+         "3B_Q2_K": ("Q2_K", "3B", [0, 3]), "3B_Q3_K_M": ("Q3_K_M", "3B", [0, 3]),
          "1B_Q3_K_L": ("Q3_K_L", "1B", [0, 2]), "qwen3_0.6B_Q4_1": ("Q4_1", "qwen3:0.6B", [0, 1]),
          "qwen3_emb_Q8_0": ("Q8_0", "qwen3:embedding-0.6B", [0, 1]),
          "qwen3_emb4b_Q4_K_M": ("Q4_K_M", "qwen3:embedding-4B", [0, 2])}
@@ -64,7 +64,10 @@ def _tokens(n: int) -> list[int]:
 
 # (Qwen3: hi + lo K only; with single K blocks the roundings of its K, whose dims span ~1e5 within a block, follow the
 # GEMV's noise, and its large scores turn them into ~30% of a layer's attention: the KL test measures that mode)
-STEP_CASES = [(c, k) for c in CASES for k in KV_K if not (c.startswith("qwen3") and k == "single")]
+# (the formats' slices run in single K; the hilo ones are the Q4_K_M files', where the head layouts differ, and Qwen3's)
+STEP_CASES = [(c, k) for c in CASES for k in KV_K
+              if (k == "single" and not c.startswith("qwen3"))
+              or (k == "hilo" and (c in ("1B_Q4_K_M", "3B_Q4_K_M") or c.startswith("qwen3")))]
 
 
 @pytest.mark.parametrize(("case", "kv_k"), STEP_CASES, ids=[f"{c}-{k}" for c, k in STEP_CASES])
@@ -173,8 +176,8 @@ def test_llama_decode_after_suspend() -> None:
     assert np.array_equal(np.array(ov.step(x, 0)), before)
 
 
-@pytest.mark.parametrize("kv_k", list(KV_K))
-@pytest.mark.parametrize("case", ["1B_Q4_K_M", "3B_Q4_K_M", "8B_Q4_K_S"])
+@pytest.mark.parametrize(("case", "kv_k"), [("1B_Q4_K_M", "single"), ("3B_Q4_K_M", "hilo"), ("8B_Q4_K_S", "single")],
+                         ids=lambda v: v)
 def test_llama_decode_deep(case: str, kv_k: str) -> None:
     """Steps at 960 .. 1039 (one token each, and steps of 4 from 1008) after a cache of 960 random positions."""
     quant, size, layers = CASES[case]

@@ -28,35 +28,22 @@ from models.qwen35.image import QwenImage
 from .. import dma_model as dm
 from ..model_files import require
 
-TILE_BYTES = {"Q4_0": 18496, "Q4_1": 20480, "Q4_K": 18496, "BFP16": 18432}
+# (rows per tile, tile bytes) of the tiles of 1024 columns the cases use
+TILES_1K = {"Q4_K": (16, 9280), "Q4_0": (16, 9280), "Q4_1": (16, 10240), "BFP16": (8, 9216)}
 
 
-def _op(fmt: str, *, M: int, K: int, passes: int, nrows: int = 4, silu: bool = False,
-        cb: bool = False, lines: bool = False) -> GemmQOperator:
-    """Tiles of 2048 columns, a column's K chunks outer (``kc_group`` 1: chunk kc's row tiles after chunk kc - 1's)."""
-    R = 8 if fmt == "BFP16" else 16
-    S = TILE_BYTES[fmt]
-    tiles = 64 // R
-    n_kc = K // 2048
-    col_bytes = max(n_kc, 1) * passes * tiles * S
+def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False, fmt: str = "Q4_K",
+          nrows: int = 4) -> GemmQOperator:
+    """Tiles of 1024 columns (Q4_K and Q4_0: Llama's 9280-B objects, the header half a slice), a row tile's chunks
+    consecutive (or in groups of kc_group)."""
+    R, S = TILES_1K[fmt]
+    n_kc = K // 1024
+    col_bytes = n_kc * passes * (64 // R) * S
     step = 32 if silu else 64
     N = COLS * passes * step
     out_cols = [[c * passes * step + step * p for p in range(passes)] for c in range(COLS)]
     return GemmQOperator(fmt=fmt, rows=R, M=M, K=K, N=N, tile_bytes=S, col_bytes=col_bytes, passes=passes,
-                         out_cols=out_cols, kc_group=1 if n_kc > 1 else 0, silu=silu, nrows=nrows, c_bfp16=cb,
-                         lines=lines)
-
-
-def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False, fmt: str = "Q4_K") -> GemmQOperator:
-    """Q4_K or Q4_0 tiles of 1024 columns (Llama: 9280-B objects, the header half a slice), a row tile's chunks
-    consecutive (or in groups of kc_group)."""
-    S, n_kc = 9280, K // 1024
-    col_bytes = n_kc * passes * 4 * S
-    step = 32 if silu else 64
-    N = COLS * passes * step
-    out_cols = [[c * passes * step + step * p for p in range(passes)] for c in range(COLS)]
-    return GemmQOperator(fmt=fmt, rows=16, M=M, K=K, N=N, tile_bytes=S, col_bytes=col_bytes, passes=passes,
-                         out_cols=out_cols, silu=silu, c_bfp16=silu, kc=1024, kc_group=kc_group)
+                         out_cols=out_cols, silu=silu, c_bfp16=silu, kc=1024, kc_group=kc_group, nrows=nrows)
 
 
 def _op_planar(fmt: str, *, R: int, S: int, kc: int, M: int, K: int, tiles: int, blocks: tuple[tuple[int, int], ...],
@@ -203,38 +190,42 @@ def _expected_a(op: GemmQOperator, ch: int, row: int) -> list[np.ndarray]:
     return out
 
 
+# (tag, format, kwargs): tile-major tiles of 1024 columns
 CASES = [
-    ("Q4_0", {"M": 256, "K": 2048, "passes": 3}),
-    ("Q4_0", {"M": 512, "K": 2048, "passes": 2, "silu": True, "cb": True}),
-    ("Q4_0", {"M": 512, "K": 2048, "passes": 4, "silu": True, "cb": True, "lines": True}),  # (pairs of passes)
-    ("Q4_0", {"M": 256, "K": 8192, "passes": 2}),  # down: A refetched per pass in K chunks
-    ("Q4_0", {"M": 64, "K": 2048, "passes": 2, "nrows": 2}),
-    ("Q4_1", {"M": 256, "K": 2048, "passes": 2, "silu": True, "cb": True}),
-    ("Q4_K", {"M": 256, "K": 8192, "passes": 2}),
-    ("BFP16", {"M": 256, "K": 2048, "passes": 2, "silu": True, "cb": True}),
-    ("Q4_K", {"M": 64, "K": 2048, "passes": 2, "nrows": 2}),
+    ("BFP16", "BFP16", {"M": 256, "K": 2048, "passes": 2, "silu": True}),  # (Llama BF16's and Flint's gate_up)
+    ("Q4_1", "Q4_1", {"M": 256, "K": 2048, "passes": 2, "silu": True}),
+    ("Q4_K", "Q4_K", {"M": 64, "K": 2048, "passes": 2, "nrows": 2}),  # (the prefill's nrows of T <= 64)
+    ("Q4_K-3B", "Q4_K", {"M": 256, "K": 3072, "passes": 6}),  # a row tile's chunks consecutive, per-pass fills
+    ("Q4_K-3B", "Q4_K", {"M": 512, "K": 3072, "passes": 3, "silu": True}),
+    ("Q4_K-3B", "Q4_K", {"M": 256, "K": 8192, "passes": 2, "kc_group": 2}),  # down: the decode's activation objects
+    # Q4_0 tiles of 1024 columns (Llama 1B Q4_0: the header half a slice, as Q4_K's)
+    ("Q4_0-1K", "Q4_0", {"M": 256, "K": 2048, "passes": 3}),
+    ("Q4_0-1K", "Q4_0", {"M": 1024, "K": 2048, "passes": 2, "silu": True}),
 ]
 
 
-CASES_3B = [
-    {"M": 256, "K": 3072, "passes": 6},  # a row tile's chunks consecutive, per-pass fills
-    {"M": 512, "K": 3072, "passes": 3, "silu": True},
-    {"M": 256, "K": 8192, "passes": 2, "kc_group": 2},  # down: the decode's activation objects
-]
-
-# Q4_0 tiles of 1024 columns (Llama 1B Q4_0: the header half a slice, as Q4_K's)
-CASES_Q40_1K = [
-    {"M": 256, "K": 2048, "passes": 3},
-    {"M": 1024, "K": 2048, "passes": 2, "silu": True},
-]
-
-ALL = CASES + [("Q4_K-3B", kw) for kw in CASES_3B] + [("Q4_0-1K", kw) for kw in CASES_Q40_1K]
+def _check_l1_q(op: GemmQOperator) -> None:
+    assert op._l1_layout() is not None
+    _check_l1(op)
+    assert op._l1_bytes(op.geo, op.plan) <= 62 * 1024
 
 
-@pytest.mark.parametrize("fmt,kw", ALL, ids=[f"{f}-" + "-".join(f"{k}{v}" for k, v in kw.items()) for f, kw in ALL])
-def test_gemm_q_dataflow(fmt: str, kw: dict) -> None:
-    op = _op3b(**kw) if fmt == "Q4_K-3B" else _op3b(**kw, fmt="Q4_0") if fmt == "Q4_0-1K" else _op(fmt, **kw)
-    assert (op.c_parts == 2) == kw.get("lines", False)
+def _check_l1_qd(op: GemmQdOperator) -> None:
+    """The L1 choices are a pure function of the geometry: asking for another token count changes nothing of the
+    operator."""
+    _check_l1(op)
+    geo, plan = op.geo, op.plan
+    assert op._plan_l1(geo) == replace(plan, csplit=0)
+    for m in (16, 32, 48):
+        op._l1_bytes(geo.with_m(m), op._plan_l1(geo.with_m(m)))
+        assert (op.geo, op.plan) == (geo, plan)
+
+
+@pytest.mark.parametrize("tag,fmt,kw", CASES,
+                         ids=[f"{t}-" + "-".join(f"{k}{v}" for k, v in kw.items()) for t, _, kw in CASES])
+def test_gemm_q_dataflow(tag: str, fmt: str, kw: dict) -> None:
+    op = _op3b(fmt=fmt, **kw)
+    assert op.c_parts == 1
     df = op.flow
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
@@ -242,6 +233,7 @@ def test_gemm_q_dataflow(fmt: str, kw: dict) -> None:
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)
+    _check_l1_q(op)
 
 
 def _check_weights(op: GemmQOperator, df: object) -> None:
@@ -359,21 +351,18 @@ def test_check_shim_tap() -> None:
 
 # planar tiles (GemmQd): (format, rows, tile bytes, columns, kwargs)
 CASES_PLANAR = [
-    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 5, "blocks": ((0, 4), (20, 1), (25, 1)), "region_rt": 30}),
-    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 10, "blocks": ((0, 4),), "region_rt": 40, "silu": True}),
-    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 10, "blocks": ((0, 4),), "region_rt": 40, "silu": True,
-                               "lines": True}),  # (a pass's halves in one C object)
+    ("Q5_K", 13, 9280, 1024, {"M": 192, "K": 2048, "tiles": 10, "blocks": ((0, 4),), "region_rt": 40, "silu": True,
+                              "lines": True}),  # (a pass's halves in one C object)
     ("Q5_K", 13, 9280, 1024, {"M": 64, "K": 3072, "tiles": 10, "blocks": ((0, 3),), "region_rt": 30, "silu": True,
                               "mac_rows": 1}),
-    ("Q4_1", 14, 18496, 2048, {"M": 192, "K": 8192, "tiles": 4, "blocks": ((0, 5),), "region_rt": 19, "kc_group": 1}),
     ("Q4_1", 14, 9280, 1024, {"M": 128, "K": 8192, "tiles": 4, "blocks": ((0, 7),), "region_rt": 28, "kc_group": 2,
                               "mac_rows": 2}),
     ("Q6_K", 11, 9280, 1024, {"M": 192, "K": 3072, "tiles": 6, "blocks": ((0, 2),), "region_rt": 12}),
     # whole-line drains (passes of 66 columns: carries of 0, 2, 4, 6 columns; of 65 rows and a zero column, in blocks)
     ("Q6_K", 11, 9280, 1024, {"M": 288, "K": 2048, "tiles": 6, "blocks": ((0, 4),), "region_rt": 24, "m": 96,
                               "lines": True}),
-    ("Q5_K", 13, 18496, 2048, {"M": 192, "K": 2048, "tiles": 5, "blocks": ((0, 4), (20, 1), (25, 1)), "region_rt": 30,
-                               "lines": True}),
+    ("Q5_K", 13, 9280, 1024, {"M": 192, "K": 2048, "tiles": 5, "blocks": ((0, 4), (20, 1), (25, 1)), "region_rt": 30,
+                              "lines": True}),
     # SiLU groups whose padding rows reach the MMUL (Q6_K's d chunks; a half-slice Q4 header): outputs dropped
     ("Q6_K", 11, 9280, 1024, {"M": 144, "K": 3072, "tiles": 12, "blocks": ((0, 2),), "region_rt": 24, "silu": True,
                               "m": 48}),
@@ -383,9 +372,8 @@ CASES_PLANAR = [
     ("Q2_K", 26, 9408, 1024, {"M": 192, "K": 3072, "tiles": 3, "blocks": ((0, 2), (6, 1)), "region_rt": 9}),
     ("Q2_K", 26, 9408, 1024, {"M": 192, "K": 3072, "tiles": 5, "blocks": ((0, 2),), "region_rt": 10, "silu": True}),
     ("Q3_K", 21, 9408, 1024, {"M": 192, "K": 8192, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12, "kc_group": 2}),
-    ("Q3_K", 22, 20160, 2048, {"M": 128, "K": 2048, "tiles": 6, "blocks": ((0, 2),), "region_rt": 12, "silu": True,
-                               "mac_rows": 2}),
-    ("Q3_K", 22, 20160, 2048, {"M": 64, "K": 2048, "tiles": 3, "blocks": ((0, 3),), "region_rt": 9, "mac_rows": 1}),
+    ("Q3_K", 22, 9856, 1024, {"M": 128, "K": 2048, "tiles": 6, "blocks": ((0, 2),), "region_rt": 12, "silu": True,
+                              "mac_rows": 2}),
     # Gemma's Q4_0 tiles of 32 rows x 512 columns: 16-row sub-units, a header unit per 4 K chunks (groups of 4 and 1)
     ("Q4_0", 32, 9216, 512, {"M": 288, "K": 2560, "tiles": 2, "blocks": ((0, 5),), "region_rt": 10, "m": 96}),
     ("Q4_0", 32, 9216, 512, {"M": 288, "K": 2560, "tiles": 4, "blocks": ((0, 3),), "region_rt": 12, "silu": True,
@@ -424,6 +412,7 @@ def test_gemm_qd_planar_dataflow(fmt: str, R: int, S: int, kc: int, kw: dict) ->
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)
+    _check_l1_qd(op)
 
 
 def _op_half(fmt: str, *, R: int, S: int, M: int, blocks: list[tuple[int, bool]], silu: bool = False,
@@ -486,6 +475,7 @@ def test_gemm_half_dataflow(fmt: str, R: int, S: int, kw: dict) -> None:
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)
+    _check_l1(op)
 
 
 def _check_l1(op: GemmQOperator) -> None:
@@ -512,35 +502,17 @@ def _check_l1(op: GemmQOperator) -> None:
             assert e0 <= a1, (n0, a0, e0, n1, a1)
 
 
-@pytest.mark.parametrize("fmt,kw", ALL, ids=[f"{f}-" + "-".join(f"{k}{v}" for k, v in kw.items()) for f, kw in ALL])
-def test_gemm_q_l1_layout(fmt: str, kw: dict) -> None:
-    op = _op3b(**kw) if fmt == "Q4_K-3B" else _op3b(**kw, fmt="Q4_0") if fmt == "Q4_0-1K" else _op(fmt, **kw)
-    assert op._l1_layout() is not None
-    _check_l1(op)
-    assert op._l1_bytes(op.geo, op.plan) <= 62 * 1024
-
-
-@pytest.mark.parametrize("fmt,R,S,kc,kw", CASES_PLANAR,
-                         ids=[f"{f}-r{r}-kc{k}-" + "-".join(f"{a}{v}" for a, v in kw.items() if a != "blocks")
-                              for f, r, _, k, kw in CASES_PLANAR])
-def test_gemm_qd_l1_layout(fmt: str, R: int, S: int, kc: int, kw: dict) -> None:
-    """The L1 choices are a pure function of the geometry: asking for another token count changes nothing of the
-    operator."""
-    op = _op_planar(fmt, R=R, S=S, kc=kc, **kw)
-    _check_l1(op)
-    geo, plan = op.geo, op.plan
-    assert op._plan_l1(geo) == replace(plan, csplit=0)
-    for m in (16, 32, 48):
-        op._l1_bytes(geo.with_m(m), op._plan_l1(geo.with_m(m)))
-        assert (op.geo, op.plan) == (geo, plan)
-
-
 HALF_FILES = {"embedding-4B": (qwen3_gguf, "embedding-4B", (0, 4)), "kev": (decision_gguf, "kev", (0, 3)),
               "minicpmv-1B": (minicpmv_gguf, None, (0, 3)), "d3-lite": (decision_gguf, "d3-lite", (0, 3))}
 
 
-@pytest.mark.parametrize("pairs", [False, True], ids=["unpaired", "pairs"])
-@pytest.mark.parametrize("name", HALF_FILES)
+# (MiniCPM-V 1B's and d3-lite's half regions are only down: pairs change nothing there)
+HALF_CASES = [(n, p) for n in HALF_FILES for p in (False, True) if p <= (n in ("embedding-4B", "kev"))]
+
+
+@pytest.mark.parametrize("name,pairs", HALF_CASES,
+                         ids=[f"{n}-{'pairs' if p else 'unpaired'}" if n in ("embedding-4B", "kev") else n
+                              for n, p in HALF_CASES])
 def test_gemm_half_plans(name: str, pairs: bool) -> None:
     """The prefill's GEMMs of a file's half regions (``decode.image.Region.half``; Qwen3-Embedding-4B's qkv: Q4_K and a
     planar Q6_K v, gate_up; Kev-4B's gdn_in and attn_in: planar Q8_0, gate_up; ``pairs``: gate / up in pass pairs;

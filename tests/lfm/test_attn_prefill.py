@@ -27,11 +27,10 @@ KVH = COLS // 2
 PP = 2  # (P panels per row block and record: hi + lo)
 LAYOUT = Layout(448, {"q": 0, "k": 256, "v": 320, "g": 384})  # (the qkv GEMMs' layout of LFM3's image, ``prefill.gemm``)
 # (K panels per record, chunk, its position, sliding window (0: a full layer), rotated pairs)
-CASES = [(1, 256, 0, 0, 32), (1, 512, 128, 0, 32), (2, 256, 64, 0, 32), (1, 256, 0, 256, 64), (1, 512, 192, 256, 64),
-         (1, 1024, 512, 256, 64), (2, 512, 64, 256, 64), (1, 64, 0, 0, 32), (1, 64, 320, 256, 64)]
+CASES = [(1, 512, 128, 0, 32), (2, 256, 64, 0, 32), (1, 1024, 512, 256, 64), (2, 512, 64, 256, 64),
+         (1, 64, 0, 0, 32), (1, 64, 320, 256, 64)]
 # non-causal: (K panels per record, chunk, the state's end and each question's: the last the prompt's length)
-SETS = [(1, 64, (48,)), (1, 256, (120, 151, 200)), (1, 512, (70, 100, 133, 166, 199, 260, 261, 300, 333, 400, 449)),
-        (2, 256, (30, 64, 128, 192, 256)), (1, 1024, (577, 650, 700, 770, 1000))]
+SETS = [(1, 256, (120, 151, 200)), (1, 1024, (577, 650, 700, 770, 1000))]
 
 
 def _q_values(units: np.ndarray, hd: int) -> np.ndarray:

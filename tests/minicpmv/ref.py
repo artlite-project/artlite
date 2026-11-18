@@ -6,9 +6,7 @@ tensors for one entry's pixels (3, H, W): the patch embedding, the learned posit
 ViT layers (LayerNorm with bias, 16 heads of 72, GELU tanh), the ViT merger after layer ``insert`` (attention inside
 2 x 2 windows, then a 2 x 2 merge: 4 x 1152 -> LayerNorm -> GELU tanh MLP (17216) -> 1152, plus the 4 tokens' mean;
 16x files only), the post LayerNorm and the final 2 x 2 merge (4608 -> LayerNorm -> 4608 GELU erf -> 1024), then the
-entry's separator rows of ``v.tok_embd_sep``. In float64, or with ``llama=True`` llama.cpp's CPU rounding: the patch
-embedding in fp16 (pixels and kernel: ggml_conv_2d's im2col), a matmul against BF16 weights takes its activations as
-bf16, GELU tanh goes through ggml's fp16 table. ``NpuEncoder``: the encoder at the NPU's rounding points
+entry's separator rows of ``v.tok_embd_sep``, in float64. ``NpuEncoder``: the encoder at the NPU's rounding points
 (``models.minicpmv.encoder`` on the vision overlay).
 """
 
@@ -21,7 +19,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 from models.minicpmv import encoder as vision
 
-from ..numerics import bf16_like, gelu_table, gelu_tanh
+from ..numerics import bf16_like, gelu_tanh
 
 # the separator rows of v.tok_embd_sep after an entry by its place (clip-impl.h clip_suffix_rows): 0 </image>,
 # 1 <slice>, 2 </slice>, 3 "\n"
@@ -34,17 +32,16 @@ SUFFIX_ROWS = {"ov": [0], "ov_slice": [0, 1], "slice": [2, 1], "row_end": [2, 3,
 
 
 class Encoder:
-    """MiniCPM-V 4.7's vision encoder from its mmproj file (module docstring); ``llama``: llama.cpp's CPU rounding."""
+    """MiniCPM-V 4.7's vision encoder from its mmproj file (module docstring)."""
 
-    def __init__(self, mmproj: str, *, llama: bool = False):
+    def __init__(self, mmproj: str):
         self.g = g = GGUFFile(mmproj)
         self.cfg = cfg = ClipConfig.from_gguf(g)
         assert cfg.projector == "minicpmv4_7", cfg.projector
         self.hidden, self.heads, self.hd = cfg.hidden, cfg.heads, cfg.head_dim
         self.layers, self.patch, self.eps = cfg.layers, cfg.patch_size, cfg.eps
         self.merge, self.insert = cfg.merge, cfg.merger_layer  # (the ViT merger and the final merge, or the final only)
-        self.llama = llama
-        self.dtype = torch.float32 if llama else torch.float64
+        self.dtype = torch.float64
         self._w: dict[str, torch.Tensor] = {}
 
     def w(self, name: str) -> torch.Tensor:
@@ -59,8 +56,6 @@ class Encoder:
 
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
-        if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = bf16_like(x)
         y = x @ w.T
         return y + self.w(bias).reshape(-1) if bias else y
 
@@ -71,7 +66,7 @@ class Encoder:
             + self.w(prefix + ".bias").reshape(-1)
 
     def _gelu(self, x: torch.Tensor) -> torch.Tensor:
-        return gelu_table(x) if self.llama else gelu_tanh(x)
+        return gelu_tanh(x)
 
     def _attn(self, x: torch.Tensor, p: str, mask: torch.Tensor | None = None) -> torch.Tensor:
         n = x.shape[0]
@@ -142,8 +137,6 @@ class Encoder:
         x = torch.as_tensor(np.asarray(pixels), dtype=self.dtype)
         ph, pw = x.shape[1] // P, x.shape[2] // P
         kern = self.w("v.patch_embd.weight").reshape(H, 3, P, P)
-        if self.llama:  # (ggml_conv_2d: im2col in fp16 for an F32 kernel, the kernel converted for the F16 dot products)
-            x, kern = (t.to(torch.float16).to(self.dtype) for t in (x, kern))
         e = torch.nn.functional.conv2d(x[None], kern, stride=P)[0]  # (H, ph, pw)
         x = e.reshape(H, -1).T + self.w("v.patch_embd.bias").reshape(-1)
         x = x + self.w("v.position_embd.weight")[torch.from_numpy(self.positions(ph, pw))]

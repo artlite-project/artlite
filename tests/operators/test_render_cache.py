@@ -10,6 +10,7 @@ from artlite.operators import FusedOperator
 from artlite.operators import render_cache as rc
 
 from .elementwise import GeluOperator, SiluOperator, StreamOperator
+from .test_fused import AddOperator
 
 
 def test_keys(request: pytest.FixtureRequest) -> None:
@@ -37,15 +38,20 @@ def test_keys(request: pytest.FixtureRequest) -> None:
     assert rc._fused_key(fused([a, b])) == rc._fused_key(fused([b, a]))
 
 
+def _silu_add() -> FusedOperator:
+    """The runlist of ``test_fused.TestFusedOperator.test_silu_add`` (its designs are built there already)."""
+    return FusedOperator(name="test_silu_add", runlist=[(SiluOperator(size=1024), "in", "scratch"),
+                                                        (AddOperator(size=1024), "in", "scratch", "out")],
+                         input_args=["in"], output_args=["out"])
+
+
 def test_hit() -> None:
     """A second compile of equal operators attaches the first's build without rendering (an ArtcOperator, a
     FusedOperator)."""
-    first = SiluOperator(size=1024, tile_size=256).compile()
-    f1 = FusedOperator(name="t_rc_hit", runlist=[(SiluOperator(size=1024, tile_size=256), "x", "y")],
-                       input_args=["x"], output_args=["y"]).compile()
-    again = SiluOperator(size=1024, tile_size=256)
-    f2 = FusedOperator(name="t_rc_hit", runlist=[(SiluOperator(size=1024, tile_size=256), "x", "y")],
-                       input_args=["x"], output_args=["y"])
+    first = SiluOperator(size=1024).compile()
+    f1 = _silu_add().compile()
+    again = SiluOperator(size=1024)
+    f2 = _silu_add()
 
     def no_render() -> None:
         raise AssertionError("rendered")

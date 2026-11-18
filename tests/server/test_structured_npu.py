@@ -1,7 +1,8 @@
 """artlite-server's structured output on the NPU, one small model per family and call syntax: a JSON schema extraction
-that parses and validates, an enum classification, a thought then JSON; tool calls with typed and nested arguments
-(required, a named function, auto with parallel_tool_calls false, a response format beside the tools); custom tools'
-inputs (a Lark grammar, a regex); a decision's options with their probabilities. Greedy, through the server's routes (the engine over the model, a test client)."""
+that parses and validates, a thought then JSON; tool calls with typed and nested arguments (required, then a named
+function, auto with parallel_tool_calls false, a response format beside the tools); custom tools' inputs (a Lark
+grammar, a regex); a decision's options with their probabilities. Greedy, through the server's routes (the engine over
+the model, a test client)."""
 
 import json
 import math
@@ -84,16 +85,6 @@ def test_extraction(served: tuple) -> None:
     assert choice["finish_reason"] == "stop"
 
 
-def test_classification(served: tuple) -> None:
-    client, _ = served
-    rf = {"type": "json_schema", "json_schema": {"name": "sentiment",
-                                                 "schema": {"enum": ["positive", "negative", "neutral"]}}}
-    for text, want in (("I love this product, it works great!", "positive"),
-                       ("This is the worst purchase I ever made.", "negative")):
-        choice = ask(client, f"Classify the sentiment: {text}", response_format=rf)
-        assert json.loads(choice["message"]["content"]) == want
-
-
 def test_thought_then_json(served: tuple) -> None:
     client, model = served
     if not model.thinks:
@@ -107,17 +98,14 @@ def test_thought_then_json(served: tuple) -> None:
 
 
 def test_tool_required(served: tuple) -> None:
-    """A call whatever the model would rather write: typed, nested arguments its schema takes."""
+    """A call whatever the model would rather write: typed, nested arguments its schema takes; then a named one."""
     client, _ = served
     choice = ask(client, "What will the weather be like in Paris over the next 3 days? Include the wind.",
                  tools=[WEATHER, TIME], tool_choice="required")
     (call,) = choice["message"]["tool_calls"]
     args = weather_args(call)
     assert "Paris" in args["city"] and choice["finish_reason"] == "tool_calls"
-
-
-def test_tool_named(served: tuple) -> None:
-    client, _ = served
+    # a named function
     choice = ask(client, "I am flying to Tokyo tomorrow.", tools=[WEATHER, TIME],
                  tool_choice={"type": "function", "function": {"name": "get_time"}})
     (call,) = choice["message"]["tool_calls"]

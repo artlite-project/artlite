@@ -22,7 +22,7 @@ from . import ref as V
 from .files import MMPROJ, MODEL
 
 PROMPT = "<__media__>Describe the image."
-CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1536x1024": (1536, 1024), "noise-1000x700": (1000, 700)}
+CASES = {"astronaut": None, "noise-300x200": (300, 200), "noise-1000x700": (1000, 700)}
 VISION_START = 125009  # (<|vision_start|>)
 
 

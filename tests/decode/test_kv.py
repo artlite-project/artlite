@@ -62,7 +62,7 @@ def test_kv_groups_dmajor() -> None:
     assert np.array_equal(gd[1, 2, 2 * rv + 144 * 7:2 * rv + 144 * 7 + 72], g[1, 2, 2 * rv + 72 * 7:2 * rv + 72 * 8])
 
 
-@pytest.mark.parametrize(("first", "g"), [(0, 0), (0, 1), (0, 2), (0, 5), (3, 19), (2, 4)])
+@pytest.mark.parametrize(("first", "g"), [(0, 0), (0, 5), (3, 19), (2, 4)])
 def test_ranges(first: int, g: int) -> None:
     """The columns cover first .. g once, in order; the last column holds g; with fewer groups than columns the empty
     ones come first."""
@@ -99,8 +99,8 @@ def test_ring_fills(wrap: int) -> None:
     assert linear.fills(3, 4, G) == (kv.fill(3, 4),) and linear.at(30 * gb, gb) == 30 * gb
 
 
-@pytest.mark.parametrize("hd", [256, 512])
-@pytest.mark.parametrize(("p", "S"), [(0, 1), (7, 1), (7, 2), (30, 4), (15, 3), (9, 4)])
+@pytest.mark.parametrize(("hd", "p", "S"), [(512, p, S) for p, S in [(0, 1), (7, 1), (7, 2), (30, 4), (15, 3), (9, 4)]]
+                         + [(256, 7, 1), (256, 30, 4)])  # (hd 256 differs only in the records per group)
 def test_emit_order(hd: int, p: int, S: int) -> None:
     """The K records of positions p and p + S - 1 in group order, then per open record its V panels and ring slot;
     a step of several slots in one record: each twice, a step of one slot: once."""

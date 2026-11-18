@@ -1,8 +1,8 @@
 """Qwen3.6-35B-A3B with an image on the NPU (models.qwen35 with Qwen3-VL's mmproj: a ``Sequence`` prompt): an essay
 paragraph, the astronaut, more essay and a question, teacher-forced over a description of the image, against
-llama.cpp's own encoder and language model on the CPU (``ref.golden``). With llama.cpp's embeddings the prompt's
-tokens and positions (the official M-RoPE ones, mtmd's) are tested on their own, through the prefill and as decode
-steps; the app's path (``Qwen(mmproj=)``) adds the NPU encoder."""
+llama.cpp's own encoder and language model on the CPU (``ref.golden``): the prompt's tokens and positions (the
+official M-RoPE ones, mtmd's) against llama.cpp's, then the app's path (``Qwen(mmproj=)``: the NPU encoder's
+embeddings through the prefill and decode steps)."""
 
 
 import numpy as np
@@ -11,7 +11,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from models.qwen3vl import host as Q
-from models.qwen35.qwen import NpuQwen, Qwen
+from models.qwen35.qwen import Qwen
 from models.sequence import MEDIA
 from models.tokenizer import BpeTokenizer, chat_prompt
 
@@ -55,24 +55,10 @@ def case() -> tuple:
     return seq, answer, want
 
 
-def test_image_prompt(case: tuple) -> None:
-    """llama.cpp's embeddings at the prompt's positions: through the prefill (chunks of 256: the image across a
-    boundary) and as decode steps, within the language model's own distance from llama.cpp's (KL ~0.005, argmax
-    agreement ~0.97)."""
-    seq, answer, want = case
-    for prefill in (True, False):
-        model = NpuQwen(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(256,))
-        got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
-        kl, agree = kl_report("prefill" if prefill else "steps", want, got)
-        assert model.rope_next == seq.next + len(answer) - 1  # (the text positions after the image's)
-        assert kl < 0.01 and agree > 0.93
-        del model
-
-
 def test_app_image_prompt(case: tuple) -> None:
     """The app's path (``Qwen(mmproj=)``: the chat prompt with the NPU encoder's embeddings) teacher-forced over the
-    description: the prompt's tokens and positions the reference's, the KL within ~2x of the language model's with
-    llama.cpp's embeddings (``test_image_prompt``; measured as close, ~0.005)."""
+    description: the prompt's tokens and positions the reference's, the KL within the gate (the language
+    model's own distance from llama.cpp's ~0.005, plus the encoder's)."""
     seq, answer, want = case
     app = Qwen(MODEL, mmproj=MMPROJ, spec_type="none")
     prompt = app.chat(_messages(ASTRONAUT))

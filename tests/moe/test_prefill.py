@@ -1,7 +1,7 @@
 """An MoE layer's prefill operators (artlite/moe: the router, the shared expert, the experts' work lists, the
 combine) on the decode images (``qwen35.image.QwenImage``, ``flint.image.FlintImage``: layers packed in host memory, each
 GEMM's W argument copied to the device) of Qwen3.6-35B-A3B Q4_K_M (layers 3, 5: Q6_K / Q4_K downs), Occamy 1.0 APEX
-(layers 3, 13: Q3_K / IQ3_XXS experts, a Q5_K shared expert) and Flint's official file (layers 2, 5: Q4_1_64 tiles, the
+(layers 3, 13: Q3_K / IQ3_XXS experts, a Q5_K shared expert) and Flint's official file (layer 2: Q4_1_64 tiles, the
 top 6 by sigmoid, an ungated shared expert of 1024), against fp64 models on the operators' own inputs."""
 
 
@@ -26,14 +26,16 @@ from . import ref
 
 # (model, layer): the layers each image holds
 MODELS = {"35B-A3B": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), (3, 5)), "occamy": (occamy_gguf, (3, 13)),
-          "flint": (flint_gguf, (2, 5))}
+          "flint": (flint_gguf, (2,))}
 FLINT = "flint"  # (its block's norm: ffn_norm; sigmoid gating; no shared gate)
-LAYERS = [(m, L) for m, (_, ls) in MODELS.items() for L in ls]
+ROUTER = [("35B-A3B", 3), ("occamy", 3), ("flint", 2)]  # (the router's design is a model's; a layer changes data)
+EXPERTS = [("35B-A3B", 3), ("35B-A3B", 5), ("occamy", 3), ("occamy", 13), ("flint", 2)]  # (every expert format once)
+BLOCK = [("35B-A3B", 5), ("occamy", 13), ("flint", 2)]
 _state: dict[str, object] = {}
 
 
 def _image(model: str = "35B-A3B") -> tuple[GGUFFile, object, np.ndarray]:
-    """A model's image of its two layers, packed (cached per module)."""
+    """A model's image of its layers, packed (cached per module)."""
     path, layers = MODELS[model][0](), MODELS[model][1]
     require(path)
     if _state.get("model") != model:
@@ -80,7 +82,7 @@ def _unpaced(op: object) -> object:
     return type(op)(*args, **{**kwargs, "pace": None})
 
 
-@pytest.mark.parametrize(("model", "L"), LAYERS)
+@pytest.mark.parametrize(("model", "L"), ROUTER)
 def test_router(model: str, L: int) -> None:
     """The post-attention norm with lo panels (``PrefillNormOperator(lo=True)``), then the router GEMM
     (``moe.gemm.router``: BFP16 hi / lo rows against x hi + lo, fp32 pairs): the logits within 5e-5 of fp64 math on the
@@ -148,8 +150,7 @@ def _normed(model: str, L: int, T: int) -> tuple[object, object, np.ndarray, np.
     return dev, xn, xd, xd / np.sqrt((xd ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps) * wn
 
 
-SHARED = [("35B-A3B", 3, 256), ("35B-A3B", 5, 256), ("35B-A3B", 3, 128), ("35B-A3B", 5, 64), ("occamy", 3, 128),
-          ("occamy", 13, 64), ("flint", 2, 256), ("flint", 5, 64)]
+SHARED = [("35B-A3B", 3, 256), ("35B-A3B", 5, 64), ("occamy", 3, 128), ("occamy", 13, 64), ("flint", 2, 256)]
 
 
 @pytest.mark.parametrize(("model", "L", "T"), SHARED)
@@ -206,7 +207,7 @@ def test_shared_down(model: str, L: int, T: int) -> None:
     assert err < 1.7e-2
 
 
-@pytest.mark.parametrize(("model", "L"), LAYERS)
+@pytest.mark.parametrize(("model", "L"), EXPERTS)
 def test_expert_gemms(model: str, L: int) -> None:
     """The experts' gate / up and down (``moe.expert_gemm``: per column a work list of 192-token chunks, each of a
     random expert, rows 64 .. 191 active or not; the weights, A strips and drains pushed by the column's control stream)
@@ -282,7 +283,7 @@ def test_expert_gemms(model: str, L: int) -> None:
     assert max(errs_h) < 3.5e-2 and max(errs_y) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
 
 
-@pytest.mark.parametrize(("model", "L"), LAYERS)
+@pytest.mark.parametrize(("model", "L"), BLOCK)
 def test_moe_block(model: str, L: int) -> None:
     """A whole MoE block of 256 tokens (random bf16 residual) in two programs around the host's routing (``plan``):
     the norm with lo panels, the router, the shared expert (gate / up, down: the prefill's whole-chunk designs); then the

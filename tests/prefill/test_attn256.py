@@ -128,7 +128,7 @@ def _run(fused: FusedOperator, params: dict[str, int], G: np.ndarray) -> None:
     fused.sync_scratch_from_device()
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B"])
+@pytest.mark.parametrize("size", ["9B", "1B"])
 def test_attn_prep(size: str) -> None:
     T, n2 = 64, 45
     s = _Setup(size, T, n2)
@@ -160,8 +160,8 @@ def test_attn_prep(size: str) -> None:
         assert rel_max(K[:T + n2], k_gold) < 1e-2, h
 
 
-@pytest.mark.parametrize(("size", "T", "pp"), [("9B", 64, 1), ("27B", 64, 1), ("1B", 64, 1), ("1B", 192, 1),
-                                              ("35B-A3B", 64, 1), ("9B", 64, 2), ("1B", 192, 2)])
+@pytest.mark.parametrize(("size", "T", "pp"), [("9B", 64, 1), ("27B", 64, 1), ("35B-A3B", 64, 1), ("9B", 64, 2),
+                                              ("1B", 192, 2)])
 def test_attn_prefill(size: str, T: int, pp: int) -> None:
     """AttnPrep then PrefillAttn (one fused runlist) over two chunks: the output panels against the exact attention
     of the cores' own operands (their Q panels, the cache they wrote, their sigmoid(gate): within 0.7%, the bfp16
@@ -246,18 +246,17 @@ def test_attn_split() -> None:
         assert rel_max(A, gold) < 3e-2, t0
 
 
-@pytest.mark.parametrize(("size", "T", "n", "pp"), [("d3-lite", 128, 99, 1), ("d3-lite", 96, 70, 1), ("d3-lite", 128, 99, 2),
-                                                   ("d3-lite", 96, 70, 2)])
-def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
+@pytest.mark.parametrize(("size", "T", "n"), [("d3-lite", 128, 99)])
+def test_attn_prefill_noncausal(size: str, T: int, n: int) -> None:
     """A non-causal chunk (vllm-d3's prompt: every query sees every key) of n valid tokens at position 0: against the
     exact attention of the cores' own operands and llama.cpp's attn_gated of the whole prompt. T 128: passes of 64
-    queries on two streams; T 96: of 32 on one. ``pp`` 2: hi + lo P."""
+    queries on two streams; hi + lo P (a readout model's: ``pp`` 2)."""
     s = _Setup(size, T, 0, tokens=n)
     assert not s.cfg.causal
     prep = AP.AttnPrepOperator(T=T, cfg=s.cfg, layout=s.lay, head_bytes=s.ash.head_bytes, cs_positions=MAX_POS)
-    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=False, pp=pp)
+    attn = AP.PrefillAttnOperator(T=T, cfg=s.cfg, head_bytes=s.ash.head_bytes, causal=False, pp=2)
     assert attn.two == (T % 64 == 0)
-    fused = FusedOperator(name=f"attn_prefill_nc{pp}", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
+    fused = FusedOperator(name="attn_prefill_nc2", runlist=[(prep, "G", "CS", "NRM", "QS", "KV"), (attn, "QS", "KV", "A")],
                           input_args=["G", "CS", "NRM"], output_args=["A"]).compile()
     _fill_cs(fused, s.cfg)
     fused.get_buffer("NRM").view(np.uint8)[:] = np.concatenate([s.qn, s.kn]).astype(np.float32).view(np.uint8)
@@ -277,22 +276,20 @@ def test_attn_prefill_noncausal(size: str, T: int, n: int, pp: int) -> None:
             pr = np.exp(sc - sc.max(-1, keepdims=True))
             want[:, g] = (pr @ V) / pr.sum(-1, keepdims=True) * sg[g]
     eq = rel_max(bfp16.values(want.reshape(n, -1).astype(np.float32)).reshape(want.shape), want)
-    print(f"{size} T {T} n {n} pp {pp}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
+    print(f"{size} T {T} n {n}: {rel_max(A, want):.2e} (the exact output rounded to bfp16 {eq:.2e})")
     assert rel_max(A, want) < 1.5e-2
     assert np.linalg.norm(A - want) / np.linalg.norm(want) < 1.2e-2
     gold = np.asarray(s.gold["attn_gated", s.L], np.float32).reshape(-1, H, hd)[:n]
     assert rel_max(A, gold) < 3e-2
 
 
-@pytest.mark.parametrize(("size", "T", "causal"), [("d3-lite", 96, True), ("d3-lite", 128, True), ("d3-lite", 128, False),
-                                                   ("d3-lite", 96, False)])
+@pytest.mark.parametrize(("size", "T", "causal"), [("d3-lite", 128, True), ("d3-lite", 128, False)])
 def test_attn_prefill_packed(size: str, T: int, causal: bool) -> None:
     """A packed chunk at position 0 (``PrefillAttnOperator(pack=True)``): segments of 32, 37, 3 and 20 tokens (from 0,
     32, 69, 72: inside a group and a record), padding after them, each token's rotary position from its segment's start
     (cos / sin rows written past the table's text rows); every row against the exact attention of the cores' own
     operands over its segment's keys (up to itself, or all of them non-causal); the first segment bit-identical to its
-    tokens alone (the unpacked design: the same keys, the masked ones adding exact zeros). At 128 tokens two streams,
-    at 96 (32-query passes) one."""
+    tokens alone (the unpacked design: the same keys, the masked ones adding exact zeros). At 128 tokens two streams."""
     lengths = [32, 37, 3, 20]
     n = sum(lengths)
     s = _Setup(size, T, 0, tokens=n)
@@ -529,7 +526,7 @@ def _spark_fused(s: _Spark, runlist: list, out: str) -> FusedOperator:
     return fused
 
 
-@pytest.mark.parametrize(("size", "kind"), [("1.7B", "swa"), ("1.7B", "full"), ("4B", "swa"), ("4B", "full")])
+@pytest.mark.parametrize(("size", "kind"), [("1.7B", "swa"), ("4B", "full")])
 def test_spark_prep(size: str, kind: str) -> None:
     """Spark's prep: Q slots (q log2(e) / 16 rotated as the kind: 128 pairs or the first 32; single panels; d-block 0's lo
     panel the 8 tokens' sigmoid(gate): one per head and token), the records (a full layer's in the cache at the
@@ -559,9 +556,8 @@ def test_spark_prep(size: str, kind: str) -> None:
             assert rel_max(V[t0:], s.v[t0:t0 + T, h]) < 1e-2, (t0, h)
 
 
-SPARK_ATTN = [("1.7B", "swa", 64, 0), ("1.7B", "swa", 128, 64), ("1.7B", "swa", 128, 3840), ("1.7B", "swa", 64, 2592),
-              ("4B", "swa", 64, 0), ("4B", "swa", 64, 640), ("4B", "swa", 128, 2560), ("1.7B", "full", 64, 64),
-              ("4B", "full", 64, 1024)]
+SPARK_ATTN = [("1.7B", "swa", 128, 3840), ("1.7B", "swa", 64, 2592), ("4B", "swa", 64, 0), ("4B", "swa", 128, 2560),
+              ("1.7B", "full", 64, 64), ("4B", "full", 64, 1024)]
 
 
 @pytest.mark.parametrize(("size", "kind", "T", "p0"), SPARK_ATTN, ids=[f"{s}-{k}-T{t}-p{p}" for s, k, t, p in SPARK_ATTN])

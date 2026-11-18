@@ -1,7 +1,7 @@
 """Gemma 4 on the NPU against its host models, on the GGUF file (models.gemma4):
 
 - slices of layers (one sliding-window and one full-attention layer; the layers that share a KV
-  cache with the ones that own it) through ``GemmaOverlay.step``, one token or four per
+  cache with the ones that own it) through ``GemmaOverlay.step``, one, three or four tokens per
   dispatch, K cached as hi + lo or single blocks: logits, attention outputs, the residual and the
   caches against the overlay's arithmetic on the host (ref.GemmaNpuRef);
 - the whole model, teacher-forced: KL of the next-token distributions against the fp32
@@ -10,8 +10,7 @@
 - multi-token prediction: the drafter on the NPU against the fp32 drafter; a generated text is
   the model's own (every token the argmax of the logits of its position, which agree with the
   same text's steps of one token), in fewer dispatches than tokens; its drafts after prompts through
-  the prefill as after decode steps;
-- the tokenizer and the chat template on fixed examples (ids as llama.cpp's llama-tokenize).
+  the prefill as after decode steps (the tokenizer: test_tokenizer.py).
 """
 
 
@@ -104,9 +103,10 @@ def npu() -> object:
 # bf16 rounding, a few 0.1% per stage; a slice fed the raw embedding is not what its layers were trained on, and the
 # four layers from 22 on double the difference with every layer
 @pytest.mark.parametrize("kv_k", ["hilo", "single"])
-@pytest.mark.parametrize("batch", [1, 3, NB], ids=["one-token", "batch3", "batch"])  # (batch 3: steps of 3 and 2)
 @pytest.mark.parametrize(("layers", "tol"), [([0, 5], 0.015), ([22, 23, 24, 29], 0.04)], ids=["swa+full", "shared-kv"])
-def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: str) -> None:
+def test_gemma_overlay_layers(layers: list[int], tol: float, kv_k: str) -> None:
+    """The text in steps of 1 token, of 3 (steps of 3 and 2) and of NB on one overlay (``reset`` between the runs);
+    the worst error over the runs."""
     import numpy as np
 
     g = _gguf()
@@ -124,30 +124,33 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, batch: int, kv_k: s
     def keep(name: str, got: torch.Tensor, want: torch.Tensor) -> None:
         worst[name] = max(worst.get(name, 0.0), rel_finite(got, want))
 
-    for t0 in range(0, len(ids), batch):
-        n = min(batch, len(ids) - t0)
-        logits = to_torch(ov.step(x[t0:t0 + n], e[t0:t0 + n], t0)).float()
-        ov.dev.fetch("ACT")
-        act = ov.dev.view("ACT")
-        for s in range(n):
-            t = t0 + s
-            keep("logits", logits[s], want[t])
-            keep("r", ov.residual(s), trace["r"][t])
-            for layer in layers:
-                rg = ov.inp[(layer, "o")][0]
-                sp = packed_slots(n)
-                o = act[rg.off + XB:rg.off + XB + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, s].reshape(-1)
-                keep(f"attn.{layer}", torch.from_numpy(o.copy()).view(torch.bfloat16), trace[f"attn.{layer}"][t])
-    r0 = (len(ids) - 1) // 8 * 8  # (the last record: its values in the ring)
-    for layer, cache in model.caches.items():  # the caches as the last token left them
-        k, v = ov.read_kv(layer, range(len(ids)))
-        worst[f"K.{layer}"], worst[f"V.{layer}"] = rel_finite(k, cache.K), rel_finite(v, cache.V)
-        ov.dev.fetch("KV")
-        rows = [ring_rows(ov.dev.view("KV")[ov.ring(layer, h) + (r0 // 8 & 1) * ov.T:][:ov.T], ov.cfg.head_dim(layer))
-                for h in range(AT.KV_HEADS)]
-        worst[f"ring.{layer}"] = rel_finite(torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
-    print({k: round(v, 4) for k, v in worst.items()})
-    assert all(v < tol for v in worst.values()), worst
+    for batch in (1, 3, NB):
+        ov.reset()
+        for t0 in range(0, len(ids), batch):
+            n = min(batch, len(ids) - t0)
+            logits = to_torch(ov.step(x[t0:t0 + n], e[t0:t0 + n], t0)).float()
+            ov.dev.fetch("ACT")
+            act = ov.dev.view("ACT")
+            for s in range(n):
+                t = t0 + s
+                keep("logits", logits[s], want[t])
+                keep("r", ov.residual(s), trace["r"][t])
+                for layer in layers:
+                    rg = ov.inp[(layer, "o")][0]
+                    sp = packed_slots(n)
+                    o = act[rg.off + XB:rg.off + XB + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, s].reshape(-1)
+                    keep(f"attn.{layer}", torch.from_numpy(o.copy()).view(torch.bfloat16), trace[f"attn.{layer}"][t])
+        r0 = (len(ids) - 1) // 8 * 8  # (the last record: its values in the ring)
+        for layer, cache in model.caches.items():  # the caches as the last token left them
+            k, v = ov.read_kv(layer, range(len(ids)))
+            keep(f"K.{layer}", k, cache.K)
+            keep(f"V.{layer}", v, cache.V)
+            ov.dev.fetch("KV")
+            rows = [ring_rows(ov.dev.view("KV")[ov.ring(layer, h) + (r0 // 8 & 1) * ov.T:][:ov.T],
+                              ov.cfg.head_dim(layer)) for h in range(AT.KV_HEADS)]
+            keep(f"ring.{layer}", torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
+        print(f"{batch} per dispatch:", {k: round(v, 4) for k, v in worst.items()})
+        assert all(v < tol for v in worst.values()), (batch, worst)
 
 
 def test_gemma_npu_teacher_forced(cpu: _Cpu, npu: object) -> None:
@@ -204,19 +207,12 @@ def test_gemma_prefill(cpu: _Cpu, npu: object) -> None:
     assert all(v < (0.03 if k[0] == "K" else 0.04) for k, v in worst.items()), worst  # (K.11 0.021, V.11 0.029)
     assert kl < 0.0006 and agree > 0.94, f"KL(same) {kl:.5f}, argmax agreement {agree:.3f}"  # (0.00020, 1.0)
 
-
-def test_gemma_forward(cpu: _Cpu, npu: object) -> None:
-    """NpuGemma.forward with the prompt's last token in a prefill chunk (a chunk, then a step from the prefill's last
-    layer on: GemmaOverlay.step(start=)): its logits against the fp32 reference's and those of the same token as a
-    whole decode step after the prompt's other tokens; the next step continues from both."""
-
-    g = npu.gguf
-    tok = GemmaTokenizer(g)
-    prompt = tok.encode(chat_prompt(g, [{"role": "user", "content": LONG}]))
-    npu.reset()
+    # NpuGemma.forward with the prompt's last token in a prefill chunk (a chunk, then a step from the prefill's last
+    # layer on: GemmaOverlay.step(start=)): the logits of the first two text tokens' rows (0 and 1 of ``want``)
+    # against the fp32 reference's and those of the same token as a whole decode step after the prompt's other tokens;
+    # the next step continues from both
     assert sum(npu.prefill.plan(0, len(prompt))) >= len(prompt), "the last token in a chunk"
-    nxt = tok.encode(TEXT)[0]
-    want = cpu.logits(prompt + [nxt], slice(len(prompt) - 1, None))
+    nxt = seq[len(prompt)]
     out = {}
     for name in ("forward", "steps"):
         npu.reset()
@@ -228,11 +224,11 @@ def test_gemma_forward(cpu: _Cpu, npu: object) -> None:
             npu.prompt(prompt[:-1])
             a = npu.step(prompt[-1])
         out[name] = torch.from_numpy(np.stack([a, npu.step(nxt)]))
-    kl = {k: [round(float(x), 5) for x in kl_rows(want, v)] for k, v in out.items()}
+    kls = {k: [round(float(x), 5) for x in kl_rows(want[:2], v)] for k, v in out.items()}
     between = [round(float(x), 5) for x in kl_rows(out["steps"], out["forward"])]
-    print(f"KL(same) {kl}, forward vs steps {between}")
-    assert all(x < 0.002 for v in kl.values() for x in v) and all(x < 0.002 for x in between), (kl, between)
-    assert (out["forward"].argmax(-1) == want.argmax(-1)).all()
+    print(f"forward: KL(same) {kls}, forward vs steps {between}")
+    assert all(x < 0.002 for v in kls.values() for x in v) and all(x < 0.002 for x in between), (kls, between)
+    assert (out["forward"].argmax(-1) == want[:2].argmax(-1)).all()
 
 
 def test_gemma_kept_projections(npu: object) -> None:
@@ -353,22 +349,3 @@ def test_gemma_mtp_prefill(npu: object) -> None:
     got = draft_gate(npu, draft_prompts(Gemma(npu.gguf.path)))
     pre, steps = got["prefill"].mean(0), got["steps"].mean(0)
     assert pre[0] > 0.985 * steps[0] and (pre[1:] > steps[1:] - 0.02).all(), (pre, steps)
-
-
-def test_gemma_tokenizer() -> None:
-
-    g = _gguf()
-    tok = GemmaTokenizer(g)
-    cases = {
-        "Hello, world!": [9259, 236764, 1902, 236888],
-        "  two  spaces\n\nand a blank line": [138, 13498, 138, 35220, 108, 624, 496, 11580, 1757],
-        "naïve café — 日本語 🙂": [1789, 238527, 560, 33443, 2192, 33375, 238582, 57235],
-        "def f(x):\n\treturn x**2  # square": [2063, 517, 236769, 236781, 1473, 107, 255968, 2060, 1123, 1018, 236778, 138,
-                                               236865, 6281],
-    }
-    for text, ids in cases.items():
-        assert tok.encode(text) == ids, text
-        assert tok.decode(ids) == text
-    prompt = chat_prompt(g, [{"role": "user", "content": "Why is the sky blue?"}])
-    assert prompt == "<bos><|turn>user\nWhy is the sky blue?<turn|>\n<|turn>model\n"
-    assert tok.encode(prompt) == [2, 105, 2364, 107, 11355, 563, 506, 7217, 3730, 236881, 106, 107, 105, 4368, 107]

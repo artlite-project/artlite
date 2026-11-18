@@ -72,20 +72,19 @@ GEMM_S, NORM_S, PREP_S = 0.056e-3, 43e-9, 17e-6
 
 class FlintPrefill(ChunkPrefill):
     """The prefill of an overlay (its layers) in chunks of the sizes ``sizes`` (those within the overlay's caches);
-    ``run`` runs one; ``dflash``: a DFlash2 drafter whose rows of the prompt a chunk writes (``prefill.dflash``). ``qp``:
-    the attention's Q as single (1, the default) or hi + lo panels (2); ``precise``: its P as
-    hi + lo panels (``prefill.attn.Shape``'s ``qp``, ``pp``). Single Q and P: their hi + lo changed the next-token NLL
-    after the prompt by nothing measurable (six 1K prompts, two of 32K: within an MoE model's noise; Flint's q / k norm
-    weights reach 7.5, Qwen3's ~100) and cost the full layers' attention 1.2x at 30K; K follows the caches' ``kv_k``."""
+    ``run`` runs one; ``dflash``: a DFlash2 drafter whose rows of the prompt a chunk writes (``prefill.dflash``). The
+    attention's Q and P are single panels (``prefill.attn.Shape``'s ``qp``, ``pp``): their hi + lo changed the next-token
+    NLL after the prompt by nothing measurable (six 1K prompts, two of 32K: within an MoE model's noise; Flint's q / k
+    norm weights reach 7.5, Qwen3's ~100) and cost the full layers' attention 1.2x at 30K; K follows the caches'
+    ``kv_k``."""
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, MAX_T, "flint_prefill", KV_PAD
     SHARED_KV_RANGE = True  # (the attention's P_FO: one range for every size)
     CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
 
-    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, qp: int = 1, precise: bool = False,
-                 dflash: DFlashOverlay | None = None):
+    def __init__(self, overlay: FlintOverlay, *, sizes: tuple[int, ...] = SIZES, dflash: DFlashOverlay | None = None):
         ov = overlay
-        s = PA.Shape(ov.hd, ov.nh // 2, ov.kp, ov.T, qp, 2 if precise else 1, per=2, sink=True)
+        s = PA.Shape(ov.hd, ov.nh // 2, ov.kp, ov.T, 1, 1, per=2, sink=True)
         pq = 32 * s.blocks[0]  # (the flash attention's queries per pass: 64 passes a chunk at most)
         assert pq * 64 >= ATTN_T
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0 and (t <= ATTN_T or t % ATTN_T == 0)))

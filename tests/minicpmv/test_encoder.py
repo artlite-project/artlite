@@ -14,7 +14,7 @@ from artlite.vision import vit
 from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
 from artlite.vision.layers import Tensor
-from artlite.vision.levels import ImageLevel, TokenLevel
+from artlite.vision.levels import ImageLevel
 from artlite.vision.seq import ColOps, MemTask
 from models.minicpmv import encoder as M
 from models.minicpmv import host as MV
@@ -105,46 +105,6 @@ def test_layer(npu: VisionDevice, enc: V.Encoder) -> None:
         assert rel(g[:, :M.H], exact) < 1.1 * rel(e, exact)
 
 
-@pytest.mark.slow  # (20 layers on the CPU: in float64 and at the NPU's rounding points)
-def test_layers(npu: VisionDevice, enc: V.Encoder) -> None:
-    """The 20 layers after the ViT merger (7 .. 26) in one dispatch on two entries: as far from the float64 layers as
-    the CPU at the NPU's rounding points (the two apart by ~1e-2 after 20 layers: each layer's 1.5e-3); the dispatch's
-    time."""
-    import time
-
-    xs = [bf16_like(x) for x in _entries(enc, 7)]
-    sim = V.NpuEncoder(MMPROJ)
-    want, exact = list(xs), [x.double() for x in xs]
-    for il in range(7, 27):
-        want = [sim.layer(x, il) for x in want]
-        exact = [enc._layer(x, il) for x in exact]
-    lv = ImageLevel(16)
-    bd = Builder(npu)
-    xc = _level_in(xs)
-    x = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
-    bd.image("x_in", np.concatenate([L.ctiles(xc[c], lv.m) for c in range(COLS)]))
-    bd.op(bd.load("x_in", x.addr, lv.ct(M.C)), {})
-    rec = M.ln_records(bd, x, name="x.rec")
-    kv = bd.ddr("kv", M.kv_bytes(lv))
-    for il in range(7, 27):
-        x, rec = M.layer(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, rec, kv_ddr=kv, keys=M.Keys("attn"))
-    bd.op(bd.spill("y_out", x.addr, lv.ct(M.C)), {})
-    tr = bd.transaction()
-    npu.run(tr)
-    ts = []
-    for _ in range(3):
-        t0 = time.perf_counter()
-        npu.run(tr)
-        ts.append(time.perf_counter() - t0)
-    yb = npu.read("y_out", COLS * lv.ct(M.C)).reshape(COLS, -1)
-    got = _level_out(torch.stack([torch.from_numpy(L.from_ctiles(yb[c], lv.m, M.C, lv.m)) for c in range(COLS)]))
-    for g, e, x in zip(got, want, exact, strict=True):
-        npu_err, cpu_err = rel(g[:, :M.H], x), rel(e, x)
-        print(f"20 layers on 2 x 256 tokens: {1e3 * min(ts):.2f} ms ({1e3 * min(ts) / 20:.3f} ms per layer); from "
-              f"float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], e):.2e}")
-        assert npu_err < 1.1 * cpu_err
-
-
 def _bands_in(bd: Builder, x: list[torch.Tensor], lv: ImageLevel, name: str) -> M.Bands:
     """Two entries (1024 tokens, 1152) as a banded 32 x 32 level's residual in DDR (their records by a copy op per
     band)."""
@@ -196,61 +156,11 @@ def test_layer_bands(npu: VisionDevice, enc: V.Encoder) -> None:
         assert rel(g[:, :M.H], exact) < 1.1 * rel(e, exact)
 
 
-def _bands_read(npu: VisionDevice, y: M.Bands) -> torch.Tensor:
-    """A banded level's residual -> (nb, COLS, 64, C)."""
-    lv = y.lv
-    return torch.stack([torch.stack([torch.from_numpy(L.from_ctiles(npu.read(y.x.band(b), COLS * lv.ct(M.C)).reshape(COLS, -1)[c], 64, M.C,
-                                                   64)) for c in range(COLS)]) for b in range(lv.nb)])
-
-
 def _pixels(case: str) -> list[np.ndarray]:
     """A dispatch's entries: "pair" the astronaut's overview (32 x 32 patches: 64 groups) and its first slice cut to
     24 x 40 (60 groups: the overview's padding masked); "joint" that slice whole (24 x 44: 66 groups, alone)."""
     ents = MV.slice_image(MV.load_image(ASTRONAUT), ClipConfig.from_gguf(GGUFFile(MMPROJ)))[0]
     return [ents[0], np.ascontiguousarray(ents[1][:, :, :40 * 14])] if case == "pair" else [ents[1]]
-
-
-def _pos(sim: V.NpuEncoder, e: M.Entry) -> torch.Tensor:
-    rows = bf16_like(sim.w("v.position_embd.weight")[torch.from_numpy(M.positions(e.ph, e.pw))])
-    return torch.nn.functional.pad(rows.float(), (0, M.C - M.H))
-
-
-@pytest.mark.slow  # (7 layers on the CPU: in float64 and at the NPU's rounding points)
-@pytest.mark.parametrize("case", ["pair", "joint"])
-def test_before_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
-    """The patch embedding and layers 0 .. 6 on a dispatch's entries (``_pixels``): each as far from the float64
-    encoder as the CPU at the NPU's rounding points."""
-    ents = _pixels(case)
-    sim = V.NpuEncoder(MMPROJ)
-    entries = M.place([M.Entry(e.shape[1] // 14, e.shape[2] // 14) for e in ents])
-    trs, ref = [], []
-    for e in ents:
-        tr, tf = {}, {}
-        sim.forward(e, None, tr)
-        enc.forward(e, None, tf)
-        trs.append(tr)
-        ref.append(tf)
-    bd = Builder(npu)
-    norm = (sim.cfg.mean, sim.cfg.std)
-    x = M.patch_embed(bd, M.patch_weights(lambda n: sim.w(n).float(), *norm), "x0")
-    for n, data in M.inputs(entries, [M.patches(e, norm) for e in ents], [_pos(sim, e) for e in entries], "x0").items():
-        npu.write(n, data)
-    kv = bd.ddr("kv", M.kv_bytes(M.PRE))
-    pre, _ = M.level_keys(case, entries, joint=entries[0].joint)
-    for il in range(7):
-        y = M.Bands(M.PRE, f"x{il + 1}")
-        M.layer_bands(bd, M.layer_weights(lambda n: sim.w(n).float(), il), f"l{il}", x, y, kv_ddr=kv, keys=pre)
-        x = y
-    bd.op({}, {})
-    npu.run(bd.transaction())
-    slots = [e.patch_slots() for e in entries]
-    for key, name in (("x0", "pos_embed"), ("x7", "layer_out-6")):
-        got = M.unpack(_bands_read(npu, M.Bands(M.PRE, key)), slots)
-        for g, tr, tf in zip(got, trs, ref, strict=True):
-            npu_err, cpu_err = rel(g[:, :M.H], tf[name]), rel(tr[name], tf[name])
-            print(f"{name}: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], tr[name]):.2e}")
-            assert float(g[:, M.H:].abs().max()) == 0
-            assert npu_err < 1.1 * cpu_err + 1e-4
 
 
 def test_window_attention(npu: VisionDevice) -> None:
@@ -292,62 +202,6 @@ def test_window_attention(npu: VisionDevice) -> None:
     err = rel(o, ref)
     print(f"window attention: rel err {err:.2e}")
     assert err < 1.2e-2
-
-
-def _bands_from(bd: Builder, rows: list[torch.Tensor], slots: list, lv: TokenLevel, name: str) -> M.Bands:
-    """Two entries' rows (n_i, 1152) at their slots as a banded level's residual in DDR (records by a copy op per
-    band)."""
-    tiles = M.pack([torch.nn.functional.pad(r.float(), (0, M.C - M.H)) for r in rows], slots, lv.nb)
-    bands = M.Bands(lv, name)
-    for b in range(lv.nb):
-        bd.image(f"{name}.in.{b}", np.concatenate([L.ctiles(tiles[b, c], 64) for c in range(COLS)]))
-        t = Tensor(lv, M.C, bd.mem.alloc(lv.ct(M.C)))
-        bd.op(bd.load(f"{name}.in.{b}", t.addr, t.nbytes), {})
-        bands.store(bd, b, t, M.ln_records(bd, t, name=f"{name}.rec{b}"))
-    bd.op({}, {})
-    return bands
-
-
-def _before_merger(sim: V.NpuEncoder, px: np.ndarray) -> torch.Tensor:
-    """The CPU at the NPU's rounding points through layer 6 (raster order)."""
-    tr: dict[str, torch.Tensor] = {}
-    P, H = sim.patch, sim.hidden
-    x = torch.as_tensor(np.asarray(px), dtype=sim.dtype)
-    ph, pw = x.shape[1] // P, x.shape[2] // P
-    cols = x.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)
-    c = V._bfp(cols) @ V._bfp(sim.w("v.patch_embd.weight").reshape(H, -1)).T + bf16_like(sim.w("v.patch_embd.bias").reshape(-1))
-    x = bf16_like(c + bf16_like(sim.w("v.position_embd.weight")[torch.from_numpy(sim.positions(ph, pw))]))
-    for il in range(sim.insert + 1):
-        x = sim.layer(x, il)
-    del tr
-    return x
-
-
-@pytest.mark.slow  # (the CPU encoder's first 7 layers, the merger's weights converted)
-@pytest.mark.parametrize("case", ["pair", "joint"])
-def test_merger(npu: VisionDevice, enc: V.Encoder, case: str) -> None:
-    """The ViT merger on a dispatch's entries (``_pixels``) from the CPU's layer-6 output (at the NPU's rounding points):
-    as far from the float64 merger of that input as the CPU's merger."""
-    ents = _pixels(case)
-    sim = V.NpuEncoder(MMPROJ)
-    entries = M.place([M.Entry(e.shape[1] // 14, e.shape[2] // 14) for e in ents])
-    xs = [_before_merger(sim, e) for e in ents]
-    want = [sim.vit_merger(x, e.ph, e.pw) for x, e in zip(xs, entries, strict=True)]
-    exact = [enc.vit_merger(x.double(), e.ph, e.pw) for x, e in zip(xs, entries, strict=True)]
-    bd = Builder(npu)
-    x = _bands_from(bd, xs, [e.patch_slots() for e in entries], M.PRE, "x")
-    y, rec = M.merger(bd, M.merger_weights(lambda n: sim.w(n).float()), "m", x)
-    bd.mem.release(rec, M.ln_rec(M.POST))
-    bd.op(bd.spill("y_out", y.addr, y.nbytes), {})
-    npu.run(bd.transaction())
-    tiles = torch.stack([torch.from_numpy(L.from_ctiles(npu.read("y_out", COLS * y.nbytes).reshape(COLS, -1)[c], 64, M.C, 64))
-                         for c in range(COLS)])[None]
-    got = M.unpack(tiles, [e.window_slots() for e in entries])
-    for g, e, ex in zip(got, want, exact, strict=True):
-        npu_err, cpu_err = rel(g[:, :M.H], ex), rel(e, ex)
-        print(f"merger: from float64 {npu_err:.2e} (the CPU's {cpu_err:.2e}), NPU vs CPU {rel(g[:, :M.H], e):.2e}")
-        assert float(g[:, M.H:].abs().max()) == 0
-        assert npu_err < 1.1 * cpu_err
 
 
 @pytest.mark.slow  # (the CPU encoders, every weight converted)

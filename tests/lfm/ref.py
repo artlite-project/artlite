@@ -50,21 +50,19 @@ def chat_ids(quant: str = "QAD-Q4_0") -> list[int]:
     return llama_tokenize(path(quant), text)
 
 
-def cpu_logits(quant: str, ids: list[int], *, layers: list[int] | None = None, vocab: int | None = None,
-               model: cpu.LfmCpu | None = None) -> torch.Tensor:
-    """The fp32 CPU model's logits (len(ids), vocab) of a sequence from position 0 (cached)."""
-    key = (common.model_key(path(quant)), tuple(ids), tuple(layers or ()), vocab)
+def cpu_logits(quant: str, ids: list[int], *, from_row: int = 0, model: cpu.LfmCpu | None = None) -> torch.Tensor:
+    """The fp32 CPU model's logits (len(ids) - from_row, vocab) of the positions from_row on of a sequence (cached)."""
+    key = (common.model_key(path(quant)), tuple(ids), from_row)
 
     def compute() -> torch.Tensor:
-        m = model or cpu.LfmCpu(gguf(quant), layers=layers, vocab=vocab)
-        return m.logits(ids, slice(None)).half()
+        m = model or cpu.LfmCpu(gguf(quant))
+        return m.logits(ids, slice(from_row, None)).half()
 
     return common.cached_ref(path(quant), "cpu_logits", key, compute, sources=SOURCES).float()
 
 
-def llama_logits(quant: str, ids: list[int]) -> torch.Tensor:
-    """llama.cpp's CPU logits (len(ids), vocab) of a sequence (its prompt graph)."""
-    g = golden(path(quant), ids, logits="f32")
+def llama_logits(quant: str, ids: list[int], *, from_row: int = 0) -> torch.Tensor:
+    """llama.cpp's CPU logits (len(ids) - from_row, vocab) of the positions from_row on of a sequence (its prompt
+    graph; it computes and stores only those rows)."""
+    g = golden(path(quant), ids, logits="f32", logits_from=from_row)
     return torch.from_numpy(np.asarray(g.logits, np.float32).copy())
-
-

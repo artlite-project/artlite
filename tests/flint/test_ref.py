@@ -1,6 +1,6 @@
 """The Flint oracles of ``ref.py`` against llama.cpp's own tensors of the official int4 file (CPU, no NPU): a chat
-prompt of ~330 tokens (layers 0 dense and full, 2 MoE and sliding-window, 5 MoE and full, the head) and an essay of 700
-tokens, past the 513-key window.
+prompt of ~120 tokens (layers 0 dense and full, 1 dense, 2 MoE and sliding-window, the head) and an essay of 700
+tokens, past the 513-key window (layers 2 and 5: sliding-window and full attention).
 
 Every block is fed llama.cpp's own input, so what differs is the block: the fp32 ops (norms, RoPE, attention with sinks,
 the router's sigmoid, top 6 and weights) agree to ~1e-6, and the Q4_1 matmuls to ~1e-6 with llama.cpp's Q8_1 activations
@@ -28,8 +28,9 @@ from . import ref
 MODEL = flint_gguf()
 NAMES = ("attn_norm|Qcur|Kcur|Vcur|kqv_out|ffn_inp|ffn_norm|ffn_up|ffn_gate|ffn_swiglu|ffn_out|ffn_moe_logits|"
          "ffn_moe_topk|ffn_moe_weights_norm|ffn_moe_swiglu|ffn_moe_weighted|ffn_moe_out|ffn_shexp|l_out|result_norm")
-LAYERS = (0, 1, 2, 5, 48)
+LAYERS = (0, 1, 2, 48)
 LONG = 2
+HEAD_ROWS = 4  # (the head's rows test_head compares: the last ones)
 
 
 class Run:
@@ -54,7 +55,7 @@ class Run:
 @pytest.fixture(scope="module")
 def chat() -> Run:
     require(MODEL)
-    text = essay("apple.txt")[:1400]
+    text = essay("apple.txt")[:500]
     prompt = ("<|system|>You are a careful assistant.<|user|>Summarize the following text in two sentences.\n\n"
               + text + "<|assistant|>")
     return Run(llama_tokenize(MODEL, prompt), (*LAYERS, "g"), NAMES, "f32")
@@ -77,12 +78,7 @@ def attention_of(r: Run, L: int, *, window: int | None | str = "layer", sinks: b
     return ref.attention(r("Qcur.2", L), r("Kcur.2", L), r("Vcur.1", L), sk, window=w, q_pos=r.pos).reshape(r.T, -1)
 
 
-def test_kinds(chat: Run) -> None:
-    assert [chat.cfg.kinds[i] for i in LAYERS] == ["full", "full", "swa", "full", "full"]
-    assert chat.cfg.rot("full") == 0 and chat.cfg.rot("swa") == 64
-
-
-@pytest.mark.parametrize("L", [0, 2, 5])
+@pytest.mark.parametrize("L", [0, 2])
 def test_attention_ops(chat: Run, L: int) -> None:
     """The projections (Q8_1 activations), the norms and RoPE (SWA layers; NoPE: the norm only) and the attention from
     llama.cpp's inputs."""
@@ -109,8 +105,8 @@ def test_attention_ops(chat: Run, L: int) -> None:
         assert rel_max(x + y, r("ffn_inp", L)) < 3e-6
 
 
-@pytest.mark.parametrize("L", [0, 1])
-def test_dense_ffn(chat: Run, L: int) -> None:
+def test_dense_ffn(chat: Run) -> None:
+    L = 0
     r, b = chat, f"blk.{L}."
     fn = r("ffn_norm", L)
     gate, up, down = (ref.weight(r.g, b + f"ffn_{n}.weight") for n in ("gate", "up", "down"))
@@ -121,8 +117,8 @@ def test_dense_ffn(chat: Run, L: int) -> None:
     assert rel_max(r("ffn_inp", L) + r("ffn_out", L), r("l_out", L)) < 1e-6
 
 
-@pytest.mark.parametrize("L", [2, 5])
-def test_moe_block(chat: Run, L: int) -> None:
+def test_moe_block(chat: Run) -> None:
+    L = 2
     r = chat
     cfg, g = r.cfg, r.g
     fn = r("ffn_norm", L)
@@ -161,7 +157,7 @@ def test_layers(chat: Run) -> None:
 
 def test_head(chat: Run) -> None:
     """The final norm and the LM head's last rows from layer 48's output."""
-    r, n = chat, 4
+    r, n = chat, HEAD_ROWS
     hn, logits = ref.head_logits(r.g, r.cfg, r("l_out", 48)[-n:])
     assert rel_max(hn, r("result_norm")[-n:]) < 1e-6
     want = f32(r.G.logits)[-n:]

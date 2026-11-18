@@ -16,7 +16,7 @@ from ..operators import kmath_sim
 from ..operators.elementwise import VtanhOperator
 
 # (tokens, groups per column, a part's slot W, the down's K, act): Qwen3.8-27B's (34 groups), MiniCPM-V's (7 groups, K
-# padded to 4096), bartowski's Spark-X 4B (19 groups, GELU's erf form, K padded to 10240)
+# padded to 4096), Llama 3.2's ffn 8192 (16 groups), bartowski's Spark-X 4B (19 groups, GELU's erf form, K padded to 10240)
 CASES = [(256, 34, 96, 17408, "silu"), (64, 7, 72, 4096, "silu"), (1024, 16, 64, 8192, "silu"),
          (256, 19, 96, 10240, "gelu_erf")]
 

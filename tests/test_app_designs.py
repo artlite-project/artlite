@@ -1,11 +1,10 @@
 """The apps' full designs, built as the apps build them (no NPU): the decode overlays and prefill libraries of the
 models present (Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the
-app's default: the design runs the drafter's formats too; LFM3's QAD-Q4_0 and Q4_K_M images), the Stable Diffusion UNet
-program. They compile (program
-memory, stack and BD limits of the whole models, which the layer-slice tests do not reach; Flint's overlay of 49
-layers and its prefill's chunks to 8192), a paged design's code pages
-link (each within the slot its core's resident code leaves: ``paging.link``, else only at load), and
-``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
+app's default: the design runs the drafter's formats too; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its
+DSpark drafter), the Stable Diffusion UNet program. They compile (program memory, stack and BD limits of the whole
+models, which the layer-slice tests do not reach; Flint's overlay of 49 layers and its prefill's chunks to 8192), a
+paged design's code pages link (each within the slot its core's resident code leaves: ``paging.link``, else only at
+load), and ``--dump-designs`` records them: the refactoring check covers the apps without running the slow tests."""
 
 from collections.abc import Callable
 
@@ -23,6 +22,8 @@ from artlite.model_config import (
     qwen_gguf,
     qwen_mtp_of,
     sd15_dir,
+    spark_dspark_of,
+    spark_gguf,
     swift_gguf,
 )
 
@@ -85,6 +86,21 @@ def _flint(path: str) -> None:
     ov.op.page_store()
 
 
+def _spark(path: str) -> None:
+    """With the model's DSpark drafter (``spark_dspark_of``: the app's default): the overlay runs the drafter's formats
+    too and the prefill's chunks write its records."""
+    from models.spark.dspark import DSparkOverlay, needs
+    from models.spark.overlay import SparkOverlay
+    from models.spark.prefill import SparkPrefill
+
+    if (file := spark_dspark_of(path)) is None:
+        pytest.skip(f"no DSpark drafter of {path}")
+    dg = GGUFFile(file)
+    ov = SparkOverlay(GGUFFile(path), max_positions=4096, **needs(dg))
+    parallel_compile.compile_all([ov.op, SparkPrefill(ov, dspark=DSparkOverlay(ov, dg)).lib])
+    ov.op.page_store()
+
+
 def _sd15(path: str) -> None:
     from artlite.vision.design import VisionDesign
 
@@ -109,6 +125,7 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "swift-1.5-APEX": (swift_gguf(), _qwen),
     "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
+    "spark-4B-Q4_K_M": (spark_gguf("4B", "Q4_K_M"), _spark),
     "flint-int4": (flint_gguf(), _flint),
     "sd15": (sd15_dir(), _sd15),
 }

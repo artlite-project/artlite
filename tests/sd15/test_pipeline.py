@@ -1,5 +1,5 @@
 """Stable Diffusion 1.5's host side (models.sd15): the UNet's time inputs, the text encoder against the fp32 reference,
-text to image in a couple of steps on the reference's networks, artlite-cli's image path and its refusals, diffusers
+artlite-cli's image path and its refusals, diffusers
 directories in ``models``. The fp32 networks (ref.py) match diffusers' and transformers' to fp32 rounding."""
 
 import json
@@ -99,15 +99,6 @@ def test_text_encoder() -> None:
     print(f"text encoder: max |d| {err:.2e} of the largest")
     assert a.shape == (2, 77, 768) and a.dtype == np.float32 and err < 1e-5
     assert np.array_equal(got(ids[1:]), a[1:])
-
-
-@pytest.mark.slow
-def test_txt2img(sd: StableDiffusion) -> None:
-    out = sd.txt2img("a photograph of an astronaut riding a horse", steps=2, seed=42)
-    assert out.pixels.shape == (512, 512, 3) and out.pixels.dtype.name == "uint8"
-    assert out.latents.shape == (1, 4, 64, 64) and np.isfinite(out.latents).all()
-    assert out.pixels.std() > 20  # (not a flat image)
-    assert min(out.t_text, out.t_steps, out.t_vae) > 0
 
 
 @pytest.mark.slow

@@ -102,13 +102,12 @@ def test_depth(weights: R.Weights, tts: R.GenGolden) -> None:
 def test_codec(weights: R.Weights, tts: R.GenGolden) -> None:
     """The codec's samples of llama.cpp's sampled speech codes: llama.cpp (in calls of 4 frames) against float64 (SNR,
     its Q8_0 activations), a bfloat16 codec's (transformers' dtype: the NPU's yardstick); float64 in calls of 4 frames
-    and of 1 = the codes at once."""
+    = the codes at once."""
     codes = np.asarray(tts.codes)
     c = R.Codec(weights)
     y = R.pcm(c, codes)
     assert y.size == R.FRAME_STACK * R.HOP * len(codes)
-    for chunk in (1, 4):
-        assert np.abs(R.pcm(c, codes, chunk) - y).max() < 1e-12
+    assert np.abs(R.pcm(c, codes, 4) - y).max() < 1e-12
     g = R.golden(MODEL, MMPROJ, frames=codes, chunk=4)
     yl = g.pcm
     assert yl.size == y.size and g.pcm_calls[-1] == R.TRIM

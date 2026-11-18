@@ -15,14 +15,9 @@ from artlite.model_config import lfm3omni_gguf, lfm3omni_mmproj, lfm3vl_gguf, lf
 from models import video as VD
 from models.lfm3vl import host as H
 
-from .common import VIDEOS, video_file
+from .common import video_file
 from .goldens.media import video_items
 from .model_files import require
-
-
-@pytest.fixture(scope="module")
-def videos(tmp_path_factory: pytest.TempPathFactory) -> str:
-    return str(tmp_path_factory.mktemp("videos"))
 
 
 def _ours(path: str, heard: bool) -> list[dict]:
@@ -43,14 +38,19 @@ def _ours(path: str, heard: bool) -> list[dict]:
     return out
 
 
-@pytest.mark.parametrize("name", list(VIDEOS))
-@pytest.mark.parametrize("model", ["omni", "vl"])
-def test_items(videos: str, name: str, model: str) -> None:
+# LFM3-Omni on the videos but the astronaut's variants of another size or without audio; LFM3-VL (frames only: its own
+# mmproj and scaling) where its plan differs: an odd last pair, the pixel bound, a long video
+ITEMS = [("omni", n) for n in ("odd-25fps", "ntsc-start", "short", "big-1080p", "silent", "astronaut")] + \
+    [("vl", n) for n in ("odd-25fps", "big-1080p", "astronaut")]
+
+
+@pytest.mark.parametrize("model,name", ITEMS, ids=[f"{m}-{n}" for m, n in ITEMS])
+def test_items(model: str, name: str) -> None:
     """Artlite's frames, timestamps and soundtrack pieces are llama.cpp's, bit for bit (LFM3-Omni: with the
     soundtrack; LFM3-VL: frames only)."""
     m, mm = (lfm3omni_gguf(), lfm3omni_mmproj()) if model == "omni" else (lfm3vl_gguf(), lfm3vl_mmproj())
     require(m, mm)
-    path = video_file(videos, name)
+    path = video_file(name)
     want = video_items(m, mm, path)
     got = _ours(path, heard=model == "omni")
     kinds = lambda items: [next(k for k in ("text", "frame", "audio") if k in it) for it in items]
@@ -88,17 +88,17 @@ def test_no_count() -> None:
         pytest.skip("no ffmpeg")
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "v.webm")
-        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12:duration=2",
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=12:duration=0.5",
                         "-c:v", "libvpx-vp9", "-deadline", "realtime", path], check=True)
         info = VD.probe(VD.read(path))
-        assert info.n_frames == 24 and (info.width, info.height) == (160, 120)
+        assert info.n_frames == 6 and (info.width, info.height) == (160, 120)
 
 
-def test_regular(videos: str) -> None:
+def test_regular() -> None:
     """A regular stream's frames are picked before ffmpeg converts them (``Info.regular``), with the pixels of the whole
-    way (llama.cpp's command: every frame converted, the indices' kept): the tests' videos but the one that starts late
-    (ffmpeg's constant-rate output duplicates its first frame from the file's start); a variable-rate stream (frames
-    off their slots) and a stream with discarded packets (an edit list's lead-in) go the whole way."""
+    way (llama.cpp's command: every frame converted, the indices' kept): a short and a long video; the one that starts
+    late (ffmpeg's constant-rate output duplicates its first frame from the file's start), a variable-rate stream
+    (frames off their slots) and a stream with discarded packets (an edit list's lead-in) go the whole way."""
     import dataclasses
     with tempfile.TemporaryDirectory() as tmp:
         vfr = os.path.join(tmp, "vfr.mp4")  # (every third frame 40% of a slot late)
@@ -106,9 +106,9 @@ def test_regular(videos: str) -> None:
                         "settb=1/1000,setpts='N*100+if(eq(mod(N\\,3)\\,2)\\,40\\,0)'", "-fps_mode", "passthrough",
                         "-enc_time_base:v", "1/1000", vfr], check=True)
         cut = os.path.join(tmp, "cut.mp4")  # (stream-copied from a mid-GOP time: discarded lead-in packets)
-        subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.55", "-i", video_file(videos, "astronaut"), "-t", "4",
+        subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.55", "-i", video_file("astronaut"), "-t", "4",
                         "-c", "copy", cut], check=True)
-        paths = {n: video_file(videos, n) for n in VIDEOS} | {"vfr": vfr, "cut": cut}
+        paths = {n: video_file(n) for n in ("short", "astronaut", "ntsc-start")} | {"vfr": vfr, "cut": cut}
         for name, path in paths.items():
             data = VD.read(path)
             info = VD.probe(data)
@@ -119,10 +119,10 @@ def test_regular(videos: str) -> None:
             assert np.array_equal(fast, VD.frames(data, dataclasses.replace(info, regular=False), plan.indices, size))
 
 
-def test_frames_errors(videos: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_frames_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Data ffmpeg cannot read is a VideoError with its message (its error pipe drained meanwhile), and a constructor that
     fails after ffmpeg started leaves no process behind."""
-    data = VD.read(video_file(videos, "short"))
+    data = VD.read(video_file("short"))
     info = VD.probe(data)
     with pytest.raises(VD.VideoError, match="decoded no frame: .*Invalid data"), \
             VD.Frames(b"not a video" * 100, info, [0, 1], (200, 120)) as fr:

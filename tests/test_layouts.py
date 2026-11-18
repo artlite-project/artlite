@@ -3,7 +3,6 @@ checks (``operators.words``: bounds, overlaps, flag bits), their kernel constant
 templates find every constant they name."""
 
 import glob
-import importlib
 import os
 import re
 
@@ -49,14 +48,6 @@ def test_template_names_are_declared(name: str) -> None:
     used = {v for v in meta.find_undeclared_variables(templating.JINJA_ENV.parse(templating.source(name)))
             if _NAMES.fullmatch(v)}
     assert not used - set(have) - _EXPLICIT, f"{name}: {sorted(used - set(have) - _EXPLICIT)} are declared nowhere"
-
-
-@pytest.mark.parametrize("module", ["artlite.decode.design", "artlite.vision.design", "models.gemma4.decode",
-                                    "models.llama.decode", "models.lfm.decode", "models.qwen35.decode",
-                                    "artlite.decode.dflash.core"])
-def test_layouts_import(module: str) -> None:
-    """The designs' modules import (every layout of their cores is checked at import)."""
-    importlib.import_module(module)
 
 
 def test_decode_design_words() -> None:

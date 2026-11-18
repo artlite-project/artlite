@@ -51,7 +51,7 @@ def test_audio_steps(app: tuple[Lfm, object]) -> None:
 def test_tts(app: tuple[Lfm, object]) -> None:
     """Two seeds: the speech ends with the end-of-audio frame (well before 512 frames: 2.5 - 8 frames a word), its
     samples are the frames' (1920 each, the codec's streamed chunks), the same seed gives the same samples, and the
-    model's own ASR of it is the text (but punctuation and case)."""
+    model's own ASR of the first run is the text (but punctuation and case)."""
     m, npu = app
     words = len(TEXT.split())
     outs = []
@@ -62,15 +62,14 @@ def test_tts(app: tuple[Lfm, object]) -> None:
         outs.append(y)
     assert np.array_equal(outs[0], outs[2]) and not np.array_equal(outs[0], outs[1])
     norm = lambda t: re.sub(r"[^a-z ]", "", t.lower()).split()
-    for y in outs[:2]:
-        x = _to16k(y)
-        msgs = [{"role": "system", "content": A.asr_system("en")}, {"role": "user", "content": [{"type": "audio", "audio": x}]}]
-        npu.reset()
-        prompt = m.chat(msgs)
-        text = m.tokenizer.decode([t for t in npu.generate(npu.forward(prompt), 100, m.sampling(), prompt)
-                                   if t not in m.eos_token_ids])
-        print("ASR:", text)
-        assert norm(text) == norm(TEXT)
+    x = _to16k(outs[0])
+    msgs = [{"role": "system", "content": A.asr_system("en")}, {"role": "user", "content": [{"type": "audio", "audio": x}]}]
+    npu.reset()
+    prompt = m.chat(msgs)
+    text = m.tokenizer.decode([t for t in npu.generate(npu.forward(prompt), 100, m.sampling(), prompt)
+                               if t not in m.eos_token_ids])
+    print("ASR:", text)
+    assert norm(text) == norm(TEXT)
 
 
 def _to16k(y: np.ndarray) -> np.ndarray:

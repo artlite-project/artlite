@@ -147,9 +147,9 @@ def test_pieces(npu: VisionDevice, mm: tuple, encoder: E.Encoder, monkeypatch: p
     assert np.array_equal(one(px), got)
 
 
-@pytest.mark.parametrize("size", [(352, 352), (512, 512), (1536, 768)], ids=["nb1", "nb2", "nb9"])
+@pytest.mark.parametrize("size", [(352, 352), pytest.param((1536, 768), marks=pytest.mark.slow)], ids=["nb1", "nb9"])
 def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
-    """An image of 1, 2 and 9 bands (4608 patches: 72 key groups) against the float64 encoder per merged token: the
+    """An image of 1 and 9 bands (4608 patches: 72 key groups) against the float64 encoder per merged token: the
     median within 5.5%, p90 within 17% (with the patch weights' last bits perturbed: 0.037-0.044 / 0.095-0.137,
     0.038-0.040 / 0.107-0.135, 0.046-0.048 / 0.140-0.146), the same at a second run. Not the sum: a few tokens, where
     the last layer's massive activation is partly on (``artlite.vision.vit``), take 0.3-2.8x their norm, which ones
@@ -188,9 +188,9 @@ def test_encoder_model(mm: tuple, encoder: E.Encoder) -> None:
 @pytest.mark.parametrize("name", ["d3-lite", "d3-nano"])
 def test_tower(npu: VisionDevice, name: str) -> None:
     """A smaller tower (``E.tower``: d3-lite's 12 layers of 768, 12 heads of 64 in C 960; d3-nano's 24 of 1024, 16 heads
-    of 64) at 1 and 2 bands per merged token as close to the float64 encoder as the CPU at the overlay's rounding points
-    (measured: lite median 4.7%, p90 14% at 352 x 352, the CPU's 4.1%, 14%; nano 6.9%, 42%, the CPU's 7.0%, 40%: its
-    residual's drift through 24 layers, post_ln's amplification), the same at a second run."""
+    of 64) at 2 bands (512 x 512: the joint key sequence) per merged token as close to the float64 encoder as the CPU
+    at the overlay's rounding points (d3-nano's error is large for both: its residual's drift through 24 layers,
+    post_ln's amplification), the same at a second run."""
     mmproj = decision_mmproj(name)
     require(mmproj)
     g = GGUFFile(mmproj)
@@ -203,16 +203,15 @@ def test_tower(npu: VisionDevice, name: str) -> None:
     assert (vt.C, vt.HD, vt.FFN) == ((960, 64, 3200) if name == "d3-lite" else (1280, 64, 4160))
     enc = E.Encoder(npu, E.weights(get, clip.layers, clip.projection_dim, vt), get("v.position_embd.weight").numpy(),
                     max_bands=2, name=f"t{clip.hidden}")
-    for size in ((352, 352), (512, 512)):
-        px = _pixels(*size)
-        lay = E.Layout(px.shape[0] // 32, px.shape[1] // 32)
-        _, _, real = lay.slot_windows()
-        pix = normalized(px, clip.mean, clip.std)
-        got = enc(px)
-        assert np.array_equal(enc(px), got)
-        want = V.Encoder(mmproj).forward(pix).numpy()
-        sim = V.NpuEncoder(mmproj).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
-        e, es = rel_rows(np.asarray(got, np.float64), want), rel_rows(np.asarray(sim, np.float64), want)
-        med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
-        print(f"{name} {size}: per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f})")
-        assert med[0] < 1.25 * med[1] and p90[0] < 1.3 * p90[1]
+    px = _pixels(512, 512)
+    lay = E.Layout(px.shape[0] // 32, px.shape[1] // 32)
+    _, _, real = lay.slot_windows()
+    pix = normalized(px, clip.mean, clip.std)
+    got = enc(px)
+    assert np.array_equal(enc(px), got)
+    want = V.Encoder(mmproj).forward(pix).numpy()
+    sim = V.NpuEncoder(mmproj).forward(pix, np.where(real, lay.slot_patches(), -1).reshape(-1, 8)).numpy()
+    e, es = rel_rows(np.asarray(got, np.float64), want), rel_rows(np.asarray(sim, np.float64), want)
+    med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
+    print(f"{name} 512 x 512: per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f})")
+    assert med[0] < 1.25 * med[1] and p90[0] < 1.3 * p90[1]

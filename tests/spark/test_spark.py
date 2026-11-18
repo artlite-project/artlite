@@ -58,7 +58,7 @@ def test_spark_continuation() -> None:
     assert np.array_equal(a[0], b[0]) and a[1] == b[1]
     m.reset()
     whole = m.forward(full)
-    want = ref.cpu_logits(("1.7B", "Q4_K_M", "XHToken"), full)[-1:]
+    want = ref.cpu_logits(("1.7B", "Q4_K_M", "XHToken"), full, from_row=len(full) - 1)
 
     def kl(x: np.ndarray) -> float:
         return float(kl_rows(want, torch.from_numpy(np.asarray(x, np.float32))[None])[0])

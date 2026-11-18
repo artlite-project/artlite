@@ -44,33 +44,43 @@ TEXTS = [
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Factorize x^2 + x - 6 = 0"}]
 
 
-@pytest.fixture(scope="module", params=["qwen35", "qwen2", "lfm2", "spark2_5", "flint"])
-def tok(request: pytest.FixtureRequest) -> tuple[str, object]:
-    path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf(),
-            "spark2_5": spark_gguf("1.7B"), "flint": flint_gguf()}[request.param]
-    require(path)
-    return path, BpeTokenizer(GGUFFile(path))
+ESSAYS = {"qwen35": 2, "qwen2": 1, "lfm2": 1, "spark2_5": 1, "flint": 1}  # (essays per pre-tokenizer: prose is plain
+# English, the pre-tokenizers differ in what TEXTS holds; qwen35's regex is the long-text sensitive one)
+_TOKENIZERS: dict[str, tuple[str, BpeTokenizer]] = {}
 
 
-def _texts() -> list[str]:
+def _tok(pre: str) -> tuple[str, BpeTokenizer]:
+    if pre not in _TOKENIZERS:
+        path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf(),
+                "spark2_5": spark_gguf("1.7B"), "flint": flint_gguf()}[pre]
+        require(path)
+        _TOKENIZERS[pre] = path, BpeTokenizer(GGUFFile(path))
+    return _TOKENIZERS[pre]
+
+
+def _texts(pre: str) -> list[str]:
     names = sorted(n for n in os.listdir(ESSAYS_DIR) if n.endswith(".txt")) if os.path.isdir(ESSAYS_DIR) else []
-    return list(TEXTS) + [essay(n) for n in names[:6]]
+    return list(TEXTS) + [essay(n) for n in names[:ESSAYS[pre]]]
 
 
-@pytest.mark.parametrize("i", range(len(_texts())))
-def test_encode(tok: tuple[str, object], i: int) -> None:
-    path, t = tok
-    text = _texts()[i]
+@pytest.mark.parametrize("pre,i", [(pre, i) for pre, n in ESSAYS.items() for i in range(len(TEXTS) + n)],
+                         ids=lambda v: str(v))
+def test_encode(pre: str, i: int) -> None:
+    path, t = _tok(pre)
+    texts = _texts(pre)
+    if i >= len(texts):
+        pytest.skip("no essay")
+    text = texts[i]
     ids = t.encode(text)
     assert ids == llama_tokenize(path, text)
     assert t.decode(ids, special=True) == text
 
 
 @pytest.mark.parametrize("thinking", [False, True])
-def test_chat_prompt(tok: tuple[str, object], thinking: bool) -> None:
-    path, t = tok
-    if GGUFFile(path).meta["tokenizer.ggml.pre"] in ("lfm2", "spark2_5", "flint"):
-        pytest.skip("LFM3's, Spark's and Flint's templates: test_lfm3_template, tests/{spark,flint}/test_host.py")
+@pytest.mark.parametrize("path", [qwen_gguf("Q4_K_M", "9B"), qwen3_gguf("0.6B")], ids=["qwen35", "qwen2"])
+def test_chat_prompt(path: str, thinking: bool) -> None:
+    require(path)
+    t = BpeTokenizer(GGUFFile(path))
     p = chat_prompt(GGUFFile(path), MESSAGES, enable_thinking=thinking)
     opens = GGUFFile(path).meta["tokenizer.ggml.pre"] == "qwen35"  # (Qwen3's model writes its <think> itself)
     tail = ("<think>\n" if opens else "") if thinking else "<think>\n\n</think>\n\n"

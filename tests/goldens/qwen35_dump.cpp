@@ -4,7 +4,7 @@
 // Built against a prebuilt llama.cpp tree (include/, ggml/include/, build/bin/libllama.so) by ref.py.
 //
 //   qwen35_dump -m MODEL -t TOKENS -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]
-//               [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]
+//               [--logits f32|f16|none] [--logits-from F] [--states last|all] [--threads N] [--mtp MTP_MODEL]
 //               [--dflash DFLASH_MODEL --dflash-at P [--dflash-names REGEX] [--dflash-random]]
 //
 // TOKENS: raw little-endian int32 token ids. The tokens run in ubatches of UBATCH (default: all of them in
@@ -17,7 +17,8 @@
 // d >= 1, of the ubatch's token count with all dimensions above it 1) -> (tokens, ...); the recurrent states
 // (STATE_NAMES) have no token axis: the last ubatch's (--states last) or all of them (--states all: (ubatches,
 // ...)). A name computed twice in a ubatch (Kcur before and after RoPE) gets ".1", ".2", ... from the second on.
-// OUTDIR/logits.npy: (tokens, vocab) of every position. OUTDIR/meta.json: what ran.
+// OUTDIR/logits.npy: (tokens - F, vocab) of positions F .. tokens - 1 (--logits-from F, default 0: every position).
+// OUTDIR/meta.json: what ran.
 //
 // --mtp: then the model's multi-token-prediction block (an MTP file, or MODEL again when it holds a block of its own:
 // Qwen3.8; llama.cpp's LLAMA_CONTEXT_TYPE_MTP context) over the same tokens, positions and ubatches, as llama.cpp's draft-mtp keeps its cache: the row at position
@@ -246,7 +247,8 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 static void usage() {
     fprintf(stderr,
             "usage: qwen35_dump -m MODEL -t TOKENS.i32 -o OUTDIR [-u UBATCH] [--split P] [-l LAYERS] [-n REGEX]\n"
-            "                   [--logits f32|f16|none] [--states last|all] [--threads N] [--mtp MTP_MODEL]\n"
+            "                   [--logits f32|f16|none] [--logits-from F] [--states last|all] [--threads N]\n"
+            "                   [--mtp MTP_MODEL]\n"
             "                   [--dflash DFLASH_MODEL --dflash-at P [--dflash-names REGEX] [--dflash-random]]\n");
     exit(1);
 }
@@ -254,7 +256,7 @@ static void usage() {
 int main(int argc, char ** argv) {
     std::string model_path, tokens_path, layers_arg, regex_arg = "", logits_mode = "f32", mtp_path, dflash_path, dflash_names;
     State st;
-    int ubatch = 0, split = -1, threads = 16, dflash_at = -1;
+    int ubatch = 0, split = -1, threads = 16, dflash_at = -1, logits_from = 0;
     bool dflash_random = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -280,6 +282,8 @@ int main(int argc, char ** argv) {
             regex_arg = next();
         } else if (a == "--logits") {
             logits_mode = next();
+        } else if (a == "--logits-from") {
+            logits_from = std::atoi(next().c_str());
         } else if (a == "--states") {
             st.states_all = next() == "all";
         } else if (a == "--threads") {
@@ -415,7 +419,8 @@ int main(int argc, char ** argv) {
             batch.pos[i] = p + i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = logits_mode != "none" || !mtp_path.empty() || p + i == n - 1;  // (--mtp: every row's h)
+            batch.logits[i] = (logits_mode != "none" && p + i >= logits_from) || !mtp_path.empty() ||
+                              p + i == n - 1;  // (--mtp: every row's h)
         }
         st.n_tokens = nb;
         st.seen.clear();
@@ -424,7 +429,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (logits.f) {
-            for (int i = 0; i < nb; i++) {
+            for (int i = std::max(0, logits_from - p); i < nb; i++) {
                 const float * l = llama_get_logits_ith(ctx, i);
                 if (logits.elem == 2) {
                     for (int k = 0; k < n_vocab; k++) {
@@ -638,8 +643,8 @@ int main(int argc, char ** argv) {
     {
         FILE * f = fopen((st.outdir + "/meta.json").c_str(), "w");
         fprintf(f, "{\"model\": \"%s\", \"tokens\": %d, \"ubatch\": %d, \"split\": %d, \"ubatches\": %d, \"logits\": \"%s\", "
-                   "\"mtp\": \"%s\"}\n",
-                model_path.c_str(), n, ubatch, split, st.ubatch, logits_mode.c_str(), mtp_path.c_str());
+                   "\"logits_from\": %d, \"mtp\": \"%s\"}\n",
+                model_path.c_str(), n, ubatch, split, st.ubatch, logits_mode.c_str(), logits_from, mtp_path.c_str());
         fclose(f);
     }
     llama_batch_free(batch);

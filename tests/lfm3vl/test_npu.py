@@ -1,9 +1,8 @@
 """LFM3-VL-2B with an image on the NPU (models.lfm with LFM3-VL's mmproj: a ``Sequence`` prompt): an essay paragraph,
 the astronaut, more essay and a question, teacher-forced over a description of the image, against llama.cpp's own
 encoder and language model on the CPU (``ref.golden``). With llama.cpp's embeddings the prompt's tokens (1-D
-positions) are tested on their own, through the prefill and as decode steps; the app's path (``Lfm(mmproj=)``) adds the
-NPU encoder."""
-
+positions) are tested on their own, as decode steps; the app's path (``Lfm(mmproj=)``) adds the NPU encoder and the
+prefill."""
 
 import numpy as np
 import pytest
@@ -57,15 +56,13 @@ def case() -> tuple:
 
 
 def test_image_prompt(case: tuple) -> None:
-    """llama.cpp's embeddings at the prompt's positions: through the prefill (chunks of 256: the image across a
-    boundary) and as decode steps, within the language model's own distance from llama.cpp's."""
+    """llama.cpp's embeddings at the prompt's positions, as decode steps (no prefill library), within the language
+    model's own distance from llama.cpp's."""
     seq, answer, want = case
-    for prefill in (True, False):
-        model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(256,))
-        got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
-        kl, agree = kl_report("prefill" if prefill else "steps", want, got)
-        assert kl < 0.003 and agree > 0.95  # (measured 0.0005 / 0.0004)
-        del model
+    model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=False)
+    got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
+    kl, agree = kl_report("steps", want, got)
+    assert kl < 0.003 and agree > 0.95  # (measured 0.0004)
 
 
 def test_app_image_prompt(case: tuple) -> None:

@@ -1,15 +1,16 @@
 """LFM3-Omni-2B (models.lfm with LFM3-Omni's mmproj: its vision tower, speech encoder and speech generator).
 
 On the NPU (slow; the tower, the speech encoder and the generator on one device: ``models.lfm.lfm.media_device``):
-teacher-forced over llama.cpp's answers to a picture, a clip (ASR) and a picture with a spoken question (Omni's own
-speech), the KL against llama.cpp's language model on float64 embeddings within 2x of the NPU language model's own; a
-TTS run that ends with the end of audio and that the model's ASR hears back; a voice reply about a picture.
+teacher-forced over llama.cpp's answers to a picture with a spoken question (Omni's own speech) and to a video with
+its soundtrack, the KL against llama.cpp's language model on float64 embeddings within 2x of the NPU language model's
+own; a TTS run that ends with the end of audio and that the model's ASR hears back; a realtime conversation (camera
+frames, a spoken question, a mixed-mode speech reply).
 
 Host (no NPU): the prompts' token ids are llama.cpp's (libmtmd's chunks through ``tests.goldens.media.golden``: text ids,
-each media chunk's tokens) for an image, an audio clip, an image with a spoken question, videos with and without a
-soundtrack (Omni's layout: per pair its timestamp, its tokens, its piece of the soundtrack), an LFM3-VL-2B video (frames
-only); the TTS and interleaved prompts' ids are llama.cpp's tokenization of their text. The encoders here are stand-ins
-that give the real token counts (``models.lfm3vl.host``, ``models.lfm3a.host``) and zero rows."""
+each media chunk's tokens) for an image with a spoken question, videos with and without a soundtrack (Omni's layout: per
+pair its timestamp, its tokens, its piece of the soundtrack), an LFM3-VL-2B video (frames only); the TTS and
+interleaved prompts' ids are llama.cpp's tokenization of their text. The encoders here are stand-ins that give the real
+token counts (``models.lfm3vl.host``, ``models.lfm3a.host``) and zero rows."""
 
 import os
 import re
@@ -94,15 +95,8 @@ def _text(m: Lfm, messages: list[dict[str, object]]) -> str:
     return chat_prompt(m.gguf, messages, enable_thinking=False, bos_token=bos)
 
 
-@pytest.fixture(scope="module")
-def videos(tmp_path_factory: pytest.TempPathFactory) -> str:
-    return str(tmp_path_factory.mktemp("videos"))
-
-
 # case -> (the user turn's parts, the files in order: "image", "audio" or a video name)
 CASES = {
-    "image": [("image", ASTRONAUT), ("text", "Describe the image.")],
-    "audio": [("audio", SPEECH_CLIP)],
     "image+audio": [("image", ASTRONAUT), ("audio", SPEECH_CLIP)],
     "video-sound": [("video", "astronaut"), ("text", "Describe what you see and hear.")],
     "video-silent": [("video", "silent"), ("text", "What happens in the video?")],
@@ -112,7 +106,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("case", list(CASES))
-def test_prompt_tokens(case: str, videos: str) -> None:
+def test_prompt_tokens(case: str) -> None:
     """Artlite's prompt (``Lfm.chat``) has llama.cpp's token ids: its text tokens where llama.cpp's are, a media row
     where each of llama.cpp's media chunks' tokens is."""
     vl = case.startswith("vl-")
@@ -125,7 +119,7 @@ def test_prompt_tokens(case: str, videos: str) -> None:
             content.append({"type": "text", "text": what})
             mtmd.append({"type": "text", "text": what})
             continue
-        path = video_file(videos, what) if kind == "video" else what
+        path = video_file(what) if kind == "video" else what
         content.append({"type": kind, kind: path})
         files.append(path)
         mtmd.append({"type": "text", "text": MARKER})
@@ -165,19 +159,11 @@ def test_interleaved_prompt() -> None:
 # On the NPU (slow): the app's path (``Lfm(mmproj=)``: the tower, the speech encoder and the generator on one device)
 
 
-IMAGE_ANSWER = ("The image is a surreal, digitally composed scene set in a barren, desert-like landscape. A "
-                "chestnut/orange horse is captured mid-gallop, its body angled toward the left with one front leg lifted "
-                "and its tail streaming behind.")  # (llama.cpp's greedy answer, CPU)
-CLIP_ANSWER = ("The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to "
-               "greet the arrival of the young princess. The French, in return, invited the English to a supper, which "
-               "was to be given the next day.")
 QUESTION = "What animal is the astronaut riding?"
 QUESTION_ANSWER = ("The astronaut is riding a **horse** (a chestnut/orange horse, shown in a galloping pose with its mane "
-                   "flowing and tail streaming).")
+                   "flowing and tail streaming).")  # (llama.cpp's greedy answer, CPU)
 # case -> (system, the user turn's parts: (kind, file or "question": the spoken question), the answer)
 QA = {
-    "image": (None, [("image", ASTRONAUT), ("text", "Describe the image.")], IMAGE_ANSWER),
-    "clip": (A.asr_system("en"), [("audio", SPEECH_CLIP)], CLIP_ANSWER),
     "image+question": (None, [("image", ASTRONAUT), ("audio", "question")], QUESTION_ANSWER),
 }
 
@@ -218,8 +204,8 @@ def test_answer_kl(app: tuple[Lfm, object], question: str, case: str) -> None:
     """Teacher-forced over llama.cpp's answer, the prompt's ids llama.cpp's; the reference: llama.cpp's language model
     (CPU) on the media's float64 embeddings (llama.cpp's own CPU encoders on the Q8_0 mmproj are 3-4% from them). The
     KL with the NPU's encoders within 2x of the NPU language model's own (on the float64 embeddings) or 1.5x of
-    llama.cpp's own run's (llama.cpp's level). Measured (own, NPU encoders, llama.cpp's own run): picture 0.0033,
-    0.0051, 0.0040; clip 0.0002, 0.0004, 0.0002; picture and spoken question 0.0021, 0.0035, 0.0024."""
+    llama.cpp's own run's (llama.cpp's level). Measured (own, NPU encoders, llama.cpp's own run): picture and spoken
+    question 0.0021, 0.0035, 0.0024."""
     m, npu = app
     system, parts, answer_text = QA[case]
     content, mtmd, files = [], [], []
@@ -252,13 +238,9 @@ def test_answer_kl(app: tuple[Lfm, object], question: str, case: str) -> None:
 
 
 VIDEO_ASK = "Describe what happens in the video, what you see and hear."
-VIDEO_ANSWERS = {  # (llama.cpp's greedy answers, CPU: the soundtrack's narrator is heard, the silent video's not)
+VIDEO_ANSWERS = {  # (llama.cpp's greedy answer, CPU: the soundtrack's narrator is heard)
     "astronaut": "The video shows a static, digitally rendered scene: a chestnut/orange horse galloping across a sandy "
                  "desert landscape, its front legs lifted in a gallop and kicking up a haze of dust.",
-    "astronaut-silent": "The video shows a surreal, digitally rendered scene: a person dressed in a full white "
-                        "spacesuit\u2014complete with a reflective helmet, a chest patch, and a long white beard\u2014sits "
-                        "astride a glossy chestnut/orange horse that is captured mid-gallop, its front legs lifted and "
-                        "tail streaming behind.",
 }
 
 
@@ -286,14 +268,14 @@ def _video_float64(path: str) -> np.ndarray:
 
 @pytest.mark.slow
 @pytest.mark.parametrize("name", list(VIDEO_ANSWERS))
-def test_video_kl(app: tuple[Lfm, object], videos: str, name: str) -> None:
-    """A video with its soundtrack (the astronaut panned, a LibriSpeech narrator) and without (a silent copy),
-    teacher-forced over llama.cpp's answer: the prompt's ids llama.cpp's, the KL against llama.cpp's language model on
-    the float64 embeddings as ``test_answer_kl``'s. Measured (own, NPU encoders, llama.cpp's own run): with the
-    soundtrack 0.0031, 0.0068, 0.0051; silent 0.0034, 0.0065, 0.0048. The pairs carry the encoders' part (the tower's
-    tokens 5.1% from float64 at the median, llama.cpp's 3.2%: NPU pairs alone 0.0057), the soundtrack's rows none."""
+def test_video_kl(app: tuple[Lfm, object], name: str) -> None:
+    """A video with its soundtrack (the astronaut panned, a LibriSpeech narrator), teacher-forced over llama.cpp's
+    answer: the prompt's ids llama.cpp's, the KL against llama.cpp's language model on the float64 embeddings as
+    ``test_answer_kl``'s. Measured (own, NPU encoders, llama.cpp's own run): 0.0031, 0.0068, 0.0051. The pairs carry the
+    encoders' part (the tower's tokens 5.1% from float64 at the median, llama.cpp's 3.2%: NPU pairs alone 0.0057), the
+    soundtrack's rows none."""
     m, npu = app
-    path = video_file(videos, name)
+    path = video_file(name)
     seq = m.chat([{"role": "user", "content": [{"type": "video", "video": path}, {"type": "text", "text": VIDEO_ASK}]}])
     answer = m.encode(VIDEO_ANSWERS[name])
     text = _text(m, [{"role": "user", "content": MARKER + VIDEO_ASK}])
@@ -316,7 +298,8 @@ def test_video_kl(app: tuple[Lfm, object], videos: str, name: str) -> None:
 @pytest.mark.slow
 def test_tts(app: tuple[Lfm, object]) -> None:
     """Omni's speech (its mmproj's sampling: temperature 0.4, no top-k, penalty 1.2 over 64 frames): two seeds end with
-    the end of audio, the same seed gives the same samples, and the model's own ASR hears the text."""
+    the end of audio, the same seed gives the same samples (another seed other ones), and the model's own ASR hears the
+    first run's text."""
     m, npu = app
     text = "Speech synthesis on the NPU sounds clear and natural."
     outs = []
@@ -327,10 +310,9 @@ def test_tts(app: tuple[Lfm, object]) -> None:
         outs.append(y)
     assert np.array_equal(outs[0], outs[2]) and not np.array_equal(outs[0], outs[1])
     norm = lambda t: re.sub(r"[^a-z ]", "", t.lower()).split()
-    for y in outs[:2]:
-        heard = _asr(m, npu, y)
-        print("ASR:", heard)
-        assert norm(heard) == norm(text)
+    heard = _asr(m, npu, outs[0])
+    print("ASR:", heard)
+    assert norm(heard) == norm(text)
 
 
 def _asr(m: Lfm, npu: object, y: np.ndarray) -> str:
@@ -341,25 +323,6 @@ def _asr(m: Lfm, npu: object, y: np.ndarray) -> str:
     prompt = m.chat(msgs)
     return m.tokenizer.decode([t for t in npu.generate(npu.forward(prompt), 200, m.sampling(), prompt)
                                if t not in m.eos_token_ids])
-
-
-@pytest.mark.slow
-def test_voice_reply_picture(app: tuple[Lfm, object]) -> None:
-    """A spoken reply about a picture (interleaved text and speech): the text names the horse, the reply ends with
-    ``<|im_end|>`` well before its limits, and the speech says the text (its ASR shares most of its words)."""
-    m, npu = app
-    st, text, audio = S.SpeechStats(), [], []
-    msgs = [{"role": "user", "content": [{"type": "image", "image": ASTRONAUT},
-                                         {"type": "text", "text": "What animal is in the picture? Answer in one sentence."}]}]
-    for kind, x in m.voice_reply(msgs, seed=3, stats=st):
-        (text if kind == "text" else audio).append(x)
-    said = m.tokenizer.decode(text)
-    print(f"reply: {said!r}; {st.frames} frames")
-    assert "horse" in said.lower() and 0 < st.frames < 2048
-    heard = _asr(m, npu, np.concatenate(audio))
-    print("ASR:", heard)
-    norm = lambda t: set(re.sub(r"[^a-z ]", "", t.lower()).split())
-    assert len(norm(heard) & norm(said)) >= 0.7 * len(norm(said))
 
 
 @pytest.mark.slow

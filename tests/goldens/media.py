@@ -1,11 +1,12 @@
 """llama.cpp's media path as a reference: ``golden`` runs a prompt with media (images, audio clips, videos) through
 libmtmd on the CPU (``minicpmv_dump.cpp``, built against the llama.cpp tree of ``model_config.LLAMA_CPP_DIR``): the
-prompt's chunks (text tokens; image chunks with llama.cpp's decoder positions, which for MiniCPM-V 4.7 differ from the
-official ``get_rope_index`` at the markers and after the image: llama.cpp PR #30510), each media chunk's embeddings,
-the encoder's tensors per entry (MiniCPM-V: the overview, then the slices row by row; inp_raw: the entry's pixels) and
-the logits after every text token. Cached under ``tests/refs/<model>/vgolden_<hash>/`` (``--refresh-refs``
-recomputes). ``seq_golden``: the language model alone on a sequence of embedding rows at given (the official)
-positions; ``video_items``: what llama.cpp's video helper reads from a video.
+prompt's chunks (text tokens; image chunks with llama.cpp's decoder positions, which for MiniCPM-V 4.7 differ from
+the official ``get_rope_index`` at the markers and after the image: llama.cpp PR #30510), each media chunk's
+embeddings, the encoder's tensors per entry (MiniCPM-V: the overview, then the slices row by row; inp_raw: the
+entry's pixels) and the logits after the last text tokens: the prompt's last and the answer's. Cached under
+``tests/refs/<model>/vgolden_<hash>_<hash>/`` (``runner.cached_golden``; ``--refresh-refs`` recomputes).
+``seq_golden``: the language model alone on a sequence of embedding rows at given (the official) positions;
+``video_items``: what llama.cpp's video helper reads from a video.
 """
 
 import hashlib
@@ -19,6 +20,11 @@ from ..llama_cpp import lib_identity
 from .runner import build_tool, cached_golden, run_tool
 
 DUMP_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "minicpmv_dump.cpp")
+
+
+def libs() -> tuple[str, str]:
+    """What the media goldens come from (their version): the llama.cpp build's libraries."""
+    return lib_identity(), lib_identity("libmtmd.so")
 
 
 def dump_tool() -> str:
@@ -63,7 +69,7 @@ def golden(model: str, mmproj: str, image: str | list[str], prompt: str, *, answ
     prompt (the text with ``<__media__>`` where each goes, in order) and teacher-forced answer tokens; ``names``: a
     regex of the encoder tensors to dump (without the "-<il>" suffix); ``embd``: the media chunks' embeddings (their
     tokens in order, n_embd) the language model takes instead of the encoders'; ``no_soundtrack``: a video's frames
-    only."""
+    only. ``logits``: the rows after the prompt's last token and the answer's (len(answer) + 1)."""
     ans = np.ascontiguousarray(answer, np.int32)
     emb = None if embd is None else np.ascontiguousarray(embd, np.float32)
     media = [image] if isinstance(image, str) else list(image)
@@ -73,13 +79,13 @@ def golden(model: str, mmproj: str, image: str | list[str], prompt: str, *, answ
             hashes.append(hashlib.sha256(f.read()).hexdigest())
     key = (common.model_key(model), common.model_key(mmproj), hashes[0] if len(hashes) == 1 else tuple(hashes), prompt,
            hashlib.sha256(ans.tobytes()).hexdigest(), names, None if emb is None else hashlib.sha256(emb.tobytes()).hexdigest(),
-           lib_identity(), lib_identity("libmtmd.so")) + (("no_soundtrack",) if no_soundtrack else ())
+           ) + (("no_soundtrack",) if no_soundtrack else ())
 
     def run(tmp: str) -> None:
         with open(os.path.join(tmp, "prompt.txt"), "w") as f:
             f.write(prompt)
         cmd = [dump_tool(), "-m", model, "--mmproj", mmproj, *(a for m in media for a in ("--image", m)), "-p",
-               os.path.join(tmp, "prompt.txt"), "-o", tmp, "--threads", str(threads)] + \
+               os.path.join(tmp, "prompt.txt"), "-o", tmp, "--logits-tail", str(ans.size + 1), "--threads", str(threads)] + \
             (["--no-soundtrack"] if no_soundtrack else [])
         if ans.size:
             ans.tofile(os.path.join(tmp, "answer.i32"))
@@ -91,7 +97,7 @@ def golden(model: str, mmproj: str, image: str | list[str], prompt: str, *, answ
             cmd += ["-e", os.path.join(tmp, "embd.f32")]
         run_tool(cmd)
 
-    return VisionGolden(cached_golden(model, "vgolden", key, DUMP_SRC, run))
+    return VisionGolden(cached_golden(model, "vgolden", key, DUMP_SRC, run, version=libs()))
 
 
 def video_items(model: str, mmproj: str, video: str, *, no_soundtrack: bool = False) -> list[dict]:
@@ -100,13 +106,13 @@ def video_items(model: str, mmproj: str, video: str, *, no_soundtrack: bool = Fa
     goldens are."""
     with open(video, "rb") as f:
         vh = hashlib.sha256(f.read()).hexdigest()
-    key = (common.model_key(model), common.model_key(mmproj), vh, no_soundtrack, lib_identity(), lib_identity("libmtmd.so"))
+    key = (common.model_key(model), common.model_key(mmproj), vh, no_soundtrack)
 
     def run(tmp: str) -> None:
         run_tool([dump_tool(), "-m", model, "--mmproj", mmproj, "--video-items", video, "-o", tmp] +
                  (["--no-soundtrack"] if no_soundtrack else []))
 
-    path = cached_golden(model, "vitems", key, DUMP_SRC, run, marker="items.json")
+    path = cached_golden(model, "vitems", key, DUMP_SRC, run, version=libs(), marker="items.json")
     with open(os.path.join(path, "items.json")) as f:
         out = json.load(f)
     for it in out:
@@ -124,8 +130,7 @@ def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *,
     rows = np.ascontiguousarray(rows, np.float32)
     pos = np.ascontiguousarray(pos, np.int32)
     assert pos.shape == (rows.shape[0], 3), (rows.shape, pos.shape)
-    key = (common.model_key(model), hashlib.sha256(rows.tobytes() + pos.tobytes()).hexdigest(), first, lib_identity(),
-           lib_identity("libmtmd.so"))
+    key = (common.model_key(model), hashlib.sha256(rows.tobytes() + pos.tobytes()).hexdigest(), first)
 
     def run(tmp: str) -> None:
         rows.tofile(os.path.join(tmp, "seq.f32"))
@@ -135,4 +140,4 @@ def seq_golden(model: str, rows: np.ndarray, pos: np.ndarray, first: int = 0, *,
         for f in ("seq.f32", "pos.i32"):
             os.remove(os.path.join(tmp, f))
 
-    return VisionGolden(cached_golden(model, "vseq", key, DUMP_SRC, run))
+    return VisionGolden(cached_golden(model, "vseq", key, DUMP_SRC, run, version=libs()))

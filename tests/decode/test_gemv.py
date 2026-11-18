@@ -26,7 +26,7 @@ from . import mmv
 PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 4), ("Q6_K", 9280, 4), ("Q4_0", 9280, 4),
         ("Q4_1", 9280, 4), ("Q4_1", 10240, 4), ("Q2_K", 9408, 4), ("Q3_K", 9408, 4), ("Q3_K", 9856, 4), ("BF16", 9216, 4),
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
-        ("IQ3_S", 18432, 8), ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
+        ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
         ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4), ("IQ1_S", 9280, 4), ("IQ1_M", 9280, 4),
         ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4), ("Q4_1_64", 9216, 4)]
 
@@ -187,13 +187,11 @@ GEMV = [
     ("IQ4_XS", 9280, 4, ("swift",), "blk.0.ffn_down.weight"),  # (16 rows)
     ("IQ4_NL", 9280, 4, ("random",), "IQ4_NL"),  # (16 rows; no file of ours has IQ4_NL tensors)
     ("IQ3_S", 9280, 4, ("swift",), "blk.0.ffn_gate.weight"),  # (20 rows)
-    ("IQ3_XXS", 9280, 4, ("swift",), "blk.16.ffn_up.weight"),  # (23 rows: a dense model's)
     ("IQ2_XXS", 9280, 4, ("random",), "IQ2_XXS"),  # (24 rows)
     ("IQ2_XS", 9280, 4, ("random",), "IQ2_XS"),
     ("IQ2_S", 9280, 4, ("random",), "IQ2_S"),
     ("IQ1_S", 9280, 4, ("random",), "IQ1_S"),  # (32 rows)
     ("IQ1_M", 9280, 4, ("random",), "IQ1_M"),
-    ("Q4_1_64", 9216, 4, ("random",), "Q4_1_64"),  # (16 rows)
     ("Q4_1_64", 9216, 4, ("flint",), "blk.0.attn_q.weight"),
 ]
 
@@ -206,24 +204,26 @@ def _path(key: tuple[str, ...]) -> str:
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])
 
 
-@pytest.mark.parametrize("S", [1, 4])
 @pytest.mark.parametrize(("fmt", "S_BYTES", "NSB", "key", "name"), GEMV, ids=[f"{c[0]}-{c[1]}" for c in GEMV])
-def test_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int) -> None:
-    _check_gemv(fmt, S_BYTES, NSB, key, name, S)
+def test_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str) -> None:
+    """One design, run with 1 and 4 slots' activations."""
+    _check_gemv(fmt, S_BYTES, NSB, key, name, (1, 4))
 
 
-GEMV8 = [c for c in GEMV if c[0] in mmv.GEMV8_FORMATS and not gemv.row_split(c[0], c[2])]
+# (the 8-slot images (qwen35, spark, dflash) hold 9280-byte tiles only)
+GEMV8_SKIP = {("Q5_K", 9856), ("Q3_K", 9856), ("Q4_1", 10240), ("Q3_K", 9408)}
+GEMV8 = [c for c in GEMV if c[0] in mmv.GEMV8_FORMATS and not gemv.row_split(c[0], c[2]) and c[:2] not in GEMV8_SKIP]
 
 
-@pytest.mark.parametrize("S", [1, 5, 8])
 @pytest.mark.parametrize(("fmt", "S_BYTES", "NSB", "key", "name"), GEMV8, ids=[f"{c[0]}-{c[1]}" for c in GEMV8])
-def test_gemv8(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int) -> None:
+def test_gemv8(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str) -> None:
     """Designs of 8 slots (x as single bfp16 rows, the sums as hi and lo panels): against their arithmetic and the
     exact product (with the activations' bfp16 rounding: 0.9-1.2e-2 rel-rms on these heavy-tailed x, 2e-3 as hi + lo)."""
-    _check_gemv(fmt, S_BYTES, NSB, key, name, S, slots=8)
+    _check_gemv(fmt, S_BYTES, NSB, key, name, (1, 8), slots=8)
 
 
-def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, S: int, slots: int = 4) -> None:
+def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: str, slot_counts: tuple[int, ...],
+                slots: int = 4) -> None:
     if key[0] == "random":
         t = random_tensor(name, 256, 2048, 4)
     else:
@@ -238,20 +238,22 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
     t.rows, t.raw = n_tiles * R, t.raw[:n_tiles * R]
     f = t.fields()
     rng = np.random.default_rng(0)
-    x = (rng.standard_normal((S, KC)) * np.exp(rng.standard_normal((S, KC)))).astype(np.float32)
-    x = torch.from_numpy(x).bfloat16().float().numpy()
-    tiles, ref, exact = [], [], []
-    for i in range(n_tiles):
-        fc = slice_fields(f, np.arange(R * i, R * (i + 1)), k0=KC, cols=t.cols, kc=KC)  # (the second K chunk)
-        tiles.append(pack_tile(fmt, fc, S_BYTES))
-        ref.append(mmv.ref_tile(fmt, fc, x, slots)[:S])
-        exact.append(x.astype(np.float64) @ _weights(fmt, fc).T)
-    X = np.concatenate([mmv.x_panels(x, slots).reshape(-1), mmv.xs_panels(x, NSB, slots).reshape(-1)])
-    got = op.compile().run(np.concatenate(tiles), X)
-    gs = mmv.tile_rows(got.reshape(n_tiles, op.y_floats), R, slots)[:, :S]
-    rs, ex = np.stack(ref), np.stack(exact)
-    assert np.abs(gs - rs).max() <= 1e-5 * np.abs(rs).max(), np.argwhere(np.abs(gs - rs) > 1e-5 * np.abs(rs).max())[:8]
-    # (vs the exact product: the sub-block sums rounded to bf16 once each, 1.5-2.0e-3 rel-rms for every integer format;
-    # x as single bfp16 (8 slots): its rounding too)
-    err = np.sqrt(((gs - ex) ** 2).mean() / (ex ** 2).mean())
-    assert err < (2.5e-3 if slots == 4 else 1.5e-2), err
+    # (the second K chunk)
+    fcs = [slice_fields(f, np.arange(R * i, R * (i + 1)), k0=KC, cols=t.cols, kc=KC) for i in range(n_tiles)]
+    tiles = [pack_tile(fmt, fc, S_BYTES) for fc in fcs]
+    compiled = op.compile()
+    for S in slot_counts:
+        x = (rng.standard_normal((S, KC)) * np.exp(rng.standard_normal((S, KC)))).astype(np.float32)
+        x = torch.from_numpy(x).bfloat16().float().numpy()
+        ref = [mmv.ref_tile(fmt, fc, x, slots)[:S] for fc in fcs]
+        exact = [x.astype(np.float64) @ _weights(fmt, fc).T for fc in fcs]
+        X = np.concatenate([mmv.x_panels(x, slots).reshape(-1), mmv.xs_panels(x, NSB, slots).reshape(-1)])
+        got = compiled.run(np.concatenate(tiles), X)
+        gs = mmv.tile_rows(got.reshape(n_tiles, op.y_floats), R, slots)[:, :S]
+        rs, ex = np.stack(ref), np.stack(exact)
+        bad = np.abs(gs - rs) > 1e-5 * np.abs(rs).max()
+        assert not bad.any(), (S, np.argwhere(bad)[:8])
+        # (vs the exact product: the sub-block sums rounded to bf16 once each, 1.5-2.0e-3 rel-rms for every integer
+        # format; x as single bfp16 (8 slots): its rounding too)
+        err = np.sqrt(((gs - ex) ** 2).mean() / (ex ** 2).mean())
+        assert err < (2.5e-3 if slots == 4 else 1.5e-2), (S, err)

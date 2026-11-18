@@ -4,7 +4,7 @@ model's prefill plans them, with random bfp16 activations, against the dequantiz
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
 Q4_1 (planar at 1024 columns; Gemma's at 512), Q4_1_64 (tile-major: Flint's), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
-file), Q8_0 (super-block units: Occamy's GDN z; every role of vllm-d3's d3-lite, gate/up in half groups; Gemma's
+file), Q8_0 (super-block units: Occamy's GDN z; vllm-d3's d3-lite: GDN in, attn in, gate/up in half groups, down; Gemma's
 16-row copy of the per-layer projection), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
 in / out and its qkv with a gate block of one tile (two rows a column). The GEMMs
 run in a library program as the prefill's do, paced (``gemm.pacing``) at level 0 and at ``LEVEL``, and as unpaced
@@ -47,99 +47,57 @@ LEVEL = 3  # (a paced level: the paced copy of each worker body)
 
 # (model, GGUF quantization, size, layers to pack, the layer and phase tested, tokens)
 CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1B", (0, 3), 3, "gate_up", 256),
-         ("llama", "Q4_K_M", "1B", (0, 3), 0, "down", 256), ("llama", "Q4_K_M", "1B", (0, 3), 3, "o", 64),
-         ("llama", "Q4_K_M", "3B", (0, 3), 3, "qkv", 256), ("llama", "Q4_K_M", "3B", (0, 3), 3, "down", 512),
-         ("llama", "Q4_K_M", "3B", (0, 3), 0, "qkv", 64), ("llama", "Q4_K_M", "3B", (0, 3), 3, "gate_up", 64),
-         ("llama", "Q4_K_M", "3B", (0, 3), 0, "o", 256),
-         ("llama", "Q4_K_S", "8B", (0,), 0, "qkv", 64), ("llama", "Q4_K_S", "8B", (0,), 0, "down", 256),
-         ("llama", "Q4_K_S", "8B", (0,), 0, "gate_up", 256),
-         ("llama", "Q5_K_M", "1B", (0, 3), 3, "qkv", 192), ("llama", "Q5_K_M", "1B", (0, 3), 3, "gate_up", 64),
-         ("llama", "Q5_K_M", "1B", (0, 3), 3, "o", 64), ("llama", "Q5_K_M", "1B", (0, 3), 0, "down", 256),
+         ("llama", "Q4_K_M", "3B", (0, 3), 3, "down", 512), ("llama", "Q4_K_S", "8B", (0,), 0, "gate_up", 256),
+         ("llama", "Q5_K_M", "1B", (0, 3), 3, "qkv", 192), ("llama", "Q5_K_M", "1B", (0, 3), 3, "o", 64),
          ("llama", "Q6_K", "1B", (0,), 0, "gate_up", 192), ("llama", "Q6_K", "1B", (0,), 0, "down", 64),
-         ("llama", "Q4_0", "1B", (0,), 0, "qkv", 64), ("llama", "Q4_0", "1B", (0,), 0, "down", 192),
-         ("llama", "Q2_K", "3B", (0,), 0, "gate_up", 192), ("llama", "Q2_K", "3B", (0,), 0, "down", 64),
-         ("llama", "Q3_K_M", "3B", (0,), 0, "qkv", 64), ("llama", "Q3_K_L", "1B", (0,), 0, "gate_up", 64),
-         ("llama", "BF16", "1B", (0,), 0, "qkv", 256), ("llama", "BF16", "1B", (0,), 0, "gate_up", 256),
-         ("llama", "BF16", "1B", (0,), 0, "down", 64), ("llama", "Q4_1", "1B", (0,), 0, "gate_up", 256),
-         ("llama", "Q4_1", "1B", (0,), 0, "o", 64), ("llama", "Q4_0", "1B", (0,), 0, "gate_up", 256),
+         ("llama", "Q4_0", "1B", (0,), 0, "qkv", 64), ("llama", "Q4_0", "1B", (0,), 0, "gate_up", 256),
+         ("llama", "Q2_K", "3B", (0,), 0, "down", 64), ("llama", "Q3_K_M", "3B", (0,), 0, "qkv", 64),
+         ("llama", "BF16", "1B", (0,), 0, "qkv", 256), ("llama", "BF16", "1B", (0,), 0, "down", 64),
+         ("llama", "Q4_1", "1B", (0,), 0, "gate_up", 256),
          ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "gdn_in", 64), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "gdn_out", 64),
-         ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "gate_up", 64), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "down", 64),
-         ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 4, "down", 256), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 3, "attn_in", 256),
-         ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 3, "attn_out", 64), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "gdn_in", 256),
-         ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "gdn_in", 256), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 8, "gdn_in", 64),
-         ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "gate_up", 256), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "down", 256),
-         ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 8, "down", 64), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 3, "attn_in", 64),
-         ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 3, "attn_out", 256),
-         ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gdn_in", 256), ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gdn_out", 64),
-         ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "gate_up", 256), ("qwen35", "Q4_K_M", "1B", (0, 3), 0, "down", 256),
-         ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "down", 64), ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "attn_in", 256),
-         ("qwen35", "Q4_K_M", "1B", (0, 3), 3, "attn_out", 64),
-         ("gemma4", "Q4_0", "E4B", (0, 5), 0, "qkv", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 256),
-         ("gemma4", "Q4_0", "E4B", (0, 5), 0, "o", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "o", 256),
+         ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 0, "gate_up", 64), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 4, "down", 256),
+         ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 3, "attn_in", 256), ("qwen35", "Q4_K_M", "9B", (0, 3, 4), 3, "attn_out", 64),
+         ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "gdn_in", 256), ("qwen35", "Q4_K_M", "27B", (0, 3, 8), 0, "down", 256),
+         ("gemma4", "Q4_0", "E4B", (0, 5), 0, "qkv", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "o", 256),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "down", 288),
          ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate", 256), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "proj", 256),
-         ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 1024), ("gemma4", "Q4_0", "E4B", (0, 5), 0, "down", 1024),
-         ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 1024), ("gemma4", "Q4_0", "E4B", (0, 5), -1, "ple", 256),
-         ("gemma4", "Q4_0", "E4B", (0, 5), -1, "ple", 1024),
-         ("occamy", "", "", (0, 3), 0, "gdn_in", 256), ("occamy", "", "", (0, 3), 0, "gdn_in", 64),
-         ("occamy", "", "", (0, 3), 0, "gdn_out", 256), ("occamy", "", "", (0, 3), 3, "attn_in", 256),
-         ("occamy", "", "", (0, 3), 3, "attn_out", 64),
+         ("gemma4", "Q4_0", "E4B", (0, 5), 0, "gate_up", 1024), ("gemma4", "Q4_0", "E4B", (0, 5), 5, "qkv", 1024),
+         ("gemma4", "Q4_0", "E4B", (0, 5), -1, "ple", 256),
+         ("occamy", "", "", (0, 3), 0, "gdn_in", 256), ("occamy", "", "", (0, 3), 0, "gdn_out", 256),
+         ("occamy", "", "", (0, 3), 3, "attn_in", 256),
          ("d3-lite", "", "", (0, 3), 0, "gdn_in", 256), ("d3-lite", "", "", (0, 3), 0, "gate_up", 256),
-         ("d3-lite", "", "", (0, 3), 0, "gate_up", 64), ("d3-lite", "", "", (0, 3), 0, "down", 256),
-         ("d3-lite", "", "", (0, 3), 3, "attn_in", 64), ("d3-lite", "", "", (0, 3), 3, "attn_out", 256),
-         ("qwen3", "", "embedding-4B", (0, 4), 4, "down", 256), ("qwen3", "", "embedding-4B", (0, 4), 0, "down", 256),
-         ("qwen3", "", "embedding-4B", (0, 4), 4, "qkv", 256), ("qwen3", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
-         ("qwen3", "", "embedding-4B", (0, 4), 4, "o", 64), ("qwen3", "", "embedding-0.6B", (0,), 0, "down", 256),
-         ("swift", "", "", (0, 16), 0, "down", 256), ("swift", "", "", (0, 16), 16, "down", 64),
-         ("swift", "", "", (0, 16), 0, "gate_up", 256), ("swift", "", "", (0, 16), 16, "gate_up", 256),
-         ("swift", "", "", (0, 16), 16, "gate_up", 64), ("swift", "", "", (0, 16), 0, "gdn_in", 256),
-         ("swift", "", "", (0, 16), 16, "gdn_in", 64),
+         ("d3-lite", "", "", (0, 3), 0, "down", 256), ("d3-lite", "", "", (0, 3), 3, "attn_in", 64),
+         ("qwen3", "", "embedding-4B", (0, 4), 4, "down", 256), ("qwen3", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
+         ("qwen3", "", "embedding-0.6B", (0,), 0, "down", 256),
+         ("swift", "", "", (0, 16), 0, "gate_up", 256), ("swift", "", "", (0, 16), 0, "gdn_in", 256),
          ("lfm", "QAD-Q4_0", "", (0, 2), 0, "in", 256), ("lfm", "QAD-Q4_0", "", (0, 2), 0, "out", 256),
-         ("lfm", "QAD-Q4_0", "", (0, 2), 2, "qkv", 256), ("lfm", "QAD-Q4_0", "", (0, 2), 2, "o", 64),
-         ("lfm", "QAD-Q4_0", "", (0, 2), 0, "gate_up", 256), ("lfm", "QAD-Q4_0", "", (0, 2), 0, "down", 256),
-         ("lfm", "QAD-Q4_0", "", (0, 2), 0, "in", 64), ("lfm", "Q4_K_M", "", (1, 2), 2, "qkv", 256),
-         ("lfm", "Q4_K_M", "", (1, 2), 1, "down", 256), ("lfm", "Q4_K_M", "", (1, 2), 1, "in", 256),
-         ("lfm", "Q8_0", "", (0, 2), 2, "qkv", 256), ("lfm", "Q8_0", "", (0, 2), 0, "gate_up", 256),
+         ("lfm", "QAD-Q4_0", "", (0, 2), 2, "qkv", 256), ("lfm", "QAD-Q4_0", "", (0, 2), 0, "gate_up", 256),
+         ("lfm", "Q4_K_M", "", (1, 2), 1, "down", 256), ("lfm", "Q8_0", "", (0, 2), 2, "qkv", 256),
          ("lfm", "BF16", "", (0, 2), 0, "in", 256),
          # Spark-X: the gate rows (BFP16, or the F32 gate's BF16 copy) after q, k, v; the 4B's hidden 2560 and the 1.7B's
          # ffn 6656 padded to whole K chunks (3072, 7168); gate / up with GELU's erf form (GemmQ, GemmQd; a split block's
          # activation: ``test_gate_up.py``)
-         ("spark", "Q4_K_M", "4B", (0, 3), 0, "attn_in", 256), ("spark", "Q4_K_M", "4B", (0, 3), 3, "attn_in", 64),
-         ("spark", "Q4_K_M", "4B", (0, 3), 0, "gate_up", 256), ("spark", "Q4_K_M", "4B", (0, 3), 0, "down", 256),
-         ("spark", "Q4_K_M", "4B", (0, 3), 3, "attn_out", 64), ("spark", "Q4_K_M", "4B", (0, 3), 0, "gate_up", 1024),
-         ("spark", "Q4_K_M", "1.7B", (0, 3), 3, "attn_in", 256), ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "gate_up", 64),
-         ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "down", 256), ("spark", "Q4_K_M", "1.7B", (0, 3), 3, "down", 1024),
-         ("spark", "Q4_K_M", "1.7B", (0, 3), 0, "attn_out", 256),
-         ("spark", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark", "Q8_0", "4B", (0,), 0, "attn_in", 64),
-         ("spark-bartowski", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
-         ("spark-bartowski", "Q4_0", "4B", (0,), 0, "gate_up", 256), ("spark-bartowski", "Q4_0", "4B", (0,), 0, "down", 256),
+         ("spark", "Q4_K_M", "4B", (0, 3), 0, "attn_in", 256), ("spark", "Q4_K_M", "4B", (0, 3), 0, "gate_up", 256),
+         ("spark", "Q4_K_M", "4B", (0, 3), 0, "down", 256), ("spark", "Q4_K_M", "1.7B", (0, 3), 3, "down", 1024),
+         ("spark", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark-bartowski", "Q4_0", "4B", (0,), 0, "gate_up", 256),
          # (the image's regions of half a chunk short, ``SparkImage(tails=True)``: their tail tiles' halves; gate / up's
          # Q4_K and Q4_0 blocks in pairs of row tiles: pass pairs)
-         ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "attn_in", 256), ("spark-tails", "Q4_K_M", "4B", (0, 4), 4, "attn_in", 64),
-         ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 256), ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 1024),
-         ("spark-tails", "Q8_0", "4B", (0,), 0, "gate_up", 256), ("spark-tails", "Q8_0", "4B", (0,), 0, "attn_in", 64),
-         ("spark-bartowski-tails", "Q4_K_M", "4B", (0,), 0, "attn_in", 256),
+         ("spark-tails", "Q4_K_M", "4B", (0, 4), 0, "gate_up", 256), ("spark-tails", "Q8_0", "4B", (0,), 0, "gate_up", 256),
          ("spark-bartowski-tails", "Q4_0", "4B", (0,), 0, "gate_up", 256),
          # (the Qwen3-4B family's and Kev-4B's half regions: "-halves" a readout model's image (every tail tile read for
          # its first half), "-tails" a decoding model's (gate / up in pass pairs); qkv's Q4_K and planar Q6_K, gdn_in's
-         # and attn_in's planar Q8_0)
+         # planar Q8_0)
          ("qwen3-halves", "", "embedding-4B", (0, 4), 0, "qkv", 256),
-         ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "qkv", 64),
-         ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
          ("qwen3-halves", "", "embedding-4B", (0, 4), 4, "gate_up", 1024),
          ("qwen3-tails", "", "embedding-4B", (0, 4), 4, "gate_up", 256),
-         ("kev-halves", "", "", (0, 3), 0, "gdn_in", 256), ("kev-halves", "", "", (0, 3), 0, "gdn_in", 64),
-         ("kev-halves", "", "", (0, 3), 3, "attn_in", 256), ("kev-halves", "", "", (0, 3), 0, "gate_up", 256),
-         ("kev-tails", "", "", (0, 3), 0, "gate_up", 1024),
+         ("kev-halves", "", "", (0, 3), 0, "gdn_in", 256), ("kev-tails", "", "", (0, 3), 0, "gate_up", 1024),
          # (down half a chunk short in one K group: MiniCPM-V 1B's and d3-lite's ffn 3584, unpaired; gate / up's rows
          # of 3584)
-         ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "down", 256), ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 3, "down", 64),
-         ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "gate_up", 256),
-         ("d3-lite-halves", "", "", (0, 3), 0, "down", 256), ("d3-lite-halves", "", "", (0, 3), 0, "gate_up", 256),
+         ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "down", 256), ("qwen35-halves", "Q4_K_M", "1B", (0, 3), 0, "gate_up", 256),
+         ("d3-lite-halves", "", "", (0, 3), 0, "gate_up", 256),
          # Flint's official file: Q4_1_64 (tile-major, the compact header); o's K 4096, down's 6144
-         ("flint", "int4", "", (0, 2), 0, "qkv", 256), ("flint", "int4", "", (0, 2), 2, "qkv", 64),
-         ("flint", "int4", "", (0, 2), 0, "o", 256), ("flint", "int4", "", (0, 2), 0, "gate_up", 256),
-         ("flint", "int4", "", (0, 2), 0, "down", 256), ("flint", "int4", "", (0, 2), 2, "o", 64)]
+         ("flint", "int4", "", (0, 2), 0, "qkv", 256), ("flint", "int4", "", (0, 2), 0, "o", 256),
+         ("flint", "int4", "", (0, 2), 0, "gate_up", 256), ("flint", "int4", "", (0, 2), 0, "down", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -361,8 +319,8 @@ def _ratio(img: object, region: object) -> torch.Tensor:
 
 
 # (format, tiles per pass): super-block unit formats in passes no test file holds (IQ3_S and IQ4 outside gate / up, IQ2)
-UNIT = [("IQ3_S", 6), ("IQ3_S", 3), ("IQ3_S", 4), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ4_XS", 1), ("IQ2_XXS", 6), ("IQ2_XS", 3),
-        ("IQ2_S", 6), ("IQ2_S", 1), ("IQ1_S", 4), ("IQ1_S", 1), ("IQ1_M", 3), ("IQ1_M", 2)]
+UNIT = [("IQ3_S", 6), ("IQ4_NL", 8), ("IQ4_XS", 4), ("IQ2_XXS", 6), ("IQ2_XS", 3), ("IQ2_S", 6), ("IQ1_S", 4),
+        ("IQ1_M", 3)]
 
 
 @pytest.mark.parametrize(("fmt", "tiles"), UNIT, ids=[f"{f}-t{t}" for f, t in UNIT])

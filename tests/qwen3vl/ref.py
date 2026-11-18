@@ -9,9 +9,7 @@ interpolated bilinearly (align corners) to the patch grid, the ViT layers (Layer
 projection, the 2-D RoPE of the vision mode: dims i, i + 36 of a head turned by y s^i for i < 18 and by x s^(i - 18)
 for 18 <= i < 36, s = 10000^(-1/18); 16 heads of 72, GELU tanh), post_ln per patch, the 2 x 2 merge (the window's
 patches (0, 0), (0, 1), (1, 0), (1, 1)) -> mm.0 -> GELU (transformers' ``nn.GELU``: erf; llama.cpp: tanh) -> mm.2.
-In float64 (patches in raster order: the attention does not depend on the tokens' order, only the merge does), or
-with ``llama=True`` llama.cpp's choices: a matmul against BF16 weights takes its activations as bf16, GELU tanh
-through ggml's fp16 table, the merger's GELU tanh too.
+In float64 (patches in raster order: the attention does not depend on the tokens' order, only the merge does).
 """
 
 import math
@@ -23,7 +21,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
 from ..goldens.media import VisionGolden, golden
-from ..numerics import bf16_like, gelu_table, gelu_tanh
+from ..numerics import bf16_like, gelu_tanh
 
 __all__ = ["Encoder", "NpuEncoder", "VisionGolden", "golden", "pos_rows", "rope_angles"]
 
@@ -47,16 +45,15 @@ def pos_rows(table: np.ndarray, ph: int, pw: int) -> np.ndarray:
 
 
 class Encoder:
-    """Qwen3-VL's vision encoder from its mmproj file (module docstring); ``llama``: llama.cpp's CPU rounding."""
+    """Qwen3-VL's vision encoder from its mmproj file (module docstring)."""
 
-    def __init__(self, mmproj: str, *, llama: bool = False):
+    def __init__(self, mmproj: str):
         self.g = g = GGUFFile(mmproj)
         self.cfg = cfg = ClipConfig.from_gguf(g)
         assert cfg.projector == "qwen3vl_merger", cfg.projector
         self.hidden, self.heads, self.hd = cfg.hidden, cfg.heads, cfg.head_dim
         self.layers, self.patch, self.eps = cfg.layers, cfg.patch_size, cfg.eps
-        self.llama = llama
-        self.dtype = torch.float32 if llama else torch.float64
+        self.dtype = torch.float64
         self._w: dict[str, torch.Tensor] = {}
 
     def w(self, name: str) -> torch.Tensor:
@@ -68,8 +65,6 @@ class Encoder:
 
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
-        if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = bf16_like(x)
         y = x @ w.T
         return y + self.w(bias).reshape(-1) if bias else y
 
@@ -80,7 +75,7 @@ class Encoder:
             + self.w(prefix + ".bias").reshape(-1)
 
     def _gelu(self, x: torch.Tensor) -> torch.Tensor:
-        return gelu_table(x) if self.llama else gelu_tanh(x)
+        return gelu_tanh(x)
 
     def _rope(self, x: torch.Tensor, ang: torch.Tensor) -> torch.Tensor:
         """x (heads, n, d) turned by ang (n, d / 2): dims i, i + d / 2 a pair (rotate_half)."""
@@ -142,7 +137,7 @@ class Encoder:
         m = x[torch.from_numpy(self.windows(ph, pw))].reshape(-1, 4 * self.hidden)
         tr["merged"] = m
         h = self._mm(m, "mm.0.weight", "mm.0.bias")
-        h = self._gelu(h) if self.llama else 0.5 * h * (1 + torch.erf(h / math.sqrt(2)))
+        h = 0.5 * h * (1 + torch.erf(h / math.sqrt(2)))
         return self._mm(h, "mm.2.weight", "mm.2.bias")
 
 

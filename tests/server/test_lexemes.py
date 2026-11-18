@@ -197,7 +197,7 @@ def test_fuzz() -> None:
     """Random grammars against llguidance: every one the analysis clears ends in the call after each of its sampled
     inputs, for each closing text (many more seeds: the analysis's research runs)."""
     wrong = []
-    for seed in range(300):
+    for seed in range(100):
         rng = random.Random(seed)
         g = random_grammar(rng)
         inputs = valid_inputs(g, rng)

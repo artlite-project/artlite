@@ -99,13 +99,6 @@ def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
     return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3)))
 
 
-def gelu_table(x: torch.Tensor) -> torch.Tensor:
-    """ggml's CPU GELU (tanh): an fp16 table of the fp16-rounded input (|x| < 10), the identity / 0 outside."""
-    xh = x.to(torch.float16).to(torch.float32)
-    y = gelu_tanh(xh).to(torch.float16).to(x.dtype)
-    return torch.where(x <= -10, torch.zeros_like(x), torch.where(x >= 10, x, y))
-
-
 def verify_close(output, reference, *, rel_tol, abs_tol, label="output"):
     """Assert elements are within tolerance.
 

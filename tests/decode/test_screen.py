@@ -73,8 +73,7 @@ def test_exact(head: tuple) -> None:
     assert np.abs(sc.exact(ids, g) - want).max() < 2e-6 * np.abs(want).max()
 
 
-@pytest.mark.parametrize("k", [1, 20, 64])
-def test_top(head: tuple, k: int) -> None:
+def test_top(head: tuple) -> None:
     """The k largest logits of a screened row are the exact ones (those within the window of the largest), in their
     order; the screened logits lie within their bounds."""
     sc = head[0]
@@ -83,13 +82,15 @@ def test_top(head: tuple, k: int) -> None:
         g = sc.input(x)
         est = row.screened.astype(np.float64) * sc.scale  # (the logits lie within their bounds)
         assert (np.abs(est - exact) <= sc.bound * np.linalg.norm(g) + 2.0 ** -8 * np.abs(exact)).all()
-        v, i = top_logits(row, k)
-        order = np.lexsort((np.arange(V), -exact))[:k]
-        m = int((exact[order] >= exact[order[0]] - SC.WINDOW).sum())
-        assert len(i) == k and np.array_equal(i[:m], order[:m])
-        assert np.abs(v[:m] - exact[order[:m]]).max() < 1e-5 * np.abs(exact).max()
-        assert (np.diff(v) <= 0).all() and len(set(i.tolist())) == k  # (past the window: screened values, below)
-        assert argmax(row) == order[0]
+        for k in (1, 20, 64):
+            v, i = top_logits(row, k)
+            order = np.lexsort((np.arange(V), -exact))[:k]
+            m = int((exact[order] >= exact[order[0]] - SC.WINDOW).sum())
+            assert len(i) == k and np.array_equal(i[:m], order[:m]), k
+            assert np.abs(v[:m] - exact[order[:m]]).max() < 1e-5 * np.abs(exact).max(), k
+            # (past the window: screened values, below)
+            assert (np.diff(v) <= 0).all() and len(set(i.tolist())) == k, k
+            assert argmax(row) == order[0], k
 
 
 def test_arrays(head: tuple) -> None:

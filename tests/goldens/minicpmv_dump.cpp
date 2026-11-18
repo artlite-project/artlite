@@ -6,7 +6,7 @@
 // ref.py.
 //
 //   minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE [--image FILE ...] -p PROMPT -o OUTDIR [-a ANSWER] [-e EMBD]
-//                 [-n REGEX] [--no-soundtrack] [--threads N]
+//                 [-n REGEX] [--logits-tail N] [--no-soundtrack] [--threads N]
 //   minicpmv_dump -m MODEL --mmproj MMPROJ --video-items FILE -o OUTDIR [--no-soundtrack]
 //   minicpmv_dump -m MODEL --seq SEQ --pos POS -o OUTDIR [--from K] [--threads N]
 //
@@ -34,9 +34,10 @@
 //   "entries": the encoder's graphs (the image's entries);
 // - embd-<i>.npy: media chunk i's embeddings (n_tokens, n_embd), as mtmd_encode_chunk gives them;
 // - <name>-<il>.e<k>.npy: the encoder's tensors per entry k of an image (the overview, then the slices row by row);
-//   the inputs (inp_raw: the entry's pixels; positions, the merges' gather indices) as the first nodes that read them
-//   see them; float tensors as float32, integer ones as int32, shape = ne reversed;
-// - logits.npy: (text tokens, vocab) float32: the logits after every text token (the image's tokens take none);
+//   inp_raw (the entry's pixels) as the first node that reads it sees it; float tensors as float32, integer ones as
+//   int32, shape = ne reversed;
+// - logits.npy: (text tokens, vocab) float32: the logits after every text token (the image's tokens take none), or
+//   after the last N text tokens (--logits-tail N);
 // - meta.json: what ran.
 //
 // Backend: CPU only, F32 KV cache, flash attention off.
@@ -158,10 +159,9 @@ static bool wanted(const State & st, const ggml_tensor * t) {
     return std::regex_match(s, st.names);
 }
 
-// the graph inputs a node reads (inp_raw, positions, gather indices: leafs the callback never sees itself)
+// the graph input a node reads (inp_raw: a leaf the callback never sees itself)
 static bool input_name(const char * name) {
-    return !strcmp(name, "inp_raw") || !strcmp(name, "positions") || !strncmp(name, "vit_merger_", 11) ||
-           !strncmp(name, "merger_ds_idx_", 14);
+    return !strcmp(name, "inp_raw");
 }
 
 static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
@@ -200,7 +200,8 @@ static bool eval_cb(ggml_tensor * t, bool ask, void * user) {
 
 static void usage() {
     fprintf(stderr, "usage: minicpmv_dump -m MODEL --mmproj MMPROJ --image FILE [--image FILE ...] -p PROMPT -o OUTDIR\n"
-                    "                     [-a ANSWER.i32] [-e EMBD.f32] [-n REGEX] [--no-soundtrack] [--threads N]\n"
+                    "                     [-a ANSWER.i32] [-e EMBD.f32] [-n REGEX] [--logits-tail N] [--no-soundtrack]\n"
+                    "                     [--threads N]\n"
                     "       minicpmv_dump -m MODEL --mmproj MMPROJ --video-items FILE -o OUTDIR [--no-soundtrack]\n"
                     "       minicpmv_dump -m MODEL --seq SEQ.f32 --pos POS.i32 -o OUTDIR [--from K] [--threads N]\n");
     exit(1);
@@ -345,7 +346,7 @@ int main(int argc, char ** argv) {
     std::string model_path, mmproj_path, prompt_path, answer_path, embd_path, regex_arg, seq_path, pos_path, items_path;
     std::vector<std::string> media;
     bool no_soundtrack = false;
-    int from = 0;
+    int from = 0, logits_tail = -1;
     State st;
     int threads = 16;
     for (int i = 1; i < argc; i++) {
@@ -384,6 +385,8 @@ int main(int argc, char ** argv) {
             pos_path = next();
         } else if (a == "--from") {
             from = std::atoi(next().c_str());
+        } else if (a == "--logits-tail") {
+            logits_tail = std::atoi(next().c_str());
         } else {
             usage();
         }
@@ -466,6 +469,15 @@ int main(int argc, char ** argv) {
         n_total += (int) mtmd_input_chunk_get_n_tokens(mtmd_input_chunks_get(chunks, c));
     }
     n_total += (int) answer.size();
+    int n_text = (int) answer.size();  // (the text tokens; the logits of those from first_out on)
+    for (size_t c = 0; c < n_chunks; c++) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, c);
+        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            n_text += (int) mtmd_input_chunk_get_n_tokens(chunk);
+        }
+    }
+    const int first_out = logits_tail < 0 ? 0 : n_text - logits_tail;
+    int text_index = 0;
 
     const llama_context_params cp = context_params(n_total, threads);
     llama_context * ctx = llama_init_from_model(model, cp);
@@ -494,18 +506,21 @@ int main(int argc, char ** argv) {
             batch.pos[i] = n_past + (llama_pos) i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = 1;
+            batch.logits[i] = text_index + (int) i >= first_out;
         }
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "llama_decode failed\n");
             exit(1);
         }
         for (size_t i = 0; i < n; i++) {
-            const float * l = llama_get_logits_ith(ctx, (int) i);
-            logits.insert(logits.end(), l, l + n_vocab);
-            logit_tokens.push_back(seq_index + (int) i);
+            if (batch.logits[i]) {
+                const float * l = llama_get_logits_ith(ctx, (int) i);
+                logits.insert(logits.end(), l, l + n_vocab);
+                logit_tokens.push_back(seq_index + (int) i);
+            }
         }
         llama_batch_free(batch);
+        text_index += (int) n;
         n_past += (llama_pos) n;
         seq_index += (int) n;
     };

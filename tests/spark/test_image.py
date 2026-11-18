@@ -3,8 +3,6 @@ matrix in exactly one column's block, the KV heads' parts and the gate rows per 
 padded, the regions in step order, the tile formats, column- or region-major) and the packed image's tiles and
 norm-weight objects at their places (an F32 gate through its BF16 copy)."""
 
-import time
-
 import numpy as np
 import pytest
 from ml_dtypes import bfloat16
@@ -18,11 +16,9 @@ from ..decode.image_checks import check_tails
 from . import ref
 
 FILES = {"4B": ("4B", "Q4_K_M", "XHToken"), "1.7B": ("1.7B", "Q4_K_M", "XHToken"), "4B-Q8_0": ("4B", "Q8_0", "XHToken"),
-         "1.7B-Q8_0": ("1.7B", "Q8_0", "XHToken"), "bartowski-4B": ("4B", "Q4_K_M", "bartowski"),
-         "bartowski-4B-Q4_0": ("4B", "Q4_0", "bartowski")}
+         "bartowski-4B": ("4B", "Q4_K_M", "bartowski"), "bartowski-4B-Q4_0": ("4B", "Q4_0", "bartowski")}
 FORMATS = {"4B": {"BFP16", "Q4_K", "Q6_K", "Q8_0"}, "1.7B": {"BFP16", "Q4_K", "Q6_K", "Q8_0"}, "4B-Q8_0": {"Q8_0"},
-           "1.7B-Q8_0": {"Q8_0"}, "bartowski-4B": {"BFP16", "Q4_K", "Q5_K", "Q6_K"},
-           "bartowski-4B-Q4_0": {"Q4_0", "Q4_1", "Q6_K"}}
+           "bartowski-4B": {"BFP16", "Q4_K", "Q5_K", "Q6_K"}, "bartowski-4B-Q4_0": {"Q4_0", "Q4_1", "Q6_K"}}
 
 
 @pytest.mark.parametrize("name", FILES)
@@ -73,8 +69,8 @@ def test_layout(name: str) -> None:
 def test_pack_image(name: str) -> None:
     """SparkImage.pack of a sliding-window and a full layer and a slice of the LM head: sampled tiles of every block at
     their places as pack_rows packs their rows (the padded K: zero past 2560 columns; bartowski's F32 gate: as its BF16
-    copy; its gate / up of two formats: a split block's parts), the norm-weight objects in every column; the whole
-    image's pack time."""
+    copy; its gate / up of two formats: a split block's parts), the norm-weight objects in every column; bartowski's
+    whole image packs."""
     g = ref.gguf(*FILES[name])
     img = SparkImage(g, layers=[2, 3], vocab=COLS * 64, tails=False)
     T = img.tile_bytes
@@ -102,11 +98,9 @@ def test_pack_image(name: str) -> None:
         gate = img.tensor("blk.3.attn_gate.weight")
         assert gate.qtype == "BF16" and np.array_equal(gate.dequantize(), g.tensor("blk.3.attn_gate.weight").dequantize()
                                                        .astype(bfloat16).astype(np.float32))
-    full = SparkImage(g, tails=False)
-    buf = np.zeros(full.nbytes, np.uint8)
-    t0 = time.perf_counter()
-    full.pack(buf)
-    print(f"{name}: {full.nbytes / 1e6:.0f} MB packed in {time.perf_counter() - t0:.2f} s")
+    if name == "bartowski-4B":
+        full = SparkImage(g, tails=False)
+        full.pack(np.zeros(full.nbytes, np.uint8))
 
 
 @pytest.mark.parametrize("name", ["4B", "bartowski-4B", "bartowski-4B-Q4_0", "4B-Q8_0"])

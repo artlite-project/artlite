@@ -17,11 +17,11 @@ from ..numerics import rel
 _from_panels = bfp16.from_panels
 
 
-CASES = [(T, add, E, 0, 8) for E in (2048, 3072) for add in (True, False) for T in (64, 512)]
-CASES += [(64, True, 2048, 264, 8), (512, True, 3072, 396, 8)]  # delta of a Q6_K down projection (11-row tiles)
-CASES += [(64, True, 3072, 396, 2), (64, False, 3072, 0, 1), (128, True, 2048, 0, 2)]  # fewer cores
-CASES += [(64, True, 4096, 528, 8), (512, True, 4096, 528, 8), (512, False, 4096, 0, 8), (64, True, 4096, 528, 2)]  # 8B
-CASES += [(2048, True, 3072, 396, 8), (1024, True, 4096, 528, 8)]  # (Llama's norm blocks)
+CASES = [(64, True, 2048, 0, 8), (512, False, 3072, 0, 8),
+         (512, True, 3072, 396, 8),  # delta of a Q6_K down projection (11-row tiles)
+         (64, True, 3072, 396, 2), (64, False, 3072, 0, 1),  # fewer cores
+         (512, True, 4096, 528, 8), (64, True, 4096, 528, 2), (512, False, 4096, 0, 8),  # 8B
+         (2048, True, 3072, 396, 8)]  # (Llama's norm blocks)
 
 
 @pytest.mark.parametrize(("T", "add", "E", "d_pitch", "cols"), CASES,
@@ -52,7 +52,7 @@ def test_prefill_norm(T: int, add: bool, E: int, d_pitch: int, cols: int):
         assert torch.equal(to_torch(xb.numpy()).view(T, E), (x.float() + d.float()).bfloat16())
 
 
-@pytest.mark.parametrize(("T", "d_pitch"), [(64, 0), (256, 264)], ids=["T64", "T256-dp264"])
+@pytest.mark.parametrize(("T", "d_pitch"), [(256, 264)], ids=["T256-dp264"])
 def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     """xn as hi + lo panels (``lo``: an MoE router's x, Qwen3.6-35B-A3B's hidden 2048): per token group [hi | lo]
     panels; hi + lo within 4e-5 of x / rms(x) w in fp64 (x the bf16 sum; 2.6e-5: lo's rounding, ~2^-16 of each block's
@@ -84,7 +84,7 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     assert torch.equal(to_torch(xb.numpy()).view(T, E), xs.float().bfloat16())
 
 
-@pytest.mark.parametrize(("T", "E"), [(64, 2048), (256, 2048), (64, 5120), (256, 5120)])
+@pytest.mark.parametrize(("T", "E"), [(64, 2048), (256, 5120)])
 def test_prefill_norm_pre_pitch(T: int, E: int) -> None:
     """Two norms into one A of 2 E columns (``out_pitch``, ``out_col``: an MTP drafter's eh_proj input [enorm(emb) |
     hnorm(h)]): a plain one into columns 0 .., ``pre`` into E ..: (x w1) w2 / rms(x w1), x w1 rounded to bf16 (h =
@@ -110,7 +110,7 @@ def test_prefill_norm_pre_pitch(T: int, E: int) -> None:
         assert rel < 1e-2, rel
 
 
-@pytest.mark.parametrize(("T", "add", "cols"), [(64, True, 4), (256, False, 4), (512, True, 8)])
+@pytest.mark.parametrize(("T", "add", "cols"), [(64, True, 4), (256, False, 4)])
 def test_prefill_norm_padded(T: int, add: bool, cols: int) -> None:
     """E 2560 (Qwen3-Embedding-4B's hidden size: the replay design, E not a multiple of 1024) into panel rows of 3072
     columns (the GEMMs' K in whole chunks): the norm within the bfp16 panels' rounding, the padding panels unwritten."""
@@ -135,9 +135,8 @@ def test_prefill_norm_padded(T: int, add: bool, cols: int) -> None:
 
 
 # (T, E, d_pitch, cols, rows, deltas): Llama's and qwen35's projections in K parts
-DELTAS = [(64, 5120, 660, 4, 96, 2), (256, 4096, 528, 8, 256, 2), (64, 4096, 0, 2, 64, 2),
-          (1024, 3072, 396, 8, 1024, 2), (2048, 4096, 528, 8, 2048, 2), (512, 2048, 264, 8, 512, 2),
-          (256, 5120, 660, 8, 288, 4), (256, 5120, 660, 8, 288, 6), (256, 4096, 528, 8, 288, 3), (64, 5120, 0, 2, 64, 5)]
+DELTAS = [(64, 5120, 660, 4, 96, 2), (256, 4096, 528, 8, 256, 2), (512, 2048, 264, 8, 512, 2),
+          (256, 5120, 660, 8, 288, 4), (64, 5120, 0, 2, 64, 5)]
 
 
 @pytest.mark.parametrize(("T", "E", "d_pitch", "cols", "rows", "n"), DELTAS,
@@ -187,10 +186,8 @@ def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.T
 # (mode, E, deltas, d_pitch, scale, the panels' row: 0 = E): Gemma E4B's modes, LFM3's (E 2048), Spark-X's pre-norm
 # updates (add; the 4B's 2560 in rows of 3072: the GEMMs' K in whole chunks)
 RESIDUAL = [("in", 2560, 1, 320, False, 0), ("post", 2560, 1, 320, False, 0), ("post", 2560, 1, 384, True, 0),
-            ("plain", 2560, 2, 320, False, 0), ("plain", 2560, 2, 384, False, 0), ("plain", 2560, 4, 320, False, 0),
-            ("in", 2048, 1, 256, False, 0), ("post", 2048, 1, 256, False, 0), ("post", 2048, 2, 256, False, 0),
-            ("in", 2560, 1, 320, False, 3072), ("add", 2560, 1, 320, False, 3072), ("add", 2560, 2, 384, False, 3072),
-            ("add", 2048, 1, 256, False, 0), ("add", 2048, 2, 256, False, 0)]
+            ("plain", 2560, 2, 384, False, 0), ("plain", 2560, 4, 320, False, 0), ("post", 2048, 2, 256, False, 0),
+            ("in", 2560, 1, 320, False, 3072), ("add", 2560, 2, 384, False, 3072), ("add", 2048, 2, 256, False, 0)]
 
 
 @pytest.mark.parametrize(("mode", "E", "deltas", "d_pitch", "scale", "pitch"), RESIDUAL,

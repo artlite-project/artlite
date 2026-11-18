@@ -4,8 +4,6 @@ in its ranges."""
 
 import ctypes
 
-import pytest
-
 from artlite import txn
 from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator
@@ -73,7 +71,6 @@ def test_gpu_metrics_layout() -> None:
     assert telemetry.GpuMetricsV3.average_fclk_frequency.offset == 182
 
 
-@pytest.mark.smoke
 def test_control_rates() -> None:
     op, clock = DmaProbeOperator(), ClockProbeOperator()
     compile_all([op, clock])

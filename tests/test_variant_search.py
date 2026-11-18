@@ -374,16 +374,30 @@ extern "C" void vs_entry(const float *__restrict x, float *__restrict y)
 """
 
 
+class _Flagged:
+    """An operator stand-in whose parameter only changes its compiler flags."""
+
+    def __init__(self, flags: tuple[str, ...] = ()):
+        self.clang_flags = list(flags)
+
+    def get_kernel_src(self) -> str:
+        return KERNEL
+
+
 def test_search_report(tmp_path: Path) -> None:
     """Variants of a kernel compiled in parallel: one row per variant in the loop's table, ranked by cycles; a
-    variant whose source equals an earlier one is measured once."""
+    variant whose source and compiler flags equal an earlier one's is measured once, one with other flags is compiled
+    on its own."""
     variants = [Variant("base"), Variant("post", pragma=POST), Variant("none", pragma=""),
-                Variant("sub", subs=[("aie::add(", "aie::sub(")])]
-    result = search(lambda: KERNEL, {}, functions=["vs_scale"], variants=variants, totals=["vs_entry"],
+                Variant("sub", subs=[("aie::add(", "aie::sub(")]), Variant("same", params={"flags": ()}),
+                Variant("flag", params={"flags": ("-mllvm", "--enable-aie-zol-without-minitercount=false")})]
+    result = search(_Flagged, {}, functions=["vs_scale"], variants=variants, totals=["vs_entry"],
                     out_dir=tmp_path)
     by_name = {item.variant.name: item for item in result.variants}
     assert all(item.error is None for item in result.variants), [item.error for item in result.variants]
     assert by_name["post"].same_as == "base" and by_name["post"].report is by_name["base"].report
+    assert by_name["same"].same_as == "base" and by_name["flag"].same_as is None
+    assert by_name["flag"].clang_cmd[-1] == "--enable-aie-zol-without-minitercount=false"
     assert by_name["base"].pragma_lines == []
     for name in ("post", "none"):  # (lines of the compiled file, the loop statement)
         (line,) = by_name[name].pragma_lines
@@ -396,31 +410,10 @@ def test_search_report(tmp_path: Path) -> None:
     lines = text.split("vs_scale loop 1/1")[1].splitlines()
     header = lines[1].split()
     assert header[:7] == ["variant", "pragma", "sched", "II", "NS", "iters", "cycles"]
-    rows = {line.split()[0]: line for line in lines[2:6]}
-    assert set(rows) == {"base", "post", "none", "sub"} and "(= base)" in rows["post"]
+    rows = {line.split()[0]: line for line in lines[2:8]}
+    assert set(rows) == {"base", "post", "none", "sub", "same", "flag"} and "(= base)" in rows["post"]
     base = by_name["base"].report
     assert base is not None
     (loop,) = [loop for loop in base.loops if "vs_scale" in loop.function]
     assert loop.asm_body and len(loop.asm_body) == loop.body_bundles
     assert f" {loop.ii} " in rows["base"]
-
-
-class _Flagged:
-    """An operator stand-in whose parameter only changes its compiler flags."""
-
-    def __init__(self, flags: tuple[str, ...] = ()):
-        self.clang_flags = list(flags)
-
-    def get_kernel_src(self) -> str:
-        return KERNEL
-
-
-def test_search_flags(tmp_path: Path) -> None:
-    """Variants of one source with different compiler flags are compiled each; equal flags share a report."""
-    variants = [Variant("base"), Variant("same", params={"flags": ()}),
-                Variant("flag", params={"flags": ("-mllvm", "--enable-aie-zol-without-minitercount=false")})]
-    result = search(_Flagged, {}, functions=["vs_scale"], variants=variants, out_dir=tmp_path)
-    by_name = {item.variant.name: item for item in result.variants}
-    assert all(item.error is None for item in result.variants), [item.error for item in result.variants]
-    assert by_name["same"].same_as == "base" and by_name["flag"].same_as is None
-    assert by_name["flag"].clang_cmd[-1] == "--enable-aie-zol-without-minitercount=false"

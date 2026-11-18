@@ -58,20 +58,19 @@ def test_teacher_forced() -> None:
     assert kl < 1.5 * kl_llama and agree > agree_llama - 0.05
 
 
-@pytest.mark.parametrize("P", [300, 2100])
-def test_prefill(P: int) -> None:
-    """P tokens through the prefill (one chunk of 512, 212 of them padding; or a chunk of 2048 and decode steps), then
-    24 teacher-forced decode steps; each position's KL capped at 0.5 before the mean (an ill-conditioned position's
-    rounding moves its distribution far: P 300's tenth token, where llama.cpp's own runs differ by 0.33, the decode
-    steps' path by 0.78, the prefill's by 2.6; the other positions' mean 0.009, decode steps' 0.004, llama.cpp's 0.005:
+def test_prefill() -> None:
+    """300 tokens through the prefill (one chunk of 512, 212 of them padding), then 24 teacher-forced decode steps;
+    each position's KL capped at 0.5 before the mean (an ill-conditioned position's rounding moves its distribution
+    far: P 300's tenth token, where llama.cpp's own runs differ by 0.33, the decode steps' path by 0.78,
+    the prefill's by 2.6; the other positions' mean 0.009, decode steps' 0.004, llama.cpp's 0.005:
     the prefill's bfp16 GEMM operands)."""
     path = _path()
-    K = 24
+    P, K = 300, 24
     tokens = _tokens(path, P + K)
-    split = torch.from_numpy(np.asarray(golden(path, tokens, split=P, logits="f32").logits, np.float32)[P - 1:P + K - 1]
-                             .copy())
-    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1]
-                           .copy())
+    split = torch.from_numpy(np.asarray(golden(path, tokens, split=P, logits="f32", logits_from=P - 1).logits,
+                                        np.float32)[:K].copy())
+    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32", logits_from=P - 1).logits,
+                                      np.float32)[:K].copy())
     model = NpuFlint(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)

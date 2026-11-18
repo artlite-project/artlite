@@ -461,12 +461,14 @@ class PrefillAttnOperator(ArtcOperator):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv", packed: "mask": wrong
         results); "ev_qk", "ev_soft", "ev_pv": an event window around each call of the kernel, the cores' counters
         programmed (``npu_regs.window_counter_writes``; two streams only). ``pp``: P as single bfp16 panels (1) or
-        hi + lo (2: P V's error gone; one stream: the lo pair in the same loop, two streams: P V once per part)."""
+        hi + lo (2: P V's error gone; one stream: the lo pair in the same loop, two streams: P V once per part); a
+        non-causal prompt's (a readout model's, ``QwenPrefill``'s precise one) 2."""
         self.kvh = cfg.num_key_value_heads
         assert cfg.head_dim == HD and COLS % self.kvh == 0
         assert T % 32 == 0
         self.T, self.cfg, self.head_bytes, self.causal, self.pp, self.pack = T, cfg, head_bytes, causal, pp, pack
         assert (window == 0) == (ring == 0) and window % 32 == 0 and (not window or (causal and not pack)), (window, ring)
+        assert causal or pp == 2, "a non-causal prompt's P is hi + lo"
         self.window, self.ring = window, ring
         self._stage = stage  # (a sliding-window layer: the staging's groups per KV head, at least the history's and T's)
         assert not stage or stage >= window // 32 + T // 32

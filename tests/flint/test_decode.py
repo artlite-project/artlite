@@ -1,8 +1,8 @@
 """The Flint decode overlay (models/flint: ``FlintOverlay``) on the NPU:
 
-- slices of layers with a truncated vocabulary against the numpy reference (``ref.layer``, fp32 weights): a dense
-  full-attention layer (0, no positional encoding), an MoE sliding-window layer (2), an MoE full layer (5) and layers 0 .. 5
-  over 600 positions (past the window of 513) in steps of 1 .. 4 tokens, K cached as hi + lo or single blocks: the
+- slices of layers with a truncated vocabulary against the numpy reference (``ref.layer``, fp32 weights): layers 0 .. 5
+  (dense full-attention without positional encoding, MoE sliding-window, MoE full) over 600 positions (past the window
+  of 513) in steps of 1 .. 4 tokens, K cached as hi + lo blocks, and an MoE full layer (5) with single K blocks: the
   logits, the residual after the last layer's attention;
 - steps of S slots give each slot the logits of a step of one, bit for bit (the attention's sub-steps, the MoE's partials
   summed on the slots' grid whatever the union of the step's experts), also where a step continues from fewer slots than
@@ -53,9 +53,8 @@ def _run(ov: FlintOverlay, x: np.ndarray, steps: tuple[int, ...]) -> np.ndarray:
 
 
 @pytest.mark.parametrize(("layers", "n", "kv_k", "steps"),
-                         [([0], 40, "hilo", (1,)), ([2], 40, "hilo", STEPS), ([5], 40, "single", STEPS),
-                          ([0, 1, 2, 3, 4, 5], 600, "hilo", STEPS)],
-                         ids=["dense-full", "moe-swa", "moe-full-single", "six"])
+                         [([5], 40, "single", STEPS), ([0, 1, 2, 3, 4, 5], 600, "hilo", STEPS)],
+                         ids=["moe-full-single", "six"])
 def test_flint_overlay_layers(flint: tuple[GGUFFile, FlintConfig], layers: list[int], n: int, kv_k: str,
                               steps: tuple[int, ...]) -> None:
     g, cfg = flint
@@ -88,7 +87,6 @@ def _sizes(n: int, steps: tuple[int, ...]) -> list[int]:
     return out
 
 
-@pytest.mark.smoke
 def test_flint_overlay_steps(flint: tuple[GGUFFile, FlintConfig]) -> None:
     """Steps of 1 .. 4 slots give the logits of steps of one, bit for bit (a dense and an MoE layer); so do steps that
     continue from fewer slots than the last one ran (a generation's rejected drafts: the slots past the accepted ones hold

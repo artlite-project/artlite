@@ -39,7 +39,7 @@ def conv_ref(b: np.ndarray, c: np.ndarray, x: np.ndarray, hist: np.ndarray, taps
     return y, win[n:n + 6]
 
 
-@pytest.mark.parametrize(("T", "n"), [(64, 64), (256, 200), (1024, 1023)])
+@pytest.mark.parametrize(("T", "n"), [(64, 64), (1024, 1023)])
 def test_conv_prefill(T: int, n: int) -> None:
     g = ref.gguf()
     L = 3

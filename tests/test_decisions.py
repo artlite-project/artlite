@@ -8,7 +8,7 @@ the host) against the fp32 CPU model's rows (``llama/cpu.py``) through the same 
 CPU answers on 320 questions: 0.040 at most, 313 of 320 choices the same). LiquidAI's d1-2B (lfm3, its full layers
 non-causal): each question alone against llama.cpp's last row, a state's questions in one sequence (its ``set``
 attention) against the fp32 CPU model's rows (``lfm/cpu.py``) of the same sequence, within 0.03 and the same choices.
-Requests with images (d1-2B, d3-lite, d3-nano with their mmproj: ``test_images``): each question alone against
+Requests with images (d1-2B, d3-nano with their mmproj: ``test_images``): each question alone against
 llama-server's CPU answers (cached), the same usage; d1's sequences against the fp32 CPU model on the same image rows,
 d3's packed chunks of image prompts against each prompt alone."""
 
@@ -107,7 +107,7 @@ def test_d1() -> None:
     worst = {1: 0.0, 16: 0.0}
     for state in (text[:400], text[2000:5000]):  # (~130 and ~750 tokens a question alone)
         qs = d.questions({"state": state, "questions": QUESTIONS})
-        for size in (1, 16):
+        for size in (1, 16) if len(state) < 1000 else (1,):  # (a sequence against the CPU model: the short state)
             for p in d.prompts(state, qs, model.tokenizer.encode, set_size=size):
                 npu.reset()
                 rows = npu.outputs(p.ids, p.rows, sets=p.sets)
@@ -141,8 +141,8 @@ IMAGE_QUESTIONS = {
 }
 # (the largest |dp| from llama-server's CPU answers, each question alone: the NPU's prefill GEMMs, and for d3 the vision
 # overlay's bfp16 encoder (its 24 layers of 1024: ~7% per merged token, as the CPU at its rounding points); on 57 such
-# questions d1 Q4_0 0.021, d3-lite 0.117, d3-nano 0.097)
-IMAGE_DP = {"d1-2b": 0.05, "d3-lite": 0.12, "d3-nano": 0.12}
+# questions d1 Q4_0 0.021, d3-nano 0.097)
+IMAGE_DP = {"d1-2b": 0.05, "d3-nano": 0.12}
 
 
 def _url(im: Image.Image, fmt: str) -> str:
@@ -180,15 +180,14 @@ def _top(a: dict) -> str:
     return str(p["true"] >= 0.5) if a["type"] == "noul" else max(p, key=p.get)
 
 
-@pytest.mark.parametrize("name", ["d1-2b", "d3-lite", "d3-nano"])
+@pytest.mark.parametrize("name", ["d1-2b", "d3-nano"])
 def test_images(name: str) -> None:
     path, mmproj = decision_gguf(name), decision_mmproj(name)
     require(path, mmproj)
     bodies = image_bodies()
     args = ("--image-max-tokens", "1600") if name == "d1-2b" else ()  # (Artlite's d1 budget: its runner's)
-    want = cached_ref(path, "systemone_images", (model_key(path), model_key(mmproj), json.dumps(bodies), args,
-                                                 lib_identity()),
-                      lambda: llama_server_decisions(path, mmproj, bodies, args))
+    want = cached_ref(path, "systemone_images", (model_key(path), model_key(mmproj), json.dumps(bodies), args),
+                      lambda: llama_server_decisions(path, mmproj, bodies, args), version=lib_identity())
     model = open_model(path, mmproj=mmproj)
     npu = model.load(capacity=4096)
     d = Decisions.of(path, model.tokenizer.encode)
@@ -268,7 +267,7 @@ def omni_bodies(clip: bytes, question: bytes, video: bytes) -> list[dict]:
              "questions": {k: IMAGE_QUESTIONS[k] for k in ("scene", "person", "count")}}]
 
 
-def test_omni_media(tmp_path: object) -> None:
+def test_omni_media() -> None:
     """d1-Omni-2B's media (``lfm3-d1-omni``): an audio clip, a spoken question (heard where its text would be, after
     the state's media), a video's frames; each question alone against llama-server's CPU answers (cached), the same
     usage."""
@@ -279,13 +278,12 @@ def test_omni_media(tmp_path: object) -> None:
         clip = f.read()
     with open(SPEECH_CLIP.replace("0001", "0000"), "rb") as f:
         question = f.read()
-    with open(video_file(str(tmp_path), "astronaut-small"), "rb") as f:
+    with open(video_file("astronaut-small"), "rb") as f:
         video = f.read()
     bodies = omni_bodies(clip, question, video)
     args = ("--image-max-tokens", "1600")  # (Artlite's d1 budget: its runner's)
-    want = cached_ref(path, "systemone_omni", (model_key(path), model_key(mmproj), json.dumps(bodies), args,
-                                               lib_identity()),
-                      lambda: llama_server_decisions(path, mmproj, bodies, args))
+    want = cached_ref(path, "systemone_omni", (model_key(path), model_key(mmproj), json.dumps(bodies), args),
+                      lambda: llama_server_decisions(path, mmproj, bodies, args), version=lib_identity())
     model = open_model(path, mmproj=mmproj)
     npu = model.load(capacity=4096)
     d = Decisions.of(path, model.tokenizer.encode)

@@ -98,27 +98,30 @@ def _nearest(got: np.ndarray, wants: list[np.ndarray]) -> tuple[np.ndarray, np.n
     return e.min(0), e.argmin(0)
 
 
-@pytest.mark.parametrize("S", [1, 3, 4, 8])
-def test_draft_steps(setup: tuple, S: int) -> None:
-    """Rows within ``TOL`` of the oracle's h (rows whose router's 8th and 9th experts nearly tie: of the oracle that
-    routes them as the NPU did); the head's argmax that oracle's on those rows where its top two logits are 0.1 apart.
-    S 8: the designs of 8 slots (the 27B's)."""
+# (the steps of S rows per drafter: S 3 leaves a partial last step of the 100 rows, kept on the 35B-A3B alone; the Q8_0
+# drafter differs only in its tile formats: one S; S 8: the designs of 8 slots, the 27B's)
+STEPS = {"35B-A3B": (1, 3, 4), "35B-A3B-Q8_0": (4,), "occamy": (1, 4), "3.8-27B": (1, 4, 8)}
+
+
+def test_draft_steps(setup: tuple, request: pytest.FixtureRequest) -> None:
+    """Steps of S rows (``STEPS``) from position 0: rows within ``TOL`` of the oracle's h (rows whose router's 8th and
+    9th experts nearly tie: of the oracle that routes them as the NPU did); the head's argmax that oracle's on those
+    rows where its top two logits are 0.1 apart."""
     draft, emb, h, refs, (med, top) = setup
-    if S > draft.SLOTS:
-        pytest.skip(f"a design of {draft.SLOTS} slots")
-    draft.reset()
-    lg, hs = [], []
-    for p in range(0, N, S):
-        k = min(S, N - p)
-        lg.append(draft.step(emb[p:p + k], h[p:p + k], p).astype(np.float32))
-        hs += [draft.hidden_state(s) for s in range(k)]
-    lg, hs = np.concatenate(lg), np.stack(hs)
-    e, which = _nearest(hs, [r["h_nextn"].astype(np.float64) for r in refs])
-    assert np.median(e) < med and e.max() < top, (np.median(e), e.max(), int(e.argmax()))
-    want = np.choose(which[:, None], [r["logits"] for r in refs])
-    top2 = np.sort(want, -1)[:, -2:]
-    clear = top2[:, 1] - top2[:, 0] > 0.1
-    assert (lg.argmax(-1) == want.argmax(-1))[clear].all()
+    for S in STEPS[request.node.callspec.params["setup"]]:
+        draft.reset()
+        lg, hs = [], []
+        for p in range(0, N, S):
+            k = min(S, N - p)
+            lg.append(draft.step(emb[p:p + k], h[p:p + k], p).astype(np.float32))
+            hs += [draft.hidden_state(s) for s in range(k)]
+        lg, hs = np.concatenate(lg), np.stack(hs)
+        e, which = _nearest(hs, [r["h_nextn"].astype(np.float64) for r in refs])
+        assert np.median(e) < med and e.max() < top, (S, np.median(e), e.max(), int(e.argmax()))
+        want = np.choose(which[:, None], [r["logits"] for r in refs])
+        top2 = np.sort(want, -1)[:, -2:]
+        clear = top2[:, 1] - top2[:, 0] > 0.1
+        assert (lg.argmax(-1) == want.argmax(-1))[clear].all(), S
 
 
 def test_table(setup: tuple) -> None:

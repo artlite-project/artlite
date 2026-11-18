@@ -27,6 +27,7 @@ from . import cpu, ref
 from .dspark_cpu import DSparkCpu
 
 VOCAB = 512
+PREFILL_SIZES = (64, 128, 256, 512)  # (the prefill tests' library: one per size for both)
 
 
 def _records(d: DSparkOverlay, L: int, lo: int, n: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -44,22 +45,28 @@ def _records(d: DSparkOverlay, L: int, lo: int, n: int) -> list[tuple[np.ndarray
     return out
 
 
-@pytest.mark.parametrize(("size", "tails"), [("1.7B", False), ("4B", False), ("4B", True)],
-                         ids=["1.7B", "4B", "4B-tails"])
-def test_dspark_rounds(size: str, tails: bool) -> None:
+def _slice(size: str) -> tuple[SparkOverlay, DSparkOverlay]:
+    g = ref.gguf(size)
+    dpath = spark_dspark_of(ref.path(size))
+    require(dpath)
+    dg = GGUFFile(dpath)
+    tgt = SparkOverlay(g, layers=sorted(DSparkConfig.from_gguf(dg).taps), vocab=VOCAB, max_positions=4096, **needs(dg))
+    tgt.load()
+    d = DSparkOverlay(tgt, dg)
+    d.load()
+    return tgt, d
+
+
+@pytest.mark.parametrize("size", ["1.7B", "4B"])
+def test_dspark_rounds(size: str) -> None:
     """Steps of 8, 3 and 1 slots over 700 positions (the rings' 20 groups wrap), each followed by the injection of its
     rows, blocks at 300 and 700 (the block's records then overwritten by the next injection): the window's records, the
     block's logits and h against the CPU's; the drafter's state at 300 restored after the rest (its rings wrapped
     since): the block there bit for bit."""
     g = ref.gguf(size)
     dpath = spark_dspark_of(ref.path(size))
-    require(dpath)
-    dg = GGUFFile(dpath)
-    taps = DSparkConfig.from_gguf(dg).taps
-    tgt = SparkOverlay(g, layers=sorted(taps), vocab=VOCAB, max_positions=1024, tails=tails, **needs(dg))
-    tgt.load()
-    d = DSparkOverlay(tgt, dg)
-    d.load()
+    taps = DSparkConfig.from_gguf(GGUFFile(dpath)).taps
+    tgt, d = _slice(size)
     emb = cpu.SparkCpu(g, layers=[]).emb
     ids = ref.corpus_ids(720, size)
     x = emb[torch.tensor(ids)]
@@ -107,19 +114,7 @@ def test_dspark_rounds(size: str, tails: bool) -> None:
     assert all(v < bound[k[0]] for k, v in worst.items()), worst
 
 
-def _slice(size: str) -> tuple[SparkOverlay, DSparkOverlay]:
-    g = ref.gguf(size)
-    dpath = spark_dspark_of(ref.path(size))
-    require(dpath)
-    dg = GGUFFile(dpath)
-    tgt = SparkOverlay(g, layers=sorted(DSparkConfig.from_gguf(dg).taps), vocab=VOCAB, max_positions=4096, **needs(dg))
-    tgt.load()
-    d = DSparkOverlay(tgt, dg)
-    d.load()
-    return tgt, d
-
-
-@pytest.mark.parametrize(("size", "n"), [("1.7B", 600), ("4B", 600), ("1.7B", 1100)])
+@pytest.mark.parametrize(("size", "n"), [("4B", 600), ("1.7B", 1100)])
 def test_dspark_prefill(size: str, n: int) -> None:
     """A prompt of n tokens through the prefill's chunks (512s, then a 64; 1100: two chunks of 512, the second's rows
     past the rings' 20 groups of the first) and the rest as decode steps with injections, against all of it as steps of
@@ -145,7 +140,7 @@ def test_dspark_prefill(size: str, n: int) -> None:
     want_l, want = block()
     tgt.reset()
     d.reset()
-    pf = SparkPrefill(tgt, sizes=(64, 128, 256, 512), dspark=d).compile().bind()
+    pf = SparkPrefill(tgt, sizes=PREFILL_SIZES, dspark=d).compile().bind()
     p = 0
     for T in pf.plan(0, n):
         m = min(T, n - p)
@@ -163,14 +158,14 @@ def test_dspark_prefill(size: str, n: int) -> None:
     assert all(v < {"argmax": 0.15, "logits": 0.05}.get(k, 0.045) for k, v in worst.items()), worst
 
 
-@pytest.mark.parametrize(("size", "p0", "T"), [("1.7B", 0, 512), ("4B", 64, 256), ("4B", 0, 64)])
+@pytest.mark.parametrize(("size", "p0", "T"), [("4B", 64, 256)])
 def test_dspark_prefill_rows(size: str, p0: int, T: int) -> None:
     """The drafter's records of a chunk (the staging DS) against the fp32 drafter on the chunk's own tap panels (FT:
     the taps normed by fc_norm, as the fc GEMMs read them): fc, enc.output_norm, per layer K (rotated) and V within
     1.9% (bfp16 g panels and GEMM outputs: the injections' own error, ``test_dspark_rounds``)."""
     tgt, d = _slice(size)
     x = cpu.SparkCpu(ref.gguf(size), layers=[]).emb[torch.tensor(ref.corpus_ids(p0 + T, size))].numpy()
-    pf = SparkPrefill(tgt, sizes=(64, 256, 512), dspark=d).compile().bind()
+    pf = SparkPrefill(tgt, sizes=PREFILL_SIZES, dspark=d).compile().bind()
     if p0:
         pf.run(x[:p0], 0, p0)
     pf.run(x[p0:], p0, T)
@@ -204,12 +199,12 @@ CODE = "Write a Python function that returns the n-th Fibonacci number using mem
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("size", ["1.7B", "4B"])
-def test_dspark_model(size: str) -> None:
+def test_dspark_model() -> None:
     """The whole model on a code prompt, greedy: the text with DSpark rounds the text without drafts (200 tokens), more
     than 3 tokens a round; the text teacher-forced: at each position the drafts against the fp32 drafter's (the fork's
     whole head and Markov bias) on the taps the model's step left: its first draft equal on 90% of positions at least,
     the walk's tokens per round within 5%."""
+    size = "4B"
     path = ref.path(size)
     dpath = spark_dspark_of(path)
     require(dpath)

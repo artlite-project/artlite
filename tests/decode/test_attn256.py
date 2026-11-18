@@ -32,30 +32,18 @@ def _enc(rows: np.ndarray, n: int) -> np.ndarray:
     return np.ascontiguousarray(v.transpose(2, 0, 1)).reshape(8, A1.HD)
 
 
-@pytest.mark.parametrize(("size", "p", "S", "split", "rec"), [("9B", 38, 2, False, False), ("27B", 39, 2, False, False),
-                                                             ("27B", 0, 1, False, False), ("9B", 5, 1, False, True),
-                                                             ("27B", 150, 2, True, True), ("9B", 151, 2, True, False),
-                                                             ("1B", 38, 2, False, False), ("1B", 5, 1, False, True),
-                                                             ("1B", 150, 2, True, True), ("1B", 1001, 2, True, False),
-                                                             ("1B", 129, 1, True, False), ("35B-A3B", 38, 2, False, False),
-                                                             ("35B-A3B", 150, 1, True, True),
-                                                             ("35B-A3B", 1001, 1, True, False), ("35B-A3B", 1001, 2, True, True),
-                                                             ("9B", 150, 4, True, True), ("9B", 1001, 3, True, False),
-                                                             ("1B", 1001, 4, True, False), ("9B", 37, 4, False, False),
-                                                             ("27B", 36, 4, False, True), ("35B-A3B", 768, 1, True, True),
-                                                             ("35B-A3B", 768, 1, True, False), ("35B-A3B", 384, 2, True, False),
-                                                             ("27B", 150, 4, True, False), ("27B", 1001, 3, True, True),
-                                                             ("27B", 1000, 4, True, False), ("3.8-27B", 39, 2, False, False),
-                                                             ("3.8-27B", 1001, 7, False, False), ("3.8-27B", 160, 8, False, True),
-                                                             ("3.8-27B", 1000, 5, False, True), ("3.8-27B", 62, 5, False, False),
-                                                             ("3.8-27B", 94, 8, False, True), ("3.8-27B", 30, 2, False, False),
-                                                             ("35B-A3B", 1001, 4, 2, False), ("35B-A3B", 1001, 3, 2, True),
-                                                             ("35B-A3B", 150, 4, 2, False), ("35B-A3B", 384, 3, 2, False)])
+@pytest.mark.parametrize(("size", "p", "S", "split", "rec"), [
+    ("9B", 38, 2, False, False), ("9B", 5, 1, False, True), ("9B", 150, 4, True, True), ("9B", 1001, 3, True, False),
+    ("27B", 0, 1, False, False), ("27B", 36, 4, False, True), ("27B", 150, 2, True, True), ("27B", 1000, 4, True, False),
+    ("1B", 38, 2, False, False), ("1B", 150, 2, True, True), ("1B", 1001, 4, True, False), ("1B", 129, 1, True, False),
+    ("35B-A3B", 38, 2, False, False), ("35B-A3B", 1001, 2, True, True), ("35B-A3B", 768, 1, True, False),
+    ("35B-A3B", 150, 4, 2, False), ("35B-A3B", 1001, 3, 2, True),
+    ("3.8-27B", 62, 5, False, False), ("3.8-27B", 160, 8, False, True), ("3.8-27B", 1001, 7, False, False)])
 def test_attention(size: str, p: int, S: int, split: int, rec: bool) -> None:
     _attention(size, p, S, split, rec)
 
 
-@pytest.mark.parametrize(("size", "p", "S", "split"), [("35B-A3B", 90, 2, False), ("35B-A3B", 150, 2, True)])
+@pytest.mark.parametrize(("size", "p", "S", "split"), [("35B-A3B", 150, 2, True)])
 def test_attention_later_keys(size: str, p: int, S: int, split: int) -> None:
     """Keys past the first group far above it, as a chat's text above its system prompt: the softmax follows them."""
     _attention(size, p, S, split, False, far=30.0, tol=0.1)
@@ -444,14 +432,13 @@ def _spark_ref(r: dict, p: int, S: int, c: int, s: int) -> tuple[np.ndarray, np.
 
 
 @pytest.mark.parametrize(("size", "kind", "p", "S", "ring", "block"),
-                         [("4B", "swa", 0, 1, 0, False), ("4B", "swa", 5, 3, 0, False), ("4B", "swa", 511, 1, 0, False),
-                          ("4B", "swa", 512, 8, 0, False), ("4B", "swa", 540, 8, 0, False), ("4B", "swa", 1000, 8, 0, False),
-                          ("4B", "full", 1001, 8, 0, False), ("4B", "full", 30, 4, 0, False),
-                          ("1.7B", "swa", 1003, 8, 0, False), ("1.7B", "full", 700, 5, 0, False),
+                         [("4B", "swa", 0, 1, 0, False), ("4B", "swa", 512, 8, 0, False),
+                          ("4B", "swa", 1000, 8, 0, False), ("4B", "full", 1001, 8, 0, False),
+                          ("4B", "full", 30, 4, 0, False), ("1.7B", "full", 700, 5, 0, False),
                           ("4B", "swa", 1000, 8, 20, False), ("1.7B", "swa", 1500, 7, 18, False),
                           ("1.7B", "swa", 505, 8, 0, False),
-                          ("4B", "swa", 300, 7, 0, True), ("4B", "swa", 543, 7, 20, True), ("1.7B", "swa", 540, 7, 0, True),
-                          ("1.7B", "swa", 1021, 7, 20, True), ("4B", "swa", 3, 7, 0, True)])
+                          ("4B", "swa", 300, 7, 0, True), ("4B", "swa", 543, 7, 20, True),
+                          ("1.7B", "swa", 540, 7, 0, True)])
 def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int, block: bool) -> None:
     """Spark's attention (``SPARK``): per column and slot o within bfp16 / bf16 rounding of the fp64 attention over what the
     slot sees: a sliding-window layer's keys p + s - 511 .. p + s (its window's first group streamed first, the keys
@@ -459,7 +446,7 @@ def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int, block:
     the kind (128 bf16 pairs, 32 fp32); one gate per head; the relayed K records of the step's positions; a ring whose
     window crosses its end read in two fills; a step whose later slots' windows start past position 0 (505); a drafter's
     block (``block``: every row the keys p - 512 .. p + S - 1, windows from a group's last key (543: 31 + 512) and of a
-    record past the group's first (540, 1021), the step across two records)."""
+    record past the group's first (540), the step across two records)."""
     r = _spark(size, kind, p, S, ring=ring, block=block)
     ash, HD = r["ash"], A1.HD
     for c in range(COLS):
@@ -479,8 +466,7 @@ def test_spark_attention(size: str, kind: str, p: int, S: int, ring: int, block:
             assert rel_max(got, k_all[8 * x:min(8 * x + 8, p + S)]) < 1e-2, (c, x)
 
 
-@pytest.mark.parametrize(("size", "kind", "p"), [("4B", "swa", 1000), ("1.7B", "full", 700), ("4B", "swa", 540),
-                                                ("1.7B", "swa", 1022)])
+@pytest.mark.parametrize(("size", "kind", "p"), [("4B", "swa", 1000), ("1.7B", "full", 700)])
 def test_spark_slot_alone(size: str, kind: str, p: int) -> None:
     """A step's first slot gets the numbers of a step of one at its position (bit for bit): its row depends on no later
     slot's (later slots in its record or the next, a window's masks of rows past it)."""

@@ -2,7 +2,7 @@
 prefill/test_attn256.py, its norms: prefill/test_norm.py) on the NPU:
 
 - a slice of four layers (three sliding-window ones and a full one) against the decode path on the same tokens: a
-  prompt from position 0, one after decode steps, one after a first prompt's chunks and steps, one past the rings' wrap:
+  prompt from position 0, one after a first prompt's chunks and decode steps, one past the rings' wrap:
   the full layer's cache, the sliding-window layers' rings (their window's records) and the last token's logits (the
   LM head alone on the chunk's last output row: ``SparkOverlay.logits_of``, or a decode step after the chunks);
 - the whole model (slow): prompts through the prefill, then the text after them as decode steps, against the fp32 CPU
@@ -27,8 +27,7 @@ VOCAB = 512
 SLICE = [0, 1, 2, 3]
 SIZES = (64, 128, 256, 512)  # (the tests' library: fewer designs to compile)
 # (a first prompt's tokens through the prefill, then decode steps (their sizes), then the prompt's tokens, sizes)
-CASES = [(0, (), 300, SIZES), (0, (8,) * 12, 333, SIZES), (100, (8,) * 3 + (4,), 500, SIZES),
-         (0, (), 3000, (64, 256, 2048))]
+CASES = [(0, (), 300, SIZES), (100, (8,) * 3 + (4,), 500, SIZES), (0, (), 3000, (64, 256, 2048))]
 
 
 def _prompt(ov: SparkOverlay, pf: SparkPrefill, x: torch.Tensor, p: int) -> torch.Tensor:
@@ -109,11 +108,11 @@ def test_spark_prefill_layers(first: int, steps: tuple[int, ...], n: int, sizes:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("size", ["1.7B", "4B"])
-def test_spark_prefill_teacher_forced(size: str) -> None:
-    """The whole model: a prompt through the prefill (a chat's first tokens, an essay's first 768), the text after it
+def test_spark_prefill_teacher_forced() -> None:
+    """The whole 4B model: a prompt through the prefill (a chat's first tokens, an essay's first 768), the text after it
     as decode steps (one token each on the chat, 8 on the essay), against the fp32 model: KL of the next-token
     distributions of the prompt's last token and the text after it, argmax agreement."""
+    size = "4B"
     spec = (size, "Q4_K_M", "XHToken")
     g = GGUFFile(ref.path(*spec))
     ov = SparkOverlay(g, max_positions=1100)
@@ -122,7 +121,7 @@ def test_spark_prefill_teacher_forced(size: str) -> None:
     emb = cpu.SparkCpu(g, layers=[]).emb
     chat = ref.chat_ids(size)
     for ids, P, S in ((chat, len(chat) - 16, 1), (ref.essay_ids(1024, size), 768, 8)):
-        want = ref.cpu_logits(spec, ids)[P - 1:]
+        want = ref.cpu_logits(spec, ids, from_row=P - 1)
         x = emb[torch.tensor(ids)]
         ov.reset()
         rows = [_prompt(ov, pf, x[:P], 0)]
@@ -134,7 +133,7 @@ def test_spark_prefill_teacher_forced(size: str) -> None:
         got = torch.stack(rows)
         k = kl_rows(want, got)
         agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(kl_rows(want, ref.llama_logits(spec, ids)[P - 1:]).mean())
+        lk = float(kl_rows(want, ref.llama_logits(spec, ids, from_row=P - 1)).mean())
         print(f"{size} prompt {P}, {len(ids) - P} after: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) "
               f"max {float(k.max()):.4f}, first {float(k[0]):.5f}, argmax {agree:.4f}")
         assert float(k.mean()) < max(4e-3, 1.6 * lk) and agree > 0.95

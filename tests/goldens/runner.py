@@ -1,8 +1,8 @@
 """What every llama.cpp golden shares: a dump tool compiled on first use against the llama.cpp tree of
 ``model_config.LLAMA_CPP_DIR`` (into the artlite cache, named by a hash of its source and of the libraries it links), and
-a run's output folder cached under ``tests/refs/<model>/<prefix>_<hash>/`` (``--refresh-refs`` recomputes): the hash covers
-a key (the model files' identity, the inputs, the libraries) and the tool's source; a run writes into a temporary folder
-that replaces the cached one only when it succeeded."""
+a run's output folder cached under ``tests/refs/<model>/<prefix>_<hash>_<hash>/`` (``--refresh-refs`` recomputes): the
+hashes of a key (the model files' identity, the inputs) and of the tool's source and the libraries; a run writes into a
+temporary folder that replaces the cached one (and its earlier versions) only when it succeeded."""
 
 import hashlib
 import os
@@ -50,23 +50,27 @@ def run_tool(cmd: list[str]) -> None:
 
 
 def cached_golden(model: str, prefix: str, key: object, src: str, run: Callable[[str], None], *,
-                  marker: str = "meta.json") -> str:
-    """The folder of a golden: ``tests/refs/<model>/<prefix>_<hash of key and the tool's source>``; where it lacks its
-    ``marker`` file (or ``--refresh-refs``) ``run(folder)`` fills a temporary folder, which then replaces it."""
-    h = hashlib.sha256(repr(key).encode())
-    with open(src, "rb") as f:
-        h.update(f.read())
-    folder = common.model_refs(model)
-    path = os.path.join(folder, f"{prefix}_{h.hexdigest()[:16]}")
-    if os.path.exists(os.path.join(path, marker)) and not common.REFRESH_REFS:
+                  version: object = (), marker: str = "meta.json") -> str:
+    """The folder of a golden (``common.ref_entry``): ``tests/refs/<model>/<prefix>_<hash of key>_<hash of the tool's
+    source and version>`` (``version``: the llama.cpp libraries' identity); where it lacks its ``marker`` file (or
+    ``--refresh-refs``) ``run(folder)`` fills a temporary folder, which then replaces it and the golden's other versions."""
+    path = common.ref_entry(model, prefix, key, common.source_version([src], version))
+    if common.hit(os.path.join(path, marker)):
+        os.utime(path)
         return path
+    common.computing()
+    folder = os.path.dirname(path)
     os.makedirs(folder, exist_ok=True)
     tmp = tempfile.mkdtemp(dir=folder, prefix=".tmp_")
     try:
         run(tmp)
+        if common.hit(os.path.join(path, marker)):  # (another process stored it meanwhile: its readers keep it)
+            shutil.rmtree(tmp)
+            return path
         shutil.rmtree(path, ignore_errors=True)
         os.replace(tmp, path)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    common.stored(path)
     return path

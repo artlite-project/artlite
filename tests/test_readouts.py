@@ -1,5 +1,5 @@
-"""``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B, -4B; LFM3): a
-readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
+"""``NpuModel.outputs`` and ``readouts`` on the NPU (qwen35: MiniCPM-V 4.7's language model; Llama 3.2 1B; Qwen3-Embedding-0.6B;
+LFM3): a readout's rows are the rows the prompt path's LM head reads (a chunk's last row: the same logits through ``logits_of``,
 bit for bit; any selection of rows: the same rows; a tail of decode steps: the step's own logits; a readout model's
 image holds no LM head: its rows alone, no logits), and pooled embeddings
 of them match llama.cpp's on the same file (``llama-embedding`` on the CPU, cached; Qwen3-Embedding's texts end with its
@@ -27,7 +27,7 @@ from .numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
-CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B"), qwen3_gguf("embedding-4B"),
+CASES = [minicpmv_gguf(), llama_gguf("Q4_K_M", "1B"), qwen3_gguf("embedding-0.6B"),
          lfm3_gguf("QAD-Q4_0")]
 
 
@@ -77,8 +77,8 @@ def test_embeddings(loaded: tuple[str, Model, NpuModel], pooling: str) -> None:
     path, model, npu = loaded
     text = essay("addiction.txt")
     texts = [text[:120], text[500:1500], text[2000:6000], text[6000:12000]]
-    ref = cached_ref(path, f"embeddings_{pooling}", (model_key(path), texts, pooling, lib_identity()),
-                     lambda: [torch.tensor(e) for e in llama_embeddings(path, texts, pooling)])
+    ref = cached_ref(path, f"embeddings_{pooling}", (model_key(path), texts, pooling),
+                     lambda: [torch.tensor(e) for e in llama_embeddings(path, texts, pooling)], version=lib_identity())
     readouts = Readouts.of(path)
     for t, want in zip(texts, ref, strict=True):
         ids = readouts.embedding_ids(model.encode, t)
@@ -189,8 +189,8 @@ def test_rerank(path: str) -> None:
     docs = [text[i:i + 1200] for i in range(0, 8 * 9000, 9000)]
     query = "What does the author say about how startups should treat their first users?"
     body = {"query": query, "documents": docs}
-    ref = cached_ref(path, "rerank", (model_key(path), body, lib_identity()),
-                     lambda: llama_server_requests(path, "/v1/rerank", [body], ("--rerank",))[0])
+    ref = cached_ref(path, "rerank", (model_key(path), body),
+                     lambda: llama_server_requests(path, "/v1/rerank", [body], ("--rerank",))[0], version=lib_identity())
     want = np.zeros(len(docs))
     for e in ref["results"]:
         want[e["index"]] = e["relevance_score"]

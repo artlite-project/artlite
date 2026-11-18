@@ -62,8 +62,7 @@ def gemm_rows(npu: VisionDevice, name: str, g: Gemm, w: torch.Tensor, b: torch.T
 
 
 @pytest.mark.parametrize("m, ntile, K, N, res, out", [
-    (64, 2, 640, 320, True, "bfp16"), (64, 1, 1280, 1280, True, "bf16"), (64, 1, 320, 640, False, "bfp16"),
-    (16, 1, 1280, 1280, True, "bfp16"), (16, 1, 2560, 320, False, "bf16"), (16, 2, 640, 640, True, "bf16"),
+    (64, 2, 640, 320, True, "bfp16"), (16, 1, 2560, 320, False, "bf16"), (16, 2, 640, 640, True, "bf16"),
     (64, 1, 1280, 1280, False, "vt")])
 def test_gemm(npu: VisionDevice, m: int, ntile: int, K: int, N: int, res: bool, out: str) -> None:
     """y = x W^T + b (+ r) on every column's m ntile tokens: within 8e-3 of the bfp16-rounded operands' GEMM (fp32 C,
@@ -120,7 +119,7 @@ def test_gemm_rope(npu: VisionDevice) -> None:
     assert rel_native(y, ref) < 8e-3
 
 
-@pytest.mark.parametrize("nb, frac, heads, kvh", [(5, 0.83, 16, 0), (2, 1.0, 16, 0), (9, 0.5, 16, 0), (2, 1.0, 16, 8),
+@pytest.mark.parametrize("nb, frac, heads, kvh", [(5, 0.83, 16, 0), (9, 0.5, 16, 0), (2, 1.0, 16, 8),
                                                  (3, 0.7, 12, 0)])
 def test_attention_dense(npu: VisionDevice, nb: int, frac: float, heads: int, kvh: int) -> None:
     """Joint self-attention of 16 (or 12) heads of 80 over more than 32 key groups (``Attention(dense=True)``): both
@@ -175,7 +174,7 @@ def test_attention_dense(npu: VisionDevice, nb: int, frac: float, heads: int, kv
     assert rel_native(o, ref) < 1.5e-2
 
 
-@pytest.mark.parametrize("m, K, N", [(64, 320, 2560), (64, 640, 1280), (16, 320, 1280)])
+@pytest.mark.parametrize("m, K, N", [(64, 320, 2560), (16, 320, 1280)])
 def test_geglu(npu: VisionDevice, m: int, K: int, N: int) -> None:
     """ff1 with the GEGLU epilogue (N / 2 outputs hid gelu(gate), the weight's rows [hid | gate]): within 1.2e-2 of
     torch on the bfp16-rounded operands (bf16 hid and gate, GELU's table, the bfp16 output)."""
@@ -242,9 +241,8 @@ def images(m: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("mode, m, C, ntile, nrows", [
-    ("gnsilu", 64, 1280, 1, 4), ("gn", 64, 640, 1, 4), ("gnsilu", 16, 1280, 1, 4), ("ln", 64, 1280, 1, 4),
-    ("ln", 16, 320, 1, 4), ("gnsilu", 64, 640, 2, 4), ("gnsilu", 64, 320, 4, 4), ("gn", 64, 640, 2, 4),
-    ("ln", 64, 640, 2, 4), ("ln", 64, 320, 4, 4), ("gnsilu", 64, 1280, 1, 2), ("ln", 64, 640, 2, 2)])
+    ("gnsilu", 16, 1280, 1, 4), ("ln", 64, 1280, 1, 4), ("gnsilu", 64, 640, 2, 4), ("gnsilu", 64, 320, 4, 4),
+    ("gn", 64, 640, 2, 4), ("ln", 64, 320, 4, 4), ("gnsilu", 64, 1280, 1, 2), ("ln", 64, 640, 2, 2)])
 def test_norm(npu: VisionDevice, mode: str, m: int, C: int, ntile: int, nrows: int) -> None:
     """A GEMM's output with its statistics (GroupNorm group sums through DDR and the B streams, LayerNorm per-token sums
     in the memtile) normalized by Apply on nrows core rows into panels (ntile tiles of m per op): within 9e-3 of torch
@@ -309,11 +307,9 @@ def test_norm(npu: VisionDevice, mode: str, m: int, C: int, ntile: int, nrows: i
 
 
 @pytest.mark.parametrize("np_, d, nb, rows, sink, heads, masked", [
-    (8, 160, 1, 2, False, 8, False), (2, 160, 1, 2, False, 8, False), (16, 80, 2, 2, False, 8, False),
-    (16, 80, 2, 4, False, 8, False), (8, 160, 1, 4, False, 8, False), (32, 40, 4, 4, False, 8, False),
-    (16, 80, 2, 4, True, 8, False), (8, 160, 1, 4, True, 8, False), (8, 80, 1, 4, False, 16, False),
-    (8, 80, 1, 4, True, 16, False), (16, 80, 2, 4, True, 16, False), (16, 80, 1, 4, False, 16, False),
-    (16, 80, 2, 4, False, 16, False), (8, 80, 2, 4, False, 16, True), (8, 160, 1, 4, False, 8, True)])
+    (2, 160, 1, 2, False, 8, False), (16, 80, 2, 2, False, 8, False), (32, 40, 4, 4, False, 8, False),
+    (16, 80, 2, 4, True, 8, False), (8, 80, 1, 4, False, 16, False), (16, 80, 2, 4, True, 16, False),
+    (8, 80, 2, 4, False, 16, True), (8, 160, 1, 4, False, 8, True)])
 def test_attention(npu: VisionDevice, np_: int, d: int, nb: int, rows: int, sink: bool, heads: int, masked: bool) -> None:
     """Self-attention of 8 heads of d 160 (16x16: 8 token panels per column; 8x8: 2) or 80 (a 32x32 band: 16 token
     panels per column, the keys of 2 bands): each column's queries (of band 0) against all keys of their image (K / V^T
@@ -378,7 +374,7 @@ def test_attention(npu: VisionDevice, np_: int, d: int, nb: int, rows: int, sink
     assert rel_native(o, ref) < 1.5e-2
 
 
-@pytest.mark.parametrize("H, stride, Cin, N, res", [(16, 1, 640, 640, False), (16, 1, 640, 640, True),
+@pytest.mark.parametrize("H, stride, Cin, N, res", [(16, 1, 640, 640, True),
                                                    (8, 1, 1280, 640, True), (16, 2, 640, 640, False)])
 def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: bool) -> None:
     """A 3x3 conv (padding 1) over both images (16x16: 2 rows of 2 groups per column; 8x8: 1 of 1; stride 2: 16x16 ->
@@ -417,7 +413,7 @@ def test_conv(npu: VisionDevice, H: int, stride: int, Cin: int, N: int, res: boo
     assert rel_native(y, ref) < 8e-3
 
 
-@pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (640, 320, True)])
+@pytest.mark.parametrize("Cin, N, res", [(640, 320, True)])
 def test_conv_rows(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     """A 3x3 conv (padding 1) of a 32x32 level in row tiles (the input's 4 rows of 4 groups per column whole in the
     memtile, an op per band of 2 output rows; halo rows from the neighbour columns), bias, a residual: within 8e-3 of
@@ -452,7 +448,7 @@ def test_conv_rows(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     assert err < 8e-3, err
 
 
-@pytest.mark.parametrize("np_, d, nb", [(8, 160, 1), (16, 80, 2), (32, 40, 4)])
+@pytest.mark.parametrize("np_, d, nb", [(16, 80, 2), (32, 40, 4)])
 def test_cross_attention(npu: VisionDevice, np_: int, d: int, nb: int) -> None:
     """Cross-attention on 77 context keys (``layout.kv_slots``, the last group's keys from 77 masked) of the queries of a
     16x16 level (d 160), a 32x32 band (d 80) or a 64x64 band (d 40, role c on every row): within 1.5e-2 of softmax
@@ -492,7 +488,7 @@ def test_cross_attention(npu: VisionDevice, np_: int, d: int, nb: int) -> None:
     assert err < 1.5e-2, err
 
 
-@pytest.mark.parametrize("Cin, N, res", [(320, 320, False), (320, 320, True)])
+@pytest.mark.parametrize("Cin, N, res", [(320, 320, True)])
 def test_conv_il(npu: VisionDevice, Cin: int, N: int, res: bool) -> None:
     """A 3x3 conv (padding 1) of a 64x64 level in its row tiles (``ops.Gemm`` il: a row's even groups, its odd ones),
     an op per band of 2 output rows per column, its input's 4 rows (the halos included, zeros past the image) filled

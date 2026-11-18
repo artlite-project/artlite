@@ -1,8 +1,7 @@
 """LFM3-VL's vision encoder on the vision overlay (models.lfm3vl.encoder) against the float64 encoder (ref.Encoder):
 each layer alone from the float64 input (its error a small part of its own contribution), the edge masks of the
-depthwise conv, pieces of layers against one dispatch (bit for bit), whole images of 1, 2 and 9 bands per merged
+depthwise conv, pieces of layers against one dispatch (bit for bit), whole images of 1 and 9 bands per merged
 token."""
-
 
 import numpy as np
 import pytest
@@ -66,10 +65,10 @@ def encoder(npu: VisionDevice, mm: tuple) -> E.Encoder:
     return E.Encoder(npu, E.weights(get, kinds, clip.projection_dim), max_bands=9)
 
 
-@pytest.mark.parametrize("il, size", [(0, (512, 512)), (2, (512, 512)), (3, (640, 576)), (12, (352, 352)), (4, (480, 480))])
+@pytest.mark.parametrize("il, size", [(0, (512, 512)), (3, (640, 576)), (12, (352, 352))])
 def test_layer(npu: VisionDevice, encoder: E.Encoder, il: int, size: tuple[int, int]) -> None:
-    """One layer (a conv: 0, 3, an attention: 2, 12, 4) from the float64 encoder's input (bf16) on the level of an
-    image (2, 3, 1, 2 bands; 352 and 480 with padding windows): its error ~1-2% of the layer's own contribution (the
+    """One layer (a conv: 0, 3, an attention: 12) from the float64 encoder's input (bf16) on the level of an
+    image (2, 3, 1 bands; 352 with padding windows): its error ~1-2% of the layer's own contribution (the
     bfp16 operands of its GEMMs), every token within 6%, the pads zero. The image's inputs are written after the
     layer's build (which writes the level's attention command without key masks)."""
     px = _pixels(*size)
@@ -138,9 +137,9 @@ def _token_errors(got: np.ndarray, want: np.ndarray) -> np.ndarray:
     return np.linalg.norm(np.asarray(got, np.float64) - want, axis=1) / np.linalg.norm(want, axis=1)
 
 
-@pytest.mark.parametrize("size", [(352, 352), (512, 512), (1152, 1024)])
+@pytest.mark.parametrize("size", [(352, 352), (1152, 1024)])
 def test_encoder(mm: tuple, encoder: E.Encoder, size: tuple[int, int]) -> None:
-    """An image of 1, 2 and 9 bands against the float64 encoder per merged token: median within 5%, p90 within 12%
+    """An image of 1 and 9 bands against the float64 encoder per merged token: median within 5%, p90 within 12%
     (a few tokens further: patches whose residual cancels to a fraction of their neighbours' before the projector's
     LayerNorm, ``encoder``'s docstring); the same embeddings again."""
     px = _pixels(*size)

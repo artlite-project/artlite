@@ -19,7 +19,10 @@ machine. The full suite is slow: run the test file of what you changed, and the 
 tests need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the
 background while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay
 corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp CPU build
-(`ARTLITE_LLAMA_CPP_DIR`) and skip without one.
+(`ARTLITE_LLAMA_CPP_DIR`) and skip without one. Their references (llama.cpp's runs, the CPU models' logits) are cached
+in `tests/refs/` (gitignored), keyed by their inputs; a new llama.cpp build or reference source replaces an entry's
+older version. An entry no test reads any more stays until deleted; a read marks it used, so
+`find tests/refs -mindepth 2 -maxdepth 2 -mtime +30 -exec rm -rf {} +` removes those unused for 30 days.
 
 The C++ runtime's tests (gtest: `tests/csrc/npu_test.cpp` on the NPU, the other files host-only) build in their own tree, with the venv active (`build/` belongs
 to the editable install):

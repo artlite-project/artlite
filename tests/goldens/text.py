@@ -12,12 +12,13 @@ full-attention layers -, ``new_state``, ``final_output``, ``Qcur_full``, ``Kcur.
 position; with an MTP block (``mtp``: an MTP file, or a model file with a block of its own: Qwen3.8) its block over
 the same positions (``src/models/qwen35moe.cpp``'s / ``qwen35.cpp``'s ``graph_mtp``:
 ``mtp_eh_proj``, ``mtp_attn_out``, ``mtp_attn_residual``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``, its logits:
-``g.mtp(name, layer)``, ``g.mtp_logits``), each row fed the model's ``h_nextn`` of the row before. They are cached under ``tests/refs/<model>/golden_<hash>/`` (gitignored; ``--refresh-refs``
-recomputes). llama.cpp quantizes the activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that
-error, and its prompt and one-token graphs differ by ~1% after a few layers: compare layers by tolerance, the model
-by KL. In a ``qwen35moe`` model they differ by ~15% at the last layer and in the top 8 of 40-70% of the tokens
-there: any rounding change moves a near-tied expert, and the difference grows (a 1e-7 change of the router's logits
-reaches the same KL), so its layers are compared where the routing agrees.
+``g.mtp(name, layer)``, ``g.mtp_logits``), each row fed the model's ``h_nextn`` of the row before. They are cached under
+``tests/refs/<model>/golden_<hash>_<hash>/`` (``runner.cached_golden``; gitignored; ``--refresh-refs`` recomputes).
+llama.cpp quantizes the activations of its Q4_K / Q6_K matmuls to Q8_K, so its tensors carry that error, and its prompt
+and one-token graphs differ by ~1% after a few layers: compare layers by tolerance, the model by KL. In a ``qwen35moe``
+model they differ by ~15% at the last layer and in the top 8 of 40-70% of the tokens there: any rounding change moves a
+near-tied expert, and the difference grows (a 1e-7 change of the router's logits reaches the same KL), so its layers are
+compared where the routing agrees.
 """
 
 import hashlib
@@ -79,21 +80,23 @@ class Golden:
 
 
 def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split: int = -1,
-           layers: tuple[int | str, ...] = (), names: str = "", logits: str = "f16", states: str = "last",
+           layers: tuple[int | str, ...] = (), names: str = "", logits: str = "f16", logits_from: int = 0,
+           states: str = "last",
            threads: int = 16, mtp: str = "", dflash: str = "", dflash_at: int = -1, dflash_names: str = "",
            dflash_random: bool = False) -> Golden:
     """llama.cpp's tensors for the token sequence (teacher forcing). ``ubatch``: tokens per graph (0: all in
     one; 1: decode graphs); ``split`` = P: the first P tokens in ubatches of ``ubatch``, then one per graph.
     ``layers``: layer indices whose tensors matching ``names`` (a regex over the names without the layer
     suffix) are dumped ("g": the tensors without a layer, "all": every layer). ``logits``: "f32", "f16" or
-    "none". ``states``: the recurrent states ("new_state", ...) of the last ubatch, or "all" of them. ``mtp``: an MTP
-    file whose block then runs over the same rows (its ``layers`` / ``names`` tensors, its logits). ``dflash``: a DFlash2
-    file, llama.cpp's draft-dflash after the run: rows 0 .. ``dflash_at`` - 1 injected, the block at ``dflash_at``
-    (``qwen35_dump.cpp``: ``g.dflash(name, layer)``, ``g["dflash.taps"]``, ``g["dflash.lattice"]``; ``dflash_names``: a regex over
-    its tensors' names; ``dflash_random``: random taps, the model does not run)."""
+    "none"; ``logits_from``: only the rows of tokens ``logits_from`` .. n - 1 (``g.logits[0]`` is token
+    ``logits_from``'s; llama.cpp then runs the last layer's FFN and the output norm on those rows only). ``states``: the recurrent states ("new_state", ...) of the last ubatch, or "all" of them.
+    ``mtp``: an MTP file whose block then runs over the same rows (its ``layers`` / ``names`` tensors, its logits).
+    ``dflash``: a DFlash2 file, llama.cpp's draft-dflash after the run: rows 0 .. ``dflash_at`` - 1 injected, the block
+    at ``dflash_at`` (``qwen35_dump.cpp``: ``g.dflash(name, layer)``, ``g["dflash.taps"]``, ``g["dflash.lattice"]``;
+    ``dflash_names``: a regex over its tensors' names; ``dflash_random``: random taps, the model does not run)."""
     tokens = np.ascontiguousarray(tokens, np.int32)
     key = (common.model_key(model), hashlib.sha256(tokens.tobytes()).hexdigest(), ubatch, split,
-           tuple(str(x) for x in layers), names, logits, states, lib_identity())
+           tuple(str(x) for x in layers), names, logits, logits_from, states)
     if mtp:
         key += (common.model_key(mtp),)
     if dflash:
@@ -102,7 +105,8 @@ def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split
     def run(tmp: str) -> None:
         tokens.tofile(os.path.join(tmp, "tokens.i32"))
         cmd = [build_tool("qwen35_dump", DUMP_SRC), "-m", model, "-t", os.path.join(tmp, "tokens.i32"), "-o", tmp,
-               "-u", str(ubatch), "--split", str(split), "--logits", logits, "--states", states, "--threads", str(threads)]
+               "-u", str(ubatch), "--split", str(split), "--logits", logits, "--logits-from", str(logits_from), "--states",
+               states, "--threads", str(threads)]
         if layers:
             cmd += ["-l", ",".join(str(x) for x in layers), "-n", names or ".*"]
         if mtp:
@@ -112,4 +116,4 @@ def golden(model: str, tokens: np.ndarray | list[int], *, ubatch: int = 0, split
             cmd += ["--dflash-random"] if dflash_random else []
         run_tool(cmd)
 
-    return Golden(cached_golden(model, "golden", key, DUMP_SRC, run))
+    return Golden(cached_golden(model, "golden", key, DUMP_SRC, run, version=lib_identity()))

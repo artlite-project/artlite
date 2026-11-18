@@ -25,10 +25,10 @@ DATE = "26 Jul 2024"  # a fixed system-header date: today's would change the CPU
 # a fixed continuation (teacher forcing): the CPU and NPU models see the same tokens
 TEXT = ("Photosynthesis is the process by which plants, algae and some bacteria convert light energy into "
         "chemical energy. It takes place in the chloroplasts, mainly in the leaves.")
-FILES = [("Q4_K_M", "1B"), ("Q5_K_M", "1B"), ("Q6_K", "1B"), ("Q4_0", "1B"), ("Q4_1", "1B"), ("Q3_K_L", "1B"),
-         ("BF16", "1B"), ("Q4_K_M", "3B"), ("Q5_K_M", "3B"), ("Q2_K", "3B"), ("Q3_K_M", "3B"), ("Q4_K_M", "8B"),
-         ("Q4_K_S", "8B"), ("Q4_1", "qwen3:0.6B"), ("Q8_0", "qwen3:embedding-0.6B")]  # (qwen3: model_config.qwen3_gguf)
-CASES = [(q, s, k) for q, s in FILES for k in ("single", "hilo") if not (s.startswith("qwen3") and k == "single")]
+# the model-level gates, one per architecture the apps run (a qwen3 model has no single K: model_config.qwen3_gguf);
+# the other formats' slices run in test_decode.py
+CASES = [("Q4_K_M", "1B", "single"), ("Q4_K_M", "1B", "hilo"), ("BF16", "1B", "single"), ("Q4_K_M", "3B", "single"),
+         ("Q4_K_S", "8B", "single"), ("Q4_1", "qwen3:0.6B", "hilo"), ("Q8_0", "qwen3:embedding-0.6B", "hilo")]
 
 
 def _cpu_logits(path: str, seq: list[int], first: int) -> torch.Tensor:
@@ -58,7 +58,7 @@ def test_llama_npu_teacher_forced(quant: str, size: str, kv_k: str) -> None:
         assert kl < 0.006 and agree > 0.9, f"KL(same) {kl:.5f}, argmax agreement {agree:.3f}"
 
 
-@pytest.mark.parametrize(("quant", "size"), [("Q4_K_M", "1B"), ("Q4_K_M", "3B"), ("Q4_K_M", "8B"), ("Q4_1", "qwen3:0.6B")])
+@pytest.mark.parametrize(("quant", "size"), [("Q4_K_M", "1B"), ("Q4_K_S", "8B"), ("Q4_1", "qwen3:0.6B")])
 def test_llama_npu_long_prompt(quant: str, size: str) -> None:
     """A 4800-token essay prompt (prefill chunks) and 32 tokens after it, one per dispatch."""
     path = llama_path(quant, size)

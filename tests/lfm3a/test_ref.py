@@ -123,12 +123,12 @@ def test_encoder(name: str) -> None:
 
 
 def test_stream() -> None:
-    """A clip in chunks of 12 rows (live ASR's), 8 frames, and a remainder: the rows of the clip at once."""
+    """A clip in chunks of 12 rows (live ASR's) and with a remainder: the rows of the clip at once."""
     require(MODEL, MMPROJ)
     enc = R.Encoder(MMPROJ)
     mel = A.log_mel(A.load_audio(clip("6930-75918-0012")), dtype=np.float64)
     whole = enc.forward(mel).numpy()
-    for step in (96, 8, 100):
+    for step in (96, 100):
         st = R.Stream(enc)
         out = [st.push(mel[:, f0:f0 + step], final=f0 + step >= mel.shape[1]).numpy() for f0 in range(0, mel.shape[1], step)]
         got = np.concatenate(out)

@@ -52,20 +52,21 @@ def chat_ids(size: str = "1.7B") -> list[int]:
 
 
 def cpu_logits(spec: tuple[str, str, str], ids: list[int], *, layers: list[int] | None = None,
-               model: cpu.SparkCpu | None = None) -> torch.Tensor:
-    """The fp32 CPU model's logits (len(ids), vocab) of a sequence from position 0 (cached); ``spec``: (size, quant,
-    org)."""
+               model: cpu.SparkCpu | None = None, from_row: int = 0) -> torch.Tensor:
+    """The fp32 CPU model's logits (len(ids) - from_row, vocab) of a sequence from position 0, the rows from ``from_row``
+    on (cached); ``spec``: (size, quant, org)."""
     p = path(*spec)
-    key = (common.model_key(p), tuple(ids), tuple(layers or ()))
+    key = (common.model_key(p), tuple(ids), tuple(layers or ()), from_row)
 
     def compute() -> torch.Tensor:
         m = model or cpu.SparkCpu(GGUFFile(p), layers=layers)
-        return m.logits(ids, slice(None)).half()
+        return m.logits(ids, slice(from_row, None)).half()
 
     return common.cached_ref(p, "cpu_logits", key, compute, sources=SOURCES).float()
 
 
-def llama_logits(spec: tuple[str, str, str], ids: list[int]) -> torch.Tensor:
-    """llama.cpp's CPU logits (len(ids), vocab) of a sequence (its prompt graph)."""
-    g = golden(path(*spec), ids, logits="f32")
+def llama_logits(spec: tuple[str, str, str], ids: list[int], *, from_row: int = 0) -> torch.Tensor:
+    """llama.cpp's CPU logits (len(ids) - from_row, vocab) of a sequence (its prompt graph), the rows from
+    ``from_row`` on."""
+    g = golden(path(*spec), ids, logits="f32", logits_from=from_row)
     return torch.from_numpy(np.asarray(g.logits, np.float32).copy())

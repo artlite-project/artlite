@@ -3,7 +3,7 @@ layers and a full-attention layer), fed llama.cpp's residual stream before the s
 sub-chunks (the second mostly padding), then chunks of the two ``SMALL`` sizes (the last with padding tokens), against
 llama.cpp's residual after the slice; then decode steps (the overlay) continuing from the state the prefill left (KV cache, GDN states, conv
 states), against llama.cpp and against the same overlay running every position as a decode step. Occamy 1.0 APEX: its
-IQ3_XXS experts (layers 20 .. 23) and its Q3_K ones (layers 4 .. 7). unsloth's Qwen3.8-27B UD-IQ4_XS: layers 12 .. 15, gate /
+IQ3_XXS experts (layers 20 .. 23). unsloth's Qwen3.8-27B UD-IQ4_XS: layers 12 .. 15, gate /
 up in IQ2_XS + IQ3_S, Q3_K + IQ3_XXS, IQ2_S, IQ3_XXS + IQ2_S (split blocks: ``prefill.gate_up``); UD-IQ3_XXS: layers 12 .. 15,
 IQ1_S and IQ1_M down and gate / up projections (gate / up split with IQ2_XS and IQ2_XXS)."""
 
@@ -21,9 +21,10 @@ from ..model_files import require, size_gguf
 from ..numerics import rel_max
 
 
-@pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("occamy", 7),
-                                         ("kev", 0), ("ud-iq4xs", 15), ("ud-iq3xxs", 15)],
-                         ids=["9B", "27B", "1B", "35B-A3B", "occamy", "occamy-7", "kev", "ud-iq4xs", "ud-iq3xxs"])
+@pytest.mark.parametrize(("size", "La"), [("9B", 0), ("27B", 0), ("1B", 0), ("35B-A3B", 0), ("occamy", 0), ("kev", 0),
+                                         ("ud-iq4xs", 15),
+                                         pytest.param("ud-iq3xxs", 15, marks=pytest.mark.slow)],
+                         ids=["9B", "27B", "1B", "35B-A3B", "occamy", "kev", "ud-iq4xs", "ud-iq3xxs"])
 def test_prefill_slice(size: str, La: int) -> None:
     """(La: the slice's attention layer, its last; 0: the one in the middle)"""
     from models.qwen35.overlay import QwenOverlay

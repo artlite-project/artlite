@@ -84,56 +84,14 @@ class TestFusedOperator:
         result = fused.run(inputs={"in": to_numpy(inp)})
         verify_close(result["out"], ref, rel_tol=0.04, abs_tol=1e-6, label="silu_add")
 
-    def test_double_silu(self):
-        """Fuse silu twice:  out = silu(silu(in))."""
-        SIZE = 1024
-        silu = SiluOperator(size=SIZE)
-
-        fused = FusedOperator(
-            name="test_double_silu",
-            runlist=[
-                (silu, "in", "scratch"),  # scratch = silu(in)
-                (silu, "scratch", "out"),  # out = silu(scratch)
-            ],
-            input_args=["in"],
-            output_args=["out"],
-        )
-        fused.compile()
-
-        torch.manual_seed(123)
-        inp = torch.randn(SIZE, dtype=torch.bfloat16)
-
-        ref = torch.nn.functional.silu(torch.nn.functional.silu(inp))
-
-        result = fused.run(inputs={"in": to_numpy(inp)})
-        verify_close(result["out"], ref, rel_tol=0.04, abs_tol=1e-6, label="double_silu")
-
-    def test_get_buffer_write(self):
-        """Test manual buffer access: write inputs, call, read outputs."""
-        SIZE = 1024
-        silu = SiluOperator(size=SIZE)
-
-        fused = FusedOperator(
-            name="test_buf_write",
-            runlist=[
-                (silu, "in", "out"),
-            ],
-            input_args=["in"],
-            output_args=["out"],
-        )
-        fused.compile()
-
-        torch.manual_seed(7)
-        inp = torch.randn(SIZE, dtype=torch.bfloat16)
-        ref = torch.nn.functional.silu(inp)
-
-        fused.get_buffer("in")[:] = to_numpy(inp)
+        # manual buffer access on the same ELF: write inputs, call, read outputs
+        inp2 = torch.randn(SIZE, dtype=torch.bfloat16)
+        fused.get_buffer("in")[:] = to_numpy(inp2)
         fused.sync_inputs()
         fused()
         fused.sync_outputs()
-        output = to_torch(fused.get_buffer("out").copy())
-
-        verify_close(output, ref, rel_tol=0.04, abs_tol=1e-6, label="get_buffer")
+        verify_close(to_torch(fused.get_buffer("out").copy()), inp2 + torch.nn.functional.silu(inp2),
+                     rel_tol=0.04, abs_tol=1e-6, label="get_buffer")
 
 
 _SHIFT_SRC = JINJA_ENV.from_string("""
@@ -513,26 +471,6 @@ class TestFusedLifecycle:
         with pytest.raises(ValueError, match="nope"):
             _add_chain("t_rbw_x", uninitialized=["nope"])
 
-    def test_patch_external(self):
-        """Shim BDs addressing an external scratch buffer point into its own BO."""
-        from artlite.txn import device_address
-
-        dev = artlite.Device()
-        ext = dev.alloc_host_buffer(1 << 16)
-        f = _add_chain("t_patch_ext", buffer_sizes={"w": 2048}, external_buffers={"w": (ext, 4096)}).compile().load()
-        w, t = f.span("w"), f.span("t")
-        assert w.offset > t.offset, "external buffers are laid out last in scratch"
-        words = f._insts_bo.map().view(np.uint32)
-        in_ext = 0
-        for bd in f.shim_bds():
-            addr = int(words[bd.offset // 4 + 1]) | (int(words[bd.offset // 4 + 2]) & 0xFFFF) << 32
-            if bd.space == "scratch" and w.offset <= bd.start < w.offset + w.nbytes:
-                in_ext += 1
-                assert addr == device_address(ext, 4096 + bd.start - w.offset, f._ctx)
-            else:
-                assert addr == device_address(*f._bo_at(bd.space, bd.start), f._ctx)
-        assert in_ext == 2, f"expected the two reads of w, got {in_ext}"
-
     def test_async_dispatches(self):
         """Several dispatches in flight; a wait whose timeout expires leaves them pending. Each dispatch is compute
         bound and long (SiLU 48 times over each tile on one core: ~22 ms) against what bounds the work still queued at
@@ -591,13 +529,30 @@ class TestFusedLifecycle:
         verify_close(to_torch(b.get_buffer("y").copy()), ref.bfloat16(), rel_tol=0.01, abs_tol=1e-2, label="shared")
 
     def test_user_buffer(self):
-        """External buffers in a user-memory BO (Device.alloc_user_buffer): the NPU reads w from it and writes t
-        into it."""
+        """External buffers in a user-memory BO (Device.alloc_user_buffer): the shim BDs addressing them point into
+        the BO, the NPU reads w from it and writes t into it."""
+        from artlite.txn import device_address
+
         dev = artlite.Device()
         ub = dev.alloc_user_buffer(4 << 20)
         f = _add_chain("t_user", buffer_sizes={"w": 2048, "t": 2048},
                        external_buffers={"w": (ub, 1 << 20), "t": (ub, 3 << 20)}).compile().load()
         assert (backend.XRT or ub.paddr % (2 << 20) == 0) and not ub.map().any()  # (amdxdna: 2 MB pages)
+        w_span, t_span = f.span("w"), f.span("t")
+        words = f._insts_bo.map().view(np.uint32)
+        ext = {"w": (w_span, 1 << 20), "t": (t_span, 3 << 20)}
+        in_ext = dict.fromkeys(ext, 0)
+        for bd in f.shim_bds():
+            addr = int(words[bd.offset // 4 + 1]) | (int(words[bd.offset // 4 + 2]) & 0xFFFF) << 32
+            for key, (span, base) in ext.items():
+                if bd.space == "scratch" and span.offset <= bd.start < span.offset + span.nbytes:
+                    in_ext[key] += 1
+                    assert addr == device_address(ub, base + bd.start - span.offset, f._ctx), key
+                    break
+            else:
+                assert addr == device_address(*f._bo_at(bd.space, bd.start), f._ctx)
+        assert in_ext["w"] == 2, f"expected the two reads of w, got {in_ext['w']}"
+        assert in_ext["t"] >= 1, "t is written and read through the user BO"
         torch.manual_seed(7)
         x, w = torch.randn(1024).bfloat16(), torch.randn(1024).bfloat16()
         ub.map()[1 << 20:(1 << 20) + 2048] = w.view(torch.uint8).numpy()

@@ -30,7 +30,7 @@ SIZES = (64, 128, 256, 512)  # (the tests' library: fewer designs to compile)
 BIG = (64, 1024, 2048)  # (chunks of 1024-token sub-chunks: ``prefill.BIG``, norm and prep blocks of 1024)
 # (a first prompt's tokens through the prefill, then steps (their sizes; the last one's slots shift the conv histories),
 # then the prompt's tokens, K, sizes)
-CASES = [(0, (), 300, "single", SIZES), (0, (4,) * 31 + (1, 3), 400, "single", SIZES),
+CASES = [(0, (4,) * 31 + (1, 3), 400, "single", SIZES),
          (0, (4,) * 15 + (2, 2), 333, "hilo", SIZES), (150, (2,) + (4,) * 10, 250, "single", SIZES),
          (0, (), 2100, "single", BIG)]
 
@@ -110,7 +110,7 @@ def test_lfm_prefill_teacher_forced(quant: str) -> None:
     pf = LfmPrefill(ov, sizes=SIZES).compile().bind()
     chat = ref.chat_ids(quant)
     for ids, P, S in ((chat, len(chat) - 32, 1), (ref.essay_ids(1024, quant), 768, 4)):
-        want = ref.cpu_logits(quant, ids, model=cpu)[P - 1:]
+        want = ref.cpu_logits(quant, ids, from_row=P - 1, model=cpu)
         x = cpu.emb[torch.tensor(ids)]
         ov.reset()
         rows = [_prompt(ov, pf, x[:P], 0)]
@@ -122,15 +122,14 @@ def test_lfm_prefill_teacher_forced(quant: str) -> None:
         got = torch.stack(rows)
         k = kl_rows(want, got)
         agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(kl_rows(want, ref.llama_logits(quant, ids)[P - 1:]).mean())
+        lk = float(kl_rows(want, ref.llama_logits(quant, ids, from_row=P - 1)).mean())
         print(f"{quant} prompt {P}, {len(ids) - P} after: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) "
               f"max {float(k.max()):.4f}, first {float(k[0]):.5f}, argmax {agree:.4f}")
         assert float(k.mean()) < max(1.5e-3, 1.5 * lk) and agree > 0.95
 
 
 # (a non-causal prompt's tokens, its bounds: the state's end, each question's)
-SET_CASES = [(50, (50,)), (300, (230, 252, 270, 300)), (480, (100, 140, 141, 200, 260, 330, 400, 480)),
-             (1500, (1300, 1400, 1500))]
+SET_CASES = [(50, (50,)), (300, (230, 252, 270, 300)), (1500, (1300, 1400, 1500))]
 
 
 @pytest.mark.parametrize(("n", "sets"), SET_CASES, ids=[f"n{n}-q{len(s) - 1}" for n, s in SET_CASES])

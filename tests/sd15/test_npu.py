@@ -75,6 +75,10 @@ def test_txt2img(model_dir: str, npu_unet: NpuUNet, npu_vae: NpuVae) -> None:
     diff = np.abs(npu.pixels.astype(int) - cpu.pixels.astype(int)).mean()
     print(f"\nlatents rel err {err:.3e}, pixels mean |diff| {diff:.2f}; npu steps {npu.t_steps:.2f} s")
     assert err < 0.8 and diff < 25
+    assert npu.pixels.shape == (512, 512, 3) and npu.pixels.dtype.name == "uint8"
+    assert npu.latents.shape == (1, 4, 64, 64) and np.isfinite(npu.latents).all()
+    assert npu.pixels.std() > 20, "a flat image"
+    assert min(npu.t_text, npu.t_steps, npu.t_vae) > 0
 
 
 def test_load(model_dir: str, npu_unet: NpuUNet, npu_vae: NpuVae) -> None:

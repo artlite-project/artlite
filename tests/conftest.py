@@ -48,81 +48,102 @@ def npu() -> "VisionDevice":
     return VisionDevice()
 
 
-# The smoke set (``pytest tests -m smoke``, about a minute with the designs cached): the host-side tests, the
-# apps' full designs build, and one or two NPU cases per component (each model's decode slice, attention, prefill
-# GEMM / attention / norm, the shared GEMV, fused ELFs, the activation table, kmath's variants, kernel_lib's gathers,
-# the vision overlay's ops and weight packer).
-# Entries: test files or test ids.
+# The smoke set (``pytest tests -m smoke``, about a minute with the designs cached): host-side tests, one full app
+# design per architecture (the largest member: it meets the program-memory, stack and BD limits first), and one NPU
+# case per component: each model's decode slice, the attention cores, the prefill GEMMs (GemmQ, GemmQd), norms,
+# attention and MoE block, a chunk program with its decode continuation, the shared GEMV, fused ELFs and libraries,
+# kmath's variants the kernels instantiate, kernel_lib's gathers, the vision overlay's ops and weight packer, an image
+# prompt end to end. Entries: test files or test ids.
 SMOKE = (
-    "test_app_designs.py", "decode/test_kv.py", "test_overlay.py", "test_gguf_model.py", "gemma4/test_attn.py",
-    "llama/test_image.py",
-    "qwen35/test_image.py", "gemm/test_dma.py", "operators/test_render_cache.py", "server/test_server.py",
-    "test_sampling.py", "prefill/test_pace.py", "minicpmv/test_host.py", "minicpmv/test_npu.py", "test_probe.py", "operators/test_kmath.py",
+    # host
+    "decode/test_kv.py", "test_overlay.py", "test_gguf_model.py", "operators/test_render_cache.py", "test_sampling.py",
+    "prefill/test_pace.py", "minicpmv/test_host.py", "moe/test_route.py", "moe/test_plan.py", "spark/test_host.py",
+    "vision/test_weights.py", "test_probe.py::test_page_cases", "qwen3vl/test_ref.py::test_sizes",
+    "qwen3vl/test_encoder.py::test_layout[64-64]",
+    "gemm/test_dma.py::test_gemm_q_dataflow", "gemm/test_dma.py::test_gemm_qd_planar_dataflow",
+    "gemm/test_dma.py::test_gemm_half_dataflow", "gemm/test_dma.py::test_check_shim_tap",
+    "gemm/test_dma.py::test_walk_offsets_outer_loop", "gemm/test_dma.py::test_gemm_half_plans[minicpmv-1B]",
+    "llama/test_image.py::test_config[1B]", "llama/test_image.py::test_layout[1B]", "llama/test_image.py::test_pack_image",
+    "llama/test_image.py::test_qwen3[0.6B-10240-151936-eos0]", "llama/test_image.py::test_pack_tails[embedding-4B-True]",
+    "qwen35/test_image.py::test_layout[9B]", "qwen35/test_image.py::test_pack_image[9B]",
+    "qwen35/test_image.py::test_pack_moe", "qwen35/test_image.py::test_gate_up_windows",
+    "qwen35/test_image.py::test_pack_tails[kev-pairs]", "qwen35/test_image.py::test_pack_tails[d3-lite-pairs]",
+    "server/test_server.py::test_stream", "server/test_server.py::test_tool_calls",
+    "server/test_server.py::test_prompt_cache", "server/test_server.py::test_errors",
+    "server/test_server.py::test_stop_strings", "server/test_router.py::test_catalog", "server/test_router.py::test_preset",
+    # the apps' full designs (no NPU)
+    "test_app_designs.py::test_app_designs[llama-8B-Q4_K_S]", "test_app_designs.py::test_app_designs[llama-1B-Q4_K_M-hilo]",
+    "test_app_designs.py::test_app_designs[qwen3-0.6B-Q4_1]", "test_app_designs.py::test_app_designs[gemma-E4B-Q4_0]",
+    "test_app_designs.py::test_app_designs[qwen-27B-Q4_K_M]", "test_app_designs.py::test_app_designs[qwen-1B-Q4_K_M]",
+    "test_app_designs.py::test_app_designs[qwen-35B-A3B-Q4_K_M-mtp]", "test_app_designs.py::test_app_designs[lfm3-QAD-Q4_0]",
+    "test_app_designs.py::test_app_designs[flint-int4]", "test_app_designs.py::test_app_designs[sd15]",
+    # NPU
+    "test_probe.py::test_probe",
+    "operators/test_kmath.py::test_kmath_sources", "operators/test_kmath.py::test_kmath_shared_dependency",
+    "operators/test_kmath.py::test_kmath[exp2]", "operators/test_kmath.py::test_kmath[exp2-zero]",
+    "operators/test_kmath.py::test_kmath[exp2-fp32]", "operators/test_kmath.py::test_kmath[exp2-b192-bounded]",
+    "operators/test_kmath.py::test_kmath[exp2-chord2]", "operators/test_kmath.py::test_kmath[recip-normal]",
+    "operators/test_kmath.py::test_kmath[sigmoid-bf16]", "operators/test_kmath.py::test_kmath[exp-bf16-neg]",
+    "operators/test_kmath.py::test_kmath[act-silu]", "operators/test_kmath.py::test_kmath[silu_tanh]",
+    "operators/test_kmath.py::test_kmath_rows[rms-256-w]", "operators/test_kmath.py::test_kmath_rows[rope-64]",
+    "operators/test_kmath.py::test_kmath_softmax[inplace-decode]",
     "operators/test_kernel_lib.py",
-    "server/test_router.py::test_catalog", "server/test_router.py::test_preset", "server/test_router.py::test_router",
-    "operators/test_fused.py::test_library_program", "operators/test_fused.py::test_library_program_memory_variants",
-    "operators/test_fused.py::test_library_without_reset", "operators/test_fused.py::test_library_abort",
+    "operators/test_fused.py::test_library_program", "operators/test_fused.py::test_library_without_reset",
     "operators/test_fused.py::TestFusedOperator::test_silu_add",
-    "operators/test_fused.py::TestFusedLifecycle::test_buffer_pinned_once",
-    "operators/test_fused.py::TestFusedLifecycle::test_buffers_together",
     "operators/test_fused.py::TestFusedLifecycle::test_sync_lines",
-    "decode/test_gemv.py::test_gemv[Q4_0-9216-4]",
+    "decode/test_gemv.py::test_gemv[Q4_0-9216]",
     "prefill/test_gemm.py::test_prefill_gemm[llama-1B-Q4_K_M-L3-gate_up-T256]",
-    "prefill/test_gemm.py::test_prefill_gemm[llama-3B-Q3_K_M-L0-qkv-T64]",
+    "prefill/test_gemm.py::test_prefill_gemm[gemma4-E4B-Q4_0-L0-gate_up-T256]",
     "prefill/test_norm.py::test_prefill_norm[T64-add-E3072-dp396-c2]",
+    "prefill/test_norm.py::test_residual_norm[post-E2560-d1-p320]",
+    "prefill/test_attn256.py::test_attn_prefill[1B-192-2]",
     "llama/test_decode.py::test_llama_decode_steps[1B_Q4_K_M-single]",
-    "llama/test_decode.py::test_llama_decode_steps[1B_Q5_K_M-single]",
     "llama/test_decode.py::test_llama_decode_steps[3B_Q4_K_M-hilo]",
-    "llama/test_decode.py::test_llama_decode_steps[8B_Q4_K_S-single]",
-    "llama/test_decode.py::test_llama_decode_deep[1B_Q4_K_M-single]",
     "llama/test_prefill.py::test_attn[hd128-qh3-kp1-T256-p0]",
     "llama/test_prefill.py::test_attn[hd64-qh4-kp2-T256-p128]",
-    "gemma4/test_npu.py::test_gemma_overlay_layers[swa+full-batch3-hilo]",
-    "gemma4/test_npu.py::test_gemma_overlay_layers[shared-kv-one-token-single]",
-    "prefill/test_gemm.py::test_prefill_gemm[gemma4-E4B-Q4_0-L0-gate_up-T256]",
-    "prefill/test_norm.py::test_residual_norm[post-E2560-d1-p320]",
-    "prefill/test_norm.py::test_residual_norm[plain-E2560-d2-p384]",
+    "gemma4/test_attn.py", "gemma4/test_npu.py::test_gemma_overlay_layers[swa+full-hilo]",
     "gemma4/test_prefill.py::test_attn_prefill[hd512-p96-T64]", "gemma4/test_prefill.py::test_ple",
     "qwen35/test_decode.py::test_overlay_slice[s3-9B]", "qwen35/test_decode.py::test_overlay_slice[split-1B]",
-    "decode/test_attn256.py::test_attention[27B-150-2-True-True]",
-    "decode/test_attn256.py::test_attention[1B-150-2-True-True]",
-    "qwen35/test_decode.py::test_phase[9B-gdn_in-4]", "qwen35/test_decode.py::test_moe_layer[3-35B-A3B-0]",
-    "moe/test_route.py", "moe/test_plan.py", "moe/test_prefill.py::test_moe_block[35B-A3B-5]",
-    "qwen35/test_decode.py::test_overlay_slice[lazy-35B-A3B]", "spark/test_host.py",
-    "spark/test_overlay.py::test_spark_overlay_steps[tails]",
-    "qwen35/test_prefill.py::test_prefill_slice[9B]", "qwen35/test_prefill.py::test_prefill_slice[27B]",
-    "qwen35/test_prefill.py::test_prefill_slice[35B-A3B]", "qwen35/test_prefill.py::test_prefill_slice[occamy]",
-    "prefill/test_attn256.py::test_attn_prefill[9B-64-1]", "prefill/test_attn256.py::test_attn_prefill[1B-192-2]",
-    "qwen35/test_gdn_prefill.py::test_gdn_scan[64-9B]",
-    "prefill/test_gemm.py::test_prefill_gemm[qwen35-9B-Q4_K_M-L3-attn_in-T256]",
+    "qwen35/test_decode.py::test_overlay_slice[lazy-35B-A3B]", "qwen35/test_decode.py::test_moe_layer[35B-A3B-0]",
+    "qwen35/test_prefill.py::test_prefill_slice[9B]", "qwen35/test_gdn_prefill.py::test_gdn_scan[64-9B]",
+    "moe/test_prefill.py::test_moe_block[35B-A3B-5]",
+    "spark/test_overlay.py::test_spark_overlay_steps", "flint/test_decode.py::test_flint_overlay_steps",
     "vision/test_ops.py::test_gemm[16-2-640-640-True-bf16]", "vision/test_ops.py::test_conv[16-1-640-640-True]",
     "vision/test_ops.py::test_norm[gnsilu-64-640-2-4]", "vision/test_ops.py::test_attention[16-80-2-2-False-8-False]",
     "vision/test_ops.py::test_gemm_rope", "vision/test_ops.py::test_attention_dense[5-0.83-16-0]",
-    "vision/test_weights.py",
-    "qwen3vl/test_ref.py::test_sizes", "qwen3vl/test_encoder.py::test_layout[64-64]", "qwen3vl/test_encoder.py::test_pieces",
-    "sd15/test_vae.py::test_conv[512-128-128]",
+    "qwen3vl/test_encoder.py::test_layer[nb1-l10]", "minicpmv/test_npu.py::test_app_image_prompt",
+    "sd15/test_unet.py::test_resnet[8-1280-1280]",
 )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Tests marked slow run on demand: with --run-slow, or when -m selects them (or the smoke set). A smoke entry
-    that names no test of a collected file (a renamed parameter) is reported (``pytest_terminal_summary``)."""
+    """Tests marked slow run on demand: with --run-slow, or when the -m expression selects them by their markers
+    (``-m slow``, ``-m smoke``; not ``-m "not smoke"``, which selects unmarked tests too). A smoke entry that names no
+    test of a collected file (a renamed parameter) is reported (``pytest_terminal_summary``)."""
     hit: set[str] = set()
     for item in items:
         name = item.nodeid.removeprefix("tests/")
         for s in SMOKE:
-            if name == s or name.startswith(s + "::"):
+            if name == s or name.startswith((s + "::", s + "[")):
                 item.add_marker(pytest.mark.smoke)
                 hit.add(s)
     files = {item.nodeid.removeprefix("tests/").split("::")[0] for item in items}
     _stale_smoke[:] = [s for s in SMOKE if s not in hit and s.split("::")[0] in files]
-    selected = config.getoption("-m") or ""
-    if config.getoption("--run-slow") or "slow" in selected or "smoke" in selected:
+    if config.getoption("--run-slow"):
         return
+    chosen = None
+    if expr := config.getoption("-m"):
+        from _pytest.mark.expression import Expression
+
+        compiled = Expression.compile(expr)
+        if not compiled.evaluate(lambda name, /, **kwargs: False):  # (an unmarked test is not selected)
+            chosen = compiled
     skip = pytest.mark.skip(reason="slow: run with --run-slow (or -m slow)")
     for item in items:
         if "slow" in item.keywords:
-            item.add_marker(skip)
+            names = {m.name for m in item.iter_markers()}
+            if chosen is None or not chosen.evaluate(lambda name, /, **kwargs: name in names):  # noqa: B023
+                item.add_marker(skip)
 
 
 _stale_smoke: list[str] = []

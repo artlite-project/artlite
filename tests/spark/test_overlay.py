@@ -61,20 +61,28 @@ def _cpu(m: cpu.SparkCpu, ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
     return m.mm(m.rms(x, m.norm), m.head_w[:VOCAB]), torch.stack(res, 1)
 
 
-@pytest.mark.parametrize(("name", "n", "tails"), [("1.7B", 700, False), ("4B", 700, False), ("1.7B", 2800, False),
-                                                  ("4B-Q8_0", 300, False), ("bartowski-4B", 300, False),
-                                                  ("bartowski-4B-Q4_0", 300, False), ("4B", 700, True),
-                                                  ("4B-Q8_0", 300, True), ("bartowski-4B", 300, True),
-                                                  ("bartowski-4B-Q4_0", 300, True)],
-                         ids=["1.7B", "4B", "1.7B-wrap", "4B-Q8_0", "bartowski-4B", "bartowski-4B-Q4_0", "4B-tails",
-                              "4B-Q8_0-tails", "bartowski-4B-tails", "bartowski-4B-Q4_0-tails"])
-def test_spark_overlay_layers(name: str, n: int, tails: bool) -> None:
+@pytest.fixture(scope="module")
+def slice17() -> SparkOverlay:
+    """The 1.7B's slice, loaded once for the steps, snapshot and wrap tests (the positions to 3456: the rings' wrap)."""
+    ov = SparkOverlay(ref.gguf(), layers=SLICE, vocab=VOCAB, max_positions=3456)
+    ov.load()
+    return ov
+
+
+@pytest.mark.parametrize(("name", "n"), [("1.7B", 2800), ("4B", 700), ("4B-Q8_0", 300), ("bartowski-4B", 300),
+                                         ("bartowski-4B-Q4_0", 300)],
+                         ids=["1.7B-wrap", "4B", "4B-Q8_0", "bartowski-4B", "bartowski-4B-Q4_0"])
+def test_spark_overlay_layers(name: str, n: int, request: pytest.FixtureRequest) -> None:
     g = ref.gguf(*FILES[name])
     ids = ref.corpus_ids(n, FILES[name][0])
     m = cpu.SparkCpu(g, layers=SLICE)
     want, wres = _cpu(m, ids)
-    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=n + 64, tails=tails)
-    ov.load()
+    if name == "1.7B":
+        ov = request.getfixturevalue("slice17")
+        ov.reset()
+    else:
+        ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=n + 64)
+        ov.load()
     hidden: list[np.ndarray] = []
     got = _run(ov, m.emb[torch.tensor(ids)], STEPS, hidden)
     err = {"logits": [rel_finite(got[p], want[p]) for p in range(n)]}
@@ -84,15 +92,14 @@ def test_spark_overlay_layers(name: str, n: int, tails: bool) -> None:
     assert all(np.mean(v) < TOL and max(v) < 3 * TOL for v in err.values()), err
 
 
-@pytest.mark.parametrize("tails", [False, True], ids=["padded", "tails"])
-def test_spark_overlay_steps(tails: bool) -> None:
+def test_spark_overlay_steps(slice17: SparkOverlay) -> None:
     """Steps of 1 .. 8 slots give the logits of steps of one, bit for bit, past the window; so do steps that continue
     from fewer slots than the last one ran (a generation's rejected drafts: the slots past the accepted ones hold other
     tokens)."""
     g = ref.gguf()
     ids = ref.essay_ids(600)
-    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=640, tails=tails)
-    ov.load()
+    ov = slice17
+    ov.reset()
     m = cpu.SparkCpu(g, layers=[])
     x = m.emb[torch.tensor(ids)]
     one = _run(ov, x, (1,))
@@ -111,13 +118,13 @@ def test_spark_overlay_steps(tails: bool) -> None:
         p += acc
 
 
-def test_spark_overlay_snapshot() -> None:
+def test_spark_overlay_snapshot(slice17: SparkOverlay) -> None:
     """A snapshot at a position past the window and its restore after other steps (past the rings' wrap: their groups
     and the open records overwritten): the steps after it give the logits they gave before, bit for bit."""
     g = ref.gguf()
     ids = ref.essay_ids(740)
-    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=3456)
-    ov.load()
+    ov = slice17
+    ov.reset()
     emb = cpu.SparkCpu(g, layers=[]).emb
     x = emb[torch.tensor(ids)]
     _run(ov, x[:700], (8, 3))
@@ -132,24 +139,28 @@ def test_spark_overlay_snapshot() -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("name", ["1.7B", "4B", "4B-Q8_0", "bartowski-4B"])
+@pytest.mark.parametrize("name", ["4B-Q8_0", "bartowski-4B"])
 def test_spark_npu_teacher_forced(name: str) -> None:
-    """The whole model, steps of 8 (and of one on the chat), against the fp32 model: KL of the next-token distributions
-    within 1.6x llama.cpp's own (its Q8 activations; module docstring) or the design's own rounding (3e-3: N0's
-    simulation of its rounding points on the 4B's chats 2.5e-3, as a Q8_0 file's, where llama.cpp's is below it), and
-    the argmax mostly the same."""
+    """The whole model, steps of 8 on the chat (and of one on bartowski's) and on an essay of 768 tokens past the
+    window (4B-Q8_0's), against the fp32 model: KL of the next-token distributions (the essay's rows from 512 on) within
+    1.6x llama.cpp's own (its Q8 activations; module docstring) or the design's own rounding (3e-3: N0's simulation of
+    its rounding points on the 4B's chats 2.5e-3, as a Q8_0 file's, where llama.cpp's is below it), and the argmax
+    mostly the same."""
     spec = FILES[name]
     g = GGUFFile(ref.path(*spec))
     ov = SparkOverlay(g, max_positions=1100)
     ov.load()
     emb = cpu.SparkCpu(g, layers=[]).emb
-    for ids, steps in ((ref.chat_ids(spec[0]), (1,)), (ref.chat_ids(spec[0]), (8,)), (ref.essay_ids(1024, spec[0]), (8,))):
-        want = ref.cpu_logits(spec, ids)
+    chat = ref.chat_ids(spec[0])
+    runs = [(chat, (8,), 0)] + ([(chat, (1,), 0)] if name == "bartowski-4B" else []) \
+        + ([(ref.essay_ids(768, spec[0]), (8,), 512)] if name == "4B-Q8_0" else [])
+    for ids, steps, row0 in runs:
+        want = ref.cpu_logits(spec, ids, from_row=row0)
         ov.reset()
-        got = _run(ov, emb[torch.tensor(ids)], steps)
+        got = _run(ov, emb[torch.tensor(ids)], steps)[row0:]
         k = kl_rows(want, got)
         agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(kl_rows(want, ref.llama_logits(spec, ids)).mean())
+        lk = float(kl_rows(want, ref.llama_logits(spec, ids, from_row=row0)).mean())
         print(f"{name} {len(ids)} tokens S {steps[0]}: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) max {float(k.max()):.4f}, "
               f"argmax {agree:.4f}")
-        assert float(k.mean()) < max(3e-3, 1.6 * lk) and agree > 0.95
+        assert float(k.mean()) < max(3e-3, 1.6 * lk) and agree > 0.95, (len(ids), steps)

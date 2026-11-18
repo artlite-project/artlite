@@ -51,10 +51,19 @@ def _run_profiled(tmp_path: Path, profile_args: dict[str, str], script: str) -> 
 
 
 def test_profiling_counters(tmp_path):
-    """Counters mode reads back event0/event1 windows per dispatch."""
-    out_dir = _run_profiled(tmp_path, {"ARTLITE_PROFILE": "1"}, ONE_CORE_SCRIPT)
+    """Counters mode reads back event0/event1 windows per dispatch: core counters (4), a memory-module counter (m:,
+    DM bank conflicts) and shim counters (sh:, the shim DMA's tasks), in one run."""
+    core = ["INSTR_EVENT_0:INSTR_EVENT_1", "INSTR_EVENT_1:INSTR_EVENT_0", "INSTR_EVENT_0:INSTR_EVENT_0",
+            "INSTR_EVENT_1:INSTR_EVENT_1"]
+    specs = [*core, "m:CONFLICT_DM_BANK_0:CONFLICT_DM_BANK_0", "sh:DMA_MM2S_0_START_TASK:DMA_MM2S_0_START_TASK",
+             "sh:DMA_S2MM_0_FINISHED_TASK:DMA_S2MM_0_FINISHED_TASK"]
+    out_dir = _run_profiled(tmp_path, {"ARTLITE_PROFILE": "1", "ARTLITE_PROFILE_COUNTERS": ",".join(specs)},
+                            ONE_CORE_SCRIPT)
 
-    files = [f for f in os.listdir(out_dir) if f.endswith("_counters.json")]
+    files = os.listdir(out_dir)
+    shim_files = [f for f in files if f.endswith("_sh_counters.json")]
+    assert len(shim_files) == 1, f"expected 1 shim counters json, got {files}"
+    files = [f for f in files if f.endswith("_counters.json") and f not in shim_files]
     assert len(files) == 1, f"expected 1 counters json, got {files}"
     with open(os.path.join(out_dir, files[0])) as f:
         events = json.load(f)
@@ -62,8 +71,9 @@ def test_profiling_counters(tmp_path):
     counters = [e for e in events if e.get("ph") == "C" and e["cat"] == "npu_counter"]
     assert counters, "no counter events produced"
 
-    # two dispatches x 4 counters x 1 tile
-    assert len(counters) == 8
+    # two dispatches x 4 core counters x 1 tile
+    assert len([e for e in counters if e["name"].startswith("INSTR_EVENT")]) == 8
+    assert "CONFLICT_DM_BANK_0->CONFLICT_DM_BANK_0 count" in {e["name"] for e in events if e.get("ph") == "C"}
 
     # host tracks per dispatch: wall time, the driver's device busy time, H clock
     host = {}
@@ -78,15 +88,27 @@ def test_profiling_counters(tmp_path):
     counts = [e for e in counters if e["name"] == "INSTR_EVENT_0->INSTR_EVENT_0 count"]
 
     # 64 kernel calls (tiles) per dispatch; each window is tens of cycles
-    assert all(e["args"]["value"] == 64 for e in counts)
+    assert counts and all(e["args"]["value"] == 64 for e in counts)
     assert all(0 < e["args"]["value"] for e in busy)
     # windows sum: 64 calls x ~0.5K cycles, well below 64 x 10k
-    assert all(e["args"]["value"] < 64 * 10_000 for e in busy)
+    assert busy and all(e["args"]["value"] < 64 * 10_000 for e in busy)
 
     meta = [e for e in events if e.get("ph") == "M"]
     assert any(
         e.get("args", {}).get("name") == "tile(0,2)" for e in meta
     ), "tile metadata missing"
+
+    with open(os.path.join(out_dir, shim_files[0])) as f:
+        shim_events = json.load(f)
+    shim = {}
+    for e in shim_events:
+        if e.get("ph") == "C":
+            shim.setdefault(e["name"], []).append(e["args"]["value"])
+    assert sorted(shim) == [
+        "DMA_MM2S_0_START_TASK->DMA_MM2S_0_START_TASK count",
+        "DMA_S2MM_0_FINISHED_TASK->DMA_S2MM_0_FINISHED_TASK count",
+    ]
+    assert all(v > 0 for vs in shim.values() for v in vs), shim
 
 
 def test_profiling_trace(tmp_path):
@@ -122,34 +144,6 @@ from tests.operators.elementwise import GeluOperator
 op = GeluOperator(size=16 * 1024, num_columns=8, num_channels=2, tile_size=512).compile()
 op.run(np.random.default_rng(0).standard_normal(16 * 1024, np.float32).astype(bfloat16))
 """
-
-
-def test_profiling_counters_mem_module(tmp_path):
-    """Memory-module counters (m: prefix, DM bank conflicts) are supported."""
-    out_dir = _run_profiled(
-        tmp_path,
-        {
-            "ARTLITE_PROFILE": "1",
-            "ARTLITE_PROFILE_COUNTERS": (
-                "INSTR_EVENT_0:INSTR_EVENT_1," "m:CONFLICT_DM_BANK_0:CONFLICT_DM_BANK_0"
-            ),
-        },
-        ONE_CORE_SCRIPT,
-    )
-    files = [f for f in os.listdir(out_dir) if f.endswith("_counters.json")]
-    assert len(files) == 1
-    with open(os.path.join(out_dir, files[0])) as f:
-        events = json.load(f)
-    names = {e.get("name") for e in events if e.get("ph") == "C"}
-    assert "INSTR_EVENT_0->INSTR_EVENT_1 cycles" in names
-    assert "CONFLICT_DM_BANK_0->CONFLICT_DM_BANK_0 count" in names
-
-    busy = [
-        e
-        for e in events
-        if e.get("ph") == "C" and e["name"] == "INSTR_EVENT_0->INSTR_EVENT_1 cycles"
-    ]
-    assert busy and all(e["args"]["value"] > 0 for e in busy)
 
 
 def test_counter_limits():
@@ -274,35 +268,6 @@ def test_instrumented_tiles():
     specs = [CounterSpec("core", 33, 34), CounterSpec("mt", 1, 1), CounterSpec("sh", 1, 1)]
     assert instrumented_tiles_of(mlir, specs) == {"core": [(0, 2), (1, 2)], "mt": [(0, 1)], "sh": [(0, 0)]}
     assert instrumented_tiles_of(mlir, specs[1:]) == {"mt": [(0, 1)], "sh": [(0, 0)]}
-
-
-def test_profiling_counters_shim(tmp_path):
-    """Shim counters (sh: prefix) count the shim DMA's tasks."""
-    out_dir = _run_profiled(
-        tmp_path,
-        {
-            "ARTLITE_PROFILE": "1",
-            "ARTLITE_PROFILE_COUNTERS": (
-                "INSTR_EVENT_0:INSTR_EVENT_1,"
-                "sh:DMA_MM2S_0_START_TASK:DMA_MM2S_0_START_TASK,"
-                "sh:DMA_S2MM_0_FINISHED_TASK:DMA_S2MM_0_FINISHED_TASK"
-            ),
-        },
-        ONE_CORE_SCRIPT,
-    )
-    files = [f for f in os.listdir(out_dir) if f.endswith("_sh_counters.json")]
-    assert len(files) == 1, f"expected 1 shim counters json, got {os.listdir(out_dir)}"
-    with open(os.path.join(out_dir, files[0])) as f:
-        events = json.load(f)
-    counts = {}
-    for e in events:
-        if e.get("ph") == "C":
-            counts.setdefault(e["name"], []).append(e["args"]["value"])
-    assert sorted(counts) == [
-        "DMA_MM2S_0_START_TASK->DMA_MM2S_0_START_TASK count",
-        "DMA_S2MM_0_FINISHED_TASK->DMA_S2MM_0_FINISHED_TASK count",
-    ]
-    assert all(v > 0 for vs in counts.values() for v in vs), counts
 
 
 def test_profiling_counters_multi_column(tmp_path):

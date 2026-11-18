@@ -12,8 +12,7 @@ with zero padding, ``conv2d_out_proj``) or bidirectional attention (16 query hea
 head; the axial 2-D RoPE: dims i, i + 32 of a head turned by y theta^(-i / 16) for i < 16 and by x theta^(-(i - 16) /
 16) above, theta 1e6), no norm after the layers, then the projector: LayerNorm (``mm.input_norm``, eps 1e-6) per
 patch, the 2 x 2 merge (the window's patches (0, 0), (0, 1), (1, 0), (1, 1)) -> mm.0 -> GELU (erf) -> mm.2. In
-float64 (patches in raster order), or with ``llama=True`` llama.cpp's choices: a matmul against BF16 weights takes its
-activations as bf16.
+float64 (patches in raster order).
 """
 
 import math
@@ -25,7 +24,6 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig
 
 from ..goldens.media import VisionGolden, golden
-from ..numerics import bf16_like
 
 __all__ = ["Encoder", "VisionGolden", "golden", "rope_angles"]
 
@@ -49,16 +47,15 @@ def windows(ph: int, pw: int) -> np.ndarray:
 
 
 class Encoder:
-    """LFM3-VL's vision encoder from its mmproj file (module docstring); ``llama``: llama.cpp's CPU rounding."""
+    """LFM3-VL's vision encoder from its mmproj file (module docstring)."""
 
-    def __init__(self, mmproj: str, *, llama: bool = False):
+    def __init__(self, mmproj: str):
         self.g = g = GGUFFile(mmproj)
         self.cfg = cfg = ClipConfig.from_gguf(g)
         assert cfg.projector == "lfm3vl", cfg.projector
         self.hidden, self.heads, self.kv_heads, self.hd = cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim
         self.layers, self.patch, self.eps = cfg.layers, cfg.patch_size, cfg.eps
-        self.llama = llama
-        self.dtype = torch.float32 if llama else torch.float64
+        self.dtype = torch.float64
         self._w: dict[str, torch.Tensor] = {}
 
     def w(self, name: str) -> torch.Tensor:
@@ -76,8 +73,6 @@ class Encoder:
 
     def _mm(self, x: torch.Tensor, name: str, bias: str | None = None) -> torch.Tensor:
         w = self.w(name)
-        if self.llama and self.g.tensor_info[name][1] == "BF16":  # (ggml's BF16 dot products: bf16 activations)
-            x = bf16_like(x)
         y = x @ w.T
         return y + self.vec(bias) if bias else y
 

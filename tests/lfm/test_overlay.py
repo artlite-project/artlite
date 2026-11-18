@@ -1,13 +1,11 @@
 """The LFM3 decode overlay (models/lfm: ``LfmOverlay``) on the NPU:
 
-- slices of layers with a truncated vocabulary against the fp32 CPU model (``cpu.LfmCpu``) on the same weights: a conv
-  layer, a full and a sliding-window attention layer alone, and five layers of all kinds over 300 positions (past the
-  window of 256) in steps of 1 .. 4 tokens, K cached as single or hi + lo blocks: logits, the K / V caches, a conv
-  layer's history;
+- slices of layers with a truncated vocabulary against the fp32 CPU model (``cpu.LfmCpu``) on the same weights: five
+  layers of all kinds (conv, conv, full, conv, sliding-window) over 300 positions (past the window of 256) in steps of
+  1 .. 4 tokens, K cached as single or hi + lo blocks: logits, the K / V caches, a conv layer's history;
 - steps of S slots give each slot the logits of a step of one, bit for bit, also where a step continues from fewer
-  slots than the last one ran (rejected drafts: the conv shift, the rings);
-- the whole model, teacher-forced (slow): KL of the next-token distributions against the fp32 model and argmax
-  agreement, next to llama.cpp's own KL against it.
+  slots than the last one ran (rejected drafts: the conv shift, the rings).
+The whole model is gated by test_prefill.py's teacher-forced test (prefill, then decode steps).
 """
 
 import numpy as np
@@ -17,7 +15,7 @@ import torch
 from models.lfm.overlay import LfmOverlay
 
 from ..common import to_torch
-from ..numerics import kl_rows, rel_finite
+from ..numerics import rel_finite
 from . import ref
 
 VOCAB = 2048
@@ -37,11 +35,10 @@ def _run(ov: LfmOverlay, x: torch.Tensor, steps: tuple[int, ...]) -> torch.Tenso
     return out
 
 
-@pytest.mark.parametrize(("layers", "n", "kv_k"), [([0], 40, "single"), ([2], 80, "single"), ([4], 80, "hilo"),
-                                                  ([0, 1, 2, 3, 4], 300, "single"), ([0, 1, 2, 3, 4], 300, "hilo")],
-                         ids=["conv", "full", "swa-hilo", "five", "five-hilo"])
-def test_lfm_overlay_layers(layers: list[int], n: int, kv_k: str) -> None:
+@pytest.mark.parametrize("kv_k", ["single", "hilo"], ids=["five", "five-hilo"])
+def test_lfm_overlay_layers(kv_k: str) -> None:
     g = ref.gguf()
+    layers, n = [0, 1, 2, 3, 4], 300
     ids = ref.essay_ids(n)
     cpu = ref.cpu.LfmCpu(g, layers=layers, vocab=VOCAB)
     state = ref.cpu.LfmState()
@@ -49,7 +46,7 @@ def test_lfm_overlay_layers(layers: list[int], n: int, kv_k: str) -> None:
     x = cpu.emb[torch.tensor(ids)]
     ov = LfmOverlay(g, layers=layers, vocab=VOCAB, max_positions=512, kv_k=kv_k)
     ov.load()
-    got = _run(ov, x, STEPS if len(layers) > 1 else (1,))
+    got = _run(ov, x, STEPS)
     worst = {"logits": max(rel_finite(got[p], want[p]) for p in range(n))}
     for L in layers:
         if ov.kind(L) == "conv":  # (the history: the last step's base and its rows of B x)
@@ -105,24 +102,3 @@ def test_lfm_overlay_steps() -> None:
         got = to_torch(ov.step(xs, p)).float()
         assert torch.equal(got[:acc], one[p:p + acc]), p
         p += acc
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("quant", ["QAD-Q4_0", "Q4_K_M", "Q8_0"])
-def test_lfm_npu_teacher_forced(quant: str) -> None:
-    """The whole model, one token per step (and steps of 4 on the essay), against the fp32 model: KL of the
-    next-token distributions within llama.cpp's own (its Q8 activations: ~5e-4) and the argmax mostly the same."""
-    g = ref.gguf(quant)
-    cpu = ref.cpu.LfmCpu(g)
-    ov = LfmOverlay(g, max_positions=1024)
-    ov.load()
-    for ids, steps in ((ref.chat_ids(quant), (1,)), (ref.essay_ids(512, quant), (4,))):
-        want = ref.cpu_logits(quant, ids, model=cpu)
-        ov.reset()
-        got = _run(ov, cpu.emb[torch.tensor(ids)], steps)
-        k = kl_rows(want, got)
-        agree = float((want.argmax(-1) == got.argmax(-1)).double().mean())
-        lk = float(kl_rows(want, ref.llama_logits(quant, ids)).mean())
-        print(f"{quant} {len(ids)} tokens: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) max {float(k.max()):.4f}, "
-              f"argmax {agree:.4f}")
-        assert float(k.mean()) < max(1e-3, 1.5 * lk) and agree > 0.95

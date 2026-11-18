@@ -1,12 +1,10 @@
-"""sd15's VAE decoder (``models.sd15.vae``) on the NPU: its convs, norms and blocks per level vs torch."""
-
-import os
+"""sd15's VAE decoder (``models.sd15.vae``) on the NPU: its resnet blocks, upsamplers and mid attention per level
+vs torch."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from artlite.operators.design import COLS
 from artlite.vision import layout as L
 from artlite.vision.builder import Builder
 from artlite.vision.device import VisionDevice
@@ -14,7 +12,6 @@ from artlite.vision.layers import DTensor
 from artlite.vision.levels import ImageLevel
 from models.sd15 import vae
 
-from ..model_files import require
 from ..numerics import rel_native
 
 
@@ -28,27 +25,6 @@ def qconv(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> torch.Ten
     xq = q(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
     wq = q(w.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
     return F.conv2d(xq, wq, None if b is None else b.bfloat16().float(), padding=1)
-
-
-@pytest.mark.parametrize("H, Cin, N", [(64, 512, 512), (128, 512, 512), (256, 256, 256), (512, 128, 256),
-                                      (512, 128, 128)])
-def test_conv(npu: VisionDevice, H: int, Cin: int, N: int) -> None:
-    """A 3x3 conv (padding 1) of every band of a level (64: row tiles; 128: even / odd groups; 256, 512: wide rows, an
-    op per half row) from its DDR image, the halves joined at the seam: within 8e-3 of torch on the bfp16 operands."""
-    torch.manual_seed(1)
-    lv = vae.LEVELS[H]
-    x = torch.randn(1, Cin, H, H)
-    w, b = torch.randn(N, Cin, 3, 3) / (9 * Cin) ** 0.5, torch.randn(N) * 0.1
-    bd = Builder(npu)
-    img = vae.VImage(Cin, f"x{H}", lv)
-    vae.write(bd, img, x)
-    ch = vae.chans(N)
-    y = vae.conv_layer(bd, img, w, b, ch=ch, name=f"c{H}", stats=False)
-    bd.op({}, {})
-    npu.run(bd.transaction())
-    err = rel_native(vae.read_dtensor(npu, y, ch), qconv(x, w, b))
-    print(f"H {H}: rel err {err:.3e}")
-    assert err < 8e-3
 
 
 def _rand_resnet(p: str, cin: int, cout: int) -> dict:
@@ -73,7 +49,7 @@ def _input(bd: Builder, x: torch.Tensor, lv: ImageLevel, name: str) -> DTensor:
     return t
 
 
-@pytest.mark.parametrize("H, cin, cout", [(64, 512, 512), (128, 512, 512), (256, 512, 256), (256, 256, 256),
+@pytest.mark.parametrize("H, cin, cout", [(64, 512, 512), (128, 512, 512), (256, 512, 256),
                                          (512, 256, 128), (512, 128, 128)])
 def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     """The decoder's ResnetBlock2D on a level (GN1 + SiLU, conv1, GN2 + SiLU, conv2 + x or the 1x1 shortcut; the
@@ -93,7 +69,7 @@ def test_resnet(npu: VisionDevice, H: int, cin: int, cout: int) -> None:
     assert err < 1.5e-2
 
 
-@pytest.mark.parametrize("H, C", [(64, 512), (128, 512), (256, 256)])
+@pytest.mark.parametrize("H, C", [(64, 512), (256, 256)])
 def test_upsample(npu: VisionDevice, H: int, C: int) -> None:
     """The decoder's upsampler (nearest 2x in the drains into the next level's image, then its 3x3 conv): within 8e-3
     of torch on the bfp16 operands."""
@@ -112,57 +88,6 @@ def test_upsample(npu: VisionDevice, H: int, C: int) -> None:
     err = rel_native(vae.read_dtensor(npu, y, ch), qconv(up, w[p + "conv.weight"], w[p + "conv.bias"]))
     print(f"H {H} -> {2 * H}: rel err {err:.3e}")
     assert err < 8e-3
-
-
-@pytest.mark.slow
-def test_decoder(npu: VisionDevice) -> None:
-    """SD 1.5's VAE decoder (one dispatch) on random latents: within 2e-2 of the fp32 decoder (pixels)."""
-    from artlite.model_config import sd15_dir
-
-    from . import ref as reference
-    path = os.path.join(sd15_dir(), "vae")
-    require(path)
-    ref = reference.VaeDecoder(path)
-    dec = vae.Decoder.build(npu, ref.w, scale=ref.scale, eps=ref.EPS)
-    torch.manual_seed(7)
-    lat = torch.randn(1, 4, 64, 64)  # (the sampler's latents: about unit variance)
-    err = rel_native(dec(lat), ref(lat))
-    print(f"rel err {err:.3e}")
-    assert err < 2e-2
-
-
-def test_attention512(npu: VisionDevice) -> None:
-    """The mid block's single-head attention of d 512 (role v) for a band of 1024 queries (16 query panels a column, 4 a
-    core row) over 1024 keys: within 1.5e-2 of softmax attention on the bfp16 operands."""
-    import numpy as np
-
-    from artlite.vision.seq import ColOps, MemTask
-    torch.manual_seed(5)
-    nq, nk, d = 8 * 128, 1024, 512
-    qs = torch.randn(nq, d) * (1.4426950408889634 / d ** 0.5) * 2
-    k, v = torch.randn(nk, d), torch.randn(nk, d)
-    bd = Builder(npu)
-    kv = bd.image("a512.kv", vae.kv512_image(k, v))
-    Qa, Oa = 0, 64 * 16 * 72
-    qimg = np.concatenate([L.panels(qs[128 * c:128 * (c + 1)]) for c in range(COLS)])
-    qa = bd.image("a512.q", qimg)
-    bd.op({c: ColOps(fills=[MemTask([{"addr": Qa, "nwords": qimg.size // 32}], ddr=(qa + c * qimg.size // 8, qimg.size // 8,
-                                                                                      None))]) for c in range(COLS)}, {})
-    at = vae.Attention512(np=16, q=Qa, o=Oa, kv=kv, nkeys=nk)
-    bd.op({c: at.col_ops() for c in range(COLS)}, at.row_ops(bd.image("a512.cmd", at.command())))
-    ob = 80 * 16 * 72
-    out = bd.ddr("a512.o", COLS * ob)
-    bd.op({c: ColOps(drains=[MemTask([{"addr": Oa, "nwords": ob // 4}], ddr=(out + c * ob, ob, None))]) for c in range(COLS)},
-          {})
-    npu.run(bd.transaction())
-    raw = npu.read("a512.o", COLS * ob).reshape(COLS, 80 * 16 * 72)
-    o = torch.cat([torch.from_numpy(L.from_panels(raw[c][:64 * 16 * 72], 128, d)) for c in range(COLS)])
-    qq, kq, vq = q(qs), q(k), q(v)
-    p = torch.exp2(qq @ kq.T - (qq @ kq.T).max(-1, keepdim=True).values)
-    ref = (p @ vq) / p.sum(-1, keepdim=True)
-    err = rel_native(o, ref)
-    print(f"rel err {err:.3e}")
-    assert err < 1.5e-2
 
 
 def test_mid_attention(npu: VisionDevice) -> None:

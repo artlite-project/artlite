@@ -1,8 +1,7 @@
 """LFM3-Audio-2B with a clip on the NPU (models.lfm with LFM3-Audio's mmproj: a ``Sequence`` prompt): the ASR prompt of
 a LibriSpeech clip, teacher-forced over its transcript, against llama.cpp's own encoder and language model on the CPU
-(``ref.golden``). With llama.cpp's embeddings the clip's rows are tested on their own, through the prefill and as
-decode steps; the app's path (``Lfm(mmproj=)``) adds the NPU encoder; its greedy transcript is the reference's."""
-
+(``ref.golden``). With llama.cpp's embeddings the clip's rows are tested on their own, as decode steps; the app's path
+(``Lfm(mmproj=)``) adds the NPU encoder and the prefill; its greedy transcript is the reference's."""
 
 import numpy as np
 import pytest
@@ -47,15 +46,13 @@ def case() -> tuple:
 
 
 def test_audio_prompt(case: tuple) -> None:
-    """llama.cpp's embeddings at the prompt's positions: through the prefill (chunks of 128: the clip across a
-    boundary) and as decode steps, within the language model's own distance from llama.cpp's."""
+    """llama.cpp's embeddings at the prompt's positions, as decode steps (no prefill library), within the language
+    model's own distance from llama.cpp's."""
     seq, answer, want = case
-    for prefill in (True, False):
-        model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=prefill, sizes=(128,))
-        got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
-        kl, agree = kl_report("prefill" if prefill else "steps", want, got)
-        assert kl < 0.003 and agree > 0.95
-        del model
+    model = NpuLfm(GGUFFile(MODEL), capacity=1024, prefill=False)
+    got = torch.from_numpy(np.stack([model.forward(seq)] + [model.step(t) for t in answer[:-1]]))
+    kl, agree = kl_report("steps", want, got)
+    assert kl < 0.003 and agree > 0.95
 
 
 def test_app_audio_prompt(case: tuple) -> None:

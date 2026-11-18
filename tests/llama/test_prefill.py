@@ -4,8 +4,8 @@ prefill/test_norm.py):
 - the attention (prefill/attn/): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
-  logits (Llama; Qwen3 0.6B Q4_1, Qwen3-Embedding-0.6B Q8_0 and -4B: q / k norms, all-Q8_0 GEMMs, a hidden size of
-  2560 in padded K chunks).
+  logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-4B: q / k norms, a hidden size of 2560 in padded K chunks), and
+  packed chunks on Qwen3-Embedding-0.6B Q8_0 (all-Q8_0 GEMMs).
 """
 
 import numpy as np
@@ -25,13 +25,11 @@ from ..numerics import rel
 A_BYTES = 9280  # the cache objects (the Q4_K_M images' tile size)
 # (head_dim, query heads per KV head, K panels per record, chunk, its position, q / k norms with weights and Q hi + lo:
 # Qwen3)
-ATTN = [(64, 4, 1, 256, 0, False), (64, 4, 2, 256, 128, False), (64, 4, 1, 512, 384, False),
-        (128, 3, 1, 256, 0, False), (128, 3, 2, 256, 64, False), (128, 3, 1, 512, 192, False),
-        (128, 4, 1, 256, 0, False), (128, 4, 2, 512, 128, False), (128, 3, 1, 1024, 64, False),
-        (64, 4, 1, 128, 128, False), (128, 3, 1, 64, 0, False), (128, 3, 2, 128, 192, False),
-        (128, 4, 1, 64, 64, False),  # (short chunks: 1 row)
-        (128, 2, 2, 256, 0, True), (128, 2, 2, 512, 128, True), (128, 2, 1, 256, 64, True), (128, 2, 2, 64, 0, True),
-        (128, 2, 2, 1024, 64, True), (128, 4, 2, 256, 64, True)]
+ATTN = [(64, 4, 2, 256, 128, False), (64, 4, 1, 512, 384, False),
+        (128, 3, 1, 256, 0, False), (128, 3, 2, 256, 64, False), (128, 4, 2, 512, 128, False),
+        (128, 3, 1, 1024, 64, False),
+        (128, 4, 1, 64, 64, False),  # (a short chunk: 1 row)
+        (128, 2, 2, 256, 0, True), (128, 2, 2, 1024, 64, True), (128, 4, 2, 256, 64, True)]
 
 
 def _q_values(units: np.ndarray, hd: int, qp: int = 1) -> np.ndarray:
@@ -282,7 +280,7 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
 # (GGUF quantization, model size, K format, tokens, decode steps first; "qwen3:<name>": model_config.qwen3_gguf's file)
 CACHES = [("Q4_K_M", "1B", "single", 300, 0), ("Q4_K_M", "1B", "hilo", 300, 128), ("Q4_K_M", "3B", "single", 600, 64),
           ("Q4_K_S", "8B", "hilo", 300, 0), ("Q4_1", "qwen3:0.6B", "hilo", 300, 64),
-          ("Q8_0", "qwen3:embedding-0.6B", "hilo", 600, 0), ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64)]
+          ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64)]
 
 
 @pytest.mark.slow
@@ -337,7 +335,7 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
 
 def test_chunk_params_to_the_end() -> None:
     """Every chunk size at every start the planner may give it (``fits``: within the caches) takes its runtime
-    parameters (a 1-layer slice of Llama 1B at 4096 positions, the largest chunk among its sizes; no dispatch). A
+    parameters (Llama 1B at 4096 positions, the largest chunk among its sizes; no dispatch). A
     library's parameter has one range, its largest chunk's: the caches' padding (``KV_PAD``) extends it to every
     smaller chunk at the caches' end (with a pad short of the largest chunk, a 256-token chunk of a 32K prompt at
     31808 of 32768 positions was refused: its attention's P_FO)."""
@@ -349,7 +347,7 @@ def test_chunk_params_to_the_end() -> None:
 
     path = llama_gguf("Q4_K_M", "1B")
     require(path)
-    ov = LlamaOverlay(GGUFFile(path), layers=[0], vocab=2048, max_positions=4096)
+    ov = LlamaOverlay(GGUFFile(path), max_positions=4096)
     ov.load()
     pf = LlamaPrefill(ov).compile().bind()
     assert max(pf.sizes) == 4096

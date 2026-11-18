@@ -134,7 +134,7 @@ class _Phases:
         return out[:, :S * n_obj * PR.C_LEN].reshape(COLS, S, -1).copy()
 
 
-@pytest.fixture(scope="module", params=["9B", "1B"])
+@pytest.fixture(scope="module")
 def setup(request: pytest.FixtureRequest) -> tuple[_Phases, Golden, int, int]:
     path = qwen_gguf("Q4_K_M", request.param)
     require(path)
@@ -177,9 +177,16 @@ class _Check:
         assert rel_max(np.concatenate(self.got), np.concatenate(self.gold)) < tol
 
 
-@pytest.mark.parametrize("S", [1, 4])
-@pytest.mark.parametrize("phase", ["gdn_in", "gdn_out", "gate_up", "down", "attn_in", "attn_out", "lm"])
-def test_phase(setup: tuple, phase: str, S: int) -> None:
+_PHASES = ["gdn_in", "gdn_out", "gate_up", "down", "attn_in", "attn_out", "lm"]
+
+
+@pytest.mark.parametrize(("setup", "phase"), [("9B", phase) for phase in _PHASES] + [("1B", "lm")],
+                         ids=[f"9B-{phase}" for phase in _PHASES] + ["1B-lm"], indirect=["setup"],
+                         scope="module")  # (the module's: one setup per size, not one per test)
+def test_phase(setup: tuple, phase: str) -> None:
+    """One GEMV phase of slice layers at S = 4 slots (S = 1 runs through every phase in ``test_overlay_slice``): the
+    9B's seven phases, the 1B's LM head."""
+    S = 4
     P, G, Lg, La = setup
     cfg, img, eps, H = P.cfg, P.img, P.cfg.rms_norm_eps, P.H
     t = np.arange(T - S, T)  # the slots' tokens
@@ -251,7 +258,7 @@ def test_phase(setup: tuple, phase: str, S: int) -> None:
     check.done(0.3 if phase == "lm" and img.screen else 5e-2)
 
 
-@pytest.fixture(scope="module", params=[4, 8])
+@pytest.fixture(scope="module")
 def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
     path = qwen_gguf("Q4_K_M", "27B")
     require(path)
@@ -260,16 +267,15 @@ def setup27(request: pytest.FixtureRequest) -> tuple[_Phases, int, int]:
     return _Phases(path, [Lg, La], request.param), Lg, La
 
 
-@pytest.mark.parametrize("S", [1, 3, 8])
 @pytest.mark.parametrize("phase", ["gdn_in", "attn_in", "attn_out", "down", "gate_up"])
+@pytest.mark.parametrize(("setup27", "S"), [(8, 1), (8, 8), (4, 4)], ids=["8-1", "8-8", "4-4"], indirect=["setup27"],
+                         scope="module")  # (the module's: one design per slot count, not one per test)
 def test_phase_27b(setup27: tuple, phase: str, S: int) -> None:
     """The 27B's K groups (attn_out: 6 chunks as 3 + 3, down: 17 chunk-major as 5 + 5 + 5 + 2; gdn_in: Q6_K qkv) on
-    random inputs, against the cores' numerics: on the 4-slot design and on the 8-slot one (x as single bfp16 rows,
-    ``decode.gemv``; its inputs packed: 1, 4, 8 slots per k block)."""
+    random inputs, against the cores' numerics: on the 4-slot design (4 slots) and on the 8-slot one (x as single bfp16
+    rows, ``decode.gemv``; its inputs packed: 1 and 8 slots per k block)."""
     P, Lg, La = setup27
     H, slots = P.H, P.slots
-    if S > slots:
-        pytest.skip(f"a design of {slots} slots")
     h8 = H // COLS
     rng = np.random.default_rng(1)
     L = La if phase.startswith("attn") else Lg
@@ -546,6 +552,7 @@ def _gdn_steps(path: str, Lg: int, x: np.ndarray, gold: np.ndarray | None) -> No
         _, st, cs = ref_tokens(msgs, acc, st, cs)
 
 
+@pytest.mark.parametrize("setup", ["9B"], indirect=True)
 def test_gdn_steps(setup: tuple) -> None:
     """Layer 0 (GDN) over tokens 0 .. 4 in three steps with the lazy commit: tokens 0 .. 2 (2 accepted), then 2, 3
     (replaying 0, 1 first; both accepted), then 4 committing (replaying 2, 3): every output within bf16 rounding of the
@@ -632,29 +639,30 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "35B-A3B", "occamy", "3.8-27B", "swift", "kev"])
-@pytest.mark.parametrize("mode", ["s1", "s3", "lazy", "split", "split4", "s7", "lazy8"])
-def test_overlay_slice(size: str, mode: str) -> None:
+_OVERLAY_SLICES = [(mode, size) for mode in ("s1",) for size in ("9B", "1B", "35B-A3B", "occamy", "3.8-27B", "kev")] + [
+    ("s3", "9B"), ("lazy", "35B-A3B"), ("split", "1B"), ("split", "9B"), ("s7", "swift"), ("lazy8", "3.8-27B")]
+
+
+@pytest.mark.parametrize(("mode", "size"), _OVERLAY_SLICES, ids=[f"{mode}-{size}" for mode, size in _OVERLAY_SLICES])
+def test_overlay_slice(mode: str, size: str) -> None:
     """The first layers up to the first full-attention layer over 34 positions (a second cache group), by steps of one
     token (s1), three committed tokens (s3), or four tokens of which two are accepted (lazy: the next step replays
     them); over 104 positions by steps of two (split: from 96 positions on, the attention's chains divide their
-    caches: 9B pairs, 1B chains of 4) or of four (split4: the 35B-A3B's rounds, a KV head each): the residual stream after every
-    layer and accepted token within llama.cpp's noise
+    caches: 9B pairs, 1B chains of 4): the residual stream after every layer and accepted token within llama.cpp's noise
     (its Q8_K activations) of its decode. The 1B's noise is ~3x the 9B's: its layer 0 against float64 math on the same
     weights is off by 1.9% on average (6% at most; the NPU's: 0.8%). 35B-A3B (every layer an MoE): where a token's
     routing differs from llama.cpp's (a near tie of its 8th and 9th logits) its layer output moves by 10-40%; none here
     (0.5-0.9% on average, 3.4% at most). Occamy (its Q3_K experts in these layers) within the 35B-A3B's bounds: its
     routing flips move a layer's output by up to ~2% (``test_moe_slice``). Qwen3.8-27B on its design of 8 slots (x as
-    single bfp16 rows, ``decode.gemv``) also by steps of seven committed tokens (s7) and of eight tokens of which three
-    are accepted (lazy8). Kev-4B (its hidden 2560: half regions, gate / up's and the LM head's row tiles in pairs on its
-    design of 4 slots) within the 9B's bounds (the padded image's at s1: 3.0% at most, 0.85% on average per layer; the
+    single bfp16 rows, ``decode.gemv``) by eight tokens of which three are accepted (lazy8), Swift 1.5 (the same
+    design) by steps of seven committed tokens (s7); the other modes' steps are bit-identical to the steps of one
+    (``test_drafts_exact``). Kev-4B (its hidden 2560: half regions, gate / up's and the LM head's row tiles in pairs on
+    its design of 4 slots) within the 9B's bounds (the padded image's at s1: 3.0% at most, 0.85% on average per layer; the
     pairs' 2.2%, 0.79%)."""
     from models.qwen35.overlay import QwenOverlay
 
     path = size_gguf(size)
     require(path)
-    if mode in ("s7", "lazy8") and size not in ("3.8-27B", "swift"):
-        pytest.skip("steps of more than 4 tokens: designs of 8 slots")
     La = QwenConfig.from_gguf(GGUFFile(path)).attention_layers[0]
     n, layers = 104 if mode.startswith("split") else 34, list(range(La + 1))
     tokens = llama_tokenize(path, essay("apple.txt"))[:n]
@@ -666,7 +674,6 @@ def test_overlay_slice(size: str, mode: str) -> None:
     while t < n:
         S, commit, acc = {"s1": (1, True, 1), "s3": (min(3, n - t), True, min(3, n - t)),
                           "lazy": (min(4, n - t), False, min(2, n - t)), "split": (2, True, 2),
-                          "split4": (min(4, n - t), True, min(4, n - t)),
                           "s7": (min(7, n - t), True, min(7, n - t)), "lazy8": (min(8, n - t), False, min(3, n - t))}[mode]
         x = ov.gguf.rows("token_embd.weight", tokens[t:t + S])
         if t == 0:
@@ -884,7 +891,7 @@ def test_split_slice(size: str, first: int, slots: int) -> None:
     assert errs.max() < 5.6e-2 and errs.mean(0).max() < 2.1e-2, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "swift"])
+@pytest.mark.parametrize("size", ["occamy", "swift"])
 def test_lm_head(size: str) -> None:
     """The LM head alone (``logits_of``: the output norm, every vocabulary row) on llama.cpp's last residual of T
     tokens: the logits within llama.cpp's own error (its Q8_K activations) of its logits, the same argmax."""
@@ -947,16 +954,16 @@ def test_screened(size: str) -> None:
 
 
 @pytest.mark.parametrize(("size", "L"), [("35B-A3B", 0), ("occamy", 0), ("occamy", 10)])
-@pytest.mark.parametrize("S", [1, 2, 3, 4])
-def test_moe_layer(size: str, L: int, S: int) -> None:
+def test_moe_layer(size: str, L: int) -> None:
     """A layer L (GDN, then its MoE) of Qwen3.6-35B-A3B or Occamy (layer 0: Q3_K experts, 10: IQ3_XXS) as a slice of
-    its own in one step of S slots: on the NPU's own input to the MoE (moe_in's x), the router's logits (the route
-    object's payload) within 3e-5 of fp32 math (the norm weight's bf16 rounding corrected in the router's rows:
-    ``image.QwenImage.pack``), the slots' top 8 the oracle's (``moe_route``); every column's control packets and expert
-    object as the host's routing of the NPU's logits makes them (``moe.route``: the union dealt as whole experts and
-    halves; the items' weights to 1e-5: the cores' fp32 to ~2^-16); each slot's layer output within 1% of the oracle's
-    (``moe_ffn`` + ``shared_expert`` on x; Occamy's layer 10: 1.5%, its shared expert's output 2.6x the routed experts'
-    and x small: 1.1% from the oracle, 0.8% from one with the cores' bf16 gate and h = silu(gate) up)."""
+    its own in a step of S = 1 .. 4 slots (from position 0 after ``reset``, on one loaded overlay): on the NPU's own
+    input to the MoE (moe_in's x), the router's logits (the route object's payload) within 3e-5 of fp32 math (the
+    norm weight's bf16 rounding corrected in the router's rows: ``image.QwenImage.pack``), the slots' top 8 the
+    oracle's (``moe_route``); every column's control packets and expert object as the host's routing of the NPU's
+    logits makes them (``moe.route``: the union dealt as whole experts and halves; the items' weights to 1e-5: the
+    cores' fp32 to ~2^-16); each slot's layer output within 1% of the oracle's (``moe_ffn`` + ``shared_expert`` on
+    x; Occamy's layer 10: 1.5%, its shared expert's output 2.6x the routed experts' and x small: 1.1% from the
+    oracle, 0.8% from one with the cores' bf16 gate and h = silu(gate) up)."""
     from artlite.moe import route as MR
     from artlite.moe.steps import CP_BYTES
     from models.qwen35.overlay import QwenOverlay
@@ -967,45 +974,48 @@ def test_moe_layer(size: str, L: int, S: int) -> None:
     ov = QwenOverlay(g, layers=[L], vocab=COLS * 64, max_positions=128)
     ov.load()
     cfg, H = ov.cfg, ov.H
-    x = g.rows("token_embd.weight", llama_tokenize(path, essay("apple.txt"))[:S])
-    ov.step(x, 0, logits=False)
-    dev = ov.dev
-    dev.fetch("ACT")
-    act = dev.view("ACT")
-    off = ov.inp[(L, "moe_in")][0].off + PR.XB
-    xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
-    b = f"blk.{L}."
-    xn = np_ops.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
-                      cfg.rms_norm_eps)
-    W = np.asarray(g.tensor(b + "ffn_gate_inp.weight").raw, np.float32).reshape(cfg.n_experts, H)
-    lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
-    o = ov.xch[L] + 4 * PR.META
-    lg = act[o:o + 4096].view(np.float32).reshape(PR.SLOTS, -1)[:S]
-    assert rel_max(lg, lg_ref) < 3e-5, rel_max(lg, lg_ref)
-    ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
-    rids, rw = moe_ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
-    assert np.array_equal(ids, rids)
-    gu = ov.image.region(L, "exp_gu")
-    for c in range(COLS):
-        cp = act[ov.cp[L] + c * (CP_BYTES + PR.XB):][:CP_BYTES].view(np.uint32)
-        assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset), stride=gu.col_stride,
-                                                                     a_packet=ov.op.PACKET.get("A"))), c
-        em = cp[MR.RBUF_META:MR.RBUF_META + PR.META].view(np.int32)
-        dn = ov.image.region(L, "exp_down")
-        nh = sum(h1 - h0 + 1 for _, h0, h1 in items[c])
-        assert (em[PR.M_NITEM], em[PR.M_NT]) == (len(items[c]), nh * (gu.n_rt * gu.n_kc + dn.n_rt * dn.n_kc)), c
-        for i, (e, h0, h1) in enumerate(items[c]):
-            it = em[PR.M_ITEM + PR.ITEM_WORDS * i:][:PR.ITEM_WORDS]
-            assert it[0] == e | h0 << 8 | h1 << 9
-            assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (c, i)
+    tokens = llama_tokenize(path, essay("apple.txt"))[:4]
     ex = moe_ref.experts(g, L)
-    shared = moe_ref.shared_expert(xn, *(g.tensor(b + t).dequantize() for t in
-                                     ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
-                               np.asarray(g.tensor(b + "ffn_gate_inp_shexp.weight").raw, np.float32).reshape(-1))
-    want = xin + moe_ref.moe_ffn(xn, rids, rw, ex) + shared
-    for s in range(S):
-        got = ov.hidden(-1, slot=s)
-        assert rel_max(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (s, rel_max(got, want[s]))
+    for S in range(1, 5):
+        ov.reset()
+        x = g.rows("token_embd.weight", tokens[:S])
+        ov.step(x, 0, logits=False)
+        dev = ov.dev
+        dev.fetch("ACT")
+        act = dev.view("ACT")
+        off = ov.inp[(L, "moe_in")][0].off + PR.XB
+        xin = from_bf16_bits(act[off:off + 8 * H].view(np.uint16).reshape(H // 8, PR.SLOTS, 8)[:, :S].transpose(1, 0, 2).reshape(S, H))
+        b = f"blk.{L}."
+        xn = np_ops.rms_norm(xin, np.asarray(g.tensor(b + "post_attention_norm.weight").raw, np.float32).reshape(-1),
+                          cfg.rms_norm_eps)
+        W = np.asarray(g.tensor(b + "ffn_gate_inp.weight").raw, np.float32).reshape(cfg.n_experts, H)
+        lg_ref = xn.astype(np.float64) @ W.T.astype(np.float64)
+        o = ov.xch[L] + 4 * PR.META
+        lg = act[o:o + 4096].view(np.float32).reshape(PR.SLOTS, -1)[:S]
+        assert rel_max(lg, lg_ref) < 3e-5, (S, rel_max(lg, lg_ref))
+        ids, w, items = MR.route(lg, cfg.n_experts_used, COLS)
+        rids, rw = moe_ref.moe_route(lg_ref.astype(np.float32), cfg.n_experts_used)
+        assert np.array_equal(ids, rids), S
+        gu = ov.image.region(L, "exp_gu")
+        for c in range(COLS):
+            cp = act[ov.cp[L] + c * (CP_BYTES + PR.XB):][:CP_BYTES].view(np.uint32)
+            assert np.array_equal(cp[:MR.PACKET_WORDS], MR.packet_words(items[c], base=dev.address("W", gu.offset), stride=gu.col_stride,
+                                                                         a_packet=ov.op.PACKET.get("A"))), (S, c)
+            em = cp[MR.RBUF_META:MR.RBUF_META + PR.META].view(np.int32)
+            dn = ov.image.region(L, "exp_down")
+            nh = sum(h1 - h0 + 1 for _, h0, h1 in items[c])
+            assert (em[PR.M_NITEM], em[PR.M_NT]) == (len(items[c]), nh * (gu.n_rt * gu.n_kc + dn.n_rt * dn.n_kc)), (S, c)
+            for i, (e, h0, h1) in enumerate(items[c]):
+                it = em[PR.M_ITEM + PR.ITEM_WORDS * i:][:PR.ITEM_WORDS]
+                assert it[0] == e | h0 << 8 | h1 << 9
+                assert np.abs(it[1:1 + S].view(np.float32) - MR.item_weights(ids, w, e)).max() < 1e-5, (S, c, i)
+        shared = moe_ref.shared_expert(xn, *(g.tensor(b + t).dequantize() for t in
+                                         ("ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")),
+                                   np.asarray(g.tensor(b + "ffn_gate_inp_shexp.weight").raw, np.float32).reshape(-1))
+        want = xin + moe_ref.moe_ffn(xn, rids, rw, ex) + shared
+        for s in range(S):
+            got = ov.hidden(-1, slot=s)
+            assert rel_max(got, want[s]) < (1.5e-2 if (size, L) == ("occamy", 10) else 1e-2), (S, s, rel_max(got, want[s]))
 
 
 # ----------------------------------------------------------------------

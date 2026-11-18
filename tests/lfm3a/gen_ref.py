@@ -334,14 +334,13 @@ def golden(model: str, mmproj: str, *, prompt: str | None = None, h: np.ndarray 
            chunk: int = 4, gen: int = 0, seed: int = 0, names: str = "", threads: int = 16) -> GenGolden:
     """llama.cpp's generator on the CPU (``gen_dump.cpp``'s options: a prompt's hidden state, passes of codes on it or on
     ``h``, ``gen`` frames sampled after the prompt (``seed``), teacher-forced frames, frames through the codec in calls
-    of ``chunk``), cached under
-    ``tests/refs/<model>/ggolden_<hash>/`` (``--refresh-refs`` recomputes)."""
+    of ``chunk``), cached under ``tests/refs/<model>/ggolden_<hash>_<hash>/`` (``goldens.runner.cached_golden``;
+    ``--refresh-refs`` recomputes)."""
     arrs = {"h": None if h is None else np.ascontiguousarray(h, np.float32),
             "passes": None if passes is None else np.ascontiguousarray(passes, np.int32),
             "feed": None if feed is None else np.ascontiguousarray(feed, np.int32),
             "frames": None if frames is None else np.ascontiguousarray(frames, np.int32)}
-    key = (common.model_key(model), common.model_key(mmproj), prompt, chunk, gen, seed, names, lib_identity(),
-           lib_identity("libmtmd.so"),
+    key = (common.model_key(model), common.model_key(mmproj), prompt, chunk, gen, seed, names,
            {k: None if v is None else hashlib.sha256(v.tobytes()).hexdigest() for k, v in arrs.items()})
 
     def run(tmp: str) -> None:
@@ -365,4 +364,5 @@ def golden(model: str, mmproj: str, *, prompt: str | None = None, h: np.ndarray 
                 os.remove(os.path.join(tmp, f"{k}.bin"))
         open(os.path.join(tmp, "done"), "w").close()
 
-    return GenGolden(cached_golden(model, "ggolden", key, DUMP_SRC, run, marker="done"))
+    libs = (lib_identity(), lib_identity("libmtmd.so"))
+    return GenGolden(cached_golden(model, "ggolden", key, DUMP_SRC, run, version=libs, marker="done"))

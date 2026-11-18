@@ -12,7 +12,7 @@ import pytest
 from ml_dtypes import bfloat16
 
 import models
-from artlite.model_config import gemma_gguf, llama_gguf, minicpmv_gguf, qwen_gguf
+from artlite.model_config import gemma_gguf, llama_gguf, qwen_gguf
 from models import open_model
 from models.drafts import (
     ALL,
@@ -432,9 +432,9 @@ def test_rewind_recurrent() -> None:
         assert (m.rewind(45), m.rewind(40)) == want
 
 
-# the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (MiniCPM-V's language model; Qwen3.5-9B: its
-# steps of several tokens past 6 cache groups)
-CASES = [llama_gguf("Q4_0", "1B"), gemma_gguf("Q4_0"), minicpmv_gguf(), qwen_gguf("Q4_K_M", "9B")]
+# the files on the NPU (slow): a Llama, a Gemma with its drafter, qwen35 (Qwen3.5-9B: its steps of several tokens past 6
+# cache groups)
+CASES = [llama_gguf("Q4_0", "1B"), gemma_gguf("Q4_0"), qwen_gguf("Q4_K_M", "9B")]
 
 
 @pytest.mark.slow

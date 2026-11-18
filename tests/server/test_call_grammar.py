@@ -5,6 +5,7 @@ token by token under the mask; random walks under the grammar parsed back into c
 ``tool_choice`` modes, a response format beside the tools, ``tool_choice`` none's ban; strict tools' errors; custom
 tools' inputs (a Lark grammar, a regex, text)."""
 
+import functools
 import json
 import os
 import random
@@ -150,6 +151,7 @@ def tokenizer_of(syntax: Syntax, path: str) -> object:
     return BpeTokenizer(GGUFFile(path))
 
 
+@functools.cache  # (a model file's tokenizer and vocabulary: seconds to build, read-only)
 def model_vocab(family: str) -> tuple[Syntax, object, S.Vocab]:
     syntax, path = TEMPLATES[family][0], TEMPLATES[family][1]()
     if not os.path.exists(path):

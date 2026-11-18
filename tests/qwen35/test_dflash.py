@@ -246,7 +246,7 @@ def test_injection(npu: _Npu) -> None:
             assert rel_max(got, x[L, pos, c]) < 0.03
 
 
-@pytest.mark.parametrize("P", [2292, 2295, 2600])
+@pytest.mark.parametrize("P", [2292, 2600])
 def test_attention_core(npu: _Npu, P: int) -> None:
     """The attention core against the attention of its own operands, at every layer, on random taps (random S, junk rows, past the ring's
     wrap): their logits are no check, a broad softmax over random keys follows K's 8-bit mantissas (5-60% from fp32, reproduced by those

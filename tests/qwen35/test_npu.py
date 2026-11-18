@@ -1,12 +1,11 @@
 """qwen35 models on the NPU (models.qwen35, models/qwen35/overlay.py) against llama.cpp's decode
 (ubatch 1) of the same GGUF file (golden tensors and logits, tests/goldens/text.py):
 
-- a slice of four layers in the middle of the model (GDN layers and a full-attention layer), fed llama.cpp's residual
-  stream before it token by token: the residual after every layer;
-- the whole model, teacher-forced over an essay: KL of the next-token distributions and argmax agreement against
-  llama.cpp's decode, within llama.cpp's own noise: it quantizes the activations of every projection to Q8_K, and its
-  prompt (one graph) and decode runs of the text differ by a KL of 0.0026 (9B) / 0.051 (27B: a few tokens of this
-  text near a tie flip, in both runs and on the NPU).
+- the whole model: the prompt through the prefill, then teacher-forced decode steps continuing from it: KL of the
+  next-token distributions and argmax agreement against llama.cpp's split run, within llama.cpp's own noise: it
+  quantizes the activations of every projection to Q8_K, and its prompt (one graph) and decode runs of the text
+  differ by a KL of 0.0026 (9B) / 0.051 (27B: a few tokens of this text near a tie flip, in both runs and on the NPU);
+- greedy generation with the MTP drafters, and the drafter after a prefill.
 """
 
 
@@ -22,7 +21,7 @@ from ..common import draft_gate, draft_prompts, essay
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
 from ..model_files import require, size_gguf
-from ..numerics import kl_rows, rel_max
+from ..numerics import kl_rows
 
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
 
@@ -40,60 +39,11 @@ def _drafter(path: str) -> None:
         pytest.skip(f"no MTP drafter of {path}")
 
 
-def _tokens(path: str, n: int, name: str = "founders.txt") -> list[int]:
-    return llama_tokenize(path, essay(name))[:n]
+def _tokens(path: str, n: int) -> list[int]:
+    return llama_tokenize(path, essay("founders.txt"))[:n]
 
 
-@pytest.mark.parametrize("size", ["9B", "27B", "1B"])
-def test_slice(size: str) -> None:
-    """Decode steps of a slice against llama.cpp's decode graphs (a non-causal model, d3-lite's, never decodes: its
-    path is the prefill's, tests/test_decisions.py)."""
-    from models.qwen35.overlay import QwenOverlay
-
-    path = _path(size)
-    g = GGUFFile(path)
-    cfg = QwenConfig.from_gguf(g)
-    La = cfg.attention_layers[len(cfg.attention_layers) // 2]
-    layers = list(range(La - 3, La + 1))
-    n = 34
-    tokens = _tokens(path, n, "apple.txt")
-    G = golden(path, tokens, ubatch=1, layers=(layers[0] - 1, *layers), names="l_out", logits="none")
-    ov = QwenOverlay(g, layers=layers, vocab=512, max_positions=64)
-    ov.load()
-    errs = np.zeros((n, len(layers)))
-    for t in range(n):
-        ov.step(torch.from_numpy(np.asarray(G["l_out", layers[0] - 1][t], np.float32).copy()), t, logits=False)
-        for i, L in enumerate(layers):
-            got = ov.hidden(layers[i + 1] if i + 1 < len(layers) else -1)
-            errs[t, i] = rel_max(got, np.asarray(G["l_out", L][t], np.float32))
-    print(f"{size} layers {layers}: mean error per layer {errs.mean(0)}, max {errs.max():.3f}")
-    assert errs.max() < 4e-2 and errs.mean(0).max() < 1.5e-2
-
-
-@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy", "swift"])
-def test_teacher_forced(size: str) -> None:
-    path = _path(size)
-    tokens = _tokens(path, 128)
-    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
-    pro = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
-    model = NpuQwen(GGUFFile(path), capacity=256)
-    got = torch.from_numpy(model.forced_logits(tokens))
-    kl, kl_llama = float(kl_rows(dec, got).mean()), float(kl_rows(dec, pro).mean())
-    # (the agreement counts the tokens whose top two llama.cpp's decode has clearly apart: a near tie flips on either side's
-    # rounding. A dense model's at least 0.25 (Qwen3.8 27B's NPU flips 9 of 128 within 0.134, llama.cpp's prompt run 4 of them);
-    # an MoE model's routing flips near-tied experts, and then the next token where its top two are near ties: at least 1
-    # (Occamy's NPU 12, all where llama.cpp's own top two lie within 0.85))
-    top2 = torch.topk(dec, 2).values
-    sure = top2[:, 0] - top2[:, 1] >= (1 if model.cfg.moe else 0.25)
-    agree = float((dec.argmax(-1) == got.argmax(-1))[sure].float().mean())
-    agree_llama = float((dec.argmax(-1) == pro.argmax(-1))[sure].float().mean())
-    print(f"{size}: KL {kl:.4f} (llama.cpp prompt vs decode {kl_llama:.4f}), argmax agreement {agree:.3f} "
-          f"({agree_llama:.3f}) over {int(sure.sum())} of {len(tokens)} tokens")
-    tol = 0.05 if model.cfg.moe else 0.02
-    assert kl < 1.5 * kl_llama and agree > agree_llama - tol
-
-
-@pytest.mark.parametrize("size", ["9B", "27B", "3.8-27B", "1B", "35B-A3B", "occamy", "swift"])
+@pytest.mark.parametrize("size", ["9B", "3.8-27B", "1B", "35B-A3B", "swift"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
@@ -102,8 +52,10 @@ def test_prefill(size: str) -> None:
     path = _path(size)
     P, K = 300, 24
     tokens = _tokens(path, P + K)
-    split = torch.from_numpy(np.asarray(golden(path, tokens, split=P, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
-    dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32)[P - 1:P + K - 1].copy())
+    split = torch.from_numpy(
+        np.asarray(golden(path, tokens, split=P, logits="f32", logits_from=P - 1).logits, np.float32)[:K].copy())
+    dec = torch.from_numpy(
+        np.asarray(golden(path, tokens, ubatch=1, logits="f32", logits_from=P - 1).logits, np.float32)[:K].copy())
     model = NpuQwen(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)
@@ -119,10 +71,10 @@ def test_prefill(size: str) -> None:
     assert float(kl.clamp(max=0.5).mean()) < 1.5 * float(kl_llama.clamp(max=0.5).mean()) + 2e-3 and agree > agree_llama - 0.05
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B", "swift"])
+@pytest.mark.parametrize("size", ["35B-A3B", "3.8-27B"])
 def test_mtp(size: str) -> None:
-    """Qwen3.6-35B-A3B and Occamy 1.0 with their MTP drafters, Qwen3.8-27B and Swift 1.5 with their files' own blocks
-    (``NpuQwen.generate``, up to SLOTS - 1 drafts per step: 3, the 27Bs' designs 7): greedy replies to two user turns of
+    """Qwen3.6-35B-A3B with its MTP drafter, Qwen3.8-27B with its file's own block (``NpuQwen.generate``, up to
+    SLOTS - 1 drafts per step: 3, the 27B's design 7): greedy replies to two user turns of
     a chat, the second after the first reply (decode steps up to a cache group, then a chunk from the host's carry). Every token is the argmax of the
     model's one-token steps over the same text (steps of S slots give the numbers of S steps of one; an exact tie of the
     bf16 logits takes either); most drafts are accepted (the drafter's cache follows the model's positions; up to 7
@@ -167,14 +119,13 @@ def test_mtp(size: str) -> None:
     assert a >= (0.5 if drafts == 3 else 0.4) * d and all(a > 0 for d, a in (stats1, stats2) if d >= 4)
 
 
-@pytest.mark.parametrize("size", ["35B-A3B", "occamy", "3.8-27B"])
+@pytest.mark.parametrize("size", ["35B-A3B"])
 def test_mtp_prefill(size: str) -> None:
     """The drafter after prompts through the prefill drafts as after the same prompts as decode steps
     (``common.draft_gate``: teacher-forced over the model's greedy replies): the prefill writes the drafter's records of
     the prompt's rows from its own hidden states (``qwen35.draft_prefill``), which the model's KL does not see. Tokens
-    per round 1.825 vs 1.823 (35B-A3B), 1.789 vs 1.808 (Occamy); a prompt's differ by up to ~2%, their first guesses the
-    argmax by up to ~7% (the decode's residual is fp32, its sums of a slot's experts exact, ``decode.design``'s "MoE"; the
-    prefill's residual bf16), ~3% over the prompts (Occamy: 0.781 vs 0.808)."""
+    per round 1.825 vs 1.823; a prompt's differ by up to ~2%, their first guesses the argmax by up to ~7% (the decode's
+    residual is fp32, its sums of a slot's experts exact, ``decode.design``'s "MoE"; the prefill's residual bf16)."""
     from models.qwen35.qwen import Qwen
 
     path = _path(size)

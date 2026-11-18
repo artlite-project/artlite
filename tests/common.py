@@ -1,5 +1,6 @@
 import hashlib
 import os
+import shutil
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -68,18 +69,16 @@ VIDEOS = {
 }
 ASTRONAUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "images", "sd15-astronaut.jpg")
 SPEECH_CLIP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "librispeech", "6930-75918-0001.wav")
+VIDEOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets", "videos")
 
 
-def video_file(folder: str, name: str) -> str:
-    """A synthetic MP4 of ``VIDEOS`` (H.264, AAC) in folder, made by ffmpeg once (skip without ffmpeg)."""
-    import shutil
+def video_file(name: str) -> str:
+    """A synthetic MP4 of ``VIDEOS`` (H.264, AAC), made by ffmpeg once into ``VIDEOS_DIR`` (gitignored), named by a
+    hash of its command (skip without ffmpeg)."""
     import subprocess
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("no ffmpeg / ffprobe")
     size, rate, sec, audio, start = VIDEOS[name]
-    path = os.path.join(folder, f"{name}.mp4")
-    if os.path.exists(path):
-        return path
     cmd = ["ffmpeg", "-v", "error", "-y"]
     if name.startswith("astronaut"):
         if audio and not os.path.exists(SPEECH_CLIP):
@@ -96,9 +95,16 @@ def video_file(folder: str, name: str) -> str:
         if audio:
             cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:beep_factor=4:duration={sec + start}"]
     cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"] + (["-c:a", "aac"] if audio else [])
-    tmp = path + ".tmp.mp4"
+    path = os.path.join(VIDEOS_DIR, f"{name}-{hashlib.sha256(repr(cmd).encode()).hexdigest()[:12]}.mp4")
+    if os.path.exists(path):
+        return path
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp.mp4"
     subprocess.run([*cmd, tmp], check=True)
     os.replace(tmp, path)
+    for f in os.listdir(VIDEOS_DIR):  # (the video's earlier versions)
+        if f.startswith(name + "-") and len(f) == len(os.path.basename(path)) and f != os.path.basename(path):
+            os.remove(os.path.join(VIDEOS_DIR, f))
     return path
 
 
@@ -170,21 +176,68 @@ def model_refs(model: str) -> str:
     return os.path.join(REFS_DIR, os.path.basename(model).removesuffix(".gguf"))
 
 
-def cached_ref(model: str, name: str, key: object, compute: Callable[[], Any], *, sources: Iterable[str] = ()) -> Any:
-    """``compute()`` (tensors, or containers of them), cached in the ``model`` file's folder of ``REFS_DIR`` under
-    a hash of ``key`` (model identity, inputs) and of the ``sources`` files (the reference implementation: editing
-    it invalidates its results). ``--refresh-refs`` recomputes."""
-    h = hashlib.sha256(repr(key).encode())
+def ref_entry(model: str, name: str, key: object, version: bytes, suffix: str = "") -> str:
+    """The path of a cached reference (a file or a folder): ``REFS_DIR/<model>/<name>_<hash of key>_<hash of version>
+    <suffix>``. ``key``: what the reference is of (model identity, inputs); ``version``: what computes it (the
+    reference's source files, the llama.cpp build), so that a new version replaces the entry of the same key
+    (``stored``)."""
+    k = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+    v = hashlib.sha256(version).hexdigest()[:16]
+    return os.path.join(model_refs(model), f"{name}_{k}_{v}{suffix}")
+
+
+def source_version(sources: Iterable[str], extra: object = ()) -> bytes:
+    """A reference's version: its source files' bytes and ``extra`` (e.g. ``llama_cpp.lib_identity()``)."""
+    out = repr(extra).encode()
     for src in sources:
         with open(src, "rb") as f:
-            h.update(f.read())
-    folder = model_refs(model)
-    path = os.path.join(folder, f"{name}_{h.hexdigest()[:16]}.pt")
+            out += f.read()
+    return out
+
+
+def hit(path: str) -> bool:
+    """Whether a cached reference exists (and ``--refresh-refs`` is off); a hit marks it used: an entry's mtime is
+    its last use, so ``find tests/refs -mindepth 2 -maxdepth 2 -mtime +30`` lists those no test read for 30 days."""
     if os.path.exists(path) and not REFRESH_REFS:
+        os.utime(path)
+        return True
+    return False
+
+
+def computing() -> None:
+    """Before computing a missing reference: in the tests' planning process (``artlite.parallel_compile``: it runs
+    the selected tests to find their designs) stop the test there, as at its first device access; the test run
+    computes it."""
+    from artlite import parallel_compile
+
+    if parallel_compile.planning_active():
+        raise parallel_compile.PlanStop("planning: a reference is computed by the test run")
+
+
+def stored(path: str) -> None:
+    """After a reference was stored at ``path`` (``ref_entry``): remove its other versions (the same name and key)."""
+    folder, base = os.path.split(path)
+    stem, _, rest = base.rpartition("_")
+    for f in os.listdir(folder):
+        if f != base and len(f) == len(base) and f.startswith(stem + "_") and f.endswith(rest[16:]):
+            old = os.path.join(folder, f)
+            shutil.rmtree(old) if os.path.isdir(old) else os.remove(old)
+
+
+def cached_ref(model: str, name: str, key: object, compute: Callable[[], Any], *, sources: Iterable[str] = (),
+               version: object = ()) -> Any:
+    """``compute()`` (tensors, or containers of them), cached in the ``model`` file's folder of ``REFS_DIR``
+    (``ref_entry``): ``key``, what it is of (model identity, inputs); ``sources`` (the reference implementation's
+    files) and ``version`` (e.g. the llama.cpp build), what computes it: a new version replaces the old result.
+    ``--refresh-refs`` recomputes."""
+    path = ref_entry(model, name, key, source_version(sources, version), ".pt")
+    if hit(path):
         return torch.load(path)
+    computing()
     out = _compact(compute())
-    os.makedirs(folder, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
     torch.save(out, tmp)
     os.replace(tmp, path)
+    stored(path)
     return out

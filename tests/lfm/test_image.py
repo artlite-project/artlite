@@ -3,8 +3,6 @@ from the GGUF metadata, the layout of each file (every row of every matrix in ex
 channels and the KV heads' halves per column, down's K padded to whole chunks, the regions in step order, the tile
 size per file) and the packed image's tiles and norm-weight objects at their places."""
 
-import time
-
 import numpy as np
 import pytest
 from ml_dtypes import bfloat16
@@ -12,13 +10,13 @@ from ml_dtypes import bfloat16
 from artlite.decode.image import COL_SLOT, pack_rows
 from artlite.decode.protocol import POST_K
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import LFM3_QUANTS, LfmConfig, lfm3_gguf
+from artlite.model_config import LfmConfig, lfm3_gguf
 from artlite.operators.design import COLS
 from models.lfm.image import CH, KC, LfmImage
 
 from ..model_files import require
 
-TILES = {"QAD-Q4_0": 9280, "Q4_K_M": 9280, "Q8_0": 9216, "BF16": 9216}
+TILES = {"QAD-Q4_0": 9280, "Q8_0": 9216, "BF16": 9216}  # (Q4_K_M's layout is QAD-Q4_0's)
 
 
 def _gguf(quant: str) -> GGUFFile:
@@ -40,7 +38,7 @@ def test_config() -> None:
     assert inv.shape == (32,) and inv[31] == 1e6 ** (-62 / 128) and cfg.rope_inv_freq("swa")[63] == 1e4 ** (-126 / 128)
 
 
-@pytest.mark.parametrize("quant", LFM3_QUANTS)
+@pytest.mark.parametrize("quant", list(TILES))
 def test_layout(quant: str) -> None:
     g = _gguf(quant)
     img = LfmImage(g)
@@ -87,8 +85,7 @@ def test_layout(quant: str) -> None:
 def test_pack_image(quant: str) -> None:
     """LfmImage.pack of a conv, a full-attention and a sliding-window layer and a slice of the LM head: sampled tiles of
     every block at their places as pack_rows packs their rows (down's padded K: zero past its 7680 columns), the
-    norm-weight objects (a header's [w1 | w_post], the first layer's plain w1) in every column; the whole image's pack
-    time."""
+    norm-weight objects (a header's [w1 | w_post], the first layer's plain w1) in every column."""
     g = _gguf(quant)
     img = LfmImage(g, layers=[3, 4, 6], vocab=COLS * 64)
     T = img.tile_bytes
@@ -118,8 +115,3 @@ def test_pack_image(quant: str) -> None:
             col = cols[c].reshape(-1, T)
             for kc in range(r.n_kc):
                 assert np.array_equal(col[r.tile(r.rt0[b.name] + t, kc)], ref[0, kc]), (r.layer, r.name, b.name, kc)
-    full = LfmImage(g)
-    buf = np.zeros(full.nbytes, np.uint8)
-    t0 = time.perf_counter()
-    full.pack(buf)
-    print(f"{quant}: {full.nbytes / 1e6:.0f} MB packed in {time.perf_counter() - t0:.2f} s")

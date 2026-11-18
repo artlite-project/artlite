@@ -3,9 +3,9 @@ test_attn_prefill.py, its MoE block: moe/test_prefill.py) on the NPU:
 
 - a slice of six layers (dense full, dense full, MoE sliding-window x 3, MoE full) against the decode path on the same
   tokens: a prompt from position 0 and after decode steps or a first prompt's chunks, past the window of 513, K hi + lo
-  and single, a chunk of 2048: the caches and the last token's logits (the LM head alone on the chunk's last output row:
-  ``ModelOverlay.logits_of``, or a decode step after the chunks);
-- the same slice's output rows against the numpy reference (``ref.layer``, fp32 weights).
+  and single, chunks of 2048 and 8192: the caches and the last token's logits (the LM head alone on the chunk's last
+  output row: ``ModelOverlay.logits_of``, or a decode step after the chunks);
+- the same slice's output rows of a chunk of 2048 against the numpy reference (``ref.layer``, fp32 weights).
 
 The two paths round differently, and a position whose routing has two near-tied experts can take either: the errors per
 position are held in their median and 95th percentile. Against the fp32 reference the decode's caches are within 0.2-1.5%
@@ -32,13 +32,14 @@ from . import ref
 VOCAB = 1024
 LAYERS = [0, 1, 2, 3, 4, 5]
 SIZES = (64, 128, 256, 512)  # (the tests' library: fewer designs to compile)
-BIG = (64, 1024, 2048)  # (prep blocks of 1024; chunks of 4096 and 8192: the attention in parts of 2048)
+BIG = (64, 2048, 8192)  # (chunks of 2048 and 8192: the attention in parts of 2048)
+BIG_POSITIONS = 10240  # (the overlay of the largest case, shared by ``test_flint_prefill_ref``)
 # (a first prompt's tokens through the prefill, then steps (their sizes), then the prompt's tokens, K, sizes)
 CASES = [(0, (), 300, "hilo", SIZES), (0, (4,) * 15 + (1, 3), 700, "hilo", SIZES),
-         (128, (2,) + (4,) * 15 + (2,), 500, "single", SIZES), (0, (), 2100, "hilo", BIG),
-         (0, (), 4200, "hilo", (64, 4096)), (192, (4,) * 16, 8300, "single", (64, 2048, 8192))]
+         (128, (2,) + (4,) * 15 + (2,), 500, "single", SIZES), (192, (4,) * 16, 8300, "hilo", BIG)]
 # (the steps end at a whole cache group: a chunk starts there)
 assert all((f + sum(s)) % 64 == 0 for f, s, *_ in CASES)
+assert -(-(192 + 64 + 8300) // 1024) * 1024 + 1024 == BIG_POSITIONS
 
 
 @pytest.fixture(scope="module")
@@ -121,18 +122,18 @@ def test_flint_prefill_layers(flint: tuple[GGUFFile, FlintConfig], first: int, s
                for k, (m, p95) in worst.items()), worst
 
 
-@pytest.mark.parametrize("n", [600, 2048])
-def test_flint_prefill_ref(flint: tuple[GGUFFile, FlintConfig], n: int) -> None:
+def test_flint_prefill_ref(flint: tuple[GGUFFile, FlintConfig]) -> None:
     """The slice's output rows (the residual after layer 5) of a prompt from position 0 against the numpy reference:
     per row within 3% (median) and 6% (95th percentile)."""
     g, cfg = flint
+    n = 2048
     x = _x(g, n)
     h, pos = x.copy(), np.arange(n)
     for L in LAYERS:
         h = ref.layer(g, cfg, L, h, pos, q8=False)["l_out"]
-    ov = FlintOverlay(g, layers=LAYERS, vocab=VOCAB, max_positions=4096)
+    ov = FlintOverlay(g, layers=LAYERS, vocab=VOCAB, max_positions=BIG_POSITIONS)
     ov.load()
-    pf = FlintPrefill(ov, sizes=BIG if n > 512 else SIZES).compile().bind()
+    pf = FlintPrefill(ov, sizes=BIG).compile().bind()
     p = 0
     rows = []
     for T in pf.plan(0, n, steps=False):
