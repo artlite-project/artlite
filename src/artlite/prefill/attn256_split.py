@@ -21,15 +21,23 @@ Streams per KV head h (columns 4 h .. 4 h + 3), each from one shim channel throu
   of a core's panels 2 i, 2 i + 1, interleaved the same way).
 
 Per group A: the scores of its six panels in three tiles of two per record pair (single Q panels against two K panels
-per d-block: 4 pops, 4 MMULs), the diagonal groups' masks, pass 1 into the A -> B object (P = 2^(round(s - m) + 64), f),
-the lazy maximum's raise (alpha into the object, flagged; pass 1 again). B: the rescale when flagged, pass 2 (P as bfp16
-panels), l += P E^T on the MMUL (E a panel of 1 / 8), o += P V over V0's then V1's object (three tiles of two panels).
-At a pass's end B writes each panel's o / l sigmoid(gate) (the gates read in place from the gate objects) as the attn_out
-GEMM's A panels, the column's two B cores joined in its memtile.
+per d-block: 4 pops, 4 MMULs), the diagonal groups' masks, pass 1 (P = 2^(round(s - m) + 64), f: panels 0 .. PA - 1
+into its own buffer, the others into the A -> B object), the lazy maximum's raise (alpha into the object, flagged; pass
+1 again), pass 2 of panels 0 .. PA - 1 (their bfp16 P panels into the object: the pair's balance). B: the rescale when
+flagged, pass 2 of the other panels, l += P E^T on the MMUL (E a panel of 1 / 8: the sum of the P that o takes), o +=
+P V over V0's object, then V1's (each released after its half: the other's refill overlaps; three tiles of two
+panels). The softmax's exp2 is kmath's quadratic (``prec`` "quad": P is rounded to bfp16 after it). At a pass's end B
+writes each panel's o / l sigmoid(gate) (the gates read in place from the gate objects) into its o's first bytes, then
+sends them as the attn_out GEMM's A panels, the column's two B cores joined in its memtile.
 
-L1 by 16 KB region (``l1_layout``), A: 0 the stack, K0's object, an A -> B object; 1 K1's, the other A -> B object, m, b;
-2 q; 3 the scores, o5. B: 0 the stack, V0's and V1's objects, the P panels, l, the output object; 1 o4; 2 o0, o2; 3 o1,
-o3. QK streams K (0, 1) against q (2); P V V (0) against two o in two regions.
+L1 by 16 KB region (``A_L1``, ``B_L1``), A: 0 the stack, K0's and K1's objects, m / b; 1 the A -> B objects (B reads
+them there: no conflicts with A's streams), pass 1's own output; 2 q; 3 the scores, o5. B: 0 the stack, V0's and V1's
+objects, the output object; 1 o4, l and the P panels; 2 o0, o2; 3 o1, o3. QK streams K (0) against q (2); P V V (0)
+against two o in two regions. P V's in-place loads and stores of a panel's o meet in 2 of its loop's 8 bundles (~50
+conflicts per region and group).
+
+Time (T = 1536 alone, at p0 = 64K / 123K): 31.79 / 58.38 ms (42.4 / 77.8 per 2048 tokens; ``PrefillAttnOperator``
+50.5 / 93.1); the floor with every kernel compiled out 22.7 at 64K. Per group A ~1600 cycles, B ~1680.
 """
 
 import numpy as np
@@ -296,8 +304,7 @@ class SplitAttnOperator(ArtcOperator):
 
 
 # A's L1 (byte addresses): region 0 the stack, K0's and K1's objects, m / b; 1 the A -> B objects (B reads them there),
-# pf;
-# 2 q; 3 the scores, o5 (B's panel 5, at B's north window)
+# pf; 2 q; 3 the scores, o5 (B's panel 5, at B's north window)
 A_L1 = {"k0": STACK, "k1": STACK + SLOT, "mb": STACK + 2 * SLOT, "ab0": REGION, "ab1": REGION + AB_BYTES,
         "pf": REGION + 2 * AB_BYTES, "wa": 2 * REGION, "o5": 3 * REGION + R * 1024}
 WA = {"q": 0, "sc": REGION, "size": REGION + R * 1024}
