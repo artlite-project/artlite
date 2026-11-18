@@ -15,7 +15,8 @@ runs several of them one body. They assume ``aie::rounding_mode::conv_even``.
 
 An ``Fn`` also carries its contract (``func``, ``params``), its domain and its error bound there (stated in its
 comment): tests/operators/test_kmath.py checks them on the NPU against the variant's numpy model
-(tests/operators/kmath_sim.py), bit-exact.
+(tests/operators/kmath_sim.py), bit-exact (rope: 99%, the rest within 2 ULP, the model's MACs after cancellations;
+the softmax passes through the attention operators' tests).
 
 The package: ``fn`` (``Fn``, the renderer of the templates, the contract checks), ``exponent`` (``exp2``: three forms),
 ``reciprocal``, ``composite`` (exp, expneg, expm1, softplus, sigmoid: fp32 or a bf16 gate, silu), ``acttable`` (the gather tables' host fit),
