@@ -507,7 +507,9 @@ __attribute__((minsize)) void {{ p }}_qsel(const bfloat16 *__restrict u, bfloat1
 
 // Scores of the chunk's K unit kk for each pair of row blocks, A = s + bias (the accumulators start at the rows' bias)
 // into sc, the chunk's maximum A per lane into vm{% if KP == 1 %}: the unit's two records (per d-block their panels, interleaved by the memtile); per pair one loop
-// over d-block pairs of two panel streams (Q: 4 panels, K: 4), four accumulators (2 row blocks x 2 records){% else %}: a record [hi panels | lo panels]; per pair a loop over d-block pairs for K hi, then one for K lo, two
+// over d-block pairs of two panel streams (Q: 4 panels, K: 4), four accumulators (2 row blocks x 2 records){% elif KILV %}: a record per d-block [hi | lo] (interleaved by the memtile);
+// per pair one loop over d-block pairs of two panel streams (Q: 4 panels, K: 4), four accumulators (2 row blocks x K hi,
+// lo: chains of two MMULs an iteration; the lo ones from 0, added at the end){% else %}: a record [hi panels | lo panels]; per pair a loop over d-block pairs for K hi, then one for K lo, two
 // accumulators (the row blocks){% endif %}
 
 {% if KP == 1 %}
@@ -569,6 +571,42 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
         uu += last;
         pr = last ? 0 : pr + 1;
     }
+{% elif KILV %}
+    float *__restrict sc = AW(float, {{ w.sc }}) + 128 * kk;
+    aie::vector<bfloat16, 64> vm = aie::load_v<64>(AW(bfloat16, {{ w.vm }}));
+    if (kk == 0)
+        vm = aie::broadcast<bfloat16, 64>(0.0f);
+    AIE_LOOP_NO_UNROLL
+    for (int pr = 0; pr < {{ RB // 2 }}; pr++) {
+        const uint8_t *__restrict qa = (const uint8_t *)q + {{ 2 * QUNIT }} * pr;
+        const aie::accum<accfloat, 64> b0(aie::load_v<64>(bias + 128 * pr)), b1(aie::load_v<64>(bias + 128 * pr + 64));
+        float *__restrict s = sc + {{ 128 * CR }} * pr;
+        al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)qa);
+        al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
+        const aie::accum<accfloat, 64> z(aie::zeros<float, 64>());
+        al::MM8 c0(b0), c0l(z), c1(b1), c1l(z);  // (row block 2 pr + e: K hi from its bias, K lo from 0)
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < {{ ND // 2 }}; j++) {  // (d-blocks 2 j, 2 j + 1)
+            const al::BV H = ks.pop(), L = ks.pop(), Hn = ks.pop(), Ln = ks.pop();
+{% for e in (0, 1) %}
+{% for part in range(QP) %}
+            {
+                const al::BV Q = qs.pop(), Qn = qs.pop();
+                c{{ e }}.mac(Q, aie::op_transpose(H));
+                c{{ e }}.mac(Qn, aie::op_transpose(Hn));
+{% if part == 0 %}
+                c{{ e }}l.mac(Q, aie::op_transpose(L));
+                c{{ e }}l.mac(Qn, aie::op_transpose(Ln));
+{% endif %}
+            }
+{% endfor %}
+{% endfor %}
+        }
+        const aie::accum<accfloat, 64> a0 = aie::add(c0.to_accum(), c0l.to_accum().template to_vector<float>());
+        const aie::accum<accfloat, 64> a1 = aie::add(c1.to_accum(), c1l.to_accum().template to_vector<float>());
+        vm = aie::max(vm, aie::max({{ p }}_vf(a0, (bfloat16 *)s), {{ p }}_vf(a1, (bfloat16 *)(s + 64))));
+    }
+    aie::store_v(AW(bfloat16, {{ w.vm }}), vm);
 {% else %}
     float *__restrict sc = AW(float, {{ w.sc }}) + 128 * kk;
     aie::vector<bfloat16, 64> vm = aie::load_v<64>(AW(bfloat16, {{ w.vm }}));

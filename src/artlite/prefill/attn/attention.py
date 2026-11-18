@@ -191,7 +191,14 @@ class AttnOperator(ArtcOperator):
                             KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
                             WIN=self.win, RG=s.rg, RING=self.ring, R=self.win + 1, GQ=s.rg // self.cr,
                             HBC=self.ring * s.rg // self.cr, SWA=self.swa > 0, WR=self.swa // 8,
-                            WG=self.wg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc, SINK=s.sink)
+                            WG=self.wg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc, SINK=s.sink, KILV=self.kilv)
+
+    @property
+    def kilv(self) -> bool:
+        """Whether the memtile streams each record's hi and lo K panels interleaved per d-block (hi + lo K, a group's K
+        objects without padding: ``qk``'s one loop over both)."""
+        s = self.shape
+        return s.kp == 2 and not self.ring and s.used == s.a_bytes
 
     @property
     def n_qs(self) -> int:
@@ -315,6 +322,9 @@ class AttnOperator(ArtcOperator):
         if self.ring:  # (a group's K records without the padding; the memory tiles' own buffers: ``ring.ring_memtiles``)
             ka_ty = np.ndarray[(s.used,), bf]
             walk = stream_walk(s.used, [(s.used // 576, 576), (576, 1)])
+        elif self.kilv:  # (the group's records, each [d-block][hi | lo])
+            n = (s.a_bytes + s.used) // 2
+            ka_ty, walk = np.ndarray[(n,), bf], stream_walk(n, [(n // (nd * 72), nd * 72), (nd, 36), (2, nd * 36), (36, 1)])
         elif s.kp == 2:
             ka_ty = np.ndarray[((s.a_bytes + s.used) // 2,), bf]
             walk = stream_walk((s.a_bytes + s.used) // 2, [(2, s.a_bytes // 2), (s.used // 1152, 576), (576, 1)],

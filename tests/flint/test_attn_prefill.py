@@ -4,7 +4,8 @@ RMS-normed with weights per dim, learned sinks (the SK argument), full layers wi
 cos 1, sin 0) and sliding-window layers of 513 positions (keys p - 512 .. p, the cache after a guard of 8 groups), on
 random projections of a chunk at p0 after a cache the host filled: the Q units and the K / V records against their fp64
 model (single panels: within their own bfp16 rounding), the output panels against the exact attention with sinks of
-the cores' own operands. Flint's planes (single K, Q and P: ``FlintPrefill``'s) and hi + lo ones."""
+the cores' own operands. Flint's planes (K hi + lo, single Q and P: ``FlintPrefill``'s; its K panels interleaved per d-block
+by the memtile, ``AttnOperator.kilv``), single K, and hi + lo throughout."""
 
 import numpy as np
 import pytest
@@ -27,8 +28,8 @@ LAYOUT = Layout(640, {"q": 0, "k": 512, "v": 576})  # (the qkv GEMMs' layout of 
 # (chunk, its position, sliding window (0: a full layer))
 CASES = [(256, 0, 0), (512, 128, 0), (256, 0, WIN), (512, 448, WIN), (1024, 640, WIN), (64, 0, 0), (64, 576, WIN),
          (2048, 0, WIN), (512, 1024, 0)]
-PLANES = [(1, 1, 1)] * len(CASES) + [(2, 2, 2)] * 3  # (K, Q, P planes: Flint's, then hi + lo on a few cases)
-CASES = [(*c, pl) for c, pl in zip(CASES + [CASES[1], CASES[3], CASES[7]], PLANES, strict=True)]
+PLANES = [(2, 1, 1)] * len(CASES) + [(1, 1, 1)] * 3 + [(2, 2, 2)] * 3  # (K, Q, P planes: Flint's, then others)
+CASES = [(*c, pl) for c, pl in zip(CASES + [CASES[1], CASES[3], CASES[7]] * 2, PLANES, strict=True)]
 
 
 def _q_values(units: np.ndarray, hd: int, qp: int) -> np.ndarray:
