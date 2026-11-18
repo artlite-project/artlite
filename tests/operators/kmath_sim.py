@@ -52,8 +52,16 @@ def mul(a: object, b: object) -> np.ndarray:
 
 
 def mac(acc: object, a: object, b: object) -> np.ndarray:
-    """acc + a b (a, b bf16)."""
-    return add(acc, np.asarray(a, np.float64) * np.asarray(b, np.float64))
+    """acc + a b (a, b bf16). A product larger than acc takes acc onto a grid 3 bits finer than its own (or the sum's,
+    if larger), rounded to nearest even, then the sum rounded (probed: 99.9% of single MACs with cancellation, the rest
+    1 ULP apart; a smaller product: ``add``, exact)."""
+    acc, p = np.broadcast_arrays(np.asarray(acc, np.float64), np.asarray(a, np.float64) * np.asarray(b, np.float64))
+    big = np.abs(p) > np.abs(acc)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        e = np.maximum(np.floor(np.log2(np.abs(p))), np.floor(np.log2(np.abs(p + acc))))
+        q = np.exp2(e - 26)
+        s = np.where(big & np.isfinite(p) & (p != 0), p + np.round(acc / q) * q, p + acc)
+    return np.where(big, _f32(_ftz(s)), add(acc, p))
 
 
 def split(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -169,6 +177,39 @@ def vtanh(a: np.ndarray) -> np.ndarray:
     return _VTANH[(np.asarray(a, np.float32).view(np.uint32) >> 16).astype(np.int64)]
 
 
+_INV: dict[str, np.ndarray] = {}  # (load_inv)
+
+
+def load_inv(op: str, results: np.ndarray) -> None:
+    """``aie::inv`` / ``aie::invsqrt`` (``op``: the scalar unit's functions, within 1 fp32 ULP of the rounded result,
+    ~88% exact) as read on the NPU: its results for every x in [1, 4) (``inv_arguments``), by x's bits. Each depends on
+    the mantissa alone (invsqrt: also on the exponent's parity), so the two binades give any normal x (probed: 2^18
+    random x over 2^-120 .. 2^120, every one)."""
+    _INV[op] = np.asarray(results, np.float32).view(np.uint32).reshape(2, 1 << 23)
+
+
+def inv_arguments() -> np.ndarray:
+    """Every fp32 in [1, 2), then in [2, 4): ``load_inv``'s arguments."""
+    m = np.arange(1 << 23, dtype=np.uint32)
+    return np.concatenate([m | 0x3F800000, m | 0x40000000]).view(np.float32)
+
+
+def inv(x: np.ndarray, op: str = "inv") -> np.ndarray:
+    """``aie::inv`` (or ``aie::invsqrt``) of normal fp32 x > 0: the loaded results (``load_inv``) at x's mantissa, the
+    exponent negated (halved)."""
+    if op not in _INV:
+        raise RuntimeError(f"kmath_sim.inv: no {op} results loaded (load_inv)")
+    b = np.asarray(x, np.float32).view(np.uint32).astype(np.int64)
+    e, m = ((b >> 23) & 0xFF) - 127, b & 0x7FFFFF
+    t = _INV[op]
+    if op == "inv":
+        r = t[0][m].astype(np.int64) - (e << 23)
+    else:
+        odd = e & 1
+        r = np.where(odd == 1, t[1][m], t[0][m]).astype(np.int64) - ((e - odd) // 2 << 23)
+    return (r & 0xFFFFFFFF).astype(np.uint32).view(np.float32)
+
+
 def log2e(x: np.ndarray) -> np.ndarray:
     """``al::log2e``: x log2(e) (bf16 hi + lo constant)."""
     return mul_hilo(x, 1.4453125, -0.00262451171875)
@@ -205,7 +246,23 @@ def _expm1(fn: kmath.Fn, g: np.ndarray) -> np.ndarray:
     return np.where(g > np.float32(-0.5), small, big)
 
 
+def _exp(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
+    """``kmath.exp``: exp_fn(x log2 e) (a bf16 x: its two products with log2 e's parts; neg: -x)."""
+    if fn.params["arg"] == "float":
+        return emulate(fn.params["exp_fn"], log2e(_f32(x)))
+    s = -1.0 if fn.params["neg"] else 1.0
+    x = bf16(x)
+    return emulate(fn.params["exp_fn"], mac(mul(x, s * 1.4453125), x, -s * 0.00262451171875))
+
+
+def _sigmoid_bf16(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
+    """``kmath.sigmoid(prec="bf16")``: 1 + e^-x (``kmath.exp``'s bf16 form), its aie::inv in bf16."""
+    return bf16(inv(add(_exp(kmath.exp(fn.lanes, arg="bfloat16", neg=True, exp_fn=fn.params["exp_fn"]), x), 1.0)))
+
+
 def _logistic(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
+    if fn.params.get("prec") == "bf16":
+        return _sigmoid_bf16(fn, x)
     x = _f32(x)
     t = emulate(fn.params["expneg"], x)
     rf = fn.params["recip_fn"]
@@ -256,6 +313,60 @@ def _silu_tanh(x: np.ndarray) -> np.ndarray:
     return np.where(np.abs(x) < 2.5, bf16(acc), y)
 
 
+def reduce_add(v: np.ndarray) -> np.ndarray:
+    """``aie::reduce_add`` of fp32 vectors (the last axis, 64 lanes or fewer: a power of two) on the accumulators'
+    adder: lanes j + j + L / 2 until one is left."""
+    v = _f32(v)
+    while v.shape[-1] > 1:
+        h = v.shape[-1] // 2
+        v = add(v[..., :h], v[..., h:])
+    return v[..., 0]
+
+
+def inv_rms(ss: np.ndarray, n: int, eps: float) -> np.ndarray:
+    """``al::inv_rms<n>``: 1 / sqrt(ss / n + eps), ss / n as bf16 products (1 / n a bf16 for n a power of two, else
+    al::mulff), the sum on the adder, aie::invsqrt."""
+    ms = mulc(_f32(ss), bf16(np.float32(1 / n))) if n & (n - 1) == 0 else mulff(_f32(ss), np.float32(1 / n))
+    return inv(add(ms, np.float32(eps)), "invsqrt")
+
+
+def rms_norm(fn: kmath.Fn, x: np.ndarray, w: np.ndarray | None) -> np.ndarray:
+    """``kmath.rms_norm``: rows x (bf16 values [rows, n]) -> fp32 x / rms(x) (times w)."""
+    n, eps = fn.params["n"], fn.params["eps"]
+    x = bf16(x)
+    sq = mul(x, x).reshape(-1, n // 64, 64)
+    ss = sq[:, 0]
+    for k in range(1, n // 64):
+        ss = add(ss, sq[:, k])  # (mac_square: per lane, in order)
+    iv = inv_rms(reduce_add(ss), n, eps)[:, None]
+    ih, il = split(iv)
+    y = mac(mul(x, ih), x, il)
+    return mulff(y, _f32(w)) if fn.params["weight"] else y
+
+
+def rot2(a: np.ndarray, b: np.ndarray, c: np.ndarray, s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``al::rot2``: a c - b s, a s + b c, each operand split once, a pair's six products in one accumulator (their
+    cancellations meet ``mac``'s unmodelled cases: ~0.5% of the results 1-2 ULP off)."""
+    (ah, al), (bh, bl), (ch, cl), (sh, sl) = split(a), split(b), split(c), split(s)
+
+    def msc(acc: np.ndarray, p: np.ndarray, q: np.ndarray) -> np.ndarray:
+        return mac(acc, -np.asarray(p, np.float64), q)
+
+    o0 = msc(msc(msc(mac(mac(mul(ah, ch), ah, cl), al, ch), bh, sh), bh, sl), bl, sh)
+    o1 = mac(mac(mac(mac(mac(mul(ah, sh), ah, sl), al, sh), bh, ch), bh, cl), bl, ch)
+    return o0, o1
+
+
+def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray, sn: np.ndarray | None) -> np.ndarray:
+    """``kmath.rope``: fp32 rows [rows, n] with their pairs (i, i + dist), i < rot, rotated by cos cs[i] and sin
+    (sn[i], or cs[rot + i]); a bf16 table's values as given (bf16)."""
+    rot, dist = fn.params["rot"], fn.params["dist"]
+    out = _f32(row).copy()
+    c, s = _f32(cs[:rot]), _f32(sn[:rot] if fn.params["sin"] == "ptr" else cs[rot:2 * rot])
+    out[:, :rot], out[:, dist:dist + rot] = rot2(out[:, :rot], out[:, dist:dist + rot], c, s)
+    return out
+
+
 def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     """``fn``'s results for the arguments x."""
     p = fn.params
@@ -270,6 +381,8 @@ def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
         return _exp2_acc(x, p["below"], p["above"], p["shift"], p["prec"])
     if fn.func == "recip":
         return _recip(x, p["domain"], p["steps"])
+    if fn.func == "exp":
+        return _exp(fn, x)
     if fn.func == "act":
         return _act(p["table"], x, p["f32"])
     if fn.func == "silu_tanh":
@@ -290,6 +403,7 @@ def exact(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
         "expm1": lambda: np.expm1(x),
         "softplus": lambda: np.logaddexp(0, x),
         "sigmoid": lambda: sig(x),
+        "exp": lambda: np.exp(-x if fn.params.get("neg") else x),
         "silu": lambda: x * sig(x),
     }
     if fn.func == "act":

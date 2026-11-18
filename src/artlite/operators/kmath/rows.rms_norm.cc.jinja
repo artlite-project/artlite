@@ -1,0 +1,23 @@
+// out = x / rms(x){{ " w" if weight }} of {{ n }} bf16 -> fp32 (kmath.rms_norm, eps {{ eps }}): 1 / rms by al::inv_rms, x times its bf16
+// parts (x is bf16: x / rms to 2^-16){{ ", times w (al::mulff)" if weight }}
+{{ attr }} void {{ name }}(const bfloat16 *__restrict x, {{ "const float *__restrict w, " if weight }}float *__restrict out)
+{
+    aie::accum<accfloat, 64> ss = aie::mac_square(aie::zeros<accfloat, 64>(), aie::load_v<64>(x));
+{% for i in range(64, n, 64) %}
+    ss = aie::mac_square(ss, aie::load_v<64>(x + {{ i }}));
+{% endfor %}
+    const float inv = al::inv_rms<{{ n }}>(aie::reduce_add(ss.template to_vector<float>()), {{ eps }}f);
+    aie::vector<bfloat16, {{ L }}> ih, il;
+    al::bf16_hilo<{{ L }}>(inv, ih, il);
+{% if pragma %}
+    {{ pragma }}
+{% endif %}
+    for (int i = 0; i < {{ n }}; i += {{ L }}) {
+        const aie::vector<bfloat16, {{ L }}> xb = aie::load_v<{{ L }}>(x + i);
+{% if weight %}
+        aie::store_v(out + i, al::mulff<{{ L }}>(aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>(), aie::load_v<{{ L }}>(w + i)));
+{% else %}
+        aie::store_v(out + i, aie::mac(aie::mul(xb, ih), xb, il).template to_vector<float>());
+{% endif %}
+    }
+}

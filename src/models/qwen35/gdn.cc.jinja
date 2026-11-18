@@ -28,7 +28,7 @@ __attribute__((noinline)) void {{ p }}_ggates(int32_t *__restrict ws)
         aie::store_v(gt, {{ gm.expm1 }}(al::mulff<16>(sp, aie::load_v<16>(prm + 16))));
         // sigmoid(beta) = e^(-softplus(-beta)) (one copy of the math less)
         const aie::vector<float, 16> sn = {{ gm.softplus }}(aie::sub(aie::zeros<float, 16>(), be));
-        aie::store_v(gt + 16, {{ gm.exp2 }}(al::log2e<16>(aie::sub(aie::zeros<float, 16>(), sn))));
+        aie::store_v(gt + 16, {{ gm.exp }}(aie::sub(aie::zeros<float, 16>(), sn)));
     }
 }
 

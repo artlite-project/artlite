@@ -828,8 +828,10 @@ __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
 }
 
 {% if GATE %}
-// A q object's gate logits (bf16: the heads of chain column c at g + 64 c, {{ GPER }} each) -> 1 + 2^(-g log2 e) per head at gt
-// (the softmax's exp2, bf16-level): l times it, o = y sigmoid(g) / l
+{% set eng = km.exp(64, arg="bfloat16", neg=True, exp_fn=exp2) %}
+{{ eng.src }}
+// A q object's gate logits (bf16: the heads of chain column c at g + 64 c, {{ GPER }} each) -> 1 / sigmoid(g) = 1 + e^-g
+// per head at gt (kmath.exp's bf16 form, through the softmax's exp2): l times it, o = y sigmoid(g) / l
 __attribute__((noinline, minsize)) void {{ p }}_gates(const bfloat16 *__restrict g, float *__restrict gt)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -837,9 +839,7 @@ __attribute__((noinline, minsize)) void {{ p }}_gates(const bfloat16 *__restrict
 {% for h in range(GPER * CHAIN) %}
     v[{{ h }}] = g[{{ 64 * (h // GPER) + h % GPER }}];
 {% endfor %}
-    const aie::vector<float, 64> a = aie::mac(aie::mul(v, aie::broadcast<bfloat16, 64>(-1.4453125f)), v,
-                                              aie::broadcast<bfloat16, 64>(0.00262451171875f)).template to_vector<float>();
-    aie::store_v(gt, aie::add({{ exp2 }}(a).template extract<4>(0), aie::broadcast<float, 4>(1.0f)));  // (16 B apart)
+    aie::store_v(gt, aie::add({{ eng }}(v).template extract<4>(0), aie::broadcast<float, 4>(1.0f)));  // (16 B apart)
 }
 
 {% endif %}

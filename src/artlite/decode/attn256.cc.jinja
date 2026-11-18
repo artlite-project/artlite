@@ -80,17 +80,6 @@ __attribute__((noinline)) void {{ p }}_qk(const uint8_t *__restrict k, const uin
 {% if not GATE_MAIN %}
 {% set sig = km.act(km.SIGMOID, table_arg=True) %}
 {{ sig.src }}
-{% else %}
-
-// 32 gates: sigmoid(g) = 1 / (1 + 2^(-g log2 e)) (bf16-level: the output is rounded to bf16; -g log2 e: al::log2e's
-// products of the bf16 g, negated)
-[[clang::always_inline]] inline void {{ p }}_gate(const bfloat16 *__restrict g, bfloat16 *__restrict out)
-{
-    const aie::vector<bfloat16, 32> gb = aie::load_v<32>(g);
-    const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
-                                                 aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
-    aie::store_v(out, aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>());
-}
 {% endif %}
 
 {% include "artlite/decode/attn256.pv4.cc.jinja" %}

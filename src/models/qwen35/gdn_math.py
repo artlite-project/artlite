@@ -14,7 +14,7 @@ PANEL = 4096  # bytes of a state panel (128 i x 8 j fp32)
 
 GDN = kernel_prefix("gdn")
 EXP2 = kmath.exp2(16, prec="fp32")
-MATH = {"exp2": EXP2, "expm1": kmath.expm1(16, exp_fn=EXP2), "softplus": kmath.softplus(16, exp_fn=EXP2),
+MATH = {"exp2": EXP2, "exp": kmath.exp(16, exp_fn=EXP2), "expm1": kmath.expm1(16, exp_fn=EXP2), "softplus": kmath.softplus(16, exp_fn=EXP2),
         "sigmoid": kmath.sigmoid(16, exp_fn=EXP2), "silu": kmath.silu(32)}
 
 

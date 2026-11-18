@@ -5,7 +5,7 @@
 {
     aie::vector<float, {{ N }}> xf = aie::accum<accfloat, {{ N }}>(x).template to_vector<float>();
     aie::vector<float, {{ N }}> nax = aie::min(xf, aie::sub(aie::zeros<float, {{ N }}>(), xf));
-    aie::vector<bfloat16, {{ N }}> tb = aie::accum<accfloat, {{ N }}>({{ exp2 }}(al::log2e<{{ N }}>(nax))).template to_vector<bfloat16>();
+    aie::vector<bfloat16, {{ N }}> tb = aie::accum<accfloat, {{ N }}>({{ exp }}(nax)).template to_vector<bfloat16>();
     aie::vector<float, {{ N }}> t = aie::accum<accfloat, {{ N }}>(tb).template to_vector<float>();
     aie::vector<float, {{ N }}> r = {{ recip }}(aie::add(t, aie::broadcast<float, {{ N }}>(1.0f)));
     aie::vector<float, {{ N }}> sg = aie::select(r, al::mulff<{{ N }}>(t, r), aie::lt(xf, aie::zeros<float, {{ N }}>()));

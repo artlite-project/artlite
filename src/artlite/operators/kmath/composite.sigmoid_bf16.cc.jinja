@@ -1,0 +1,6 @@
+// sigmoid(x) = 1 / (1 + e^-x) of {{ N }} bf16 lanes, rounded to bf16 (kmath.sigmoid, prec "bf16": {{ bound }} for x in
+// [-87, 100)): e^-x by {{ exp }}, the reciprocal aie::inv (within 1 fp32 ULP)
+{{ attr }} aie::vector<bfloat16, {{ N }}> {{ name }}(aie::vector<bfloat16, {{ N }}> x)
+{
+    return aie::accum<accfloat, {{ N }}>(aie::inv(aie::add({{ exp }}(x), aie::broadcast<float, {{ N }}>(1.0f)))).template to_vector<bfloat16>();
+}

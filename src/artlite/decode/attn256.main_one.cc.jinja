@@ -1,19 +1,15 @@
 
-{% set exp2 = km.exp2(32, below="zero", inline=True) %}
-{{ exp2.src }}
+{% set sig = km.sigmoid(32, prec="bf16", inline=True) %}
+{{ sig.src }}
 
 {% if not GATE_HEAD %}
-// A head's gates: sigmoid(g) = 1 / (1 + 2^(-g log2 e)) (bf16-level: the output is rounded to bf16; -g log2 e: al::log2e's
-// products of the bf16 g, negated)
+// A head's gates: sigmoid(g) (kmath's bf16 gate)
 __attribute__((noinline)) void {{ p }}_gates(const bfloat16 *__restrict g, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int j = 0; j < {{ HD // 32 }}; j++) {
-        const aie::vector<bfloat16, 32> gb = aie::load_v<32>(g);
-        const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
-                                                     aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
-        aie::store_v(out, aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>());
+        aie::store_v(out, {{ sig }}(aie::load_v<32>(g)));
         g += 32;
         out += 32;
     }
@@ -25,10 +21,7 @@ __attribute__((noinline)) void {{ p }}_gates(const bfloat16 *__restrict g, bfloa
 __attribute__((noinline)) void {{ p }}_gate1(bfloat16 g, bfloat16 *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::vector<bfloat16, 32> gb = aie::broadcast<bfloat16, 32>(g);
-    const aie::vector<float, 32> e = {{ exp2 }}(aie::mac(aie::mul(gb, aie::broadcast<bfloat16, 32>(-1.4453125f)), gb,
-                                                 aie::broadcast<bfloat16, 32>(0.00262451171875f)).template to_vector<float>());
-    const aie::vector<bfloat16, 32> v = aie::accum<accfloat, 32>(aie::inv(aie::add(e, aie::broadcast<float, 32>(1.0f)))).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 32> v = {{ sig }}(aie::broadcast<bfloat16, 32>(g));
     AIE_LOOP_NO_UNROLL
     for (int j = 0; j < {{ HD // 32 }}; j++)
         aie::store_v(out + 32 * j, v);

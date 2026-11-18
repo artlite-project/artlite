@@ -13,7 +13,7 @@ from artlite.operators import kmath
 from artlite.operators.kernel_source import KernelSource
 
 from . import kmath_sim
-from .elementwise import KmOperator, VtanhOperator
+from .elementwise import InvOperator, KmOperator, RowOperator, VtanhOperator
 
 CASES = {  # id: the function and its arguments
     "exp2": ("exp2", {"lanes": 32}),
@@ -35,6 +35,9 @@ CASES = {  # id: the function and its arguments
     "expm1": ("expm1", {"lanes": 16}),
     "softplus": ("softplus", {"lanes": 16}),
     "sigmoid": ("sigmoid", {"lanes": 16}),
+    "sigmoid-bf16": ("sigmoid", {"lanes": 32, "prec": "bf16"}),
+    "exp": ("exp", {"lanes": 16}),
+    "exp-bf16-neg": ("exp", {"lanes": 64, "arg": "bfloat16", "neg": True}),
     "silu": ("silu", {"lanes": 32}),
     "act-silu": ("act", {"table": "silu"}),
     "act-silu-f32": ("act", {"table": "silu", "f32": True}),
@@ -77,7 +80,10 @@ def _contracts() -> list[kmath.Fn]:
         fns += [kmath.exp2(lanes, bias=0, prec=p, inline=inline) for p in ("chord", "chord2")]
         fns += [kmath.recip(lanes, domain=d, steps=n, unroll=u, inline=inline)
                 for d, n, u in itertools.product(("unit", "normal"), (2, 3), (False, True))]
-        fns += [f(lanes, inline=inline) for f in (kmath.expneg, kmath.expm1, kmath.softplus, kmath.sigmoid)]
+        fns += [f(lanes, inline=inline) for f in (kmath.expneg, kmath.expm1, kmath.softplus, kmath.sigmoid, kmath.exp)]
+        fns += [kmath.exp(lanes, exp_fn=kmath.exp2(lanes, below="zero", inline=True), inline=inline)]
+        fns += [kmath.sigmoid(lanes, prec="bf16", exp_fn=e, inline=inline) for e in (None, kmath.exp2(lanes, below="zero"))]
+        fns += [kmath.exp(lanes, arg="bfloat16", neg=n, inline=inline) for n in (False, True)]
         fns += [kmath.sigmoid(lanes, recip_fn=kmath.recip(lanes), inline=inline),
                 kmath.silu(lanes, exp_fn=kmath.exp2(lanes, below="zero"), inline=inline),
                 kmath.expm1(lanes, exp_fn=kmath.exp2(lanes, inline=True), inline=inline)]
@@ -122,6 +128,13 @@ def test_kmath_shared_dependency() -> None:
 
 
 @pytest.fixture(scope="module")
+def inv_results() -> dict[str, np.ndarray]:
+    """aie::inv's and aie::invsqrt's results over [1, 4) as the NPU computes them: the model's (``kmath_sim.load_inv``)."""
+    x = kmath_sim.inv_arguments()
+    return {op: InvOperator(size=len(x), op=op).compile().run(x) for op in ("inv", "invsqrt")}
+
+
+@pytest.fixture(scope="module")
 def vtanh_table() -> np.ndarray:
     """vtanh of every bf16 (by its bits) as the NPU computes it: the model's (``kmath_sim.load_vtanh``)."""
     bits = np.arange(65536, dtype=np.int32).astype(np.uint16).view(bfloat16)
@@ -134,6 +147,9 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     if func == "silu_tanh":
         kmath_sim.load_vtanh(request.getfixturevalue("vtanh_table"))
     fn = getattr(kmath, func)(**{k: kmath.TABLES[v] if k == "table" else v for k, v in kwargs.items()})
+    if "aie::inv" in fn.src or "al::inv_rms" in fn.src:
+        for op, r in request.getfixturevalue("inv_results").items():
+            kmath_sim.load_inv(op, r)
     dom, edges = _arguments(fn)
     x = np.concatenate([dom, edges])
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
@@ -159,3 +175,71 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
         r = np.abs(o / ref - 1)
         print(f"\n{fn.name}: max rel. error {r.max():.3g}")
         assert r.max() <= fn.rel, f"max rel. error {r.max():.3g} at {dom[np.argmax(r)]}"
+
+
+ROWS = {  # id: a row function's arguments
+    "rms-256-w": ("rms_norm", {"n": 256, "eps": 1e-6, "weight": True}),
+    "rms-256-w-min1": ("rms_norm", {"n": 256, "eps": 1e-6, "weight": True, "loop": "min1"}),
+    "rms-128-w-l64": ("rms_norm", {"n": 128, "eps": 1e-5, "weight": True, "lanes": 64}),
+    "rms-512": ("rms_norm", {"n": 512, "eps": 1e-6}),
+    "rms-192": ("rms_norm", {"n": 192, "eps": 1e-6}),
+    "rope-32-sn": ("rope", {"rot": 32, "sin": "ptr"}),
+    "rope-64": ("rope", {"rot": 64}),
+    "rope-64-d128": ("rope", {"rot": 64, "dist": 128}),
+    "rope-128-bf16": ("rope", {"rot": 128, "table": "bf16"}),
+}
+
+
+@pytest.mark.parametrize("case", list(ROWS))
+def test_kmath_rows(case: str, request: pytest.FixtureRequest) -> None:
+    """A row function on 256 rows of random values (rows of scales 2^-20 .. 2^20): bit-exact against its model
+    (kmath_sim; rope: 99% of its results, the rest within 2 ULP: the model's MACs after a cancellation), and within its
+    bound of the exact result (rms_norm: 2^-15 relative per element; rope: 2^-15.8 of |a| + |b| per pair)."""
+    func, kwargs = ROWS[case]
+    fn = getattr(kmath, func)(**kwargs)
+    for op, r in request.getfixturevalue("inv_results").items():
+        kmath_sim.load_inv(op, r)
+    rng = np.random.default_rng(1)
+    n = kwargs.get("n", 256)
+    rows = 72 if n == 192 else 256  # (a tile of whole rows)
+    scale = np.exp2(rng.uniform(-20, 20, (rows, 1)))
+    x = (rng.standard_normal((rows, n)) * scale).astype(np.float32)
+    if func == "rms_norm":
+        x = kmath_sim.bf16(x)
+        w = rng.uniform(0.25, 4, n).astype(np.float32) if kwargs.get("weight") else None
+        out = RowOperator(size=rows * n, fn=fn, n=n, **({"w": w} if w is not None else {})).compile().run(
+            x.astype(bfloat16).ravel()).reshape(rows, n)
+        em = kmath_sim.rms_norm(fn, x, w)
+        x64 = x.astype(np.float64)
+        ref = x64 / np.sqrt(np.mean(x64 ** 2, axis=1, keepdims=True) + kwargs["eps"]) * (1 if w is None else w)
+        keep = ref != 0
+        err = np.abs(out[keep] - ref[keep]) / np.abs(ref[keep])
+        bound = 2.0 ** -15
+    else:
+        rot = kwargs["rot"]
+        th = rng.uniform(0, 2 * np.pi, rot)
+        cs, sn = np.cos(th).astype(np.float32), np.sin(th).astype(np.float32)
+        if kwargs.get("table") == "bf16":
+            cs, sn = kmath_sim.bf16(cs), kmath_sim.bf16(sn)
+        tables = {"cs": np.concatenate([cs, sn]).astype(bfloat16 if kwargs.get("table") == "bf16" else np.float32)}
+        if kwargs.get("sin") == "ptr":
+            tables = {"cs": cs, "sn": sn}
+        out = RowOperator(size=rows * n, fn=fn, n=n, **tables).compile().run(x.ravel()).reshape(rows, n)
+        em = kmath_sim.rope(fn, x, np.concatenate([cs, sn]), sn)
+        d = fn.params["dist"]
+        a, b = x[:, :rot].astype(np.float64), x[:, d:d + rot].astype(np.float64)
+        ref = x.astype(np.float64).copy()
+        ref[:, :rot], ref[:, d:d + rot] = a * cs - b * sn, a * sn + b * cs
+        mag = np.zeros_like(ref)
+        mag[:, :rot] = mag[:, d:d + rot] = np.abs(a) + np.abs(b)
+        keep = mag > 0
+        err = np.abs(out - ref)[keep] / mag[keep]
+        bound = 2.0 ** -15.8
+    same = out == em
+    if func == "rope":
+        ulps = np.abs(out.astype(np.float64) - em) / np.spacing(np.abs(em)).astype(np.float64)
+        assert same.mean() >= 0.99 and ulps.max() <= 2, f"{same.mean():.4f} as the model, max {ulps.max()} ULP apart"
+    else:
+        assert same.all(), f"{(~same).sum()} results differ from the model; at {np.argwhere(~same)[:4]}: {out[~same][:4]} vs {em[~same][:4]}"
+    print(f"\n{fn.name}: max error {err.max():.3g}")
+    assert err.max() <= bound, f"max error {err.max():.3g}"

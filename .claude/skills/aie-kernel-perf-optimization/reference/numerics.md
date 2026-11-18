@@ -23,7 +23,10 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
 - **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op. Not IEEE: the smaller operand
   is rounded (to nearest even) onto the larger's grid of 23 fractional bits before the add (AM027),
   so a cancellation keeps only that grid: x - round(x) loses x's last bit where round(x) is a power
-  of two above x. A MAC's sum (accumulator + exact bf16 product) is the same adder.
+  of two above x. A MAC's sum (accumulator + exact bf16 product) is the same adder while the product is the smaller;
+  a larger product takes the accumulator onto a grid ~3 bits finer (of the larger of the product's and the sum's
+  exponents), then rounds the sum: 99.9% of single MACs with cancellation (kmath_sim's ``mac``), the rest 1 ULP off,
+  so a chain with cancellations (``al::rot2``) matches the model ~99.5%, within 2 ULP.
 - **Denormals are flushed to zero**, judged by the exact result: a product, a MAC's sum (of the exact product, not
   flushed itself) before its rounding, a conversion. So x hi / lo splits lose the lo part where it falls below 2^-126
   (`km.sigmoid`'s error rises below x = -79).
@@ -35,7 +38,9 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
     the bits.
 - **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. `aie::inv` / `aie::invsqrt` of an fp32 vector is one
   scalar `inv` per lane (aie_api's elementary fallback): ~3 instructions a lane of program memory; invert only the lanes
-  that matter (4 rows of a set, not 16 lanes). **Scalar float math** is
+  that matter (4 rows of a set, not 16 lanes). Both are within 1 fp32 ULP of the rounded result, ~88% exact, a
+  function of the mantissa (invsqrt: and the exponent's parity): kmath_sim models them by the NPU's results over [1, 4)
+  (``load_inv``, read by test_kmath's fixture). **Scalar float math** is
   soft-float (`__mulsf3`, `__gtsf2`: calls, 0.9 KB of program memory). `checks.py` warns about
   both.
 - **The bfp16 8x8x8 MMUL** (`mac_8x8_8x8T`) is the only hardware matrix path; bf16 `aie::mmul`
@@ -166,7 +171,8 @@ and reciprocal).
 
 ### e^x of fp32 x in a pipelined loop
 
-``km.exp2``'s fp32 forms (``{{ e }}(al::log2e<32>(x))``) do not pipeline; ``al::log2e`` is ~2^-16 relative, so e^x this
+``km.exp``'s fp32 form (``km.exp2``'s of ``al::log2e<32>(x)``; of a bf16 x two products: ``km.exp(arg="bfloat16")``) does
+not pipeline; ``al::log2e`` is ~2^-16 relative, so e^x this
 way is off by ~1.6e-5 |x| (2^-9.5 at |x| = 87: ``km.expneg``) (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
 two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f by a quadratic in bf16 MACs (minimax
 on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238

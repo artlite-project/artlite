@@ -1,0 +1,16 @@
+{% if bf %}
+// e^{{ "-x" if neg else "x" }} of {{ N }} bf16 lanes in fp32 (kmath.exp: {{ bound }} for x in [{{ -88 if neg else -87 }}, {{ 87 if neg else 88 }})): {{ exp2 }}({{ "-x" if neg else "x" }} log2 e),
+// {{ "-x" if neg else "x" }} log2 e the two products of x and log2 e's bf16 parts{{ " (negated)" if neg }} in one accumulator (al::log2e's values)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<bfloat16, {{ N }}> x)
+{
+    return {{ exp2 }}(aie::mac(aie::mul(x, aie::broadcast<bfloat16, {{ N }}>({{ "-1.4453125f" if neg else "1.4453125f" }})), x,
+                             aie::broadcast<bfloat16, {{ N }}>({{ "0.00262451171875f" if neg else "-0.00262451171875f" }})).template to_vector<float>());
+}
+{% else %}
+// e^x of {{ N }} fp32 lanes (kmath.exp: {{ bound }} for x in [-87, 88), 2^-15.9 for |x| <= 1): {{ exp2 }}(x log2 e), x log2 e
+// through al::log2e (~2^-16 relative: e^x off by ~1.6e-5 |x|)
+{{ attr }} aie::vector<float, {{ N }}> {{ name }}(aie::vector<float, {{ N }}> x)
+{
+    return {{ exp2 }}(al::log2e<{{ N }}>(x));
+}
+{% endif %}

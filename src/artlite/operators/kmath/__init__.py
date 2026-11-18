@@ -18,20 +18,22 @@ comment): tests/operators/test_kmath.py checks them on the NPU against the varia
 (tests/operators/kmath_sim.py), bit-exact.
 
 The package: ``fn`` (``Fn``, the renderer of the templates, the contract checks), ``exponent`` (``exp2``: three forms),
-``reciprocal``, ``composite`` (expneg, expm1, softplus, sigmoid, silu), ``acttable`` (the gather tables' host fit),
-``gather`` (the tables' kernels: ``table_pass``, ``act``, ``silu_tanh``). Each function's C++ is a template file
+``reciprocal``, ``composite`` (exp, expneg, expm1, softplus, sigmoid: fp32 or a bf16 gate, silu), ``acttable`` (the gather tables' host fit),
+``gather`` (the tables' kernels: ``table_pass``, ``act``, ``silu_tanh``), ``rows`` (a head's row:
+``rms_norm``, ``rope``). Each function's C++ is a template file
 ``<module>.<part>.cc.jinja`` next to its module.
 """
 
 from .acttable import GELU, GELU_ERF, SIGMOID, SILU, TABLES, ActTable, bf16_values, silu64
-from .composite import ATANH_C, EXPM1_C, expm1, expneg, sigmoid, silu, softplus
+from .composite import ATANH_C, EXPM1_C, exp, expm1, expneg, sigmoid, silu, softplus
 from .exponent import ACC_C, ACC_Q, CHORD2_C, CHORD2_SCALE, CUBIC, LN2, TAYLOR, exp2
 from .fn import KM, LANES, Fn
 from .gather import act, silu_tanh, table_pass
 from .reciprocal import recip
+from .rows import rms_norm, rope
 
 __all__ = [
     "ACC_C", "ACC_Q", "ATANH_C", "CHORD2_C", "CHORD2_SCALE", "CUBIC", "EXPM1_C", "GELU", "GELU_ERF", "KM", "LANES", "LN2",
-    "SIGMOID", "SILU", "TABLES", "TAYLOR", "ActTable", "Fn", "act", "bf16_values", "exp2", "expm1", "expneg", "recip",
-    "sigmoid", "silu", "silu64", "silu_tanh", "softplus", "table_pass",
+    "SIGMOID", "SILU", "TABLES", "TAYLOR", "ActTable", "Fn", "act", "bf16_values", "exp", "exp2", "expm1", "expneg", "recip",
+    "rms_norm", "rope", "sigmoid", "silu", "silu64", "silu_tanh", "softplus", "table_pass",
 ]

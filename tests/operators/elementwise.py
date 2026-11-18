@@ -182,6 +182,79 @@ class VtanhOperator(StreamOperator):
         return _VTANH.render(name=self.kernel_name, ts=self.tile)
 
 
+_INV = JINJA_ENV.from_string(r"""
+extern "C"
+void {{ name }}(float *__restrict input, float *__restrict output)
+{
+    for (int j = 0; j < {{ ts }}; j += 16)
+        aie::store_v(output + j, aie::{{ op }}(aie::load_v<16>(input + j)));
+}
+""")
+
+
+_ROW = JINJA_ENV.from_string(r"""
+{{ fn.src }}
+{% for name, t in tables.items() %}
+alignas(64) static const {{ t.ctype }} {{ kname }}_{{ name }}[{{ t.vals | length }}] = { {{ t.vals | join(", ") }} };
+{% endfor %}
+
+extern "C"
+void {{ kname }}({{ "bfloat16" if fn.func == "rms_norm" else "float" }} *__restrict input, float *__restrict output)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int r = 0; r < {{ ts // n }}; r++) {
+{% if fn.func == "rms_norm" %}
+        {{ fn }}(input + {{ n }} * r, {{ (kname ~ "_w, ") if fn.params.weight }}output + {{ n }} * r);
+{% else %}
+        for (int i = 0; i < {{ n }}; i += 32)
+            aie::store_v(output + {{ n }} * r + i, aie::load_v<32>(input + {{ n }} * r + i));
+        {{ fn }}(output + {{ n }} * r, {{ kname }}_cs{{ (", " ~ kname ~ "_sn") if fn.params.sin == "ptr" }});
+{% endif %}
+    }
+}
+""")
+
+
+class RowOperator(StreamOperator):
+    """A kmath row function (``kmath.rms_norm``: bf16 rows -> fp32, ``kmath.rope``: fp32 rows rotated) on rows of
+    ``n`` values, its constant arguments (``w``, ``cs``, ``sn``: numpy arrays) in the kernel."""
+
+    def __init__(self, *, size: int, fn: kmath.Fn, n: int, **tables: np.ndarray):
+        self.fn, self.n, self.tables = fn, n, tables
+        dt = bfloat16 if fn.func == "rms_norm" else np.float32
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(dt,), dtypes_out=(np.float32,))
+        assert self.tile % n == 0, (self.tile, n)
+
+    @property
+    def kernel_name(self) -> str:
+        return "kmrow_" + self.fn.name.removeprefix(kmath.KM + "_")
+
+    def get_kernel_src(self) -> str:
+        def table(a: np.ndarray) -> dict[str, object]:
+            if a.dtype == bfloat16:
+                return {"ctype": "bfloat16", "vals": [f"bfloat16({float(v)!r}f)" for v in a]}
+            return {"ctype": "float", "vals": [f"{float(v)!r}f" for v in a.astype(np.float32)]}
+        return _ROW.render(fn=self.fn, kname=self.kernel_name, ts=self.tile, n=self.n,
+                           tables={k: table(v) for k, v in self.tables.items()})
+
+
+class InvOperator(StreamOperator):
+    """``aie::inv`` or ``aie::invsqrt`` (``op``) of an fp32 vector: the scalar unit's functions, read for
+    ``kmath_sim.load_inv``."""
+
+    def __init__(self, *, size: int, op: str):
+        assert op in ("inv", "invsqrt"), op
+        self.op = op
+        super().__init__(size=size, num_columns=1, tile_size=None, dtypes_in=(np.float32,), dtypes_out=(np.float32,))
+
+    @property
+    def kernel_name(self) -> str:
+        return f"{self.op}_f32_{self.tile}"
+
+    def get_kernel_src(self) -> str:
+        return _INV.render(name=self.kernel_name, ts=self.tile, op=self.op)
+
+
 class GeluOperator(StreamOperator):
     """GELU in its tanh form (``kmath.act(kmath.GELU)``) on a 1-D bf16 vector, up to 4 cores per column."""
 

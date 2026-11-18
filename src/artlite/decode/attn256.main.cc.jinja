@@ -1,4 +1,8 @@
 
+{# the gates: sigmoid(g) (kmath's bf16 gate, through the merge factors' exp2) #}
+{% set gate = km.sigmoid(32, prec="bf16", exp_fn=km.exp2(32, below="zero"), inline=True) %}
+{{ gate.src }}
+
 namespace {
 
 // An object of another core (the main core's begin): an F_ATT object of a column that emits o: its q objects' gates
@@ -37,7 +41,7 @@ __attribute__((minsize)) void {{ p }}_mgate(const bfloat16 *__restrict x, int32_
         bfloat16 *__restrict g = gt + {{ HD }} * (QR * s + h0 + h);
         AIE_LOOP_NO_UNROLL
         for (int i = 0; i < {{ HD }}; i += 32)
-            {{ p }}_gate(pay + {{ 2 * HD }} * h + {{ HD }} + i, g + i);
+            aie::store_v(g + i, {{ gate }}(aie::load_v<32>(pay + {{ 2 * HD }} * h + {{ HD }} + i)));
     }
 }
 
