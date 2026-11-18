@@ -1,6 +1,7 @@
 """The apps' full designs, built as the apps build them (no NPU): the decode overlays and prefill libraries of the
 models present (Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the
-app's default: the design runs the drafter's formats too; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its
+app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block and
+with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its
 DSpark drafter), the Stable Diffusion UNet program. They compile (program memory, stack and BD limits of the whole
 models, which the layer-slice tests do not reach; Flint's overlay of 49 layers and its prefill's chunks to 8192), a
 paged design's code pages link (each within the slot its core's resident code leaves: ``paging.link``, else only at
@@ -19,6 +20,7 @@ from artlite.model_config import (
     llama_gguf,
     occamy_gguf,
     qwen3_gguf,
+    qwen_dflash_of,
     qwen_gguf,
     qwen_mtp_of,
     sd15_dir,
@@ -66,6 +68,29 @@ def _qwen(path: str, mtp: bool = False) -> None:
                      gu=draft_gate_up(drafter) if drafter else frozenset())
     parallel_compile.compile_all([ov.op, QwenPrefill(ov, draft=QwenDraft(ov, drafter) if drafter else None).lib])
     ov.op.page_store()
+
+
+def _qwen_drafts(path: str, dflash: bool) -> None:
+    """A dense qwen35 file with an MTP block (Qwen3.8 27B: a design of 8 slots, the one-pass attention) as its app
+    builds it: its own block as the drafter, or (``dflash``) its DFlash2 drafter's file (``model_config.qwen_dflash_of``:
+    the app's default where there is one) on a design of its own beside the model's."""
+    from artlite.decode.dflash.overlay import DFlashOverlay
+    from artlite.model_config import QwenConfig
+    from models.qwen35.draft import QwenDraft
+    from models.qwen35.image import QwenImage
+    from models.qwen35.overlay import QwenOverlay
+    from models.qwen35.prefill import QwenPrefill
+
+    gguf = GGUFFile(path)
+    if not dflash:
+        ov = QwenOverlay(gguf, max_positions=4096, drafts=True)
+        parallel_compile.compile_all([ov.op, QwenPrefill(ov, draft=QwenDraft(ov)).lib])
+        return
+    if (file := qwen_dflash_of(path)) is None:
+        pytest.skip(f"no DFlash2 drafter of {path}")
+    ov = QwenOverlay(gguf, max_positions=4096, image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False), drafts=True)
+    drafter = DFlashOverlay(ov, GGUFFile(file))
+    parallel_compile.compile_all([ov.op, drafter.op, QwenPrefill(ov, draft=None, dflash=drafter).lib])
 
 
 def _lfm(path: str) -> None:
@@ -118,6 +143,8 @@ APPS: dict[str, tuple[str, Callable[[str], None]]] = {
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
+    "qwen-3.8-27B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda path: _qwen_drafts(path, dflash=False)),
+    "qwen-3.8-27B-Q4_K_M-dflash": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda path: _qwen_drafts(path, dflash=True)),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
     "qwen-35B-A3B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "35B-A3B"), lambda path: _qwen(path, mtp=True)),

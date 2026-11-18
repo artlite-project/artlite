@@ -251,7 +251,7 @@ __attribute__((noinline, minsize)) void {{ p }}_bqk(uint8_t *rec, int32_t *__res
 }
 
 // The new K into the open ones of a pair of records (r, r + 1) of a K object rec, the records to the merged ones' region
-__attribute__((noinline, minsize)) void {{ p }}_kopen(uint8_t *rec, int32_t *__restrict ws, int r)
+__attribute__((noinline)) void {{ p }}_kopen(uint8_t *rec, int32_t *__restrict ws, int r)
 {
     const int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int p = st[{{ A_P }}], S = st[{{ A_S }}], rp = p >> 3, rl = (p + S - 1) >> 3;
@@ -438,7 +438,7 @@ __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
 
 // The next q object (slot s): its heads' q (normed, rotated, x log2(e) / 16: the scale in q_norm) into the staging rows
 // (head h's octet h, row s)
-__attribute__((minsize)) void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws)
+void {{ p }}_aq(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int s = st[{{ A_QS }}];
