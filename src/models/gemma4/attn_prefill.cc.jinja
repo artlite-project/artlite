@@ -4,8 +4,8 @@
 // maxima), st [16] int32 (the group's first record relative to the core's queries, skip)
 #define AW(T, off) ((T *)((uint8_t *)ws + (off)))
 
-{# P = 2^(A - 192) (pexp clamps A at 129 itself: 2^-63) #}
-{% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, below="none", inline=True) %}
+{# P = 2^(A - 192), clamped in bf16 at ~2^-63.5 (an fp32 max is emulated: the loop would not schedule) #}
+{% set exp2, e192 = km.exp2(64, inline=True), km.exp2(32, bias=192, inline=True) %}
 {{ exp2.src }}
 {{ e192.src }}
 
@@ -23,18 +23,20 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
     aie::store_v(pm, mn);
 }
 
-// P = 2^(s - m) of the group's RG score panels, clamped at 2^-63 (A = max(s + 192 - m, 129)), in place (sl, ss: the
-// scores as distinct restrict parameters, each read before it is written); l += P
+// P = 2^(s - m) of the group's RG score panels (A = s + 192 - m, clamped at ~2^-63.5), in place (sl, ss: the scores as
+// distinct restrict parameters, each read before it is written); l += P. Two records a step, their exp2 chains
+// interleaved: 126 cycles a call at RG 2, 246 at 4 (a record a step: 172 / 308; RG 4 unrolled fully spills)
 __attribute__((noinline)) void {{ p }}_pexp(const float *__restrict sl, float *__restrict ss, const float *__restrict pm,
                                             float *__restrict pl)
 {
     const aie::vector<float, 32> b0 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm));
     const aie::vector<float, 32> b1 = aie::sub(aie::broadcast<float, 32>(192.0f), aie::load_v<32>(pm + 32));
-    const aie::vector<float, 32> lo = aie::broadcast<float, 32>(129.0f);
     aie::accum<accfloat, 32> l0(aie::load_v<32>(pl)), l1(aie::load_v<32>(pl + 32));
+    AIE_LOOP_UNROLL(2)
     for (int k = 0; k < {{ RG }}; k++) {
-        const aie::accum<accfloat, 32> p0 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl), b0), lo)));
-        const aie::accum<accfloat, 32> p1 = {{ e192 }}(aie::accum<accfloat, 32>(aie::max(aie::add(aie::load_v<32>(sl + 32), b1), lo)));
+        aie::accum<accfloat, 32> A0(aie::load_v<32>(sl)), A1(aie::load_v<32>(sl + 32));
+        const aie::accum<accfloat, 32> p0 = {{ e192 }}(aie::add(A0, b0));
+        const aie::accum<accfloat, 32> p1 = {{ e192 }}(aie::add(A1, b1));
         l0 = aie::add(l0, p0);
         l1 = aie::add(l1, p1);
         aie::store_v(ss, p0.template to_vector<float>());

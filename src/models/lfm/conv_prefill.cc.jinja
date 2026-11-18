@@ -34,7 +34,7 @@ void {{ p }}_cgrp(const bfloat16 *__restrict g, const bfloat16 *__restrict taps,
         AIE_LOOP_NO_UNROLL
         for (int v = 0; v < {{ CH // 64 }}; v++) {
             aie::accum<accfloat, 64> acc = aie::zeros<accfloat, 64>();
-            AIE_LOOP_NO_UNROLL
+            AIE_LOOP_UNROLL_FULL  // (the taps in one block: 4624 cycles a call against 5241 as a loop)
             for (int k = 0; k < {{ WIDTH }}; k++) {
                 const aie::vector<bfloat16, 64> r = aie::load_v<64>(win + {{ CH }} * (t + k) + 64 * v);
                 acc = aie::mac(acc, aie::load_v<64>(taps + {{ 2 * CH }} * k + 64 * v), r);

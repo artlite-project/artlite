@@ -107,10 +107,10 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "llguidance", specifier = ">=1.9.1" },
-    { name = "llvm-aie", specifier = "==22.0.0.2026111101+81af12b7" },
+    { name = "llvm-aie", specifier = "==22.0.0.2026111801+7083001b" },
     { name = "miniaudio", specifier = ">=1.71" },
     { name = "ml-dtypes", specifier = ">=0.4" },
-    { name = "mlir-aie", specifier = "==1.4.6.dev15+ge5a3fa1" },
+    { name = "mlir-aie", specifier = "==1.4.6.dev41+gdca0ca1" },
     { name = "numpy", specifier = ">=2" },
     { name = "pillow", specifier = ">=11.0" },
     { name = "pydantic", specifier = ">=2" },
@@ -645,11 +645,11 @@ wheels = [
 
 [[package]]
 name = "llvm-aie"
-version = "22.0.0.2026111101+81af12b7"
+version = "22.0.0.2026111801+7083001b"
 source = { registry = "https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly" }
 wheels = [
-    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111101+81af12b7-py3-none-win_amd64.whl" },
-    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111101+81af12b7-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
+    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111801+7083001b-py3-none-win_amd64.whl" },
+    { url = "https://github.com/Xilinx/llvm-aie/releases/download/nightly/llvm_aie-22.0.0.2026111801+7083001b-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
 ]
 
 [[package]]
@@ -798,20 +798,20 @@ wheels = [
 
 [[package]]
 name = "mlir-aie"
-version = "1.4.6.dev15+ge5a3fa1"
-source = { registry = "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4" }
+version = "1.4.6.dev41+gdca0ca1"
+source = { registry = "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-5" }
 dependencies = [
     { name = "cloudpickle" },
     { name = "ml-dtypes" },
     { name = "numpy" },
 ]
 wheels = [
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp312-cp312-manylinux_2_35_x86_64.whl" },
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp312-cp312-win_amd64.whl" },
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp313-cp313-manylinux_2_35_x86_64.whl" },
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp313-cp313-win_amd64.whl" },
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp314-cp314-manylinux_2_35_x86_64.whl" },
-    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-4/mlir_aie-1.4.6.dev15+ge5a3fa1-cp314-cp314-win_amd64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp312-cp312-manylinux_2_35_x86_64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp312-cp312-win_amd64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp313-cp313-manylinux_2_35_x86_64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp313-cp313-win_amd64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp314-cp314-manylinux_2_35_x86_64.whl" },
+    { url = "https://github.com/Xilinx/mlir-aie/releases/download/latest-wheels-5/mlir_aie-1.4.6.dev41+gdca0ca1-cp314-cp314-win_amd64.whl" },
 ]
 
 [[package]]

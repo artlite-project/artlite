@@ -3,14 +3,14 @@
 Tile registers (``TileMap``: ``CORE_TILE``, ``MEM_TILE``, ``SHIM_TILE``, ``tile_map(row)``): where a tile kind's locks,
 DMA BD file, DMA channels, program and data memory, core control and stream switch ports are, and the fields of a BD's
 lock word (``BdLocks``) that the program assembler reads. The shim's DMA BDs, queues and the words of a BD are
-``txn``'s. ``tests/test_npu_regs.py`` compares every constant here with aie-rt's header. Offsets are within a tile
-(``txn.tile_address`` adds its column and row).
+``txn``'s. ``tests/test_npu_regs.py`` compares every constant here with the mlir_aie wheel's header. Offsets are
+within a tile (``txn.tile_address`` adds its column and row).
 
 Performance counters:
 
-The map is aie-rt's ``xaie2pgbl_params.h``, not AM029's (Versal's layout: its core offsets differ, its memtile and
-shim have 6 counters). A counter module has up to 4 counters; a start / stop control register serves two of them, and
-the counters' value registers follow each other 4 bytes apart. Reading an address past a module's counters (no
+The map is aie-rt's (aie-codegen's) ``xaie2pgbl_params.h``, not AM029's (Versal's layout: its core offsets differ, its
+memtile and shim have 6 counters). A counter module has up to 4 counters; a start / stop control register serves two of
+them, and the counters' value registers follow each other 4 bytes apart. Reading an address past a module's counters (no
 register there, e.g. 0x91030) wedges the hardware context: ``CounterModule.address`` refuses such an index.
 
 - ``CORE``: a core tile's core module (4 counters), ``MEM``: its memory module (the 64 KB data memory with locks and

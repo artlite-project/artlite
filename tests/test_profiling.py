@@ -10,7 +10,6 @@ Trace mode: hardware event streaming to DDR + Chromium JSON conversion.
 
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -179,31 +178,6 @@ def test_counter_registers():
     assert npu_regs.window_counter_writes(stall=23, memory_events=[7, 9])[2:] == [(0x11000, 7 | 7 << 8 | 9 << 16 | 9 << 24)]
     with pytest.raises(ValueError, match="counters"):
         npu_regs.MEM.ctrl_writes([(1, 1)] * 3)
-
-
-AIE_RT_PARAMS = Path(__file__).resolve().parents[2] / "mlir-aie/third_party/aie-rt/driver/src/global/xaie2pgbl_params.h"
-
-
-@pytest.mark.skipif(not AIE_RT_PARAMS.exists(), reason="no mlir-aie checkout next to this one")
-def test_counter_registers_match_aie_rt():
-    """The register map is the NPU's (aie-rt's xaie2pgbl_params.h), not AM029's."""
-    from artlite import npu_regs
-
-    text = AIE_RT_PARAMS.read_text()
-
-    def define(name: str) -> int:
-        return int(re.search(rf"#define XAIE2PGBL_{name}\s+(0x[0-9A-Fa-f]+)", text).group(1), 16)
-
-    for module, prefix, ctrl in (
-        (npu_regs.CORE, "CORE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
-        (npu_regs.MEM, "MEMORY_MODULE_PERFORMANCE_", ("CONTROL0",)),
-        (npu_regs.MEMTILE, "MEM_TILE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
-        (npu_regs.SHIM, "PL_MODULE_PERFORMANCE_", ("CTRL0",)),
-    ):
-        assert list(module.ctrl) == [define(prefix + name) for name in ctrl]
-        assert [module.address(i) for i in range(module.max_counters)] == [
-            define(f"{prefix}COUNTER{i}") for i in range(module.max_counters)
-        ]
 
 
 def test_profile_config_from_env():

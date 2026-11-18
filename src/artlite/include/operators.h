@@ -47,7 +47,6 @@
 #define AIE_LOOP_OUTER_NO_SPLIT_PROLOGUE AIE_LOOP_HINT(aie-outer-loop-pipelining-split-prologue, 0)
 #define AIE_LOOP_OUTER_LEAN_STAGE0       AIE_LOOP_HINT(aie-outer-loop-pipelining-lean-stage0, 1)
 #define AIE_LOOP_OUTER_SPECULATIVE       AIE_LOOP_HINT(aie-outer-loop-pipelining-speculative, 1)
-#define AIE_LOOP_OUTER_HW_LOOP           AIE_LOOP_HINT(aie-outer-loop-hw-loop, 1)
 
 #define AIE_LOOP_RANGE(a, ...) \
     AIE_LOOP_MIN_ITERATION_COUNT(a) __VA_OPT__(AIE_LOOP_MAX_ITERATION_COUNT(__VA_ARGS__))

@@ -18,6 +18,7 @@ import platform
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -29,7 +30,7 @@ PYPROJECT = REPO / "pyproject.toml"
 # package name as written in pyproject -> (release page, wheel-filename version regex)
 SOURCES: dict[str, tuple[str, str]] = {
     "mlir_aie": (
-        "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-4",
+        "https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-5",
         r"mlir_aie-(\d+\.\d+\.\d+\.dev\d+\+g[0-9a-f]+)-",
     ),
     "llvm_aie": (
@@ -73,6 +74,20 @@ def latest_version(url: str, regex: str) -> str:
     return max(found, key=lambda v: Version(v.split("+")[0]))
 
 
+def newer_release(url: str) -> str | None:
+    """The next numbered release page after ``url`` (``latest-wheels-5`` -> ``-6``) when it exists: mlir-aie moves its
+    rolling wheels to a new tag now and then, and the old page then stops getting builds."""
+    m = re.fullmatch(r"(.*-)(\d+)", url)
+    if not m:
+        return None
+    nxt = f"{m.group(1)}{int(m.group(2)) + 1}"
+    try:
+        with urllib.request.urlopen(nxt, timeout=60) as resp:
+            return nxt if ".whl" in resp.read().decode() else None
+    except urllib.error.HTTPError:
+        return None
+
+
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
     print(f"$ {' '.join(cmd)}", flush=True)
     subprocess.run(cmd, cwd=REPO, env=env, check=True)
@@ -101,6 +116,10 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="report available updates, change nothing")
     ap.add_argument("--no-sync", action="store_true", help="update pins and uv.lock, skip uv sync/verify")
     args = ap.parse_args()
+
+    for n, (url, _) in SOURCES.items():
+        if nxt := newer_release(url):
+            sys.exit(f"error: {n} publishes wheels on {nxt}: point SOURCES here and [tool.uv] find-links there")
 
     text = PYPROJECT.read_text()
     pins = {n: current_pin(text, n) for n in SOURCES}

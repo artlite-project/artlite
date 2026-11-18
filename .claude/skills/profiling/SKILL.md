@@ -73,7 +73,7 @@ Limitations (validated on hardware):
 
 Manual conversion: `python -m artlite.profiling dump.ttbin <rtc_dir>/design.mlir.prj/input_with_addresses.mlir`
 
-Counter limits (aie-rt's AIE2P map, mlir-aie's `third_party/aie-rt/driver/src/global/xaie2pgbl_params.h`: memtiles
+Counter limits (aie-codegen's AIE2P map, mlir-aie's `third_party/aie-codegen/aie-regdb/globalparams/xaie2pgbl_params.h`: memtiles
 have 4 counters, shims 2; AM029's 6 are Versal's):
 - **Reading an address that is no register hangs the KMD context permanently** (ETIME, then ENODEV; the NPU needs a
   driver reload or a reboot): memtile counters ≥ 0x91030 did, and core 0x38004 (AM029's Core_Status; AIE2P's is
@@ -140,7 +140,7 @@ JSON come from `aie.utils.trace.events.CoreEvent` names for known ids.
 
 ## Interpreting the output
 
-### Counter semantics (AIE2P, from aie-rt xaie_perfcnt + measurements)
+### Counter semantics (AIE2P, from aie-codegen's xaie_perfcnt + measurements)
 
 - `start != stop`: the counter accumulates **cycles between the start and stop events** (e.g. 33:34 = cycles inside
   event0()→event1() markers, accumulated over all windows in the dispatch).

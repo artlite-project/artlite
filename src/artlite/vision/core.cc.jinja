@@ -671,12 +671,12 @@ static __attribute__((noinline, minsize)) void {{ p }}_apply_gn({{ p }}_st &s, i
 {{ exp2.parts.reduce.src }}
 {{ exp2.parts.poly.src }}
 
-// P = 2^(S - m) of a query pair's NKP key panels ([q panel: QS floats apart][key panel NKP (64 floats apart)][64], A = S
-// + mb, mb [q panel][8 q][8]) in two passes, ``{{ exp2 }}``'s two steps (in one loop its long chain pipelines at II 23
-// per 32 lanes, these at 8 + 10; each over all key panels: their ramps are about 16 iterations' work). Pass 1, 32 lanes
-// a step: P = 2^(round(A - 192) + 64), f = the rest (bf16) as [P 32 | f 32] in place of the step's S (sl, ss: S as
-// distinct restrict parameters, each read before it is written); whether a bf16(A) reached 255 (P saturates from A =
-// 255.5)
+// P = 2^(S - m) of a query pair's NKP key panels ([q panel: QS floats apart][key panel NKP (64 floats apart)][64], A =
+// S + mb, mb [q panel][8 q][8]) in two passes, ``{{ exp2 }}``'s two steps (in one loop its long chain pipelines at II
+// 23 per 32 lanes, these at 8 per 32 and 14 per 64; each over all key panels: their ramps are about 16 iterations'
+// work). Pass 1, 32 lanes a step: P = 2^(round(A - 192) + 64), f = the rest (bf16) as [P 32 | f 32] in place of the
+// step's S (sl, ss: S as distinct restrict parameters, each read before it is written); whether a bf16(A) reached 255
+// (P saturates from A = 255.5)
 template <int QS, int NKP>
 static __attribute__((noinline)) int {{ p }}_pexp1(const float *__restrict sl, float *__restrict ss, const float *__restrict mb) {
   int cl = 0, cs = 0;
@@ -695,19 +695,19 @@ static __attribute__((noinline)) int {{ p }}_pexp1(const float *__restrict sl, f
   return !aie::lt(mx, aie::broadcast<bfloat16, 32>(255.0f)).full();
 }
 
-// pass 2: the exp2's second step of pass 1's [P 32 | f 32] halves, a half a step, P as fp32 in place ([q panel: QS
-// floats apart][key panel NKP][64]: ``{{ p }}_attn_sm`` makes the panels; two 32-lane results joined into one 64-lane
-// accumulator in registers lose lanes 32-63: Peano moves the first into the upper half before the second's MAC, which
-// writes the whole accumulator, lands)
+// pass 2: the exp2's second step of pass 1's [P 32 | f 32] halves, a key panel's 64 lanes a step, pushed as bfp16
+// panels in the P V^T MAC's A order ([key panel][q panel])
 template <int QS, int NKP>
-static __attribute__((noinline)) void {{ p }}_pexp2(const bfloat16 *__restrict pf, float *__restrict ps) {
-  int cl = 0, cs = 0;
-  AIE_LOOP_MIN_ITERATION_COUNT(4 * NKP)
+static __attribute__((noinline)) void {{ p }}_pexp2(const bfloat16 *__restrict pf, bfp16ebs8 *__restrict pp) {
+  al::BOut<> po(pp);
+  int c = 0;
+  AIE_LOOP_MIN_ITERATION_COUNT(2 * NKP)
   AIE_PREPARE_FOR_POSTPIPELINING
-  for (int t = 0; t < 4 * NKP; t++) {
-    aie::store_v(ps, {{ exp2.parts.poly }}(aie::load_v<32>(pf), aie::load_v<32>(pf + 32)).template to_vector<float>());
-    pf = add_2d_ptr(pf, 2 * QS - 128 * NKP + 64, 2 * NKP - 1, cl, 64);
-    ps = add_2d_ptr(ps, QS - 64 * NKP + 32, 2 * NKP - 1, cs, 32);
+  for (int t = 0; t < 2 * NKP; t++) {
+    po.push(aie::concat({{ exp2.parts.poly }}(aie::load_v<32>(pf), aie::load_v<32>(pf + 32)),
+                        {{ exp2.parts.poly }}(aie::load_v<32>(pf + 64), aie::load_v<32>(pf + 96)))
+                .template to_vector<bfp16ebs8>());
+    pf = add_2d_ptr(pf, 128 - 2 * QS, 1, c, 2 * QS);
   }
 }
 
@@ -788,24 +788,17 @@ static __attribute__((noinline)) int {{ p }}_attn_sm(float *__restrict sm, float
 {% if win == "aexp2" %}
   event0();
 {% endif %}
-  {{ p }}_pexp2<QS, NKP>((const bfloat16 *)sm, sm);
+  {{ p }}_pexp2<QS, NKP>((const bfloat16 *)sm, pp);
 {% if win == "aexp2" %}
   event1();
 {% endif %}
   const al::BV ones = aie::accum<accfloat, 64>(aie::broadcast<bfloat16, 64>(1.0f)).template to_vector<bfp16ebs8>();
   al::MM8 a0(aie::accum<accfloat, 64>(aie::load_v<64>(l))), a1(aie::accum<accfloat, 64>(aie::load_v<64>(l + 64)));
-  al::BOut<> po(pp);
-  const float *s0 = sm, *s1 = sm + QS;
+  al::BInR<aie_dm_resource::a> ps(pp);
   AIE_LOOP_MIN_ITERATION_COUNT(4)
   for (int kp = 0; kp < nkp; kp++) {
-    const al::BV p0 = aie::accum<accfloat, 64>(aie::load_v<64>(s0)).template to_vector<bfp16ebs8>();
-    const al::BV p1 = aie::accum<accfloat, 64>(aie::load_v<64>(s1)).template to_vector<bfp16ebs8>();
-    po.push(p0);
-    po.push(p1);
-    a0.mac(p0, aie::op_transpose(ones));
-    a1.mac(p1, aie::op_transpose(ones));
-    s0 += 64;
-    s1 += 64;
+    a0.mac(ps.pop(), aie::op_transpose(ones));
+    a1.mac(ps.pop(), aie::op_transpose(ones));
   }
   aie::store_v(l, a0.template to_vector<float>());
   aie::store_v(l + 64, a1.template to_vector<float>());

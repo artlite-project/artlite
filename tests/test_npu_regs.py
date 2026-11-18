@@ -1,5 +1,5 @@
-"""The tile registers of ``artlite.npu_regs`` against aie-rt's ``xaie2pgbl_params.h`` (the NPU's register map:
-shipped in the mlir_aie wheel), and the BD lock fields' decoder."""
+"""The tile registers of ``artlite.npu_regs`` against ``xaie2pgbl_params.h`` (the NPU's register map: aie-rt's, in
+aie-codegen ``aie-regdb``'s; shipped in the mlir_aie wheel), and the BD lock fields' decoder."""
 
 import glob
 import os
@@ -8,7 +8,7 @@ from importlib.util import find_spec
 
 import pytest
 
-from artlite import npu_regs, txn
+from artlite import npu_regs, portable, txn
 from artlite.npu_regs import CORE_TILE, MEM_TILE, SHIM_TILE, BdLocks
 
 _SUFFIXES = ("_MASK", "_DEFVAL", "_LSB", "_WIDTH")
@@ -22,7 +22,7 @@ class Header:
         self.defs: dict[str, int] = {}
         with open(path) as f:
             for line in f:
-                m = re.match(r"#define XAIE2PGBL_(\w+)\s+(0x[0-9A-Fa-f]+|\d+)\b", line)
+                m = re.match(r"\s*#define XAIE2PGBL_(\w+)\s+(0x[0-9A-Fa-f]+|\d+)\b", line)
                 if m:
                     self.defs[m[1]] = int(m[2], 0)
 
@@ -47,11 +47,13 @@ class Header:
 @pytest.fixture(scope="module")
 def h() -> Header:
     wheel = find_spec("mlir_aie").submodule_search_locations[0]
-    found = glob.glob(os.path.join(wheel, "runtime_lib", "*", "xaiengine", "include", "xaiengine",
-                                   "xaie2pgbl_params.h"))
-    if not found:
-        pytest.skip("the mlir_aie wheel ships no xaie2pgbl_params.h")
-    return Header(found[0])
+    # (aie-rt's include/xaiengine/, aie-codegen's include/aie_codegen_inc/)
+    found = glob.glob(os.path.join(wheel, "runtime_lib", "*", "xaiengine", "include", "*", "xaie2pgbl_params.h"))
+    if not found:  # (a moved header fails here: a skip would hide it)
+        (pytest.skip if portable.WINDOWS else pytest.fail)("the mlir_aie wheel ships no xaie2pgbl_params.h")
+    h = Header(found[0])
+    assert h.has("CORE_MODULE_CORE_CONTROL"), found[0]
+    return h
 
 
 def _dma(h: Header, module: str, tile: npu_regs.TileMap, channels: tuple[int, int]) -> None:
@@ -148,6 +150,20 @@ def test_txn_registers(h: Header) -> None:
     assert txn.CORE_LOCK0 == CORE_TILE.locks[0]
     assert h.reg("MEM_TILE_MODULE_DMA_S2MM_0_CTRL") == txn.MEM_S2MM_CTRL
     assert h.reg("MEM_TILE_MODULE_DMA_MM2S_0_CTRL") == txn.MEM_MM2S_CTRL
+
+
+def test_counter_registers(h: Header) -> None:
+    """The performance counters' control and counter registers of each module (the map is the NPU's, not AM029's)."""
+    for module, prefix, ctrl in (
+        (npu_regs.CORE, "CORE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
+        (npu_regs.MEM, "MEMORY_MODULE_PERFORMANCE_", ("CONTROL0",)),
+        (npu_regs.MEMTILE, "MEM_TILE_MODULE_PERFORMANCE_", ("CONTROL0", "CONTROL1")),
+        (npu_regs.SHIM, "PL_MODULE_PERFORMANCE_", ("CTRL0",)),
+    ):
+        assert list(module.ctrl) == [h.reg(prefix + name) for name in ctrl]
+        assert [module.address(i) for i in range(module.max_counters)] == [
+            h.reg(f"{prefix}COUNTER{i}") for i in range(module.max_counters)
+        ]
 
 
 def test_bd_locks() -> None:

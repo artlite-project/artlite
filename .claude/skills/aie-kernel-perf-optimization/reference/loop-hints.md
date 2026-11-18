@@ -38,7 +38,7 @@ Enum options take integers (use the macros).
 | `AIE_LOOP_IGNORE_MEM_DEPS` | `aie-safe-to-ignore-memory-deps` | scheduler ignores ALL memory dependences in this loop, including the compiler's own spill/reload pairs: only for spill-free loops whose dependences you know are false (a spilling k=32 MAC loop miscompiled); prefer distinct `__restrict` helper parameters |
 | `AIE_LOOP_OLP_WAR_RENAME` | `aie-olp-war-rename` | WAR renaming in epilogues of outer-loop-pipelined loops |
 | `AIE_LOOP_OUTER_PIPELINING` / `_NO_OUTER_PIPELINING` | `aie-enable-outer-loop-pipelining` | IR outer-loop pipeliner (put on the OUTER loop) |
-| `AIE_LOOP_OUTER_MIN_TRIP_COUNT(N)`, `_NO_SPLIT_PROLOGUE`, `_LEAN_STAGE0`, `_SPECULATIVE`, `_HW_LOOP` | `aie-outer-loop-pipelining-*`, `aie-outer-loop-hw-loop` | outer-loop pipeliner tuning |
+| `AIE_LOOP_OUTER_MIN_TRIP_COUNT(N)`, `_NO_SPLIT_PROLOGUE`, `_LEAN_STAGE0`, `_SPECULATIVE` | `aie-outer-loop-pipelining-*` | outer-loop pipeliner tuning |
 
 The outer-loop pipeliner takes a counted outer loop of three or more trips around one pipelined inner loop (a
 2-trip loop is lowered to a flag loop: "Cannot adjust loop bound" under `-mllvm -debug-only=aie-outer-loop-pipeliner`

@@ -309,9 +309,9 @@ ablation (qk / soft / pv compiled out) and a variant_search table:
   - **both K units of a chunk in one call**, the (pair, unit) loop outer-loop-pipelined (loop-hints.md): 532 -> 494.
 - **The vision overlay's encoder attention** (role a: 16 heads of d 80, dense joint keys; Qwen3-VL, LFM3-VL, d3,
   MiniCPM-V), bit-identical: per core, unit (image, head) and 64-key group 4123 -> 3436 cycles, an op of 4096 keys
-  1166 -> 972 us. The exp2 in two passes over all of a pair's key panels (reduce II 8, poly II 10 per 32 lanes, P stored
-  as fp32 for the panel loop: rewritten as one 64-lane accumulator it miscompiled, aie2p-coding section 9; one loop II
-  23; per 4 key panels the passes' ramps ate the gain), QK with constant trip counts and its block loop
+  1166 -> 972 us. The exp2 in two passes over all of a pair's key panels (reduce II 8 per 32 lanes; poly II 14 per 64,
+  its two 32-lane halves joined in registers into the bfp16 P panels: 34 cycles a key panel against 48 with P stored as
+  fp32 for a panel loop; one loop II 23; per 4 key panels the passes' ramps ate the gain), QK with constant trip counts and its block loop
   outer-loop-pipelined (520 -> 252 cycles a pair; the d-blocks unrolled spill), P V of both pairs in one MAC call
   alternating block by block between their O in two regions (region 0's conflicts 33 -> 1 us an op).
 
