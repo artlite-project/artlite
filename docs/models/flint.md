@@ -71,6 +71,8 @@ while they beat steps of one token. Short chat prompts, 400 tokens greedy, again
 | generation (greedy, 256 tokens, essay summary) | 31.4 tokens/s | | 19.3 tokens/s | |
 | the same with the DFlash2 drafter (steps of up to 4 tokens) | 36.5 tokens/s | | 21.6 tokens/s | |
 
+A 128K prompt: 197 s to the first token (the full layers' attention is most of it past 64K).
+
 Accuracy against llama.cpp's CPU runs of the same file:
 
 | | |
