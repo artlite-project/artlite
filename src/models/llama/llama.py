@@ -16,6 +16,11 @@ of up to 4 tokens.
 The KV caches hold K as one bfp16 block per 8 dims (``kv_k="single"``, the default: 18 / 64.5 / 73.7 KB per position
 for 1B / 3B / 8B) or as hi + lo blocks ("hilo": +50% of the caches' bytes, and of their read time at long contexts).
 
+Several sequences (``NpuLlama(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for
+each (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's slots dealt to them
+(``models.lanes``: one stream of the weights for all of them; 4 lanes give 3.1x a lane's tokens per second on the 1B
+at 1K positions, 3.6x on the 8B, and less at depth, where each sequence reads its own cache).
+
 Memory: the weights the NPU streams are re-laid-out into a device buffer at load (packed by the C++ packer in a thread
 while the tokenizer and the designs load), at their quantization's size; nothing is written to disk.
 """
@@ -27,6 +32,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
+from ..lanes import alone
 from ..model import Model
 from ..overlay_model import OverlayModel
 from ..sampling import Sampling
@@ -41,13 +47,17 @@ class NpuLlama(OverlayModel):
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``
     (default ``prefill.SIZES``); ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``); ``readout``:
     a readout model (``models.readouts.readout_model``): the prefill's precise variants and packed chunks
-    (``LlamaPrefill``'s ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head)."""
+    (``LlamaPrefill``'s ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head);
+    ``sequences``: the sequences the device holds, each with KV caches of ``capacity`` positions (``lanes``: the
+    model of each; their generations share decode steps)."""
+
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf")
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
-                 readout: bool = False):
+                 readout: bool = False, sequences: int = 1):
         self.gguf = gguf
-        self.overlay = LlamaOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
+        self.overlay = LlamaOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, sequences=sequences)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.generates = not readout
@@ -56,6 +66,7 @@ class NpuLlama(OverlayModel):
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
+        self._open_lanes()
 
     @property
     def capacity(self) -> int:
@@ -63,9 +74,12 @@ class NpuLlama(OverlayModel):
 
     def describe(self) -> str:
         ov = self.overlay
-        return (f"{ov.image.streamed_bytes() / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
+        kv = f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache"
+        return (f"{ov.image.streamed_bytes() / 1e9:.2f} GB of weights, "
+                f"{kv if ov.sequences == 1 else f'{ov.sequences} sequences of {kv} each'} "
                 f"({self.capacity} positions, K {'hi + lo' if ov.kp == 2 else 'single'})")
 
+    @alone
     def reset(self) -> None:
         """Forget the cached positions."""
         self.overlay.reset()
@@ -113,5 +127,7 @@ class Llama(Model):
     def sampling(self, *, think: bool = False) -> Sampling:
         return Sampling(temp=0.7, top_k=50)
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
-        return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights)
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuLlama:
+        """(``sequences``: ``NpuLlama``'s)"""
+        return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
+                        sequences=sequences)

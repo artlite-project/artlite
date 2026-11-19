@@ -1,13 +1,14 @@
 """How the next token is chosen: ``Sampling`` (temperature, top-k, top-p, min-p, penalties), llama.cpp's penalties
 sampler over a generation (``Penalties``), a constraint on the tokens (``Mask``), and the native top-k of a
-vocabulary's logits (``top_logits``, ``argmax``, ``max_prob``). The draws come from one generator (``seed``)."""
+vocabulary's logits (``top_logits``, ``argmax``, ``max_prob``). The draws come from a ``Sampling``'s own generator
+(``rng``: a job's, where several generate at once), else from the process's (``seed``)."""
 
 import collections
 import copy
 import math
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -20,11 +21,11 @@ from .sequence import MEDIA, token_ids
 
 # a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32, or a screened head's row (``taken``)
 LogitsLike = np.ndarray | ScreenedRow
-_rng = random.Random()  # (sampling's draws: ``seed``)
+_rng = random.Random()  # (the draws of a ``Sampling`` without a generator of its own: ``seed``)
 
 
 def seed(n: int | None = None) -> None:
-    """Seed sampling's draws (None: from the operating system's randomness)."""
+    """Seed the process's draws (None: from the operating system's randomness)."""
     _rng.seed(n)
 
 
@@ -48,6 +49,9 @@ class Sampling:
     presence_penalty: float = 0.0  # subtracted from a recent token's logit
     frequency_penalty: float = 0.0  # subtracted from a recent token's logit per occurrence
     banned: tuple[int, ...] = ()  # tokens never chosen (their logits -inf: LFM3-Audio's text-only output)
+    # the generator of its draws (None: the process's, ``seed``): one per job, so that a job's draws are its seed's
+    # whatever generates beside it
+    rng: random.Random | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not 0 < self.repeat_penalty < math.inf:
@@ -68,10 +72,11 @@ class Sampling:
 
     def pick(self, values: np.ndarray, ids: np.ndarray) -> int:
         """The next token from the ``k`` largest logits (values descending, fp32) and their token ids
-        (``_native.pick``; the draw: ``seed``)."""
+        (``_native.pick``; the draw: ``rng``'s, else the process's)."""
         if self.k == 1:
             return int(ids[0])
-        return int(ids[_native.pick(values, self.temp, self.top_p, self.min_p, _rng.random())])
+        draw = (_rng if self.rng is None else self.rng).random()
+        return int(ids[_native.pick(values, self.temp, self.top_p, self.min_p, draw)])
 
     def probs(self, values: np.ndarray) -> np.ndarray:
         """The probabilities ``pick`` draws from (of its candidates, in their order; 0: filtered out)."""
@@ -256,11 +261,12 @@ class Penalties:
         ids = np.fromiter(self.counts, np.int32, len(self.counts))
         count = np.fromiter(self.counts.values(), np.float32, len(ids))
         if isinstance(logits, ScreenedRow) and rows is None and where is None:
-            few = _native.mask_ids(bits, len(logits), _few)
+            allowed = np.empty(SEEDS, np.int32)
+            few = _native.mask_ids(bits, len(logits), allowed)
             if not few:  # (none: the caller's fallback)
                 return np.empty(0, np.float32), np.empty(0, np.int32)
-            if few <= len(_few):  # (a few tokens allowed: their rows, exact)
-                allowed = _few[:few].copy()
+            if few <= len(allowed):  # (a few tokens allowed: their rows, exact)
+                allowed = allowed[:few]
                 sub = logits.at(allowed)
                 at = np.searchsorted(allowed, ids)
                 hit = (at < few) & (allowed[np.minimum(at, few - 1)] == ids)
@@ -275,9 +281,6 @@ class Penalties:
         at = ids if where is None else where[ids]
         return _native.top_logits(x, k, cap, at if len(at) else None, count if len(at) else None, s.repeat_penalty,
                                   s.presence_penalty, s.frequency_penalty, rows, bits)
-
-
-_few = np.empty(SEEDS, np.int32)  # (a mask's few allowed tokens: exact rows of a screened head)
 
 
 def pack_mask(allowed: np.ndarray, words: int) -> np.ndarray:

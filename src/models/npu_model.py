@@ -72,6 +72,14 @@ class NpuModel:
         """Forget the cached positions: a new sequence."""
         raise NotImplementedError
 
+    def recover(self) -> None:
+        """After a failure on the device, whose state is unknown then: start over (``reset``)."""
+        self.reset()
+
+    def idle(self) -> None:
+        """The reader of a generation's tokens stopped reading (a stop string, a forced opener next; the generator may
+        stay suspended): a model that waits for the generation's next step before it runs others' need not."""
+
     def rewind(self, n: int) -> int:
         """Keep at most the first ``n`` cached positions (a prompt cache: a new prompt continues from the prefix it
         shares with the cached tokens) and return how many it kept; this default keeps none (``reset``)."""

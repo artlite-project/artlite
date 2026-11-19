@@ -106,6 +106,25 @@ def test_arrays(head: tuple) -> None:
         assert np.abs(d[order[:m]] - exact[order[:m]]).max() < 1e-5 * np.abs(exact).max()
 
 
+def test_take(head: tuple) -> None:
+    """Slots taken from a step's screened logits (``Screened.take``) are copies: their rows give the step's choices
+    after the NPU's buffer holds another step's and the step's own rows are no longer valid."""
+    sc, _, plane, _ = head
+    xs = np.stack(_inputs(head)[:4])
+    buf = np.stack([(plane @ sc.input(x).astype(np.float64)).astype(np.float32) for x in xs]).astype(bfloat16)
+    alive = [True]
+    step = SC.Screened(sc, buf, xs, lambda: alive[0])
+    want = [top_logits(step[i], 20) for i in range(4)]
+    mine = step.take(1, 3)
+    buf[:], alive[0] = 0, False  # (the next dispatch)
+    assert len(mine) == 2
+    for i in range(2):
+        v, ids = top_logits(mine[i], 20)
+        assert np.array_equal(ids, want[1 + i][1]) and np.array_equal(v, want[1 + i][0])
+    with pytest.raises(RuntimeError, match="before the overlay's next dispatch"):
+        SC.Screened(sc, buf, xs, lambda: alive[0])[0].top(1)
+
+
 def test_sampling(head: tuple) -> None:
     """``Penalties.top`` of a screened row (recent tokens penalized, a mask's tokens) against the exact logits'."""
     rng = np.random.default_rng(4)

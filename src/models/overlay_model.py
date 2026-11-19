@@ -1,19 +1,22 @@
 """A model on a decode overlay with a chunk prefill (``OverlayModel``): its steps, prompts in prefill chunks and decode
 steps, the output rows of prompts (``Readout``) and the packed chunks of several inputs, and the accounting of its
-dispatches. Its generation in rounds of drafts: ``speculative.SpeculativeMixin``."""
+dispatches. Its generation in rounds of drafts: ``speculative.SpeculativeMixin``; its lanes, where its overlay holds
+several sequences: ``lanes``."""
 
+import copy
 import dataclasses
 import functools
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 import numpy as np
 
 from artlite.decode.model import HostRecords, nbytes_of
 from artlite.decode.screen import Screened, ScreenedRow
 
+from .lanes import Request, Rounds, alone, kept
 from .npu_model import Checkpoint, NpuModel
 from .sampling import Penalties, top_logits
 from .sequence import Sequence as Tokens
@@ -49,12 +52,34 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     (``_step_inputs``: the overlay step's arguments before the position), a chunk's (``_chunk_inputs``: the prefill
     run's), the logits of a chunk's last token and the soft cap of its final logits (``softcap``).
 
-    ``generate`` (``SpeculativeMixin``) runs a generation in rounds of a step of the sampled token and its drafts."""
+    ``generate`` (``SpeculativeMixin``) runs a generation in rounds of a step of the sampled token and its drafts.
+
+    Lanes (a model whose overlay holds several sequences, ``_open_lanes``; module ``lanes``): ``lanes[s]`` is the model
+    for sequence s, lane 0 the model object itself and the others shallow copies of it: one device, prefill and set of
+    options (``LANE_SHARED``), a sequence's state, counters, drafter calibration and planner each (``LANE_OWN``).
+    Each lane is driven by one thread at a time. Its generation's rounds share their dispatches with the other lanes'
+    (``_joined``); a lane's other calls on the device (a prompt, the state copies, single steps) hold it alone
+    (``lanes.alone``), so the lanes' decode rounds wait for a prompt's end. After a failed dispatch a lane's calls raise
+    ``lanes.DeviceFailed`` until its ``recover``."""
 
     overlay: Any
     _w_out: np.ndarray  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
+    seq = 0  # the lane's sequence on the overlay's device
+    _lanes: "tuple[OverlayModel, ...] | None" = None  # (``lanes``; None: the model alone)
+    _rounds: Rounds | None = None  # several lanes: what joins their rounds and gives one the device (``lanes.Rounds``)
+    _round: Request | None = None  # (the lane's last round, where it asked ``_rounds`` for it: ``_overhead``)
+    # a model's attributes by what its lanes do with them (``_open_lanes`` refuses one on neither list): one object or
+    # value for all of them (the device's side, the model's options) ...
+    LANE_SHARED: ClassVar[tuple[str, ...]] = ("overlay", "prefill", "cfg", "eos_token_ids", "generates", "_w_out", "_pool",
+                                              "_lanes", "_rounds", "DRAFTS", "lookup", "softcap", "drafter")
+    # ... or each lane's own, from the class's defaults on (a sequence's state, its generations' counters, the drafter's
+    # calibration, the planner)
+    LANE_OWN: ClassVar[tuple[str, ...]] = (
+        "seq", "position", "slot", "carry", "rounds", "_rounds_of", "_round", "planner", "t_npu", "t_host", "dispatches",
+        "drafted", "accepted", "drafted_ctx", "accepted_ctx", "forced", "blocks", "t_draft", "_t_row", "_kept_at",
+        "_chain_at", "_chains")
 
     def cap(self, logits: np.ndarray | Screened | ScreenedRow) -> np.ndarray:
         """The model's logits (fp32) of the overlay's (bf16 or fp32): the soft cap, if any. A screened head's
@@ -83,6 +108,56 @@ class OverlayModel(SpeculativeMixin, NpuModel):
                 self.prefill.bind()
         self.overlay.ready()  # (the weights' thread packs meanwhile)
 
+    @property
+    def lanes(self) -> "tuple[OverlayModel, ...]":
+        """The model per sequence of its overlay (class docstring): lane 0 is the model object."""
+        return self._lanes or (self,)
+
+    def _open_lanes(self) -> None:
+        """The lanes of a model whose overlay holds several sequences (``lanes``), once it is loaded and its
+        attributes are set: copies of the model, each attribute shared or a lane's own (``LANE_SHARED``, ``LANE_OWN``;
+        TypeError: one that is on neither list)."""
+        if self.overlay.sequences == 1:
+            return
+        self._pool  # noqa: B018 (one for the lanes: made before the copies)
+        self._rounds = Rounds(self.overlay)
+        if unknown := sorted(set(vars(self)) - set(self.LANE_SHARED) - set(self.LANE_OWN)):
+            raise TypeError(f"{type(self).__name__}: several sequences, and {', '.join(unknown)} neither shared by its "
+                            f"lanes nor a lane's own (LANE_SHARED, LANE_OWN)")
+        lanes = [self]
+        for s in range(1, self.overlay.sequences):
+            lane = copy.copy(self)
+            for name in self.LANE_OWN:  # (the class's: counters of none, a planner made at its first use)
+                vars(lane).pop(name, None)
+            lane.seq, lane.position = s, 0
+            lanes.append(lane)
+        for lane in lanes:
+            lane._lanes = tuple(lanes)
+
+    @property
+    def budget(self) -> int | None:  # type: ignore[override]
+        """(several lanes: the lane's share of a step's slots this round, ``lanes.Rounds.budget``)"""
+        return None if self._rounds is None else self._rounds.budget(self.seq)
+
+    def _total(self, name: str) -> float:
+        """(of every lane)"""
+        return sum(getattr(lane, name) for lane in self.lanes)
+
+    def idle(self) -> None:
+        """(the other lanes' rounds no longer wait for this lane's, until its next one)"""
+        if self._rounds is not None:
+            self._rounds.idle(self.seq)
+
+    def _abandon(self) -> None:
+        super()._abandon()
+        self.idle()
+
+    def recover(self) -> None:
+        """(a lane: its own sequence, its calls run again; the other lanes' once they recover)"""
+        if self._rounds is not None:
+            self._rounds.recover(self.seq)
+        self.reset()
+
     def _also(self) -> dict[str, int]:
         """The buffers on the overlay's device besides its own, allocated with them (``ModelOverlay.load``): the
         prefill's."""
@@ -98,6 +173,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             self.overlay.prepare(S, logits=False)
             self.overlay.prepare(S, logits=True)
 
+    @alone
     def prepare(self, prompt_len: int) -> None:
         """(the overlay's and the prefill's hardware contexts, the prefill's piece BOs and its chunks' items: else the
         first prompt of a process pays them, ~50 ms, most of it the first context waking the NPU)"""
@@ -127,10 +203,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         self.dispatches += 1
         return out
 
-    def steps(self, tokens: list[int], *, logits: bool = True, **step: Any) -> np.ndarray | None:
-        """Run up to ``overlay.SLOTS`` tokens at the next positions in one dispatch: the overlay's logits (n, vocab)
-        bf16 after each of them (a view of the NPU's buffer, valid until the next dispatch), or None (``logits=False``:
-        prompt tokens); ``step``: the overlay step's other keywords."""
+    def _step_inputs_of(self, tokens: list[int]) -> tuple:
+        """``_step_inputs`` of a step that fits (ValueError), timed."""
         if self.position + len(tokens) > self.capacity:
             raise ValueError(f"the KV cache holds {self.capacity} positions")
         if not self.causal:
@@ -140,11 +214,46 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         t0 = time.perf_counter()
         args = self._step_inputs(tokens)
         self.t_host += time.perf_counter() - t0
+        return args
+
+    @alone
+    def steps(self, tokens: list[int], *, logits: bool = True, **step: Any) -> np.ndarray | None:
+        """Run up to ``overlay.SLOTS`` tokens at the next positions in one dispatch: the overlay's logits (n, vocab)
+        bf16 after each of them (a view of the NPU's buffer, valid until the next dispatch; a model of several lanes:
+        copies), or None (``logits=False``: prompt tokens); ``step``: the overlay step's other keywords."""
+        args = self._step_inputs_of(tokens)
         out = self._dispatch(lambda: self.overlay.step(*args, self.position, logits=logits, **step))
         self.position += len(tokens)
         if logits:
             self.slot = len(tokens) - 1
-        return out
+        return out if out is None or self._rounds is None else kept(out)  # (another lane's dispatch may come next)
+
+    def _joined(self, tokens: list[int]) -> np.ndarray | Screened:
+        """A generation round's step of the tokens at the next positions (``SpeculativeMixin._verify``): ``steps``; a
+        model of several lanes: in one dispatch with the other lanes' rounds (``lanes.Rounds.join``: it waits for
+        them), its rows copies, valid until its next round. The inputs are made and checked first: their errors are
+        this lane's alone."""
+        rounds = self._rounds
+        if rounds is None:
+            return self.steps(tokens)
+        if rounds.mine():  # (the caller holds the device: no round could run)
+            self._round = None
+            return self.steps(tokens)
+        args = self._step_inputs_of(tokens)
+        r = self._round = rounds.join(self.seq, args, self.position, len(tokens))
+        self.t_npu += r.wall
+        self.dispatches += 1
+        self.position += len(tokens)
+        self.slot = len(tokens) - 1
+        return r.rows
+
+    def _overhead(self, wall: float) -> float | None:
+        """(a round that asked the lanes' ``Rounds`` for its step: what it waited for the round and for the device;
+        None where the step ran other lanes' slots too)"""
+        r = self._round
+        if r is None:
+            return super()._overhead(wall)
+        return wall - r.seconds if r.parts == 1 else None
 
     def _generating(self) -> None:
         """NotImplementedError for a readout model (``generates``)."""
@@ -207,6 +316,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         group runs as decode steps up to the next)"""
         return self.prefill.group if self.prefill is not None else 8
 
+    @alone
     def rewind(self, n: int) -> int:
         """(down to a multiple of ``group``; a recurrent model's: all cached positions or none, its states hold the whole
         sequence and cannot go back: a ``checkpoint`` keeps a position)"""
@@ -230,11 +340,13 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def _set_state(self, state: dict[str, Any]) -> None:
         """Back to ``_state``'s."""
 
+    @alone
     def checkpoint(self) -> Checkpoint:
         self._abandon()
         state = ([ov.snapshot(self.position) for ov in self._overlays()], self._state())
         return Checkpoint(self.position, state, nbytes_of(state))
 
+    @alone
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
         self._abandon()
         if checkpoint is None:
@@ -252,13 +364,16 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         self._set_state(state)
         self.position = position
 
+    @alone
     def read_records(self, start: int, end: int) -> list[HostRecords]:
         return [ov.read_records(start, end) for ov in self._overlays()]
 
+    @alone
     def write_records(self, records: list[HostRecords], start: int, end: int) -> None:
         for ov, r in zip(self._overlays(), records, strict=True):
             ov.write_records(r, start, end)
 
+    @alone
     def prompt(self, tokens: list[int], *, logits: bool = False, progress: Callable[[int], None] | None = None,
                readout: Readout | None = None, sets: Sequence[int] | None = None) -> np.ndarray | None:
         """Run tokens after the cached positions (prefill chunks, else decode steps); ``logits``: return the last
@@ -355,6 +470,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             return self.prefill.pack(lengths, position).seconds
         return super().readout_seconds(lengths, position)
 
+    @alone
     def readouts(self, inputs: list[list[int] | Tokens], at: list[np.ndarray], *, norm: bool = True,
                  lead: list[int] | None = None, sets: list[Sequence[int] | None] | None = None) -> list[np.ndarray]:
         """(the prefill's packed chunks where its plan packs inputs, ``ChunkPrefill.pack``: every one of them continues

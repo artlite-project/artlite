@@ -8,13 +8,14 @@ rewinds to there and runs the opener."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import random
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ..detokenizer import StreamDecoder
-from ..sampling import seed
 from ..structured import Ban, GrammarMask, thought_of
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
 from .textflow import ReasoningSplitter, StopMatcher
@@ -53,6 +54,8 @@ class Generation:
         self.entries: list[dict[str, Any]] = []  # (llama-server's probs: one per sampled token)
         self.sent = self.sampled = 0
         self.probs: Callable[..., None] | None = None
+        # (the job's draws: its seed's, whatever generates beside it)
+        self.sampling = dataclasses.replace(job.sampling, rng=random.Random(job.seed if job.seed >= 0 else None))
 
     # ------------------------------------------------------------------
     # The steps
@@ -64,7 +67,6 @@ class Generation:
         if job.cancel.is_set():
             raise Cancelled
         self.t0 = time.perf_counter()
-        seed(job.seed if job.seed >= 0 else None)
         self.engine.begin()
         self.kept, last, how = self.cache.prepare(self.ids, enabled=job.cache_prompt)
         job.kept = self.kept
@@ -198,27 +200,30 @@ class Generation:
         goes; whether the opener goes next."""
         job, npu, model, ids, gen, calls = self.job, self.npu, self.model, self.ids, self.gen, self.calls
         left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
-        self.it = npu.generate(logits, left, job.sampling, ids + gen, self.mask, self.probs, drafts=job.drafts)
-        for token in self.it:
-            gen.append(token)
-            self.sampled += 1
-            job.n_gen = len(gen)
-            if token in model.eos_token_ids:
-                self.finish = "stop"
-                break
-            s, hit = self.stop.feed(self.text.feed(token))
-            self._send(self._parse(s))
-            if hit:
-                self.finish = "stop"
-                break
-            if job.cancel.is_set():
-                raise Cancelled
-            # (the answer began and no call did: the forced call's opener follows)
-            forcing = bool(self.late) and self.split is not None and self.split.answering and not calls.started
-            # the answer is complete, or the opener goes next: end where every token but the last ran (a
-            # step of drafts runs several; the parser drops what follows a call when parallel is off)
-            if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):
-                break
+        self.it = npu.generate(logits, left, self.sampling, ids + gen, self.mask, self.probs, drafts=job.drafts)
+        try:
+            for token in self.it:
+                gen.append(token)
+                self.sampled += 1
+                job.n_gen = len(gen)
+                if token in model.eos_token_ids:
+                    self.finish = "stop"
+                    break
+                s, hit = self.stop.feed(self.text.feed(token))
+                self._send(self._parse(s))
+                if hit:
+                    self.finish = "stop"
+                    break
+                if job.cancel.is_set():
+                    raise Cancelled
+                # (the answer began and no call did: the forced call's opener follows)
+                forcing = bool(self.late) and self.split is not None and self.split.answering and not calls.started
+                # the answer is complete, or the opener goes next: end where every token but the last ran (a
+                # step of drafts runs several; the parser drops what follows a call when parallel is off)
+                if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):
+                    break
+        finally:
+            npu.idle()  # (the generator stays suspended where the reading stopped)
         return forcing
 
     def _settle(self) -> None:

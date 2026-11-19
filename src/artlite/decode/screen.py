@@ -79,7 +79,6 @@ class Screen:
         self.scale, self.bound = np.empty(n, np.float32), np.empty(n, np.float32)
         _native.screen_stats(t.raw, t.cols, self.scale, self.bound)
         self.bound *= np.float32(Z)
-        self._ids = np.empty(IDS, np.int32)
         self.rows = 0  # (rows computed exactly so far)
         self.taken = 0  # (choices so far: ``candidates``)
 
@@ -99,9 +98,10 @@ class Screen:
 
     def _above(self, bits: np.ndarray, gnorm: float, thr: float, mask: np.ndarray | None = None) -> np.ndarray:
         """The rows whose upper bound reaches thr (``mask``: of the allowed ones), ascending (int32; a copy)."""
-        n = _native.screen_above(bits, self.scale, self.bound, gnorm, thr, self._ids, mask)
-        if n <= len(self._ids):
-            return self._ids[:n].copy()
+        ids = np.empty(IDS, np.int32)  # (the call's own: several sequences' choices run on threads of their own)
+        n = _native.screen_above(bits, self.scale, self.bound, gnorm, thr, ids, mask)
+        if n <= len(ids):
+            return ids[:n].copy()
         up = self._upper(bits, gnorm) >= thr
         if mask is not None:
             up &= np.unpackbits(mask.view(np.uint8), count=self.n, bitorder="little").astype(bool)
@@ -251,7 +251,14 @@ class Screened:
     def __init__(self, screen: Screen, screened: np.ndarray, x: np.ndarray, alive: Callable[[], bool]):
         assert screened.dtype == bfloat16 and len(x) == len(screened)
         self.shape = screened.shape
+        self._of = (screen, screened, x)
         self._rows = [ScreenedRow(screen, s, xi, alive) for s, xi in zip(screened, x, strict=True)]
+
+    def take(self, a: int, b: int) -> "Screened":
+        """Slots a .. b - 1 over copies of the NPU's rows: valid past the overlay's next dispatch of logits (several
+        sequences' step: each one's rows, read while the next step runs)."""
+        screen, screened, x = self._of
+        return Screened(screen, screened[a:b].copy(), x[a:b], lambda: True)
 
     def __len__(self) -> int:
         return self.shape[0]

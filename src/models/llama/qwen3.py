@@ -64,6 +64,6 @@ class Qwen3(Model):
     def sampling(self, *, think: bool = False) -> Sampling:
         return THINK_SAMPLING if think else PLAIN_SAMPLING
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuLlama:
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuLlama:
         return NpuLlama(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                        readout=not self.generates)
+                        readout=not self.generates, sequences=sequences)

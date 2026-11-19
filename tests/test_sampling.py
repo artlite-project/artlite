@@ -4,6 +4,8 @@ mask of the tokens allowed, the choice among the candidates (``Sampling.pick``),
 recent tokens (``NpuModel.generate``, the overlay models' bf16 logits with a soft cap)."""
 
 import collections
+import dataclasses
+import random
 import types
 
 import ml_dtypes
@@ -88,7 +90,8 @@ def test_max_prob() -> None:
 
 def test_pick() -> None:
     """The choice among candidates: softmax at the temperature, top_p's smallest prefix, min_p, the draw u; and the
-    draws of a seed."""
+    draws of a seed: the process's generator's, and those of a sampling's own (a job's), whatever else draws beside
+    it."""
     rng = np.random.default_rng(0)
     for _ in range(500):
         v = np.sort(rng.standard_normal(64).astype(np.float32) * 2)[::-1].copy()
@@ -106,6 +109,9 @@ def test_pick() -> None:
     seed(7)
     assert [s.pick(v, ids) for _ in range(20)] == first
     assert len(set(first)) > 1
+    a, b = dataclasses.replace(s, rng=random.Random(7)), dataclasses.replace(s, rng=random.Random(8))
+    mixed = [(a.pick(v, ids), b.pick(v, ids), s.pick(v, ids))[0] for _ in range(20)]
+    assert mixed == first and a == s  # (the generator is none of a sampling's settings)
 
 
 @pytest.mark.parametrize("dtype", ["fp32", "bf16-cap"])

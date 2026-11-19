@@ -26,9 +26,9 @@ class SpeculativeMixin:
     draft's logits are valid too. A model with a drafter or lazy states supplies the round's step (``_verify``) and
     what follows its kept tokens (``_kept``).
 
-    The host class supplies ``steps`` (a dispatch of up to ``overlay.SLOTS`` tokens: their bf16 logits), ``cap``,
-    ``position``, ``capacity``, ``softcap``, ``eos_token_ids``, and for ``forced_drafts`` ``prompt``, ``reset`` and
-    ``prefill``."""
+    The host class supplies ``steps`` (a dispatch of up to ``overlay.SLOTS`` tokens: their bf16 logits), ``_joined`` (a
+    round's step: ``steps``, or one that shares its dispatch with other sequences' rounds), ``cap``, ``position``,
+    ``capacity``, ``softcap``, ``eos_token_ids``, and for ``forced_drafts`` ``prompt``, ``reset`` and ``prefill``."""
 
     overlay: Any
     position: int
@@ -38,6 +38,7 @@ class SpeculativeMixin:
     drafted: int  # draft tokens run and accepted (of both kinds: ``NpuModel``'s counters)
     accepted: int
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1, or fewer: ``--spec-draft-n-max``)
+    budget: int | None = None  # a round's slots at most where the step is shared (``OverlayModel``); None: DRAFTS + 1
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
     # (a drafter step of one row's seconds; per draft depth the rounds that kept a draft there and their chains'
@@ -65,16 +66,21 @@ class SpeculativeMixin:
     def _drafting(self) -> bool:
         return self.drafter is not None and self.DRAFTS > 0
 
+    def _total(self, name: str) -> float:
+        """A counter of the model's generations (``stats``; of every lane's: ``OverlayModel``)."""
+        return getattr(self, name)
+
     def stats(self) -> str:
+        n = self._total
         out = []
-        if mtp := self.drafted - self.drafted_ctx:
-            cost = (f"{self.t_draft / self.blocks * 1e3:.1f} ms a block" if self.blocks
-                    else f"{self.t_draft / mtp * 1e3:.2f} ms each")
-            out.append(f"{mtp} draft tokens ({cost}), {self.accepted - self.accepted_ctx} accepted")
-        if self.drafted_ctx:
-            out.append(f"{self.drafted_ctx} context draft tokens, {self.accepted_ctx} accepted")
-        if self.forced:
-            out.append(f"{self.forced} forced tokens")
+        if mtp := n("drafted") - n("drafted_ctx"):
+            cost = (f"{n('t_draft') / n('blocks') * 1e3:.1f} ms a block" if n("blocks")
+                    else f"{n('t_draft') / mtp * 1e3:.2f} ms each")
+            out.append(f"{mtp} draft tokens ({cost}), {n('accepted') - n('accepted_ctx')} accepted")
+        if n("drafted_ctx"):
+            out.append(f"{n('drafted_ctx')} context draft tokens, {n('accepted_ctx')} accepted")
+        if n("forced"):
+            out.append(f"{n('forced')} forced tokens")
         return "; ".join(out)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
@@ -138,7 +144,14 @@ class SpeculativeMixin:
 
     def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
         """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab)."""
-        return self.steps(tokens)
+        return self._joined(tokens)
+
+    def _overhead(self, wall: float) -> float | None:
+        """The seconds of a round's step (``_verify``: ``wall``, less other processes' turns) that are no step's time for
+        the planner: its one-time host work (a prompt's states turned into the decode's, a transaction's first run, up
+        to ~200 / ~60 ms, which a running average would carry for ten steps). None: the time measures no step of this
+        sequence's alone (its dispatch ran other sequences' slots too)."""
+        return self.overlay.once_s
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
         """After a round's step of ``tokens`` at p: its first m tokens are the sequence's (the rejected drafts'
@@ -197,7 +210,9 @@ class SpeculativeMixin:
         try:
             while n != max_tokens and token not in self.eos_token_ids and self.position + len(self.carry) < self.capacity:
                 c = len(self.carry)
-                k = min(most - c, self.capacity - self.position - 1 - c, max_tokens - n - 1 if max_tokens > 0 else most)
+                room = most if (b := self.budget) is None else min(most, b - 1)  # (a shared step: this round's slots)
+                k = max(min(room - c, self.capacity - self.position - 1 - c,
+                            max_tokens - n - 1 if max_tokens > 0 else room), 0)
                 plan.place(self.position)
                 plan.crossing = self._crossing()
                 t0, w0 = time.perf_counter(), _native.turn_waited()  # (the planner's times: this process's own work)
@@ -243,10 +258,9 @@ class SpeculativeMixin:
                         won += 1
                 self._kept(p, [*self.carry, token, *d], c + 1 if won else c + len(new), mtp, won)
                 self.carry = tuple(new[:won])
-                # (less the step's one-time host work: a prompt's states turned into the decode's, a transaction's first
-                # run, up to ~200 / ~60 ms, which a running average would carry for ten steps)
-                once = self.overlay.once_s
-                plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - once)
+                once = self._overhead(t2 - t1 - (w2 - w1))  # (None: the step's time is no measure)
+                if once is not None:
+                    plan.ran(c + len(d) + 1 + len(sib or ()), t2 - t1 - (w2 - w1) - once)
                 self.accepted += len(new) - 1
                 if f:
                     kept = len(new) - 1
@@ -258,7 +272,8 @@ class SpeculativeMixin:
                         self.drafted_ctx += len(more)
                         self.accepted_ctx += max(kept - len(f), 0)
                 elif mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
-                    plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
+                    if once is not None:
+                        plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
                     self._calibrate(len(new) - 1)
                 elif d:
                     plan.accepted(m, len(d), len(new) - 1, agree=agree)
