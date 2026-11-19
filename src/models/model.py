@@ -52,6 +52,7 @@ class Model:
     user_turn: str | None = None  # the text that begins a user message
     chat_template: str | None = None  # a Jinja chat template in place of the file's (``open_model``'s); None: the file's
     generates = True  # False: a readout model's file (``readouts.readout_model``): no LM head on the NPU, no text
+    parallel = False  # ``load`` takes ``sequences``: the NPU holds several sequences, a lane each (``NpuModel.lanes``)
     gguf: GGUFFile  # the model file
     cfg: Any  # its configuration (``artlite.model_config``)
     tokenizer: Tokenizer

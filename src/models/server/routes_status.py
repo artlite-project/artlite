@@ -29,7 +29,7 @@ def add_routes(public: APIRouter, listed: APIRouter, api: APIRouter, ctx: ApiCon
         mods = Modalities.of(engine)
         return {"default_generation_settings": {"n_ctx": engine.npu.capacity, "params": ctx.params(ctx.sampling(
                     ctx.default_think()))},
-                "total_slots": 1, "model_alias": options.alias, "model_path": info.path,
+                "total_slots": len(engine.lanes), "model_alias": options.alias, "model_path": info.path,
                 "modalities": {"vision": mods.vision, "audio": mods.audio, "video": mods.video},
                 **({"voices": list(VOICES)} if mods.speech else {}),
                 "endpoint_slots": options.slots, "endpoint_props": False, "endpoint_metrics": False,
@@ -56,10 +56,14 @@ def add_routes(public: APIRouter, listed: APIRouter, api: APIRouter, ctx: ApiCon
     async def slots() -> list[dict[str, Any]]:
         if not options.slots:
             raise not_supported("This server does not support slots endpoint.")
-        j = engine.current
-        return [{"id": 0, "id_task": -1 if j is None else 0, "n_ctx": engine.npu.capacity,
-                 "is_processing": j is not None, "n_cached": len(engine.cached), "n_waiting": engine.waiting(),
-                 "params": ctx.params(ctx.sampling(ctx.default_think())) if j is None
-                 else ctx.params(j.sampling, j.drafts),
-                 "next_token": [{"has_next_token": j is not None and j.state == "generating",
-                                 "n_decoded": 0 if j is None else j.n_gen}]}]
+        idle = ctx.params(ctx.sampling(ctx.default_think()))
+        out = []
+        for lane in engine.lanes:  # (a sequence of the model each: -np)
+            j = lane.current
+            out.append({"id": lane.index, "id_task": -1 if j is None else 0, "n_ctx": lane.npu.capacity,
+                        "is_processing": j is not None, "n_cached": len(lane.cache.tokens),
+                        "n_waiting": engine.waiting(),
+                        "params": idle if j is None else ctx.params(j.sampling, j.drafts),
+                        "next_token": [{"has_next_token": j is not None and j.state == "generating",
+                                        "n_decoded": 0 if j is None else j.n_gen}]})
+        return out

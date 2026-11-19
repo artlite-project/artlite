@@ -133,6 +133,11 @@ class PromptCache:
             k = max(k, m - m % self.npu.group)
         return k
 
+    def keeps(self, ids: list[int] | Sequence) -> int:
+        """The positions of a prompt that ``prepare`` would keep (no work on the device: an engine's choice of the lane
+        a job goes to)."""
+        return max(self._keeps(e, common_prefix(e.tokens, ids), len(ids)) for e in (self.active, *self.entries))
+
     def prepare(self, ids: list[int] | Sequence, *, enabled: bool = True) -> tuple[int, np.ndarray | None, str]:
         """Put the device where ``ids`` continue from: the positions kept (the device holds ``ids[:kept]``), the logits
         of the last one when all of them are (the checkpoint of a prompt that ended there), and how (for the log)."""

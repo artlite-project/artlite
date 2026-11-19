@@ -1,7 +1,14 @@
-"""The server's NPU side: one worker thread owns the model and runs the requests' generations one at a time, in
-arrival order (``Engine``; ``jobs``: its queue's work and the events back), each from what the prompt cache
-(``cache.PromptCache``) keeps of its prompt (``generation.Generation``: the stop strings and the thought split of
-``textflow``, the answer's tool calls of ``tools``)."""
+"""The server's NPU side: the worker threads that own the model, one per sequence it holds (``Lane``: one, or ``-np`` of
+a model with lanes, ``OverlayModel.lanes``), each running the requests' generations one at a time (``Engine``;
+``jobs``: its queue's work and the events back), each from what its lane's prompt cache (``cache.PromptCache``) keeps
+of its prompt (``generation.Generation``: the stop strings and the thought split of ``textflow``, the answer's tool
+calls of ``tools``).
+
+Several lanes: the jobs go to the idle lanes in arrival order, each to the lane its request names (``id_slot``), else to
+the one whose prompt cache keeps the most of its prompt where that is ``SIMILAR`` of it at least, else to the least
+recently used (llama-server's choice of a slot); the lanes' generations share their decode steps (``models.lanes``).
+What is no job (a ``Call``: readouts, answers, an image's encoder, a live stream's step) runs on lane 0 with the device
+held, as a prompt's chunks hold it: the other lanes' steps wait for it."""
 
 import collections
 import concurrent.futures
@@ -10,6 +17,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -28,16 +36,35 @@ from .jobs import Call, Cancelled, Failed, Job
 
 log = logging.getLogger("artlite.server")
 CACHE_RAM = 8192 << 20  # the prompt cache's host memory by default at most (llama-server's --cache-ram)
+SIMILAR = 0.5  # a job goes to the idle lane that keeps the most of its prompt where that is this share of it at least
+# (llama-server's --slot-prompt-similarity), else to the least recently used
+
+
+@dataclass(eq=False)
+class Lane:
+    """A sequence of the model as the engine serves it: its model (``npu``: the model's lane, ``NpuModel.lanes``), its
+    prompt cache, the job it runs."""
+
+    index: int
+    npu: NpuModel
+    cache: PromptCache
+    thread: threading.Thread | None = None
+    current: Job | None = None
+    busy: bool = False  # (it runs a job or a call)
+    dirty: bool = False  # (a failure: its next work resets its caches)
+    used: int = 0  # (the engine's count of work done when its last ended: the least recently used lane's is lowest)
 
 
 class Engine:
-    """The worker thread that owns the model: it opens and loads it (``load``: the ``Model`` and its ``NpuModel``),
-    runs one token through it (``warmup``; it also builds structured output's vocabulary aside: ``vocab``), then runs
-    the jobs one at a time in arrival order.
+    """The worker threads that own the model. The first opens and loads it (``load``: the ``Model`` and its
+    ``NpuModel``), runs one token through it (``warmup``; it also builds structured output's vocabulary aside:
+    ``vocab``), then each lane's worker (``lanes``: the model's, ``NpuModel.lanes``) runs jobs one at a time, the
+    queue in arrival order (module docstring). ``npu``, ``cache``, ``cached``: lane 0's (the calls' and a model of one
+    sequence's).
 
-    The prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory - None: ``CACHE_RAM``, at most half of
-    what is still available once the model is loaded (its weights and caches are host memory too), over ``share``
-    (a router's models: each server's part); a non-causal model's none -, ``checkpoints``
+    A lane's prompt cache (``cache.PromptCache``: ``cache_ram`` bytes of host memory - None: ``CACHE_RAM``, at most half
+    of what is still available once the model is loaded (its weights and caches are host memory too), over ``share``
+    (a router's models: each server's part) and over the lanes; a non-causal model's none -, ``checkpoints``
     per sequence): a job continues from what it keeps of its prompt (the device's sequence, a checkpoint, a sequence
     saved in RAM) and runs the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``), with a
     checkpoint at its end; ``cached``: the tokens whose K / V the caches hold (the last sampled token never ran).
@@ -49,22 +76,31 @@ class Engine:
                  cache_ram: int | None = None, share: int = 1, checkpoints: int = 32):
         self.model: Model | None = None
         self.npu: NpuModel | None = None
-        self.cache: PromptCache | None = None
+        self.lanes: list[Lane] = []
         self.error: str | None = None  # why the load failed
-        self.current: Job | None = None
         self._load, self._warmup, self._on_ready, self._on_exit = load, warmup, on_ready, on_exit
         self._cache_ram, self._share, self._checkpoints = cache_ram, max(share, 1), checkpoints
-        self._queue: collections.deque[Job] = collections.deque()
+        self._queue: collections.deque[Job | Call] = collections.deque()
         self._cv = threading.Condition()
         self._stopping = False
-        self._dirty = False  # (a failure: the next job resets the caches)
         self._ready = threading.Event()
         self._ids = itertools.count(1)
+        self._done = itertools.count(1)  # (``Lane.used``)
         self._thread = threading.Thread(target=self._run, name="artlite-npu")
 
     @property
+    def cache(self) -> PromptCache | None:
+        """Lane 0's prompt cache."""
+        return self.lanes[0].cache if self.lanes else None
+
+    @property
+    def current(self) -> Job | None:
+        """A job that runs (the lowest lane's), or None."""
+        return next((lane.current for lane in self.lanes if lane.current is not None), None)
+
+    @property
     def cached(self) -> list[int]:
-        """The tokens at the cached positions."""
+        """The tokens at lane 0's cached positions."""
         return self.cache.tokens if self.cache is not None else []
 
     @property
@@ -85,8 +121,11 @@ class Engine:
                 raise RuntimeError("the server is shutting down")
             if isinstance(job, Job):
                 job.name = job.name or f"request {next(self._ids)}"
+                job.arrived = time.perf_counter()
+                job.beside = sum(lane.current is not None for lane in self.lanes) + \
+                    sum(isinstance(j, Job) for j in self._queue)
             self._queue.append(job)
-            self._cv.notify()
+            self._cv.notify_all()
 
     def run(self, fn: Callable[[], Any]) -> concurrent.futures.Future:
         """Run fn on the worker after the queued jobs (NPU work outside a generation); its result or exception."""
@@ -105,18 +144,24 @@ class Engine:
                 raise
         return self.run(run)
 
-    def begin(self) -> None:
-        """(on the worker) Before work on the device: it starts over when a failure left its state unknown."""
-        if self._dirty:
-            self.npu.reset()
-            self._dirty = False
+    def begin(self, lane: Lane | None = None) -> None:
+        """(on a lane's worker; default: lane 0's) Before work on the device: the lane's sequence starts over when a
+        failure left its state unknown (its own work's, or a dispatch that failed under another lane's:
+        ``NpuModel.failed``)."""
+        lane = lane or self.lanes[0]
+        if lane.npu.failed and not lane.dirty:
+            self.recover(lane)
+        if lane.dirty:
+            lane.npu.recover()
+            lane.dirty = False
 
-    def recover(self) -> None:
-        """(on the worker) After a failure, or before work that leaves the device's sequence unknown to the prompt cache
-        (speech output: ``models.lfm3a.speech``): the cache keeps what RAM holds of the current one, the next work
-        resets the device (``begin``)."""
-        self.cache.clear()
-        self._dirty = True
+    def recover(self, lane: Lane | None = None) -> None:
+        """(on a lane's worker; default: lane 0's) After a failure, or before work that leaves the device's sequence
+        unknown to the prompt cache (speech output: ``models.lfm3a.speech``): the lane's cache keeps what RAM holds of
+        the current one, its next work resets its sequence (``begin``)."""
+        lane = lane or self.lanes[0]
+        lane.cache.clear()
+        lane.dirty = True
 
     def hold(self, ids: Sequence) -> int:
         """(on the worker) A live stream's text sequence and its next chunk's tokens: the device where they continue
@@ -245,23 +290,25 @@ class Engine:
     def cancel(self, conv_id: str) -> int:
         """Cancel the jobs of a conversation (running or queued); returns how many."""
         with self._cv:
-            jobs = [j for j in (self.current, *self._queue) if j is not None and j.conv_id == conv_id]
+            jobs = [j for j in (*(lane.current for lane in self.lanes), *self._queue)
+                    if isinstance(j, Job) and j.conv_id == conv_id]
         for j in jobs:
             j.cancel.set()
         return len(jobs)
 
     def stop(self) -> None:
-        """Shut down: cancel the running and the queued jobs, end the worker after the running one's dispatch."""
+        """Shut down: cancel the running and the queued jobs, end the workers after the running ones' dispatches."""
         with self._cv:
             self._stopping = True
-            for j in (self.current, *self._queue):
+            for j in (*(lane.current for lane in self.lanes), *self._queue):
                 if j is not None:
                     j.cancel.set()
-            self._cv.notify()
+            self._cv.notify_all()
 
     def join(self, timeout: float | None = None) -> None:
-        if self._thread.is_alive():
-            self._thread.join(timeout)
+        for thread in (self._thread, *(lane.thread for lane in self.lanes)):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout)
 
     # ------------------------------------------------------------------
     # The worker
@@ -273,58 +320,121 @@ class Engine:
             if self._warmup and not self._stopping:
                 self._warm()
             turns = [self.model.tokenizer.encode(t) if t else None for t in (self.model.turn, self.model.user_turn)]
+            npus = self.npu.lanes
             ram = self._cache_ram
             if not self.npu.causal:  # (it reads every prompt whole: nothing continues from a saved sequence)
                 ram = 0
             elif ram is None:
                 free = portable.available_memory()
                 ram = (CACHE_RAM if free is None else min(CACHE_RAM, free // 2)) // self._share
-                log.info("prompt cache: up to %.1f GiB of host RAM (--cache-ram%s)", ram / 2**30,
-                         f", over --models-max {self._share}" if self._share > 1 else "")
-            self.cache = PromptCache(self.npu, ram=ram, checkpoints=self._checkpoints, turn=turns[0],
-                                     user_turn=turns[1])
+                log.info("prompt cache: up to %.1f GiB of host RAM (--cache-ram%s%s)", ram / 2**30,
+                         f", over --models-max {self._share}" if self._share > 1 else "",
+                         f"; a lane's: 1 / {len(npus)} of it" if len(npus) > 1 else "")
+            lanes = [Lane(i, npu, PromptCache(npu, ram=ram // len(npus) if ram > 0 else ram, turn=turns[0],
+                                              checkpoints=self._checkpoints, user_turn=turns[1]))
+                     for i, npu in enumerate(npus)]
         except Exception as e:  # (any failure of the load: reported, the server exits)
             log.exception("loading the model failed")
             self.error = f"{type(e).__name__}: {e}"
             if self._on_exit is not None:
                 self._on_exit()
             return
+        with self._cv:
+            self.lanes = lanes
         self._ready.set()
         if self._on_ready is not None:
             self._on_ready()
         if self._warmup and self.npu.causal and self.npu.generates and hasattr(self.model.tokenizer, "vocabulary"):
             threading.Thread(target=self.vocab, name="artlite-vocab", daemon=True).start()  # (structured output's)
+        for lane in lanes[1:]:
+            lane.thread = threading.Thread(target=self._serve, args=(lane,), name=f"artlite-npu-{lane.index}")
+            lane.thread.start()
+        self._serve(lanes[0])
+
+    def _serve(self, lane: Lane) -> None:
+        """A lane's worker: the queue's work that goes to it (``_take``), one at a time, until the shutdown."""
         while True:
             with self._cv:
-                while not self._queue and not self._stopping:
+                while (work := self._take(lane)) is None:
+                    if self._stopping:
+                        return
                     self._cv.wait()
-                if not self._queue:
-                    return
-                job = self._queue.popleft()
-                if not isinstance(job, Call):
-                    self.current = job
-            if isinstance(job, Call):
-                try:
-                    if job.cancel.is_set():
-                        raise RuntimeError("the server is shutting down")
-                    job.future.set_result(job.fn())
-                except Exception as e:  # noqa: BLE001 (the caller's: its future)
-                    job.future.set_exception(e)
-                continue
+                lane.busy = True
+                if isinstance(work, Job):
+                    lane.current, work.lane, work.waited = work, lane.index, time.perf_counter() - work.arrived
             try:
-                Generation(self, job).run()
-            except Cancelled:
-                log.info("%s: cancelled after %d of %d prompt tokens, %d generated", job.name,
-                         max(min(self.npu.position, len(job.ids)) - job.kept, 0), len(job.ids) - job.kept, job.n_gen)
-                job.emit("cancelled", {})
-            except Exception as e:  # (a failure in the model: the job's error; the caches start over)
-                log.exception("%s failed", job.name)
-                self.recover()
-                job.emit("error", Failed(message=f"{type(e).__name__}: {e}"))
+                if isinstance(work, Call):
+                    self._call(work)
+                else:
+                    self._job(lane, work)
             finally:
-                job.state = "done"
                 with self._cv:
-                    self.current = None
+                    lane.busy, lane.current, lane.used = False, None, next(self._done)
+                    self._cv.notify_all()
+
+    def _take(self, lane: Lane) -> Job | Call | None:
+        """(with the lock) The work ``lane`` runs now, taken from the queue: in arrival order each piece goes to a
+        free lane - a call to lane 0, a job to ``_lane_of``'s (at the shutdown, when they are cancelled, to any) -,
+        and the first that goes to this one is it."""
+        free = {x.index for x in self.lanes if not x.busy}
+        for i, work in enumerate(self._queue):
+            if not free:
+                break
+            if isinstance(work, Call):
+                to = 0 if 0 in free else None
+            else:
+                to = lane.index if self._stopping else self._lane_of(work, free)
+            if to == lane.index:
+                del self._queue[i]
+                return work
+            free.discard(to)
+        return None
+
+    def _lane_of(self, job: Job, free: set[int]) -> int | None:
+        """The lane of ``free`` a job goes to (module docstring), or None: the lane it names is not among them."""
+        if job.lane is not None:
+            return job.lane if job.lane in free else None
+        if len(free) > 1 and job.cache_prompt:
+            keeps = {i: self._keeps(job, self.lanes[i]) for i in free}
+            best = max(free, key=lambda i: (keeps[i], -i))
+            if keeps[best] >= SIMILAR * len(job.ids) and keeps[best]:
+                return best
+        return min(free, key=lambda i: (self.lanes[i].used, i))
+
+    @staticmethod
+    def _keeps(job: Job, lane: Lane) -> int:
+        """The positions of its prompt a job would keep on an idle lane (``PromptCache.keeps``; kept with the job
+        while the lane runs nothing)."""
+        got = job.keeps.get(lane.index)
+        if got is None or got[0] != lane.used:
+            got = job.keeps[lane.index] = (lane.used, lane.cache.keeps(job.ids))
+        return got[1]
+
+    def _call(self, call: Call) -> None:
+        """A call on lane 0's worker, the device held: what it runs on the NPU (lane 0's sequence, other hardware
+        contexts: an encoder's) comes between two steps of the other lanes."""
+        try:
+            if call.cancel.is_set():
+                raise RuntimeError("the server is shutting down")
+            self.begin()
+            with self.npu.device():
+                call.future.set_result(call.fn())
+        except Exception as e:  # noqa: BLE001 (the caller's: its future)
+            call.future.set_exception(e)
+
+    def _job(self, lane: Lane, job: Job) -> None:
+        try:
+            Generation(self, job, lane).run()
+        except Cancelled:
+            log.info("%s: cancelled after %d of %d prompt tokens, %d generated", job.name,
+                     max(min(lane.npu.position, len(job.ids)) - job.kept, 0), len(job.ids) - job.kept, job.n_gen)
+            job.emit("cancelled", {})
+        except Exception as e:  # (a failure in the model: the job's error; the lane's caches start over)
+            log.exception("%s failed", job.name)
+            self.recover(lane)
+            job.emit("error", Failed(message=f"{type(e).__name__}: {e}"))
+        finally:
+            job.state = "done"
 
     def _warm(self) -> None:
         """A short prompt and one step (as llama-server's warmup): the first request's dispatches find their HW

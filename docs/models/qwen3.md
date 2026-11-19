@@ -40,6 +40,8 @@ chat template has Qwen3's thinking mode (`--think`); sampling follows the model 
 - The KV cache holds K as bfp16 hi + lo by default (`--kv-k hilo`; 96 KB per position): with one block per 8 dims
   (`--kv-k single`, 64 KB) the KL against the same file on the CPU goes from 0.0037 to 0.0085 on a chat.
 - A file of Q8_0 alone (the embedding, reranker and decision files) takes 8-row tiles of 9216 bytes.
+- Several chat requests at a time (`artlite-server -np N`) share the decode steps, as Llama's
+  ([artlite-server](../server.md#several-requests-at-a-time)).
 - The 4B models' hidden size (2560) is two and a half K chunks of 1024: the projections that read it (q / k / v,
   gate / up, the LM head) take inputs of 2560, and the prompt's GEMMs read 2.5 of a row's 3 tiles (13-16% faster at
   1024 tokens). In a model that generates, the last tile's second half is the next row's (gate / up and the LM head:

@@ -50,6 +50,7 @@ from .. import _native, parallel_compile
 from ..gemm.pacing import PACE, PACE_IDLE, pace_levels
 from ..operators.base import ArtcOperator
 from ..operators.fused import Library
+from ..operators.fused.library import Guest
 from ..operators.util import arg_bytes, rup
 from . import gemm as PG
 from . import pace as PACING
@@ -122,6 +123,8 @@ class ChunkPrefill:
         self.lead = 0  # (the tokens of a prompt a packed chunk may lead with, which every segment sees: ``run_packed``)
         self.span = 0  # (a packed chunk's longest segment)
         self._est: dict[tuple, Any] = {}  # (the planner's estimates by (kind, tokens or size, position); pieces' splits)
+        # what a chunk lets in between its pieces (``Library.run``'s: the steps of the model's other sequences), or None
+        self.guest: Guest | None = None
         self._last_pack: tuple[tuple, Packing] | None = None  # (``pack``'s last request and plan)
         self._items: dict[tuple[int | tuple[str, int], int], list] = {}  # (a program's items, per sequence: ``_program``)
         self._static_s: dict[tuple[int, float], float] = {}  # (``_layer_static`` by layer and sub-chunks)
@@ -441,13 +444,16 @@ class ChunkPrefill:
         code pages come back before its next dispatch, whoever runs it)."""
         self.lib.set_params({**params, PACE: self.pace_ready()} if self.paced else params)
         self.ov.ready()
-        budget = PEER_PIECE_S if _native.turn_peers() else PIECE_BUDGET_S  # (another process's requests wait less)
+        # (another process's requests wait less, and so do the model's other sequences' steps: ``guest``)
+        peers = _native.turn_peers() or (self.guest is not None and self.guest.waiting())
+        budget = PEER_PIECE_S if peers else PIECE_BUDGET_S
         cut = ("splits", T, p0, self.pace, budget)  # (a packed or tree chunk's: its size's, the same items per layer)
         if cut not in self._est:
             self._est[cut] = self._splits(T, p0, budget)
         self.dispatches = self.lib.run(self._program(T if key is None else key),
                                        splits=[*self._est[cut], *(hooks or {})],
-                                       bufs=list({id(b): b for b in self._buffers().values()}.values()), hooks=hooks)
+                                       bufs=list({id(b): b for b in self._buffers().values()}.values()), hooks=hooks,
+                                       guest=self.guest)
         self.ov.dev.stale = True  # (another hardware context ran: the overlay's code pages again before its next dispatch)
         self.ov.vring.from_prefill.update(self.kv_layers)
 

@@ -3,6 +3,7 @@ steps, the output rows of prompts (``Readout``) and the packed chunks of several
 dispatches. Its generation in rounds of drafts: ``speculative.SpeculativeMixin``; its lanes, where its overlay holds
 several sequences: ``lanes``."""
 
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -59,8 +60,9 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     options (``LANE_SHARED``), a sequence's state, counters, drafter calibration and planner each (``LANE_OWN``).
     Each lane is driven by one thread at a time. Its generation's rounds share their dispatches with the other lanes'
     (``_joined``); a lane's other calls on the device (a prompt, the state copies, single steps) hold it alone
-    (``lanes.alone``), so the lanes' decode rounds wait for a prompt's end. After a failed dispatch a lane's calls raise
-    ``lanes.DeviceFailed`` until its ``recover``."""
+    (``lanes.alone``): a prompt lets the others in between its chunks, and the lanes' round between a chunk's pieces
+    (the prefill's ``guest``). After a failed dispatch a lane's calls raise ``lanes.DeviceFailed`` until its
+    ``recover``."""
 
     overlay: Any
     _w_out: np.ndarray  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
@@ -113,6 +115,15 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         """The model per sequence of its overlay (class docstring): lane 0 is the model object."""
         return self._lanes or (self,)
 
+    @property
+    def failed(self) -> bool:  # type: ignore[override]
+        """(several lanes: a dispatch failed, under any lane's work, and this lane has not started over)"""
+        return self._rounds is not None and self._rounds.down(self.seq)
+
+    def device(self) -> contextlib.AbstractContextManager[None]:
+        """(several lanes: ``lanes.Rounds.alone``, the lane's sequence selected)"""
+        return contextlib.nullcontext() if self._rounds is None else self._rounds.alone(self.seq)
+
     def _open_lanes(self) -> None:
         """The lanes of a model whose overlay holds several sequences (``lanes``), once it is loaded and its
         attributes are set: copies of the model, each attribute shared or a lane's own (``LANE_SHARED``, ``LANE_OWN``;
@@ -121,6 +132,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             return
         self._pool  # noqa: B018 (one for the lanes: made before the copies)
         self._rounds = Rounds(self.overlay)
+        if self.prefill is not None:  # (the lanes' steps between a chunk's pieces)
+            self.prefill.guest = self._rounds
         if unknown := sorted(set(vars(self)) - set(self.LANE_SHARED) - set(self.LANE_OWN)):
             raise TypeError(f"{type(self).__name__}: several sequences, and {', '.join(unknown)} neither shared by its "
                             f"lanes nor a lane's own (LANE_SHARED, LANE_OWN)")
@@ -431,6 +444,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             i += n
             if progress is not None:
                 progress(i)
+            if self._rounds is not None and i < len(tokens):  # (the other lanes' turn, between two chunks)
+                self._rounds.breathe(self.seq)
         return out
 
     def forward(self, tokens: list[int], *, progress: Callable[[int], None] | None = None) -> np.ndarray:

@@ -494,8 +494,29 @@ class ModelOverlay:
     def _join(self, parts: tuple[Part, ...]) -> tuple:
         """The sub-steps of a step of several sequences' slots (``parts``; the key of its transaction): each part's own
         (``subs``) from its first slot on. A model whose overlay runs such steps (``SEQ``) supplies it and
-        ``_set_parts``; their transactions are built at their first use (``prepare`` builds one sequence's)."""
+        ``_set_parts``."""
         raise NotImplementedError
+
+    def _joint_subs(self, S: int) -> set[tuple]:
+        """The sub-step patterns (``_join``) of every step of S slots of two or more sequences: each way to deal the
+        slots to them, each part at each kind of position (``subs`` over ``period``)."""
+        at: dict[int, dict[tuple, int]] = {}  # (per part size: a position per pattern of its own sub-steps)
+        for n in range(1, S):
+            for p in range(self.period):
+                at.setdefault(n, {}).setdefault(self.subs(p, n), p)
+        out: set[tuple] = set()
+
+        def deal(left: int, parts: tuple[Part, ...]) -> None:
+            if not left:
+                out.add(self._join(parts))
+                return
+            if len(parts) < self.sequences:
+                for n in range(1, min(left, S - 1) + 1):
+                    for p in at[n].values():
+                        deal(left - n, (*parts, Part(len(parts), p, n)))
+
+        deal(S, ())
+        return out
 
     def _set_position(self, st: Any, p: int, ahead: bool = False) -> bool:
         """A step's position-dependent objects and transfers (the patches of its transaction ``st``). ``ahead``: while
@@ -551,10 +572,12 @@ class ModelOverlay:
 
     def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
         """Build the transactions of a step of S slots (from layer ``start`` on: one per pattern of sub-steps over the
-        positions, ``period``) and its metadata ahead (a step builds them at its first use)."""
+        positions, ``period``; an overlay of several sequences: those of their joint steps too, which run with logits)
+        and its metadata ahead (a step builds them at its first use)."""
         start = self._mode(start)
         self._meta_of(S)
-        for subs in {self.subs(p, S) for p in range(self.period)}:
+        joint = self._joint_subs(S) if self.sequences > 1 and logits else set()
+        for subs in {self.subs(p, S) for p in range(self.period)} | joint:
             for b in range(2 if self.AHEAD and self.AHEAD_PREPARED else 1):
                 self._transaction(self._key(S, logits, subs, b))
 

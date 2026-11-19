@@ -71,7 +71,9 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("-n", "--n-predict", type=int, default=-1,
                      help="tokens to generate when a request does not say (default: -1, until an end-of-sequence "
                           "token or a full KV cache)")
-    gen.add_argument("-np", "--parallel", type=int, default=1, help="sequences at a time (1 only: the NPU runs one)")
+    gen.add_argument("-np", "--parallel", type=int, default=1,
+                     help="sequences at a time (default: 1): requests that meet generate together, each with KV "
+                          "caches of -c positions (Llama 3.x and Qwen3; another model serves one at a time)")
     gen.add_argument("--cache-prompt", action=argparse.BooleanOptionalAction, default=True,
                      help="continue from the prefix a prompt shares with the cached tokens (default: on)")
     gen.add_argument("-cram", "--cache-ram", type=int,

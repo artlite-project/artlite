@@ -103,6 +103,7 @@ class Llama(Model):
     load. ``kv_k``: the KV caches' K precision ("single": one bfp16 block per 8 dims, "hilo": two)."""
 
     name = "Llama 3"
+    parallel = True
 
     def __init__(self, path: str, *, kv_k: str = "single"):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)

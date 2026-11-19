@@ -33,6 +33,7 @@ class Qwen3(Model):
     designs load. ``kv_k``: the KV caches' K precision ("hilo": two bfp16 blocks per 8 dims, the default; "single")."""
 
     name = "Qwen3"
+    parallel = True
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True

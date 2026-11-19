@@ -48,8 +48,8 @@ def main(argv: list[str] | None = None, *, report: Report | None = None) -> None
     p = arg_parser()
     args = p.parse_args(argv)
     explicit = given(argv)
-    if args.parallel != 1:
-        p.error("-np/--parallel: only 1 (the NPU runs one sequence at a time)")
+    if args.parallel < 1:
+        p.error("-np/--parallel: 1 at least")
     setup_logging(args, child=report is not None)
     if report is None:  # (a router's children: its checks, under its mode)
         if stale := stale_install():
@@ -103,10 +103,15 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
         model = open_model(args.model, chat_template=template, **{k: v for k, v in opts.items() if v is not None})
         if args.reasoning == "on" and not model.thinks:
             log.warning("%s has no thinking mode: --reasoning on has no effect", model.name)
-        npu = model.load(capacity=n_ctx, prefill=not args.no_prefill)
-        npu.lookup = args.lookup
-        if args.spec_draft_n_max is not None:
-            npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
+        if args.parallel > 1 and not model.parallel:
+            log.warning("%s holds one sequence on the NPU: -np %d serves its requests one at a time", model.name,
+                        args.parallel)
+        several = {"sequences": args.parallel} if args.parallel > 1 and model.parallel else {}
+        npu = model.load(capacity=n_ctx, prefill=not args.no_prefill, **several)
+        for lane in npu.lanes:
+            lane.lookup = args.lookup
+            if args.spec_draft_n_max is not None:
+                lane.DRAFTS = min(lane.DRAFTS, args.spec_draft_n_max)
         log.info("%s (%s): loaded in %.1f s: %s%s", name, model.name, time.perf_counter() - t0, npu.describe(),
                  memory_note())
         return model, npu

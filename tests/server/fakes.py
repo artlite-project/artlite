@@ -239,10 +239,13 @@ class FakeNpu(NpuModel):
     "ok"); ``seq``: the tokens at the cached positions; ``fail``: an exception for forward to raise. ``group``: rewinds
     keep multiples of it; ``exact``: all positions or none (Qwen: recurrent); ``chunk``: prompt tokens per dispatch;
     ``delay``: seconds per dispatch. A checkpoint is the tokens before its position, the records the tokens of their
-    positions: a restore checks that the device holds the checkpoint's tokens."""
+    positions: a restore checks that the device holds the checkpoint's tokens. ``lanes``: the sequences it holds, each
+    a fake of its own (their replies, calls and positions theirs)."""
 
     def __init__(self, model: FakeModel, *, capacity: int = 512, group: int = 4, exact: bool = False, chunk: int = 8,
-                 delay: float = 0.0, drafts: int = 0):
+                 delay: float = 0.0, drafts: int = 0, lanes: int = 1):
+        self._lanes = (self, *(FakeNpu(model, capacity=capacity, group=group, exact=exact, chunk=chunk, delay=delay,
+                                       drafts=drafts) for _ in range(lanes - 1)))
         self.tok = model.tokenizer
         self.eos_token_ids = model.eos_token_ids
         self.capacity, self.group, self.exact, self.chunk, self.delay = capacity, group, exact, chunk, delay
@@ -256,6 +259,10 @@ class FakeNpu(NpuModel):
         self.calls: list[tuple] = []
         self.fail: Exception | None = None  # what forward raises
         self._next: Iterator[int] = iter(())
+
+    @property
+    def lanes(self) -> "tuple[FakeNpu, ...]":
+        return self._lanes
 
     @property
     def replies(self) -> list[list[str]]:

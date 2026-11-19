@@ -12,7 +12,7 @@ from models import open_model
 from models.npu_model import NpuModel
 from models.sampling import Sampling
 
-from ..common import essay
+from ..common import essay, essays
 from ..model_files import llama_path
 
 pytestmark = pytest.mark.slow  # whole models on the NPU: run with --run-slow
@@ -59,3 +59,34 @@ def test_lanes_greedy(quant: str, size: str) -> None:
             assert max(n for r in hist if len(r.parts) == 2 for _, n, _ in r.parts) == 2
         # (a lane counts the steps it had a part in)
         assert sum(lane.dispatches - d for lane, d in zip(npu.lanes, d0, strict=True)) > len(hist)
+
+
+def test_lanes_prompt_beside_decode() -> None:
+    """A long prompt on one lane while another generates: the generating lane keeps getting steps, between the
+    prompt's chunk's pieces (the chunk lends the NPU: ``Rounds.lend``), and both lanes' tokens are those of each
+    alone."""
+    model = open_model(llama_path("Q4_K_M", "1B"))
+    npu = model.load(capacity=4096, sequences=2)
+    a, b = npu.lanes
+    text = essays()
+    short = model.chat([{"role": "user", "content": "Summarize this text in a few sentences:\n\n" + text[:1200]}])
+    long = model.chat([{"role": "user", "content": "List the main claims of this text:\n\n" + text[1200:14000]}])
+    assert 2500 < len(long) < 3800
+
+    def reply(lane: NpuModel, ids: list[int], n: int, wait: float = 0.0, during: list[int] | None = None) -> list[int]:
+        time.sleep(wait)
+        lane.reset()
+        k = len(npu._rounds.history)
+        logits = lane.forward(ids)
+        if during is not None:
+            during.append(len(npu._rounds.history) - k)
+        return list(lane.generate(logits, n, GREEDY, ids, drafts=0))
+
+    want = [reply(a, short, 160), reply(a, long, 32)]
+    during: list[int] = []
+    with ThreadPoolExecutor(2) as pool:
+        jobs = [pool.submit(reply, a, short, 160), pool.submit(reply, b, long, 32, 0.4, during)]
+        got = [j.result(timeout=120) for j in jobs]
+    print(f"{len(long)} prompt tokens beside a generation: {during[0]} of its rounds ran during the prompt")
+    assert got == want
+    assert during[0] >= 3, during

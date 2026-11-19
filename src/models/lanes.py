@@ -27,7 +27,11 @@ run: each request gets copies (a screened head's: ``Screened.take``), valid unti
 The device alone. A prompt's chunks and steps, the state copies and every other dispatch of one sequence run with the
 device held (``alone``: re-entrant per thread, the lane's sequence selected first, ``ModelOverlay.select``), in arrival
 order with the rounds: a round and a holder never overlap, and a waiting holder goes before the next round is
-assembled. The selection means something only there: a round's step names its sequences itself.
+assembled. The selection means something only there: a round's step names its sequences itself. A long holder lets
+the others in between two parts of its work: whoever waits, between a prompt's chunks (``breathe``), and the lanes'
+round between a chunk's pieces (``lend``, ``waiting``: the chunk then runs in short pieces,
+``artlite.prefill.chunks.PEER_PIECE_S``) once the holder has had the device for as long as the round's step takes, so
+a prompt and the lanes that generate beside it take turns of about the same time.
 
 Failures. A dispatch that fails leaves the device in a state nobody knows, for every sequence (a step's rings are
 marked before it ends): the error goes to every lane of the round, and every lane's calls raise ``DeviceFailed`` until
@@ -139,6 +143,8 @@ class Rounds:
         self._busy: frozenset[int] = frozenset()
         self._owner: int | None = None  # (the thread that has the device alone, and how deep)
         self._depth = 0
+        self._lent = False  # (that thread lets the waiting round run now: ``lend``)
+        self._failures = 0
         self._free = 0.0  # (when the device was last given back)
         self._step_s = 0.0  # (the last round's dispatch)
         self._failure: BaseException | None = None  # (the last failed dispatch's error)
@@ -172,6 +178,10 @@ class Rounds:
         """Whether the calling thread has the device alone."""
         return self._owner == threading.get_ident()
 
+    def down(self, seq: int) -> bool:
+        """Whether lane ``seq`` has not started over since a dispatch failed (its calls raise ``DeviceFailed``)."""
+        return seq in self._down
+
     def join(self, seq: int, args: tuple, position: int, n: int) -> Request:
         """Lane ``seq``'s round of n slots at ``position`` (``Request``), in a step with the other lanes' rounds; blocks
         until its rows are there. ``DeviceFailed``: the step failed, or a dispatch failed before and the lane has not
@@ -202,7 +212,7 @@ class Rounds:
                     del self._pending[seq]
                     if not self._pending:
                         self._queue.remove(_ROUND)
-                        self._queued = False
+                        self._queued = self._lent = False
                     cv.notify_all()
         if req.error is not None:
             raise DeviceFailed(f"a decode step failed ({type(req.error).__name__}: {req.error}): the device's "
@@ -248,6 +258,58 @@ class Rounds:
                     self._owner, self._free = None, time.perf_counter()
                     cv.notify_all()
 
+    def breathe(self, seq: int) -> None:
+        """(by the thread that has the device alone for lane ``seq``, between two parts of its work) Whoever waits
+        for the device runs first - the holders that came, the lanes' round -, then the thread has it again, its
+        sequence selected. Nothing where nobody waits, or inside another holder of the thread's own."""
+        cv, me = self._cv, threading.get_ident()
+        with cv:
+            if self._depth != 1 or not self._queue:
+                return
+            assert self._owner == me
+            ticket = object()
+            self._queue.append(ticket)
+            self._owner, self._free = None, time.perf_counter()
+            cv.notify_all()
+            error: BaseException | None = None
+            while True:  # (the thread has the device again before it goes on, an interrupt's exception too: the
+                # context that holds it gives it back)
+                try:
+                    while self._running or self._owner is not None or (error is None and self._queue[0] is not ticket):
+                        cv.wait()
+                    break
+                except BaseException as e:  # noqa: BLE001
+                    error = error or e
+            self._queue.remove(ticket)
+            self._owner, self._depth = me, 1
+            cv.notify_all()
+            if error is not None:
+                raise error
+            self._check(seq)
+        self.overlay.select(seq)
+
+    def waiting(self) -> bool:
+        """Whether lanes' requests wait for a round (a holder's question between two of its dispatches)."""
+        return bool(self._pending)
+
+    def lend(self) -> None:
+        """(by the thread that has the device alone, between two of its dispatches, which were another hardware
+        context's) The round of the requests that wait runs now, as it is, if the thread has had the device for a
+        step's time since the last one; then the thread has it again. ``DeviceFailed``: the round's step failed."""
+        cv = self._cv
+        with cv:
+            if not self._pending or time.perf_counter() - self._free < self._step_s:
+                return
+            assert self._owner == threading.get_ident()
+            self.overlay.dev.stale = True  # (its cores' code pages come back before the step)
+            self._lent, failures = True, self._failures
+            cv.notify_all()
+            while self._lent or self._running:
+                cv.wait()
+            if self._failures != failures:
+                e = self._failure
+                raise DeviceFailed(f"a decode step failed beside the device's holder ({type(e).__name__}: {e})") from e
+
     def recover(self, seq: int) -> None:
         """After a failure: lane ``seq``'s calls run again (the caller starts its sequence over)."""
         with self._cv:
@@ -269,6 +331,7 @@ class Rounds:
         for s in seqs:
             self.overlay._vrings[s].clear()
         self._failure, self._down = error, set(range(self.overlay.sequences))
+        self._failures += 1
         for r in self._pending.values():
             r.error, r.done = error, True
         self._pending.clear()
@@ -285,7 +348,10 @@ class Rounds:
 
     def _due(self) -> float | None:
         """Seconds until the calling lane, whose request is pending, runs the round: 0 now (the device is free, the
-        round's turn has come, every expected lane asked or is late); None: not before another thread's notify."""
+        round's turn has come, every expected lane asked or is late; or its holder lends it: ``lend``); None: not
+        before another thread's notify."""
+        if self._lent:
+            return 0.0
         if self._running or self._owner is not None or self._queue[0] is not _ROUND:
             return None
         if not self._expected:
@@ -308,19 +374,22 @@ class Rounds:
         """Run the round (the calling thread holds the lock, which the dispatch gives up): the expected lanes that did
         not ask are passed over, the admitted requests get their rows or the step's error."""
         cv = self._cv
-        late = tuple(sorted(self._expected))
-        self._expected.clear()
+        late: tuple[int, ...] = ()
+        lent, self._lent = self._lent, False
+        if not lent:  # (a holder's pause: the round does not wait, and the lanes that have not asked are not late)
+            late = tuple(sorted(self._expected))
+            self._expected.clear()
         reqs = self._admit()
         for r in reqs:
             del self._pending[r.seq]
-        self._queue.popleft()
+        self._queue.remove(_ROUND)
         if self._pending:
             self._queue.append(_ROUND)
         else:
             self._queued = False
         self._running, self._busy = True, frozenset(r.seq for r in reqs)
         start = time.perf_counter()
-        idle = start - max(self._free, min(r.asked for r in reqs))
+        idle = 0.0 if lent else start - max(self._free, min(r.asked for r in reqs))
         error: BaseException | None = None
         wall = seconds = once = 0.0
         cv.release()

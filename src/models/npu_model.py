@@ -1,6 +1,7 @@
 """A model on the NPU as the tools and the server drive it (``NpuModel``: a prompt's logits, steps, the generation loop,
 a sequence's state as host copies: ``Checkpoint`` and the KV records) and the default KV cache capacity."""
 
+import contextlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -39,7 +40,10 @@ class NpuModel:
     host work on their inputs, ``dispatches``: their count.
 
     A sequence's state as host copies (a prompt cache's): ``checkpoint`` / ``restore`` (the state at a position besides
-    the KV records), ``read_records`` / ``write_records`` (the records of positions)."""
+    the KV records), ``read_records`` / ``write_records`` (the records of positions).
+
+    A model that holds several sequences is one of its ``lanes`` (the model per sequence: each a model as this one,
+    driven by one thread at a time); ``device`` gives a caller the NPU between their dispatches."""
 
     cfg: Any  # the model file's configuration (``artlite.model_config``: ``hidden_size``, ``rms_norm_eps``, ...)
     capacity: int  # KV cache positions
@@ -56,6 +60,17 @@ class NpuModel:
     generates = True  # False: a readout model's (``models.readouts.readout_model``: its image holds no LM head): its
     # prompts' rows only (``outputs``, ``readouts``), no logits, no tokens
     DRAFTS = 0  # draft tokens per step at most (0: steps of one token)
+    failed = False  # a dispatch failed and the sequence has not started over (``recover``): the model's calls raise
+
+    @property
+    def lanes(self) -> "tuple[NpuModel, ...]":
+        """The model per sequence it holds: itself, and with several sequences each other one's."""
+        return (self,)
+
+    def device(self) -> contextlib.AbstractContextManager[None]:
+        """The NPU to the caller alone (a context): no dispatch of the model's other lanes runs inside (what runs
+        another hardware context on the device, an encoder, takes it)."""
+        return contextlib.nullcontext()
 
     def prepare(self, prompt_len: int) -> None:
         """Compile and open what a prompt of ``prompt_len`` tokens needs (before it is timed)."""

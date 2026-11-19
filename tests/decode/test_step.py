@@ -1,12 +1,14 @@
 """The decode overlays' host-side step machinery (``decode/model.py``, ``decode/step.py``, ``decode/vring.py``): the
 transaction cache's key, the patch-ahead state, snapshots, the AHEAD contract. No NPU."""
 
+import itertools
+
 import numpy as np
 import pytest
 
 from artlite.decode.model import AheadStep, HostRecords, ModelOverlay, Snapshot, StepKey, nbytes_of
 from artlite.decode.step import Part, slots_of
-from artlite.decode.vring import RingStateError, VRing
+from artlite.decode.vring import PAIR, RingStateError, VRing, substeps
 
 
 def test_step_key_and_ahead_state() -> None:
@@ -34,6 +36,44 @@ def test_sequences_need_buffers() -> None:
     """An overlay whose model keeps nothing per sequence on the device (``SEQ``) holds one."""
     with pytest.raises(ValueError, match="holds one"):
         ModelOverlay(None, layers=None, vocab=None, weights=None, sequences=2)
+
+
+def test_joint_patterns() -> None:
+    """The sub-step patterns of several sequences' steps of S slots (``ModelOverlay._joint_subs``, built ahead by
+    ``prepare``): every way to cut S slots into two or more runs, whatever the sequences' count from two on (a part
+    that crosses a pair of records is two sub-steps, as two parts are); with those of one sequence's steps, every
+    way to cut S slots."""
+
+    class Pairs(ModelOverlay):
+        SEQ = ("KV",)
+        period = PAIR
+
+        def __init__(self, sequences: int):
+            self.sequences = sequences
+
+        def subs(self, p: int, S: int) -> tuple:
+            return tuple(substeps(p, S, PAIR, 4))
+
+        def _join(self, parts: tuple[Part, ...]) -> tuple:
+            out, a0 = [], 0
+            for q in parts:
+                out += [(a0 + a, n) for a, n in self.subs(q.position, q.n)]
+                a0 += q.n
+            return tuple(out)
+
+    def cuts(S: int) -> set[tuple]:
+        out = set()
+        for mask in range(1 << (S - 1)):
+            edges = [0, *(i + 1 for i in range(S - 1) if mask >> i & 1), S]
+            out.add(tuple((a, b - a) for a, b in itertools.pairwise(edges)))
+        return out
+
+    for sequences in (2, 3, 4):
+        ov = Pairs(sequences)
+        for S in range(1, 5):
+            joint = ov._joint_subs(S)
+            assert joint == {u for u in cuts(S) if len(u) > 1}, (sequences, S)
+            assert joint | {ov.subs(p, S) for p in range(PAIR)} == cuts(S)
 
 
 def test_snapshot_bytes() -> None:

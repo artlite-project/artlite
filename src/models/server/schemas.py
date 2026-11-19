@@ -42,6 +42,7 @@ class GenerationRequest(BaseModel):
     stop: str | list[str] | None = None
     n: int | None = 1
     cache_prompt: bool | None = None
+    id_slot: int | None = None  # (llama-server's: the sequence that runs it, of -np; -1: any)
     return_progress: bool | None = False
     timings_per_token: bool | None = False
     sse_ping_interval: float | None = None

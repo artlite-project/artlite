@@ -14,7 +14,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 
@@ -158,6 +158,19 @@ _PIECES = Pieces()
 _native.set_heap_reclaim(_PIECES.release)
 
 
+class Guest(Protocol):
+    """Other work of the process on the NPU that a program lets in between two of its pieces (``Library.run``):
+    dispatches of another hardware context, run by other threads."""
+
+    def waiting(self) -> bool:
+        """Whether it waits for the NPU."""
+        ...
+
+    def lend(self) -> None:
+        """Run what waits (the program's pieces so far have ended); returns once the NPU is the program's again."""
+        ...
+
+
 class Library(FusedElf):
     LIBRARY = True
     # bytes of assembled pieces kept for programs run again: every piece of a prefill's chunk sizes at both parities
@@ -234,7 +247,7 @@ class Library(FusedElf):
             _PIECES.ensure(self._device)
 
     def run(self, items: Sequence[Item], *, splits: Iterable[int] = (), bufs: Sequence[Any],
-            hooks: Mapping[int, Callable[[], None]] | None = None) -> int:
+            hooks: Mapping[int, Callable[[], None]] | None = None, guest: Guest | None = None) -> int:
         """Dispatch the program of ``items`` (``items()``; consecutive items of one design share its configuration): a
         new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed the
         process's piece BOs (``Pieces``). ``bufs``: the data BOs the items address. ``hooks``: per item index of
@@ -247,21 +260,23 @@ class Library(FusedElf):
         wake-up and the submit), unless another process uses the NPU (``_native.turn_peers``): then the previous one
         ends first, and if that process waits for the NPU's turn (``overlay.npu_turn``) its dispatches run before this
         one (each piece configures the array again), so that it waits for one piece at most, not also for one queued
-        behind it. The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
+        behind it. ``guest``: other work of this process that waits for the NPU (several sequences' decode steps beside a
+        prompt's chunk): where it waits at a piece's start, the previous piece ends first as well, and it runs
+        (``Guest.lend``) before the piece. The calling thread runs on the CPU that takes the NPU's interrupts meanwhile
         (``irq_cpu``): it waits there (napping, then polling from shortly before the piece's shortest seen end), and the
         host work between pieces runs on that warm core (a thread let go after each wait ran it ~2.5x slower, on a CPU
         the scheduler woke for it)."""
         cpu = irq_cpu()
         with portable.on_cpu(cpu), _PIECES.lock:
             try:
-                return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu)
+                return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu, guest=guest)
             except BaseException:  # (a hook's exception: the pieces dispatched end first, and with them the NPU's turn)
                 with contextlib.suppress(_native.DispatchError):
                     self._kernel().dispatch_wait()
                 raise
 
     def _run(self, items: Sequence[Item], *, splits: Iterable[int], bufs: Sequence[Any],
-             hooks: Mapping[int, Callable[[], None]] | None, cpu: int) -> int:
+             hooks: Mapping[int, Callable[[], None]] | None, cpu: int, guest: Guest | None = None) -> int:
         asm = self.load()._asm
         kern = self._kernel()
         limit = _PIECES.ensure(self._device)
@@ -310,11 +325,14 @@ class Library(FusedElf):
             bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
                 hooks[a]()
-            if last is not None and _native.turn_peers():  # (none queued ahead of another process's turn)
+            ours = last is not None and guest is not None and guest.waiting()
+            if last is not None and (ours or _native.turn_peers()):  # (none queued ahead of another's turn)
                 end = wait(last, 0)
                 last = None
-                if _native.turn_contended():  # (its dispatches between the pieces)
+                if _native.turn_contended():  # (another process's dispatches between the pieces)
                     _native.turn_pass()
+                if ours:  # (this process's)
+                    guest.lend()
             with npu_turn():  # (the piece's submit time: once the turn is this process's)
                 submit = time.perf_counter()
                 kern.dispatch_elf_async(bo, refs, piece.nbytes)

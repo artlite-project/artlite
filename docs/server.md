@@ -413,7 +413,8 @@ curl http://127.0.0.1:8080/tts -H "Content-Type: application/json" -d '{"input":
 ## Requests
 
 With `-m`, the model loads after the server starts; until then the API answers 503 `Loading model`, which the UI
-retries. A model's requests run one at a time, in arrival order; a waiting stream gets pings. A client that goes away, the UI's Stop
+retries. A model's requests run one at a time, in arrival order (several at a time with `-np`:
+[below](#several-requests-at-a-time)); a waiting stream gets pings. A client that goes away, the UI's Stop
 button and the shutdown stop a request at its next token or prompt chunk.
 
 A chat's next turn continues from the KV cache: the server keeps the prefix a prompt shares with the cached tokens,
@@ -434,6 +435,35 @@ back (`reasoning_content`, as the web UI does). Where they are dropped (Qwen3.5'
 `--no-reasoning-preserve`), the next user message renders the last answer from its start otherwise: the server also
 saves the state where each prompt's last message begins, and a turn continues from there. A request's
 `cache_prompt: false` starts from an empty cache.
+
+### Several requests at a time
+
+With `-np N`, Llama 3.x and Qwen3 serve up to N requests at a time. The NPU holds N sequences, each with KV caches of
+`-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the requests that
+generate share their decode steps. A step streams the weights once for 4 tokens: with one request those are its token
+and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a queue:
+
+| tokens per second | one request | 2 at a time | 4 at a time |
+|---|---|---|---|
+| Llama 3.2 1B Q4_K_M | 82 | 135 | 226 |
+| Llama 3.1 8B Q4_K_M | 14.6 | 25.3 | 43.7 |
+
+(`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
+tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
+depend on what shares its step, and a request's `seed` draws for that request alone. Deep in a context the gain is
+smaller, as every sequence reads its own KV cache in each step: four sequences at 16K positions give 1.9x one's tokens
+per second on Llama 3.2 3B.
+
+- A request takes the sequence it names (`id_slot`, as llama-server's), else an idle one whose prompt cache holds at
+  least half of its prompt (a conversation's next turn continues where it is), else the least recently used; more
+  requests than sequences wait in arrival order. `/slots` lists the sequences, `/props` counts them (`total_slots`).
+- A prompt and the requests that generate take turns on the NPU, of about the same time each: beside a generating
+  request, a prompt of 2000 tokens takes 2.2 s instead of 1.25 s on Llama 3.1 8B, and the generating request gets 5
+  tokens per second during it instead of 12.5 (a token every 0.2 s at most).
+- Draft tokens share a step's 4 slots with the other requests: two requests have a draft each, three or more none.
+- The prompt cache's RAM (`--cache-ram`) is split evenly between the sequences.
+- Embeddings, reranks and the other requests that are no chat run on sequence 0, between the others' steps.
+- Another model serves `-np N` one request at a time (a line in the log says so).
 
 ## Several models (router mode)
 
@@ -577,7 +607,7 @@ Generation:
 |---|---|
 | `-c N`, `--ctx-size` | KV cache positions, rounded up to a power of two >= 4096 (default 0: 32768, at most the model's context) |
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
-| `-np N`, `--parallel` | sequences at a time (1 only: the NPU runs one) |
+| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x and Qwen3](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3, Flint past 16384 positions; default 32) |

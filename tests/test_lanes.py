@@ -1,9 +1,10 @@
 """Several lanes of one model (models/lanes.py: ``Rounds``; ``OverlayModel``'s lanes) on a stub overlay whose step
 gives each slot the row of its sequence and position, in a buffer the next step overwrites and with two dispatches at
 once refused: the lanes' attributes; generations on threads of their own against each alone (their rounds' parts and
-slots); a reader that stops, a lane that is always late, rows read late; a prompt between the rounds; more lanes than
-slots; failed dispatches. No NPU."""
+slots); a reader that stops, a lane that is always late, rows read late; a prompt between the rounds, and the rounds
+between a prompt's chunks; more lanes than slots; failed dispatches. No NPU."""
 
+import itertools
 import threading
 import time
 from collections.abc import Callable
@@ -74,21 +75,61 @@ class Overlay:
             self._busy.release()
 
 
+class Prefill:
+    """A prefill of chunks of 16 tokens (from a multiple of 8 on) on the stub overlay: a chunk is two pieces, each a
+    dispatch of its own, in the overlay's ``ran`` as the selected sequence's part of 16 slots; between them the
+    chunk lets its ``guest`` in (``artlite.operators.fused.library.Guest``: the lanes' round), if it waits."""
+
+    group, dispatches, guest = 8, 2, None
+
+    def __init__(self, ov: Overlay):
+        self.ov = ov
+
+    def plan(self, p0: int, n: int, *, steps: bool = True) -> list[int]:
+        return [16] * (n // 16) if p0 % 8 == 0 else []
+
+    def prepare(self, position: int, n: int) -> None:
+        pass
+
+    def run(self, x: np.ndarray, position: int, T: int) -> None:
+        ov = self.ov
+        for piece in range(2):
+            if piece and self.guest is not None and self.guest.waiting():
+                self.guest.lend()
+            assert ov._busy.acquire(blocking=False), "two dispatches at once"
+            try:
+                ov.ran.append((Part(ov.seq, position, T),))
+                time.sleep(2 * ov.delay)
+            finally:
+                ov._busy.release()
+
+
 class Lanes(OverlayModel):
-    """A model of a lane per text on the stub overlay: lane s's next token after position p is texts[s][p + 1]."""
+    """A model of a lane per text on the stub overlay: lane s's next token after position p is texts[s][p + 1];
+    ``prefill``: prompts in chunks (``Prefill``), else as decode steps."""
 
     eos_token_ids = (0,)
     capacity = 256
     prefill = None
 
-    def __init__(self, texts: list[list[int]], *, delay: float = 0.0, lookup: bool = False):
+    def __init__(self, texts: list[list[int]], *, delay: float = 0.0, lookup: bool = False, prefill: bool = False):
         self.overlay = Overlay(texts, delay)
         self.lookup = lookup
+        if prefill:
+            self.prefill = Prefill(self.overlay)
         self.position = 0
         self._open_lanes()
 
     def _step_inputs(self, tokens: list[int]) -> tuple:
         return (np.asarray(tokens, np.float32).reshape(-1, 1),)
+
+    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
+        return self._step_inputs(tokens)
+
+    def _chunk_logits(self, token: int, n: int) -> np.ndarray:
+        out = np.full(VOCAB, -8.0, np.float32)
+        out[self.text[self.position + n]] = 8.0
+        return out
 
     @alone
     def reset(self) -> None:
@@ -251,6 +292,26 @@ def test_prompt_between_rounds() -> None:
     assert len(prompt) == 10 and prompt == list(range(prompt[0], prompt[0] + 10)), prompt
     assert all(len(ran[i]) == 1 for i in prompt) and ran[prompt[0] - 1][0].seq == 0  # (a's rounds ran before it)
     assert any(len(parts) == 2 for parts in ran[prompt[-1]:])
+
+
+def test_rounds_between_chunks() -> None:
+    """A prompt in prefill chunks while another lane generates: between two chunks, and between a chunk's two
+    pieces, the other lane's round runs (one step each time: the prompt came first), and no dispatch overlaps a
+    piece; the prompt's lane then generates."""
+    m = Lanes(texts(2, 120), delay=0.002, prefill=True)
+    a, b = m.lanes
+
+    def late() -> list[int]:
+        time.sleep(0.03)
+        return b.reply(96)  # (6 chunks)
+
+    assert run(a.reply, late) == [a.text[P:], b.text[96:]]
+    ran = m.overlay.ran
+    pieces = [i for i, parts in enumerate(ran) if parts[0].n == 16]
+    assert [ran[i][0] for i in pieces] == [Part(1, 16 * (k // 2), 16) for k in range(12)]
+    assert [j - i for i, j in itertools.pairwise(pieces)] == [2] * 11, pieces  # (a round between two pieces)
+    assert all(len(ran[i + 1]) == 1 and ran[i + 1][0].seq == 0 for i in pieces[:-1])
+    assert m.overlay.dev.stale  # (a chunk's other hardware context ran: the overlay's pages before its next step)
 
 
 def test_more_lanes_than_slots(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -46,6 +46,9 @@ the weights; both give the same token ids for Llama 3. The chat template is the 
 - The KV cache (`-c`, up to the model's 131072 positions) holds K and V in bfp16ebs8: 18 KB per position for 1B,
   64.5 / 73.7 KB for 3B / 8B (2.4 / 8.5 / 9.7 GB at 128K). `--kv-k hilo` stores K as bfp16 hi + lo blocks: 1.5x the
   cache and its read time at long contexts, with no measured quality gain for Llama.
+- Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches, and a decode step's 4
+  slots are tokens of the requests that generate, each in its own cache (`models/lanes.py`): 4 requests at 2.8x
+  (1B) and 3.0x (8B) one request's tokens per second ([artlite-server](../server.md#several-requests-at-a-time)).
 
 Time to first token at 1K / 8K / 32K prompt tokens: 1B Q4_0 0.109 / 1.07 / 8.59 s, 3B Q4_K_M 0.305 / 2.78 / 19.1 s,
 8B Q4_K_M 0.653 / 6.16 / 40.9 s; a 48-token chat prompt: 1B Q4_0 35 ms, 3B 70 ms, 8B 129 ms. Decode per token after a

@@ -99,11 +99,18 @@ class Job:
     n_probs: int = 0  # per sampled token its probability and the n_probs most likely ones' (0: none; ``prob_entry``)
     post_sampling: bool = False  # the probabilities the sampler drew from (its candidates), not the model's
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
+    lane: int | None = None  # the engine's lane it runs on (llama-server's id_slot; None: the engine's choice, then set)
     name: str = ""  # for the log
     cancel: threading.Event = field(default_factory=threading.Event)
     state: str = "queued"  # queued, prompt, generating, done
     kept: int = 0  # the prompt's cached tokens (the prefix it continued from)
     n_gen: int = 0  # tokens generated so far
+    # (the engine's: when it came, the jobs that ran or waited then, the seconds it waited for a lane; per idle lane
+    # what its cache keeps of the prompt)
+    arrived: float = 0.0
+    beside: int = 0
+    waited: float = 0.0
+    keeps: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass(eq=False)

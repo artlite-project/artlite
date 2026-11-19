@@ -21,18 +21,19 @@ from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
 from .textflow import ReasoningSplitter, StopMatcher
 
 if TYPE_CHECKING:
-    from .engine import Engine
+    from .engine import Engine, Lane
 
 log = logging.getLogger("artlite.server")
 
 
 class Generation:
-    """A job run on ``engine``'s worker: ``run``; its end is an event (``done``; ``Cancelled`` raised: the caller's
-    ``cancelled``, any other exception: its ``error``)."""
+    """A job run on a lane of ``engine`` (its worker; the lane's sequence of the model and prompt cache): ``run``; its
+    end is an event (``done``; ``Cancelled`` raised: the caller's ``cancelled``, any other exception: its
+    ``error``)."""
 
-    def __init__(self, engine: Engine, job: Job):
-        self.engine, self.job = engine, job
-        self.npu, self.model, self.cache = engine.npu, engine.model, engine.cache
+    def __init__(self, engine: Engine, job: Job, lane: Lane):
+        self.engine, self.job, self.lane = engine, job, lane
+        self.npu, self.model, self.cache = lane.npu, engine.model, lane.cache
         self.ids = job.ids
         self.gen: list[int] = []  # (the generation's tokens)
         self.finish = "length"
@@ -67,7 +68,7 @@ class Generation:
         if job.cancel.is_set():
             raise Cancelled
         self.t0 = time.perf_counter()
-        self.engine.begin()
+        self.engine.begin(self.lane)
         self.kept, last, how = self.cache.prepare(self.ids, enabled=job.cache_prompt)
         job.kept = self.kept
         npu = self.npu
@@ -243,7 +244,7 @@ class Generation:
         t2 = time.perf_counter()
         t = self._times(t2)
         done: Done = {"finish_reason": self.finish, "stop_word": self.stop.word, "timings": t, "n_prompt": len(ids),
-                      "n_cached": len(self.engine.cached), "n_calls": calls.calls if calls is not None else 0,
+                      "n_cached": len(self.cache.tokens), "n_calls": calls.calls if calls is not None else 0,
                       "probs": self.entries[self.sent:self.sampled]}
         job.emit("done", done)
         passes = max(npu.dispatches - d1, 1)
@@ -251,7 +252,10 @@ class Generation:
         drafts = f"; {t['draft_n']} draft tokens, {t['draft_n_accepted']} accepted" if "draft_n" in t else ""
         how = f" ({how})" if how else ""
         t1 = self.t1
-        log.info(f"{job.name}: {kept} cached tokens{how}; prompt: {len(ids) - kept} tokens in {t1 - self.t0:.2f} s "
+        # (how requests meet: the jobs that ran or waited when this one came, its wait for a lane)
+        came = f"{job.beside} beside it, waited {job.waited:.2f} s" if job.beside else "none beside it"
+        lane = f"lane {self.lane.index}, " if len(self.engine.lanes) > 1 else ""
+        log.info(f"{job.name} ({lane}{came}): {kept} cached tokens{how}; prompt: {len(ids) - kept} tokens in {t1 - self.t0:.2f} s "
                  f"({t['prompt_per_second']:.1f} tokens/s, {d1 - self.d0} dispatches); generation: {len(gen)} tokens "
                  f"in {t2 - t1:.2f} s ({t['predicted_per_second']:.2f} tokens/s): {passes} dispatches of "
                  f"{(npu.t_npu - t_npu1) / passes * 1e3:.1f} ms{host}{drafts}; finish: {self.finish}")

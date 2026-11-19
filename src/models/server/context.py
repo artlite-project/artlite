@@ -103,7 +103,9 @@ class ApiContext:
             raise not_supported("This model is an embedding / rerank model without text generation, use its routes "
                                 "(--embedding, --rerank)")
         if req.n not in (None, 1):
-            raise bad_request("n > 1 is not supported: one sequence at a time")
+            raise bad_request("n > 1 is not supported: a request gets one answer")
+        if req.id_slot is not None and not -1 <= req.id_slot < len(self.engine.lanes):
+            raise bad_request(f"id_slot {req.id_slot}: the server has {len(self.engine.lanes)} (-np)")
         if req.model and req.model != self.options.alias:  # (as llama-server: any)
             self.warn_once(("model", req.model), "requests for model %r: served by %r", req.model, self.options.alias)
         for name, value in (req.model_extra or {}).items():
@@ -222,7 +224,7 @@ class ApiContext:
                 inside=reasoning and opened, opened=opened, think=think,
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
                 progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark,
-                grammar=grammar, ban=ban)
+                grammar=grammar, ban=ban, lane=req.id_slot if req.id_slot is not None and req.id_slot >= 0 else None)
         try:
             self.engine.submit(j)
         except RuntimeError as e:
