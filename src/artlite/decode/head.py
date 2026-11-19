@@ -8,6 +8,7 @@ column's other tokens (``head_rows``). The model's logits come back in id order 
 
 import itertools
 import math
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 
@@ -98,7 +99,9 @@ class HeadView:
 class HeadTable:
     """A drafter head's tokens: ``ids`` (the token of each logit) and its table of the sequence's own (module docstring), of a
     ``view`` of the image (a drafter's image, ``HeadView``) for a model of ``vocab_size`` tokens; ``device``: the device that
-    holds the view's weights."""
+    holds the view's weights. A model of several lanes has one table, of the tokens its lanes saw last: its rows are
+    the drafter's alone (the model's logits come from none of them), so a lane's ``see`` beside another's step costs
+    that step's drafter a guess at most."""
 
     def __init__(self, view: object, vocab_size: int, device: Callable[[], object]):
         self.view, self.device = view, device
@@ -109,6 +112,7 @@ class HeadTable:
         self._fixed[view.fixed] = True
         idle = sorted(zip(self.ids[self.rows].tolist(), self.rows.tolist()), reverse=True)
         self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
+        self._lock = threading.Lock()  # (``see`` of a model's lanes: each on a thread of its own)
 
     def see(self, ids: Iterable[int]) -> None:
         """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
@@ -121,17 +125,18 @@ class HeadTable:
             return
         u, last = np.unique(a[::-1], return_index=True)
         order = u[np.argsort(-last)][-len(self.rows):].tolist()  # (the last ones, by their last occurrence)
-        lru = self._lru
-        for t in order:
-            if t in lru:
-                lru.move_to_end(t)  # (they stay: the others leave first)
-        new = [t for t in order if t not in lru]
-        for t in new:
-            lru[t] = lru.popitem(last=False)[1]
-        for t in order:
-            lru.move_to_end(t)
-        if new:
-            self._write([lru[t] for t in new], new)
+        with self._lock:
+            lru = self._lru
+            for t in order:
+                if t in lru:
+                    lru.move_to_end(t)  # (they stay: the others leave first)
+            new = [t for t in order if t not in lru]
+            for t in new:
+                lru[t] = lru.popitem(last=False)[1]
+            for t in order:
+                lru.move_to_end(t)
+            if new:
+                self._write([lru[t] for t in new], new)
 
     def _write(self, rows: list[int], tokens: list[int]) -> None:
         """The head's logits ``rows`` are the ``tokens``' now: their row tiles packed again, flushed."""

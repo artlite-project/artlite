@@ -1,5 +1,5 @@
 """artlite-server with several sequences on the NPU (``-np``: Llama 3.2 1B, Gemma 4 E4B with its drafter, Flint, LFM3,
-Spark-X 1.7B and Qwen3.6-27B, on three lanes): requests that meet give each one's answer alone - greedy ones, and a sampled one with a seed, whose
+Spark-X 1.7B and Qwen3.8-27B with its MTP layer as the drafter, on three lanes): requests that meet give each one's answer alone - greedy ones, and a sampled one with a seed, whose
 draws are its own -, their decode steps shared; a conversation's next turn continues on its lane."""
 
 import threading
@@ -21,7 +21,7 @@ from ..model_files import require
 pytestmark = pytest.mark.slow  # a GGUF model on the NPU: run with --run-slow
 
 PATHS = {"llama-1B": llama_gguf("Q4_K_M", "1B"), "gemma-E4B": gemma_gguf("Q4_0"), "flint": flint_gguf(),
-         "lfm3": lfm3_gguf("QAD-Q4_0"), "spark-1.7B": spark_gguf("1.7B"), "qwen-27B": qwen_gguf("Q4_K_M", "27B")}
+         "lfm3": lfm3_gguf("QAD-Q4_0"), "spark-1.7B": spark_gguf("1.7B"), "qwen-3.8-27B": qwen_gguf("Q4_K_M", "3.8-27B")}
 
 
 @pytest.fixture(scope="module", params=list(PATHS))

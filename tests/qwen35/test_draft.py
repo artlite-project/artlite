@@ -168,6 +168,68 @@ def test_interleaved(setup: tuple) -> None:
         assert np.array_equal(draft.step(emb[p:p + 1], h[p:p + 1], p).view(np.uint16), alone[p].view(np.uint16)), p
 
 
+def test_draft_sequences() -> None:
+    """The model's own block as the drafter of a model of three sequences (the 27B's ``QwenDraft`` on
+    ``QwenOverlay(sequences=3)``: a cache of each, selected with the model's): each sequence's drafter steps (rows of
+    its own, some written again as after rejected drafts), between the model's steps of one sequence and of several
+    on the same hardware context, give the logits (bf16 bits) of a drafter of a model of one sequence."""
+    from artlite.decode.step import Part
+
+    model, mtp = _files("3.8-27B")
+    g = GGUFFile(model)
+    rng = np.random.default_rng(5)
+    n, nseq = 48, 3
+    emb = [g.rows("token_embd.weight", [int(t) for t in rng.integers(0, 50000, n)]) for _ in range(nseq)]
+    hs = [(0.05 * rng.standard_normal(emb[0].shape)).astype(np.float32) for _ in range(nseq)]
+    # (a sequence's drafter steps: (position, rows); a step after one of several rows starts inside it)
+    plan = [[], [], []]
+    for s in range(nseq):
+        p = 0
+        while p < n - 8:
+            k = int(rng.integers(1, 9))
+            plan[s].append((p, k))
+            p += int(rng.integers(1, k + 1))
+
+    def run(draft: QwenDraft, s: int, i: int) -> np.ndarray:
+        p, k = plan[s][i]
+        return draft.step(emb[s][p:p + k], hs[s][p:p + k], p).view(np.uint16).copy()
+
+    target, draft = _slice(model, mtp, 256)
+    target.load()
+    draft.load()
+    want = []
+    for s in range(nseq):
+        draft.reset()
+        want.append([run(draft, s, i) for i in range(len(plan[s]))])
+    draft.dev = target.dev = None
+    target = QwenOverlay(g, layers=[0, 3], max_positions=256, sequences=nseq)
+    draft = QwenDraft(target)
+    target.load()
+    draft.load()
+    assert draft.sequences == nseq and draft.SLOTS == 8
+    pos = [0] * nseq  # (the model's positions: its steps between the drafter's)
+    for i in range(max(len(q) for q in plan)):
+        for s in range(nseq):
+            if i < len(plan[s]):
+                target.select(s)
+                assert draft.seq == s
+                got = run(draft, s, i)
+                assert np.array_equal(got, want[s][i]), f"sequence {s}, drafter step {i} at {plan[s][i]}"
+        if i % 3 == 0:  # (a step of one sequence)
+            s = i % nseq
+            target.select(s)
+            target.step(emb[s][pos[s]:pos[s] + 2], pos[s], logits=False, commit=False)
+            target.accept(1)
+            pos[s] += 1
+        else:  # (a step of all of them)
+            parts = tuple(Part(s, pos[s], 1 + (i + s) % 2) for s in range(nseq))
+            target.step(np.concatenate([emb[q.seq][q.position:q.position + q.n] for q in parts]), parts)
+            for q in parts:
+                target.accept(1, q.seq)
+                pos[q.seq] += 1
+    draft.dev = target.dev = None
+
+
 @pytest.mark.parametrize("size", SIZES)
 def test_draft_prefill(size: str) -> None:
     """Three 256-token chunks of an essay through the slice's prefill with the drafter's records (the carry between

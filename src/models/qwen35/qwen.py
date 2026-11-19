@@ -34,8 +34,10 @@ replays the accepted tokens.
 Several sequences (``NpuQwen(sequences=N)``; a dense model whose design runs steps of 8 slots: the 27B models): the
 device holds the KV caches and the GDN states, objects and conv states of each, and the model has a lane for each
 (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
-(``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence). Without
-a drafter (its records follow one sequence), the LM head's rows whole (a screened head's tiles do not fit that design).
+(``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence). The LM
+head's rows whole (a screened head's tiles do not fit that design). The file's own MTP block drafts for every lane
+(``drafting.MtpDrafting``: a cache of each sequence, its steps for a lane ahead of the lanes' joint step, for that
+lane's share of the step's slots); a DFlash2 drafter's records follow one sequence: none then.
 
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to disk. Load (27B, the
@@ -90,14 +92,17 @@ class NpuQwen(OverlayModel):
     ``drafter``: the multi-token-prediction drafter's file ("": the model file's own MTP block, else a qwen35moe model's
     ``model_config.qwen_mtp_of`` file, when there is one; None: none, and an image without the block); ``dflash``: a
     DFlash2 drafter's file, in the place of any of those (``dflash.DFlashOverlay``); ``sequences``: the sequences the
-    device holds (module docstring: no drafter then; ``lanes``: the model of each)."""
+    device holds (module docstring: no DFlash2 drafter then; ``lanes``: the model of each)."""
 
     recurrent = True  # (the GDN layers' states hold the whole sequence)
-    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "causal", "STEP_COST", "dflash", "mtp", "flash")
-    LANE_OWN = (*OverlayModel.LANE_OWN, "rope_next", "_prompting", "_x")
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "causal", "STEP_COST", "dflash", "flash")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "rope_next", "_prompting", "_x", "mtp", "_hid")
     rope_next = 0  # (the M-RoPE position of the next text token)
     _prompting = False
     _x: np.ndarray | None = None  # (the last step's rows)
+    mtp: MtpDrafting | None = None  # (the MTP drafter's bookkeeping of the lane's sequence: ``drafting``)
+    # (several lanes, a drafter: the residuals before the LM head of the lane's rows of its last step, ``QwenOverlay.hiddens``)
+    _hid: np.ndarray | None = None
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = "",
@@ -105,8 +110,8 @@ class NpuQwen(OverlayModel):
         """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); readout: a readout model
         (``models.readouts.readout_model``): the prefill's precise variants and packed chunks (``QwenPrefill``'s
         ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head)."""
-        if sequences > 1 and (drafter is not None or dflash):
-            raise ValueError("several sequences: without a drafter (its records follow one sequence)")
+        if sequences > 1 and dflash:
+            raise ValueError("several sequences: without a DFlash2 drafter (its records follow one sequence)")
         self.gguf = gguf
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
@@ -154,13 +159,25 @@ class NpuQwen(OverlayModel):
         if self.overlay.sequences > 1:
             self.overlay.prepare_joint()
 
+    def _open_lanes(self) -> None:
+        """(the MTP drafter's bookkeeping: a lane's own)"""
+        super()._open_lanes()
+        for lane in self.lanes[1:]:
+            lane.mtp = MtpDrafting(lane) if self.mtp is not None else None
+
     @property
     def capacity(self) -> int:
         return self.overlay.max_positions
 
     @property
-    def _drafting(self) -> bool:
+    def _follows(self) -> bool:
+        """Whether a drafter's records follow the model's steps."""
         return (self.drafter is not None or self.dflash is not None) and self.DRAFTS > 0
+
+    @property
+    def _drafting(self) -> bool:
+        """(several lanes: not while another lane has the device alone, a prompt: the drafter's steps wait for none)"""
+        return self._follows and (self._rounds is None or not self._rounds.held())
 
     @property
     def _table(self) -> HeadTable:
@@ -176,7 +193,7 @@ class NpuQwen(OverlayModel):
         """(also, with drafts: the rounds' step transactions, the model's of 1 .. DRAFTS + 1 tokens with logits and the
         drafter's: 1.3 s on the 35B-A3B; else, and without ``prepare``, each is built at its first use)"""
         super().prepare(prompt_len)
-        for S in range(1, self.DRAFTS + 2) if self.lookup or self._drafting else ():
+        for S in range(1, self.DRAFTS + 2) if self.lookup or self._follows else ():
             self.overlay.prepare(S)
             for logits in (True, False) if self.drafter is not None and self.DRAFTS else ():
                 self.drafter.prepare(S, logits=logits)
@@ -294,7 +311,9 @@ class NpuQwen(OverlayModel):
                 self.overlay.rope[p:p + n] = self.rope_next + np.arange(n)[:, None]
             out = super().steps(tokens, logits=logits, commit=commit, branch=branch)
             self.rope_next += n
-        if commit and self._drafting:
+        if self._rounds is not None and self.mtp is not None:  # (while the device is the lane's)
+            self._hid = self.overlay.hiddens(n)
+        if commit and self._follows:
             if self.flash is not None:
                 self.flash.after_step(n, p)
             else:
@@ -338,7 +357,7 @@ class NpuQwen(OverlayModel):
     def _prefill_run(self, args: tuple, T: int, n: int, sets: abc.Sequence[int] | None = None) -> None:
         """(the drafter's records of the rows before the chunk first; the chunk's carry after decode steps)"""
         self._inject()
-        mtp = self.mtp if self._drafting else None
+        mtp = self.mtp if self._follows else None
         if mtp is not None:
             mtp.before_prefill()
         super()._prefill_run(args, T, n, sets)
@@ -352,7 +371,7 @@ class NpuQwen(OverlayModel):
     def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: abc.Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(the drafter's table follows the prompt and each token: ``HeadTable.see``)"""
-        see = self._table.see if self._drafting else None
+        see = self._table.see if self._follows else None
         if see is not None:
             see(token_ids(prompt))
         for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs, drafts=drafts):
@@ -363,12 +382,17 @@ class NpuQwen(OverlayModel):
     def forced_drafts(self, tokens: list[int], first: int, *, turns: abc.Sequence[int] = (), prefill: bool = True
                       ) -> Iterator[tuple[list[int], np.ndarray]]:
         """(the drafter's table sees all the tokens first: runs over the same tokens draft from the same rows)"""
-        if self._drafting:
+        if self._follows:
             self._table.see(tokens)
         return super().forced_drafts(tokens, first, turns=turns, prefill=prefill)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         return self.draft(token, k) if self.flash is None else self.flash.block(token, k)
+
+    def _mtp_offer(self, n: int) -> tuple[float, ...] | None:
+        """(the MTP drafter's guesses: a shared step runs those it has room for - the rows of the others are written
+        again as a rejected draft's -, each kept as often as its chain's probability says, ``_kappa``)"""
+        return None if self.flash is not None else tuple(c * self._kappa(d) for d, c in enumerate(self._chains[:n]))
 
     def _sibling(self) -> list[int] | None:
         return self.flash.sibling if self.flash is not None else None
@@ -395,6 +419,14 @@ class NpuQwen(OverlayModel):
         self.rope_next += self._round.n
         return out
 
+    def _tapped(self, S: int) -> tuple:
+        """(a drafter: the residuals before the LM head of the step's rows, which its rows continue from)"""
+        return (self.overlay.hiddens(S),) if self.mtp is not None else ()
+
+    def _took(self, tokens: list[int], taken: tuple) -> None:
+        if taken:
+            self._hid = taken[0]
+
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
         """(a drafter's round: its kept drafts' rows pending, the token's ran with the drafts, a kept sibling branch's from its
         slots, the carry's not: injected after the step that kept it; another lazy step: its kept tokens' rows pending)"""
@@ -402,6 +434,11 @@ class NpuQwen(OverlayModel):
             self.overlay.accept(m, self.seq)
             self.position = p + m
             self.rope_next -= len(tokens) - m
+            if self.mtp is not None and self._follows:  # (a round whose drafter step did not run: as one without)
+                if mtp and self.mtp.ran:
+                    self.mtp.kept(p, tokens, m)
+                else:
+                    self.mtp.follow(m, self._x)
             return
         if len(tokens) == 1 and not mtp:  # (a committed step: its row pending, ``steps``)
             return
@@ -418,7 +455,7 @@ class NpuQwen(OverlayModel):
             fd.kept(p, m, won, S, L)
         elif mtp:
             self.mtp.kept(p, tokens, m)
-        elif self._drafting:
+        elif self._follows:
             self.mtp.follow(m, self._x)
 
 
@@ -522,28 +559,37 @@ class Qwen(Model):
         return Sampling(temp=s["temp"], top_k=int(s["top_k"]), top_p=s["top_p"],
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
+    def _own(self) -> bool:
+        """Whether the file's own MTP block drafts for a model of several sequences (where a drafter is asked for: a
+        DFlash2 drafter's place too)."""
+        return bool(self.cfg.nextn_layers) and (self.mtp == "" or self.dflash is not None)
+
     @property
     def parallel(self) -> bool:  # type: ignore[override]
-        """(a dense chat model whose design runs steps of 8 slots, its LM head's rows whole: ``overlay.slots_of``)"""
+        """(a dense chat model whose design runs steps of 8 slots, its LM head's rows whole: ``overlay.slots_of``, with
+        its MTP block as the drafter where it has one)"""
         if not (self.generates and self.cfg.causal) or self.cfg.moe:
             return False
-        return slots_of(self.cfg, QwenImage(self.gguf, self.cfg, mtp=False, screen=False).formats(), False) == 8
+        own = self._own()
+        return slots_of(self.cfg, QwenImage(self.gguf, self.cfg, mtp=own, screen=False).formats(), own) == 8
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
-        """(``sequences``: ``NpuQwen``'s; several: without a drafter, the LM head's rows whole)"""
+        """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole, the file's MTP block as the drafter where
+        it has one and a drafter is asked for, a DFlash2 drafter's place too)"""
         if sequences == 1:
             self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
                                 dflash=self.dflash, readout=not self.generates)
             return self._npu
-        if self.mtp is not None or self.dflash is not None:
-            log.warning("%s with %d sequences runs without its drafter (the drafter's records follow one sequence)",
-                        self.name, sequences)
+        own = self._own()
+        if self.dflash is not None:
+            log.warning("%s with %d sequences drafts with its MTP layer (the DFlash2 drafter's records follow one "
+                        "sequence)", self.name, sequences)
         weights = self.weights
-        if weights.image.screen or weights.image.mtp_layer >= 0:  # (the image packed again: without the MTP block,
-            # its LM head's rows whole)
+        if weights.image.screen or (weights.image.mtp_layer >= 0) != own:  # (the image packed again: its LM head's
+            # rows whole, the MTP block where it drafts)
             weights.wait()
-            self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=False, pairs=self.generates,
+            self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=own, pairs=self.generates,
                                                             screen=False))
-        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights, drafter=None,
-                            readout=not self.generates, sequences=sequences)
+        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights,
+                            drafter="" if own else None, readout=not self.generates, sequences=sequences)
         return self._npu

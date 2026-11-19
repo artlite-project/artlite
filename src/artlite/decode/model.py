@@ -244,6 +244,8 @@ class ModelOverlay:
         # the selected one's)
         self._vrings = [VRing() for _ in range(sequences)]
         self.vring = self._vrings[0]
+        # (overlays that hold the same sequences beside this one, selected with it: a drafter's records of each)
+        self.followers: list[ModelOverlay] = []
         self._layout: dict[str, int] = {}  # (buffer -> bytes so far: ``_take``)
         self._steps: dict[StepKey, Any] = {}  # (a step's transaction, built at its first use)
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
@@ -378,13 +380,16 @@ class ModelOverlay:
     def select(self, s: int) -> None:
         """Make sequence s the overlay's: its buffers of ``SEQ`` under their plain names (``OverlayDevice.alias``) and
         its ``vring``, which a step of one sequence, a prompt's chunks and the state copies (``snapshot``,
-        ``read_records``, ...) work on. No copy: every sequence's caches stay on the device."""
+        ``read_records``, ...) work on (and its ``followers``'). No copy: every sequence's caches stay on the
+        device."""
         if not 0 <= s < self.sequences:
             raise ValueError(f"sequence {s} of {self.sequences}")
         if s != self.seq:
             self.seq, self.vring, self._ahead = s, self._vrings[s], None
             if self.dev is not None:  # (before ``load``: its device takes the selection)
                 self.dev.alias = self._alias()
+        for f in self.followers:
+            f.select(s)
 
     def ready(self) -> None:
         """Until the weight image is packed (``WeightBuffer``)."""

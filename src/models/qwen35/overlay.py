@@ -190,6 +190,7 @@ class QwenOverlay(ModelOverlay):
         # (the positions whose ``rope`` rows the last position patch took, and the rows it took: ``_ring_state``)
         self._rope_used = (0, 0, b"")
         self._round = False  # (``patch_ahead`` patched the next step: ``_run``)
+        self._kept_rows: np.ndarray | None = None  # (the last step's rows of its caller's, where not its first: ``hiddens``)
         self._ropes = [_text_rope(self.max_positions) for _ in range(sequences)]  # (per sequence: ``rope``)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
@@ -750,6 +751,7 @@ class QwenOverlay(ModelOverlay):
         else:
             self.gdn_steps.set_words(nrep=cur.nrep, cshift=cur.cshift, commit=commit)
         cur.committed = commit
+        self._kept_rows = None
         self._write_loadr(x)
         first = self._input(self.layers[0])
         self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
@@ -796,6 +798,7 @@ class QwenOverlay(ModelOverlay):
             assert q.position == cur.gnext or not self.gobj, (q, cur.gnext)
             cur.gpos, cur.committed = q.position, False
         self.ends = len(parts) > 1 or parts[0].position % 8 + parts[0].n >= 8
+        self._kept_rows = keep
         self.gdn_steps.set_chain_words(parts)
         self._write_loadr(x)
         first = self._input(self.layers[0])
@@ -822,8 +825,8 @@ class QwenOverlay(ModelOverlay):
             vring.ran(L, p, S)
 
     def _ring_state(self, seq: int | None = None) -> tuple:
-        """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``; the GSTATE halves of the
-        blocks, ``GdnCursor.half``; the ``rope`` rows the last position patch took)"""
+        """(and whether a prefill's conv states wait in GHDR; the GSTATE halves of the blocks, ``GdnCursor.half``; the
+        ``rope`` rows the last position patch took)"""
         a, b, _ = self._rope_used
         s = self.seq if seq is None else seq
         cur = self._curs[s]
@@ -896,6 +899,15 @@ class QwenOverlay(ModelOverlay):
     def drafter_view(self) -> object:
         """(a DFlash2 drafter's head: the MTP block's view of the LM rows, ``QwenImage.mtp_view``; ``DFlashTarget``)"""
         return self.image.mtp_view(self.cfg) if self.image.draft_cols else None
+
+    def hiddens(self, n: int) -> np.ndarray:
+        """``hidden(-1, .)`` of the first n rows the last step's caller gave it (n, hidden) fp32: copies (a step of
+        several sequences' slots: the rows in the caller's order, whatever slots ran them)."""
+        off, sp = self.tap_x(-1), self._sp(self._last_s, self._input(-1))
+        self.dev.fetch("ACT", off, 2 * sp * self.H)
+        v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)
+        rows = np.arange(n) if self._kept_rows is None else self._kept_rows[:n]
+        return np.ascontiguousarray(v[:, rows].transpose(1, 0, 2)).reshape(n, self.H).view(bfloat16).astype(np.float32)
 
     def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""

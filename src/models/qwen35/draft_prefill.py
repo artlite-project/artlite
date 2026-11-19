@@ -71,8 +71,11 @@ class DraftPrefill(DrafterPrefill):
         return {"PEH": 9 * 2 * H // 8, "DZ": 2 * H, "DX0": 2 * H, "DPN": 9 * H // 8, "DG": 2 * COLS * self.pitch}
 
     def buffers(self) -> dict[str, object]:
-        """The drafter's device buffers by the names the items use."""
-        return {"D" + k: v for k, v in self.d.dev.buffers.items() if k != "W" or self.wbuf == "DW"}
+        """The drafter's device buffers by the names the items use (a sequence's under their plain names: the
+        selected one's, as the model's)."""
+        dev = self.d.dev
+        bufs = dev.buffers | {name: dev.buffers[b] for name, b in dev.alias.items()}
+        return {"D" + k: v for k, v in bufs.items() if k != "W" or self.wbuf == "DW"}
 
     def external(self) -> set[str]:
         """(their names before the drafter is loaded)"""

@@ -294,7 +294,7 @@ class GdnTransfers:
         its slots' bytes, its outputs' from its first slot's place on."""
         ov = self.ov
         key = tuple((q.seq, q.n, ov._curs[q.seq].half(q.position)) for q in parts)
-        if st.chained == key:
+        if st.chained == key or not st.chains:
             return
         (t, lines), dev = self.chain_table(st), ov.dev
         at, u, kind, off = t.T

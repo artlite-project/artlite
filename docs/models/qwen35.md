@@ -86,13 +86,15 @@ GDN states and conv states land in the decode's buffers; a chunk runs as dispatc
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
-Several requests at a time (`artlite-server -np N`, up to 8; Qwen3.6-27B and Qwen3.8-27B, whose design runs 8 tokens
-per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.3 GB a sequence), and a decode
+Several requests at a time (`artlite-server -np N`, up to 8; Qwen3.6-27B, Qwen3.8-27B and, with its MTP layer, Swift
+1.5: the files whose design runs 8 tokens per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.3 GB a sequence), and a decode
 step's 8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them,
 each attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per
 sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.05x / 1.12x / 1.39x a step of one,
-so 4 requests get 3.2x and 8 get 4.8x one request's tokens per second in all. The LM head is then read whole and the
-drafters do not load (their records follow one sequence):
+so 4 requests get 3.2x and 8 get 4.8x one request's tokens per second in all. The LM head is then read whole.
+A file's MTP layer (Qwen3.8-27B's, Swift 1.5's) drafts for every request (a cache of its own per sequence, its guesses for a request ahead
+of the step the requests share, for that request's share of the step's slots: 8.9 / 13.5 / 18.0 tokens per second
+for 1 / 2 / 4 requests); the DFlash2 drafter, whose records follow one sequence, does not load then:
 [artlite-server](../server.md#several-requests-at-a-time). The other files of this page (a design of 4 tokens per
 dispatch, the mixture-of-experts models) serve `-np N` one request at a time.
 

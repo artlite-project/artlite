@@ -10,6 +10,12 @@ the pending rows and the sampled token's (its first draft), one-row steps for th
 and the drafts (``commit=False``), then the accepted tokens' rows pending (they rewrite the draft rows' records); a round of
 the context's drafts leaves the token's row pending with the accepted ones'.
 
+A model of several lanes (``NpuQwen(sequences=)``): each lane has its ``MtpDrafting`` and the drafter a cache of each
+sequence (``QwenDraft``); the drafter's steps run with the device for the lane (``OverlayModel._before``: ahead of the
+lanes' joint step; a round goes without them while another lane has the device alone, its rows then pending on), the
+model's hidden states are the lane's rows of its last step (``NpuQwen._hid``: the next step is another lane's too), and
+the prefill's carry is kept per lane.
+
 The DFlash2 drafter's: ``models.dflash.DFlashDrafting``.
 """
 
@@ -37,13 +43,15 @@ class MtpDrafting:
         self.dpos = 0
         self.h = np.zeros(self.model.cfg.hidden_size, np.float32)  # (zeros before position 0)
         self.carry_at = 0  # (the position after the last chunk: the prefill's carry is its)
+        self.carry: np.ndarray | None = None  # (that carry: another lane's chunk leaves the prefill its own)
+        self.ran = True  # (the last round's drafter step ran: ``draft``)
 
     def state(self) -> dict[str, object]:
         """What a checkpoint keeps: the rows, and the prefill's carry."""
         m = self.model
         out: dict[str, object] = {"pend": list(self.pend), "dpos": self.dpos, "h": self.h, "carry_at": self.carry_at}
         if m.prefill is not None and m.prefill.dp is not None:
-            out["carry"] = m.prefill.dp.carry.copy()
+            out["carry"] = (m.prefill.dp.carry if self.carry is None else self.carry).copy()
         return out
 
     def set_state(self, state: dict[str, object]) -> None:
@@ -51,10 +59,14 @@ class MtpDrafting:
         self.pend, self.dpos, self.h, self.carry_at = list(state["pend"]), state["dpos"], state["h"], state["carry_at"]
         if m.prefill is not None and m.prefill.dp is not None:
             m.prefill.dp.carry[:] = state["carry"]
+            self.carry = state["carry"].copy()
 
     def hidden(self, n: int) -> np.ndarray:
-        """The model's output-normed hidden states (n, hidden) fp32 of the last step's first n slots."""
+        """The model's output-normed hidden states (n, hidden) fp32 of the last step's first n slots (several lanes:
+        of the lane's rows of its last step)."""
         m = self.model
+        if m._rounds is not None:
+            return m._normed(m._hid[:n].copy())
         return m._normed(np.stack([m.overlay.hidden(-1, s) for s in range(n)]))
 
     def follow(self, n: int, x: np.ndarray) -> None:
@@ -63,12 +75,20 @@ class MtpDrafting:
         h = np.concatenate([self.h[None], hs[:-1]])
         self.pend += list(zip(x[:n], h, strict=True))
         self.h = hs[-1]
+        if len(self.pend) >= self.model.overlay.SLOTS:
+            with self.model._before() as free:
+                if free:
+                    self._flush()
+
+    def _flush(self) -> None:
+        """Records of the pending rows while a step's worth of them wait."""
         while len(self.pend) >= self.model.overlay.SLOTS:
             self.run_pending(self.model.overlay.SLOTS)
 
     def step(self, rows: list[tuple[np.ndarray, np.ndarray]], logits: bool) -> np.ndarray | None:
         """A drafter step of rows at ``dpos`` on (their records; the drafter's logits (n, vocab) bf16, or None)."""
         m = self.model
+        assert m.drafter.seq == m.seq, "the drafter's cache: the lane's sequence's (the device held for it)"
         p, n = self.dpos, len(rows)
         q = np.arange(p, p + n)
         old = q < m.position  # (the model's positions; text from ``rope_next`` after them)
@@ -92,6 +112,8 @@ class MtpDrafting:
             self.run_pending(m.overlay.SLOTS)
         if m.position and self.carry_at != m.position:
             m.prefill.dp.carry_of(self.h)
+        elif m.position and self.carry is not None:  # (several lanes: another's chunk ran since)
+            m.prefill.dp.carry[:] = self.carry
 
     def after_prefill(self, n: int) -> None:
         """After a prompt chunk of n valid tokens: its last row's hidden state is the next one's."""
@@ -99,34 +121,40 @@ class MtpDrafting:
         x = m.prefill.hidden(n - 1)
         self.h = m._normed(x)[0]
         self.dpos = self.carry_at = m.position + n
+        self.carry = m.prefill.dp.carry.copy()
 
     def draft(self, token: int, n: int) -> list[int]:
         """The drafter's guesses of up to n tokens after ``token`` (the token of the next position, not run yet; its
         row runs with the pending ones): the most likely one, the most likely one after it, ... while their chain's
         probability pays for the round's slot of each and the drafter's step of the next (``_worth``, ``_more``) (ends
-        with an end-of-sequence token)."""
+        with an end-of-sequence token). Several lanes: with the device for the lane (``OverlayModel._before``); none
+        where it is not to be had: the token's row then waits with the round's kept ones (``ran``)."""
         m = self.model
-        t0 = time.perf_counter()
-        rows = [*self.pend, (m._rows([token])[0], self.h)]
-        assert self.dpos + len(rows) == m.position + 1 and len(rows) <= m.overlay.SLOTS
-        self.pend = []
-        raw = self.step(rows, logits=n > 0)
         out: list[int] = []
         chains: list[float] = []
-        chain, slot = 1.0, len(rows) - 1
-        while len(out) < n:
-            i, p = max_prob(raw[slot])
-            chain *= p
-            if not m._keep(chain, len(out)):
-                break
-            out.append(int(m.drafter.table.ids[i]))
-            chains.append(chain)
-            if out[-1] in m.eos_token_ids or len(out) == n or not m._more(chain, p, len(out)):
-                break
-            h = m.drafter.hidden_state(slot)
-            t = time.perf_counter()
-            raw, slot = self.step([(m._rows(out[-1:])[0], h)], logits=True), 0
-            m._row_time(time.perf_counter() - t)
+        with m._before() as free:
+            self.ran = free
+            t0 = time.perf_counter()  # (the guesses' time, without the wait for the device)
+            if free:
+                self._flush()
+                rows = [*self.pend, (m._rows([token])[0], self.h)]
+                assert self.dpos + len(rows) == m.position + 1 and len(rows) <= m.overlay.SLOTS
+                self.pend = []
+                raw = self.step(rows, logits=n > 0)
+                chain, slot = 1.0, len(rows) - 1
+                while len(out) < n:
+                    i, p = max_prob(raw[slot])
+                    chain *= p
+                    if not m._keep(chain, len(out)):
+                        break
+                    out.append(int(m.drafter.table.ids[i]))
+                    chains.append(chain)
+                    if out[-1] in m.eos_token_ids or len(out) == n or not m._more(chain, p, len(out)):
+                        break
+                    h = m.drafter.hidden_state(slot)
+                    t = time.perf_counter()
+                    raw, slot = self.step([(m._rows(out[-1:])[0], h)], logits=True), 0
+                    m._row_time(time.perf_counter() - t)
         m.t_draft += time.perf_counter() - t0
         m.drafted += len(out)
         m._chains = tuple(chains)

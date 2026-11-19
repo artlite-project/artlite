@@ -455,7 +455,7 @@ queue:
 | Spark-X 1.7B Q4_K_M (`-np 8`, no drafter) | 43.4 | 72.1 | 122 |
 | Spark-X 4B Q4_K_M (`-np 8`, no drafter) | 18.8 | 32.7 | 57.9 |
 | Qwen3.6-27B Q4_K_M | 3.8 | 6.9 | 12.0 |
-| Qwen3.8-27B Q4_K_M (no drafter with `-np`) | 3.3 | 6.4 | 11.7 |
+| Qwen3.8-27B Q4_K_M, with its MTP layer as the drafter | 8.9 | 13.5 | 18.0 |
 
 (`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
 tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
@@ -467,9 +467,10 @@ instead of 38.2). Spark-X's steps have 8 slots: with `-np 8` (its most), 8 reque
 per second in all; its DSpark drafter does not load with `-np` above 1 either (one request alone on these summaries:
 43 instead of 47-50 on the 1.7B, 19 instead of 27-29 on the 4B). The 27B Qwen models' steps have 8 slots too
 (`-np` up to 8: 8 requests at a time get 18 tokens per second in all on Qwen3.6-27B), each sequence with its own
-Gated DeltaNet states (0.3 GB) beside its KV cache. Qwen3.8-27B's drafters do not load with `-np` above 1: one
-request alone gets 3.3 tokens per second instead of 10.7 with its drafter, so `-np` pays on that file only where
-four or more requests usually meet. Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
+Gated DeltaNet states (0.3 GB) beside its KV cache. Qwen3.8-27B drafts with its MTP layer then, for each request
+ahead of the step the requests share (as Gemma 4's drafter; `--spec-type none`: 3.3 / 6.4 / 11.7 tokens per second);
+its DFlash2 drafter, whose records follow one sequence, does not load with `-np` above 1 (one request alone: 8.9
+tokens per second instead of 10.7). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
 sequences at 16K positions give 1.9x one's tokens per second on Llama 3.2 3B.
 
 - A request takes the sequence it names (`id_slot`, as llama-server's), else an idle one whose prompt cache holds at
@@ -479,9 +480,9 @@ sequences at 16K positions give 1.9x one's tokens per second on Llama 3.2 3B.
   request, a prompt of 2000 tokens takes 2.2 s instead of 1.25 s on Llama 3.1 8B, and the generating request gets 5
   tokens per second during it instead of 12.5 (a token every 0.2 s at most).
 - Draft tokens take the slots the requests leave free, the likeliest drafts first: with two requests two slots, with
-  three one, with four none. Gemma 4's drafter guesses for one request at a time, before the step the requests
-  share, as many tokens as the request's share of the free slots (with three requests: for each in its turn); not
-  while another request's prompt runs.
+  three one, with four none. Gemma 4's drafter and Qwen3.8-27B's MTP layer guess for one request at a time, before
+  the step the requests share, as many tokens as the request's share of the free slots (with three requests of
+  Gemma 4: for each in its turn); not while another request's prompt runs.
 - The prompt cache's RAM (`--cache-ram`) is split evenly between the sequences.
 - Embeddings, reranks and the other requests that are no chat run on sequence 0, between the others' steps.
 - Another model serves `-np N` one request at a time (a line in the log says so).
