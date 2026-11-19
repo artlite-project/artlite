@@ -61,8 +61,10 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     Each lane is driven by one thread at a time. Its generation's rounds share their dispatches with the other lanes'
     (``_joined``); a lane's other calls on the device (a prompt, the state copies, single steps) hold it alone
     (``lanes.alone``): a prompt lets the others in between its chunks, and the lanes' round between a chunk's pieces
-    (the prefill's ``guest``). After a failed dispatch a lane's calls raise ``lanes.DeviceFailed`` until its
-    ``recover``."""
+    (the prefill's ``guest``). A model whose round starts with dispatches of its own (a drafter's steps on the
+    sequence's caches) runs them inside ``_before``, gives a joint step its per-slot keywords (``_step_kw``) and takes
+    what else it reads of a step through ``_tapped`` / ``_took``. After a failed dispatch a lane's calls raise
+    ``lanes.DeviceFailed`` until its ``recover``."""
 
     overlay: Any
     _w_out: np.ndarray  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
@@ -132,7 +134,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         if self.overlay.sequences == 1:
             return
         self._pool  # noqa: B018 (one for the lanes: made before the copies)
-        self._rounds = Rounds(self.overlay)
+        self._rounds = Rounds(self.overlay, self._tapped)
         if self.prefill is not None:  # (the lanes' steps between a chunk's pieces)
             self.prefill.guest = self._rounds
         if unknown := sorted(set(vars(self)) - set(self.LANE_SHARED) - set(self.LANE_OWN)):
@@ -152,6 +154,34 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def budget(self) -> int | None:  # type: ignore[override]
         """(several lanes: the slots a round of the lane can get, ``lanes.Rounds.budget``)"""
         return None if self._rounds is None else self._rounds.budget(self.seq)
+
+    @property
+    def share(self) -> int | None:  # type: ignore[override]
+        """(several lanes: ``lanes.Rounds.share``)"""
+        return None if self._rounds is None else self._rounds.share(self.seq)
+
+    @property
+    def _drafting(self) -> bool:
+        """(several lanes: not while another lane has the device alone, a prompt: ``_before`` would refuse)"""
+        return super()._drafting and (self._rounds is None or not self._rounds.held())
+
+    def _before(self) -> contextlib.AbstractContextManager[bool]:
+        """A context for a round's dispatches of the lane's own before its step (a drafter's): True inside where they
+        may run (several lanes: with the device, ``lanes.Rounds.before``), False: the round goes without them."""
+        return contextlib.nullcontext(True) if self._rounds is None else self._rounds.before(self.seq)
+
+    def _step_kw(self, tokens: list[int]) -> dict[str, Any]:
+        """The overlay step's keywords that are per slot, for the tokens (None: not for these): a joint step takes one
+        where each of its lanes has it."""
+        return {}
+
+    def _tapped(self, S: int) -> tuple:
+        """What else than the logits the model reads of a step of S slots, right after it: arrays of a row per slot
+        (copies) or None (``lanes.Rounds``' ``tap``: whichever lane's thread ran the step)."""
+        return ()
+
+    def _took(self, tokens: list[int], taken: tuple) -> None:
+        """The lane's rows of ``_tapped`` after its round's step of ``tokens``."""
 
     def _total(self, name: str) -> float:
         """(of every lane)"""
@@ -256,11 +286,13 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             self._round = None
             return self.steps(tokens)
         args = self._step_inputs_of(tokens)
-        r = self._round = rounds.join(self.seq, args, self.position, len(tokens) - len(offer), offer)
+        r = self._round = rounds.join(self.seq, args, self.position, len(tokens) - len(offer), offer,
+                                      self._step_kw(tokens))
         self.t_npu += r.wall
         self.dispatches += 1
         self.position += r.n
         self.slot = r.n - 1
+        self._took(tokens[:r.n], r.taken)
         return r.rows
 
     def _overhead(self, wall: float) -> float | None:

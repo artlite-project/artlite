@@ -239,37 +239,41 @@ def _llama(path: str, kv_k: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
-def _llama_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+def _run_sequences(ov: object, log: _Log, step: Callable[..., object]) -> None:
     """Three sequences on the device: alternated steps (``select``), then joint steps (parts of 1 .. 2 slots at
-    positions of their own, every split of the slots), one starting over in between."""
+    positions of their own, every split of the slots), one starting over in between; ``step(x, position, logits)``."""
+    from artlite.decode.step import Part
+
+    rng = np.random.default_rng(0)
+    ov.load()
+    pos = [0, 0, 0]
+    for i, S in enumerate((1, 4, 3, 2, 4, 1, 2, 3, 4, 4, 1, 3)):
+        s = i % 3
+        log.label = f"sequence {s} S={S} p={pos[s]}"
+        ov.select(s)
+        step(_x(rng, S, ov.H), pos[s], i % 4 != 2)
+        pos[s] += S
+    for i in range(48):
+        take = [(s, 1 + (i + s) % 2) for s in ((0, 1, 2), (2, 0), (1,), (1, 2, 0), (0, 2))[i % 5]][:4]
+        while sum(n for _, n in take) > 4:
+            take[-1] = (take[-1][0], take[-1][1] - 1)
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        log.label = f"joint {i}: {parts}"
+        step(_x(rng, sum(n for _, n in take), ov.H), parts, i % 5 != 3)
+        for s, n in take:
+            pos[s] += n
+        if i == 20:  # (sequence 1 starts over)
+            ov.select(1)
+            ov.reset()
+            pos[1] = 0
+
+
+def _llama_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
     def run(attach: Callable[[object], _Log]) -> None:
-        from artlite.decode.step import Part
         from models.llama.overlay import LlamaOverlay
 
         ov = LlamaOverlay(GGUFFile(path), sequences=3)
-        log = attach(ov.op)
-        rng = np.random.default_rng(0)
-        ov.load()
-        pos = [0, 0, 0]
-        for i, S in enumerate((1, 4, 3, 2, 4, 1, 2, 3, 4, 4, 1, 3)):
-            s = i % 3
-            log.label = f"sequence {s} S={S} p={pos[s]}"
-            ov.select(s)
-            ov.step(_x(rng, S, ov.H), pos[s], logits=i % 4 != 2)
-            pos[s] += S
-        for i in range(48):
-            take = [(s, 1 + (i + s) % 2) for s in ((0, 1, 2), (2, 0), (1,), (1, 2, 0), (0, 2))[i % 5]][:4]
-            while sum(n for _, n in take) > 4:
-                take[-1] = (take[-1][0], take[-1][1] - 1)
-            parts = tuple(Part(s, pos[s], n) for s, n in take)
-            log.label = f"joint {i}: {parts}"
-            ov.step(_x(rng, sum(n for _, n in take), ov.H), parts, logits=i % 5 != 3)
-            for s, n in take:
-                pos[s] += n
-            if i == 20:  # (sequence 1 starts over)
-                ov.select(1)
-                ov.reset()
-                pos[1] = 0
+        _run_sequences(ov, attach(ov.op), lambda x, p, lg: ov.step(x, p, logits=lg))
 
     return run
 
@@ -300,6 +304,27 @@ def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
             ov.step(x, e, p, logits=lg)
 
         _run_plain(ov, log, step, lm=False)
+
+    return run
+
+
+def _gemma_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    """(``_run_sequences``; every third step with its slots' per-layer projections given: without their phase)"""
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.gemma4.overlay import GemmaOverlay
+
+        ov = GemmaOverlay(GGUFFile(path), max_positions=1024, sequences=3)
+        rng, n = np.random.default_rng(1), 0
+        layers, d = len(ov.layers), ov.cfg.per_layer_dim
+
+        def step(x: np.ndarray, p: object, lg: bool) -> None:
+            nonlocal n
+            n += 1
+            e = rng.standard_normal((x.shape[0], layers, d)).astype(np.float32) if d else None
+            kept = rng.integers(0, 1 << 16, (x.shape[0], layers, d)).astype(np.uint16) if d and n % 3 == 0 else None
+            ov.step(x, e, p, logits=lg, p=kept)
+
+        _run_sequences(ov, attach(ov.op), step)
 
     return run
 
@@ -623,6 +648,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "qwen3-0.6B-Q4_1": (qwen3_gguf("0.6B"), lambda p: _llama(p, "hilo")),
     "qwen3-embedding-4B-Q4_K_M": (qwen3_gguf("embedding-4B"), lambda p: _llama(p, "hilo")),  # (half regions in pairs)
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
+    "gemma-E4B-Q4_0-sequences": (gemma_gguf("Q4_0"), _gemma_sequences),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "kev-4B": (decision_gguf("kev"), _qwen),  # (half regions in pairs, a design of 4 slots)
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),

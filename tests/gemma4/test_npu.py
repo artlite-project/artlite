@@ -4,6 +4,8 @@
   cache with the ones that own it) through ``GemmaOverlay.step``, one, three or four tokens per
   dispatch, K cached as hi + lo or single blocks: logits, attention outputs, the residual and the
   caches against the overlay's arithmetic on the host (ref.GemmaNpuRef);
+- four sequences on one device, alternated and in joint steps: every slot the logits and residual of its sequence
+  alone, bit for bit;
 - the whole model, teacher-forced: KL of the next-token distributions against the fp32
   reference (gemma_cpu.GemmaCpu) on the same weights; prompt tokens run in batches without the
   layers that share a cache;
@@ -17,14 +19,17 @@
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.decode.protocol import SLOTS as NB
 from artlite.decode.protocol import XB, packed_slots
+from artlite.decode.step import Part
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import assistant_of, gemma_gguf
 from models.gemma4 import attn as AT
 from models.gemma4.gemma import Gemma, NpuGemma
+from models.gemma4.host import GemmaHost
 from models.gemma4.overlay import GemmaOverlay
 from models.gemma4.tokenizer import GemmaTokenizer, chat_prompt
 from models.sampling import Sampling
@@ -151,6 +156,112 @@ def test_gemma_overlay_layers(layers: list[int], tol: float, kv_k: str) -> None:
             keep(f"ring.{layer}", torch.from_numpy(np.stack(rows)[:, :len(ids) - r0]), cache.rows[:, r0:])
         print(f"{batch} per dispatch:", {k: round(v, 4) for k, v in worst.items()})
         assert all(v < tol for v in worst.values()), (batch, worst)
+
+
+STEPS = (1, 4, 3, 2, 4, 4, 1, 3, 3, 2, 1, 4)  # (step sizes, repeated: every alignment to the records and their pairs)
+
+
+@pytest.mark.parametrize("layers", [[0, 5], [22, 23, 24, 29]], ids=["swa+full", "shared-kv"])
+def test_gemma_overlay_sequences(layers: list[int]) -> None:
+    """Four sequences on one device (``GemmaOverlay(sequences=4)``: texts of their own, at positions of their own)
+    give, slot by slot, the logits and the residual of each sequence alone in steps of one, bit for bit:
+
+    - alternated (``select``: a step of 1 .. 4 slots of one, then of the next: no copies between them);
+    - in joint steps (``step``'s parts: one sequence 5 positions behind, one joining at the 12th step, slots dealt at
+      random, a sequence's second slot too: sub-steps of every pattern up to a sequence per slot in both cache
+      kinds), some of them with the tokens' per-layer projections as the steps alone left them (``step(p=)``: without
+      the projection's phase);
+
+    and each sequence's caches and open records' rings are then those of the sequence alone."""
+    g = _gguf()
+    N, NSEQ = 44, 4  # (crosses the cache groups: 32 positions at head_dim 256, 16 at 512)
+    ids = GemmaTokenizer(g).encode(LONG + " " + TEXT)[:NSEQ * N]
+    assert len(ids) == NSEQ * N
+    host = GemmaHost(g)
+    xs = [host.embed(ids[s * N:(s + 1) * N]).astype(bfloat16).astype(np.float32) for s in range(NSEQ)]
+    es = [host.layer_rows(ids[s * N:(s + 1) * N]) for s in range(NSEQ)]
+    ov = GemmaOverlay(g, layers=layers, vocab=VOCAB, max_positions=64, sequences=NSEQ)
+    ov.load()
+    own = [L for L in layers if ov.cfg.kv_source(L) == L]
+
+    def slots(n: int) -> list[np.ndarray]:  # (per slot of the last step of n slots: its logits and residual)
+        lg = np.asarray(ov._npu_logits(n)).view(np.uint16)
+        return [np.concatenate([lg[s], ov.residual(s).view(np.uint32)], dtype=np.int64) for s in range(n)]
+
+    def caches(s: int) -> list[np.ndarray]:  # (sequence s's caches as stored, its open records' rows)
+        ov.select(s)
+        ov.dev.fetch("KV")
+        out = [a for L in own for a in ov.read_kv(L, range(N))]
+        r0 = (N - 1) // 8
+        rows = N - 8 * r0
+        return out + [ring_rows(ov.dev.view("KV")[ov.ring(L, h) + (r0 & 1) * ov.T:][:ov.T], ov.cfg.head_dim(L))[:rows]
+                      for L in own for h in range(AT.KV_HEADS)]
+
+    want, kept, proj = [], [], []
+    for s in range(NSEQ):  # (alone, in steps of one, as sequence 0)
+        ov.select(0)
+        ov.reset()
+        row, ps = [], []
+        for p in range(N):
+            ov.step(xs[s][p:p + 1], es[s][p:p + 1], p)
+            row.append(slots(1)[0])
+            ps.append(ov.read_p(1)[0].copy())
+        want.append(row)
+        proj.append(ps)
+        kept.append(caches(0))
+    assert not any(np.array_equal(a, b) for a, b in zip(want[0], want[1])), "the sequences' texts differ"
+
+    def check(got: list[np.ndarray], at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for g_, (s, p) in zip(got, at, strict=True) if not np.array_equal(g_, want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    def fresh() -> None:
+        for s in range(NSEQ):
+            ov.select(s)
+            ov.reset()
+
+    fresh()  # alternated: a step of one sequence, then of the next
+    pos, i = [0] * NSEQ, 0
+    while min(pos) < N:
+        s = i % NSEQ
+        n = min(STEPS[(i // NSEQ + s) % len(STEPS)], N - pos[s])
+        i += 1
+        if n:
+            ov.select(s)
+            ov.step(xs[s][pos[s]:pos[s] + n], es[s][pos[s]:pos[s] + n], pos[s])
+            check(slots(n), [(s, pos[s] + k) for k in range(n)], "alternated")
+            pos[s] += n
+    for s in range(NSEQ):
+        assert all(np.array_equal(a, b) for a, b in zip(caches(s), kept[s], strict=True)), f"alternated: caches of {s}"
+
+    fresh()  # joint steps
+    rng = np.random.default_rng(0)
+    pos, steps, patterns, projected = [0] * NSEQ, 0, set(), set()
+    while min(pos) < N:
+        take = [[s, 1] for s in range(NSEQ) if pos[s] < N and not (s == 1 and steps < 5) and not (s == 2 and steps < 12)]
+        spare = NB - len(take)
+        for t in take:  # (a second slot of its own)
+            if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
+                t[1] += 1
+                spare -= 1
+        rng.shuffle(take)
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        at = [(s, pos[s] + k) for s, n in take for k in range(n)]
+        patterns.add(ov._join(parts))
+        p = np.stack([proj[s][q] for s, q in at]) if rng.random() < 0.5 else None
+        ov.step(np.concatenate([xs[s][pos[s]:pos[s] + n] for s, n in take]),
+                np.concatenate([es[s][pos[s]:pos[s] + n] for s, n in take]), parts, p=p)
+        projected.add(ov.ple)
+        check(slots(len(at)), at, f"step {steps}{'' if p is None else ' (kept projections)'}")
+        if p is None:
+            assert np.array_equal(ov.read_p(len(at)), np.stack([proj[s][q] for s, q in at])), f"step {steps}: p"
+        for s, n in take:
+            pos[s] += n
+        steps += 1
+    assert projected == {True, False}
+    assert all(max(len(u) for u in k) == NB for k in zip(*patterns)), "a step of a sequence per slot, in both kinds"
+    for s in range(NSEQ):
+        assert all(np.array_equal(a, b) for a, b in zip(caches(s), kept[s], strict=True)), f"joint steps: caches of {s}"
 
 
 def test_gemma_npu_teacher_forced(cpu: _Cpu, npu: object) -> None:

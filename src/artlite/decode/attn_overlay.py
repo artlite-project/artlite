@@ -723,5 +723,12 @@ class AttentionOverlay(ModelOverlay):
         v = self.dev.view("ACT")[off:off + 4 * sp * self.H].view(np.uint16).reshape(-1, 2, sp, 8)[:, 1, slot]
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)
 
+    def residuals(self, S: int) -> np.ndarray:
+        """``residual`` of the last step's first S slots (S, hidden): copies."""
+        off, sp = self.final + XB + XPAY, packed_slots(self._last_s)
+        self.dev.fetch("ACT", off, 4 * sp * self.H)
+        v = self.dev.view("ACT")[off:off + 4 * sp * self.H].view(np.uint16).reshape(-1, 2, sp, 8)[:, 1, :S]
+        return np.ascontiguousarray(v.transpose(1, 0, 2)).reshape(S, self.H).view(bfloat16).astype(np.float32)
+
 
 __all__ = ["AttentionOverlay", "CacheKind", "CacheUse"]

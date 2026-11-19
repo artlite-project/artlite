@@ -1,6 +1,6 @@
-"""artlite-server with several sequences on the NPU (``-np``: Llama 3.2 1B on three lanes): requests that meet give
-each one's answer alone - greedy ones, and a sampled one with a seed, whose draws are its own -, their decode steps
-shared; a conversation's next turn continues on its lane."""
+"""artlite-server with several sequences on the NPU (``-np``: Llama 3.2 1B, and Gemma 4 E4B with its drafter, on three
+lanes): requests that meet give each one's answer alone - greedy ones, and a sampled one with a seed, whose draws are
+its own -, their decode steps shared; a conversation's next turn continues on its lane."""
 
 import threading
 import time
@@ -9,7 +9,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from artlite.model_config import llama_gguf
+from artlite.model_config import gemma_gguf, llama_gguf
 from models import open_model
 from models.server.api import create_app
 from models.server.engine import Engine
@@ -20,17 +20,18 @@ from ..model_files import require
 
 pytestmark = pytest.mark.slow  # a GGUF model on the NPU: run with --run-slow
 
-PATH = llama_gguf("Q4_K_M", "1B")
+PATHS = {"llama-1B": llama_gguf("Q4_K_M", "1B"), "gemma-E4B": gemma_gguf("Q4_0")}
 
 
-@pytest.fixture(scope="module")
-def served() -> Iterator[tuple[TestClient, Engine]]:
-    require(PATH)
-    model = open_model(PATH)
+@pytest.fixture(scope="module", params=list(PATHS))
+def served(request: pytest.FixtureRequest) -> Iterator[tuple[TestClient, Engine]]:
+    path = PATHS[request.param]
+    require(path)
+    model = open_model(path)
     npu = model.load(capacity=4096, sequences=3)
     engine = Engine(lambda: (model, npu))
     engine.start()
-    with TestClient(create_app(engine, Options(alias="test", n_ctx=4096), ModelInfo.from_gguf(PATH))) as c:
+    with TestClient(create_app(engine, Options(alias="test", n_ctx=4096), ModelInfo.from_gguf(path))) as c:
         assert engine.wait_ready(300)
         yield c, engine
     engine.stop()

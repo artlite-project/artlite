@@ -39,9 +39,11 @@ class SpeculativeMixin:
     accepted: int
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1, or fewer: ``--spec-draft-n-max``)
     # where a round's step is shared with other sequences (``OverlayModel``): the slots it can get at most (None: its
-    # own step, DRAFTS + 1), and what the round gives the step: per draft that the step may leave out, how often it
-    # is kept (``_joined``; None: the step runs them all)
+    # own step, DRAFTS + 1), its even share of them (what a drafter drafts for),
+    # and what the round gives the step: per draft that the step may leave out, how often it is kept (``_joined``;
+    # None: the step runs them all)
     budget: int | None = None
+    share: int | None = None
     _offer: tuple[float, ...] | None = None
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
@@ -90,6 +92,11 @@ class SpeculativeMixin:
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         """The drafter's guesses of up to k tokens after ``token`` (the next position's, not run yet)."""
         raise NotImplementedError
+
+    def _mtp_offer(self, n: int) -> tuple[float, ...] | None:
+        """What a round of n drafts of the drafter gives a shared step (``_offer``): None, the step runs them all (the
+        drafter's states follow them); a drafter without such states: how often each is kept."""
+        return None
 
     def _crossing(self) -> tuple[bool, ...]:
         """Per step of S = 1 .. DRAFTS + 1 tokens at the position: whether it takes one more pass over the KV caches
@@ -236,9 +243,11 @@ class SpeculativeMixin:
                     d = f + more
                 else:
                     m, agree, d = ctx.draft(k) if ctx is not None else (0, ONE, [])
-                    j = plan.choose(m, len(d), agree=agree, drafter=self._drafting and k > 0)
+                    # (a shared step: the drafter guesses for the lane's share of its slots)
+                    kd = k if b is None else max(min(k, self.share - 1 - c), 0)
+                    j = plan.choose(m, len(d), agree=agree, drafter=kd > 0 and self._drafting)
                     mtp = j is None
-                    d = self._mtp(token, k, penalties) if mtp else d[:j]
+                    d = self._mtp(token, kd, penalties) if mtp else d[:j]
                     if valid is not None and d:
                         d = d[:valid(d)]
                 sib = self._sibling() if mtp else None
@@ -246,15 +255,17 @@ class SpeculativeMixin:
                 if ahead is not None:
                     ahead(d)
                 # (a shared step may leave drafts out: the forced ones are kept, the context's as often as their
-                # chain; a drafter's all run, its states follow them)
-                self._offer = None if mtp or b is None else \
+                # chain; a drafter's as it says, ``_mtp_offer``)
+                offer = self._offer = None if b is None else self._mtp_offer(len(d)) if mtp else \
                     (*(1.0,) * len(f), *plan.chain(m, len(d) - len(f), agree).tolist())
                 t1, w1 = time.perf_counter(), _native.turn_waited()
                 raw = self._verify([*self.carry, token, *d], mtp)
                 t2, w2 = time.perf_counter(), _native.turn_waited()
-                if len(raw) < c + 1 + len(d) and not mtp:  # (the drafts the step ran)
+                if offer is not None and len(raw) < c + 1 + len(d):  # (the drafts the step ran)
                     d = d[:len(raw) - c - 1]
                     f, more = f[:len(d)], more[:max(len(d) - len(f), 0)]
+                    if mtp:
+                        self._chains = self._chains[:len(d)]
                 new: list[int] = []
                 for i in range(len(d) + 1):
                     new.append(choose(raw[c + i], self.softcap))

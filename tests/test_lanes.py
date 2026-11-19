@@ -2,7 +2,8 @@
 gives each slot the row of its sequence and position, in a buffer the next step overwrites and with two dispatches at
 once refused: the lanes' attributes; generations on threads of their own against each alone (their rounds' parts and
 slots); a reader that stops, a lane that is always late, rows read late; a prompt between the rounds, and the rounds
-between a prompt's chunks; more lanes than slots; failed dispatches. No NPU."""
+between a prompt's chunks; more lanes than slots; failed dispatches; lanes with a drafter (its dispatches before a
+round's step, a step's per-slot keyword, what else a lane reads of a step). No NPU."""
 
 import itertools
 import threading
@@ -31,7 +32,9 @@ class Overlay:
     """An overlay of len(texts) sequences and 4 slots: a step's row of a slot at position p of sequence s has its
     largest logit at texts[s][p + 1], in one buffer every step overwrites (as the NPU's); ``ran``: each step's parts
     (a step of the selected sequence: its part); ``delay``: a dispatch's seconds; ``fail``: the index in ``ran`` of a
-    step that raises, and what."""
+    step that raises, and what. ``marks``: each step's keyword ``mark`` (per slot, or None); ``last``: the last step's
+    (sequence, position) per slot; ``drafts``: a drafter's dispatches (``draft``: the selected sequence, a position)
+    as their index in ``ran``."""
 
     SLOTS = SLOTS
     once_s = 0.0
@@ -40,6 +43,9 @@ class Overlay:
         self.texts, self.sequences, self.seq, self.delay = texts, len(texts), 0, delay
         self._vrings = [VRing() for _ in texts]
         self.ran: list[tuple[Part, ...]] = []
+        self.marks: list[list[int] | None] = []
+        self.last: list[tuple[int, int]] = []
+        self.drafts: list[tuple[int, int, int]] = []
         self.fail: tuple[int, Exception] | None = None
         self.dev = SimpleNamespace(stale=False)
         self._buf = np.zeros((SLOTS, VOCAB), bfloat16)
@@ -54,12 +60,26 @@ class Overlay:
     def reset(self) -> None:
         self._vrings[self.seq].clear()
 
-    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
+    def draft(self, seq: int, position: int) -> None:
+        """A drafter's dispatch for sequence ``seq`` (the selected one) at ``position``."""
+        assert self._busy.acquire(blocking=False), "two dispatches at once"
+        try:
+            assert seq == self.seq, "a drafter's dispatch on another sequence's caches"
+            self.drafts.append((len(self.ran), seq, position))
+            time.sleep(self.delay / 4)
+        finally:
+            self._busy.release()
+
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True,
+             mark: np.ndarray | None = None) -> np.ndarray | None:
         parts = position if isinstance(position, tuple) else (Part(self.seq, position, len(x)),)
         assert self._busy.acquire(blocking=False), "two dispatches at once"
         try:
             assert sum(q.n for q in parts) == len(x) <= SLOTS and [q.seq for q in parts] == sorted({q.seq for q in parts})
+            assert mark is None or len(mark) == len(x)
             self.ran.append(parts)
+            self.marks.append(None if mark is None else [int(t) for t in mark])
+            self.last = [(q.seq, q.position + i) for q in parts for i in range(q.n)]
             if self.fail is not None and self.fail[0] == len(self.ran) - 1:
                 raise self.fail[1]
             time.sleep(self.delay)
@@ -150,6 +170,47 @@ class Lanes(OverlayModel):
                 break
             time.sleep(pause)
         return out
+
+
+class Drafting(Lanes):
+    """``Lanes`` with a drafter: a round's guesses are a dispatch each on the lane's sequence before its step (the
+    lane's next tokens; ``wrong``: from that depth on another token), which a shared step runs where it has room.
+    Its steps take a per-slot keyword (``mark``: the slots' tokens, of the lanes in ``marked``), and a lane reads each
+    slot's (sequence, position) of its steps (``took``)."""
+
+    drafter = True
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "wrong", "marked")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "took", "refused")
+    took: tuple[tuple[int, int], ...] = ()
+    refused = 0  # (rounds whose guesses could not run)
+
+    def __init__(self, texts: list[list[int]], *, wrong: int = SLOTS, marked: tuple[int, ...] = (), **kw: object):
+        self.wrong, self.marked = wrong, marked
+        super().__init__(texts, **kw)
+
+    def _mtp(self, token: int, k: int, penalties: object) -> list[int]:
+        out: list[int] = []
+        with self._before() as free:
+            self.refused += not free
+            for i in range(k if free else 0):
+                self.overlay.draft(self.seq, self.position)
+                t = self.text[min(self.position + 1 + i, len(self.text) - 1)]
+                out.append(t if i < self.wrong else t % (VOCAB - 1) + 1)
+        self.drafted += len(out)
+        self._chains = (1.0,) * len(out)
+        return out
+
+    def _mtp_offer(self, n: int) -> tuple[float, ...]:
+        return tuple(self._kappa(d) for d in range(n))
+
+    def _step_kw(self, tokens: list[int]) -> dict[str, object]:
+        return {"mark": np.asarray(tokens) if self.seq in self.marked else None}
+
+    def _tapped(self, S: int) -> tuple:
+        return (np.array(self.overlay.last[:S]),)
+
+    def _took(self, tokens: list[int], taken: tuple) -> None:
+        self.took += tuple(map(tuple, taken[0].tolist()))
 
 
 def texts(n: int, length: int = 72, *, copy: bool = False) -> list[list[int]]:
@@ -384,3 +445,98 @@ def test_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     for lane in (a, b):
         lane.recover()
     assert run(a.reply, b.reply) == [a.text[P:], b.text[P:]]
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_drafter(n: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lanes with a drafter: a lane's guesses run before its round's step, with the device and on its sequence, and
+    the lanes still meet in every step (no round waits in vain or leaves a lane out); a lane guesses for its share
+    of the step's slots (a slot left over: the lanes' in turns) and the step is full; each lane reads its own slots
+    of a step."""
+    monkeypatch.setattr(lanes, "WAIT", 5.0)
+    m = Drafting(texts(n, 120), delay=0.004)
+    alone_ = [lane.reply() for lane in m.lanes]
+    assert alone_ == [lane.text[P:] for lane in m.lanes]
+    ov, rounds = m.overlay, m._rounds
+    assert max(len(q) == 1 and q[0].n for q in ov.ran) == SLOTS and m.lanes[0].accepted > 60  # (alone: 3 guesses a round)
+    for lane in m.lanes:
+        lane.reset()
+        lane.took = ()
+    k, d0 = len(rounds.history), len(ov.drafts)
+    assert run(*(lane.reply for lane in m.lanes)) == alone_
+    hist = list(rounds.history)[k:]
+    full = [r for r in hist if len(r.parts) == n]
+    assert len(full) >= len(hist) - 2 * n and not any(r.late for r in hist), (len(full), len(hist))
+    assert sum(sum(slots for _, slots, _ in r.parts) == SLOTS for r in full) > 0.9 * len(full)
+    drafts = ov.drafts[d0:]
+    per = {}  # (per step: each lane's guesses before it)
+    for i, seq, _ in drafts:
+        per.setdefault(i, []).append(seq)
+    shared = [q for i, q in per.items() if len(ov.ran[i]) == n]
+    # (its share: two lanes one each, three the fourth slot's in turns; the first step's lanes guessed before the
+    # others asked)
+    if n == 2:
+        assert len(shared) > 20 and sum(sorted(q) == [0, 1] for q in shared) >= len(shared) - 2, shared[:8]
+    else:
+        assert len(shared) > 20 and sum(len(q) == 1 for q in shared) >= len(shared) - 2, shared[:8]
+        turns = [sum(q == [s] for q in shared) for s in range(n)]
+        assert max(turns) - min(turns) <= 2, turns
+    assert not any(lane.refused for lane in m.lanes)
+    for lane in m.lanes:  # (the slots a lane read: its own, at its positions in order; then its guesses past the end)
+        mine, end = [(s, p) for s, p in lane.took if p >= P], len(lane.text) - 1
+        assert mine[:end - P] == [(lane.seq, p) for p in range(P, end)]
+        assert all(s == lane.seq and p >= end for s, p in mine[end - P:])
+
+
+def test_drafter_wrong(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lanes with a drafter, one's guesses wrong: every text is its own, whatever shares its steps."""
+    monkeypatch.setattr(lanes, "WAIT", 5.0)
+    for n in (2, 3):
+        m = Drafting(texts(n, 100), delay=0.002)
+        b = m.lanes[1]
+        vars(b)["_mtp"] = lambda token, k, penalties, mtp=b._mtp: [t % (VOCAB - 1) + 1 for t in mtp(token, k, penalties)]
+        assert run(*(lane.reply for lane in m.lanes)) == [lane.text[P:] for lane in m.lanes]
+        assert b.accepted == 0 and b.drafted > 20 and m.lanes[0].accepted > 20
+
+
+def test_step_keyword(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A step's per-slot keyword: a joint step takes it where each of its lanes has it (the slots in their order),
+    a lane's own step where that lane has it."""
+    monkeypatch.setattr(lanes, "WAIT", 5.0)
+    for marked in ((0, 1), (0,)):
+        long, short = texts(2, 96)
+        m = Drafting([long, [*short[:60], 0]], delay=0.002, marked=marked)
+        a, b = m.lanes
+        assert run(a.reply, b.reply) == [a.text[P:], b.text[P:]]
+        ov = m.overlay
+        joint = [(parts, mark) for parts, mark in zip(ov.ran, ov.marks, strict=True) if len(parts) == 2]
+        assert len(joint) > 20
+        for parts, mark in joint:
+            want = [m.lanes[q.seq].text[q.position] for q in parts for _ in range(1)]
+            assert (mark is not None) == (marked == (0, 1))
+            assert mark is None or [mark[0], mark[parts[0].n]] == want, (parts, mark)
+        # (a round of one lane: lane 0's last ones, its text the longer)
+        own = [mark for parts, mark in zip(ov.ran, ov.marks, strict=True)
+               if len(parts) == 1 and parts[0].seq == 0 and parts[0].position >= P]
+        assert own and all(mark is not None for mark in own)
+
+
+def test_drafter_beside_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lane with a drafter generates while another lane's prompt holds the device (chunks that lend it to a round's
+    step): its rounds go on without guesses then, with them after."""
+    m = Drafting(texts(2, 200), delay=0.002, prefill=True)
+    a, b = m.lanes
+
+    def late() -> list[int]:
+        time.sleep(0.03)
+        return b.reply(160)  # (10 chunks)
+
+    assert run(lambda: a.reply(P), late) == [a.text[P:], b.text[160:]]
+    ran, drafts = m.overlay.ran, m.overlay.drafts
+    pieces = [i for i, parts in enumerate(ran) if parts[0].n == 16]
+    between = [i for i in range(pieces[0] + 1, pieces[-1]) if ran[i][0].n != 16]
+    assert len(between) >= 12 and all(len(ran[i]) == 1 and ran[i][0].seq == 0 for i in between)  # (a's rounds)
+    during = [i for i, _, _ in drafts if pieces[0] < i <= pieces[-1]]
+    assert len(during) <= 2, during  # (none but where the prompt was between two chunks)
+    assert a.refused + sum(1 for i in between if ran[i][0].n == 1) >= len(between) - 2
+    assert sum(1 for i, s, _ in drafts if i > pieces[-1] and s == 0) > 10  # (after the prompt: guesses again)

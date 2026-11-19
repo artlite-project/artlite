@@ -41,6 +41,10 @@ image: one A task.
 Each own-cache layer keeps per KV head a ring of two slots (``ring``, after the caches) with the exact V values of its
 open records (``attn``); the host tracks which records they hold (``decode.vring.VRing``: a step continues from the
 last one's positions, at most its own back, as the generation loop's rejected drafts do).
+
+Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
+step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own in both cache kinds
+(``_join``). Every slot's logits and residual are those of a step of one of its sequence, bit for bit.
 """
 
 from collections.abc import Callable
@@ -69,7 +73,7 @@ from artlite.decode.protocol import (
     packed_slots,
     post_region_bytes,
 )
-from artlite.decode.step import StepPlan
+from artlite.decode.step import Part, StepPlan
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
 from artlite.operators.design import COLS
@@ -91,15 +95,18 @@ class GemmaOverlay(AttentionOverlay):
     """A Gemma 4 GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices; the
     first one reads x), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the full-attention caches'
     capacity, ``kv_k``: the caches' K precision ("hilo": bfp16 hi + lo blocks; "single": one block per 8 dims),
-    ``weights``: the image's buffer allocated ahead. Two cache kinds (sliding-window: 0, full: 1); a layer without K / V
-    projections reads the cache of the last layer of its kind that has them."""
+    ``weights``: the image's buffer allocated ahead, ``sequences``: the sequences whose caches the device holds
+    (``ModelOverlay.select``). Two cache kinds (sliding-window: 0, full: 1); a layer without K / V projections reads the
+    cache of the last layer of its kind that has them."""
 
     CONFIG, IMAGE = GemmaConfig, GemmaImage
     CHAIN = AT.QH
+    SEQ = ("KV",)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None):
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights)
+                 max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None,
+                 sequences: int = 1):
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, sequences=sequences)
         cfg, img = self.cfg, self.image
         assert self.T == TILE_BYTES
         self.at = at = AT.GemmaAttn(cfg, kp=self.kp)
@@ -268,6 +275,16 @@ class GemmaOverlay(AttentionOverlay):
     def _kind_subs(self, subs: tuple, kind: int) -> tuple[tuple[int, int], ...]:
         return subs[kind]
 
+    def _join(self, parts: tuple[Part, ...]) -> tuple:
+        """(per cache kind: each part's sub-steps of that kind from its first slot on)"""
+        out: list[list[tuple[int, int]]] = [[] for _ in self.kinds]
+        a0 = 0
+        for q in parts:
+            for k, subs in enumerate(self.subs(q.position, q.n)):
+                out[k] += [(a0 + a, n) for a, n in subs]
+            a0 += q.n
+        return tuple(tuple(x) for x in out)
+
     def passes(self, p: int, S: int) -> int:
         return max(len(x) for x in self.subs(p, S))
 
@@ -278,12 +295,14 @@ class GemmaOverlay(AttentionOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: np.ndarray, e: np.ndarray | None, position: int, *, logits: bool = True,
+    def step(self, x: np.ndarray, e: np.ndarray | None, position: int | tuple[Part, ...], *, logits: bool = True,
              start: int | None = None, emb: np.ndarray | None = None, p: np.ndarray | None = None
              ) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the scaled embeddings, e (S, layers, per_layer_dim)
         the model's per-layer token rows times sqrt(per_layer_dim / 2) (``GemmaHost.layer_rows``; E2B / E4B), at positions
-        position .. position + S - 1 (the positions before are cached). Returns the raw logits (S, vocab) bf16 (before
+        position .. position + S - 1 of the selected sequence (the positions before are cached), or of several
+        sequences' slots: ``position`` their parts (``decode.step.Part``: the rows in the parts' order, each sequence's
+        at its own next positions; from the first layer). Returns the raw logits (S, vocab) bf16 (before
         the soft cap; a view of the NPU's buffer, valid until the next step), or without ``logits`` None (only the
         caches are updated). ``start``: the step from that layer on, x its input (e.g. a prompt's last token after a
         prefill chunk: ``GemmaPrefill.residual``; ``emb``: the scaled embeddings, the per-layer projection's input):
@@ -297,6 +316,7 @@ class GemmaOverlay(AttentionOverlay):
         assert 1 <= S <= SLOTS
         dev, H = self.dev, self.H
         start = self._mode(start)
+        assert start == self.layers[0] or not isinstance(position, (tuple, list)), "a step of parts: from the first layer"
         if self._metas_s != (S, start):
             self._metas(S)
         act = dev.view("ACT")

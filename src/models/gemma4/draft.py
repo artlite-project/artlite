@@ -25,8 +25,12 @@ On the overlay (the model's phases: ``gemma4/overlay.py``):
   the masks of position p - 1 (the window W - 1), no K / V insert;
 - per step the host writes x (and h for a draft's first step: the post-projection's drain writes the next one) and,
   at a new position, the token objects and the cache fills (``_position``).
+
+On an overlay of several sequences a draft step attends to the selected one's caches (``ModelOverlay.select``): its
+fills are patched for a sequence and a position.
 """
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -248,11 +252,11 @@ class GemmaDraft:
         self.src = [self.cfg.kv_layers - (2 if s else 1) for s in img.swa]  # (the model's caches the layers attend to)
         self.nq = img.heads // AT.KV_HEADS
         self.rows = img.logit_rows().astype(np.int32)
-        self._pos = -1
+        self._pos: tuple[int, int] | None = None  # (the sequence and position the cache fills were patched for)
         self._tr: Transaction | None = None
         self._fills: list[tuple[int, int, int]] = []  # (BD word index, layer, column) of the cache fills
         self._tails: list[tuple[int, int, int]] = []  # (the same) of the chain ends' tail fills
-        self._tkey: tuple | None = None  # (the position and record modes the tail fills were patched for)
+        self._tkey: tuple | None = None  # (the sequence, position and record modes the tail fills were patched for)
         self._plan()
 
     # ------------------------------------------------------------------
@@ -438,7 +442,8 @@ class GemmaDraft:
     # ------------------------------------------------------------------
 
     def _position(self, pos: int) -> None:
-        """The token objects (the masks at pos - 1, RoPE at pos, the columns' ranges) and the cache fills."""
+        """The token objects (the masks at pos - 1, RoPE at pos, the columns' ranges) and the cache fills (the selected
+        sequence's caches)."""
         ov, cfg, dev, T = self.ov, self.cfg, self.ov.dev, self.T
         act = dev.view("DACT")
         fills = {}
@@ -459,14 +464,14 @@ class GemmaDraft:
         f = np.array([(at, *fills[(0 if self.image.swa[L] else 1, c)], ov.kv_base(self.src[L], c // AT.QH))
                       for at, L, c in self._fills], np.int64)
         ov._bd_words(self._tr.words, f[:, 0], kv0 + f[:, 3] + f[:, 1] * T, f[:, 2] * T)
-        self._pos = pos
+        self._pos = (ov.seq, pos)
 
     def _tail_fills(self, pos: int) -> bool:
         """The chain ends' tail fills of the open record of position pos - 1 (``AttentionOverlay.tail_mode``: its ring
         slots, or its V panels as the prefill left them) and the F_ATT objects' M_ATREC; False: as they were."""
         ov, T, dev = self.ov, self.T, self.ov.dev
         rec = {src: ov.tail_mode(src, before=False) for src in set(self.src)}
-        key = (pos, tuple(sorted(rec.items())))
+        key = (ov.seq, pos, tuple(sorted(rec.items())))
         if key == self._tkey:
             return False
         for src, m in rec.items():
@@ -485,8 +490,8 @@ class GemmaDraft:
         return True
 
     def step(self, x: np.ndarray, h: np.ndarray | None, pos: int) -> np.ndarray:
-        """A draft step for the token at position ``pos`` (not cached; the positions before are): x (hidden,) its
-        scaled embedding, h (hidden,) the model's output-normed hidden state of position pos - 1, or None: the hidden
+        """A draft step for the token at position ``pos`` of the overlay's selected sequence (not cached; the
+        positions before are): x (hidden,) its scaled embedding, h (hidden,) the model's output-normed hidden state of position pos - 1, or None: the hidden
         state the previous step left (the steps of a draft run at the position of its first token). Returns the raw
         logits of the next token in the LM's output order (vocab,) bf16 (a view of the NPU's buffer; ``token``)."""
         assert 1 <= pos <= self.ov.max_positions, pos
@@ -496,7 +501,7 @@ class GemmaDraft:
         xh = np.concatenate([x.reshape(-1), h.reshape(-1)]) if h is not None else x.reshape(-1)
         act[pre:pre + 2 * xh.size] = xh.astype(bfloat16).view(np.uint8)
         dev.flush("DACT", pre, 2 * xh.size)
-        moved = pos != self._pos
+        moved = (self.ov.seq, pos) != self._pos
         if moved:
             self._position(pos)
         if self._tail_fills(pos) or moved:
@@ -510,9 +515,16 @@ class GemmaDraft:
         """The most likely token of a step's logits."""
         return int(self.rows[argmax(logits)])
 
+    @functools.cached_property
+    def where(self) -> np.ndarray:
+        """The logit of each token in a step's logits (the inverse of ``rows``)."""
+        out = np.empty_like(self.rows)
+        out[self.rows] = np.arange(len(self.rows), dtype=self.rows.dtype)
+        return out
+
     def reset(self) -> None:
         """(the token objects and the tail fills are rewritten at the next step)"""
-        self._pos = -1
+        self._pos = None
         self._tkey = None
 
 

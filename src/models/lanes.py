@@ -25,10 +25,12 @@ Slots. A request names the slots it needs (its token) and what each further one 
 kept). A step takes every admitted request's needed slots, then gives its spare ones to the drafts worth most, a
 lane's in their order, and each request learns how many of its slots ran: with three lanes the fourth slot is the
 best draft's, with two the two spare ones go where the drafts are likelier. A lane plans for the slots it can get at
-most (``budget``: a step's less one for each other lane that asks).
+most (``budget``: a step's less one for each other lane that asks); a drafter, whose guesses cost a dispatch each,
+guesses for the lane's even share of them, the slots left over the lanes' in turns (``share``).
 
 Rows. The overlay's logits are a view of the NPU's one buffer, and a lane reads its rows while the next round may
-run: each request gets copies (a screened head's: ``Screened.take``), valid until that lane's next request.
+run: each request gets copies (a screened head's: ``Screened.take``), valid until that lane's next request; what
+else a model reads of a step (``Rounds``' ``tap``: a drafter's hidden states, ...) goes to the requests the same way.
 
 The device alone. A prompt's chunks and steps, the state copies and every other dispatch of one sequence run with the
 device held (``alone``: re-entrant per thread, the lane's sequence selected first, ``ModelOverlay.select``), in arrival
@@ -38,6 +40,12 @@ the others in between two parts of its work: whoever waits, between a prompt's c
 round between a chunk's pieces (``lend``, ``waiting``: the chunk then runs in short pieces,
 ``artlite.prefill.chunks.PEER_PIECE_S``) once the holder has had the device for as long as the round's step takes, so
 a prompt and the lanes that generate beside it take turns of about the same time.
+
+A round's own dispatches. A lane whose round starts with dispatches of its own on its sequence (a drafter's steps on
+the caches) takes the device for them with ``before``: it goes ahead of the round that waits, and the round waits
+for the lane's request after them as after its rows, so the lanes that draft still meet in one step. Not while another
+lane has the device alone or waits for it (a prompt lends the device to a round's step only): the lane's round then
+goes without them.
 
 Failures. A dispatch that fails leaves the device in a state nobody knows, for every sequence (a step's rings are
 marked before it ends): the error goes to every lane of the round, and every lane's calls raise ``DeviceFailed`` until
@@ -52,7 +60,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -95,21 +103,24 @@ def kept(logits: np.ndarray | Screened, a: int = 0, b: int | None = None) -> np.
 @dataclass(eq=False)
 class Request:
     """A lane's round: slots of sequence ``seq`` from ``position`` on, their inputs ``args`` (the overlay step's
-    arguments before the position, each per slot): the first ``need`` of them run, the others (``worth`` each, in
+    arguments before the position, each per slot or None; ``kw``: its keywords that are per slot, which a step takes
+    where each of its requests has them): the first ``need`` of them run, the others (``worth`` each, in
     their order) where the step has room; then its result: ``n`` (the slots that ran), ``rows`` (their logits,
-    copies), ``wall`` (the dispatch's seconds), ``seconds`` (those less its one-time host work and other processes'
-    turns: a step's time) and ``parts`` (the sequences of its step)."""
+    copies), ``taken`` (its rows of the model's ``tap``), ``wall`` (the dispatch's seconds), ``seconds`` (those less
+    its one-time host work and other processes' turns: a step's time) and ``parts`` (the sequences of its step)."""
 
     seq: int
     args: tuple
     position: int
     need: int
     worth: tuple[float, ...] = ()
+    kw: dict[str, Any] = field(default_factory=dict)
     n: int = 0
     asked: float = 0.0
     gap: float = math.inf  # (seconds from the lane's last rows to this request)
     waited: bool = False  # (a round left it out: its slots did not fit)
     rows: Any = None
+    taken: tuple = ()
     wall: float = 0.0
     seconds: float = 0.0
     parts: int = 0
@@ -134,11 +145,15 @@ _ROUND = object()  # (the round's place in the device's queue)
 
 class Rounds:
     """The lanes of a model on ``overlay`` (an ``artlite.decode.model.ModelOverlay`` of several sequences): module
-    docstring. ``join``: a lane's round; ``alone``: the device to a lane; ``idle``: a lane stops asking; ``budget``: a
-    lane's slots of the next round; ``recover``: a lane starts over after a failure."""
+    docstring. ``join``: a lane's round; ``alone``: the device to a lane; ``before``: to a lane for its round's own
+    dispatches; ``idle``: a lane stops asking; ``budget``, ``share``: a lane's slots of the next round;
+    ``recover``: a lane starts over after a failure. ``tap``: what else than the logits the model reads of a step,
+    called with the step's slots right after it: arrays of a row per slot (copies) or None, whose rows go to the
+    requests (``Request.taken``)."""
 
-    def __init__(self, overlay: Any):
+    def __init__(self, overlay: Any, tap: Callable[[int], tuple] | None = None):
         self.overlay = overlay
+        self.tap = tap
         n = overlay.sequences
         self._cv = threading.Condition(threading.Lock())
         self._pending: dict[int, Request] = {}  # (lane -> its request)
@@ -146,12 +161,15 @@ class Rounds:
         self._released = [-math.inf] * n  # (per lane: when its last rows were handed out; -inf: it asked for none since)
         self._late = [0] * n  # (per lane: its requests in a row that came after the round's wait for it)
         self._passed = [-1] * n  # (per lane: the last round that left its request out)
+        self._spared = [-1] * n  # (per lane: the last round that gave it a spare slot)
         self._queue: collections.deque[object] = collections.deque()  # (who waits for the device, in arrival order)
         self._queued = False  # (the round is in the queue: it is while requests are pending)
         self._running = False  # (a round's dispatch runs: of the lanes ``_busy``)
         self._busy: frozenset[int] = frozenset()
         self._owner: int | None = None  # (the thread that has the device alone, and how deep)
         self._depth = 0
+        self._parts: set[object] = set()  # (the queue's tickets of ``before``)
+        self._part = False  # (the owner has the device for a part of its round: ``before``)
         self._lent = False  # (that thread lets the waiting round run now: ``lend``)
         self._failures = 0
         self._free = 0.0  # (when the device was last given back)
@@ -169,8 +187,20 @@ class Rounds:
         """The slots lane ``seq``'s next round can get at most: a step's less one for each other lane that asks for
         rounds, 1 at least."""
         with self._cv:
-            others = len((self._expected | self._pending.keys() | self._busy) - {seq})
-        return max(self.overlay.SLOTS - others, 1)
+            return max(self.overlay.SLOTS - len(self._asking() - {seq}), 1)
+
+    def share(self, seq: int) -> int:
+        """The slots lane ``seq``'s next round gets where the lanes that ask take as many each: a step's over them,
+        and the slots left over to the lanes in turns, a round each (what a drafter guesses for: a guess that finds
+        no slot costs its dispatch)."""
+        with self._cv:
+            asking = sorted(self._asking() | {seq})
+            each, left = divmod(self.overlay.SLOTS, len(asking))
+            return each + ((asking.index(seq) - self.rounds) % len(asking) < left)
+
+    def _asking(self) -> set[int]:
+        """The lanes that ask for rounds."""
+        return self._expected | self._pending.keys() | self._busy
 
     def idle(self, seq: int) -> None:
         """Lane ``seq`` asks for no round until its next request (its generation ended or was abandoned)."""
@@ -188,16 +218,26 @@ class Rounds:
         """Whether the calling thread has the device alone."""
         return self._owner == threading.get_ident()
 
+    def held(self) -> bool:
+        """Whether another thread has the device alone or waits for it (for more than a part of its round:
+        ``before``, which would refuse the calling thread)."""
+        with self._cv:
+            if self._owner == threading.get_ident():
+                return False
+            return (self._owner is not None and not self._part) or \
+                any(x is not _ROUND and x not in self._parts for x in self._queue)
+
     def down(self, seq: int) -> bool:
         """Whether lane ``seq`` has not started over since a dispatch failed (its calls raise ``DeviceFailed``)."""
         return seq in self._down
 
-    def join(self, seq: int, args: tuple, position: int, need: int, worth: tuple[float, ...] = ()) -> Request:
+    def join(self, seq: int, args: tuple, position: int, need: int, worth: tuple[float, ...] = (),
+             kw: dict[str, Any] | None = None) -> Request:
         """Lane ``seq``'s round at ``position`` (``Request``: ``need`` slots, and one more per entry of ``worth`` where
-        the step has room), in a step with the other lanes' rounds; blocks until its rows are there.
-        ``DeviceFailed``: the step failed, or a dispatch failed before and the lane has not started over
-        (``recover``)."""
-        req = Request(seq, args, position, need, worth)
+        the step has room; ``kw``: the step's per-slot keywords), in a step with the other lanes' rounds; blocks
+        until its rows are there. ``DeviceFailed``: the step failed, or a dispatch failed before and the lane has not
+        started over (``recover``)."""
+        req = Request(seq, args, position, need, worth, kw or {})
         cv = self._cv
         with cv:
             self._check(seq)
@@ -235,7 +275,7 @@ class Rounds:
         """The device to the calling thread alone, lane ``seq``'s sequence selected (re-entrant: inside, the thread's
         own dispatches run directly); after the holders and the round that came before it. A ``DispatchError`` inside
         is every lane's failure."""
-        me, cv, ov = threading.get_ident(), self._cv, self.overlay
+        me, cv = threading.get_ident(), self._cv
         with cv:
             if self._owner == me:
                 self._depth += 1
@@ -252,6 +292,51 @@ class Rounds:
                     self._queue.remove(ticket)
                     cv.notify_all()
                 self._owner, self._depth = me, 1
+        with self._hold(seq):
+            yield
+
+    @contextlib.contextmanager
+    def before(self, seq: int) -> Iterator[bool]:
+        """The device to the calling thread for lane ``seq``'s own dispatches before its round's step (a drafter's, on
+        the sequence's caches), its sequence selected: True, once it has it - ahead of the round that waits, which then
+        waits for the lane's request as after its last rows. False, without the device, where another lane has it
+        alone or waits for it: the round goes without those dispatches. Inside a holder of the thread's own: True."""
+        me, cv, busy = threading.get_ident(), self._cv, False
+        with cv:
+            if self._owner == me:
+                self._depth += 1
+            else:
+                self._check(seq)
+                busy = (self._owner is not None and not self._part) or \
+                    any(x is not _ROUND and x not in self._parts for x in self._queue)
+                if not busy:
+                    ticket = object()
+                    self._parts.add(ticket)
+                    if self._queued:  # (ahead of the round: the lane's request is one of its)
+                        self._queue.insert(self._queue.index(_ROUND), ticket)
+                    else:
+                        self._queue.append(ticket)
+                    try:
+                        while self._running or self._owner is not None or self._queue[0] is not ticket:
+                            cv.wait()
+                        self._check(seq)
+                    finally:
+                        self._queue.remove(ticket)
+                        self._parts.discard(ticket)
+                        cv.notify_all()
+                    self._owner, self._depth, self._part = me, 1, True
+        if busy:
+            yield False
+            return
+        with self._hold(seq):
+            yield True
+
+    @contextlib.contextmanager
+    def _hold(self, seq: int) -> Iterator[None]:
+        """(the calling thread has the device: ``_owner``, ``_depth``) Lane ``seq``'s sequence selected; the device
+        given back at the end of the thread's outermost holder (one of ``before``: the next round waits for the lane's
+        request from then on)."""
+        cv, ov = self._cv, self.overlay
         before = ov.seq
         try:
             ov.select(seq)
@@ -267,6 +352,12 @@ class Rounds:
                 self._depth -= 1
                 if not self._depth:
                     self._owner, self._free = None, time.perf_counter()
+                    if self._part:
+                        self._part = False
+                        if seq not in self._down:
+                            self._released[seq] = self._free
+                            if self._late[seq] < LATE:
+                                self._expected.add(seq)
                     cv.notify_all()
 
     def breathe(self, seq: int) -> None:
@@ -372,7 +463,8 @@ class Rounds:
     def _admit(self) -> list[Request]:
         """The pending requests of the next step, in lane order, each with its slots (``Request.n``): those a round
         left out first, then those passed over longest ago, while the slots they need fit; then the spare slots, one
-        at a time, to the request whose next one is worth most (equal ones: the request of fewer slots)."""
+        at a time, to the request whose next one is worth most (equal ones: the request of fewer slots, then the lane
+        that got a spare slot longest ago)."""
         take, left = [], self.overlay.SLOTS
         for r in sorted(self._pending.values(), key=lambda r: (not r.waited, -self._passed[r.seq], r.seq)):
             if r.need <= left:
@@ -385,8 +477,11 @@ class Rounds:
             more = [r for r in take if r.n - r.need < len(r.worth)]
             if not more:
                 break
-            max(more, key=lambda r: (r.worth[r.n - r.need], -r.n, -r.seq)).n += 1
+            max(more, key=lambda r: (r.worth[r.n - r.need], -r.n, -self._spared[r.seq], -r.seq)).n += 1
             left -= 1
+        for r in take:
+            if r.n > r.need:
+                self._spared[r.seq] = self.rounds
         return sorted(take, key=lambda r: r.seq)
 
     def _lead(self) -> None:
@@ -445,14 +540,23 @@ class Rounds:
         """One step of the requests' slots, the device held by the caller: each request's ``rows``; the dispatch's
         seconds, those of a step (less its one-time host work and other processes' turns), that work's."""
         ov = self.overlay
-        args = tuple(a[0] if len(a) == 1 else np.concatenate(a)
-                     for a in zip(*([x[:r.n] for x in r.args] for r in reqs), strict=True))
+
+        def rows(per: list[Any]) -> Any:  # (the requests' per-slot arrays as the step's; None: none of them has it)
+            if any(x is None for x in per):
+                return None
+            per = [x[:r.n] for x, r in zip(per, reqs, strict=True)]
+            return per[0] if len(per) == 1 else np.concatenate(per)
+
+        args = tuple(rows(list(a)) for a in zip(*(r.args for r in reqs), strict=True))
+        kw = {k: v for k in reqs[0].kw if (v := rows([r.kw.get(k) for r in reqs])) is not None}
         t0, w0 = time.perf_counter(), _native.turn_waited()
-        logits = ov.step(*args, tuple(Part(r.seq, r.position, r.n) for r in reqs))
+        logits = ov.step(*args, tuple(Part(r.seq, r.position, r.n) for r in reqs), **kw)
         wall = time.perf_counter() - t0
         once = ov.once_s
+        taps = self.tap(sum(r.n for r in reqs)) if self.tap is not None else ()
         a = 0
         for r in reqs:
             r.rows = kept(logits, a, a + r.n)
+            r.taken = tuple(None if x is None else x[a:a + r.n] for x in taps)
             a += r.n
         return wall, wall - (_native.turn_waited() - w0) - once, once
