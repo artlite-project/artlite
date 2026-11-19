@@ -127,6 +127,7 @@ def test_overlay_idle_prologue(monkeypatch: pytest.MonkeyPatch) -> None:
     now, turns = [100.0], [0]
     kernel = types.SimpleNamespace(dispatch=lambda buf, bufs, **spin: dispatched.append(buf))
     dev = object.__new__(OverlayDevice)
+    dev._shared = {"stale": False}  # (its hardware context's)
     dev._prog = types.SimpleNamespace(_kernel=lambda: kernel)
     dev.buffers = {"W": object()}
     dev._prologue = types.SimpleNamespace(buffer="prologue")
@@ -152,6 +153,10 @@ def test_overlay_idle_prologue(monkeypatch: pytest.MonkeyPatch) -> None:
         assert run(0.1) == ["prologue", "step"]  # (another process's turn)
         assert run(IDLE_S) == ["prologue"] * wake + ["step"]  # (idle)
         assert run(0.1) == ["step"]
+    other = object.__new__(OverlayDevice)  # (another device of the hardware context, a drafter's: stale with it)
+    other._shared = dev._shared
+    other.stale = True
+    assert run(0.1) == ["prologue", "step"] and not other.stale
     dev._prologue = None  # (a design that keeps nothing on the array)
     assert run(10 * IDLE_S) == ["step"]
 

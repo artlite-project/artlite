@@ -19,7 +19,12 @@ positions, which it writes again. The caches: per layer and KV head a ring of ``
 block's window and its own groups; ``decode.attn256_steps``' "ra" / "rb" fills), the open records' rings
 (``decode.vring``); a sequence's state (``snapshot``) holds the window's groups before a position, as the model's
 sliding-window layers'. Transactions per (injected slots, block) are built at their first use and patched per round: the
-two parts' F_ATT objects are the two buffers of ``AttentionSteps`` (b 0: the injection's, 1: the block's)."""
+two parts' F_ATT objects are the two buffers of ``AttentionSteps`` (b 0: the injection's, 1: the block's).
+
+A model of several sequences (``SparkOverlay(sequences=)``): the drafter holds the rings of each (its KV per sequence,
+the selected one the model's: ``ModelOverlay.followers``), and an injection reads its rows' taps from a staging region
+of the drafter's ACT (``run``'s ``rows``: the model's next step is another sequence's too, and a sequence's rows are at
+its slots of a joint step: ``SparkOverlay.tap_rows`` copies them out)."""
 
 import dataclasses
 from collections.abc import Callable
@@ -102,7 +107,9 @@ class DSparkOverlay(SparkOverlay):
         self.head = HeadView(target.image, target.image.draft_cols)
         image.head = self.head.region(-1, "lm")
         image.vocab = self.head.vocab
-        ModelOverlay.__init__(self, gguf, layers=list(range(cfg.layers)), vocab=None, weights=None, image=image)
+        ModelOverlay.__init__(self, gguf, layers=list(range(cfg.layers)), vocab=None, weights=None, image=image,
+                              sequences=target.sequences)
+        target.followers.append(self)  # (its rings of each of the model's sequences: selected with the model's)
         self.target, self.op, self.ash = target, target.op, target.ash
         if not image.formats() <= set(self.op.rows) or (image.gu_rows() != {16} and not self.op.gu_win):
             raise ValueError("the model's design lacks the drafter's tiles: SparkOverlay(**dspark.needs(gguf))")
@@ -113,7 +120,7 @@ class DSparkOverlay(SparkOverlay):
         self.period = 1
         self.attn_steps = AttentionSteps(self)
         self.table = HeadTable(self.head, tc.vocab_size, lambda: target.dev)
-        self._rounds: dict[tuple[int, bool], Round] = {}
+        self._rounds: dict[tuple[int, bool, bool], Round] = {}
         for L in cfg.taps:  # (a tap: one K group, the fc phases' own)
             assert len(target.inp[(L, "attn_in")]) == 1
         self._plan()
@@ -155,10 +162,13 @@ class DSparkOverlay(SparkOverlay):
         take = self._take
         self.loadr = take("ACT", COLS * self.SLOTS * XB)  # (the block's residual slices: [column][slot])
         self.zero = take("ACT", COLS * self.SLOTS * XB)  # (the injection's: zero)
+        self.stage: list[int] = []  # (several sequences: per tap the x of an injection's rows, an object before it)
         for i in range(len(cfg.taps)):
             self._add_meta((i, "fc"))
             tg = self.target.inp[(cfg.taps[i], "attn_in")][0]
             assert self.inp[(i, "fc")][0].K == tg.K, "fc's K group: the tap's x as the model's attn_in reads it"
+            if self.sequences > 1:
+                self.stage.append(take("ACT", region_bytes(tg.K, self.SLOTS)) + XB)
         self._add_inputs((0, "ikv"))
         for L in self.layers[1:]:
             self._add_meta((L, "ikv"))
@@ -206,7 +216,9 @@ class DSparkOverlay(SparkOverlay):
         adopted ("MW", "MACT"), the static objects written."""
         img, tgt = self.image, self.target
         self.dev = dev = OverlayDevice(self.op, device=tgt.dev.device)
-        dev.alloc_all({"W": img.nbytes, **self.sizes})
+        dev.alloc_all({"W": img.nbytes, **self.sizes,
+                       **{self.seq_name(b, s): self.sizes[b] for b in self.SEQ for s in range(1, self.sequences)}})
+        dev.alias = self._alias()
         if img.pack(dev.view("W"), threads=threads):
             dev.flush("W")
         dev.adopt("MW", tgt.dev.buffers["W"])
@@ -222,7 +234,10 @@ class DSparkOverlay(SparkOverlay):
             dev.set_prologue(self.op.page_prologue(store))
         self._w_out = self._f32("output_norm.weight")
         self.gguf.release()
-        self.reset()
+        for s in reversed(range(self.sequences)):  # (every sequence starts over; the selected one: the model's)
+            ModelOverlay.select(self, s)
+            self.reset()
+        ModelOverlay.select(self, tgt.seq)
 
     def _load(self) -> None:
         """The norm weights (NORM), the F_ATT objects (sliding-window layers)."""
@@ -284,9 +299,9 @@ class DSparkOverlay(SparkOverlay):
             return
         super()._inputs(seq, rg, S, phase)
 
-    def _inject(self, seq: Sequence, st: AttnStep) -> None:
+    def _inject(self, seq: Sequence, st: AttnStep, staged: bool) -> None:
         """fc over the S rows' taps (a phase per tap, normed; into the zero residual), g -> ikv, per layer K, V and the
-        records."""
+        records. ``staged``: the taps' x from ``stage`` (``run``'s ``rows``), else the model's ACT in place."""
         dev, S, cfg = self.dev, st.S, self.cfg
         sp = self._sp(S)
         for c in range(COLS):
@@ -296,10 +311,11 @@ class DSparkOverlay(SparkOverlay):
             rg = self.inp[phase][0]
             self._weights(seq, phase, 0)
             nbytes, dims = input_fill(rg.K, sp, self.SLOTS)
-            x = self.target.tap_x(tap) - 4 * META
+            x = dev.address("ACT", self.stage[i] - 4 * META) if staged else \
+                dev.address("MACT", self.target.tap_x(tap) - 4 * META)
             for c in range(COLS):  # (the dispatch's first phases: per column, after local objects)
                 seq.fill("X", c, dev.address("ACT", rg.off), XB)
-                seq.fill("X", c, dev.address("MACT", x), nbytes - XB, dims)
+                seq.fill("X", c, x, nbytes - XB, dims)
         h8 = self.H // COLS
         for c in range(COLS):
             self._values_to(seq, c, (self.layers[0], "ikv"), e0=h8 * c, n=h8, S=S, whole=True)
@@ -319,15 +335,15 @@ class DSparkOverlay(SparkOverlay):
             self._phase(seq, (L, "down"), B, nxt)
         self._phase(seq, (-1, "lm"), B, "LOGITS")
 
-    def _round(self, S: int, block: bool) -> Round:
-        """The transaction of a round (built at its first use)."""
-        key = (S, block)
+    def _round(self, S: int, block: bool, staged: bool = False) -> Round:
+        """The transaction of a round (built at its first use); ``staged``: its injection's taps from ``stage``."""
+        key = (S, block, staged and S > 0)
         if key not in self._rounds:
             seq = Sequence(self.op, inputs=("X",))
             inj = AttnStep(S, ((0, S, 0),), b=0, mode="insert") if S else None
             blk = AttnStep(self.B, ((0, self.B, 0),), b=1, mode="block") if block else None
             if inj is not None:
-                self._inject(seq, inj)
+                self._inject(seq, inj, key[2])
             if blk is not None:
                 self._block(seq, blk)
             seq.sync(fills=True)
@@ -351,17 +367,26 @@ class DSparkOverlay(SparkOverlay):
         """The block's inputs (B, hidden) fp32 of the anchor's and the mask token's embeddings (hidden each)."""
         return np.stack([anchor, *[mask] * (self.B - 1)]).astype(np.float32)
 
-    def run(self, S: int, q: int, x: np.ndarray | None, P: int, *, meanwhile: Callable[[], None] | None = None
-            ) -> None:
+    def run(self, S: int, q: int, x: np.ndarray | None, P: int, *, meanwhile: Callable[[], None] | None = None,
+            rows: np.ndarray | None = None) -> None:
         """One round's dispatch: the injection of the model's last step (its S slots at q .., whose taps its ACT holds;
         0: none) and, with x (B, hidden) the block's inputs (``block_rows``), the block at P (its logits and h:
-        ``logits``, ``h``). ``meanwhile``: host work while it runs."""
-        rnd = self._round(S, x is not None)
+        ``logits``, ``h``). ``meanwhile``: host work while it runs. ``rows`` (a model of several sequences): the
+        injection's taps (S, taps, K) bf16 bits (``SparkOverlay.tap_rows``: a sequence's rows of a step, at q ..)."""
+        assert (rows is not None) == (S > 0 and self.sequences > 1), "a sequence's rows: given with the injection"
+        rnd = self._round(S, x is not None, rows is not None)
         s = S or self._metas_s[0] or 1  # (no injection: its phases' objects as they are)
         if self._metas_s != (s, self.start):
             self._metas(s)
         if S:
             self._clear_pads(self._sp(S))
+        if rows is not None:
+            act, sp = self.dev.view("ACT"), self._sp(S)
+            for i, off in enumerate(self.stage):
+                v = np.zeros((rows.shape[2] // 8, sp, 8), np.uint16)
+                v[:, :S] = rows[:, i].reshape(S, -1, 8).transpose(1, 0, 2)
+                act[off:off + v.nbytes] = v.view(np.uint8).reshape(-1)
+                self.dev.flush("ACT", off, v.nbytes)
         if x is not None:
             x = np.asarray(x, np.float32).reshape(self.B, self.H)
             self._write_loadr(x)

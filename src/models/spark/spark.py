@@ -12,10 +12,10 @@ clients send mapped to those two).
 
 Several sequences (``NpuSpark(sequences=N)``): the device holds the caches of each and the model has a lane for each
 (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
-(``models.lanes``: one stream of the weights for all of them, an attention pass per sequence). Without the DSpark
-drafter, whose records follow one sequence."""
+(``models.lanes``: one stream of the weights for all of them, an attention pass per sequence). The DSpark drafter
+drafts for every lane: its rings per sequence, a lane's rows of the model's steps kept on the host until the lane's
+next round injects them with its block, ahead of the lanes' joint step (``NpuSpark._rows_at``)."""
 
-import logging
 import time
 from collections.abc import Iterator, Sequence
 
@@ -37,33 +37,39 @@ from .dspark import DSparkOverlay, needs
 from .overlay import SparkOverlay
 from .prefill import SIZES, SparkPrefill
 
-log = logging.getLogger("artlite")
-
 
 class NpuSpark(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full layers' caches hold; ``prefill``: prompts in chunks
     (else as decode steps), of the sizes ``sizes``; ``dspark``: a DSpark drafter's file: a generation's rounds of its
     drafts (``dspark.DSparkOverlay``, the Markov chain on the host: ``models.dspark``); ``sequences``: the sequences
     the device holds, each with caches of ``capacity`` positions (``lanes``: the model of each; their generations share
-    decode steps; without a drafter).
+    decode steps).
 
     The drafter's records follow the model's: a prompt's chunks write them (``SparkPrefill(dspark=)``), after each
     committed step its rows wait (``_inj``: the step's slots and first position; their taps in the model's ACT) until the
     drafter's next dispatch, the round's block's or one of their own before the model's next dispatch. A round's step of
-    the token and 7 drafts injects all 8 rows; the kept ones are the sequence's, the next block writes over the others."""
+    the token and 7 drafts injects all 8 rows; the kept ones are the sequence's, the next block writes over the others.
+    Several lanes: the model's next step is another lane's too, so a lane's rows are copied out of each step
+    (``_rows_at`` on: the taps of the positions from ``_rows_from``, the sequence's up to its position) and injected
+    from the drafter's staging region (``DSparkOverlay.run``'s ``rows``), 8 a dispatch, the last ones with the block;
+    a lane that drafts nothing for long (no slot left for a draft) keeps the rows a block's window reaches."""
 
     recurrent = True  # (the sliding-window layers' rings and the drafter's hold a window: a position comes back from a
     # checkpoint, ``SparkOverlay.snapshot``)
     STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)
-    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dspark", "chain")
-    LANE_OWN = (*OverlayModel.LANE_OWN, "_inj", "_end")
+    # a block's drafts must be kept this many times what the block costs the lanes of a shared round (``_block_pays``).
+    # Measured with two lanes and a block every round, where the two are about equal (1.0 - 1.2): -1.5% (1.7B) to +7%
+    # (4B) against no block; with four lanes (0.3 - 0.5): -30%
+    BLOCK_MARGIN = 1.3
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dspark", "chain", "_mask")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "_inj", "_end", "_rows_from", "_rows_at")
     _inj: tuple[int, int] | None = None  # (the last step's slots and first position: its rows wait for the drafter)
     _end = 0  # (the running prompt's end)
+    _rows_from = 0  # (several lanes: the position of the first of the rows that wait for the drafter)
+    _rows_at: tuple[np.ndarray, ...] = ()  # (those rows: the taps of a position each, ``SparkOverlay.tap_rows``)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] = SIZES, dspark: str | None = None, sequences: int = 1):
-        if dspark and sequences > 1:
-            raise ValueError("several sequences: without the DSpark drafter (its records follow one sequence)")
         self.gguf = gguf
         dg = GGUFFile(dspark) if dspark else None
         self.overlay = SparkOverlay(gguf, max_positions=capacity, sequences=sequences,
@@ -87,6 +93,17 @@ class NpuSpark(OverlayModel):
             self.chain.resident()
             self._mask = self._rows([self.dspark.cfg.mask_token])[0]
 
+    def _prepare_steps(self) -> None:
+        """(several lanes: the drafter's rounds' transactions too, 0.2 s: a first block's build would count as its
+        time, ``_block_pays``)"""
+        super()._prepare_steps()
+        d = self.dspark
+        if d is not None and self.overlay.sequences > 1:
+            for S in range(d.SLOTS + 1):
+                for block in (False, True):
+                    if S or block:
+                        d._round(S, block, True)
+
     @property
     def capacity(self) -> int:
         return self.overlay.max_positions
@@ -100,6 +117,32 @@ class NpuSpark(OverlayModel):
             out += f", DSpark drafter ({d.image.nbytes / 1e9:.2f} GB, {d.sizes['KV'] / 1e6:.0f} MB of records)"
         return out
 
+    @property
+    def _follows(self) -> bool:
+        """Whether the drafter's records follow the model's steps (``_drafting``: whether it may draft now)."""
+        return self.dspark is not None and self.DRAFTS > 0
+
+    @property
+    def share(self) -> int | None:  # type: ignore[override]
+        """(several lanes: no slot for the drafter's guesses in a round whose block does not pay, ``_block_pays``)"""
+        s = super().share
+        return s if s is None or s <= 1 or self.dspark is None or self._block_pays(s - 1) else 1
+
+    def _block_pays(self, k: int) -> bool:
+        """Whether a block for k drafts pays in the lane's next round. Its dispatch is one of the device's for every
+        lane that asks: n lanes that draft make a round's time step + n blocks for n (1 + g) tokens, g the drafts a
+        block gets kept, so a block pays where g step > n block (alone: about always; the 1.7B with 2 lanes: 3 drafts,
+        1.1 kept, for a block of half a step: not; 4 lanes: a draft each, never). From the lanes' measured rounds
+        (``_kept_at``, the block's seconds ``_t_row``); before any: its first blocks measure."""
+        r = self._rounds
+        n = r.asking(self.seq)
+        if n == 1:
+            return True
+        cal = next((x for x in (self, *self.lanes) if x._t_row and x._kept_at), None)
+        if cal is None or not r.step_s:
+            return True
+        return sum(cal._kept_at[:k]) * r.step_s > self.BLOCK_MARGIN * n * cal._t_row
+
     @alone
     def reset(self) -> None:
         """Forget the cached positions."""
@@ -107,7 +150,7 @@ class NpuSpark(OverlayModel):
         self.overlay.reset()
         if self.dspark is not None:
             self.dspark.reset()
-        self._inj = None
+        self._inj, self._rows_at = None, ()
         self.position = 0
 
     def _rows(self, tokens: list[int]) -> np.ndarray:
@@ -131,9 +174,29 @@ class NpuSpark(OverlayModel):
         p = self.position
         self._inject()
         out = super().steps(tokens, logits=logits, **step)
-        if self._drafting:
+        if self._follows and self._rounds is None:
             self._inj = (len(tokens), p)
+        elif self._follows:  # (while the device is the lane's)
+            self._wait(p, self.overlay.tap_rows(self.dspark.cfg.taps, len(tokens)))
         return out
+
+    def _wait(self, p: int, rows: np.ndarray) -> None:
+        """(several lanes) The taps of a step's rows at p wait for the drafter: after the sequence's rows before p
+        (a rejected draft's leave), as far back as a block's window reaches from a record's first position on."""
+        kept = self._rows_at[:max(p - self._rows_from, 0)] if self._rows_at else ()
+        assert not self._rows_at or self._rows_from + len(kept) == p, (self._rows_from, len(kept), p)
+        start, rows = (self._rows_from if kept else p), (*kept, *rows)
+        cut = max(len(rows) - self.dspark.cfg.window - 64, 0)
+        cut -= (start + cut) % 32
+        self._rows_from, self._rows_at = (start + cut, rows[cut:]) if cut > 0 else (start, rows)
+
+    def _tapped(self, S: int) -> tuple:
+        """(the drafter's taps of the step's rows)"""
+        return (self.overlay.tap_rows(self.dspark.cfg.taps, S),) if self.dspark is not None else ()
+
+    def _took(self, tokens: list[int], taken: tuple) -> None:
+        if taken and self._follows:
+            self._wait(self.position - len(tokens), taken[0])
 
     @alone
     def prompt(self, tokens: list[int], **kw: object) -> np.ndarray | None:
@@ -145,7 +208,7 @@ class NpuSpark(OverlayModel):
         """(the drafter's rows of the last step first; the chunk's of the positions a block's window after the prompt
         reads)"""
         self._inject()
-        rows_from = self._end - self.dspark.cfg.window - 32 if self._drafting else 1 << 62
+        rows_from = self._end - self.dspark.cfg.window - 32 if self._follows else 1 << 62
         self.prefill.run(*args, self.position, T, rows_from=rows_from)
         self.stale()
 
@@ -161,15 +224,27 @@ class NpuSpark(OverlayModel):
 
     @alone
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
-        self._inj = None
+        self._inj, self._rows_at = None, ()
         super().restore(position, checkpoint)
 
-    def _inject(self) -> None:
-        """The drafter's rows of the model's last step, while its taps are in place."""
-        if self._inj is not None:
-            S, q = self._inj
+    def _inject(self, x: np.ndarray | None = None) -> None:
+        """The drafter's rows of the model's last step, while its taps are in place (several lanes: the sequence's
+        rows that wait, ``_wait``); with ``x`` the block's inputs: the block at the position in the last dispatch."""
+        d = self.dspark
+        if self._rounds is None:
+            S, q = self._inj or (0, 0)
             self._inj = None
-            self._dispatch(lambda: self.dspark.run(S, q, None, 0))
+            if S or x is not None:
+                self._dispatch(lambda: d.run(S, q, x, self.position))
+            return
+        q = self._rows_from
+        rows, self._rows_at = self._rows_at[:max(self.position - q, 0)], ()
+        while len(rows) > d.SLOTS or (rows and x is None):
+            part, rows = rows[:d.SLOTS], rows[d.SLOTS:]
+            self._dispatch(lambda part=part, q=q: d.run(len(part), q, None, 0, rows=np.stack(part)))
+            q += len(part)
+        if x is not None:
+            self._dispatch(lambda: d.run(len(rows), q, x, self.position, rows=np.stack(rows) if rows else None))
 
     # ------------------------------------------------------------------
     # Drafts
@@ -178,7 +253,7 @@ class NpuSpark(OverlayModel):
     def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: Sequence[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(the drafter's head table follows the prompt and each token: ``HeadTable.see``)"""
-        see = self.dspark.table.see if self._drafting else None
+        see = self.dspark.table.see if self._follows else None
         if see is not None:
             see(token_ids(prompt))
         for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs, drafts=drafts):
@@ -189,27 +264,35 @@ class NpuSpark(OverlayModel):
     def forced_drafts(self, tokens: list[int], first: int, *, turns: Sequence[int] = (), prefill: bool = True
                       ) -> Iterator[tuple[list[int], np.ndarray]]:
         """(the drafter's table sees all the tokens first: runs over the same tokens draft from the same rows)"""
-        if self._drafting:
+        if self._follows:
             self.dspark.table.see(tokens)
         return super().forced_drafts(tokens, first, turns=turns, prefill=prefill)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         """A round's drafts after ``token`` (the next position's): the last step's rows injected and the block at the
-        position in one dispatch, the Markov chain's drafts (up to k)."""
-        t0 = time.perf_counter()
+        position in one dispatch, the Markov chain's drafts (up to k). Several lanes: with the device for the lane
+        (``OverlayModel._before``); none where it is not to be had (the rows wait on)."""
         d = self.dspark
-        S, q = self._inj or (0, 0)
-        self._inj = None
-        x = d.block_rows(self._rows([token])[0], self._mask)
-        self._dispatch(lambda: d.run(S, q, x, self.position))
-        fork = getattr(penalties.mask, "fork", None)  # (a grammar's: the chain's drafts follow it)
-        out, conf = self.chain.walk(d.logits(), d.table.ids, d.h(), token, min(k, d.B), set(self.eos_token_ids),
-                                    fork() if fork is not None else None)
+        with self._before() as free:
+            t0 = time.perf_counter()  # (the block's time, without the wait for the device)
+            if not free:
+                self._chains = ()
+                return []
+            self._inject(d.block_rows(self._rows([token])[0], self._mask))
+            fork = getattr(penalties.mask, "fork", None)  # (a grammar's: the chain's drafts follow it)
+            out, conf = self.chain.walk(d.logits(), d.table.ids, d.h(), token, min(k, d.B), set(self.eos_token_ids),
+                                        fork() if fork is not None else None)
         self._chains = tuple(np.cumprod(conf).tolist())
+        self._row_time(time.perf_counter() - t0)  # (a block's seconds: ``_block_pays``)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
         self.blocks += 1
         return out
+
+    def _mtp_offer(self, n: int) -> tuple[float, ...]:
+        """(a block's drafts: a shared step runs those it has room for, each kept as often as its chain's confidence
+        says, ``_kappa``; the rows of the others never ran)"""
+        return tuple(c * self._kappa(i) for i, c in enumerate(self._chains[:n]))
 
 
 class Spark(Model):
@@ -262,9 +345,5 @@ class Spark(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuSpark:
-        """(``sequences``: ``NpuSpark``'s; several: without the DSpark drafter)"""
-        if self.dspark is not None and sequences > 1:
-            log.warning("%s with %d sequences runs without its DSpark drafter (the drafter's records follow one "
-                        "sequence)", self.name, sequences)
-        return NpuSpark(self.gguf, capacity=capacity, prefill=prefill, dspark=self.dspark if sequences == 1 else None,
-                        sequences=sequences)
+        """(``sequences``: ``NpuSpark``'s)"""
+        return NpuSpark(self.gguf, capacity=capacity, prefill=prefill, dspark=self.dspark, sequences=sequences)

@@ -239,9 +239,21 @@ class OverlayDevice:
         self.alias: dict[str, str] = {}
         self._submitted: tuple[Transaction, float] | None = None  # (``submit``: the running one, its start)
         self._prologue: Transaction | None = None
-        self.stale = False  # (``set_prologue``)
+        # (what the devices of one hardware context share: ``stale``)
+        self._shared: dict[str, bool] = vars(prog).setdefault("_overlay_shared", {"stale": False})
         self._turns = -1  # (``turn_foreign`` at the last dispatch)
         self._last = -IDLE_S  # (``portable.uptime`` at the last dispatch's end)
+
+    @property
+    def stale(self) -> bool:
+        """Whether the array may have lost the design's state since its prologue last ran (``set_prologue``): of the
+        hardware context, so of every device on it (a model's overlay and its drafter's: either one's prologue brings
+        the state back for both, and whoever ran another context marks one of them)."""
+        return self._shared["stale"]
+
+    @stale.setter
+    def stale(self, value: bool) -> None:
+        self._shared["stale"] = value
 
     def set_prologue(self, words: np.ndarray) -> None:
         """A transaction run before the next dispatch whenever the array may have lost the state the design keeps on it

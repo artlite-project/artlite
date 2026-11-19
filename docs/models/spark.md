@@ -52,8 +52,11 @@ decode overlay of 8 token slots (`artlite.decode`) with the head_dim-256 attenti
   8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them, and
   each attention layer runs a pass per sequence over that sequence's cache. A step of 2 / 4 / 8 requests takes
   1.07x / 1.20x / 1.48x (1.7B) and 1.05x / 1.15x / 1.36x (4B) a step of one, so 8 requests get 4.4x (1.7B) and 4.9x
-  (4B) one request's tokens per second in all. The DSpark drafter does not load then (its records follow one
-  sequence): [artlite-server](../server.md#several-requests-at-a-time).
+  (4B) one request's tokens per second in all. The DSpark drafter keeps a record ring per sequence and drafts for a
+  request ahead of the step the requests share, where its block pays for itself: one dispatch of about half a model
+  step whatever number of its guesses find a slot, so for a request alone (48 and 29 tokens per second) and not in a
+  crowded step; a request's rows of the shared steps wait on the host until its next block:
+  [artlite-server](../server.md#several-requests-at-a-time).
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size; nothing is written to disk. The 4B's hidden size of 2560 is two and a half of the 1024-column tiles: the

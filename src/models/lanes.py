@@ -202,6 +202,16 @@ class Rounds:
         """The lanes that ask for rounds."""
         return self._expected | self._pending.keys() | self._busy
 
+    def asking(self, seq: int) -> int:
+        """How many lanes ask for rounds, lane ``seq`` among them."""
+        with self._cv:
+            return len(self._asking() | {seq})
+
+    @property
+    def step_s(self) -> float:
+        """The last round's dispatch (seconds; 0 before one)."""
+        return self._step_s
+
     def idle(self, seq: int) -> None:
         """Lane ``seq`` asks for no round until its next request (its generation ended or was abandoned)."""
         with self._cv:

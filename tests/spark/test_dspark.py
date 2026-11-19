@@ -195,6 +195,75 @@ def test_dspark_prefill_rows(size: str, p0: int, T: int) -> None:
     assert max(worst.values()) < 0.021, worst
 
 
+def test_dspark_sequences() -> None:
+    """The drafter of a model of three sequences (``DSparkOverlay`` on ``SparkOverlay(sequences=3)``: rings of each,
+    selected with the model's; an injection's taps from its staging region, ``run``'s ``rows``): per sequence the
+    model's steps (of one sequence, and of the three: a sequence's rows at its slots of the step), the injection of
+    its rows and blocks give the blocks' logits and rows (bf16 bits) of the drafter of a model of one sequence over
+    the same steps, its taps read in place."""
+    from artlite.decode.step import Part
+
+    size, nseq, rounds = "1.7B", 3, 24
+    g = ref.gguf(size)
+    dg = GGUFFile(spark_dspark_of(ref.path(size)))
+    taps = DSparkConfig.from_gguf(dg).taps
+    rng = np.random.default_rng(11)
+    sizes = rng.integers(1, 9, (nseq, rounds))  # (a sequence's slots of each round's step: 1 .. 8 of its own step,
+    sizes[:, 1::2] = rng.integers(1, 3, (nseq, rounds // 2))  # 1 .. 2 of a step of the three)
+    ids = [ref.corpus_ids(200 + 40 * s, size)[40 * s:] for s in range(nseq)]
+    emb = [g.rows("token_embd.weight", t) for t in ids]
+    mask = g.rows("token_embd.weight", [DSparkConfig.from_gguf(dg).mask_token])[0]
+
+    def block(d: DSparkOverlay, s: int, P: int) -> np.ndarray:
+        return d.block_rows(emb[s][P], mask)
+
+    tgt, d = _slice(size)
+    want: list[list[tuple[np.ndarray, np.ndarray]]] = []
+    for s in range(nseq):  # (alone: a model of one sequence, the taps in place)
+        tgt.reset()
+        d.reset()
+        p, out = 0, []
+        for i in range(rounds):
+            S = int(sizes[s, i])
+            tgt.step(emb[s][p:p + S], p, logits=False)
+            d.run(S, p, block(d, s, p + S) if i % 3 == 2 else None, p + S)
+            p += S
+            if i % 3 == 2:
+                out.append((d.logits().view(np.uint16).copy(), d.h().copy()))
+        want.append(out)
+    d.dev = tgt.dev = None
+    tgt = SparkOverlay(g, layers=sorted(taps), vocab=VOCAB, max_positions=4096, sequences=nseq, **needs(dg))
+    tgt.load()
+    d = DSparkOverlay(tgt, dg)
+    d.load()
+    assert d.sequences == nseq
+    pos, got = [0] * nseq, [[] for _ in range(nseq)]
+    for i in range(rounds):
+        n = [int(sizes[s, i]) for s in range(nseq)]
+        if i % 2:  # (a step of the three; else a step of each)
+            parts = tuple(Part(s, pos[s], n[s]) for s in range(nseq))
+            tgt.step(np.concatenate([emb[s][pos[s]:pos[s] + n[s]] for s in range(nseq)]), parts, logits=False)
+            rows = np.split(tgt.tap_rows(taps, sum(n)), np.cumsum(n)[:-1])
+        else:
+            rows = []
+            for s in range(nseq):
+                tgt.select(s)
+                tgt.step(emb[s][pos[s]:pos[s] + n[s]], pos[s], logits=False)
+                rows.append(tgt.tap_rows(taps, n[s]))
+        for s in (2, 0, 1):  # (the drafter's rounds: a sequence's rows from the staging region)
+            tgt.select(s)
+            assert d.seq == s
+            P = pos[s] + n[s]
+            d.run(n[s], pos[s], block(d, s, P) if i % 3 == 2 else None, P, rows=rows[s])
+            if i % 3 == 2:
+                got[s].append((d.logits().view(np.uint16).copy(), d.h().copy()))
+            pos[s] = P
+    for s in range(nseq):
+        for j, ((gl, gh), (wl, wh)) in enumerate(zip(got[s], want[s], strict=True)):
+            assert np.array_equal(gl, wl) and np.array_equal(gh, wh), f"sequence {s}, block {j}"
+    d.dev = tgt.dev = None
+
+
 CODE = "Write a Python function that returns the n-th Fibonacci number using memoization, with a docstring and two tests."
 
 

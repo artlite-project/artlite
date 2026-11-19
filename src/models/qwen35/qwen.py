@@ -233,11 +233,6 @@ class NpuQwen(OverlayModel):
         if self.mtp is not None:
             self.mtp.reset()
 
-    def stale(self) -> None:
-        super().stale()
-        if self.drafter is not None:
-            self.drafter.dev.stale = True
-
     def _overlays(self) -> list[QwenOverlay | DFlashOverlay]:
         d = self.dflash if self.dflash is not None else self.drafter
         return [self.overlay] + ([d] if d is not None else [])
