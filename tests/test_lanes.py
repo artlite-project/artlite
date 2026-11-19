@@ -206,7 +206,7 @@ def test_lanes() -> None:
 @pytest.mark.parametrize(("n", "lookup"), [(2, False), (2, True), (3, False), (4, True)])
 def test_generations(n: int, lookup: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     """n lanes generating at once give each one's tokens alone (with and without the context's drafts); their rounds
-    share steps, the parts in lane order within a step's slots, a lane's slots its share of them."""
+    share steps, the parts in lane order within a step's slots; a step's spare slots are the lanes' drafts."""
     monkeypatch.setattr(lanes, "WAIT", 5.0)  # (every round waits for its lanes: its parts whatever the threads' timing)
     m = Lanes(texts(n, copy=lookup), delay=0.002, lookup=lookup)
     alone_ = [lane.reply() for lane in m.lanes]  # (one after another: every round one lane's)
@@ -222,11 +222,16 @@ def test_generations(n: int, lookup: bool, monkeypatch: pytest.MonkeyPatch) -> N
     hist = list(rounds.history)[k:]
     assert all([s for s, _, _ in r.parts] == sorted(s for s, _, _ in r.parts) for r in hist)
     assert all(sum(slots for _, slots, _ in r.parts) <= SLOTS for r in hist)
-    # (all lanes in a round but for the first ones, the lanes' prompts ending one after another)
+    # (all lanes in a round but for the first ones, the lanes' prompts ending one after another, and with drafts
+    # the last ones: the lanes' texts end rounds apart)
     full = [r for r in hist if len(r.parts) == n]
-    assert len(full) >= len(hist) - 2 * n, (len(full), len(hist))
+    assert len(full) >= (0.6 * len(hist) if lookup else len(hist) - 2 * n), (len(full), len(hist))
     assert not any(r.late for r in hist) and max(r.idle for r in hist) < 1.0
-    assert max(slots for r in full for _, slots, _ in r.parts) == (SLOTS // n if lookup else 1)
+    used = [sum(slots for _, slots, _ in r.parts) for r in full]
+    if lookup:  # (the texts copy themselves: every lane has drafts to offer, and the step is full)
+        assert sum(u == SLOTS for u in used) > 0.8 * len(used) and max(s for r in full for _, s, _ in r.parts) <= SLOTS + 1 - n
+    else:
+        assert set(used) == {n}
     assert [lane.position for lane in m.lanes] == [len(lane.text) - 1] * n
 
 
@@ -312,6 +317,21 @@ def test_rounds_between_chunks() -> None:
     assert [j - i for i, j in itertools.pairwise(pieces)] == [2] * 11, pieces  # (a round between two pieces)
     assert all(len(ran[i + 1]) == 1 and ran[i + 1][0].seq == 0 for i in pieces[:-1])
     assert m.overlay.dev.stale  # (a chunk's other hardware context ran: the overlay's pages before its next step)
+
+
+def test_spare_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three lanes on four slots: the fourth is the draft of the lane that has one (its text copies itself; the
+    others' drafts, where they have any, are worth less), and every token is its lane's."""
+    monkeypatch.setattr(lanes, "WAIT", 5.0)
+    plain, copies = texts(3), texts(3, copy=True)
+    m = Lanes([plain[0], copies[1], plain[2]], delay=0.002, lookup=True)
+    assert run(*(lane.reply for lane in m.lanes)) == [lane.text[P:] for lane in m.lanes]
+    full = [r for r in m._rounds.history if len(r.parts) == 3]
+    assert len(full) > 20
+    second = [{s: n for s, n, _ in r.parts} for r in full]
+    assert sum(q[1] == 2 for q in second) > 0.8 * len(full), [q[1] for q in second]
+    assert all(sum(q.values()) <= SLOTS for q in second)
+    assert m.lanes[1].accepted_ctx > 15 and m.lanes[1].dispatches < m.lanes[0].dispatches
 
 
 def test_more_lanes_than_slots(monkeypatch: pytest.MonkeyPatch) -> None:

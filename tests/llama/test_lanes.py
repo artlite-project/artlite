@@ -53,10 +53,10 @@ def test_lanes_greedy(quant: str, size: str) -> None:
         slots = sum(n for r in hist for _, n, _ in r.parts)
         print(f"{quant} {size}, {drafts} drafts: {len(hist)} rounds of 1 / 2 / 3 lanes: {by}, {slots} slots, "
               f"{sum(bool(r.late) for r in hist)} waited in vain; {npu.stats()}")
-        assert by[2] >= 30 and by[1] + by[2] > 0.8 * len(hist), by
+        assert by[2] >= 30 and (drafts or by[1] + by[2] > 0.8 * len(hist)), by
         assert all(sum(n for _, n, _ in r.parts) <= npu.overlay.SLOTS for r in hist)
-        if drafts:  # (two lanes: a draft each; alone: up to three)
-            assert max(n for r in hist if len(r.parts) == 2 for _, n, _ in r.parts) == 2
+        if drafts:  # (three lanes: the fourth slot is a draft of one of them; the lanes that copy end rounds earlier)
+            assert sum(sum(n for _, n, _ in r.parts) == 4 for r in hist if len(r.parts) == 3) >= 10
         # (a lane counts the steps it had a part in)
         assert sum(lane.dispatches - d for lane, d in zip(npu.lanes, d0, strict=True)) > len(hist)
 

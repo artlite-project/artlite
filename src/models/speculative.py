@@ -38,7 +38,11 @@ class SpeculativeMixin:
     drafted: int  # draft tokens run and accepted (of both kinds: ``NpuModel``'s counters)
     accepted: int
     DRAFTS = 3  # draft tokens per step at most (the overlay's SLOTS - 1, or fewer: ``--spec-draft-n-max``)
-    budget: int | None = None  # a round's slots at most where the step is shared (``OverlayModel``); None: DRAFTS + 1
+    # where a round's step is shared with other sequences (``OverlayModel``): the slots it can get at most (None: its
+    # own step, DRAFTS + 1), and what the round gives the step: per draft that the step may leave out, how often it
+    # is kept (``_joined``; None: the step runs them all)
+    budget: int | None = None
+    _offer: tuple[float, ...] | None = None
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
     # (a drafter step of one row's seconds; per draft depth the rounds that kept a draft there and their chains'
@@ -143,7 +147,8 @@ class SpeculativeMixin:
         """A generation's rounds begin (after its prompt's last step)."""
 
     def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
-        """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab)."""
+        """A round's step of the sampled token and its drafts (``mtp``: the drafter's): their logits (S, vocab), or of
+        the first of them where the step left drafts out (``_offer``)."""
         return self._joined(tokens)
 
     def _overhead(self, wall: float) -> float | None:
@@ -210,7 +215,7 @@ class SpeculativeMixin:
         try:
             while n != max_tokens and token not in self.eos_token_ids and self.position + len(self.carry) < self.capacity:
                 c = len(self.carry)
-                room = most if (b := self.budget) is None else min(most, b - 1)  # (a shared step: this round's slots)
+                room = most if (b := self.budget) is None else min(most, b - 1)  # (a shared step: its slots at most)
                 k = max(min(room - c, self.capacity - self.position - 1 - c,
                             max_tokens - n - 1 if max_tokens > 0 else room), 0)
                 plan.place(self.position)
@@ -240,9 +245,16 @@ class SpeculativeMixin:
                 p = self.position
                 if ahead is not None:
                     ahead(d)
+                # (a shared step may leave drafts out: the forced ones are kept, the context's as often as their
+                # chain; a drafter's all run, its states follow them)
+                self._offer = None if mtp or b is None else \
+                    (*(1.0,) * len(f), *plan.chain(m, len(d) - len(f), agree).tolist())
                 t1, w1 = time.perf_counter(), _native.turn_waited()
                 raw = self._verify([*self.carry, token, *d], mtp)
                 t2, w2 = time.perf_counter(), _native.turn_waited()
+                if len(raw) < c + 1 + len(d) and not mtp:  # (the drafts the step ran)
+                    d = d[:len(raw) - c - 1]
+                    f, more = f[:len(d)], more[:max(len(d) - len(f), 0)]
                 new: list[int] = []
                 for i in range(len(d) + 1):
                     new.append(choose(raw[c + i], self.softcap))

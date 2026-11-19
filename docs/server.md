@@ -460,7 +460,8 @@ per second on Llama 3.2 3B.
 - A prompt and the requests that generate take turns on the NPU, of about the same time each: beside a generating
   request, a prompt of 2000 tokens takes 2.2 s instead of 1.25 s on Llama 3.1 8B, and the generating request gets 5
   tokens per second during it instead of 12.5 (a token every 0.2 s at most).
-- Draft tokens share a step's 4 slots with the other requests: two requests have a draft each, three or more none.
+- Draft tokens take the slots the requests leave free, the likeliest drafts first: with two requests two slots, with
+  three one, with four none.
 - The prompt cache's RAM (`--cache-ram`) is split evenly between the sequences.
 - Embeddings, reranks and the other requests that are no chat run on sequence 0, between the others' steps.
 - Another model serves `-np N` one request at a time (a line in the log says so).

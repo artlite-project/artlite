@@ -186,12 +186,17 @@ class Planner:
         s = min(known, key=lambda s: abs(s - (S - 1)))
         return t[s] * self.cost[S - 1] / self.cost[s]
 
+    def chain(self, m: int, k: int, agree: int) -> np.ndarray:
+        """Per draft of k context drafts after a match of m tokens whose occurrences agree as ``agree``: how often it
+        is kept (it and the drafts before it accepted)."""
+        b = bucket(m)
+        a = np.concatenate(([self.kept1[b, agree] / self.tried1[b, agree]], self.kept[b] / self.tried[b]))
+        return np.cumprod(a[:k])
+
     def expected(self, m: int, k: int, agree: int) -> float:
         """The tokens a round of k context drafts after a match of m tokens whose occurrences agree as ``agree`` gives
         (with the sampled one)."""
-        b = bucket(m)
-        a = np.concatenate(([self.kept1[b, agree] / self.tried1[b, agree]], self.kept[b] / self.tried[b]))
-        return 1.0 + float(np.cumprod(a[:k]).sum())
+        return 1.0 + float(self.chain(m, k, agree).sum())
 
     def choose(self, m: int, k: int, *, agree: int, drafter: bool) -> int | None:
         """The context drafts to take of k after a match of m tokens whose occurrences agree as ``agree``, or None:

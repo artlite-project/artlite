@@ -79,7 +79,8 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     # ... or each lane's own, from the class's defaults on (a sequence's state, its generations' counters, the drafter's
     # calibration, the planner)
     LANE_OWN: ClassVar[tuple[str, ...]] = (
-        "seq", "position", "slot", "carry", "rounds", "_rounds_of", "_round", "planner", "t_npu", "t_host", "dispatches",
+        "seq", "position", "slot", "carry", "rounds", "_rounds_of", "_round", "_offer", "planner", "t_npu", "t_host",
+        "dispatches",
         "drafted", "accepted", "drafted_ctx", "accepted_ctx", "forced", "blocks", "t_draft", "_t_row", "_kept_at",
         "_chain_at", "_chains")
 
@@ -149,7 +150,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
 
     @property
     def budget(self) -> int | None:  # type: ignore[override]
-        """(several lanes: the lane's share of a step's slots this round, ``lanes.Rounds.budget``)"""
+        """(several lanes: the slots a round of the lane can get, ``lanes.Rounds.budget``)"""
         return None if self._rounds is None else self._rounds.budget(self.seq)
 
     def _total(self, name: str) -> float:
@@ -244,20 +245,22 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     def _joined(self, tokens: list[int]) -> np.ndarray | Screened:
         """A generation round's step of the tokens at the next positions (``SpeculativeMixin._verify``): ``steps``; a
         model of several lanes: in one dispatch with the other lanes' rounds (``lanes.Rounds.join``: it waits for
-        them), its rows copies, valid until its next round. The inputs are made and checked first: their errors are
-        this lane's alone."""
+        them), its rows copies, valid until its next round: of the first of the tokens where the step had no room for
+        the drafts the round offered it (``_offer``). The inputs are made and checked first: their errors are this
+        lane's alone."""
         rounds = self._rounds
         if rounds is None:
             return self.steps(tokens)
+        offer, self._offer = self._offer or (), None  # (this round's)
         if rounds.mine():  # (the caller holds the device: no round could run)
             self._round = None
             return self.steps(tokens)
         args = self._step_inputs_of(tokens)
-        r = self._round = rounds.join(self.seq, args, self.position, len(tokens))
+        r = self._round = rounds.join(self.seq, args, self.position, len(tokens) - len(offer), offer)
         self.t_npu += r.wall
         self.dispatches += 1
-        self.position += len(tokens)
-        self.slot = len(tokens) - 1
+        self.position += r.n
+        self.slot = r.n - 1
         return r.rows
 
     def _overhead(self, wall: float) -> float | None:

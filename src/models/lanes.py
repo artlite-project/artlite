@@ -21,6 +21,12 @@ the others their rows (a lane alone pays no thread hop). A round's parts are in 
 patched only for the same parts); requests of more slots than a step has wait a round, those that waited first, then
 those passed over longest ago.
 
+Slots. A request names the slots it needs (its token) and what each further one is worth (a draft: how often it is
+kept). A step takes every admitted request's needed slots, then gives its spare ones to the drafts worth most, a
+lane's in their order, and each request learns how many of its slots ran: with three lanes the fourth slot is the
+best draft's, with two the two spare ones go where the drafts are likelier. A lane plans for the slots it can get at
+most (``budget``: a step's less one for each other lane that asks).
+
 Rows. The overlay's logits are a view of the NPU's one buffer, and a lane reads its rows while the next round may
 run: each request gets copies (a screened head's: ``Screened.take``), valid until that lane's next request.
 
@@ -88,15 +94,18 @@ def kept(logits: np.ndarray | Screened, a: int = 0, b: int | None = None) -> np.
 
 @dataclass(eq=False)
 class Request:
-    """A lane's round: ``n`` slots of sequence ``seq`` at ``position``, their inputs ``args`` (the overlay step's
-    arguments before the position, each per slot); then its result: ``rows`` (the slots' logits, copies), ``wall``
-    (the dispatch's seconds), ``seconds`` (those less its one-time host work and other processes' turns: a step's
-    time) and ``parts`` (the sequences of its step)."""
+    """A lane's round: slots of sequence ``seq`` from ``position`` on, their inputs ``args`` (the overlay step's
+    arguments before the position, each per slot): the first ``need`` of them run, the others (``worth`` each, in
+    their order) where the step has room; then its result: ``n`` (the slots that ran), ``rows`` (their logits,
+    copies), ``wall`` (the dispatch's seconds), ``seconds`` (those less its one-time host work and other processes'
+    turns: a step's time) and ``parts`` (the sequences of its step)."""
 
     seq: int
     args: tuple
     position: int
-    n: int
+    need: int
+    worth: tuple[float, ...] = ()
+    n: int = 0
     asked: float = 0.0
     gap: float = math.inf  # (seconds from the lane's last rows to this request)
     waited: bool = False  # (a round left it out: its slots did not fit)
@@ -157,10 +166,11 @@ class Rounds:
     # ------------------------------------------------------------------
 
     def budget(self, seq: int) -> int:
-        """The slots lane ``seq`` plans its next round for: a step's over the lanes that ask for rounds, 1 at least."""
+        """The slots lane ``seq``'s next round can get at most: a step's less one for each other lane that asks for
+        rounds, 1 at least."""
         with self._cv:
-            lanes = len(self._expected | self._pending.keys() | self._busy | {seq})
-        return max(self.overlay.SLOTS // lanes, 1)
+            others = len((self._expected | self._pending.keys() | self._busy) - {seq})
+        return max(self.overlay.SLOTS - others, 1)
 
     def idle(self, seq: int) -> None:
         """Lane ``seq`` asks for no round until its next request (its generation ended or was abandoned)."""
@@ -182,11 +192,12 @@ class Rounds:
         """Whether lane ``seq`` has not started over since a dispatch failed (its calls raise ``DeviceFailed``)."""
         return seq in self._down
 
-    def join(self, seq: int, args: tuple, position: int, n: int) -> Request:
-        """Lane ``seq``'s round of n slots at ``position`` (``Request``), in a step with the other lanes' rounds; blocks
-        until its rows are there. ``DeviceFailed``: the step failed, or a dispatch failed before and the lane has not
-        started over (``recover``)."""
-        req = Request(seq, args, position, n)
+    def join(self, seq: int, args: tuple, position: int, need: int, worth: tuple[float, ...] = ()) -> Request:
+        """Lane ``seq``'s round at ``position`` (``Request``: ``need`` slots, and one more per entry of ``worth`` where
+        the step has room), in a step with the other lanes' rounds; blocks until its rows are there.
+        ``DeviceFailed``: the step failed, or a dispatch failed before and the lane has not started over
+        (``recover``)."""
+        req = Request(seq, args, position, need, worth)
         cv = self._cv
         with cv:
             self._check(seq)
@@ -359,15 +370,23 @@ class Rounds:
         return max(max(self._released[s] for s in self._expected) + self._cap() - time.perf_counter(), 0.0)
 
     def _admit(self) -> list[Request]:
-        """The pending requests of the next step, in lane order: those a round left out first, then those passed over
-        longest ago, while their slots fit."""
+        """The pending requests of the next step, in lane order, each with its slots (``Request.n``): those a round
+        left out first, then those passed over longest ago, while the slots they need fit; then the spare slots, one
+        at a time, to the request whose next one is worth most (equal ones: the request of fewer slots)."""
         take, left = [], self.overlay.SLOTS
         for r in sorted(self._pending.values(), key=lambda r: (not r.waited, -self._passed[r.seq], r.seq)):
-            if r.n <= left:
+            if r.need <= left:
                 take.append(r)
-                left -= r.n
+                r.n = r.need
+                left -= r.need
             else:
                 r.waited, self._passed[r.seq] = True, self.rounds
+        while left:
+            more = [r for r in take if r.n - r.need < len(r.worth)]
+            if not more:
+                break
+            max(more, key=lambda r: (r.worth[r.n - r.need], -r.n, -r.seq)).n += 1
+            left -= 1
         return sorted(take, key=lambda r: r.seq)
 
     def _lead(self) -> None:
@@ -426,7 +445,8 @@ class Rounds:
         """One step of the requests' slots, the device held by the caller: each request's ``rows``; the dispatch's
         seconds, those of a step (less its one-time host work and other processes' turns), that work's."""
         ov = self.overlay
-        args = tuple(a[0] if len(a) == 1 else np.concatenate(a) for a in zip(*(r.args for r in reqs), strict=True))
+        args = tuple(a[0] if len(a) == 1 else np.concatenate(a)
+                     for a in zip(*([x[:r.n] for x in r.args] for r in reqs), strict=True))
         t0, w0 = time.perf_counter(), _native.turn_waited()
         logits = ov.step(*args, tuple(Part(r.seq, r.position, r.n) for r in reqs))
         wall = time.perf_counter() - t0
