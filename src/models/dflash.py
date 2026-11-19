@@ -12,6 +12,15 @@ The model supplies: ``dflash`` (the drafter), ``overlay``, ``position``, ``capac
 row), the counters ``t_draft``, ``drafted``, ``blocks``, ``_keep`` and ``_chains`` (``SpeculativeMixin``), and
 ``_dflash_ahead(S, p)``: the model's step of S slots at p patched while the drafter's dispatch runs
 (``ModelOverlay.patch_ahead``, and what the model's positions need first).
+
+A model of several lanes (``OverlayModel.lanes``: a ``DFlashDrafting`` each, one drafter): a block is one dispatch
+whatever number of its drafts find a slot, so it pays for a lane that runs alone (``OverlayModel._block_pays``), and
+the drafter holds the records of one lane's sequence at a time (``own``: the lane that had it keeps its state, a
+``DFlashOverlay.snapshot``, and gets it back at its next turn with the drafter). A lane's rows of the model's steps
+wait on the host meanwhile (``wait``: their taps, copied out of each step: the next step is another lane's too) and
+are injected from the drafter's staging region before its next block, prompt chunk or checkpoint (``_run``); past
+``LIMIT`` rows the drafter follows the lane's sequence no longer (``lost``), until a prompt chunk of the lane writes
+its records again. No sibling branches there, and no step patched ahead (a lane's next step is the lanes').
 """
 
 import dataclasses
@@ -37,23 +46,131 @@ class DFlashDrafting:
     """The DFlash2 drafter's injections and sibling branch of the model ``model`` (module docstring)."""
 
     BRANCH = 2  # the tokens of a sibling branch that rounds may run (``block``; 0: none)
+    LIMIT = 256  # (several lanes) a lane's rows that wait for the drafter at most: 64 injections to catch up
 
     def __init__(self, model: Any):
         self.model = model
         self.inj: Injection | None = None
         self.sibling: list[int] | None = None  # (the round's sibling branch: ``block``)
         self.siblings = self.siblings_won = 0  # sibling branches run and kept (their first token)
+        # several lanes: the taps of the sequence's rows that wait, from the position ``rows_from`` (the drafter's
+        # next of this sequence); the drafter's state of the sequence while it holds another lane's; whether it no
+        # longer follows the sequence
+        self.rows: tuple[np.ndarray, ...] = ()
+        self.rows_from = 0
+        self.saved: dict[str, Any] | None = None
+        self.lost = False
 
     def reset(self) -> None:
+        """(several lanes: the drafter's records of the lane's old sequence are nobody's; its next ``own`` starts
+        them over)"""
         self.inj = None
+        self.rows, self.rows_from, self.saved, self.lost = (), 0, None, False
+        d = self.model.dflash
+        if d.owner is self:
+            d.owner = None
+
+    # ------------------------------------------------------------------
+    # Several lanes (module docstring); the device held for the lane
+    # ------------------------------------------------------------------
+
+    def own(self, *, restored: bool = False) -> None:
+        """The drafter's records: this lane's sequence's (``restored``: the caller restores them, a checkpoint's)."""
+        m = self.model
+        d = m.dflash
+        cur = d.owner
+        if cur is self:
+            return
+        if cur is not None:
+            cur.saved = d.snapshot(d.next)
+        if self.saved is not None and not restored:
+            d.restore(self.saved)
+        elif not restored:
+            d.reset()
+            if self.lost:  # (no records, and none until a prompt chunk: its state at the position, for a checkpoint)
+                d.next = m.position
+        self.saved = None
+        d.owner = self
+
+    def wait(self, p: int, rows: np.ndarray) -> None:
+        """The taps of a step's rows at p (``ModelOverlay.tap_rows``) wait for the drafter, after the sequence's rows
+        before p (a rejected draft's leave)."""
+        if self.lost:
+            return
+        kept = self.rows[:max(p - self.rows_from, 0)] if self.rows else ()
+        assert not self.rows or self.rows_from + len(kept) == p, (self.rows_from, len(kept), p)
+        self.rows_from, self.rows = (self.rows_from if kept else p), (*kept, *rows)
+        if len(self.rows) > self.LIMIT:
+            self.lose()
+
+    def lose(self) -> None:
+        """The drafter follows the lane's sequence no longer (until ``found``)."""
+        self.rows, self.saved, self.lost = (), None, True
+        d = self.model.dflash
+        if d.owner is self:
+            d.owner = None
+
+    def found(self) -> None:
+        """After a prompt chunk of the lane (the drafter its own): the chunk wrote its records, the next rows follow."""
+        self.rows, self.rows_from, self.lost = (), self.model.dflash.next, False
+
+    def _run(self, x: np.ndarray | None, p: int) -> None:
+        """The sequence's rows that wait, injected (as many as a step's slots a dispatch); with ``x`` the block's rows:
+        the block at p in the last dispatch."""
+        m = self.model
+        d, S = m.dflash, m.overlay.SLOTS
+        q = self.rows_from
+        rows, self.rows = self.rows[:max(m.position - q, 0)], ()
+        assert not rows or q == d.next, (q, d.next)
+        while len(rows) > S or (rows and x is None):
+            part, rows = rows[:S], rows[S:]
+            m._dispatch(lambda part=part, q=q: d.step(len(part), len(part), q, None, 0, rows=np.stack(part)))
+            q += len(part)
+        if x is not None:
+            m._dispatch(lambda: d.step(len(rows), len(rows), q, x, p, rows=np.stack(rows) if rows else None))
+        self.rows_from = d.next
+        m.stale()
+
+    def _block(self, token: int, k: int) -> list[int]:
+        """``block`` of a lane: with the device for it (``OverlayModel._before``; none where it is not to be had, or
+        the drafter does not follow the sequence), the lane's rows that wait first."""
+        m = self.model
+        d = m.dflash
+        out: list[int] = []
+        m._chains = ()
+        with m._before() as free:
+            t0 = time.perf_counter()  # (the block's time, without the wait for the device)
+            if not free or self.lost:
+                return out
+            self.own()
+            x = np.stack([m._rows([token])[0], *[m._mask] * (d.cfg.block - 1)])
+            n = min(k, d.cfg.block - 1)
+            self._run(x, m.position)
+            out = d.selector.walk(d.logits(), d.gates(), token, d.table.ids, n, set(m.eos_token_ids), sibling=0)
+            chains = d.selector.chains
+            out = out[:next((i for i in range(len(out)) if not m._keep(chains[i], i)), len(out))]
+            m._chains = tuple(chains[:len(out)])
+        m._row_time(time.perf_counter() - t0)  # (a block's seconds: ``OverlayModel._block_pays``)
+        m.t_draft += time.perf_counter() - t0
+        m.drafted += len(out)
+        m.blocks += 1
+        return out
+
+    # ------------------------------------------------------------------
 
     def after_step(self, n: int, p: int) -> None:
         """After a committed step of n tokens at p: all of them are the drafter's to inject."""
         self.inj = Injection(n, n, p)
 
     def inject(self) -> None:
-        """The drafter's rows of the model's last step, while its taps are in place."""
+        """The drafter's rows of the model's last step, while its taps are in place (several lanes: the lane's rows
+        that wait, the drafter its own first)."""
         m = self.model
+        if m._rounds is not None:
+            if self.rows and not self.lost:
+                self.own()
+                self._run(None, 0)
+            return
         if self.inj is not None:
             inj = self.inj
             self.move_taps()
@@ -84,6 +201,8 @@ class DFlashDrafting:
         drafts patched (``steps``' rope rows, ``patch_ahead``: a block ends at an end-of-sequence token alone). In a generation's
         rounds whose step has 8 slots, the selector's sibling branch in the last drafts' places where it is worth more."""
         m = self.model
+        if m._rounds is not None:
+            return self._block(token, k)
         t0 = time.perf_counter()
         d = m.dflash
         c = len(m.carry)

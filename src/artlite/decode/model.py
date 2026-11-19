@@ -274,6 +274,20 @@ class ModelOverlay:
         [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place)."""
         return self.inp[self._input(L)][0].off + XB
 
+    def tap_rows(self, taps: tuple[int, ...], n: int) -> np.ndarray:
+        """The x of the layers ``taps``' first phase (``tap_x``) of the last step's first n slots: (n, taps, K) bf16
+        bits, copies (a block drafter's injection of a sequence's rows from a staging region of its own: a model of
+        several sequences, whose next step is another's too)."""
+        out = []
+        for L in taps:
+            rg = self.inp[self._input(L)][0]
+            sp = self._sp(self._last_s, self._input(L))
+            off = rg.off + XB
+            self.dev.fetch("ACT", off, 2 * sp * rg.K)
+            v = self.dev.view("ACT")[off:off + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, :n]
+            out.append(v.transpose(1, 0, 2).reshape(n, rg.K))
+        return np.stack(out, 1)
+
     def move_tap_slots(self, L: int, S: int, src: list[int]) -> None:
         """After a step of S slots: layer L's tap of the slots ``src`` moved to its first slots."""
         sp = self._sp(S)

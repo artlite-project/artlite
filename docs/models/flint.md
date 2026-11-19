@@ -66,8 +66,10 @@ while they beat steps of one token. Short chat prompts, 400 tokens greedy, again
 Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches, and a decode step's 4 slots
 are tokens of the requests that generate, each in its own cache (`models/lanes.py`). The dense weights stream once for
 all of them, and an MoE layer runs the union of their experts: a step of 2 / 3 / 4 requests takes 1.37x / 1.84x / 2.24x
-a step of one, so 4 requests get 1.6x one request's tokens per second in all. The DFlash2 drafter does not load then
-(its records follow one sequence): [artlite-server](../server.md#several-requests-at-a-time).
+a step of one, so 4 requests get 1.4x one request's tokens per second in all. The DFlash2 drafter drafts for a
+request that generates alone (37.4 tokens per second on a server with `-np 4`); its records are one sequence's at a
+time, saved and brought back as the requests change (11 MB at 1K positions), so where requests share the steps it
+stands back and their rows wait for it: [artlite-server](../server.md#several-requests-at-a-time).
 
 ## Speed and accuracy (Strix Halo)
 

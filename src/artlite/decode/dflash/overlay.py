@@ -65,6 +65,7 @@ from artlite.decode.protocol import (
     XB,
     XPAY,
     input_fill,
+    region_bytes,
 )
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import DFlashConfig
@@ -143,7 +144,9 @@ class DFlashTarget(Protocol):
     packed inputs: the drafter's injections read their x in place), the taps (``tap_x``: a layer's input x in its ACT) and
     the drafter's head: the first rows of each column of its LM region (``drafter_view``: a ``decode.head`` view, its fixed
     tokens and its table; None: no such rows); ``KV_PAD``: the positions past its last layer's caches that its prefill's
-    slices reach (the drafter's rings have as many past them)."""
+    slices reach (the drafter's rings have as many past them); ``sequences``: the sequences it holds (several: the
+    drafter holds one's records at a time, ``snapshot`` / ``restore`` change it, and an injection takes its rows given:
+    ``step``'s ``rows``)."""
 
     cfg: Any
     gguf: GGUFFile
@@ -152,6 +155,7 @@ class DFlashTarget(Protocol):
     T: int
     SLOTS: int
     KV_PAD: int
+    sequences: int
 
     def tap_x(self, L: int) -> int: ...
 
@@ -189,6 +193,8 @@ class DFlashOverlay(ModelOverlay):
         self.flags = FLAGS
         self.n_norm = -(-cfg.hidden // (NX_PER_NORM * OBJ_K))
         self.selector = Selector(gguf, cfg)
+        # (a target of several sequences: whose sequence's records it holds, a ``models.dflash.DFlashDrafting``)
+        self.owner: Any = None
         self._cs: dict[int, np.ndarray] = {}  # (``_angles``)
         self._plan()
 
@@ -232,6 +238,9 @@ class DFlashOverlay(ModelOverlay):
         take = self._take
         self.loadr = take("ACT", COLS * self.SLOTS * XB)
         self._add_meta((-2, "fc"))
+        # (a target of several sequences: per tap the x of an injection's rows, an object before it: ``step``'s ``rows``)
+        self.stage = [take("ACT", region_bytes(rg.K, self.SLOTS)) + XB for rg in self.inp[(-2, "fc")]] \
+            if self.target.sequences > 1 else []
         self._add_inputs((0, "ikv"))
         for L in range(1, cfg.layers):
             self._add_meta((L, "ikv"))
@@ -406,8 +415,9 @@ class DFlashOverlay(ModelOverlay):
         h8 = self.shape.h8
         self._values_to(seq, c, phase, e0=h8 * c, n=h8, S=S, whole=True)
 
-    def _inject(self, seq: Sequence, st: Step) -> None:
-        """fc over the rows' taps, g normed, per layer K and V, the attention core's records."""
+    def _inject(self, seq: Sequence, st: Step, staged: bool = False) -> None:
+        """fc over the rows' taps, g normed, per layer K and V, the attention core's records. ``staged``: the taps' x
+        from ``stage`` (``step``'s ``rows``), else the target's ACT in place."""
         dev, S, cfg, tgt = self.dev, st.S, self.cfg, self.target
         sp = self._sp(S)
         for c in range(COLS):  # (the main cores' residual zero; fc's K groups local: nothing drained yet)
@@ -416,10 +426,11 @@ class DFlashOverlay(ModelOverlay):
         for gi, rg in enumerate(self.inp[phase]):
             self._weights(seq, phase, gi)
             nbytes, dims = input_fill(rg.K, sp, self.SLOTS)
-            tap = tgt.tap_x(cfg.taps[gi]) - 4 * META
+            tap = dev.address("ACT", self.stage[gi] - 4 * META) if staged else \
+                dev.address("MACT", tgt.tap_x(cfg.taps[gi]) - 4 * META)
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", rg.off), XB)
-                seq.fill("X", c, dev.address("MACT", tap), nbytes - XB, dims)
+                seq.fill("X", c, tap, nbytes - XB, dims)
         for c in range(COLS):
             self._x_drains(seq, c, (0, "ikv"), S)
         g0 = self.inp[(0, "ikv")][0]
@@ -526,12 +537,13 @@ class DFlashOverlay(ModelOverlay):
         for c in range(COLS):
             self._logits_out(seq, c, S)
 
-    def _build(self, S: int, block: bool) -> Step:
-        """The transaction of a dispatch: an injection of a verify's S rows (0: none), the block."""
+    def _build(self, S: int, block: bool, staged: bool = False) -> Step:
+        """The transaction of a dispatch: an injection of a verify's S rows (0: none; ``staged``: from ``stage``), the
+        block."""
         seq = Sequence(self.op, inputs=("X",))
         st = Step(S, block)
         if S:
-            self._inject(seq, st)
+            self._inject(seq, st, staged)
         if block:
             self._block(seq, st)
         seq.sync(fills=True)
@@ -610,25 +622,38 @@ class DFlashOverlay(ModelOverlay):
         st.tr.flush_lines(t["lines"])
         return nobj
 
-    def _transaction_of(self, S: int, block: bool) -> Step:
-        key = (S, block)
+    def _transaction_of(self, S: int, block: bool, staged: bool = False) -> Step:
+        key = (S, block, staged and S > 0)
         if key not in self._steps:
-            self._steps[key] = self._build(S, block)
+            self._steps[key] = self._build(*key)
         return self._steps[key]
 
     def prepare(self, S: int, logits: bool = True, start: int | None = None) -> None:
-        """The transactions of an injection of S rows (0: none) with the block and of one alone."""
-        self._transaction_of(S, True)
+        """The transactions of an injection of S rows (0: none) with the block and of one alone (a target of several
+        sequences: of rows from ``stage``)."""
+        staged = bool(self.stage)
+        self._transaction_of(S, True, staged)
         if S:
-            self._transaction_of(S, False)
+            self._transaction_of(S, False, staged)
             self._meta_of(S)
 
-    def step(self, S: int, keep: int, q: int, x: np.ndarray | None, p: int, *, meanwhile: Callable[[], None] | None = None) -> None:
+    def step(self, S: int, keep: int, q: int, x: np.ndarray | None, p: int, *, meanwhile: Callable[[], None] | None = None,
+             rows: np.ndarray | None = None) -> None:
         """A dispatch: the injection of the first ``keep`` rows at q .. of the model's last step of S slots (S 0: none), then with rows x
         (8, hidden) fp32 (the anchor's and the mask token's embeddings; None: no block) the block at p. The results: ``logits``,
-        ``gates``. ``meanwhile``: host work run while the dispatch runs (the model's next step patched ahead)."""
+        ``gates``. ``meanwhile``: host work run while the dispatch runs (the model's next step patched ahead). ``rows`` (a target
+        of several sequences): the injection's taps (S, taps, K) bf16 bits (``ModelOverlay.tap_rows``: a sequence's rows of the
+        model's steps, kept until its drafter's turn), written into ``stage``."""
         assert not S or q == self.next, (q, self.next)
-        st = self._transaction_of(S, x is not None)
+        assert (rows is not None) == (S > 0 and bool(self.stage)), "a sequence's rows: given with the injection"
+        st = self._transaction_of(S, x is not None, rows is not None)
+        if rows is not None:
+            act, sp = self.dev.view("ACT"), self._sp(S)
+            for i, off in enumerate(self.stage):
+                v = np.zeros((rows.shape[2] // 8, sp, 8), np.uint16)
+                v[:, :S] = rows[:, i].reshape(S, -1, 8).transpose(1, 0, 2)
+                act[off:off + v.nbytes] = v.view(np.uint8).reshape(-1)
+                self.dev.flush("ACT", off, v.nbytes)
         rec = None
         if S:
             if self._metas_s[0] != S:

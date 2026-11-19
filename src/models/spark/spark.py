@@ -57,10 +57,7 @@ class NpuSpark(OverlayModel):
     recurrent = True  # (the sliding-window layers' rings and the drafter's hold a window: a position comes back from a
     # checkpoint, ``SparkOverlay.snapshot``)
     STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)
-    # a block's drafts must be kept this many times what the block costs the lanes of a shared round (``_block_pays``).
-    # Measured with two lanes and a block every round, where the two are about equal (1.0 - 1.2): -1.5% (1.7B) to +7%
-    # (4B) against no block; with four lanes (0.3 - 0.5): -30%
-    BLOCK_MARGIN = 1.3
+    BLOCK_MARGIN = 1.3  # (the DSpark drafter's blocks: ``OverlayModel._block_pays``)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dspark", "chain", "_mask")
     LANE_OWN = (*OverlayModel.LANE_OWN, "_inj", "_end", "_rows_from", "_rows_at")
     _inj: tuple[int, int] | None = None  # (the last step's slots and first position: its rows wait for the drafter)
@@ -95,7 +92,7 @@ class NpuSpark(OverlayModel):
 
     def _prepare_steps(self) -> None:
         """(several lanes: the drafter's rounds' transactions too, 0.2 s: a first block's build would count as its
-        time, ``_block_pays``)"""
+        time, ``OverlayModel._block_pays``)"""
         super()._prepare_steps()
         d = self.dspark
         if d is not None and self.overlay.sequences > 1:
@@ -121,27 +118,6 @@ class NpuSpark(OverlayModel):
     def _follows(self) -> bool:
         """Whether the drafter's records follow the model's steps (``_drafting``: whether it may draft now)."""
         return self.dspark is not None and self.DRAFTS > 0
-
-    @property
-    def share(self) -> int | None:  # type: ignore[override]
-        """(several lanes: no slot for the drafter's guesses in a round whose block does not pay, ``_block_pays``)"""
-        s = super().share
-        return s if s is None or s <= 1 or self.dspark is None or self._block_pays(s - 1) else 1
-
-    def _block_pays(self, k: int) -> bool:
-        """Whether a block for k drafts pays in the lane's next round. Its dispatch is one of the device's for every
-        lane that asks: n lanes that draft make a round's time step + n blocks for n (1 + g) tokens, g the drafts a
-        block gets kept, so a block pays where g step > n block (alone: about always; the 1.7B with 2 lanes: 3 drafts,
-        1.1 kept, for a block of half a step: not; 4 lanes: a draft each, never). From the lanes' measured rounds
-        (``_kept_at``, the block's seconds ``_t_row``); before any: its first blocks measure."""
-        r = self._rounds
-        n = r.asking(self.seq)
-        if n == 1:
-            return True
-        cal = next((x for x in (self, *self.lanes) if x._t_row and x._kept_at), None)
-        if cal is None or not r.step_s:
-            return True
-        return sum(cal._kept_at[:k]) * r.step_s > self.BLOCK_MARGIN * n * cal._t_row
 
     @alone
     def reset(self) -> None:
@@ -283,7 +259,7 @@ class NpuSpark(OverlayModel):
             out, conf = self.chain.walk(d.logits(), d.table.ids, d.h(), token, min(k, d.B), set(self.eos_token_ids),
                                         fork() if fork is not None else None)
         self._chains = tuple(np.cumprod(conf).tolist())
-        self._row_time(time.perf_counter() - t0)  # (a block's seconds: ``_block_pays``)
+        self._row_time(time.perf_counter() - t0)  # (a block's seconds: ``OverlayModel._block_pays``)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
         self.blocks += 1

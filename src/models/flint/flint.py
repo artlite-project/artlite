@@ -25,15 +25,15 @@ syntax (``server.tools``). A generation ends at ``<|end_of_text|>``, ``<|user|>`
 
 Several sequences (``NpuFlint(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for
 each (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's slots dealt to them
-(``models.lanes``: the dense weights stream once, an MoE layer runs the union of the slots' experts). Without the
-DFlash2 drafter, whose records follow one sequence.
+(``models.lanes``: the dense weights stream once, an MoE layer runs the union of the slots' experts). The DFlash2
+drafter drafts for a lane where its block pays (one that runs alone), its records one lane's sequence's at a time
+(``models.dflash``).
 
 The KV caches hold K as hi + lo bfp16 blocks by default (``kv_k``; "single": one block per 8 dims, a third fewer bytes,
 but +0.013 nats a token in teacher-forced text, worse on every one of six essays): per position and layer 4 KV heads x
 432 B, 84.7 KB a position over the 49 layers (the sliding-window layers' caches linear in the positions)."""
 
 import itertools
-import logging
 import os
 from collections.abc import Iterator
 from collections.abc import Sequence as Seq
@@ -60,8 +60,6 @@ from .image import FlintImage
 from .overlay import FlintOverlay
 from .prefill import SIZES, FlintPrefill
 
-log = logging.getLogger("artlite")
-
 
 class NpuFlint(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("hilo",
@@ -69,11 +67,15 @@ class NpuFlint(OverlayModel):
     ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``; with a drafter: laid out with its head);
     ``dflash``: a DFlash2 drafter's file (module docstring); ``wrap``: the sliding-window caches' ring (``FlintOverlay``);
     ``sequences``: the sequences the device holds, each with KV caches of ``capacity`` positions (``lanes``: the model of
-    each; their generations share decode steps; no drafter)."""
+    each; their generations share decode steps; the drafter drafts for a lane where its block pays, which is for one
+    that runs alone: ``models.dflash``)."""
 
     STEP_COST = (1.0, 1.32, 1.65, 1.98)  # (steps of 1 .. 4 slots at 1K: 31.4 ms for one slot; each slot's experts)
+    BLOCK_MARGIN = 1.0  # (a block drafter's: the DFlash2 drafter's blocks by a rule of their own, ``_block_pays``)
     drafter = None
-    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dflash", "flash")
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dflash", "_mask")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "flash")
+    flash: DFlashDrafting | None = None  # (the drafter's rounds of the lane's sequence: ``models.dflash``)
 
     @property
     def recurrent(self) -> bool:
@@ -84,8 +86,6 @@ class NpuFlint(OverlayModel):
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
                  dflash: str | None = None, wrap: int | None = None, sequences: int = 1):
-        if dflash and sequences > 1:
-            raise ValueError("several sequences: without the DFlash2 drafter (its records follow one sequence)")
         self.gguf = gguf
         self.overlay = FlintOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, head=dflash is not None,
                                     wrap=wrap, sequences=sequences)
@@ -120,9 +120,28 @@ class NpuFlint(OverlayModel):
             self.dflash.load(threads=threads)
             self._mask = self._rows([self.dflash.cfg.mask_token])[0]
 
+    def _open_lanes(self) -> None:
+        """(the drafter's rounds: a lane's own)"""
+        super()._open_lanes()
+        for lane in self.lanes[1:]:
+            lane.flash = DFlashDrafting(lane) if self.dflash is not None else None
+
+    @property
+    def _follows(self) -> bool:
+        """Whether the drafter's records follow the model's steps (``_drafting``: whether it may draft now)."""
+        return self.dflash is not None and self.DRAFTS > 0
+
+    def _block_pays(self, k: int) -> bool:
+        """(a block for a lane that runs alone: in a round of several each lane's block would take the drafter's
+        records from the other's sequence first, ``DFlashDrafting.own``: 11 MB each way at 1K positions, more than
+        the block; measured with two requests: 39 tokens per second with blocks, 43.5 without)"""
+        return self._rounds.asking(self.seq) == 1
+
     @property
     def _drafting(self) -> bool:
-        return self.dflash is not None and self.DRAFTS > 0
+        """(several lanes: not while another lane has the device alone, nor where the drafter lost the lane's
+        sequence)"""
+        return self._follows and (self._rounds is None or not (self._rounds.held() or self.flash.lost))
 
     @property
     def _table(self) -> HeadTable:
@@ -133,7 +152,7 @@ class NpuFlint(OverlayModel):
     def prepare(self, prompt_len: int) -> None:
         """(with drafts: the rounds' steps' transactions and the drafter's, else built at their first use)"""
         super().prepare(prompt_len)
-        for S in range(1, self.DRAFTS + 2) if self.lookup or self._drafting else ():
+        for S in range(1, self.DRAFTS + 2) if self.lookup or self._follows else ():
             self.overlay.prepare(S)
             if self.dflash is not None:
                 self.dflash.prepare(S)
@@ -148,18 +167,45 @@ class NpuFlint(OverlayModel):
         self._abandon()
         self.overlay.reset()
         if self.dflash is not None:
-            self.dflash.reset()
+            if self._rounds is None:
+                self.dflash.reset()
             self.flash.reset()
         self.position = 0
 
     def _overlays(self) -> list[FlintOverlay | DFlashOverlay]:
         return [self.overlay] + ([self.dflash] if self.dflash is not None else [])
 
+    @alone
     def checkpoint(self) -> Checkpoint:
-        """(the drafter's rows of the last step in first: their taps do not outlive the model's next step)"""
+        """(the drafter's rows of the last step in first: their taps do not outlive the model's next step; several
+        lanes: the drafter the lane's own)"""
         self._abandon()
+        if self.flash is not None and self._rounds is not None:
+            self.flash.own()
         self._inject()
         return super().checkpoint()
+
+    @alone
+    def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
+        """(several lanes: the drafter the lane's own for a checkpoint's records; without one it follows the sequence
+        no longer, until the prompt's chunk)"""
+        fd = self.flash if self._rounds is not None else None
+        if fd is not None and checkpoint is not None:
+            fd.own(restored=True)
+        super().restore(position, checkpoint)
+        if fd is not None:
+            if checkpoint is None and position:
+                fd.lose()
+            else:
+                fd.rows, fd.rows_from = (), position
+
+    def _state(self) -> dict[str, object]:
+        """(several lanes: whether the drafter follows the sequence)"""
+        return {"lost": self.flash.lost} if self.flash is not None and self._rounds is not None else {}
+
+    def _set_state(self, state: dict[str, object]) -> None:
+        if self.flash is not None and self._rounds is not None:
+            self.flash.lost = bool(state.get("lost"))
 
     def _rows(self, tokens: list[int]) -> np.ndarray:
         """The tokens' embedding rows (n, hidden) fp32."""
@@ -180,9 +226,19 @@ class NpuFlint(OverlayModel):
         p, n = self.position, len(tokens)
         self._inject()
         out = super().steps(tokens, logits=logits)
-        if commit and self._drafting:
+        if self._follows and self._rounds is not None:  # (while the device is the lane's)
+            self.flash.wait(p, self.overlay.tap_rows(self.dflash.cfg.taps, n))
+        elif commit and self._follows:
             self.flash.after_step(n, p)
         return out
+
+    def _tapped(self, S: int) -> tuple:
+        """(the drafter's taps of the step's rows)"""
+        return (self.overlay.tap_rows(self.dflash.cfg.taps, S),) if self.dflash is not None else ()
+
+    def _took(self, tokens: list[int], taken: tuple) -> None:
+        if taken and self._follows:
+            self.flash.wait(self.position - len(tokens), taken[0])
 
     def _inject(self) -> None:
         """The drafter's rows of the model's last step, while its taps are in place."""
@@ -197,14 +253,20 @@ class NpuFlint(OverlayModel):
         self.overlay.patch_ahead(S, p)
 
     def _prefill_run(self, args: tuple, T: int, n: int, sets: Seq[int] | None = None) -> None:
-        """(the drafter's rows of the last step first)"""
+        """(the drafter's rows of the last step first; several lanes: the drafter the lane's own, the chunk writes its
+        records)"""
+        fd = self.flash if self._rounds is not None else None
+        if fd is not None:
+            fd.own()
         self._inject()
         super()._prefill_run(args, T, n, sets)
+        if fd is not None:
+            fd.found()
 
     def generate(self, logits: np.ndarray, max_tokens: int, sampling: Sampling, prompt: Seq[int] = (),
                  mask: Mask | None = None, probs: Probs | None = None, *, drafts: int | None = None) -> Iterator[int]:
         """(the drafter's table follows the prompt and each token: ``HeadTable.see``)"""
-        see = self._table.see if self._drafting else None
+        see = self._table.see if self._follows else None
         if see is not None:
             see(token_ids(prompt))
         for token in super().generate(logits, max_tokens, sampling, prompt, mask, probs, drafts=drafts):
@@ -215,22 +277,31 @@ class NpuFlint(OverlayModel):
     def forced_drafts(self, tokens: list[int], first: int, *, turns: Seq[int] = (), prefill: bool = True
                       ) -> Iterator[tuple[list[int], np.ndarray]]:
         """(the drafter's table sees all the tokens first)"""
-        if self._drafting:
+        if self._follows:
             self._table.see(tokens)
         return super().forced_drafts(tokens, first, turns=turns, prefill=prefill)
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         return self.flash.block(token, k)
 
+    def _mtp_offer(self, n: int) -> tuple[float, ...]:
+        """(a block's drafts: a shared step runs those it has room for, each kept as often as its chain's probability
+        says, ``_kappa``)"""
+        return tuple(c * self._kappa(i) for i, c in enumerate(self._chains[:n]))
+
     def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
         """(a round's step commits none of its rows to the drafter: ``_kept`` gives it the kept ones; without a
         drafter: the round's step, shared with the other lanes' where the model has lanes)"""
-        if self.flash is None:
+        if self.flash is None or self._rounds is not None:
             return self._joined(tokens)
         return self.steps(tokens, commit=len(tokens) == 1 and not mtp)
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
-        """(a drafter's round: its kept rows pending for the drafter, injected after the next step's start)"""
+        """(a drafter's round: its kept rows pending for the drafter, injected after the next step's start; several
+        lanes: the step's rows wait already, ``DFlashDrafting.wait``)"""
+        if self._rounds is not None:
+            self.position = p + m
+            return
         if len(tokens) == 1 and not mtp:  # (a committed step: its row pending, ``steps``)
             return
         self.position = p + m
@@ -295,12 +366,9 @@ class Flint(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuFlint:
-        """(``sequences``: ``NpuFlint``'s; several: without the DFlash2 drafter)"""
-        if self.dflash is not None and sequences > 1:
-            log.warning("%s with %d sequences runs without its DFlash2 drafter (the drafter's records follow one "
-                        "sequence)", self.name, sequences)
+        """(``sequences``: ``NpuFlint``'s)"""
         return NpuFlint(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                        dflash=self.dflash if sequences == 1 else None, sequences=sequences)
+                        dflash=self.dflash, sequences=sequences)
 
 
 __all__ = ["Flint", "NpuFlint"]

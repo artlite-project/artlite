@@ -71,6 +71,11 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     seq = 0  # the lane's sequence on the overlay's device
+    # a block drafter's (one dispatch a round whatever number of its drafts find a slot: DSpark, DFlash2): how many
+    # times what the block costs the lanes of a shared round its drafts must be kept (``_block_pays``). Measured on
+    # Spark-X with two lanes and a block every round, where the two are about equal (1.0 - 1.2): -1.5% (1.7B) to +7%
+    # (4B) against no block; with four lanes (0.3 - 0.5): -30%. None: a drafter whose cost follows its drafts
+    BLOCK_MARGIN: ClassVar[float | None] = None
     _lanes: "tuple[OverlayModel, ...] | None" = None  # (``lanes``; None: the model alone)
     _rounds: Rounds | None = None  # several lanes: what joins their rounds and gives one the device (``lanes.Rounds``)
     _round: Request | None = None  # (the lane's last round, where it asked ``_rounds`` for it: ``_overhead``)
@@ -157,8 +162,28 @@ class OverlayModel(SpeculativeMixin, NpuModel):
 
     @property
     def share(self) -> int | None:  # type: ignore[override]
-        """(several lanes: ``lanes.Rounds.share``)"""
-        return None if self._rounds is None else self._rounds.share(self.seq)
+        """(several lanes: ``lanes.Rounds.share``; a block drafter's: no slot for its guesses in a round whose block
+        does not pay, ``_block_pays``)"""
+        if self._rounds is None:
+            return None
+        s = self._rounds.share(self.seq)
+        return 1 if s > 1 and self.BLOCK_MARGIN is not None and not self._block_pays(s - 1) else s
+
+    def _block_pays(self, k: int) -> bool:
+        """(a block drafter's: ``BLOCK_MARGIN``) Whether a block for k drafts pays in the lane's next round. Its
+        dispatch is one of the device's for every lane that asks: n lanes that draft make a round's time step + n
+        blocks for n (1 + g) tokens, g the drafts a block gets kept, so a block pays where g step > n block (alone:
+        about always; Spark-X 1.7B with 2 lanes: 3 drafts, 1.1 kept, for a block of half a step: not; 4 lanes: a
+        draft each, never). From the lanes' measured rounds (``_kept_at``, a block's seconds ``_t_row``); before
+        any: its first blocks measure."""
+        r = self._rounds
+        n = r.asking(self.seq)
+        if n == 1:
+            return True
+        cal = next((x for x in (self, *self.lanes) if x._t_row and x._kept_at), None)
+        if cal is None or not r.step_s:
+            return True
+        return sum(cal._kept_at[:k]) * r.step_s > self.BLOCK_MARGIN * n * cal._t_row
 
     @property
     def _drafting(self) -> bool:

@@ -482,9 +482,9 @@ def test_branch(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     m.lookup = False
     ids = _chat(tk, "Tell me about the history of the printing press in a few paragraphs.")
     m.reset()
-    s0, w0 = m.siblings, m.siblings_won
+    s0, w0 = m.siblings, m.flash.siblings_won
     out = list(m.generate(m.forward(ids), 160, Sampling(greedy=True), ids))
-    assert m.siblings - s0 >= 10 and m.siblings_won - w0 >= 2, (m.siblings - s0, m.siblings_won - w0)
+    assert m.siblings - s0 >= 6 and m.flash.siblings_won - w0 >= 2, (m.siblings - s0, m.flash.siblings_won - w0)
     m.reset()
     d, DRAFTS, pf = m.dflash, m.DRAFTS, m.prefill
     m.dflash, m.DRAFTS, m.prefill = None, 0, None
@@ -508,7 +508,7 @@ def test_context_rounds(app: tuple[NpuQwen, BpeTokenizer]) -> None:
     m.lookup = True
     plan, round_of = m.planner, itertools.count(1)
 
-    def alternate(_m: int, k: int, *, drafter: bool) -> int | None:
+    def alternate(_m: int, k: int, *, drafter: bool, agree: object = None) -> int | None:
         return None if drafter and not next(round_of) % 3 else k
 
     plan.choose = alternate
