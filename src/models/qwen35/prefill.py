@@ -254,11 +254,11 @@ class QwenPrefill(ChunkPrefill):
         return self.split and T == SPLIT_T and not packed
 
     def _prep(self, lay: PG.Layout, T: int) -> AP.AttnPrepOperator:
-        """(its cos / sin table: the text positions, one sub-chunk past them for a chunk's own rows: ``_cs_row``; a split
-        chunk's: per ``SPLIT_PREP`` tokens, the split attention's passes)"""
+        """(its cos / sin table: the text positions, its tokens' rows past them for a chunk's own rows: ``_cs_row``,
+        whose parameter is every prep's; a split chunk's: per ``SPLIT_PREP`` tokens, the split attention's passes)"""
         if self._split(T):
             return self._op(AP.AttnPrepOperator, lay, T=SPLIT_PREP, head_bytes=self.ov.ash.head_bytes,
-                            cs_positions=self.ov.max_positions + SUB, qg=SPA.QG)
+                            cs_positions=self.ov.max_positions + SPLIT_PREP, qg=SPA.QG)
         return self._op(AP.AttnPrepOperator, lay, T=self._t(T), head_bytes=self.ov.ash.head_bytes,
                         cs_positions=self.ov.max_positions + SUB)
 

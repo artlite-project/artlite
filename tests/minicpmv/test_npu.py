@@ -117,7 +117,7 @@ def test_app_image_prompt(case: tuple) -> None:
     prompt = app.chat(_messages(ASTRONAUT))
     assert np.array_equal(prompt.ids, seq.ids[:K]) and np.array_equal(prompt.pos, seq.pos[:K])
     assert np.array_equal(prompt.given, seq.given[:K])
-    model = app.load(capacity=1024)
+    model = app.load(capacity=4096)  # (a capacity that has the chunk of 2304 tokens: its prep's table too)
     got = [model.forward(prompt)]
     got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
     kl, agree = kl_report("the NPU encoder, prefill", want, got, where=" at the official positions")

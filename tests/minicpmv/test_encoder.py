@@ -233,7 +233,7 @@ def test_encoder(npu: VisionDevice, compression: int) -> None:
         print(f"encoder ({compression}x), {case} of {len(ents)}: {1e3 * min(ts):.1f} ms")
         for g, e in zip(got, ents, strict=True):
             ex, want = enc.forward(e), sim.forward(e)
-            med = [float(((a.double() - ex).norm(dim=1) / ex.norm(dim=1)).median()) for a in (g, want)]
+            med = [float(((torch.as_tensor(a).double() - ex).norm(dim=1) / ex.norm(dim=1)).median()) for a in (g, want)]
             print(f"embeddings: from float64 median {med[0]:.2e} (the CPU's {med[1]:.2e}), rms {rel(g, ex):.2e} (the "
                   f"CPU's {rel(want, ex):.2e}), NPU vs CPU {rel(g, want):.2e}")
             errs.append(med)
