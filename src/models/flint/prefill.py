@@ -313,7 +313,7 @@ class FlintPrefill(ChunkPrefill):
         return set().union(*(d.external() for d in self.drafters))
 
     def _buffers(self) -> dict[str, object]:
-        return self.ov.dev.buffers | {k: v for d in self.drafters for k, v in d.buffers().items()}
+        return super()._buffers() | {k: v for d in self.drafters for k, v in d.buffers().items()}
 
     def _bind(self) -> None:
         """The norms' weights (NP), the q / k norms' weights (NW), the sinks (SK), the cos / sin tables (CSS, CSF); the

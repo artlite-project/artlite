@@ -32,6 +32,10 @@ the sub-step's open records, or after a prefill the V panels of the first) and t
 address, length). A column's weights between two operator phases are one run of the (column-major) image: one A task;
 an MoE layer's run ends with its sdown (the array pushes its experts' slabs next), the next one goes after the array's
 last packet.
+
+Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
+step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own. Every slot's logits are those
+of a step of one of its sequence, bit for bit; an MoE layer runs the union of the slots' experts, whoever's they are.
 """
 
 import math
@@ -62,7 +66,7 @@ from artlite.decode.protocol import (
     interleave,
     packed_slots,
 )
-from artlite.decode.step import StepPlan
+from artlite.decode.step import Part, StepPlan
 from artlite.decode.vring import PAIR
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import FlintConfig
@@ -93,19 +97,20 @@ class FlintOverlay(AttentionOverlay):
     the caches' K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's
     buffer allocated ahead; ``head``: the LM rows laid out with a DFlash2 drafter's head (``FlintImage``; a
     ``decode.dflash.overlay.DFlashTarget``); ``wrap``: the sliding-window caches' ring (groups; 0: linear; default: ``WRAP``
-    past that capacity)."""
+    past that capacity); ``sequences``: the sequences whose caches the device holds (``ModelOverlay.select``)."""
 
     CONFIG, IMAGE = FlintConfig, FlintImage
     KV_PAD = KV_PAD
     CHAIN = CHAIN
+    SEQ = ("KV",)
     OPS = ("att", "moe")  # (the operator cores' phases; "moe": the MoE transfers after moe_in and sdown)
     NORMED = frozenset({"qkv", "gate_up", "moe_in", "lm"})
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, head: bool = False,
-                 wrap: int | None = None):
+                 wrap: int | None = None, sequences: int = 1):
         image = FlintImage(gguf, layers=layers, vocab=vocab, head=True) if head and weights is None else None
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
         assert cfg.num_key_value_heads * CHAIN == COLS
         fmts = img.formats()
@@ -287,10 +292,12 @@ class FlintOverlay(AttentionOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
-        - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
-        until the next step), or without ``logits`` None (only the caches are updated)."""
+        - 1 of the selected sequence (the positions before are cached), or of several sequences' slots: ``position``
+        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next positions).
+        Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without
+        ``logits`` None (only the caches are updated)."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS

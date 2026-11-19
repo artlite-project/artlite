@@ -438,7 +438,7 @@ saves the state where each prompt's last message begins, and a turn continues fr
 
 ### Several requests at a time
 
-With `-np N`, Llama 3.x, Qwen3 and Gemma 4 serve up to N requests at a time. The NPU holds N sequences, each with KV
+With `-np N`, Llama 3.x, Qwen3, Gemma 4 and Flint serve up to N requests at a time. The NPU holds N sequences, each with KV
 caches of `-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the
 requests that generate share their decode steps. A step streams the weights once for 4 tokens: with one request those
 are its token and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a
@@ -450,13 +450,16 @@ queue:
 | Llama 3.1 8B Q4_K_M | 14.7 | 25.8 | 44.2 |
 | Gemma 4 E4B Q4_0, with its drafter | 31.8 | 44.9 | 57.4 |
 | Gemma 4 E4B Q4_0, `--spec-type none` | 18.0 | 32.5 | 57.8 |
+| Flint (no drafter with `-np`) | 32.6 | 43.5 | 53.6 |
 
 (`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
 tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
 depend on what shares its step, and a request's `seed` draws for that request alone. A model with a drafter gains less
-over one request, whose spare slots its drafts already fill (Gemma 4: two tokens a step alone). Deep in a context the
-gain is smaller, as every sequence reads its own KV cache in each step: four sequences at 16K positions give 1.9x one's
-tokens per second on Llama 3.2 3B.
+over one request, whose spare slots its drafts already fill (Gemma 4: two tokens a step alone). Flint gains least:
+each slot of a step routes its own experts (a step of 4 requests takes 2.2x a step of one), and its DFlash2 drafter,
+whose records follow one sequence, does not load with `-np` above 1 (one request alone: 32.6 tokens per second
+instead of 38.2). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
+sequences at 16K positions give 1.9x one's tokens per second on Llama 3.2 3B.
 
 - A request takes the sequence it names (`id_slot`, as llama-server's), else an idle one whose prompt cache holds at
   least half of its prompt (a conversation's next turn continues where it is), else the least recently used; more
@@ -614,7 +617,7 @@ Generation:
 |---|---|
 | `-c N`, `--ctx-size` | KV cache positions, rounded up to a power of two >= 4096 (default 0: 32768, at most the model's context) |
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
-| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3 and Gemma 4](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
+| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3, Gemma 4 and Flint](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions (Flint: without its DFlash2 drafter); another model serves one at a time |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3, Flint past 16384 positions; default 32) |

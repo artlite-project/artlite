@@ -322,7 +322,7 @@ class SparkPrefill(ChunkPrefill):
 
     def _buffers(self) -> dict[str, object]:
         """(the drafter's weights: its device's)"""
-        out = self.ov.dev.buffers
+        out = super()._buffers()
         return {**out, "DW": self.ds.dev.buffers["W"]} if self.ds is not None else out
 
     def _layer_starts(self, T: int) -> list[int]:

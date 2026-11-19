@@ -23,11 +23,17 @@ The chat template (the file's): GLM-style turns ``<|system|>``, ``<|user|>``, ``
 results); the model opens its own ``<think>`` (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's
 syntax (``server.tools``). A generation ends at ``<|end_of_text|>``, ``<|user|>`` or ``<|observation|>``.
 
+Several sequences (``NpuFlint(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for
+each (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's slots dealt to them
+(``models.lanes``: the dense weights stream once, an MoE layer runs the union of the slots' experts). Without the
+DFlash2 drafter, whose records follow one sequence.
+
 The KV caches hold K as hi + lo bfp16 blocks by default (``kv_k``; "single": one block per 8 dims, a third fewer bytes,
 but +0.013 nats a token in teacher-forced text, worse on every one of six essays): per position and layer 4 KV heads x
 432 B, 84.7 KB a position over the 49 layers (the sliding-window layers' caches linear in the positions)."""
 
 import itertools
+import logging
 import os
 from collections.abc import Iterator
 from collections.abc import Sequence as Seq
@@ -42,6 +48,7 @@ from artlite.model_config import FlintConfig, flint_dflash_of
 from artlite.overlay import WeightBuffer
 
 from ..dflash import DFlashDrafting
+from ..lanes import alone
 from ..model import Model
 from ..npu_model import Checkpoint
 from ..overlay_model import OverlayModel
@@ -53,15 +60,20 @@ from .image import FlintImage
 from .overlay import FlintOverlay
 from .prefill import SIZES, FlintPrefill
 
+log = logging.getLogger("artlite")
+
 
 class NpuFlint(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the KV caches hold; ``kv_k``: their K precision ("hilo",
     "single"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``;
     ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``; with a drafter: laid out with its head);
-    ``dflash``: a DFlash2 drafter's file (module docstring); ``wrap``: the sliding-window caches' ring (``FlintOverlay``)."""
+    ``dflash``: a DFlash2 drafter's file (module docstring); ``wrap``: the sliding-window caches' ring (``FlintOverlay``);
+    ``sequences``: the sequences the device holds, each with KV caches of ``capacity`` positions (``lanes``: the model of
+    each; their generations share decode steps; no drafter)."""
 
     STEP_COST = (1.0, 1.32, 1.65, 1.98)  # (steps of 1 .. 4 slots at 1K: 31.4 ms for one slot; each slot's experts)
     drafter = None
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dflash", "flash")
 
     @property
     def recurrent(self) -> bool:
@@ -71,10 +83,12 @@ class NpuFlint(OverlayModel):
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
-                 dflash: str | None = None, wrap: int | None = None):
+                 dflash: str | None = None, wrap: int | None = None, sequences: int = 1):
+        if dflash and sequences > 1:
+            raise ValueError("several sequences: without the DFlash2 drafter (its records follow one sequence)")
         self.gguf = gguf
         self.overlay = FlintOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, head=dflash is not None,
-                                    wrap=wrap)
+                                    wrap=wrap, sequences=sequences)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         # (the drafter's rings hold a chunk's writes past them and its padding rows: the prefill's largest chunk, gap)
@@ -86,6 +100,7 @@ class NpuFlint(OverlayModel):
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
+        self._open_lanes()
 
     @property
     def capacity(self) -> int:
@@ -95,8 +110,9 @@ class NpuFlint(OverlayModel):
         ov, f = self.overlay, self.dflash
         d = "" if f is None else (f", DFlash2 drafter {os.path.basename(f.gguf.path)} ({f.image.nbytes / 1e9:.2f} GB, "
                                   f"{f.sizes['KV'] / 1e6:.0f} MB of records)")
+        kv = f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache"
         return (f"{ov.image.nbytes / 1e9:.2f} GB of weights ({ov.image.streamed_bytes() / 1e9:.2f} GB dense), "
-                f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache ({self.capacity} positions, K "
+                f"{kv if ov.sequences == 1 else f'{ov.sequences} sequences of {kv} each'} ({self.capacity} positions, K "
                 f"{'hi + lo' if ov.kp == 2 else 'single'}){d}")
 
     def _load_drafters(self, threads: int) -> None:
@@ -113,6 +129,7 @@ class NpuFlint(OverlayModel):
         """The drafter's head."""
         return self.dflash.table
 
+    @alone
     def prepare(self, prompt_len: int) -> None:
         """(with drafts: the rounds' steps' transactions and the drafter's, else built at their first use)"""
         super().prepare(prompt_len)
@@ -125,6 +142,7 @@ class NpuFlint(OverlayModel):
             self.dflash.prepare(0)
             self.stale()
 
+    @alone
     def reset(self) -> None:
         """Forget the cached positions."""
         self._abandon()
@@ -205,7 +223,10 @@ class NpuFlint(OverlayModel):
         return self.flash.block(token, k)
 
     def _verify(self, tokens: list[int], mtp: bool) -> np.ndarray:
-        """(a round's step commits none of its rows to the drafter: ``_kept`` gives it the kept ones)"""
+        """(a round's step commits none of its rows to the drafter: ``_kept`` gives it the kept ones; without a
+        drafter: the round's step, shared with the other lanes' where the model has lanes)"""
+        if self.flash is None:
+            return self._joined(tokens)
         return self.steps(tokens, commit=len(tokens) == 1 and not mtp)
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
@@ -230,6 +251,7 @@ class Flint(Model):
     there is one; none; draft-dflash: it, which must exist; ``draft_model``: that file)."""
 
     name = "Flint"
+    parallel = True
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
@@ -272,9 +294,13 @@ class Flint(Model):
         return Sampling(temp=s["temp"], top_k=k if k > 0 else TOP_K_ALL, top_p=s.get("top_p", 1.0),
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuFlint:
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuFlint:
+        """(``sequences``: ``NpuFlint``'s; several: without the DFlash2 drafter)"""
+        if self.dflash is not None and sequences > 1:
+            log.warning("%s with %d sequences runs without its DFlash2 drafter (the drafter's records follow one "
+                        "sequence)", self.name, sequences)
         return NpuFlint(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                        dflash=self.dflash)
+                        dflash=self.dflash if sequences == 1 else None, sequences=sequences)
 
 
 __all__ = ["Flint", "NpuFlint"]

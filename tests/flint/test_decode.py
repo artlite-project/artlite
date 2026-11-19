@@ -6,12 +6,16 @@
   logits, the residual after the last layer's attention;
 - steps of S slots give each slot the logits of a step of one, bit for bit (the attention's sub-steps, the MoE's partials
   summed on the slots' grid whatever the union of the step's experts), also where a step continues from fewer slots than
-  the last one ran (rejected drafts).
+  the last one ran (rejected drafts);
+- several sequences on one device, alternated and in joint steps: every slot the logits of its sequence alone, bit for
+  bit, with linear caches and with the sliding-window caches as rings, one sequence across the wrap.
 """
 
 import numpy as np
 import pytest
 
+from artlite.decode.protocol import SLOTS
+from artlite.decode.step import Part
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import FlintConfig, flint_gguf
 from models.flint.overlay import FlintOverlay
@@ -110,3 +114,68 @@ def test_flint_overlay_steps(flint: tuple[GGUFFile, FlintConfig]) -> None:
         got = np.asarray(ov.step(xs, p), np.float32)
         assert np.array_equal(got[:acc], one[p:p + acc]), p
         p += acc
+
+
+@pytest.mark.parametrize(("layers", "wrap", "lengths"), [([1, 2], 0, (72, 72, 72)), ([2, 3], 9, (640, 150, 40))],
+                         ids=["linear", "ring"])
+def test_flint_overlay_sequences(flint: tuple[GGUFFile, FlintConfig], layers: list[int], wrap: int,
+                                 lengths: tuple[int, ...]) -> None:
+    """Three sequences on one device (``FlintOverlay(sequences=3)``: texts of their own, at positions of their own) give,
+    slot by slot, the logits of each sequence alone in steps of one, bit for bit: alternated (``select``: a step of 1 ..
+    4 slots of one, then of the next) and in joint steps (``step``'s parts: slots dealt at random, a sequence's second
+    slot too, one sequence joining later; an MoE layer runs the union of the slots' experts). "ring": the
+    sliding-window caches as rings of 9 groups (576 positions), the first sequence across the wrap while the others
+    are before it."""
+    g, _ = flint
+    nseq = len(lengths)
+    ids = _ids(g, sum(lengths))
+    offs = np.cumsum([0, *lengths])
+    xs = [g.rows("token_embd.weight", np.asarray(ids[offs[s]:offs[s + 1]])).astype(np.float32) for s in range(nseq)]
+    ov = FlintOverlay(g, layers=layers, vocab=VOCAB, max_positions=1024, wrap=wrap, sequences=nseq)
+    ov.load()
+    want = []
+    for s in range(nseq):  # (alone, in steps of one, as sequence 0)
+        ov.select(0)
+        ov.reset()
+        want.append(_run(ov, xs[s], (1,)))
+    assert not np.array_equal(want[0][:32], want[1][:32]), "the sequences' texts differ"
+
+    def check(got: np.ndarray, at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for row, (s, p) in zip(np.asarray(got, np.float32), at, strict=True)
+               if not np.array_equal(row, want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    def fresh() -> None:
+        for s in range(nseq):
+            ov.select(s)
+            ov.reset()
+
+    fresh()  # alternated: a step of one sequence, then of the next
+    pos, i = [0] * nseq, 0
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        s = i % nseq
+        n = min(STEPS[(i // nseq + s) % len(STEPS)], lengths[s] - pos[s])
+        i += 1
+        if n:
+            ov.select(s)
+            check(ov.step(xs[s][pos[s]:pos[s] + n], pos[s]), [(s, pos[s] + k) for k in range(n)], "alternated")
+            pos[s] += n
+
+    fresh()  # joint steps
+    rng = np.random.default_rng(0)
+    pos, steps, patterns = [0] * nseq, 0, set()
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
+        spare = SLOTS - len(take)
+        for t in take:  # (more slots of its own)
+            while spare and rng.random() < 0.4 and pos[t[0]] + t[1] < lengths[t[0]]:
+                t[1] += 1
+                spare -= 1
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        patterns.add(ov._join(parts))
+        got = ov.step(np.concatenate([xs[s][pos[s]:pos[s] + n] for s, n in take]), parts)
+        check(got, [(s, pos[s] + k) for s, n in take for k in range(n)], f"step {steps}")
+        for s, n in take:
+            pos[s] += n
+        steps += 1
+    assert max(len(u) for u in patterns) >= 3, "a step of three sequences"

@@ -63,6 +63,12 @@ rounds calibrate it) pays for their slots at the measured step times, and the ge
 while they beat steps of one token. Short chat prompts, 400 tokens greedy, against ~32.4 tokens/s without it: math
 1.31x, code 1.24x, prose 1.13x, JSON 1.07x; the drafter takes 0.19 GB.
 
+Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches, and a decode step's 4 slots
+are tokens of the requests that generate, each in its own cache (`models/lanes.py`). The dense weights stream once for
+all of them, and an MoE layer runs the union of their experts: a step of 2 / 3 / 4 requests takes 1.37x / 1.84x / 2.24x
+a step of one, so 4 requests get 1.6x one request's tokens per second in all. The DFlash2 drafter does not load then
+(its records follow one sequence): [artlite-server](../server.md#several-requests-at-a-time).
+
 ## Speed and accuracy (Strix Halo)
 
 | | 1K | 8K | 32K | 64K |

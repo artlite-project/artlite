@@ -329,6 +329,16 @@ def _gemma_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
+def _flint_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.flint.overlay import FlintOverlay
+
+        ov = FlintOverlay(GGUFFile(path), max_positions=1024, sequences=3)
+        _run_sequences(ov, attach(ov.op), lambda x, p, lg: ov.step(x, p, logits=lg))
+
+    return run
+
+
 def _flint(path: str, wrap: int) -> Callable[[Callable[[object], _Log]], None]:
     """Flint: plain steps; with its sliding-window caches a ring of ``wrap`` groups (``CacheKind.wrap``): steps of 1 .. 4
     slots across the ring's wraps (1024 and 2048 positions), a snapshot and its restore, a reset."""
@@ -666,6 +676,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "spark-4B-bartowski-Q4_K_M": (spark_gguf("4B", "Q4_K_M", "bartowski"), _spark),
     "flint-int4": (flint_gguf(), lambda p: _flint(p, 0)),
     "flint-int4-ring": (flint_gguf(), lambda p: _flint(p, 16)),
+    "flint-int4-sequences": (flint_gguf(), _flint_sequences),
 }
 
 

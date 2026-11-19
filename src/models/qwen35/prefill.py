@@ -455,7 +455,7 @@ class QwenPrefill(ChunkPrefill):
         return self._items[k1]
 
     def _buffers(self) -> dict[str, object]:
-        return self.ov.dev.buffers | {k: v for d in self.drafters for k, v in d.buffers().items()}
+        return super()._buffers() | {k: v for d in self.drafters for k, v in d.buffers().items()}
 
     def _conv_index(self) -> None:
         """The GHDR bytes of the GDN layers' conv states (3 rows x the column's channels, bf16) and their places in CVL
