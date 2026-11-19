@@ -88,7 +88,11 @@ def test_image_prompt(case: tuple) -> None:
         model = NpuQwen(GGUFFile(path), capacity=1024, prefill=prefill, sizes=(256,))
         got = [model.forward(seq[:K])]
         caches[prefill] = _k_cache(model, K - K % 32)
-        got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K:-1]]))
+        got.append(model.step(int(seq.ids[K])))
+        # (the first decode step after the prompt's chunks runs at its own position, 191 before its cache slot's, and
+        # the prompt's positions stay the overlay's)
+        assert seq.pos[K, 0] < K - 100 and np.array_equal(model.overlay.rope[:K + 1], seq.pos[:K + 1])
+        got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K + 1:-1]]))
         kl, agree = kl_report("prefill" if prefill else "steps", want, got, where=" at the official positions")
         assert model.rope_next == seq.next - 1  # (the text positions continued through the answer's steps)
         assert kl < 0.008 and agree > 0.92

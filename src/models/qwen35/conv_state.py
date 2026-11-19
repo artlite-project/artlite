@@ -118,5 +118,4 @@ class ConvHandoff:
                         gobj[a:a + 64 * (p % 8)] = 0
         dev.flush("GOBJ")
         cur.conv_in_ghdr = False
-        ov.reset_rope()
         ov._once(t0)
