@@ -445,8 +445,8 @@ and drafts of the next ones, with several a token of each, so requests that meet
 
 | tokens per second | one request | 2 at a time | 4 at a time |
 |---|---|---|---|
-| Llama 3.2 1B Q4_K_M | 82 | 135 | 226 |
-| Llama 3.1 8B Q4_K_M | 14.6 | 25.3 | 43.7 |
+| Llama 3.2 1B Q4_K_M | 82 | 137 | 236 |
+| Llama 3.1 8B Q4_K_M | 14.7 | 25.8 | 44.2 |
 
 (`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
 tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
