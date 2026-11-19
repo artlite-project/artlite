@@ -39,12 +39,20 @@ phase's inputs wait for the drains before them (``Sequence.sync``: its producers
 out before that wait (they stream into the memtile meanwhile). A column-major image (``image.QwenImage``) streams a
 column's weights between two attentions (their caches on A) as one run, its phases' norm-weight objects in it; a
 region-major one per phase and K group (the norm-weight objects from NORM).
+
+Several sequences (``sequences``; a dense model on its design of 8 slots): each has its KV caches and its GDN layers'
+objects, states and conv states in buffers of its own (``SEQ``; ``ModelOverlay.select``), its lazy commit's cursor and
+its ``rope``. A step's slots may be several sequences' (``decode.step.Part``), with no kernel of its own: each attention
+runs a pass per sequence (``decode.attn256_steps``' "Several sequences") and each GDN layer a chain per sequence
+(``gdn_steps``' "Several sequences": its words in its header object, its rows drained into its objects, its outputs
+into its slots of gdn_out's staged x), and every slot's numbers are those of a step of its sequence alone.
 """
 
 import dataclasses
 import itertools
 import math
 import os
+from collections.abc import Mapping
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -53,7 +61,7 @@ from artlite.decode import attn256 as attn
 from artlite.decode import gemv
 from artlite.decode import phases as mp
 from artlite.decode.attn256 import F_ATT, M_ALANE, M_AMASK, M_BRANCH
-from artlite.decode.attn256_steps import AttentionSteps
+from artlite.decode.attn256_steps import AttentionSteps, pass_subs
 from artlite.decode.design import PG_ONE_CHANNEL
 from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, StepKey, host_bytes, paged_formats
 from artlite.decode.protocol import (
@@ -80,6 +88,7 @@ from artlite.decode.protocol import (
     interleave,
 )
 from artlite.decode.screen import Screen
+from artlite.decode.step import Part
 from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import QwenConfig
@@ -136,11 +145,12 @@ class QwenOverlay(ModelOverlay):
     besides the image's (a drafter's: ``draft``; past three formats, all but the model's largest as code pages),
     ``gu``: the rows per tile of a drafter's gate / up tiles besides the image's (``draft.draft_gate_up``: gate / up
     tiles of other than 16 rows take ``decode.design``'s windows), ``image``: an image laid out already
-    (``ModelOverlay``'s: a drafter's view of its model's).
+    (``ModelOverlay``'s: a drafter's view of its model's), ``sequences``: the sequences whose caches and GDN states the
+    device holds (module docstring; more than one: the design of 8 slots, a dense model's).
 
-    ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot, which the step's and the prefill's
-    rotations take; the slot's index (text from position 0) until a model writes others (an image's tokens, the
-    text after it: ``models.qwen35``), again after ``reset``."""
+    ``rope`` (max_positions, 3): the M-RoPE position (T, H, W) of each cache slot of the selected sequence, which the
+    step's and the prefill's rotations take; the slot's index (text from position 0) until a model writes others (an
+    image's tokens, the text after it: ``models.qwen35``), again after ``reset``."""
 
     CONFIG, IMAGE = QwenConfig, QwenImage
     NORMED = frozenset(NORMS)
@@ -153,27 +163,34 @@ class QwenOverlay(ModelOverlay):
     STEPS_AHEAD = True
     AHEAD_PREPARED = False
     KV_PAD = KV_PAD  # (``decode.dflash.overlay.DFlashTarget``)
+    SEQ = ("KV", "GOBJ", "GSTATE", "GHDR")
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
                  image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset(),
-                 drafts: bool | None = None):
+                 drafts: bool | None = None, sequences: int = 1):
         """slots: a step's token slots at most (default ``slots_of``, ``drafts``: whether a drafter's steps of several
         tokens run, default: the file has an MTP layer of its own)."""
-        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
+        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
         gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
         slots = slots or slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts)
+        if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
+            raise ValueError(f"{sequences} sequences: a dense model whose design runs steps of 8 slots (this one: "
+                             f"{slots}; ``slots_of``: its tile formats, an image whose LM head is not screened)")
+        if sequences > 8:
+            raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
-        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots) if any(att) else None
+        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots,
+                                  passes=sequences) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.AHEAD = self.STEPS_AHEAD and slots == 4 and self.ash is not None
         # (the positions whose ``rope`` rows the last position patch took, and the rows it took: ``_ring_state``)
         self._rope_used = (0, 0, b"")
         self._round = False  # (``patch_ahead`` patched the next step: ``_run``)
-        self.rope = _text_rope(self.max_positions)
+        self._ropes = [_text_rope(self.max_positions) for _ in range(sequences)]  # (per sequence: ``rope``)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
@@ -190,14 +207,26 @@ class QwenOverlay(ModelOverlay):
         self.g4 = self.gsh is not None and slots == 4 and self.gsh.chunk  # (chunkwise of 4: ``gdn``'s "Chunkwise", "4 slots")
         self.blocks = self.g4 or self.g8  # (a chunkwise core: the states at the ends of blocks of 8 positions, ``GdnCursor.half``)
         self.flags = FLAGS | ({"gdn_in": F_NORM | F_GIN} if slots == 8 else {})
-        self.cur = GdnCursor()  # (the GDN layers' lazy commit and blocks)
-        self.ends = True  # (chunkwise) whether the step's chain ends its block: its state panels drain (``_variant``)
+        self._curs = [GdnCursor() for _ in range(sequences)]  # (the GDN layers' lazy commit and blocks, per sequence: ``cur``)
+        # (chunkwise) whether the step's chain ends its block: its state panels drain (``_variant``); a step of several
+        # sequences: every chain does (``_step_parts``)
+        self.ends = True
         self.gdn_steps, self.attn_steps, self.moe_steps = GdnTransfers(self), AttentionSteps(self), MoeTransfers(self)
         self.conv = ConvHandoff(self)  # (the conv states between the decode and the prefill)
         if img.screen:
             self.screen = Screen(gguf, img.lm, self._f32("output_norm.weight"), cfg.rms_norm_eps,
                                  min(self.vocab, cfg.vocab_size))
         self._plan()
+
+    @property
+    def rope(self) -> np.ndarray:
+        """The selected sequence's M-RoPE positions (class docstring)."""
+        return self._ropes[self.seq]
+
+    @property
+    def cur(self) -> GdnCursor:
+        """The selected sequence's lazy commit and blocks (``cursor.GdnCursor``)."""
+        return self._curs[self.seq]
 
     # ------------------------------------------------------------------
     # Layout
@@ -244,8 +273,10 @@ class QwenOverlay(ModelOverlay):
         self._layout = dict.fromkeys(("ACT", "NORM", "GOBJ", "GSTATE", "KV", "GHDR"), 0)
         take = self._take
         self.loadr = take("ACT", COLS * self.SLOTS * XB)  # [column][slot]
-        for L, name in self._phases():  # (gdn_out: the GDN pads' sink past each x)
-            self._add_inputs((L, name), extra=2 * self.SLOTS if name == "gdn_out" else 0)
+        for L, name in self._phases():  # (gdn_out: the GDN pads' sink past each x; several sequences: the x that the
+            # attention's passes and the GDN chains write staged)
+            self._add_inputs((L, name), extra=2 * self.SLOTS if name == "gdn_out" else 0,
+                             staged=self.sequences > 1 and name in ("attn_out", "gdn_out"))
         self.norm_off: dict[tuple[int, str], int] = {}
         self.n_norm = -(-self.H // (NX_PER_NORM * OBJ_K))  # norm-weight A objects of a phase
         nw = 2 * NX_PER_NORM * OBJ_K * (self.n_norm - 1) + self.T  # (the last object's extent)
@@ -361,7 +392,8 @@ class QwenOverlay(ModelOverlay):
         dt, A = self._f32(f"blk.{L}.ssm_dt.bias"), self._f32(f"blk.{L}.ssm_a")
         norm = self._f32(f"blk.{L}.ssm_norm.weight")
         m = np.zeros(META, np.int32)
-        m[M_FLAGS], m[M_SKIP] = F_GDN, sh.n_objects - 1
+        # (several sequences: the header also gives the core its chain's words, ``GdnTransfers.set_words``)
+        m[M_FLAGS], m[M_SKIP] = F_GDN | (F_GIN if self.sequences > 1 else 0), sh.n_objects - 1
         if self.g8:  # (the helper's requests per step: ``gdn``'s ``hgdn``, its heads' and the step's end)
             m[M_HPAN] = sh.hc + 3
         for c in range(COLS):
@@ -380,6 +412,14 @@ class QwenOverlay(ModelOverlay):
             for b, pay in enumerate(gdn.conv_payloads(sh, cw[rows], dt[vh], A[vh], norm)):
                 k = b if b < 4 else 5 + 3 * ((b - 4) // 2) + (b - 4) % 2
                 gobj[self.gdn_payload(L, c, k):self.gdn_payload(L, c, k) + XPAY] = pay
+
+    def load(self, *, threads: int = 0, also: Mapping[str, int] | None = None) -> None:
+        """(every sequence's GDN objects and zero states)"""
+        super().load(threads=threads, also=also)
+        for s in range(1, self.sequences):
+            self.select(s)
+            self.reset()
+        self.select(0)
 
     def reset(self) -> None:
         """A new sequence: the GDN layers' conv histories, replay objects and states zeroed (a layer's objects as
@@ -514,7 +554,8 @@ class QwenOverlay(ModelOverlay):
         """Phases before the first layer's (a drafter's eh: ``draft``)."""
 
     def _variant(self) -> tuple:
-        """(a step of a chunkwise GDN core: whether its chain ends its block, ``ends``: only then its state panels drain)"""
+        """(a step of a chunkwise GDN core: whether its chain ends its block, ``ends``: only then its state panels
+        drain)"""
         return (self.start, self.ends)
 
     def _variant_ahead(self, p: int, S: int) -> tuple:
@@ -546,6 +587,16 @@ class QwenOverlay(ModelOverlay):
             super().prepare(S, logits, start)
         self.ends = True
 
+    def prepare_joint(self) -> None:
+        """(several sequences) Build the transactions of the steps of several parts (``_step_parts``: all the design's
+        slots) and their patch tables: one per number of sequences in the step."""
+        self.ends = True
+        for k in range(2, self.sequences + 1):
+            st = self._transaction(self._key(self.SLOTS, True, pass_subs(k)))
+            self.gdn_steps.chain_table(st)
+            if self.ash is not None and st.patch is None:
+                st.patch = self.attn_steps.patch_tables(st)
+
     def patch_ahead(self, S: int, p: int) -> None:
         """(a step of a chain)"""
         if self.blocks:
@@ -567,6 +618,15 @@ class QwenOverlay(ModelOverlay):
         return tuple((a, n, split) for a, n in substeps(p, S, attn.POS_PER_GROUP, self.ash.sub)
                      for split in self.ash.split_of((p + a) // attn.POS_PER_GROUP, n))
 
+    def _join(self, parts: tuple[Part, ...]) -> tuple[tuple[int, int, int], ...]:
+        """(a pass of each attention and a chain of each GDN layer per part: one transaction for every way to deal
+        the step's slots, ``decode.attn256_steps.pass_subs``; a step of one part: that sequence's)"""
+        return self.subs(parts[0].position, parts[0].n) if len(parts) == 1 else pass_subs(len(parts))
+
+    def _joint_subs(self, S: int) -> set[tuple]:
+        """(built at their first use: a transaction per number of sequences and set of chains that end their block)"""
+        return set()
+
     def _set_position(self, st: Step, p: int, ahead: bool = False) -> bool:
         """A step's words that follow its position: a chunkwise core's state transfers (``GdnTransfers.patch_panels``),
         the attention's F_ATT objects and cache, ring and record transfers (``AttentionSteps.set_position``). ``ahead``
@@ -579,11 +639,26 @@ class QwenOverlay(ModelOverlay):
             if self.vring.from_prefill & set(self.fatt):
                 return False
             rope = np.repeat(int(self.rope[p - 1].max()) + 1 + np.arange(st.S, dtype=self.rope.dtype)[:, None], 3, 1)
+        if self.sequences > 1:
+            return self._set_parts(st, (Part(self.seq, p, st.S),))
         if self.blocks:
             self.gdn_steps.patch_panels(st, p)
         if self.ash is not None:
             self.attn_steps.set_position(st, p, np.concatenate(attn.rope_cs(self.cfg, rope), 1))
         self._rope_used = (p, p + st.S, rope.tobytes())
+        return True
+
+    def _set_parts(self, st: Step, parts: tuple[Part, ...], ahead: bool = False) -> bool:
+        """``_set_position`` of a step of several sequences' slots (or of one sequence of an overlay of several): each
+        GDN chain's transfers in its sequence's buffers and its slots (``GdnTransfers.patch_chains``), each
+        attention's passes (``AttentionSteps.set_parts``) with their sequences' ``rope`` rows."""
+        assert not ahead and self.sequences > 1, parts
+        if self.gobj:
+            self.gdn_steps.patch_chains(st, parts)
+        if self.ash is not None:
+            rope = np.concatenate([self._ropes[q.seq][q.position:q.position + q.n] for q in parts])
+            self.attn_steps.set_parts(st, parts, np.concatenate(attn.rope_cs(self.cfg, rope), 1))
+        self._branch = None  # (the F_ATT objects' step words are the passes': ``_set_branch`` writes its own again)
         return True
 
     @property
@@ -632,7 +707,7 @@ class QwenOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: np.ndarray, position: int, *, logits: bool = True, commit: bool = True,
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True, commit: bool = True,
              branch: tuple[int, int] | None = None) -> np.ndarray | None:
         """One step of S = len(x) <= SLOTS (4; 8 where ``slots_of``) token slots: x (S, hidden) the first layer's inputs (embeddings) at positions
         position .. position + S - 1 (the positions before are in the caches, the GDN states hold the committed ones and
@@ -641,11 +716,17 @@ class QwenOverlay(ModelOverlay):
         as accepted (a chunkwise core of 4: the states are written at the ends of blocks of 8 positions whatever
         ``commit``, which then only says that all S are accepted: ``gdn``'s "Chunkwise"). ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
         at position + parent + 1 .. inside the 8 positions of slot parent's (position % 8 + parent + L <= 7: its attention
-        records and GDN block; a tree of two branches: ``_set_branch``); None: a chain. Returns the slots' logits
-        (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits`` None."""
+        records and GDN block; a tree of two branches: ``_set_branch``); None: a chain. Several sequences' slots:
+        ``position`` their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next
+        positions; no state is committed: each sequence's accepted tokens through ``accept(n, seq)``). Returns the
+        slots' logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits``
+        None."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
+        if isinstance(position, tuple):
+            return self._step_parts(x, position, logits)
+        assert branch is None or self.sequences == 1, "a branching step: a model of one sequence"
         cur = self.cur
         assert cur.committed or cur.accepted, "accept() the previous lazy step's tokens first"
         assert branch is None or (S == 8 and self.can_branch and not commit and branch[1] in (1, 2)
@@ -664,6 +745,8 @@ class QwenOverlay(ModelOverlay):
             self.ends = position % 8 + S - (branch[1] if branch else 0) >= 8
             cur.gpos = position
             self.gdn_steps.set_words(nrep=position % 8, cshift=cur.cshift, commit=False)
+            if self.sequences > 1:  # (the chain's words: in its sequence's headers)
+                self.gdn_steps.set_chain_words((Part(self.seq, position, S),))
         else:
             self.gdn_steps.set_words(nrep=cur.nrep, cshift=cur.cshift, commit=commit)
         cur.committed = commit
@@ -679,7 +762,52 @@ class QwenOverlay(ModelOverlay):
                 cur.nrep, cur.cshift = 0, S
         return out
 
-    def _run(self, S: int, position: int, logits: bool) -> np.ndarray | None:
+    def _step_parts(self, x: np.ndarray, parts: tuple[Part, ...], logits: bool) -> np.ndarray | None:
+        """``step`` of several sequences' slots (chunkwise cores: the states are written at the ends of the chains'
+        blocks; each sequence's accepted tokens: ``accept``). A step of several parts has one transaction per number
+        of parts (``prepare_joint`` builds them all: one takes 0.4 s per part on the 27B): it runs all the design's
+        slots, those nobody asked for as one part's further slots (its last row again: drafts that nobody accepts; a
+        step of 8 slots takes 2% more than one of a slot), and each of its chains ends its block, the core taking it
+        there (``GdnTransfers.set_chain_words``): its state's update into the half the next block starts from, which
+        that block's real end writes again (0.7 ms a chain of the 27B's step of 325 ms)."""
+        S = x.shape[0]
+        assert self.sequences > 1 and sum(q.n for q in parts) == S, parts
+        keep = np.arange(S)  # (the caller's rows in the step's)
+        pad = self.SLOTS - S if len(parts) > 1 else 0
+        fit = [i for i, q in enumerate(parts) if q.position + q.n + pad <= self.max_positions] if pad else []
+        if fit:
+            i = fit[-1]  # (the last part: the caller's rows stay the step's first)
+            q, e = parts[i], sum(r.n for r in parts[:i + 1])
+            parts = (*parts[:i], Part(q.seq, q.position, q.n + pad), *parts[i + 1:])
+            x = np.concatenate([x[:e], np.repeat(x[e - 1:e], pad, 0), x[e:]])
+            keep = np.concatenate([np.arange(e), np.arange(e + pad, S + pad)])
+            S += pad
+        curs = [self._curs[q.seq] for q in parts]
+        assert all(c.committed or c.accepted for c in curs), "accept() the previous lazy step's tokens first"
+        before = self.seq
+        for q, cur in zip(parts, curs, strict=True):  # (after a prefill: the sequence's conv states into its objects)
+            if cur.conv_in_ghdr:
+                self.select(q.seq)
+                self.conv.for_decode(q.position)
+        self.select(before)
+        if self._metas_s != (S, self.start):
+            self._metas(S)
+        for q, cur in zip(parts, curs, strict=True):
+            assert q.position == cur.gnext or not self.gobj, (q, cur.gnext)
+            cur.gpos, cur.committed = q.position, False
+        self.ends = len(parts) > 1 or parts[0].position % 8 + parts[0].n >= 8
+        self.gdn_steps.set_chain_words(parts)
+        self._write_loadr(x)
+        first = self._input(self.layers[0])
+        self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
+        out = self._run(S, parts, logits)
+        for cur in curs:
+            cur.accepted = False
+        if out is None:
+            return None
+        return out[:len(keep)] if keep[-1] == len(keep) - 1 else out[keep]  # (the caller's rows: a view, else a copy)
+
+    def _run(self, S: int, position: int | tuple[Part, ...], logits: bool) -> np.ndarray | None:
         """(a step that ``patch_ahead`` patched patches none ahead itself: ``STEPS_AHEAD``)"""
         ahead, self.AHEAD = self.AHEAD, self.AHEAD and not self._round
         self._round = False
@@ -688,15 +816,18 @@ class QwenOverlay(ModelOverlay):
         finally:
             self.AHEAD = ahead
 
-    def _ran(self, p: int, S: int) -> None:
+    def _ran(self, p: int, S: int, seq: int | None = None) -> None:
+        vring = self.vring if seq is None else self._vrings[seq]
         for L in self.fatt:
-            self.vring.ran(L, p, S)
+            vring.ran(L, p, S)
 
-    def _ring_state(self) -> tuple:
+    def _ring_state(self, seq: int | None = None) -> tuple:
         """(and whether a prefill's conv states wait in GHDR: the next step resets ``rope``; the GSTATE halves of the
         blocks, ``GdnCursor.half``; the ``rope`` rows the last position patch took)"""
         a, b, _ = self._rope_used
-        return (*super()._ring_state(), self.cur.conv_in_ghdr, self.cur.gh, self.cur.gp, self.rope[a:b].tobytes())
+        s = self.seq if seq is None else seq
+        cur = self._curs[s]
+        return (*super()._ring_state(seq), cur.conv_in_ghdr, cur.gh, cur.gp, self._ropes[s][a:b].tobytes())
 
     def _ahead_state(self) -> tuple:
         """(the ``rope`` rows the patch took in place of those ``rope`` holds now)"""
@@ -707,11 +838,12 @@ class QwenOverlay(ModelOverlay):
             self._weight_run(seq, [(-1, "lm")])
         self._phase(seq, (-1, "lm"), 1, "LOGITS")
 
-    def accept(self, n: int) -> None:
-        """The previous step's first n tokens are accepted (the next step's positions start after them): its GDN
-        layers replay them (unless it committed: then n must be all of them) and shift their conv histories (a chunkwise
-        core of 4: the next step recomputes its block's lanes from the histories, ``GdnCursor.advance``)."""
-        cur = self.cur
+    def accept(self, n: int, seq: int | None = None) -> None:
+        """The previous step's first n tokens (of sequence ``seq``; None: the selected one) are accepted (the next
+        step's positions start after them): its GDN layers replay them (unless it committed: then n must be all of
+        them) and shift their conv histories (a chunkwise core: the next step recomputes its block's lanes from the
+        histories, ``GdnCursor.advance``)."""
+        cur = self.cur if seq is None else self._curs[seq]
         assert 0 <= n <= self._last_s and not cur.accepted
         if cur.committed:
             assert n == self._last_s, "a committing step's tokens are all accepted"

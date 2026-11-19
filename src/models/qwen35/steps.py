@@ -24,6 +24,20 @@ class StatePanel(NamedTuple):
     drain: bool
 
 
+class ChainBD(NamedTuple):
+    """A GDN chain's transfer that follows its sequence or its slots (an overlay of several sequences,
+    ``gdn_steps.GdnTransfers._chains``): its BD word index, the chain, its kind and its byte offset - in GOBJ (``GOBJ``; its
+    rows of gdn_in, ``ROWS``: of the chain's slots' bytes), in a half of GSTATE (``PANEL``: the block's; ``UPDATE``: the
+    other), or in ACT (``OUT``: its outputs, from its first slot's bytes on)."""
+
+    at: int
+    chain: int
+    kind: int
+    offset: int
+
+    GOBJ, ROWS, PANEL, UPDATE, OUT = range(5)
+
+
 @dataclasses.dataclass(eq=False)
 class PanelTable:
     """``StatePanel``s as arrays: BD word index, offset, bytes, drain, and the transaction's cache lines they patch."""
@@ -48,3 +62,6 @@ class Step(AttnStep):
     panels: list[StatePanel] = dataclasses.field(default_factory=list)
     table: PanelTable | None = None  # (``panels`` as arrays, at the first patch)
     half: int = -1  # (the GSTATE half the panels are patched for: ``gdn_steps.GdnTransfers.patch_panels``)
+    chains: list[ChainBD] = dataclasses.field(default_factory=list)
+    chain_table: tuple[np.ndarray, np.ndarray] | None = None  # (``chains`` as an array, the transaction's lines they patch)
+    chained: tuple | None = None  # (per chain the sequence, slots and half ``chains`` are patched for: ``patch_chains``)

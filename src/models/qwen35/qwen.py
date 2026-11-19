@@ -31,12 +31,19 @@ each (2.4-3.4 ms on the 35B-A3B), while their chain's probability pays for the s
 draft. A step of drafts leaves the GDN states uncommitted: the next one
 replays the accepted tokens.
 
+Several sequences (``NpuQwen(sequences=N)``; a dense model whose design runs steps of 8 slots: the 27B models): the
+device holds the KV caches and the GDN states, objects and conv states of each, and the model has a lane for each
+(``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
+(``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence). Without
+a drafter (its records follow one sequence), the LM head's rows whole (a screened head's tiles do not fit that design).
+
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to disk. Load (27B, the
 file in the page cache: 1.1 s): the buffer allocated and the image packed (C++) in a thread while the tokenizer,
 the designs (found through the render manifest) and the overlay's other buffers load.
 """
 
+import logging
 import os
 from collections import abc
 from collections.abc import Callable, Iterator
@@ -49,6 +56,7 @@ from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mt
 from artlite.overlay import WeightBuffer
 
 from ..dflash import DFlashDrafting
+from ..lanes import alone
 from ..minicpmv import host as minicpmv_host
 from ..minicpmv import npu as minicpmv_npu
 from ..model import Model
@@ -73,6 +81,7 @@ from .prefill import QwenPrefill
 THINK_SAMPLING = {"temp": 1.0, "top_k": 20, "top_p": 0.95}
 PLAIN_SAMPLING = {"temp": 0.7, "top_k": 20, "top_p": 0.8}
 MINICPMV_SAMPLING = {"temp": 0.7, "top_k": 100, "top_p": 0.95, "penalty_repeat": 1.03}
+log = logging.getLogger("artlite")
 
 
 class NpuQwen(OverlayModel):
@@ -80,16 +89,24 @@ class NpuQwen(OverlayModel):
     in chunks through the prefill ELFs (else as decode steps), of the sizes ``sizes`` (default ``QwenPrefill``'s);
     ``drafter``: the multi-token-prediction drafter's file ("": the model file's own MTP block, else a qwen35moe model's
     ``model_config.qwen_mtp_of`` file, when there is one; None: none, and an image without the block); ``dflash``: a
-    DFlash2 drafter's file, in the place of any of those (``dflash.DFlashOverlay``)."""
+    DFlash2 drafter's file, in the place of any of those (``dflash.DFlashOverlay``); ``sequences``: the sequences the
+    device holds (module docstring: no drafter then; ``lanes``: the model of each)."""
 
     recurrent = True  # (the GDN layers' states hold the whole sequence)
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "causal", "STEP_COST", "dflash", "mtp", "flash")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "rope_next", "_prompting", "_x")
+    rope_next = 0  # (the M-RoPE position of the next text token)
+    _prompting = False
+    _x: np.ndarray | None = None  # (the last step's rows)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
                  sizes: tuple[int, ...] | None = None, weights: WeightBuffer | None = None, drafter: str | None = "",
-                 dflash: str | None = None, readout: bool = False):
+                 dflash: str | None = None, readout: bool = False, sequences: int = 1):
         """weights: the weight image's buffer, allocated ahead (``WeightBuffer``); readout: a readout model
         (``models.readouts.readout_model``): the prefill's precise variants and packed chunks (``QwenPrefill``'s
         ``precise``, ``pack``), no text generation (``generates``: its image holds no LM head)."""
+        if sequences > 1 and (drafter is not None or dflash):
+            raise ValueError("several sequences: without a drafter (its records follow one sequence)")
         self.gguf = gguf
         cfg = QwenConfig.from_gguf(gguf)
         path = None if dflash else qwen_mtp_of(gguf.path) if drafter == "" and cfg.moe else drafter
@@ -99,7 +116,8 @@ class NpuQwen(OverlayModel):
         self.overlay = QwenOverlay(gguf, max_positions=capacity, weights=weights, image=image,
                                    formats=draft_formats(mtp) if mtp is not None else (),
                                    gu=draft_gate_up(mtp) if mtp is not None else frozenset(),
-                                   drafts=mtp is not None or bool(dflash) or (own and bool(cfg.nextn_layers)))
+                                   drafts=mtp is not None or bool(dflash) or (own and bool(cfg.nextn_layers)),
+                                   sequences=sequences)
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal
         self.generates = not readout
@@ -120,8 +138,7 @@ class NpuQwen(OverlayModel):
         gguf.release()
         self._w_out = self.overlay._f32("output_norm.weight")
         self.position = 0
-        self.rope_next = 0  # (the M-RoPE position of the next text token)
-        self._prompting = False
+        self._open_lanes()
 
     def _load_drafters(self, threads: int) -> None:
         """(a drafter's file of its own gives its pages back once its image is packed)"""
@@ -133,7 +150,9 @@ class NpuQwen(OverlayModel):
             self._mask = self._rows([self.dflash.cfg.mask_token])[0]
 
     def _prepare_steps(self) -> None:
-        """(``prepare`` builds the steps' transactions)"""
+        """(``prepare`` builds the steps' transactions; several sequences: their shared steps' now)"""
+        if self.overlay.sequences > 1:
+            self.overlay.prepare_joint()
 
     @property
     def capacity(self) -> int:
@@ -179,9 +198,11 @@ class NpuQwen(OverlayModel):
             f", drafter {os.path.basename(self.drafter.gguf.path)}"
         if f is not None:
             d = f", DFlash2 drafter {os.path.basename(f.gguf.path)} ({f.image.nbytes / 1e9:.2f} GB, {f.sizes['KV'] / 1e6:.0f} MB of records)"
-        return (f"{ov.image.nbytes / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
+        each = "" if ov.sequences == 1 else f"{ov.sequences} sequences, each "
+        return (f"{ov.image.nbytes / 1e9:.2f} GB of weights, {each}{ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
                 f"({self.capacity} positions), {ov.sizes['GSTATE'] / 1e6:.0f} MB of GDN states{d}")
 
+    @alone
     def reset(self) -> None:
         """A new sequence: no cached positions, the GDN states zeroed."""
         self._abandon()
@@ -204,6 +225,7 @@ class NpuQwen(OverlayModel):
         d = self.dflash if self.dflash is not None else self.drafter
         return [self.overlay] + ([d] if d is not None else [])
 
+    @alone
     def checkpoint(self) -> Checkpoint:
         """(the drafter's rows of the last step in first: their taps do not outlive the model's next step)"""
         self._abandon()
@@ -239,6 +261,7 @@ class NpuQwen(OverlayModel):
     def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
         return (self._rows(tokens),)
 
+    @alone
     def prompt(self, tokens: list[int] | Sequence, *, logits: bool = False,
                progress: Callable[[int], None] | None = None, readout: Readout | None = None,
                sets: abc.Sequence[int] | None = None) -> np.ndarray | None:
@@ -257,6 +280,7 @@ class NpuQwen(OverlayModel):
             self.rope_next = (self.rope_next + seq.next if done == n else
                               int(self.overlay.rope[self.position - 1].max()) + 1 if done else self.rope_next)
 
+    @alone
     def steps(self, tokens: list[int], *, logits: bool = True, commit: bool = True,
               branch: tuple[int, int] | None = None) -> np.ndarray | None:
         """(tokens after a prompt: text from ``rope_next``; ``commit``, ``branch``: ``QwenOverlay.step``'s, else the caller
@@ -356,11 +380,29 @@ class NpuQwen(OverlayModel):
         sibling = self._sibling()
         if sibling is not None:
             return self.steps([*tokens, *sibling], commit=False, branch=(len(self.carry), len(sibling)))
+        if self._rounds is not None and not self._rounds.mine():
+            return self._shared(tokens)
+        self._round = None
         return self.steps(tokens, commit=len(tokens) == 1 and not mtp)
+
+    def _shared(self, tokens: list[int]) -> np.ndarray:
+        """(several lanes) A round's step in a dispatch with the other lanes' (``OverlayModel._joined``): the tokens'
+        M-RoPE rows first (text from ``rope_next``); it commits no GDN state (``_kept`` accepts its kept tokens)."""
+        p, n = self.position, len(tokens)
+        if p + n <= self.capacity:
+            self.overlay._ropes[self.seq][p:p + n] = self.rope_next + np.arange(n)[:, None]
+        out = self._joined(tokens)
+        self.rope_next += self._round.n
+        return out
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
         """(a drafter's round: its kept drafts' rows pending, the token's ran with the drafts, a kept sibling branch's from its
         slots, the carry's not: injected after the step that kept it; another lazy step: its kept tokens' rows pending)"""
+        if self._round is not None:  # (several lanes: a shared step, which committed nothing)
+            self.overlay.accept(m, self.seq)
+            self.position = p + m
+            self.rope_next -= len(tokens) - m
+            return
         if len(tokens) == 1 and not mtp:  # (a committed step: its row pending, ``steps``)
             return
         fd = self.flash
@@ -480,7 +522,28 @@ class Qwen(Model):
         return Sampling(temp=s["temp"], top_k=int(s["top_k"]), top_p=s["top_p"],
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuQwen:
-        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
-                            dflash=self.dflash, readout=not self.generates)
+    @property
+    def parallel(self) -> bool:  # type: ignore[override]
+        """(a dense chat model whose design runs steps of 8 slots, its LM head's rows whole: ``overlay.slots_of``)"""
+        if not (self.generates and self.cfg.causal) or self.cfg.moe:
+            return False
+        return slots_of(self.cfg, QwenImage(self.gguf, self.cfg, mtp=False, screen=False).formats(), False) == 8
+
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
+        """(``sequences``: ``NpuQwen``'s; several: without a drafter, the LM head's rows whole)"""
+        if sequences == 1:
+            self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
+                                dflash=self.dflash, readout=not self.generates)
+            return self._npu
+        if self.mtp is not None or self.dflash is not None:
+            log.warning("%s with %d sequences runs without its drafter (the drafter's records follow one sequence)",
+                        self.name, sequences)
+        weights = self.weights
+        if weights.image.screen or weights.image.mtp_layer >= 0:  # (the image packed again: without the MTP block,
+            # its LM head's rows whole)
+            weights.wait()
+            self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=False, pairs=self.generates,
+                                                            screen=False))
+        self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights, drafter=None,
+                            readout=not self.generates, sequences=sequences)
         return self._npu

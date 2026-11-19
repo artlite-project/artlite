@@ -33,8 +33,8 @@ device rather than for portability.
   they apply.
 - **A local model for coding agents.** Claude Code, Codex and opencode work against `artlite-server`, with tool calls
   and a prompt cache, so each turn reads only what is new ([Agents](docs/server.md#agents)).
-- **Requests that meet run together.** With `-np`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3 and Spark-X answer several
-  requests at a time: four get about 3x one request's tokens per second in all, 1.8x where one request already runs with a
+- **Requests that meet run together.** With `-np`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X and the 27B Qwen
+  models answer several requests at a time: four get about 3x one request's tokens per second in all, 1.8x where one request already runs with a
   drafter, 1.6x on Flint ([Several requests at a time](docs/server.md#several-requests-at-a-time)).
 - **Answers that parse.** JSON schemas, grammars and tool calls hold what the model writes, in every API's spelling
   (OpenAI's, Anthropic's, llama-server's, vLLM's), about as fast as free text ([Structured

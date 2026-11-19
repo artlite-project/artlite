@@ -4,6 +4,24 @@ commit patch into them (``patch_panels``: a chunkwise core's state panels, ``set
 
 A chunkwise core's transfers are units in an order (``units``); the state panels of its v heads are the transfers the position
 patches: the block's half of GSTATE (``QwenOverlay.cur``).
+
+Several sequences (an overlay of several, 8 slots: ``_chains``): a GDN layer runs a chain per sequence of the step (a
+step of one sequence: one chain), each the core's step of that sequence's slots alone, on the kernels of one sequence:
+
+- its words (its slots, its block's lanes before it, its histories' base rows) reach the core in the metadata of its
+  sequence's header object, which has ``F_GIN`` beside ``F_GDN`` (``gdn.entry8``'s ``gbegin`` takes the step's words
+  where it finds ``F_GIN``: after the gdn_in phase's own object, whose words the header's replace);
+- gdn_in's rows are drained per chain into its sequence's objects, the chain's first slot's as the objects' first (a
+  drain per group of the stream's objects - the q and k blocks' halves, the v heads' v and z halves, ab - and chain);
+- its objects, histories and states are its sequence's (GOBJ, GSTATE: every transfer's address patched per step,
+  ``patch_chains``; the state panels from its block's half);
+- its outputs, whole heads of 8 slots, go into gdn_out's staged x from the chain's first slot on
+  (``decode.protocol.staged_region_bytes``), the block's gates after them into the sink or, the last head's, into the
+  sequence's header.
+
+A step of several chains has one transaction per number of chains: the rows' drains and the outputs' are patched with
+the chains' slots, and every chain ends its block (``QwenOverlay._step_parts``; a step of one chain: where its slots
+do, as a model of one sequence).
 """
 
 import itertools
@@ -12,13 +30,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from artlite.decode.protocol import C_LEN, DIMS_OBJ, XB, XPAY
+from artlite.decode.attn256 import M_BRANCH
+from artlite.decode.protocol import C_LEN, DIMS_OBJ, M_NS, STAGED_X, XB, XPAY, staged_cell
+from artlite.decode.step import Part
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence
 
 from . import gdn
 from .image import gdn_v_heads
-from .steps import PanelTable, StatePanel, Step
+from .steps import ChainBD, PanelTable, StatePanel, Step
 from .words import M_COMMIT, M_CSHIFT, M_KSHIFT, M_NREP
 
 if TYPE_CHECKING:
@@ -52,7 +72,9 @@ class GdnTransfers:
 
     def build(self, seq: Sequence, st: Step, L: int, S: int) -> None:
         """gdn_in and the GDN step of layer L."""
-        if self.ov.g8:
+        if self.ov.sequences > 1:
+            self._chains(seq, st, L, S)
+        elif self.ov.g8:
             self._chunkwise(seq, st, L, S, wide=True)
         elif self.ov.g4:
             self._chunkwise(seq, st, L, S, wide=False)
@@ -185,6 +207,137 @@ class GdnTransfers:
                       (2048 // 4, 2))  # v rows, then z (the R objects' halves)
             seq.drain("C", c, pay(c, gdn.H_SLOT) + gdn.H_AB, 2 * S * C_LEN)  # ab
         seq.sync()
+
+    def _chains(self, seq: Sequence, st: Step, L: int, S: int) -> None:
+        """(an overlay of several sequences, 8 slots) gdn_in and a GDN chain per sequence of the step (module docstring
+        "Several sequences"): gdn_in's rows per chain into its objects' first slots (a sync), then per chain its units
+        as ``_chunkwise``'s, every transfer in a sequence's buffer recorded (``Step.chains``: ``patch_chains``)."""
+        ov = self.ov
+        dev, sh, hc = ov.dev, ov.gsh, ov.gsh.hc
+        chains = [(a, n) for a, n, _ in st.subs] if len(st.subs) > 1 else [(0, S)]
+        assert ov.ends or len(chains) == 1, "a step of several sequences: every chain ends its block"
+        gobj, gstate = dev.address("GOBJ"), dev.address("GSTATE")
+        row = 2 * C_LEN  # (bytes of a slot's object of gdn_in's rows)
+
+        def pay(c: int, k: int) -> int:
+            return ov.gdn_payload(L, c, k)
+
+        def rec(at: int, u: int, kind: int, offset: int) -> None:
+            st.chains.append(ChainBD(at, u, kind, offset))
+
+        self._gdn_in(seq, L, S)
+
+        def dests(c: int) -> list[int]:  # (the stream's groups in its order: a block's objects (half, slot); then ab)
+            out = [pay(c, sh.kh_slot(kh) + 1) + 3 * 2 * gdn.D + 8 * row * half for kh in range(2) for half in range(2)]
+            out += [pay(c, sh.kh_slot(kh) + 4) + 8 * row * half for kh in range(2) for half in range(2)]
+            out += [pay(c, sh.v_slot(h) + 2) + 2048 * z + 8 * row * half for z in range(2) for h in range(hc)
+                    for half in range(2)]
+            return [*out, pay(c, gdn.H_SLOT) + gdn.H_AB]
+
+        # (per group each chain's slots, in rounds over the columns: a column's drains in a row would hold the others'
+        # rows back, a channel queues 4)
+        for ds in zip(*(dests(c) for c in range(COLS)), strict=True):
+            for u, (_, n) in enumerate(chains):
+                for c, d in enumerate(ds):
+                    rec(seq.drain("C", c, gobj + d, n * row)[0], u, ChainBD.ROWS, d)
+        seq.sync()
+        vh = [gdn_v_heads(ov.cfg, c) for c in range(COLS)]
+        last = hc - 1  # (the last v head the core runs: k head 1's last)
+        cell = staged_cell(ov.SLOTS)
+        for u, (a, n) in enumerate(chains):
+            def kh_x(kh: int, c: int, u: int = u) -> None:  # (k head 0's group after the header)
+                o = pay(c, sh.kh_slot(kh) - (1 if kh == 0 else 0)) - 256
+                rec(seq.fill("X", c, gobj + o, (gdn.KH_SPAN + 1 - kh) * XB, DIMS_OBJ), u, ChainBD.GOBJ, o)
+
+            def kh_d(kh: int, c: int, u: int = u) -> None:
+                for o, nb in ((pay(c, sh.kh_slot(kh)) + 2048, gdn.D_BYTES), (pay(c, sh.kh_slot(kh) + 2) + 2048, 2 * gdn.D_BYTES)):
+                    rec(seq.drain("D", c, gobj + o, nb)[0], u, ChainBD.GOBJ, o)
+
+            def v_xa(h: int, c: int, u: int = u) -> None:
+                o = pay(c, sh.v_slot(h)) - 256
+                rec(seq.fill("X", c, gobj + o, gdn.V_SPAN * XB, DIMS_OBJ), u, ChainBD.GOBJ, o)
+
+            def v_xp(h: int, c: int, u: int = u) -> None:  # (from the block's half)
+                o = ov.gstate[L] + c * ov.ps + 16 * h * gdn.PANEL - 256
+                rec(seq.fill("X", c, gstate + o, 16 * XB, DIMS_OBJ), u, ChainBD.PANEL, o)
+
+            def v_dp(h: int, c: int, u: int = u) -> None:  # (into the other half; of a chain that ends its block)
+                o = ov.gstate[L] + c * ov.ps + 16 * h * gdn.PANEL
+                rec(seq.drain("D", c, gstate + o, 16 * gdn.PANEL)[0], u, ChainBD.UPDATE, o)
+
+            def v_dh(h: int, c: int, u: int = u) -> None:
+                o = pay(c, sh.v_slot(h)) + 2048
+                rec(seq.drain("D", c, gobj + o, 2 * gdn.D_BYTES)[0], u, ChainBD.GOBJ, o)
+
+            def v_do(h: int, c: int, u: int = u, a: int = a) -> None:
+                # (its gated outputs (2 KB: [k block 16][slot 8][8]) into the cells of its head in gdn_out's staged x from the
+                # chain's first slot on; the block's gates after them (2 KB): of the last head into the header, else into
+                # the sink past that K group's x)
+                e = gdn.D * vh[c][h]
+                rg = next(r for r in ov.inp[(L, "gdn_out")] if r.k0 <= e < r.k0 + r.K)
+                x = rg.off + STAGED_X + cell * ((e - rg.k0) // 8)
+                kb = cell // 8  # (words of a k block)
+                at = seq.drain("D", c, dev.address("ACT", x + 16 * a), gdn.D_BYTES // 2, (kb, gdn.D // 8, 2 * kb, 2 * kb * gdn.D // 8))[0]
+                rec(at, u, ChainBD.OUT, x)
+                if h == last:
+                    o = pay(c, gdn.H_SLOT) + gdn.H_DN
+                    rec(seq.drain("D", c, gobj + o, gdn.D_BYTES // 2)[0], u, ChainBD.GOBJ, o)
+                else:
+                    sink = rg.off + STAGED_X + cell * (rg.K // 8) + 2 * ov.SLOTS * (e - rg.k0)
+                    seq.drain("D", c, dev.address("ACT", sink), gdn.D_BYTES // 2)
+
+            units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_dh, v_do)))
+
+    def patch_chains(self, st: Step, parts: tuple[Part, ...]) -> None:
+        """(an overlay of several sequences) A step's GDN chains for its parts: every transfer of chain u in the buffers
+        of part u's sequence (the state panels from its block's half, their updates into the other), its rows' drains of
+        its slots' bytes, its outputs' from its first slot's place on."""
+        ov = self.ov
+        key = tuple((q.seq, q.n, ov._curs[q.seq].half(q.position)) for q in parts)
+        if st.chained == key:
+            return
+        (t, lines), dev = self.chain_table(st), ov.dev
+        at, u, kind, off = t.T
+        n = np.array([q.n for q in parts], np.int64)
+        a = np.cumsum(n) - n
+        half = np.array([ov._curs[q.seq].half(q.position) for q in parts], np.int64)
+        base = np.array([[dev.address(ov.seq_name(b, q.seq), own=True) for q in parts] for b in ("GOBJ", "GSTATE")], np.int64)
+        addr = np.select(
+            [kind == ChainBD.OUT, kind == ChainBD.PANEL, kind == ChainBD.UPDATE],
+            [dev.address("ACT") + off + 16 * a[u], base[1][u] + off + half[u] * ov.ghalf, base[1][u] + off + (1 - half[u]) * ov.ghalf],
+            base[0][u] + off)
+        nbytes = np.where(kind == ChainBD.ROWS, n[u] * 2 * C_LEN, st.tr.words[at].astype(np.int64) * 4)
+        ov._bd_words(st.tr.words, at, addr, nbytes)
+        st.tr.flush_lines(lines)
+        st.chained = key
+
+    @staticmethod
+    def chain_table(st: Step) -> tuple[np.ndarray, np.ndarray]:
+        """A step's recorded transfers as ``patch_chains`` takes them ((word index, chain, kind, offset) rows; the
+        lines their words lie in)."""
+        if st.chain_table is None:
+            t = np.array(st.chains, np.int64).reshape(-1, 4)
+            st.chain_table = (t, np.unique(np.concatenate([4 * t[:, 0], 4 * t[:, 0] + 8]) & ~63))
+        return st.chain_table
+
+    def set_chain_words(self, parts: tuple[Part, ...]) -> None:
+        """(an overlay of several sequences) The chains' words in their sequences' header objects (per GDN layer and
+        column: its slots, its block's lanes before it, the q history's base row, the k / v histories' and the gates'
+        first row; a chain: no branch). A chain's slots in a step of several: its part's, or those up to its block's
+        end where the part ends before it: the core then runs the lanes past the part's as drafts that nobody
+        accepts, on the rows its objects hold, and writes the block's update (``QwenOverlay._step_parts``)."""
+        ov = self.ov
+        if not ov.gobj:
+            return
+        hdr = np.array([(ov.gobj[L] + c * ov.gcol) // 4 for L in ov.gobj for c in range(COLS)], np.int64)
+        for q in parts:
+            cur, name = ov._curs[q.seq], ov.seq_name("GOBJ", q.seq)
+            g32 = ov.dev.view(name, own=True).view(np.int32)
+            ns = q.n if len(parts) == 1 else max(q.n, 8 - q.position % 8)
+            g32[hdr + M_NS], g32[hdr + M_NREP], g32[hdr + M_CSHIFT] = ns, q.position % 8, cur.cshift
+            g32[hdr + M_KSHIFT], g32[hdr + M_COMMIT], g32[hdr + M_BRANCH] = cur.kshift, 0, 0
+            words = np.array([M_NS, M_NREP, M_CSHIFT, M_COMMIT, M_KSHIFT, M_BRANCH])
+            ov.dev.buffers[name].sync_lines(np.unique(4 * (hdr[:, None] + words) & ~63))
 
     def patch_panels(self, st: Step, p: int) -> None:
         """(chunkwise) A step's state transfers for position p: the panels from p's block's half, into the other."""

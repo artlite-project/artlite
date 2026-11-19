@@ -438,7 +438,7 @@ saves the state where each prompt's last message begins, and a turn continues fr
 
 ### Several requests at a time
 
-With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3 and Spark-X serve up to N requests at a time. The NPU holds N
+With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.6-27B and Qwen3.8-27B serve up to N requests at a time. The NPU holds N
 sequences, each with KV caches of `-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the
 requests that generate share their decode steps. A step streams the weights once for 4 tokens: with one request those
 are its token and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a
@@ -454,6 +454,8 @@ queue:
 | LFM3 1.7B QAD-Q4_0 | 57.0 | 94.4 | 156 |
 | Spark-X 1.7B Q4_K_M (`-np 8`, no drafter) | 43.4 | 72.1 | 122 |
 | Spark-X 4B Q4_K_M (`-np 8`, no drafter) | 18.8 | 32.7 | 57.9 |
+| Qwen3.6-27B Q4_K_M | 3.8 | 6.9 | 12.0 |
+| Qwen3.8-27B Q4_K_M (no drafter with `-np`) | 3.3 | 6.4 | 11.7 |
 
 (`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
 tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
@@ -461,9 +463,13 @@ depend on what shares its step, and a request's `seed` draws for that request al
 over one request, whose spare slots its drafts already fill (Gemma 4: two tokens a step alone). Flint gains least:
 each slot of a step routes its own experts (a step of 4 requests takes 2.2x a step of one), and its DFlash2 drafter,
 whose records follow one sequence, does not load with `-np` above 1 (one request alone: 32.6 tokens per second
-instead of 38.2). Spark-X's steps have 8 slots: with `-np 8`, 8 requests at a time get 191 (1.7B) and 93 (4B) tokens
+instead of 38.2). Spark-X's steps have 8 slots: with `-np 8` (its most), 8 requests at a time get 191 (1.7B) and 93 (4B) tokens
 per second in all; its DSpark drafter does not load with `-np` above 1 either (one request alone on these summaries:
-43 instead of 47-50 on the 1.7B, 19 instead of 27-29 on the 4B). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
+43 instead of 47-50 on the 1.7B, 19 instead of 27-29 on the 4B). The 27B Qwen models' steps have 8 slots too
+(`-np` up to 8: 8 requests at a time get 18 tokens per second in all on Qwen3.6-27B), each sequence with its own
+Gated DeltaNet states (0.3 GB) beside its KV cache. Qwen3.8-27B's drafters do not load with `-np` above 1: one
+request alone gets 3.3 tokens per second instead of 10.7 with its drafter, so `-np` pays on that file only where
+four or more requests usually meet. Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
 sequences at 16K positions give 1.9x one's tokens per second on Llama 3.2 3B.
 
 - A request takes the sequence it names (`id_slot`, as llama-server's), else an idle one whose prompt cache holds at

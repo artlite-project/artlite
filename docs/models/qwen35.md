@@ -86,6 +86,16 @@ GDN states and conv states land in the decode's buffers; a chunk runs as dispatc
 driver's hang detection. The prompt's last logits come from the LM head alone. Tokens where a chunk cannot start
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
+Several requests at a time (`artlite-server -np N`, up to 8; Qwen3.6-27B and Qwen3.8-27B, whose design runs 8 tokens
+per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.3 GB a sequence), and a decode
+step's 8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them,
+each attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per
+sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.05x / 1.12x / 1.39x a step of one,
+so 4 requests get 3.2x and 8 get 4.8x one request's tokens per second in all. The LM head is then read whole and the
+drafters do not load (their records follow one sequence):
+[artlite-server](../server.md#several-requests-at-a-time). The other files of this page (a design of 4 tokens per
+dispatch, the mixture-of-experts models) serve `-np N` one request at a time.
+
 Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qwen3.8's MTP layer; 4.60 GB of the
 9B's, 0.41 GB of MiniCPM-V's, 20.77 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and
 0.66 GB of its drafter's) are re-laid-out into a device buffer at load, in memory, at their quantization's size (of a

@@ -661,6 +661,27 @@ def _diffusion(path: str) -> Callable[[_Log], None]:
     return run
 
 
+def _qwen_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    """(``_run_sequences``; the image as a model of several sequences takes it: the LM head's rows whole. A joint
+    step's tokens: accepted, each sequence's first slot)"""
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.qwen35.image import QwenImage
+        from models.qwen35.overlay import QwenOverlay
+
+        gguf = GGUFFile(path)
+        ov = QwenOverlay(gguf, max_positions=1024, sequences=3,
+                         image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False, screen=False))
+
+        def step(x: np.ndarray, p: object, lg: bool) -> None:
+            ov.step(x, p, logits=lg)
+            for q in p if isinstance(p, tuple) else ():
+                ov.accept(q.n, q.seq)
+
+        _run_sequences(ov, attach(ov.op), step)
+
+    return run
+
+
 MEDIA_APPS: dict[str, tuple[str, Callable[[str], Callable[[_Log], None]]]] = {
     "qwen3vl-d3-lite": (decision_mmproj("d3-lite"), _vision("qwen3vl", ((224, 224), (640, 480)))),
     "minicpmv-4.7": (minicpmv_mmproj(), _vision("minicpmv", ((448, 448), (1024, 640)))),
@@ -683,6 +704,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "kev-4B": (decision_gguf("kev"), _qwen),  # (half regions in pairs, a design of 4 slots)
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
+    "qwen-27B-Q4_K_M-sequences": (qwen_gguf("Q4_K_M", "27B"), _qwen_sequences),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
     "occamy-1.0-APEX": (occamy_gguf(), _qwen),
     "swift-1.5-APEX": (swift_gguf(), _qwen),

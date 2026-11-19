@@ -106,12 +106,12 @@ class QwenImage(MoeImage, TileImage):
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True, tails: bool = True,
-                 pairs: bool = True):
+                 pairs: bool = True, screen: bool = True):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
         (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block); tails: a dense model's
         regions of the hidden's input half regions where it is half a chunk short, pairs: their pairs of row tiles
-        (module docstring)."""
+        (module docstring); screen: the LM head may be screened (False: its rows whole, for a design of 8 slots)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
@@ -142,7 +142,8 @@ class QwenImage(MoeImage, TileImage):
         # model's with an MTP block, whatever rows of it the image holds: its drafters read the head's rows in place
         # (``draft_cols``), and its design of 8 slots has no L1 for tiles of more than 16 rows next to two X objects,
         # ``decode.design``'s "Designs of 8 slots")
-        self.screen = self.SCREEN and not (cfg.nextn_layers and not cfg.moe) and screened(self.qtype(lm), self.formats())
+        self.screen = (screen and self.SCREEN and not (cfg.nextn_layers and not cfg.moe)
+                       and screened(self.qtype(lm), self.formats()))
         self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *(("Q6_KH",) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()

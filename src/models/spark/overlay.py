@@ -98,6 +98,8 @@ class SparkOverlay(ModelOverlay):
             image = SparkImage(gguf, layers=layers, vocab=vocab, head=head)
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
+        if sequences > 8:
+            raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         fmts = img.formats() | set(formats)
         gu = {R for r in img.regions if r.name == "gate_up" for b in r.blocks for R in (b.R, b.R2) if R} | set(gu)
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=8, spec=attn_spec(cfg),

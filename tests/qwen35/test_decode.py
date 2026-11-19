@@ -639,6 +639,92 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
+def test_overlay_sequences() -> None:
+    """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; tokens of their own, at
+    positions of their own) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay
+    of one sequence: alternated (``select``: a round of 1 .. 8 slots of one, some of them kept, then of the next) and
+    in joint steps (``step``'s parts: a GDN chain and an attention pass per sequence; slots dealt at random, drafts
+    kept or not, one sequence joining later, chains across their blocks' ends); the first layers up to the first
+    full-attention layer."""
+    from artlite.decode.step import Part
+    from models.qwen35.overlay import QwenOverlay
+
+    path = size_gguf("3.8-27B")
+    require(path)
+    g = GGUFFile(path)
+    layers = list(range(QwenConfig.from_gguf(g).attention_layers[0] + 1))
+    lengths = (90, 60, 44)
+    nseq = len(lengths)
+    rng = np.random.default_rng(7)
+    toks = [[int(t) for t in rng.integers(0, 50000, n)] for n in lengths]
+    emb = [g.rows("token_embd.weight", t) for t in toks]
+    one = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, slots=8)
+    one.load()
+    want = []
+    for s in range(nseq):  # (alone: an overlay of one sequence, in steps of one)
+        one.reset()
+        want.append([np.asarray(one.step(emb[s][p:p + 1], p)[0]).view(np.uint16).copy() for p in range(lengths[s])])
+    one.dev = None
+    ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, sequences=nseq)
+    ov.load()
+    assert ov.SLOTS == 8
+
+    def check(got: np.ndarray, at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for row, (s, p) in zip(got, at, strict=True)
+               if not np.array_equal(np.asarray(row).view(np.uint16), want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    def slots(s: int, p: int, n: int) -> tuple[np.ndarray, int]:
+        """A round's rows of sequence s at p: its token and n - 1 drafts, the text's (some kept) or others (none)."""
+        m = int(rng.integers(1, n + 1))
+        x = emb[s][p:p + n].copy()
+        if m < n:
+            x[m:] = g.rows("token_embd.weight", [int(t) for t in rng.integers(0, 50000, n - m)])
+        return x, m
+
+    def fresh() -> None:
+        for s in range(nseq):
+            ov.select(s)
+            ov.reset()
+
+    fresh()  # alternated: a round of one sequence, then of the next
+    pos, i = [0] * nseq, 0
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        s = i % nseq
+        n = min(int(rng.integers(1, 9)), lengths[s] - pos[s])
+        i += 1
+        if n:
+            ov.select(s)
+            x, m = slots(s, pos[s], n)
+            check(ov.step(x, pos[s], commit=False)[:m], [(s, pos[s] + k) for k in range(m)], "alternated")
+            ov.accept(m)
+            pos[s] += m
+
+    fresh()  # joint steps
+    pos, steps, deals, ends = [0] * nseq, 0, set(), set()
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 10)]
+        spare = ov.SLOTS - len(take)
+        for t in take:  # (more slots of its own: drafts)
+            while spare and rng.random() < 0.5 and pos[t[0]] + t[1] < lengths[t[0]]:
+                t[1] += 1
+                spare -= 1
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        deals.add(tuple(n for _, n in take))
+        ends.add(tuple(q.position % 8 + q.n >= 8 for q in parts))
+        rows = [slots(s, pos[s], n) for s, n in take]
+        got = ov.step(np.concatenate([x for x, _ in rows]), parts)
+        a = 0
+        for (s, n), (_, m) in zip(take, rows, strict=True):
+            check(got[a:a + m], [(s, pos[s] + k) for k in range(m)], f"step {steps}")
+            ov.accept(m, s)
+            pos[s] += m
+            a += n
+        steps += 1
+    assert max(len(u) for u in deals) >= 3 and len(deals) > 15 and len(ends) >= 4, (len(deals), ends)
+    ov.dev = None
+
+
 _OVERLAY_SLICES = [(mode, size) for mode in ("s1",) for size in ("9B", "1B", "35B-A3B", "occamy", "3.8-27B", "kev")] + [
     ("s3", "9B"), ("lazy", "35B-A3B"), ("split", "1B"), ("split", "9B"), ("s7", "swift"), ("lazy8", "3.8-27B")]
 
