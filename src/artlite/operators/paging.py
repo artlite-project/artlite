@@ -394,14 +394,18 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     if {e for es in calls.values() for e in es} - entries:
         raise PagingError(f"calls of functions no page enters: {sorted({e for es in calls.values() for e in es} - entries)}")
     lname = {n: symbol(names, n) for n in {pager, *entries}}
-    resident = {s.name for s in ref.symbols if s.name and s.section_index}
+    # (named symbols only: the assembler's .L labels repeat across the objects linked into a core, the .Lfunc_begin<N>
+    # that .stack_sizes refers to in every object)
+    resident = {s.name for s in ref.symbols if s.name and s.section_index and not s.name.startswith(".L")}
     many = {n: [x for x in symbols(names, n) if x in resident] for n in {*roots, *calls}}  # (their instances here)
     if lname[pager] not in resident or not all(many.values()):
         raise PagingError(f"the pager {pager}, a caller of entries ({', '.join(calls)}) or a root ({', '.join(roots)}) "
                           "is not resident")
     entry_of = {s.name: s.section_index for s in obj.symbols if s.name and s.section_index}
-    sec_resident = {s.section_index for s in obj.symbols
-                    if s.name in resident and 0 < s.section_index < len(obj.sections)}
+    # (kernel.o's sections the core keeps: what its named resident symbols reach, as the linker's garbage collection
+    # keeps them; constant pools have no named symbol)
+    sec_resident = _reach(obj, {s.section_index for s in obj.symbols
+                                if s.name in resident and 0 < s.section_index < len(obj.sections)})
     text = _data(ref, ".text")
     slot = ref.address(STARTUP)
     if slot + _size(ref, STARTUP) < len(text):
