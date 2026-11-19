@@ -15,6 +15,11 @@ decode steps.
 The conv histories hold the whole sequence (``recurrent``): a position is kept only where a checkpoint was taken (the
 histories, ~0.5 MB). Drafts: the context's (``drafts.Lookup``), whose rejected tokens cost nothing (the histories'
 lazy shift, the caches' records overwritten).
+
+Several sequences (``NpuLfm(sequences=N)``): the device holds the KV caches and conv histories of each and the model
+has a lane for each (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's slots dealt to
+them (``models.lanes``: one stream of the weights for all of them, a conv pass per sequence). The media encoders, live
+ASR and speech output are calls that hold the device (lane 0's sequence).
 """
 
 import dataclasses
@@ -32,6 +37,7 @@ from artlite.overlay import WeightBuffer
 from artlite.vision.shell import shared_device
 
 from .. import video
+from ..lanes import alone
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
 from ..lfm3a import speech as a_speech
@@ -61,16 +67,18 @@ class NpuLfm(OverlayModel):
     "hilo"); ``prefill``: prompts in chunks through the prefill (else as decode steps), of the sizes ``sizes``;
     ``weights``: the weight image's buffer, allocated ahead (``WeightBuffer``); ``readout``: a readout model (d1's
     decision models, ``models.readouts.readout_model``): no text generation (``generates``: its image holds no LM
-    head)."""
+    head); ``sequences``: the sequences the device holds, each with KV caches of ``capacity`` positions and conv
+    histories (``lanes``: the model of each; their generations share decode steps)."""
 
     recurrent = True  # (the conv histories hold the whole sequence)
     STEP_COST = (1.0, 1.02, 1.05, 1.06)  # (decode steps at 1K: QAD-Q4_0 20.2 ms for one slot, Q4_K_M 21.3)
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "causal", "_w_post")
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "single", threads: int = 0,
                  prefill: bool = True, sizes: tuple[int, ...] = SIZES, weights: WeightBuffer | None = None,
-                 readout: bool = False):
+                 readout: bool = False, sequences: int = 1):
         self.gguf = gguf
-        self.overlay = LfmOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights)
+        self.overlay = LfmOverlay(gguf, max_positions=capacity, kv_k=kv_k, weights=weights, sequences=sequences)
         self.cfg = self.overlay.cfg
         self.causal = self.cfg.causal  # (d1's decision models: readouts of whole prompts, no decode steps)
         self.generates = not readout
@@ -81,6 +89,7 @@ class NpuLfm(OverlayModel):
         self._w_post = gguf.tensor(f"blk.{self.cfg.num_hidden_layers - 1}.post_ffw_norm.weight").dequantize().reshape(-1)
         gguf.release()
         self.position = 0
+        self._open_lanes()
 
     @property
     def capacity(self) -> int:
@@ -88,9 +97,12 @@ class NpuLfm(OverlayModel):
 
     def describe(self) -> str:
         ov = self.overlay
-        return (f"{ov.image.streamed_bytes() / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
+        kv = f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache"
+        return (f"{ov.image.streamed_bytes() / 1e9:.2f} GB of weights, "
+                f"{kv if ov.sequences == 1 else f'{ov.sequences} sequences of {kv} each'} "
                 f"({self.capacity} positions, K {'hi + lo' if ov.kp == 2 else 'single'})")
 
+    @alone
     def reset(self) -> None:
         """Forget the cached positions (the conv histories zero)."""
         self.overlay.reset()
@@ -108,6 +120,7 @@ class NpuLfm(OverlayModel):
             x[tokens.given] = tokens.rows
         return x
 
+    @alone
     def audio_step(self, row: np.ndarray, *, logits: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
         """An embedding row (hidden,) at the next position (a speech frame's feedback: ``models.lfm3a.speech``), in a
         step without the LM head unless ``logits`` (a text token follows): the hidden state after it (the LM head's
@@ -122,6 +135,7 @@ class NpuLfm(OverlayModel):
             self.slot = 0
         return self.hidden_after(), None if out is None else self.cap(out[0])
 
+    @alone
     def hidden_after(self, slot: int = 0) -> np.ndarray:
         """The hidden state (hidden,) fp32 after a slot of the last step, with or without the LM head (module
         ``audio_step``)."""
@@ -206,6 +220,11 @@ class Lfm(Model):
                                                load=self.audio is None)
             if self.vision is not None and self.audio is not None:
                 shared_device("lfm3omni", mmproj, {"vision": self.vision, "audio": self.audio})
+
+    @property
+    def parallel(self) -> bool:  # type: ignore[override]
+        """(a chat model's: several sequences generate at once; a readout or non-causal model's requests are calls)"""
+        return self.generates and self.cfg.causal
 
     @property
     def capabilities(self) -> Capabilities:
@@ -392,7 +411,8 @@ class Lfm(Model):
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)),
                         banned=self.banned)
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuLfm:
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuLfm:
+        """(``sequences``: ``NpuLfm``'s)"""
         self._npu = NpuLfm(self.gguf, capacity=capacity, kv_k=self.kv_k, prefill=prefill, weights=self.weights,
-                           readout=not self.generates)
+                           readout=not self.generates, sequences=sequences)
         return self._npu

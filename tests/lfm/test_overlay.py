@@ -4,7 +4,9 @@
   layers of all kinds (conv, conv, full, conv, sliding-window) over 300 positions (past the window of 256) in steps of
   1 .. 4 tokens, K cached as single or hi + lo blocks: logits, the K / V caches, a conv layer's history;
 - steps of S slots give each slot the logits of a step of one, bit for bit, also where a step continues from fewer
-  slots than the last one ran (rejected drafts: the conv shift, the rings).
+  slots than the last one ran (rejected drafts: the conv shift, the rings);
+- three sequences on one device, alternated and in joint steps (a conv pass per sequence), give each one's logits and
+  conv histories alone, bit for bit.
 The whole model is gated by test_prefill.py's teacher-forced test (prefill, then decode steps).
 """
 
@@ -12,6 +14,8 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.decode.protocol import SLOTS
+from artlite.decode.step import Part
 from models.lfm.overlay import LfmOverlay
 
 from ..common import to_torch
@@ -102,3 +106,85 @@ def test_lfm_overlay_steps() -> None:
         got = to_torch(ov.step(xs, p)).float()
         assert torch.equal(got[:acc], one[p:p + acc]), p
         p += acc
+
+
+def test_lfm_overlay_sequences() -> None:
+    """Three sequences on one device (``LfmOverlay(sequences=3)``: texts of their own, at positions of their own, each
+    with its conv histories and caches) give, slot by slot, the logits of each sequence alone in steps of one, bit for
+    bit: alternated (``select``: a step of 1 .. 4 slots of one, then of the next) and in joint steps (``step``'s parts:
+    slots dealt at random, a sequence's drafts too, some of them rejected - the next step continues at the accepted
+    ones: the conv shift per sequence -, one sequence joining later); the conv histories after them are each one's."""
+    g = ref.gguf()
+    layers, lengths = [0, 1, 2, 3, 4], (90, 70, 60)
+    nseq = len(lengths)
+    ids = ref.essay_ids(sum(lengths) + 1)[1:]
+    offs = np.cumsum([0, *lengths])
+    cpu = ref.cpu.LfmCpu(g, layers=[], vocab=0)
+    xs = [cpu.emb[torch.tensor(ids[offs[s]:offs[s + 1]])] for s in range(nseq)]
+    ov = LfmOverlay(g, layers=layers, vocab=VOCAB, max_positions=512, sequences=nseq)
+    ov.load()
+    want, conv = [], []
+    for s in range(nseq):  # (alone, in steps of one, as sequence 0)
+        ov.select(0)
+        ov.reset()
+        want.append(_run(ov, xs[s], (1,)))
+        conv.append(ov.read_conv(1)[:7])
+    assert not torch.equal(want[0][:32], want[1][:32]), "the sequences' texts differ"
+
+    def check(got: torch.Tensor, at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for row, (s, p) in zip(got, at, strict=True) if not torch.equal(row, want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    def fresh() -> None:
+        for s in range(nseq):
+            ov.select(s)
+            ov.reset()
+
+    def histories(what: str) -> None:  # (each sequence's last step was of one slot: its base and that row)
+        for s in range(nseq):
+            ov.select(s)
+            assert ov.conv_s == 1 and torch.equal(torch.from_numpy(ov.read_conv(1)[:7]), torch.from_numpy(conv[s])), \
+                f"{what}: sequence {s}'s conv history"
+
+    fresh()  # alternated: a step of one sequence, then of the next; the last steps of one slot
+    pos, i = [0] * nseq, 0
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        s = i % nseq
+        left = lengths[s] - pos[s]
+        n = min(STEPS[(i // nseq + s) % len(STEPS)], left - 1) or left
+        i += 1
+        if left:
+            ov.select(s)
+            check(to_torch(ov.step(xs[s][pos[s]:pos[s] + n], pos[s])).float(), [(s, pos[s] + k) for k in range(n)],
+                  "alternated")
+            pos[s] += n
+    histories("alternated")
+
+    fresh()  # joint steps, with rejected drafts
+    rng = np.random.default_rng(0)
+    pos, steps, patterns = [0] * nseq, 0, set()
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
+        spare = SLOTS - len(take)
+        for t in take:  # (more slots of its own: drafts, the last one's step alone of one slot)
+            while spare and rng.random() < 0.4 and pos[t[0]] + t[1] < lengths[t[0]] - 1:
+                t[1] += 1
+                spare -= 1
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        patterns.add(ov._join(parts))
+        x = []
+        acc = {}
+        for s, n in take:  # (its accepted slots the text's, the rejected ones other tokens)
+            acc[s] = int(rng.integers(1, n + 1))
+            xi = xs[s][pos[s]:pos[s] + n].clone()
+            xi[acc[s]:] = cpu.emb[torch.from_numpy(rng.integers(0, 120000, n - acc[s]))]
+            x.append(xi)
+        got = to_torch(ov.step(torch.cat(x), parts)).float()
+        a = 0
+        for s, n in take:
+            check(got[a:a + acc[s]], [(s, pos[s] + k) for k in range(acc[s])], f"step {steps}")
+            pos[s] += acc[s]
+            a += n
+        steps += 1
+    assert max(len(u[1]) for u in patterns) >= 3, "a step of three sequences"
+    histories("joint")

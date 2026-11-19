@@ -86,6 +86,7 @@ from .step import (
     Fill,
     FillTable,
     Part,
+    PartTable,
     PatchTables,
     PositionWords,
     Rec,
@@ -473,8 +474,8 @@ class AttentionOverlay(ModelOverlay):
         ``positions``."""
         raise NotImplementedError
 
-    def _token_words(self, st: StepPlan, p: int) -> None:
-        """The words of the model's own in the token objects of a step at p (before they are flushed)."""
+    def _token_words(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
+        """The words of the model's own in the token objects of a step of ``parts`` (before they are flushed)."""
 
     def _token_objects(self, st: StepPlan, parts: tuple[Part, ...]) -> PositionWords:
         """The step's token objects (per cache kind and sub-step: its positions, the columns' ranges, the step's RoPE
@@ -527,10 +528,12 @@ class AttentionOverlay(ModelOverlay):
                        layers.index(x.layer)) for x in st.tails], np.int64).reshape(-1, 8)
         r = np.array([(x.handle[0], uses[x.layer].kind, x.sub, x.i, self.kv_base(x.layer, x.head),
                        self.ring(x.layer, x.head)) for x in st.recs], np.int64).reshape(-1, 6)
+        b = np.array(st.part_bds, np.int64).reshape(-1, 4)
         return PatchTables(FillTable(f[:, 0], f[:, 1], f[:, 2], f[:, 3], f[:, 4], f[:, 5]),
                            TailTable(t[:, 0], t[:, 1], t[:, 2], t[:, 3], t[:, 4], t[:, 5], t[:, 6].astype(bool),
                                      t[:, 7], layers),
-                           RecTable(r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4:6]))
+                           RecTable(r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4:6]),
+                           PartTable(b[:, 0], b[:, 1], b[:, 2], b[:, 3]))
 
     def tail_mode(self, src: int, *, before: bool, seq: int | None = None) -> bool:
         """Whether a step's tail objects of a layer attending to the cache of ``src`` are the open record's V panels (the
@@ -604,12 +607,13 @@ class AttentionOverlay(ModelOverlay):
 
     def _set_parts(self, st: StepPlan, parts: tuple[Part, ...], ahead: bool = False) -> bool:
         """The token objects (per cache kind and sub-step: its positions, the columns' ranges, the step's RoPE tables; st's
-        copy) and the step's cache transfers, each sub-step's in its sequence's KV."""
+        copy) and the step's cache transfers, each sub-step's in its sequence's KV; a part's transfers of its sequence's
+        own objects (``StepPlan.part_bds``) in its KV."""
         dev, T = self.dev, self.T
         assert all(0 <= q.position and q.position + q.n <= self.max_positions for q in parts), parts
         assert len(parts) == 1 or st.subs == self._join(parts), (parts, st.subs)
         words = self._token_objects(st, parts)
-        self._token_words(st, parts[0].position)
+        self._token_words(st, parts)
         dev.flush("ACT", st.tok, self._tok_bytes)
         if st.patch is None:
             st.patch = self._patch_tables(st)
@@ -619,6 +623,9 @@ class AttentionOverlay(ModelOverlay):
         f = words.fo[t.fills.kind, t.fills.sub, t.fills.place, t.fills.piece]  # (first object, objects)
         self._bd_words(st.tr.words, t.fills.at, kv0[words.su[t.fills.kind, t.fills.sub]] + t.fills.base + f[:, 0] * T,
                        f[:, 1] * T)
+        if t.parts.at.size:
+            seqs = np.array([q.seq for q in parts], np.int64)
+            self._bd_words(st.tr.words, t.parts.at, kv0[seqs[t.parts.part]] + t.parts.offset, t.parts.nbytes)
         if not self._tails(st, parts, words, kv0, ahead):
             return False
         # (the record drains: from the KV head's group 0 or ring, offset, bytes)

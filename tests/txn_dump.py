@@ -289,6 +289,16 @@ def _lfm(path: str) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
+def _lfm_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.lfm.overlay import LfmOverlay
+
+        ov = LfmOverlay(GGUFFile(path), max_positions=1024, sequences=3)
+        _run_sequences(ov, attach(ov.op), lambda x, p, lg: ov.step(x, p, logits=lg))
+
+    return run
+
+
 def _gemma(path: str) -> Callable[[Callable[[object], _Log]], None]:
     def run(attach: Callable[[object], _Log]) -> None:
         from models.gemma4.gemma import BATCH
@@ -671,6 +681,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "qwen-3.8-27B-dflash": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda p: _qwen(p, dflash=qwen_dflash_of(p))),
     "lfm3-QAD-Q4_0": (lfm3_gguf("QAD-Q4_0"), _lfm),
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
+    "lfm3-QAD-Q4_0-sequences": (lfm3_gguf("QAD-Q4_0"), _lfm_sequences),
     "spark-4B-Q4_K_M": (spark_gguf("4B"), _spark),
     "spark-1.7B-Q4_K_M": (spark_gguf("1.7B"), _spark),
     "spark-4B-bartowski-Q4_K_M": (spark_gguf("4B", "Q4_K_M", "bartowski"), _spark),

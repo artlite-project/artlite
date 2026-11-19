@@ -300,12 +300,13 @@ class OverlayDevice:
         """The buffer a name stands for (``alias``: another one's, else its own)."""
         return self.buffers[self.alias.get(name, name)]
 
-    def view(self, name: str) -> np.ndarray:
-        return self.named(name).map()
+    def view(self, name: str, *, own: bool = False) -> np.ndarray:
+        """A buffer's bytes (``own``: of the buffer of that name itself, whatever the name stands for: ``alias``)."""
+        return (self.buffers[name] if own else self.named(name)).map()
 
-    def flush(self, name: str, offset: int = 0, nbytes: int | None = None) -> None:
-        """Host writes of a buffer range -> DDR."""
-        b = self.named(name)
+    def flush(self, name: str, offset: int = 0, nbytes: int | None = None, *, own: bool = False) -> None:
+        """Host writes of a buffer range -> DDR (``own``: ``view``'s)."""
+        b = self.buffers[name] if own else self.named(name)
         b.sync_to_device(b.size - offset if nbytes is None else nbytes, offset)
 
     def flush_lines(self, name: str, offsets: np.ndarray) -> None:

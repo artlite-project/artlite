@@ -1,4 +1,4 @@
-"""LFM3's conv history in the overlay's ACT regions (``lfm/conv.py``): the spans that the snapshot, the reset, the prefill's
+"""LFM3's conv history in the overlay's conv regions (``lfm/conv.py``): the spans that the snapshot, the reset, the prefill's
 base move and the readback share. No NPU."""
 
 import numpy as np

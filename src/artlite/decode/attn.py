@@ -140,7 +140,7 @@ class AttnJob(Protocol):
     """A second job of the attention cores (``Attn(conv=)``: LFM3's short convolution, ``models.lfm.conv.ConvJob``): the
     M_FLAGS ``flag`` of its regions' first object, its state words (``words``, after A_WORDS), the bytes of a D object it
     emits (``d_bytes``), its workspace (``need`` bytes), its kernels (``render``) and the lines it adds to abegin
-    (``begin_src``: a region's first object, ``token_src``: token object 0)."""
+    (``begin_src``: a region's first object, ``token_src``: a token object of the first kind, t < SLOTS)."""
 
     flag: int
     words: int

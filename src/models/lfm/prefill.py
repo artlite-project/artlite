@@ -262,7 +262,7 @@ class LfmPrefill(ChunkPrefill):
             if kind == "conv":
                 cv = self.conv[T]
                 h0 = ov.conv_reg[(L, 0)]
-                rl.append((cv, sl("G", 0, cv, i=0), f"ACT[{h0}:{h0 + arg_bytes(cv, 1)}]", sl("A", 0, cv, i=2)))
+                rl.append((cv, sl("G", 0, cv, i=0), f"KV[{h0}:{h0 + arg_bytes(cv, 1)}]", sl("A", 0, cv, i=2)))
             else:
                 prep, attn = o.preps[(kind, plan.layout.key, pt)], self.attn[(kind, T)]
                 kv0, kvb = ov.kv_off[L], arg_bytes(prep, 3)

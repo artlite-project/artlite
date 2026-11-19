@@ -4,7 +4,8 @@ those records as arrays (``PatchTables``), built once per transaction at its fir
 
 A step's transaction is built once per pattern of sub-steps and patched per step: each column's range of each layer's
 cache (A: address, length), a chain end's tail objects (A: the ring slots of the sub-step's open records, or the V
-panels of the first after a prefill) and the record drains (D: address, length).
+panels of the first after a prefill), the record drains (D: address, length) and the transfers of a part's sequence's
+own objects (``PartBD``: address).
 
 A step's slots may be several sequences' (``Part``: the device holds each one's caches, ``ModelOverlay.select``): a
 sequence's slots are sub-steps of their own, so a sub-step's patches take its sequence's buffers and its own position,
@@ -55,6 +56,16 @@ class Tail(NamedTuple):
     obj: int
 
 
+class PartBD(NamedTuple):
+    """A BD in the KV buffer of a step part's sequence at an offset that follows no position (a conv pass's region,
+    LFM3's): its first word in the transaction, the part (its index in the step's parts), the offset, its bytes."""
+
+    at: int
+    part: int
+    offset: int
+    nbytes: int
+
+
 class Rec(NamedTuple):
     """The ``i``-th record drain of a layer's KV head in a sub-step (D): the BD handle (``Sequence.drain``)."""
 
@@ -77,6 +88,7 @@ class StepPlan:
     fills: list[Fill] = field(default_factory=list)
     tails: list[Tail] = field(default_factory=list)
     recs: list[Rec] = field(default_factory=list)
+    part_bds: list[PartBD] = field(default_factory=list)
     patch: "PatchTables | None" = None
 
 
@@ -122,10 +134,21 @@ class RecTable:
 
 
 @dataclass(frozen=True)
+class PartTable:
+    """The ``PartBD``s as arrays: BD word index, part, byte offset, bytes."""
+
+    at: np.ndarray
+    part: np.ndarray
+    offset: np.ndarray
+    nbytes: np.ndarray
+
+
+@dataclass(frozen=True)
 class PatchTables:
     fills: FillTable
     tails: TailTable
     recs: RecTable
+    parts: PartTable
 
 
 class PositionWords(NamedTuple):

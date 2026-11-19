@@ -717,7 +717,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         tk[2] = m[{{ M_TOK_NA }} + col] & 0xFFFF;
         tk[3] = (m[{{ M_POS }}] << 8) | (m[{{ M_TOK_A }}] << 4) | m[{{ M_NS }}];
 {% if CONV %}
-        if (t == 0) {  // (the step's words of the conv)
+        if (t < {{ SMAX }}) {  // (a token object of the first kind: the conv's words)
             {{ CONV_TOK }}
         }
 {% endif %}

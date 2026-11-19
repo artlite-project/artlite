@@ -2,12 +2,13 @@
 the step.
 
 Per step (one dispatch; the weights stream once for all slots) the columns read the token objects (per layer kind and
-sub-step its positions and cache ranges, the RoPE tables; token object 0 also the step's slots and the conv shift) and
-the slots' residual slices (F_LOADR: the embeddings, fp32), then per layer L (column c, KV head h = c / 2, j = c % 2):
+sub-step its positions and cache ranges, the RoPE tables; those of the first kind also the conv passes) and the slots'
+residual slices (F_LOADR: the embeddings, fp32), then per layer L (column c, KV head h = c / 2, j = c % 2):
 
 - conv layers: in (the input norm: layer 0 of x, later layers a header, below) -> the rows B, C, x of the column's 256
-  channels into its conv region (``lfm.conv``); conv (the operator cores: the region's taps, history and rows on X ->
-  y into out's input, the new history over the old, on D); out -> F_VOUT;
+  channels into its rows objects (``lfm.conv``); conv (the operator cores, a pass per sequence of the step: the
+  sequence's conv region - taps, history - and the rows on X -> y into its slots of out's input, the new history over
+  the old, on D); out -> F_VOUT;
 - attention layers: qkv (a header) -> the KV head's attention region [q objects SLOTS | raw K / V objects SLOTS]: the
   column's two query heads at heads 2 j, 2 j + 1 of each q object, its halves of K_h and V_h (dims 64 j ..) in the raw
   K / V objects, its two heads' gate logits at the q objects' ``Attn.goff`` + 64 j; att (the operator cores, a chain of
@@ -28,17 +29,22 @@ The KV caches (KV): per attention layer and KV head linear groups of kp + 1 obje
 prefill reads a window before a position from there on); then per layer and KV head a ring of two slots of T bytes with
 the exact V values of the open records (``decode.vring``).
 
-The conv regions (ACT, per conv layer and column, ``lfm.conv``) hold the layer's taps and its history: the 6 rows before
+The conv regions (KV, per conv layer and column, ``lfm.conv``) hold the layer's taps and its history: the 6 rows before
 the last step's first token and that step's rows; a step takes its window from the accepted count of the last one on
-(``M_CSHIFT``: its first position minus the last step's), so the host patches nothing per conv layer; a step that does
-not continue the last one (a reset, a restore, after a prefill) starts from a history whose base is right before it
-(``conv_at``).
+(the pass's shift: its first position minus the last step's), so the host patches nothing per conv layer for it; a step
+that does not continue the last one (a reset, a restore, after a prefill) starts from a history whose base is right
+before it (``conv_at``).
 
-The step's transaction is built once per S and pattern of sub-steps (and LM head or not) and patched per step: each
-column's range of each layer's cache per sub-step (A: address, length), a chain end's tail objects (A: the ring slots of
-the sub-step's open records, or after a prefill the V panels of the first: ``tail_mode``) and the record drains of
-column 2 h + 1 (D: address, length). A column's weights between two operator steps are one run of the (column-major)
-image: one A task.
+The step's transaction is built once per S, pattern of sub-steps and conv passes (and LM head or not: ``subs``) and
+patched per step: each column's range of each layer's cache per sub-step (A: address, length), a chain end's tail
+objects (A: the ring slots of the sub-step's open records, or after a prefill the V panels of the first: ``tail_mode``),
+the record drains of column 2 h + 1 (D: address, length) and a conv pass's region fills and history drains (address:
+its sequence's). A column's weights between two operator steps are one run of the (column-major) image: one A task.
+
+Several sequences (``sequences``: each one's caches, rings and conv regions in a KV buffer of its own,
+``ModelOverlay.select``): a step's slots may be several sequences' (``decode.step.Part``): a sequence's slots are
+attention sub-steps and a conv pass of their own (``_join``). Every slot's logits are those of a step of one of its
+sequence, bit for bit.
 """
 
 import numpy as np
@@ -67,7 +73,7 @@ from artlite.decode.protocol import (
     packed_slots,
     post_region_bytes,
 )
-from artlite.decode.step import StepPlan
+from artlite.decode.step import Part, PartBD, StepPlan
 from artlite.decode.vring import PAIR
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import LfmConfig
@@ -89,15 +95,18 @@ class LfmOverlay(AttentionOverlay):
     """An LFM3 GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices; the first
     one reads x), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the caches' capacity, ``kv_k``: the
     caches' K precision ("single": one bfp16 block per 8 dims, "hilo": hi + lo blocks), ``weights``: the image's buffer
-    allocated ahead."""
+    allocated ahead, ``sequences``: the sequences whose caches and conv histories the device holds
+    (``ModelOverlay.select``)."""
 
     CONFIG, IMAGE = LfmConfig, LfmImage
     CHAIN = CHAIN
     OPS = ("att", "conv")  # (the operator cores' phases)
+    SEQ = ("KV",)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
-                 max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None):
-        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights)
+                 max_positions: int = 4096, kv_k: str = "single", weights: WeightBuffer | None = None,
+                 sequences: int = 1):
+        super().__init__(gguf, layers=layers, vocab=vocab, kv_k=kv_k, weights=weights, sequences=sequences)
         cfg, img = self.cfg, self.image
         assert cfg.num_key_value_heads * CHAIN == COLS and cfg.conv_width == CV.WIDTH
         self.hd, self.nh = cfg.head_dim, cfg.q_per_kv
@@ -121,7 +130,8 @@ class LfmOverlay(AttentionOverlay):
                      for L in self.layers if self.kind(L) != "conv"}
         self.period = PAIR
         self.inv_freq = {k: cfg.rope_inv_freq(k) for k in KINDS}
-        self.conv_p, self.conv_s = 0, 0  # (the conv histories: the last step's first position and slots: ``conv_at``)
+        # (per sequence its conv histories' last step: its first position and slots, ``conv_at``)
+        self._convs = [(0, 0)] * sequences
         self._plan()
 
     # ------------------------------------------------------------------
@@ -158,8 +168,9 @@ class LfmOverlay(AttentionOverlay):
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
         # object of the sub-step from slot a on (its token SLOTS kind + a)
         self.att_reg = {(L, h): take("ACT", 2 * SLOTS * XB) for L in att for h in range(self.kv_heads)}
-        self.conv_reg = {(L, c): take("ACT", CV.region_bytes()) for L in convs for c in range(COLS)}
+        self.rows_reg = {(L, c): take("ACT", CV.rows_bytes()) for L in convs for c in range(COLS)}
         self._plan_caches(att, pad=KV_PAD // self.pg * self.G * self.T)
+        self.conv_reg = {(L, c): take("KV", CV.region_bytes()) for L in convs for c in range(COLS)}  # (a sequence's)
         self._sizes()
         self._plan_headers()
 
@@ -183,20 +194,26 @@ class LfmOverlay(AttentionOverlay):
                 .view(np.uint8) for n in ("q", "k")}
 
     def _load_conv(self, L: int) -> None:
-        """A conv layer's regions: the first object's metadata (F_CONV: the other cores skip the region), the taps, a
-        zero history."""
+        """A conv layer's regions of every sequence: the first object's metadata (F_CONV: the other cores skip the pass),
+        the taps, a zero history; its rows objects."""
         act = self.dev.view("ACT")
         w = np.asarray(self.gguf.tensor(f"blk.{L}.shortconv.conv.weight").dequantize(), np.float32)
         taps = CV.tap_objects(w.reshape(self.H, CV.WIDTH))
+        m = np.zeros(META, np.int32)
+        m[M_FLAGS], m[M_SKIP] = CV.F_CONV, CV.OBJS - 1
+        for s in range(self.sequences):
+            name = self.seq_name("KV", s)
+            kv = self.dev.view(name, own=True)
+            for c in range(COLS):
+                o = self.conv_reg[(L, c)]
+                reg = kv[o:o + CV.region_bytes()]
+                reg[:] = 0
+                reg[:4 * META] = m.view(np.uint8)
+                reg[CV.payload(0):CV.payload(0) + XPAY] = taps[c, :XPAY]
+                reg[CV.payload(1):CV.payload(1) + 3 * CV.TAP] = taps[c, XPAY:]
+                self.dev.flush(name, o, CV.region_bytes(), own=True)
         for c in range(COLS):
-            o = self.conv_reg[(L, c)]
-            reg = act[o:o + CV.region_bytes()]
-            reg[:] = 0
-            m = np.zeros(META, np.int32)
-            m[M_FLAGS], m[M_SKIP] = CV.F_CONV, CV.OBJS - 1
-            reg[:4 * META] = m.view(np.uint8)
-            reg[CV.payload(0):CV.payload(0) + XPAY] = taps[c, :XPAY]
-            reg[CV.payload(1):CV.payload(1) + 3 * CV.TAP] = taps[c, XPAY:]
+            act[self.rows_reg[(L, c)]:][:CV.rows_bytes()] = 0
 
     # ------------------------------------------------------------------
     # The transaction of a step
@@ -228,8 +245,8 @@ class LfmOverlay(AttentionOverlay):
                 seq.drain("C", c, dev.address("ACT", reg + SLOTS * XB + 2 * half * j), S * 2 * 2 * C_LEN,
                           (C_LEN // 2, S, XB // 4, self.hd // 2))
                 seq.drain("C", c, dev.address("ACT", reg + 2 * (self.at.goff + 64 * j)), S * 2 * C_LEN, pat)
-            elif name == "in":  # (B, C, x of the column's channels into its conv region)
-                o = self.conv_reg[(L, c)]
+            elif name == "in":  # (B, C, x of the column's channels into its rows objects)
+                o = self.rows_reg[(L, c)]
                 for off, nbytes, dims in CV.rows_drains(S):
                     seq.drain("C", c, dev.address("ACT", o + off), nbytes, dims)
             elif flags & F_VOUT:
@@ -247,21 +264,27 @@ class LfmOverlay(AttentionOverlay):
             super()._operator(seq, st, L, name, weights)
 
     def _conv(self, seq: Sequence, st: StepPlan, L: int, weights: list[tuple[int, str]]) -> None:
-        """The conv of layer L (``lfm.conv``): per column its region (X, after the in phase's drains), y into out's input
-        and the new history over the old (D). The weights of the GEMV phases after it go first (A streams them while
-        the operator cores run the conv)."""
+        """The conv of layer L (``lfm.conv``), a pass per sequence of the step (``subs``): per column its sequence's
+        region and the step's rows objects (X, after the in phase's drains), y into the pass's slots of out's input and
+        the new history over the old (D); the region's transfers in the pass's sequence's KV (``StepPlan.part_bds``).
+        The weights of the GEMV phases after it go first (A streams them while the operator cores run the conv)."""
         dev, S = self.dev, st.S
         if weights:
             self._weight_run(seq, weights)
-        seq.sync()  # (the in phase's rows in the regions)
-        out, sp = self.inp[(L, "out")][0], packed_slots(S)
-        for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", self.conv_reg[(L, c)]), CV.region_bytes())
-        for c in range(COLS):
-            o = self.conv_reg[(L, c)]
-            seq.drain("D", c, dev.address("ACT", out.off + XB + 2 * sp * CH * c), CV.y_bytes(S))
-            for off, nbytes in CV.hist_drains(S):
-                seq.drain("D", c, dev.address("ACT", o + off), nbytes)
+        seq.sync()  # (the in phase's rows in the rows objects)
+        out, sp, rb = self.inp[(L, "out")][0], packed_slots(S), CV.region_bytes()
+        for u, (a, n) in enumerate(st.subs[1]):
+            for c in range(COLS):
+                o = self.conv_reg[(L, c)]
+                st.part_bds.append(PartBD(seq.fill("X", c, dev.address("KV", o), rb), u, o, rb))
+                seq.fill("X", c, dev.address("ACT", self.rows_reg[(L, c)]), CV.rows_bytes())
+            for c in range(COLS):
+                o = self.conv_reg[(L, c)]
+                seq.drain("D", c, dev.address("ACT", out.off + XB + 2 * sp * CH * c + 16 * a), CV.y_bytes(n),
+                          CV.y_dims(n, S))
+                for off, nbytes in CV.hist_drains(n):
+                    st.part_bds.append(PartBD(seq.drain("D", c, dev.address("KV", o + off), nbytes)[0], u, o + off,
+                                              nbytes))
 
     def logits_of(self, x: np.ndarray) -> np.ndarray:
         """(its header's input: r = x, v and its partial sums zero, so the header's update adds nothing and its norm is
@@ -289,50 +312,84 @@ class LfmOverlay(AttentionOverlay):
     # The per-step words
     # ------------------------------------------------------------------
 
-    def subs(self, p: int, S: int) -> tuple[tuple[int, int], ...]:
-        """(both kinds: one head dim)"""
-        return self._substeps(p, S, self.hd)
+    def subs(self, p: int, S: int) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+        """The attentions' sub-steps (first slot, slots; both kinds: one head dim) and the conv's passes (first slot,
+        slots: one) of a step at p .. p + S - 1."""
+        return self._substeps(p, S, self.hd), ((0, S),)
+
+    def _kind_subs(self, subs: tuple, kind: int) -> tuple[tuple[int, int], ...]:
+        return subs[0]
+
+    def _join(self, parts: tuple[Part, ...]) -> tuple:
+        """(the attentions': each part's sub-steps from its first slot on; the conv's: a pass per part)"""
+        att, passes, a0 = [], [], 0
+        for q in parts:
+            att += [(a0 + a, n) for a, n in self._substeps(q.position, q.n, self.hd)]
+            passes.append((a0, q.n))
+            a0 += q.n
+        return tuple(att), tuple(passes)
+
+    def passes(self, p: int, S: int) -> int:
+        return len(self.subs(p, S)[0])
 
     def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
         kn = KINDS[kind]
         return rope_tables(self.inv_freq[kn], positions, self.cfg.rot(kn))
 
-    def _token_words(self, st: StepPlan, p: int) -> None:
-        """Token object 0: the step's slots and conv shift."""
-        m0 = self.dev.view("ACT")[st.tok:st.tok + 4 * META].view(np.int32)
-        m0[CV.M_TOK_S], m0[CV.M_CSHIFT] = st.S, self._cshift(p)
+    def _token_words(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
+        """The token objects of the first kind: from each part's first slot its conv pass (its slots and shift), from
+        the others none."""
+        act, a = self.dev.view("ACT"), 0
+        w = [0] * SLOTS
+        for q in parts:
+            w[a] = CV.pass_word(q.n, self._cshift(q.position, q.seq))
+            a += q.n
+        for a in range(SLOTS):
+            act[st.tok + a * XB:][:4 * META].view(np.int32)[CV.M_CPASS] = w[a]
 
-    def _ran(self, p: int, S: int) -> None:
+    def _ran(self, p: int, S: int, seq: int | None = None) -> None:
         """(and the conv histories: their rows)"""
-        super()._ran(p, S)
-        self.conv_p, self.conv_s = p, S
+        super()._ran(p, S, seq)
+        self._convs[self.seq if seq is None else seq] = (p, S)
+
+    @property
+    def conv_p(self) -> int:
+        """The selected sequence's conv histories: the first position of their last step."""
+        return self._convs[self.seq][0]
+
+    @property
+    def conv_s(self) -> int:
+        """The selected sequence's conv histories: the slots of their last step (0: their base is before ``conv_p``)."""
+        return self._convs[self.seq][1]
 
     def conv_at(self, p: int) -> None:
-        """The conv histories' base is the 6 rows before position p (a prefill wrote them, a restore put them back): the
-        next step continues at p with shift 0."""
-        self.conv_p, self.conv_s = p, 0
+        """The selected sequence's conv histories' base is the 6 rows before position p (a prefill wrote them, a restore
+        put them back): the next step continues at p with shift 0."""
+        self._convs[self.seq] = (p, 0)
 
     def conv_base(self, p: int) -> None:
-        """Before a prefill chunk at p: each conv region's rows of the 6 positions before p moved to its base (rows 0 ..
-        5, where the chunk's conv reads its history), as a step at p shifts them on its cores."""
+        """Before a prefill chunk at p: each of the selected sequence's conv regions' rows of the 6 positions before p
+        moved to its base (rows 0 .. 5, where the chunk's conv reads its history), as a step at p shifts them on its
+        cores."""
         sh = self._cshift(p)
         if sh:
-            act, dev = self.dev.view("ACT"), self.dev
+            kv, dev = self.dev.view("KV"), self.dev
             for o in self.conv_reg.values():
                 (h, _, nh), (t, _, nt) = CV.history_parts(o)  # (rows 0 .. 7, rows 8, 9)
-                dev.fetch("ACT", h, nh)
-                dev.fetch("ACT", t, nt)
-                rows = np.concatenate([act[h:h + nh], act[t:t + nt]]).reshape(CV.HIST, CV.ROW)
-                act[h:h + 6 * CV.ROW] = rows[sh:sh + 6].reshape(-1)
-                dev.flush("ACT", h, 6 * CV.ROW)
+                dev.fetch("KV", h, nh)
+                dev.fetch("KV", t, nt)
+                rows = np.concatenate([kv[h:h + nh], kv[t:t + nt]]).reshape(CV.HIST, CV.ROW)
+                kv[h:h + 6 * CV.ROW] = rows[sh:sh + 6].reshape(-1)
+                dev.flush("KV", h, 6 * CV.ROW)
         self.conv_at(p)
 
-    def _cshift(self, p: int) -> int:
-        """The conv shift of a step at p: the last step's tokens before p (a step continues from the last one's
-        positions, at most its own back, as a generation loop's rejected drafts do)."""
-        sh = p - self.conv_p
-        assert 0 <= sh <= self.conv_s or (sh == 0 and self.conv_s == 0), \
-            f"a step at {p} after the conv histories of a step at {self.conv_p} ({self.conv_s} slots)"
+    def _cshift(self, p: int, seq: int | None = None) -> int:
+        """The conv shift of a step at p of sequence ``seq`` (None: the selected one): its last step's tokens before p (a
+        step continues from the last one's positions, at most its own back, as a generation loop's rejected drafts
+        do)."""
+        p0, s0 = self._convs[self.seq if seq is None else seq]
+        sh = p - p0
+        assert 0 <= sh <= s0 or (sh == 0 and s0 == 0), f"a step at {p} after the conv histories of a step at {p0} ({s0} slots)"
         return sh
 
     # ------------------------------------------------------------------
@@ -343,16 +400,18 @@ class LfmOverlay(AttentionOverlay):
         super().reset()
         self.conv_at(0)
         if self.dev is not None:  # (zero histories: the rows before position 0)
-            act = self.dev.view("ACT")
+            kv = self.dev.view("KV")
             for o in self.conv_reg.values():
                 for a, _, n in CV.history_parts(o):
-                    act[a:a + n] = 0
-                    self.dev.flush("ACT", a, n)
+                    kv[a:a + n] = 0
+                    self.dev.flush("KV", a, n)
 
-    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
-        - 1 (the positions before are cached). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid
-        until the next step), or without ``logits`` None (only the caches are updated)."""
+        - 1 of the selected sequence (the positions before are cached), or of several sequences' slots: ``position``
+        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next positions).
+        Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without
+        ``logits`` None (only the caches and histories are updated)."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS
@@ -375,22 +434,23 @@ class LfmOverlay(AttentionOverlay):
         """(and the conv histories: each region's rows, the last step's position and slots, ``conv_at``)"""
         out = super().snapshot(position)
         rows = np.zeros((len(self.conv_reg), CV.HIST * CV.ROW), np.uint8)
-        act = self.dev.view("ACT")
+        kv = self.dev.view("KV")
         for i, o in enumerate(self.conv_reg.values()):
             for a, b, n in CV.history_parts(o):
-                self.dev.fetch("ACT", a, n)
-                rows[i, b:b + n] = act[a:a + n]
-        out.extra["conv"] = (rows, self.conv_p, self.conv_s)
+                self.dev.fetch("KV", a, n)
+                rows[i, b:b + n] = kv[a:a + n]
+        out.extra["conv"] = (rows, *self._convs[self.seq])
         return out
 
     def restore(self, snapshot: Snapshot) -> None:
         super().restore(snapshot)
-        rows, self.conv_p, self.conv_s = snapshot.extra["conv"]
-        act = self.dev.view("ACT")
+        rows, p, S = snapshot.extra["conv"]
+        self._convs[self.seq] = (p, S)
+        kv = self.dev.view("KV")
         for i, o in enumerate(self.conv_reg.values()):
             for a, b, n in CV.history_parts(o):
-                act[a:a + n] = rows[i, b:b + n]
-                self.dev.flush("ACT", a, n)
+                kv[a:a + n] = rows[i, b:b + n]
+                self.dev.flush("KV", a, n)
 
     def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
         """The residual stream the LM head read in the last step (L = -1), of a slot (bf16 values, fp32): its updated
@@ -399,15 +459,15 @@ class LfmOverlay(AttentionOverlay):
         return self.residual(slot)
 
     def read_conv(self, layer: int) -> np.ndarray:
-        """A conv layer's history (HIST rows, hidden) as the regions hold it (bf16 values as fp32): rows 0 .. 5 the base
-        of the last step, then its rows."""
+        """A conv layer's history of the selected sequence (HIST rows, hidden) as the regions hold it (bf16 values as fp32):
+        rows 0 .. 5 the base of the last step, then its rows."""
         out = []
         for c in range(COLS):
             parts = CV.history_parts(self.conv_reg[(layer, c)])
             for a, _, n in parts:
-                self.dev.fetch("ACT", a, n)
-            act = self.dev.view("ACT")
-            rows = np.concatenate([act[a:a + n] for a, _, n in parts])
+                self.dev.fetch("KV", a, n)
+            kv = self.dev.view("KV")
+            rows = np.concatenate([kv[a:a + n] for a, _, n in parts])
             out.append(rows.view(np.uint16).reshape(CV.HIST, CH))
         return np.ascontiguousarray(np.concatenate(out, 1)).view(bfloat16).astype(np.float32)
 

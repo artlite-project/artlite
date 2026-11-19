@@ -50,11 +50,17 @@ objects.
   continues from; the prompt's last token's logits come from the LM head alone.
 - The conv histories hold the whole sequence: a position is kept only where a checkpoint was taken (`artlite-server`'s
   prompt cache: a checkpoint is 2.8 MB, copied in under a millisecond).
+- Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches and conv histories, and a
+  decode step's 4 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for
+  all of them, each sequence's attention reads its own cache and its conv runs as a pass of its own on its own
+  history. A step of 2 / 3 / 4 requests takes 1.06x / 1.11x / 1.15x a step of one, so 4 requests get 2.7x one
+  request's tokens per second in all ([artlite-server](../server.md#several-requests-at-a-time)). The media
+  encoders, speech output and live transcription run one at a time, between the requests' steps.
 
 Memory:
 - The weights the NPU streams (QAD-Q4_0: 1.07 GB; Q4_K_M: 1.12 GB; the LM head is the token embedding, Q6_K) are
   re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.
-- The KV cache: 108 MB at 8192 positions, 1.68 GB at 131072 (K as one bfp16 block per 8 dimensions; `--kv-k hilo`: hi
+- The KV cache: 109 MB at 8192 positions, 1.68 GB at 131072 (K as one bfp16 block per 8 dimensions; `--kv-k hilo`: hi
   + lo blocks). The sliding-window layers' caches are linear in the positions too (the prefill writes and reads them
   as the decode does).
 
