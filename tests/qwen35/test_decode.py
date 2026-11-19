@@ -639,7 +639,8 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_overlay_sequences() -> None:
+@pytest.mark.parametrize("size", ["9B", "3.8-27B"])
+def test_overlay_sequences(size: str) -> None:
     """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; tokens of their own, at
     positions of their own) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay
     of one sequence: alternated (``select``: a round of 1 .. 8 slots of one, some of them kept, then of the next) and
@@ -649,7 +650,7 @@ def test_overlay_sequences() -> None:
     from artlite.decode.step import Part
     from models.qwen35.overlay import QwenOverlay
 
-    path = size_gguf("3.8-27B")
+    path = size_gguf(size)
     require(path)
     g = GGUFFile(path)
     layers = list(range(QwenConfig.from_gguf(g).attention_layers[0] + 1))
@@ -658,14 +659,17 @@ def test_overlay_sequences() -> None:
     rng = np.random.default_rng(7)
     toks = [[int(t) for t in rng.integers(0, 50000, n)] for n in lengths]
     emb = [g.rows("token_embd.weight", t) for t in toks]
-    one = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, slots=8)
+    def image() -> QwenImage:  # (the LM head's rows whole, as a model of several sequences lays them out)
+        return QwenImage(g, layers=layers, vocab=COLS * 64, screen=False)
+
+    one = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, slots=8, image=image())
     one.load()
     want = []
     for s in range(nseq):  # (alone: an overlay of one sequence, in steps of one)
         one.reset()
         want.append([np.asarray(one.step(emb[s][p:p + 1], p)[0]).view(np.uint16).copy() for p in range(lengths[s])])
     one.dev = None
-    ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, sequences=nseq)
+    ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, sequences=nseq, image=image())
     ov.load()
     assert ov.SLOTS == 8
 

@@ -1,8 +1,9 @@
-"""The 27B's lanes on the NPU (``NpuQwen(sequences=)``; models/lanes.py): a conversation alone on lane 1 against lane 0
-(its prompt's chunks into its own caches, GDN states and conv states), then three conversations on one model object,
-each on a thread of its own, against each one alone: greedy replies token for token, with the context's drafts and
-without, the lanes' decode rounds in joint steps of up to 8 slots (an attention pass and a GDN chain per sequence).
-Without a drafter, the LM head's rows whole."""
+"""The dense Qwen3.5 / 3.6 models' lanes on the NPU (``NpuQwen(sequences=)``; models/lanes.py; the 9B: on its design
+of 8 slots, every format's kernel a code page): a conversation alone on lane 1 against lane 0 (its prompt's chunks
+into its own caches, GDN states and conv states), then three conversations on one model object, each on a thread of
+its own, against each one alone: greedy replies token for token, with the context's drafts and without, the lanes'
+decode rounds in joint steps of up to 8 slots (an attention pass and a GDN chain per sequence). No drafter (files
+without an MTP block), the LM head's rows whole."""
 
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,8 +23,9 @@ GREEDY = Sampling(greedy=True)
 N = 40  # a reply's tokens
 
 
-def test_lanes_greedy() -> None:
-    path = size_gguf("27B")
+@pytest.mark.parametrize("size", ["9B", "27B"])
+def test_lanes_greedy(size: str) -> None:
+    path = size_gguf(size)
     require(path)
     model = open_model(path)
     assert model.parallel

@@ -43,12 +43,14 @@ def _tokens(path: str, n: int) -> list[int]:
     return llama_tokenize(path, essay("founders.txt"))[:n]
 
 
-@pytest.mark.parametrize("size", ["9B", "3.8-27B", "1B", "35B-A3B", "swift"])
+@pytest.mark.parametrize("size", ["9B", "9B-lanes", "3.8-27B", "1B", "35B-A3B", "swift"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
     and states; the next-token distributions against llama.cpp's split run (the prompt in one graph, then one token per
-    graph), next to llama.cpp's own decode-only run against it."""
+    graph), next to llama.cpp's own decode-only run against it. "-lanes": the model of two sequences (the 9B's: its
+    design of 8 slots, every format's kernel a code page, the LM head's rows whole), on lane 0."""
+    size, lanes, _ = size.partition("-lanes")
     path = _path(size)
     P, K = 300, 24
     tokens = _tokens(path, P + K)
@@ -56,7 +58,13 @@ def test_prefill(size: str) -> None:
         np.asarray(golden(path, tokens, split=P, logits="f32", logits_from=P - 1).logits, np.float32)[:K].copy())
     dec = torch.from_numpy(
         np.asarray(golden(path, tokens, ubatch=1, logits="f32", logits_from=P - 1).logits, np.float32)[:K].copy())
-    model = NpuQwen(GGUFFile(path), capacity=4096)
+    if lanes:
+        from models.qwen35.qwen import Qwen
+
+        model = Qwen(path).load(capacity=4096, sequences=2)
+        assert model.overlay.SLOTS == 8 and len(model.lanes) == 2
+    else:
+        model = NpuQwen(GGUFFile(path), capacity=4096)
     got = torch.from_numpy(np.stack([model.forward(tokens[:P])] + [model.step(t) for t in tokens[P:P + K - 1]]))
     kl, kl_llama = kl_rows(split, got), kl_rows(split, dec)
     agree = float((split.argmax(-1) == got.argmax(-1)).float().mean())

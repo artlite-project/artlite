@@ -438,7 +438,7 @@ saves the state where each prompt's last message begins, and a turn continues fr
 
 ### Several requests at a time
 
-With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.6-27B and Qwen3.8-27B serve up to N requests at a time. The NPU holds N
+With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.5-9B, Qwen3.6-27B and Qwen3.8-27B serve up to N requests at a time. The NPU holds N
 sequences, each with KV caches of `-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the
 requests that generate share their decode steps. A step streams the weights once for 4 tokens: with one request those
 are its token and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a
@@ -454,6 +454,7 @@ queue:
 | LFM3 1.7B QAD-Q4_0 | 57.0 | 94.4 | 156 |
 | Spark-X 1.7B Q4_K_M (`-np 8`) | 48.5 | 72 | 120 |
 | Spark-X 4B Q4_K_M (`-np 8`) | 29.3 | 33 | 57 |
+| Qwen3.5-9B Q4_K_M (`-np 8`) | 10.7 | 19.4 | 35.0 |
 | Qwen3.6-27B Q4_K_M | 3.8 | 6.9 | 12.0 |
 | Qwen3.8-27B Q4_K_M, with its MTP layer as the drafter | 8.9 | 13.5 | 18.0 |
 
@@ -467,9 +468,11 @@ requests share the steps: its records are one request's at a time, and moving th
 costs more than their drafts gain. Spark-X's steps have 8 slots: with `-np 8` (its most), 8 requests at a time get 189 (1.7B) and 93 (4B) tokens
 per second in all. Its DSpark drafter drafts for a request while its block pays: one dispatch whatever number of its
 guesses find a slot, about half a step of the model, so it runs for a request alone and stands back where requests
-share the steps (a block for each of four cost 30% of their tokens per second). The 27B Qwen models' steps have 8 slots too
-(`-np` up to 8: 8 requests at a time get 18 tokens per second in all on Qwen3.6-27B), each sequence with its own
-Gated DeltaNet states (0.3 GB) beside its KV cache. Qwen3.8-27B drafts with its MTP layer then, for each request
+share the steps (a block for each of four cost 30% of their tokens per second). The 9B and 27B Qwen models' steps have 8 slots too
+(`-np` up to 8: 8 requests at a time get 51 tokens per second in all on Qwen3.5-9B, 18 on Qwen3.6-27B), each
+sequence with its own Gated DeltaNet states (0.1 and 0.3 GB) beside its KV cache. The 9B runs another design then
+than with `-np 1` (8 tokens per dispatch instead of 4, its LM head read whole): one request alone gets 10.7 tokens
+per second instead of 12.5. Qwen3.8-27B drafts with its MTP layer then, for each request
 ahead of the step the requests share (as Gemma 4's drafter; `--spec-type none`: 3.3 / 6.4 / 11.7 tokens per second);
 its DFlash2 drafter, whose records follow one sequence, does not load with `-np` above 1 (one request alone: 8.9
 tokens per second instead of 10.7). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
@@ -632,7 +635,7 @@ Generation:
 |---|---|
 | `-c N`, `--ctx-size` | KV cache positions, rounded up to a power of two >= 4096 (default 0: 32768, at most the model's context) |
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
-| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X and the 27B Qwen models](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
+| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X and the 9B / 27B Qwen models](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
 | `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3, Flint past 16384 positions; default 32) |

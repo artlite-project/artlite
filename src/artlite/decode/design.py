@@ -174,8 +174,9 @@ _SRC = templating.load("artlite/decode/design.cc.jinja")  # (the main and helper
 
 WS8_AT = 0x4000  # (8 slots) the main core's workspace (region 1 on; then the sum panels)
 # (8 slots) the main core's activation table (SiLU's, GELU's), its two copies in regions 0, 3 of the helper's memory: the
-# room of a second X object
+# room of a second X object (``ACT8_PAGED``: the second one under the pager's state, a paged design without gather tables)
 ACT8_AT = (0x0800, 0xF9C0)
+ACT8_PAGED = (0x0800, 0xF980)
 # (8 slots with gather tables: ``l1_8``) the main core's table copies in regions 1 (its workspace after it) and 3, the
 # helper's in regions 0 and 3 (its scratch is in the core south of it)
 TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
@@ -379,7 +380,11 @@ class DecodeOverlayOperator(ArtcOperator):
         0x40000), with gather tables its one copy twice (``l1_8``)."""
         if self.slots != 8:
             return [0, 0]
-        return [0x40000 + self.l1_8()["h_act"]] * 2 if self.tables else [0x40000 + a for a in ACT8_AT]
+        return [0x40000 + self.l1_8()["h_act"]] * 2 if self.tables else [0x40000 + a for a in self._act8_at()]
+
+    def _act8_at(self) -> tuple[int, int]:
+        """(8 slots, no gather tables) The activation table's copies in the helper's memory."""
+        return ACT8_PAGED if self.paged else ACT8_AT
 
     @property
     def xp_bytes(self) -> int:
@@ -845,7 +850,7 @@ class DecodeOverlayOperator(ArtcOperator):
             if not s8:
                 return []
             words = kmath.TABLES[self.act].table_words()
-            at = [self.l1_8()["h_act"]] if self.tables else list(ACT8_AT)
+            at = [self.l1_8()["h_act"]] if self.tables else list(self._act8_at())
             return [Buffer(np.ndarray[(words.size,), np.dtype[np.uint32]], name=f"{P}_mact{c}_{i}", tile=Tile(c, hr), address=a,
                            initial_value=words) for i, a in enumerate(at)]
 

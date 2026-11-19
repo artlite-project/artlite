@@ -40,7 +40,8 @@ out before that wait (they stream into the memtile meanwhile). A column-major im
 column's weights between two attentions (their caches on A) as one run, its phases' norm-weight objects in it; a
 region-major one per phase and K group (the norm-weight objects from NORM).
 
-Several sequences (``sequences``; a dense model on its design of 8 slots): each has its KV caches and its GDN layers'
+Several sequences (``sequences``; a dense model on the design of 8 slots, which a model of several takes wherever
+its formats run on one: the 9B's too): each has its KV caches and its GDN layers'
 objects, states and conv states in buffers of its own (``SEQ``; ``ModelOverlay.select``), its lazy commit's cursor and
 its ``rope``. A step's slots may be several sequences' (``decode.step.Part``), with no kernel of its own: each attention
 runs a pass per sequence (``decode.attn256_steps``' "Several sequences") and each GDN layer a chain per sequence
@@ -175,7 +176,8 @@ class QwenOverlay(ModelOverlay):
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
         gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
-        slots = slots or slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts)
+        # (several sequences: the design of 8 slots where the file's formats run on one, as with a drafter)
+        slots = slots or slots_of(cfg, fmts, sequences > 1 or (bool(cfg.nextn_layers) if drafts is None else drafts))
         if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
             raise ValueError(f"{sequences} sequences: a dense model whose design runs steps of 8 slots (this one: "
                              f"{slots}; ``slots_of``: its tile formats, an image whose LM head is not screened)")
@@ -194,12 +196,16 @@ class QwenOverlay(ModelOverlay):
         self._ropes = [_text_rope(self.max_positions) for _ in range(sequences)]  # (per sequence: ``rope``)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
+        paged = paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16 or gu_win))
+        if slots == 8 and not paged and len(fmts) > 2:  # (a design of 8 slots holds two formats' kernels: Qwen3.5 9B's
+            # three overflow the main core's program by 0.7 KB, and one of them beside a page slot leaves the slot
+            # 0.1 KB short of a page)
+            paged = tuple(sorted(fmts))
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
-                                      paged=paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16
-                                                                                        or gu_win)),
+                                      paged=paged,
                                       slots=slots, bcast=slots == 8, gu_win=gu_win, split=img.split,
                                       pairs=not cfg.moe and any(b.pairs for r in img.regions for b in r.blocks),
                                       tails=any(r.half for r in img.regions),
