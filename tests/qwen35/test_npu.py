@@ -43,13 +43,14 @@ def _tokens(path: str, n: int) -> list[int]:
     return llama_tokenize(path, essay("founders.txt"))[:n]
 
 
-@pytest.mark.parametrize("size", ["9B", "9B-lanes", "3.8-27B", "1B", "35B-A3B", "swift"])
+@pytest.mark.parametrize("size", ["9B", "9B-lanes", "3.8-27B", "1B", "1B-lanes", "35B-A3B", "swift"])
 def test_prefill(size: str) -> None:
     """The app's prompt path: 300 tokens through the prefill (one chunk of 512 tokens, 212 of them padding), the
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
     and states; the next-token distributions against llama.cpp's split run (the prompt in one graph, then one token per
-    graph), next to llama.cpp's own decode-only run against it. "-lanes": the model of two sequences (the 9B's: its
-    design of 8 slots, every format's kernel a code page, the LM head's rows whole), on lane 0."""
+    graph), next to llama.cpp's own decode-only run against it. "-lanes": the model of two sequences (the design of 8
+    slots, the LM head's rows whole; the 9B's: every format's kernel a code page; MiniCPM-V's: a KV head's cache over
+    4 columns in one pass), on lane 0."""
     size, lanes, _ = size.partition("-lanes")
     path = _path(size)
     P, K = 300, 24

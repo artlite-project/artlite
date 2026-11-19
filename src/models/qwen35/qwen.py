@@ -31,8 +31,8 @@ each (2.4-3.4 ms on the 35B-A3B), while their chain's probability pays for the s
 draft. A step of drafts leaves the GDN states uncommitted: the next one
 replays the accepted tokens.
 
-Several sequences (``NpuQwen(sequences=N)``; a dense model whose formats run on the design of 8 slots: the 9B, the
-27B models; the 9B's own design is of 4, ``overlay.slots_of``): the
+Several sequences (``NpuQwen(sequences=N)``; a dense model whose formats run on the design of 8 slots,
+``overlay.runs_eight``: MiniCPM-V's, the 9B, the 27B models; the first two's own design is of 4, ``overlay.slots_of``): the
 device holds the KV caches and the GDN states, objects and conv states of each, and the model has a lane for each
 (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
 (``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence). The LM
@@ -75,7 +75,7 @@ from ..tokenizer import BpeTokenizer, chat_prompt
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
 from .drafting import MtpDrafting
 from .image import QwenImage
-from .overlay import QwenOverlay, slots_of
+from .overlay import QwenOverlay, runs_eight, slots_of
 from .prefill import QwenPrefill
 
 # the model card's sampling (thinking / instruct) when the file names none (general.sampling.*); MiniCPM-V 4.7's (one
@@ -562,12 +562,11 @@ class Qwen(Model):
 
     @property
     def parallel(self) -> bool:  # type: ignore[override]
-        """(a dense chat model whose tile formats run on a design of 8 slots, its LM head's rows whole:
-        ``overlay.slots_of`` as with a drafter)"""
-        if not (self.generates and self.cfg.causal) or self.cfg.moe:
+        """(a dense chat model whose tile formats run on the design of 8 slots, its LM head's rows whole:
+        ``overlay.runs_eight``)"""
+        if not (self.generates and self.cfg.causal):
             return False
-        fmts = QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=False).formats()
-        return slots_of(self.cfg, fmts, True) == 8
+        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=False).formats())
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
         """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole, the file's MTP block as the drafter where

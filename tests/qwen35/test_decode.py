@@ -639,7 +639,7 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["9B", "3.8-27B"])
+@pytest.mark.parametrize("size", ["1B", "9B", "3.8-27B"])
 def test_overlay_sequences(size: str) -> None:
     """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; tokens of their own, at
     positions of their own) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay

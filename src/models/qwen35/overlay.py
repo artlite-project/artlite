@@ -124,8 +124,14 @@ def slots_of(cfg: QwenConfig, fmts: set[str], drafts: bool) -> int:
     formats, their tables' layout with one X object, +2%), which only the drafts pay for (Swift 1.5's MTP layer at 1K:
     +10% on prose). Else 4: an MoE design has no broadcast input, a KV head per 4 columns makes the one-pass attention
     slower at S 1."""
-    return 8 if (not cfg.moe and COLS // cfg.num_key_value_heads == 2 and all(gemv.supported(f, 4, 8) for f in fmts)
+    return 8 if (runs_eight(cfg, fmts) and COLS // cfg.num_key_value_heads == 2
                  and (fmts <= {"Q4_K", "Q6_K"} or drafts or len(fmts) > PG_ONE_CHANNEL)) else 4
+
+
+def runs_eight(cfg: QwenConfig, fmts: set[str]) -> bool:
+    """Whether a model's formats run on the design of 8 slots: a dense model whose formats' GEMV does (what a model of
+    several sequences takes, whatever ``slots_of`` prefers for one: a GDN chain per sequence is that design's)."""
+    return not cfg.moe and all(gemv.supported(f, 4, 8) for f in fmts)
 
 
 def chunk_of(cfg: QwenConfig) -> bool:
@@ -176,11 +182,12 @@ class QwenOverlay(ModelOverlay):
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
         gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
-        # (several sequences: the design of 8 slots where the file's formats run on one, as with a drafter)
-        slots = slots or slots_of(cfg, fmts, sequences > 1 or (bool(cfg.nextn_layers) if drafts is None else drafts))
+        # (several sequences: the design of 8 slots where the file's formats run on one)
+        slots = slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
+                          slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts))
         if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
-            raise ValueError(f"{sequences} sequences: a dense model whose design runs steps of 8 slots (this one: "
-                             f"{slots}; ``slots_of``: its tile formats, an image whose LM head is not screened)")
+            raise ValueError(f"{sequences} sequences: a dense model whose formats run on the design of 8 slots "
+                             f"(``runs_eight``: its tile formats, an image whose LM head is not screened)")
         if sequences > 8:
             raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
