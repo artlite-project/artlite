@@ -48,6 +48,12 @@ decode overlay of 8 token slots (`artlite.decode`) with the head_dim-256 attenti
   model step of 8 slots verifies the token and the 7 drafts; a draft is kept only where the model's own choice at its
   position is that draft, so greedy text is the same with and without the drafter. A prompt's chunks write the
   drafter's rows of its last window too.
+- Several requests at a time (`artlite-server -np N`, up to 8): the NPU holds N sequences' caches, and a decode step's
+  8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them, and
+  each attention layer runs a pass per sequence over that sequence's cache. A step of 2 / 4 / 8 requests takes
+  1.07x / 1.20x / 1.48x (1.7B) and 1.05x / 1.15x / 1.36x (4B) a step of one, so 8 requests get 4.4x (1.7B) and 4.9x
+  (4B) one request's tokens per second in all. The DSpark drafter does not load then (its records follow one
+  sequence): [artlite-server](../server.md#several-requests-at-a-time).
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size; nothing is written to disk. The 4B's hidden size of 2560 is two and a half of the 1024-column tiles: the

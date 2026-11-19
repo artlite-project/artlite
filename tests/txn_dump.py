@@ -381,6 +381,16 @@ def _flint(path: str, wrap: int) -> Callable[[Callable[[object], _Log]], None]:
     return run
 
 
+def _spark_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
+    def run(attach: Callable[[object], _Log]) -> None:
+        from models.spark.overlay import SparkOverlay
+
+        ov = SparkOverlay(GGUFFile(path), max_positions=1024, sequences=3)
+        _run_sequences(ov, attach(ov.op), lambda x, p, lg: ov.step(x, p, logits=lg))
+
+    return run
+
+
 def _spark(path: str) -> Callable[[Callable[[object], _Log]], None]:
     """Spark-X: steps of 1 .. 8 slots across the window's start (511) and the sliding-window rings' first wrap (82
     groups: 2624 positions), a snapshot and its restore, a reset."""
@@ -684,6 +694,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "lfm3-QAD-Q4_0-sequences": (lfm3_gguf("QAD-Q4_0"), _lfm_sequences),
     "spark-4B-Q4_K_M": (spark_gguf("4B"), _spark),
     "spark-1.7B-Q4_K_M": (spark_gguf("1.7B"), _spark),
+    "spark-1.7B-Q4_K_M-sequences": (spark_gguf("1.7B"), _spark_sequences),
     "spark-4B-bartowski-Q4_K_M": (spark_gguf("4B", "Q4_K_M", "bartowski"), _spark),
     "flint-int4": (flint_gguf(), lambda p: _flint(p, 0)),
     "flint-int4-ring": (flint_gguf(), lambda p: _flint(p, 16)),

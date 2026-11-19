@@ -45,7 +45,9 @@ from .protocol import (
     BC_COL,
     BC_ID,
     C_LEN,
+    DIMS_OBJ,
     META,
+    STAGED_X,
     XB,
     input_fill,
     interleave,
@@ -53,6 +55,9 @@ from .protocol import (
     post_input_fill,
     post_region_bytes,
     region_bytes,
+    staged_cell,
+    staged_fill,
+    staged_region_bytes,
 )
 from .screen import Screen, Screened
 from .step import Part
@@ -86,12 +91,13 @@ def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tupl
 @dataclass
 class InputRegion:
     """A K group's input region in ACT: [metadata object | x] (``protocol.region_bytes``; a header's:
-    ``protocol.post_region_bytes``), its input elements k0 .. k0 + K."""
+    ``protocol.post_region_bytes``; ``staged``: ``protocol.staged_region_bytes``), its input elements k0 .. k0 + K."""
 
     off: int
     k0: int
     K: int
     post: bool = False
+    staged: bool = False
 
 
 def host_bytes(shape: tuple[int, ...]) -> np.ndarray:
@@ -289,16 +295,33 @@ class ModelOverlay:
         self._layout[buf] = off + rup(n)
         return off
 
-    def _add_inputs(self, phase: tuple[int, str], *, post: bool = False, extra: int = 0) -> None:
+    def _add_inputs(self, phase: tuple[int, str], *, post: bool = False, extra: int = 0, staged: bool = False) -> None:
         """The input regions of a phase's K groups (``phases.group_chunks``) in ACT; ``extra``: bytes per input element
-        past a region's x (e.g. a sink of padding outputs)."""
+        past a region's x (e.g. a sink of padding outputs); ``staged``: x in cells (``protocol.staged_region_bytes``:
+        an input of the design's slots per k block that several producers write)."""
         r = self.image.region(*phase)
         regs = []
         for k0, g in mp.group_chunks(r):
             K = mp.group_K(r, k0, g)
-            n = (post_region_bytes(K) if post else region_bytes(K, self.SLOTS)) + extra * K
-            regs.append(InputRegion(self._take("ACT", n), k0 * r.kc, K, post))
+            n = staged_region_bytes(K, self.SLOTS) if staged else post_region_bytes(K) if post else region_bytes(K, self.SLOTS)
+            regs.append(InputRegion(self._take("ACT", n + extra * K), k0 * r.kc, K, post, staged))
         self.inp[phase] = regs
+
+    def staged(self, phase: tuple[int, str]) -> bool:
+        """Whether a phase's input x is staged."""
+        return self.inp[phase][0].staged
+
+    def x_slot(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int, int]:
+        """(ACT offset of input element e's k block in a phase's x of a step of S slots (a staged x: of its cell), the
+        bytes of x left in its K group from there on, the K group's x bytes of a design's slots: where a sink past it
+        starts)."""
+        sp = self._sp(S, phase)
+        for rg in self.inp[phase]:
+            if rg.k0 <= e < rg.k0 + rg.K:
+                at = rg.off + STAGED_X + staged_cell(self.SLOTS) * ((e - rg.k0) // 8) if rg.staged else \
+                    rg.off + XB + 2 * sp * (e - rg.k0)
+                return at, 2 * sp * (rg.k0 + rg.K - e), 2 * self.SLOTS * rg.K
+        raise ValueError(e)
 
     def _sizes(self) -> None:
         """The buffers' sizes (``sizes``): the layout's (64 bytes at least), LOGITS [slot][vocab] bf16."""
@@ -445,12 +468,17 @@ class ModelOverlay:
     def _inputs(self, seq: Sequence, rg: InputRegion, S: int, phase: tuple[int, str] | None = None) -> None:
         """The X fills of a K group's input (``protocol.input_fill``, a header's ``post_input_fill``) of a phase."""
         sp = self._sp(S, phase)
-        nbytes, dims = post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)
-        if self.op.bcast and phase != self._input(self.start):  # (a step's first phase: ``design``'s "Broadcast inputs")
-            seq.fill("X", BC_COL, self.dev.address("ACT", rg.off), nbytes, dims, packet=BC_ID)
-            return
-        for c in range(COLS):
-            seq.fill("X", c, self.dev.address("ACT", rg.off), nbytes, dims)
+        if rg.staged:  # (the metadata object, then x's objects from the cells)
+            assert sp == self.SLOTS and not rg.post, (phase, sp)
+            fills = [(rg.off, XB, DIMS_OBJ), (rg.off + XB, *staged_fill(rg.K, self.SLOTS))]
+        else:
+            fills = [(rg.off, *(post_input_fill(rg.K, sp) if rg.post else input_fill(rg.K, sp, self.SLOTS)))]
+        for off, nbytes, dims in fills:
+            if self.op.bcast and phase != self._input(self.start):  # (a step's first phase: ``design``'s "Broadcast inputs")
+                seq.fill("X", BC_COL, self.dev.address("ACT", off), nbytes, dims, packet=BC_ID)
+                continue
+            for c in range(COLS):
+                seq.fill("X", c, self.dev.address("ACT", off), nbytes, dims)
 
     def _values_to(self, seq: Sequence, c: int, phase: tuple[int, str], *, e0: int, n: int, S: int,
                    stream: str = "C", whole: bool = False) -> None:

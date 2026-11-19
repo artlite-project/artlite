@@ -13,6 +13,15 @@ g % NR), whose window's groups (from ``attn256.window_words``' first group) a st
 split where they wrap the ring, else before the last object (the transaction's tasks are the same at every position).
 Each kind's F_ATT objects take their words (a sliding-window layer's window and masks) and their angles (``cs`` per kind)
 per step; the step's masks and K lanes too (``attn256.step_words``: no branches).
+
+Several sequences in a step (one pass; ``decode.step.Part``, ``set_parts``): a pass per part, in order - an F_ATT object
+of its own (``AttnShape.u`` of them per layer and column), whose words are those of a step of the part's slots alone at
+its position, the part's q and raw K, V objects (from its first slot on), its sequence's cache, ring and records (the
+patches take each pass's KV buffer) -, its o's octets drained into the staged x of the output phase from the pass's
+first slot on (``attn256``'s "Several passes"; an overlay of several sequences stages that x for every step). A step of
+one part runs as a step of that sequence. A step's transaction does not follow how its slots are dealt: the transfers
+that do (``Span``: a pass's q objects, raw K, V objects and o) are patched with each pass's first slot and slots, so
+there is one transaction per number of passes (``pass_subs``).
 """
 
 import dataclasses
@@ -29,6 +38,7 @@ from ..overlay import Sequence, Transaction
 from . import attn256 as attn
 from .attn256 import M_ANA, M_G0, M_GATT, M_GJ, M_NTAIL, M_POS, M_SA, M_SPLIT
 from .protocol import AB_ID, C_LEN, M_NASKIP, M_NREL, M_NS, M_SKIP, META, XB
+from .step import Part
 from .vring import VRing
 
 # a step's cache fills: the whole cache, the sub-step's group, a split column's run; a ring's (a windowed spec's
@@ -67,6 +77,24 @@ class Drain(NamedTuple):
     index: int
 
 
+class Span(NamedTuple):
+    """A transfer of a pass that follows its slots (several sequences, one pass): its BD word index, the pass, the
+    ACT offset of its first slot's bytes for a pass from slot 0 on, the bytes per slot (its address moves by them per
+    first slot), and its bytes: per slot (0), or as built (1: o's octets)."""
+
+    at: int
+    sub: int
+    base: int
+    unit: int
+    fixed: int
+
+
+def pass_subs(k: int) -> tuple[tuple[int, int, int], ...]:
+    """(one pass) The sub-steps of a step of k sequences' slots as its transaction's key: a pass each, whatever its
+    slots (``Span``: patched)."""
+    return tuple((u, 1, 0) for u in range(k))
+
+
 # how a windowed spec's sliding-window layers attend in a step (``AttnStep.mode``): "step" (row s at p + s: its window and
 # the slots up to its own), "block" (a drafter's block: every row the window before the first slot's and the step's slots
 # whole), "insert" (records only: the step's first group streamed, no window, the rows' outputs for a sink)
@@ -89,6 +117,7 @@ class AttnStep:
     fills: list[Fill] = dataclasses.field(default_factory=list)
     tails: list[Tail] = dataclasses.field(default_factory=list)
     drains: list[Drain] = dataclasses.field(default_factory=list)
+    spans: list[Span] = dataclasses.field(default_factory=list)
     patch: dict[str, np.ndarray] | None = None  # (``AttentionSteps.patch_tables``)
 
 
@@ -110,6 +139,9 @@ class AttnOverlay(Protocol):
     kv_off: dict[int, int]
     fobj: np.ndarray
     vring: VRing
+    _vrings: list[VRing]
+    seq: int
+    seq_name: Callable[[str, int], str]
     _weights: Callable[..., None]
     _inputs: Callable[..., None]
     _weight_run: Callable[..., None]
@@ -118,6 +150,8 @@ class AttnOverlay(Protocol):
     _once: Callable[[float], None]
 
     def x_slot(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int, int]: ...
+
+    def staged(self, phase: tuple[int, str]) -> bool: ...
 
     def ring(self, L: int, h: int) -> int: ...
 
@@ -139,6 +173,7 @@ class WindowOverlay(AttnOverlay, Protocol):
 
 F_WORDS = {"pos": M_POS, "ns": M_NS, "sa": M_SA, "skip": M_SKIP, "split": M_SPLIT, "nrel": M_NREL, "ntail": M_NTAIL,
            "naskip": M_NASKIP, "g0": M_G0, "gatt": M_GATT, "gj": M_GJ, "ana": M_ANA}  # (an F_ATT object's words, by name)
+F_LINES = np.arange(0, 4 * META, 64)  # (the cache lines of an F_ATT object's words)
 F_ATT_AT = np.array(list(F_WORDS.values()))
 NO_END = 1 << 20  # a core's end of attention groups: none
 RECORD_STRIDE = 72  # bytes: a record's place in its pair in a panel (two records in 144 B)
@@ -243,7 +278,7 @@ class AttentionSteps:
             rnd = split & 3 == attn.SPLIT_ROUND  # (a round: both chains on its KV head, the cache shared 4 columns apart)
             last = u == len(st.subs) - 1 and run
             if not split & attn.SPLIT_KV:  # (a sub-step's second round: issued with its first)
-                if u or rnd:
+                if (u and not ash.one) or rnd:  # (one pass: sub-step u is another sequence's pass, which reads none of them)
                     seq.sync()  # (sub-step u - 1's records in DDR; a shared stream: every column's objects before it through)
                 self._cache(seq, st, L, u)
                 if last and not rnd and ov.a_bds > nf + attn.TAILS:  # (a later block's after the X objects: ``_weight_run``)
@@ -302,8 +337,15 @@ class AttentionSteps:
                 seq.fill("X", c, dev.address("ACT", ov.q_object(L, q0, a)), nc * n * XB,
                          (XB // 8, 2 * n, XB // 8, ov.SLOTS * XB // 4))
             else:
-                seq.fill("X", c, dev.address("ACT", ov.q_object(L, c, a)), n * XB)
-            seq.fill("X", c, dev.address("ACT", ov.rawkv[L] + a * XB), n * XB)
+                at = seq.fill("X", c, dev.address("ACT", ov.q_object(L, c, a)), n * XB)
+                self._span(st, at, u, ov.q_object(L, c, 0), XB)
+            at = seq.fill("X", c, dev.address("ACT", ov.rawkv[L] + a * XB), n * XB)
+            self._span(st, at, u, ov.rawkv[L], XB)
+
+    def _span(self, st: AttnStep, at: int, u: int, base: int, unit: int, *, fixed: bool = False) -> None:
+        """(an overlay of several sequences, one pass) Pass u's transfer at BD word ``at`` follows its slots (``Span``)."""
+        if self.ov.ash.one and self.ov.ash.u > 1:
+            st.spans.append(Span(at, u, base, unit, int(fixed)))
 
     def _outputs(self, seq: Sequence, st: AttnStep, L: int, S: int, u: int, out: str = "attn_out") -> None:
         """o (the column's heads in the x of phase ``out`` at the sub-step's slots; split: the chain's last column's of the
@@ -321,8 +363,13 @@ class AttentionSteps:
                 at, left, _ = ov.x_slot((L, out), attn.HD * h0, S)
                 assert left >= 4 * sp * 128 * nh
                 sw, m = 4 * sp, sp if ash.one else n  # (words of an x k block: [slot sp][8] bf16; the slots out)
-                seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * m * 32 * nh,
-                          None if m == sp else (4 * m, 32 * nh, sw, sw * 32 * nh))
+                if ov.staged((L, out)):  # (a pass's octets from its first slot on: a k block's into its cell)
+                    hd = seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * m * 32 * nh,
+                                   (sw, 32 * nh, 2 * sw, 2 * sw * 32 * nh))
+                    self._span(st, hd[0], u, at, 16, fixed=True)
+                else:
+                    seq.drain("C", c, dev.address("ACT", at + 16 * a), 16 * m * 32 * nh,
+                              None if m == sp else (4 * m, 32 * nh, sw, sw * 32 * nh))
             nk = attn.REC_K if ash.one else 2 * attn.REC_K  # (one pass: a K record; sub-steps: its pair)
             nr = ash.records(n)
             sizes = {attn.ROLE_K: (nk,) * nr, attn.ROLE_V: (attn.REC_V, attn.ROWS_B) * nr, attn.ROLE_O: ()}[role]
@@ -350,8 +397,9 @@ class AttentionSteps:
         t = np.array([(r.at, r.sub, *where(r.layer, r.column), r.tail) for r in st.tails], np.int64).reshape(-1, 7)
         r = np.array([(r.handle[0], r.sub, *where(r.layer, r.column), r.index) for r in st.drains],
                      np.int64).reshape(-1, 7)
-        at = np.concatenate([x[:, AT] for x in (f, t, r)] + [x[:, AT] + 2 for x in (f, t, r)])
-        out = {"f": f, "t": t, "r": r, "lines": np.unique(4 * at & ~63)}
+        s = np.array(st.spans, np.int64).reshape(-1, 5)  # (``Span``'s columns)
+        at = np.concatenate([x[:, AT] for x in (f, t, r, s)] + [x[:, AT] + 2 for x in (f, t, r, s)])
+        out = {"f": f, "t": t, "r": r, "s": s, "lines": np.unique(4 * at & ~63)}
         if self.window:  # (per attention layer, by its index: its ring's groups, whether it is a sliding-window layer)
             out["nr"] = np.array([self.ring_groups(L) for L in ov.fatt], np.int64)
             out["swa"] = np.array([self.kind(L) == "swa" for L in ov.fatt])
@@ -370,76 +418,142 @@ class AttentionSteps:
         for L in ov.fatt:
             ov.vring.check(L, p, p)
         if self.window:
-            gr, su = self._window_words(st, p, cs)
+            gr, su = self._window_words(st, (Part(ov.seq, p, S),), cs)
         else:
             w, gr, su = att_words(ov.ash, st.subs, p)
             self._write_words(st, w, cs)
+        self._patch(st, gr, su, ov.dev.address("KV"))
+
+    def set_parts(self, st: AttnStep, parts: tuple[Part, ...], cs: np.ndarray | dict[str, np.ndarray]) -> None:
+        """(one pass) ``set_position`` of a step of several sequences' slots, a pass per part (``st.subs``: each
+        part's first slot and its slots): its F_ATT objects by its own position, its cache, ring and record transfers
+        in its sequence's KV. ``cs``: the angles of the step's slots, in the parts' order."""
+        ov = self.ov
+        assert ov.ash.one and st.mode == "step" and len(parts) == len(st.subs), (parts, st.subs)
+        assert sum(q.n for q in parts) == st.S, (parts, st.S)
+        for q in parts:
+            assert 0 <= q.position and q.position + q.n <= ov.max_positions, parts
+            self._rings_from_prefill(q.position, q.seq)
+            for L in ov.fatt:
+                ov._vrings[q.seq].check(L, q.position, q.position)
+        gr, su = self._window_words(st, parts, cs) if self.window else self._pass_words(st, parts, cs)
+        kv0 = np.array([ov.dev.address(ov.seq_name("KV", q.seq), own=True) for q in parts], np.int64)
         if st.patch is None:
             st.patch = self.patch_tables(st)
-        t, kv0, words = st.patch, ov.dev.address("KV"), st.tr.words
-        self.patch_fills(words, t["f"], gr, kv0, t)
-        self.patch_tails(words, t["t"], su, kv0)
-        self.patch_drains(words, t["r"], su, kv0, t)
+        s = st.patch["s"]  # (the transfers that follow each pass's slots: its first slot, its slots)
+        n = np.array([q.n for q in parts], np.int64)
+        a = np.cumsum(n) - n
+        ov._bd_words(st.tr.words, s[:, 0], ov.dev.address("ACT") + s[:, 2] + a[s[:, 1]] * s[:, 3],
+                     np.where(s[:, 4] == 1, st.tr.words[s[:, 0]].astype(np.int64) * 4, n[s[:, 1]] * s[:, 3]))
+        self._patch(st, gr, su, kv0)
+
+    def _patch(self, st: AttnStep, gr: np.ndarray, su: np.ndarray, kv0: int | np.ndarray) -> None:
+        """The step's cache and ring fills and record drains (``gr``, ``su``: the F_ATT words' groups and sub-steps);
+        ``kv0``: the address of KV, or per sub-step of its sequence's."""
+        if st.patch is None:
+            st.patch = self.patch_tables(st)
+        t, words = st.patch, st.tr.words
+
+        def at(rows: np.ndarray) -> int | np.ndarray:
+            return kv0 if np.ndim(kv0) == 0 else kv0[rows[:, SUB]]
+
+        self.patch_fills(words, t["f"], gr, at(t["f"]), t)
+        self.patch_tails(words, t["t"], su, at(t["t"]))
+        self.patch_drains(words, t["r"], su, at(t["r"]), t)
         st.tr.flush_lines(t["lines"])
 
-    def _write_words(self, st: AttnStep, w: np.ndarray, cs: np.ndarray) -> None:
-        """The F_ATT objects' words ``w`` (per sub-step and column) and the sub-steps' slots' angles ``cs``, flushed."""
+    def _pass_words(self, st: AttnStep, parts: tuple[Part, ...], cs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(one pass, no window) The F_ATT objects' words of a step of ``parts``, a pass each: those of a step of the
+        part's slots alone at its position (a chain: no branch) and its angles; the fills' groups and the
+        sub-steps."""
+        ov = self.ov
+        U = len(parts)
+        ws, grs, sus = [], [], []
+        a32 = ov.dev.view("ACT").view(np.int32)
+        fo = ov.fobj[st.b][:, :, :U]  # ([layer][column][sub-step])
+        for u, q in enumerate(parts):
+            w, gr, su = att_words(ov.ash, ((0, q.n, 0),), q.position)
+            ws.append(w[0]), grs.append(gr[0]), sus.append(su[0])
+            _, amask, lanes = attn.step_words(q.position, q.n)
+            f = fo[:, :, u]
+            a32[f[..., None] + attn.M_AMASK + np.arange(4)] = amask.view(np.int32)
+            a32[f + attn.M_ALANE], a32[f + attn.M_BRANCH] = lanes, 0
+        self._write_words(st, np.stack(ws), cs, parts)
+        return np.stack(grs), np.stack(sus)
+
+    def _write_words(self, st: AttnStep, w: np.ndarray, cs: np.ndarray, parts: tuple[Part, ...] | None = None) -> None:
+        """The F_ATT objects' words ``w`` (per sub-step and column) and the sub-steps' slots' angles ``cs``, flushed;
+        ``parts``: (several sequences) the passes' slots are the parts' (else the sub-steps')."""
         ov = self.ov
         U = len(st.subs)
+        spans = [(a, n) for a, n, _ in st.subs]
+        if parts is not None:
+            n = [q.n for q in parts]
+            spans = [(sum(n[:u]), n[u]) for u in range(U)]
         act = ov.dev.view("ACT")
         fo = ov.fobj[st.b][:, :, :U]  # (the F_ATT objects' first words of st's buffer: [layer][column][sub-step])
         a32 = act.view(np.int32)
         a32[fo[..., None] + F_ATT_AT] = w[np.arange(U), np.arange(COLS)[:, None]]
         q0 = META + 2 * attn.HD  # (the sub-step's slots' angles, in words)
         af = act.view(np.float32)
-        for u, (a, n, _) in enumerate(st.subs):
+        for u, (a, n) in enumerate(spans):
             af[fo[..., u, None] + q0 + np.arange(64 * n)] = cs[a:a + n].reshape(-1)
         lines = np.concatenate([np.arange(0, 192, 64),
-                                4 * q0 + np.arange(0, 4 * 64 * max(n for _, n, _ in st.subs) + 64, 64)])
+                                4 * q0 + np.arange(0, 4 * 64 * max(n for _, n in spans) + 64, 64)])
         ov.dev.flush_at("ACT", 4 * fo[..., None] + lines)
 
-    def _window_words(self, st: AttnStep, p: int, cs: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-        """(a windowed spec, one pass) The F_ATT objects' words: the step's (``attn256.step_words``: no branches), each
+    def _window_words(self, st: AttnStep, parts: tuple[Part, ...], cs: dict[str, np.ndarray]
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        """(a windowed spec, one pass) The F_ATT objects' words of a step of ``parts`` (one: the step's slots at its
+        position), a pass each: the pass's (``attn256.step_words`` of its slots at its position: no branches), each
         layer kind's (a sliding-window layer's from its window's first group, its masks: ``attn256.window_words``;
-        M_KIND: the overlay's, static) and payloads (``cs``), flushed; the fills' groups per kind (gr: [kind 0 full,
-        1 swa] then ``att_words``'), the sub-steps."""
+        M_KIND: the overlay's, static) and payloads (``cs``: the pass's slots' rows), flushed; the fills' groups per
+        kind (gr: [kind 0 full, 1 swa] then ``att_words``'), the sub-steps."""
         ov = self.ov
-        U = len(st.subs)
-        assert ov.ash.one and U == 1, st.subs
+        U = len(parts)
+        assert ov.ash.one and U == len(st.subs), (parts, st.subs)
         a32, a8 = ov.dev.view("ACT").view(np.int32), ov.dev.view("ACT")
         fo = ov.fobj[st.b][:, :, :U]  # ([layer][column][sub-step])
         kinds = np.array([self.kind(L) == "swa" for L in ov.fatt])
         assert not ov.ash.spec.branch and (st.mode == "step" or kinds.all()), st.mode
-        # (a step without branches: its rows' masks, its slots' K lanes)
-        _, amask, lanes = attn.step_words(p, st.S, block=st.mode == "block")
-        a32[fo[..., None] + attn.M_AMASK + np.arange(4)] = amask.view(np.int32)
-        a32[fo + attn.M_ALANE] = lanes
-        grs, su = [], None
+        assert st.mode == "step" or U == 1, (st.mode, parts)
+        grs: tuple[list[np.ndarray], list[np.ndarray]] = ([], [])
+        sus = []
         none = (0, -1, np.zeros(4, np.uint32), np.zeros(2, np.uint32))
-        for swa in (False, True):
-            if not swa:
-                first, wrec, wm, late = none
-            elif st.mode == "insert":  # (the records' groups alone)
-                first, wrec, wm, late = (p >> 5, *none[1:])
-            else:
-                first, wrec, wm, late = attn.window_words(p, self.window, block=st.mode == "block")
-            w, gr, su = att_words(ov.ash, st.subs, p, first=first)
-            grs.append(gr)
-            sel = fo[kinds == swa]  # ([layer][column][sub-step])
-            if not sel.size:
-                continue
-            a32[sel[..., None] + F_ATT_AT] = w[np.arange(U), np.arange(COLS)[:, None]]
-            if swa:
-                a32[sel + attn.M_WREC] = wrec
-                a32[sel[..., None] + attn.M_WMASK + np.arange(4)] = wm.view(np.int32)
-                a32[sel[..., None] + attn.M_WLATE + np.arange(2)] = late.view(np.int32)
-                a32[sel + attn.M_WHOLE] = int(st.mode == "block")
-            pay = np.ascontiguousarray(cs["swa" if swa else "full"], np.uint8).reshape(-1)
-            for o in 4 * sel.reshape(-1) + 4 * META:  # (each object's payload: a slice, not an index per byte)
-                a8[o:o + pay.size] = pay
-            lines = np.concatenate([np.arange(0, 4 * META, 64), 4 * META + np.arange(0, pay.size + 64, 64)])
-            ov.dev.flush_at("ACT", 4 * sel[..., None] + lines)
-        return np.stack(grs), su
+        a = 0
+        for u, q in enumerate(parts):
+            p, n = q.position, q.n
+            f = fo[:, :, u]  # ([layer][column])
+            # (a step without branches: its rows' masks, its slots' K lanes)
+            _, amask, lanes = attn.step_words(p, n, block=st.mode == "block")
+            a32[f[..., None] + attn.M_AMASK + np.arange(4)] = amask.view(np.int32)
+            a32[f + attn.M_ALANE] = lanes
+            for swa in (False, True):
+                if not swa:
+                    first, wrec, wm, late = none
+                elif st.mode == "insert":  # (the records' groups alone)
+                    first, wrec, wm, late = (p >> 5, *none[1:])
+                else:
+                    first, wrec, wm, late = attn.window_words(p, self.window, block=st.mode == "block")
+                w, gr, su = att_words(ov.ash, ((0, n, 0),), p, first=first)
+                grs[swa].append(gr[0])
+                sel = f[kinds == swa]  # ([layer][column])
+                if not sel.size:
+                    continue
+                a32[sel[..., None] + F_ATT_AT] = w[0]
+                if swa:
+                    a32[sel + attn.M_WREC] = wrec
+                    a32[sel[..., None] + attn.M_WMASK + np.arange(4)] = wm.view(np.int32)
+                    a32[sel[..., None] + attn.M_WLATE + np.arange(2)] = late.view(np.int32)
+                    a32[sel + attn.M_WHOLE] = int(st.mode == "block")
+                pay = np.ascontiguousarray(cs["swa" if swa else "full"][a:a + n], np.uint8).reshape(-1)
+                for o in 4 * sel.reshape(-1) + 4 * META:  # (each object's payload: a slice, not an index per byte)
+                    a8[o:o + pay.size] = pay
+                lines = np.concatenate([F_LINES, 4 * META + np.arange(0, pay.size + 64, 64)])
+                ov.dev.flush_at("ACT", 4 * sel[..., None] + lines)
+            sus.append(su[0])
+            a += n
+        return np.stack([np.stack(g) for g in grs]), np.stack(sus)
 
     def patch_fills(self, words: np.ndarray, f: np.ndarray, gr: np.ndarray, kv0: int, t: dict[str, np.ndarray]) -> None:
         """The cache fills: the KV head's groups of the fill's kind (an object of a split column's new group: 2 T; a
@@ -487,29 +601,33 @@ class AttentionSteps:
         nr = t["nr"][layer]
         return np.where(nr > 0, g % np.maximum(nr, 1), g)
 
-    def _rings_from_prefill(self, p: int) -> None:
-        """Before a step at p, of each attention layer whose caches a prefill wrote last (it writes no ring): its open
-        record (p >> 3) as rows into its ring slot, from the record's V panels in the cache (their values are bf16 values:
-        exact), so that a step reads every open record from the ring."""
+    def _rings_from_prefill(self, p: int, seq: int | None = None) -> None:
+        """Before a step at p (of sequence ``seq``; None: the selected one), of each attention layer whose caches a
+        prefill wrote last (it writes no ring): its open record (p >> 3) as rows into its ring slot, from the record's V
+        panels in the cache (their values are bf16 values: exact), so that a step reads every open record from the
+        ring."""
         ov = self.ov
-        layers = [L for L in ov.fatt if L in ov.vring.from_prefill]
+        vring = ov.vring if seq is None else ov._vrings[seq]
+        layers = [L for L in ov.fatt if L in vring.from_prefill]
         if not layers:
             return
         t0 = time.perf_counter()
         r, dev, ash, T = p >> 3, ov.dev, ov.ash, ov.T
+        # (the sequence's own KV buffer; the selected one's: under its plain name)
+        name, own = ("KV", False) if seq is None else (ov.seq_name("KV", seq), True)
         if p % 8:
-            kv = dev.view("KV")
+            kv = dev.view(name, own=own)
             for L in layers:
                 nr = self.ring_groups(L)
                 g = (r // 4) % nr if nr else r // 4
                 for h in range(ash.kvh):  # (the record in its pair [d-block][record 2] of the group's V object)
                     a = ov.kv_off[L] + h * self.head_bytes(L) + attn.OBJS * g * T + T + (r % 4 // 2) * 2 * attn.REC_V
-                    dev.fetch("KV", a, 2 * attn.REC_V)
+                    dev.fetch(name, a, 2 * attn.REC_V, own=own)
                     v = block_values(kv[a:a + 2 * attn.REC_V].reshape(attn.ND, 2, 8, 9)[:, r % 2])  # ([d-block][dim][position])
                     o = ov.ring(L, h) + (r & 1) * T
                     kv[o:o + attn.ROWS_B] = np.ascontiguousarray(v.transpose(0, 2, 1), bfloat16).view(np.uint8).reshape(-1)
-                    dev.flush("KV", o, attn.ROWS_B)
+                    dev.flush(name, o, attn.ROWS_B, own=own)
         for L in layers:
-            ov.vring.slots.setdefault(L, {})[r & 1] = (r, p)
-            ov.vring.from_prefill.discard(L)
+            vring.slots.setdefault(L, {})[r & 1] = (r, p)
+            vring.from_prefill.discard(L)
         ov._once(t0)

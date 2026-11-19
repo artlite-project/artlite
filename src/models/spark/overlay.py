@@ -26,6 +26,11 @@ load the slots' residual slices (F_LOADR), then per layer
 
 and the LM head (normed: ``output_norm``) -> LOGITS. A column-major image (the 4B) streams a column's weights between two
 attentions as one run (``ModelOverlay._weight_run``), a region-major one (the 1.7B) per phase and K group.
+
+Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
+step's slots may be several sequences' (``decode.step.Part``): each attention then runs a pass per sequence over that
+sequence's cache, its rows drained into the sequence's slots of attn_out's staged x (``decode.attn256_steps``' "Several
+sequences"), and every slot's logits are those of a step of one of its sequence, bit for bit.
 """
 
 import dataclasses
@@ -37,7 +42,7 @@ from artlite import txn
 from artlite.decode import attn256 as attn
 from artlite.decode import phases as mp
 from artlite.decode.attn256 import F_ATT, KIND_FULL, KIND_SWA, M_KIND, M_WREC
-from artlite.decode.attn256_steps import AttentionSteps, AttnStep
+from artlite.decode.attn256_steps import AttentionSteps, AttnStep, pass_subs
 from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, StepKey, host_bytes, paged_formats
 from artlite.decode.protocol import (
     F_EMITR,
@@ -52,6 +57,7 @@ from artlite.decode.protocol import (
     XB,
     interleave,
 )
+from artlite.decode.step import Part
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import SparkConfig
 from artlite.operators.design import COLS
@@ -78,22 +84,24 @@ class SparkOverlay(ModelOverlay):
     ``weights``: the image's buffer allocated ahead (its image's layers and vocabulary), ``formats``, ``gu``: tile
     formats and gate / up rows per tile the design runs besides the image's (a drafter's: ``dspark.DSparkOverlay.needs``),
     ``head``: the LM rows with a drafter's head (``SparkImage``), ``image``: an image laid out already
-    (``ModelOverlay``'s)."""
+    (``ModelOverlay``'s), ``sequences``: the sequences whose caches the device holds (``ModelOverlay.select``)."""
 
     CONFIG, IMAGE = SparkConfig, SparkImage
     NORMED = frozenset(NORMS)
     AHEAD, AHEAD_PREPARED = True, False
+    SEQ = ("KV",)
 
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
-                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None):
+                 gu: tuple[int, ...] = (), head: bool = False, image: SparkImage | None = None, sequences: int = 1):
         if image is None and weights is None:
             image = SparkImage(gguf, layers=layers, vocab=vocab, head=head)
-        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image)
+        super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
         fmts = img.formats() | set(formats)
         gu = {R for r in img.regions if r.name == "gate_up" for b in r.blocks for R in (b.R, b.R2) if R} | set(gu)
-        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=8, spec=attn_spec(cfg))
+        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=8, spec=attn_spec(cfg),
+                                  passes=sequences)
         self.max_positions = self.ash.max_positions
         self.nr = ring_groups(cfg.sliding_window)
         self.period = 1  # (one pass: a step's transaction is the same at every position)
@@ -144,8 +152,8 @@ class SparkOverlay(ModelOverlay):
         self._layout = dict.fromkeys(("ACT", "NORM", "KV"), 0)
         take, ash, T = self._take, self.ash, self.T
         self.loadr = take("ACT", COLS * self.SLOTS * XB)  # [column][slot]
-        for phase in self._phases():
-            self._add_inputs(phase)
+        for phase in self._phases():  # (several sequences: attn_out's x staged, the attention's passes write it)
+            self._add_inputs(phase, staged=phase[1] == "attn_out" and ash.u > 1)
         self.norm_off: dict[tuple[int, str], int] = {}
         self.n_norm = -(-self.H // (NX_PER_NORM * OBJ_K))  # norm-weight A objects of a phase
         nw = 2 * NX_PER_NORM * OBJ_K * (self.n_norm - 1) + T  # (the last object's extent)
@@ -208,8 +216,9 @@ class SparkOverlay(ModelOverlay):
             m[M_FLAGS], m[M_KIND], m[M_WREC] = F_ATT, KIND_SWA if self.cfg.kinds[L] == "swa" else KIND_FULL, -1
             for b in range(2):
                 for c in range(COLS):
-                    o = self.fatt_object(L, c, 0, b)
-                    act[o:o + 4 * META] = m.view(np.uint8)
+                    for u in range(self.ash.u):
+                        o = self.fatt_object(L, c, u, b)
+                        act[o:o + 4 * META] = m.view(np.uint8)
 
     # ------------------------------------------------------------------
     # The transaction of a step
@@ -230,15 +239,6 @@ class SparkOverlay(ModelOverlay):
                          (self.T // 16, 4, self.T // 16, NX_PER_NORM * OBJ_K // 2))
             for o, n, dims, rep, it in mp.a_reads(region, c, gr):
                 seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
-
-    def x_slot(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int, int]:
-        """(ACT offset of input element e's k block in a phase's x of a step of S slots, the bytes left in its K group's x,
-        the K group's x bytes of a design's slots: where a sink past it starts)."""
-        sp = self._sp(S, phase)
-        for rg in self.inp[phase]:
-            if rg.k0 <= e < rg.k0 + rg.K:
-                return rg.off + XB + 2 * sp * (e - rg.k0), 2 * sp * (rg.k0 + rg.K - e), 2 * self.SLOTS * rg.K
-        raise ValueError(e)
 
     def _phase(self, seq: Sequence, phase: tuple[int, str], S: int, to: tuple[int, str] | str | None) -> None:
         """A phase of the step: per K group its weights and inputs (after the drains so far: its producers'); its
@@ -300,6 +300,15 @@ class SparkOverlay(ModelOverlay):
         """The attention's one pass: (first slot, slots, no split)."""
         return ((0, S, 0),)
 
+    def _join(self, parts: tuple[Part, ...]) -> tuple[tuple[int, int, int], ...]:
+        """(a pass per part: one transaction for every way to deal the step's slots, ``attn256_steps.pass_subs``; a
+        step of one part: that sequence's)"""
+        return self.subs(parts[0].position, parts[0].n) if len(parts) == 1 else pass_subs(len(parts))
+
+    def _joint_subs(self, S: int) -> set[tuple]:
+        """(a pattern per number of sequences in the step)"""
+        return {pass_subs(k) for k in range(2, min(S, self.sequences) + 1)}
+
     def _transaction(self, key: StepKey) -> AttnStep:
         """(the second buffer's: a copy of the first's whose F_ATT fills read that buffer's objects)"""
         if key.b and key not in self._steps:
@@ -317,11 +326,22 @@ class SparkOverlay(ModelOverlay):
         when a prefill's caches still owe the rings their rows (KV, which the running step reads)."""
         if ahead and self.vring.from_prefill & set(self.fatt):
             return False
-        pos = np.arange(p, p + st.S)
+        self.attn_steps.set_position(st, p, self._cs(np.arange(p, p + st.S)))
+        return True
+
+    def _cs(self, pos: np.ndarray) -> dict[str, np.ndarray]:
+        """The F_ATT objects' payloads of slots at positions ``pos``, per layer kind (``_set_position``)."""
         cfg = self.cfg
-        cs = {"full": cos_sin_rows(cfg.rope_theta(pos, "full")).view(np.uint8),
-              "swa": cos_sin_rows(cfg.rope_theta(pos, "swa")).astype(bfloat16).view(np.uint8)}
-        self.attn_steps.set_position(st, p, cs)
+        return {"full": cos_sin_rows(cfg.rope_theta(pos, "full")).view(np.uint8),
+                "swa": cos_sin_rows(cfg.rope_theta(pos, "swa")).astype(bfloat16).view(np.uint8)}
+
+    def _set_parts(self, st: AttnStep, parts: tuple[Part, ...], ahead: bool = False) -> bool:
+        """``_set_position`` of a step of several sequences' slots: a pass per part, by its sequence and position
+        (``AttentionSteps.set_parts``)."""
+        if ahead and any(self._vrings[q.seq].from_prefill & set(self.fatt) for q in parts):
+            return False
+        pos = np.concatenate([np.arange(q.position, q.position + q.n) for q in parts])
+        self.attn_steps.set_parts(st, parts, self._cs(pos))
         return True
 
     def _lm_phase(self, seq: Sequence) -> None:
@@ -333,10 +353,12 @@ class SparkOverlay(ModelOverlay):
     # Run
     # ------------------------------------------------------------------
 
-    def step(self, x: np.ndarray, position: int, *, logits: bool = True) -> np.ndarray | None:
+    def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 8 token slots: x (S, hidden) the first layer's inputs (embeddings) at positions
-        position .. position + S - 1 (the positions before are in the caches). Returns the slots' logits (S, vocab)
-        bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits`` None."""
+        position .. position + S - 1 of the selected sequence (the positions before are in the caches), or of several
+        sequences' slots: ``position`` their parts (``decode.step.Part``: x's rows in the parts' order, each
+        sequence's at its own next positions). Returns the slots' logits (S, vocab) bf16 (a view of the NPU's buffer,
+        valid until the next step), or without ``logits`` None."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS
@@ -347,9 +369,10 @@ class SparkOverlay(ModelOverlay):
         self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
-    def _ran(self, p: int, S: int) -> None:
+    def _ran(self, p: int, S: int, seq: int | None = None) -> None:
+        vring = self.vring if seq is None else self._vrings[seq]
         for L in self.fatt:
-            self.vring.ran(L, p, S)
+            vring.ran(L, p, S)
 
     # ------------------------------------------------------------------
     # A sequence's state

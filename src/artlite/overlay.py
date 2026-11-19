@@ -318,9 +318,9 @@ class OverlayDevice:
         """``flush_lines`` of line offsets given without repeats (int64)."""
         self.named(name).sync_lines(lines.ravel())
 
-    def fetch(self, name: str, offset: int = 0, nbytes: int | None = None) -> None:
-        """Drop the CPU's cached copy of a buffer range the NPU wrote."""
-        b = self.named(name)
+    def fetch(self, name: str, offset: int = 0, nbytes: int | None = None, *, own: bool = False) -> None:
+        """Drop the CPU's cached copy of a buffer range the NPU wrote (``own``: ``view``'s)."""
+        b = self.buffers[name] if own else self.named(name)
         b.sync_from_device(b.size - offset if nbytes is None else nbytes, offset)
 
     def address(self, name: str, offset: int = 0, *, own: bool = False) -> int:

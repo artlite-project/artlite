@@ -9,6 +9,8 @@
 - steps of S slots give each slot the logits of a step of one, bit for bit, also where a step continues from fewer
   slots than the last one ran (rejected drafts: the slots past the accepted ones hold other tokens);
 - a snapshot and its restore continue a sequence as it was (the rings' windows);
+- three sequences on one device, alternated and in joint steps (an attention pass per sequence), give each one's logits
+  alone, bit for bit;
 - the whole model, teacher-forced (slow): KL of the next-token distributions against the fp32 model next to llama.cpp's
   own (the 8-slot design's GEMV takes x as single bfp16 rows and sums its sub-blocks to bf16: N0's simulation of its
   rounding points, per layer 10-15% below the NPU's error at each point), argmax agreement.
@@ -18,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.decode.step import Part
 from artlite.gguf_model import GGUFFile
 from models.spark.overlay import SparkOverlay
 
@@ -164,3 +167,76 @@ def test_spark_npu_teacher_forced(name: str) -> None:
         print(f"{name} {len(ids)} tokens S {steps[0]}: KL {float(k.mean()):.5f} (llama.cpp {lk:.5f}) max {float(k.max()):.4f}, "
               f"argmax {agree:.4f}")
         assert float(k.mean()) < max(3e-3, 1.6 * lk) and agree > 0.95, (len(ids), steps)
+
+
+@pytest.mark.parametrize("name", ["1.7B", "4B"])
+def test_spark_overlay_sequences(name: str) -> None:
+    """Three sequences on one device (``SparkOverlay(sequences=3)``: texts of their own, at positions of their own,
+    the first past its sliding window) give, slot by slot, the logits of each sequence alone in steps of one, bit for
+    bit: alternated (``select``: a step of 1 .. 8 slots of one, then of the next) and in joint steps (``step``'s parts:
+    an attention pass per sequence, its rows of o alone; slots dealt at random, a sequence's drafts too, some of them
+    rejected, one sequence joining later)."""
+    size, quant, org = FILES[name]
+    g = ref.gguf(size, quant, org)
+    lengths = (600, 180, 140)
+    nseq = len(lengths)
+    ids = ref.essay_ids(sum(lengths) + 1, size)[1:]
+    offs = np.cumsum([0, *lengths])
+    emb = cpu.SparkCpu(g, layers=[]).emb
+    xs = [emb[torch.tensor(ids[offs[s]:offs[s + 1]])] for s in range(nseq)]
+    ov = SparkOverlay(g, layers=SLICE, vocab=VOCAB, max_positions=704, sequences=nseq)
+    ov.load()
+    want = []
+    for s in range(nseq):  # (alone, in steps of one, as sequence 0)
+        ov.select(0)
+        ov.reset()
+        want.append(_run(ov, xs[s], (1,)))
+    assert not torch.equal(want[0][:32], want[1][:32]), "the sequences' texts differ"
+
+    def check(got: torch.Tensor, at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for row, (s, p) in zip(got, at, strict=True) if not torch.equal(row, want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    def fresh() -> None:
+        for s in range(nseq):
+            ov.select(s)
+            ov.reset()
+
+    fresh()  # alternated: a step of one sequence, then of the next
+    pos, i = [0] * nseq, 0
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        s = i % nseq
+        n = min(STEPS[(i // nseq + s) % len(STEPS)], lengths[s] - pos[s])
+        i += 1
+        if n:
+            ov.select(s)
+            check(to_torch(ov.step(xs[s][pos[s]:pos[s] + n].numpy(), pos[s])).float(), [(s, pos[s] + k) for k in range(n)],
+                  "alternated")
+            pos[s] += n
+
+    fresh()  # joint steps, with rejected drafts
+    rng = np.random.default_rng(0)
+    pos, steps, deals = [0] * nseq, 0, set()
+    while any(pos[s] < lengths[s] for s in range(nseq)):
+        take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
+        spare = ov.SLOTS - len(take)
+        for t in take:  # (more slots of its own: drafts)
+            while spare and rng.random() < 0.5 and pos[t[0]] + t[1] < lengths[t[0]]:
+                t[1] += 1
+                spare -= 1
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        deals.add(tuple(n for _, n in take))
+        x, acc = [], {}
+        for s, n in take:  # (its accepted slots the text's, the rejected ones other tokens)
+            acc[s] = int(rng.integers(1, n + 1))
+            xi = xs[s][pos[s]:pos[s] + n].clone()
+            xi[acc[s]:] = emb[torch.from_numpy(rng.integers(0, 120000, n - acc[s]))]
+            x.append(xi)
+        got = to_torch(ov.step(torch.cat(x).numpy(), parts)).float()
+        a = 0
+        for s, n in take:
+            check(got[a:a + acc[s]], [(s, pos[s] + k) for k in range(acc[s])], f"step {steps}")
+            pos[s] += acc[s]
+            a += n
+        steps += 1
+    assert max(len(u) for u in deals) >= 3 and len(deals) > 20, "steps of three sequences, their slots dealt in many ways"

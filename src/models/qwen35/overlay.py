@@ -434,15 +434,6 @@ class QwenOverlay(ModelOverlay):
             for o, n, dims, rep, it in mp.a_reads(region, c, gr):
                 seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
 
-    def x_slot(self, phase: tuple[int, str], e: int, S: int) -> tuple[int, int, int]:
-        """(ACT offset of input element e's k block in a phase's x of a step of S slots, the bytes left in its K group's x,
-        the K group's x bytes of a design's slots: where a sink past it starts)."""
-        sp = self._sp(S, phase)
-        for rg in self.inp[phase]:
-            if rg.k0 <= e < rg.k0 + rg.K:
-                return rg.off + XB + 2 * sp * (e - rg.k0), 2 * sp * (rg.k0 + rg.K - e), 2 * self.SLOTS * rg.K
-        raise ValueError(e)
-
     def _phase(self, seq: Sequence, phase: tuple[int, str], S: int, to: tuple[int, str] | str | None) -> None:
         """A phase of the step: per K group its weights and inputs (after the drains so far: its producers'); its
         outputs (the last group's) -> ``to``."""

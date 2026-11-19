@@ -8,8 +8,14 @@ The chat template (the file's): every turn ``<｜start▁of▁sentence｜>`` + i
 thinking); a reply after ``<|Bot|><think>`` (thinking) or ``<|Bot|></think>``; an earlier reply keeps its thought where
 its message has ``reasoning_content`` (``preserve``, else dropped); tools as JSON lines in ``<tools>``, calls in GLM-4.5's
 syntax (``server.tools``); ``reasoning_effort`` "high" (the template's default) or "low" (``Spark.efforts``: the levels
-clients send mapped to those two)."""
+clients send mapped to those two).
 
+Several sequences (``NpuSpark(sequences=N)``): the device holds the caches of each and the model has a lane for each
+(``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
+(``models.lanes``: one stream of the weights for all of them, an attention pass per sequence). Without the DSpark
+drafter, whose records follow one sequence."""
+
+import logging
 import time
 from collections.abc import Iterator, Sequence
 
@@ -19,6 +25,7 @@ from artlite.gguf_model import GGUFFile
 from artlite.model_config import SparkConfig, spark_dspark_of
 
 from ..dspark import MarkovChain
+from ..lanes import alone
 from ..model import Model
 from ..npu_model import Checkpoint
 from ..overlay_model import OverlayModel
@@ -30,11 +37,15 @@ from .dspark import DSparkOverlay, needs
 from .overlay import SparkOverlay
 from .prefill import SIZES, SparkPrefill
 
+log = logging.getLogger("artlite")
+
 
 class NpuSpark(OverlayModel):
     """The model on the NPU. ``capacity``: the positions the full layers' caches hold; ``prefill``: prompts in chunks
     (else as decode steps), of the sizes ``sizes``; ``dspark``: a DSpark drafter's file: a generation's rounds of its
-    drafts (``dspark.DSparkOverlay``, the Markov chain on the host: ``models.dspark``).
+    drafts (``dspark.DSparkOverlay``, the Markov chain on the host: ``models.dspark``); ``sequences``: the sequences
+    the device holds, each with caches of ``capacity`` positions (``lanes``: the model of each; their generations share
+    decode steps; without a drafter).
 
     The drafter's records follow the model's: a prompt's chunks write them (``SparkPrefill(dspark=)``), after each
     committed step its rows wait (``_inj``: the step's slots and first position; their taps in the model's ACT) until the
@@ -43,26 +54,32 @@ class NpuSpark(OverlayModel):
 
     recurrent = True  # (the sliding-window layers' rings and the drafter's hold a window: a position comes back from a
     # checkpoint, ``SparkOverlay.snapshot``)
+    STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dspark", "chain")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "_inj", "_end")
+    _inj: tuple[int, int] | None = None  # (the last step's slots and first position: its rows wait for the drafter)
+    _end = 0  # (the running prompt's end)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, threads: int = 0, prefill: bool = True,
-                 sizes: tuple[int, ...] = SIZES, dspark: str | None = None):
+                 sizes: tuple[int, ...] = SIZES, dspark: str | None = None, sequences: int = 1):
+        if dspark and sequences > 1:
+            raise ValueError("several sequences: without the DSpark drafter (its records follow one sequence)")
         self.gguf = gguf
         dg = GGUFFile(dspark) if dspark else None
-        self.overlay = SparkOverlay(gguf, max_positions=capacity, **(needs(dg) if dg is not None else {}))
+        self.overlay = SparkOverlay(gguf, max_positions=capacity, sequences=sequences,
+                                    **(needs(dg) if dg is not None else {}))
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.dspark = DSparkOverlay(self.overlay, dg) if dg is not None else None
         self.chain = MarkovChain(dg) if dg is not None else None
         self.drafter = self.dspark
         self.DRAFTS = self.overlay.SLOTS - 1
-        self.STEP_COST = (1.0, 1.002, 1.006, 1.008, 1.014, 1.018, 1.02, 1.02)
         self.prefill = SparkPrefill(self.overlay, sizes=sizes, dspark=self.dspark) if prefill else None
-        self._inj: tuple[int, int] | None = None
-        self._end = 0  # (the running prompt's end)
         self._open(threads=threads)
         self._w_out = self.overlay._f32("output_norm.weight")
         gguf.release()
         self.position = 0
+        self._open_lanes()
 
     def _load_drafters(self, threads: int) -> None:
         if self.dspark is not None:
@@ -76,12 +93,14 @@ class NpuSpark(OverlayModel):
 
     def describe(self) -> str:
         ov, d = self.overlay, self.dspark
-        out = (f"{ov.image.nbytes / 1e9:.2f} GB of weights, {ov.sizes['KV'] / 1e6:.0f} MB of KV cache "
-               f"({self.capacity} positions)")
+        kv = f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache"
+        out = (f"{ov.image.nbytes / 1e9:.2f} GB of weights, "
+               f"{kv if ov.sequences == 1 else f'{ov.sequences} sequences of {kv} each'} ({self.capacity} positions)")
         if d is not None:
             out += f", DSpark drafter ({d.image.nbytes / 1e9:.2f} GB, {d.sizes['KV'] / 1e6:.0f} MB of records)"
         return out
 
+    @alone
     def reset(self) -> None:
         """Forget the cached positions."""
         self._abandon()
@@ -106,6 +125,7 @@ class NpuSpark(OverlayModel):
         x = self.prefill.hidden(n - 1)
         return self._dispatch(lambda: self.overlay.logits_of(x))
 
+    @alone
     def steps(self, tokens: list[int], *, logits: bool = True, **step: object) -> np.ndarray | None:
         """(the drafter's rows of the last step injected first; this step's after it)"""
         p = self.position
@@ -115,6 +135,7 @@ class NpuSpark(OverlayModel):
             self._inj = (len(tokens), p)
         return out
 
+    @alone
     def prompt(self, tokens: list[int], **kw: object) -> np.ndarray | None:
         """(the prompt's end: the drafter's rows its chunks write, ``_prefill_run``)"""
         self._end = self.position + len(tokens)
@@ -131,12 +152,14 @@ class NpuSpark(OverlayModel):
     def _overlays(self) -> list[SparkOverlay]:
         return [self.overlay] + ([self.dspark] if self.dspark is not None else [])
 
+    @alone
     def checkpoint(self) -> Checkpoint:
         """(the drafter's rows of the last step in first: their taps do not outlive the model's next step)"""
         self._abandon()
         self._inject()
         return super().checkpoint()
 
+    @alone
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
         self._inj = None
         super().restore(position, checkpoint)
@@ -195,6 +218,7 @@ class Spark(Model):
     (``spec_options``: auto, the one found by name; none)."""
 
     name = "Spark-X"
+    parallel = True
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
@@ -237,5 +261,10 @@ class Spark(Model):
         return Sampling(temp=s["temp"], top_k=k if k > 0 else TOP_K_ALL, top_p=s.get("top_p", 1.0),
                         repeat_penalty=s.get("penalty_repeat", 1.0), repeat_last_n=int(s.get("penalty_last_n", 64)))
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuSpark:
-        return NpuSpark(self.gguf, capacity=capacity, prefill=prefill, dspark=self.dspark)
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuSpark:
+        """(``sequences``: ``NpuSpark``'s; several: without the DSpark drafter)"""
+        if self.dspark is not None and sequences > 1:
+            log.warning("%s with %d sequences runs without its DSpark drafter (the drafter's records follow one "
+                        "sequence)", self.name, sequences)
+        return NpuSpark(self.gguf, capacity=capacity, prefill=prefill, dspark=self.dspark if sequences == 1 else None,
+                        sequences=sequences)

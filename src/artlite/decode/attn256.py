@@ -38,6 +38,13 @@ core's L1 holds none) and relays them to C: o ([head][k block][slot 8][8]: an oc
 core its merged K records of the step's first and last positions, its last core their V panels and rows (the same record
 twice when one holds both). The two emit at once: neither waits for an object of the other.
 
+Several passes (a step of several sequences' slots, ``decode.step.Part``: ``AttnShape(passes=)``, ``attn256_steps``): a pass
+per sequence, each an F_ATT object of its own with the sequence's slots as its rows 0 .. n - 1 (their q and raw K, V
+objects, its position's words, its cache on A): the cores run it as a step of that sequence alone, o's octets as they
+lie. The host puts each pass's rows at its slots: attn_out's x is staged (``decode.protocol.staged_region_bytes``: a k
+block's [slot 8][8] in a cell of twice its bytes), a pass's octets are drained into the cells from its first slot on,
+so its rows past its own land on the later passes' slots, which those write after it, or past the slots.
+
 L1: 3 octets take 25 KB of y and l, 3 KB of scores, 7 KB of Q panels; what the core reads rarely lies in the main core's
 memory (``AttnShape.ext``), which the core reads through shared memory: the main core's workspace past its residual (``EXT_W8`` bytes:
 GEMV scratch, idle while the attention runs; its next phase starts after a sync on the attention's outputs) and its sum
@@ -271,8 +278,9 @@ class AttnShape:
     memory."""
 
     def __init__(self, cfg: AttnConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
-                 slots: int = SLOTS, spec: AttnSpec = QWEN):
-        """slots: a step's slots at most (a design of 8: ``one``); spec: the model's attention (``AttnSpec``)."""
+                 slots: int = SLOTS, spec: AttnSpec = QWEN, passes: int = 1):
+        """slots: a step's slots at most (a design of 8: ``one``); spec: the model's attention (``AttnSpec``); passes:
+        (one pass) a step's passes at most (the sequences whose slots a step may hold: module docstring)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.one = slots == 8  # (module docstring "One pass")
         self.spec = spec
@@ -296,7 +304,8 @@ class AttnShape:
         self.a_bcast = tuple((c, c + 4) for c in range(COLS // 2)) if self.rounds else ()
         self.sub = SLOTS if self.rounds else self.sub1
         # (a step's sub-steps at most, a round each: one more where a sub-step of more slots than sub1 runs in two)
-        self.u = 1 if self.one else -(-(slots - 1) // self.sub) + 1 + self.rounds
+        assert passes == 1 or (self.one and passes <= slots), (passes, slots)
+        self.u = passes if self.one else -(-(slots - 1) // self.sub) + 1 + self.rounds
         self.rows = 8 * self.qc if self.one else self.sub1 * self.nph * self.qc  # (a sub-step's query rows at most)
         self.main_gates = self.one or self.rows > MAX_ROWS
         assert not (self.rounds and self.main_gates)  # (``_MAIN_SRC``: a chain's last column gates o)

@@ -57,6 +57,8 @@ META = 64  # int32 metadata words at the start of an X object
 XB = 4352  # bytes of an X object
 XPAY = XB - 4 * META  # payload bytes of an X object
 DIMS_OBJ = (XB // 8, 2, XB // 8, XPAY // 4)  # shim BD dims of X objects of XB bytes, XPAY apart (the overlapping regions)
+STAGE_PAD = 2 * (XB - XPAY)  # bytes before a staged x (``staged_region_bytes``): an input object's header as strips of cells
+STAGED_X = XB + STAGE_PAD  # bytes from a staged region's start to its x
 OBJ_K = XPAY // (2 * SLOTS)  # k of an input object (512: 64 k blocks of the slots' 8 values; 8 slots: 256, ``obj_k``)
 NX_PER_NORM = 8  # input objects per norm-weight object (8 x 512 bf16 weights; 8 slots: 16 x 256, ``nx_per_norm``)
 NORM_K = NX_PER_NORM * OBJ_K  # weights of a norm-weight object
@@ -251,6 +253,31 @@ def input_fill(K: int, sp: int = SLOTS, slots: int = SLOTS) -> tuple[int, tuple[
     object i = the XB bytes that end with x's i-th XPAY bytes (strides of XPAY, extents of XB); x of sp slots per k
     block (``packed_slots``) of a design of ``slots``."""
     return (1 + -(-n_inputs(K, slots) * sp // slots)) * XB, DIMS_OBJ
+
+
+def staged_cell(slots: int = SLOTS) -> int:
+    """Bytes of a staged x's cell: twice a k block's [slot ``slots``][8] bf16 (``staged_region_bytes``)."""
+    return 2 * 2 * slots * 8
+
+
+def staged_region_bytes(K: int, slots: int = SLOTS) -> int:
+    """Bytes of a phase's input in DDR whose x is staged: [metadata object | STAGE_PAD bytes | x: [k block K / 8]
+    [cell]], a cell [slot ``slots``][8] bf16 and as many bytes past it. Several producers each write whole k blocks'
+    [slot][8] into the cells from a slot of their own on (the attention's passes of a step of several sequences,
+    ``decode.attn256``): what they write past their own slots lands on the later producers' slots, which those write
+    after it, or past the slots. The X fill reads the cells' first halves (``staged_fill``); x's first cell is
+    ``STAGED_X`` bytes into the region."""
+    return STAGED_X + staged_cell(slots) * (K // 8)
+
+
+def staged_fill(K: int, slots: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
+    """(bytes, shim BD dims) of the X fill of a staged x's input objects, from XB bytes into its region on (after the
+    metadata object, a fill of its own): object i the XB bytes that end with x's i-th XPAY bytes, read as strips of a k
+    block's bytes a cell apart (its first strips, the header: whatever the cells before hold, STAGE_PAD bytes of them
+    before x), the objects XPAY of x apart."""
+    kb = staged_cell(slots) // 2
+    assert XB % kb == 0 and XPAY % kb == 0, (slots, kb)
+    return n_inputs(K, slots) * XB, (kb // 4, XB // kb, 2 * kb // 4, XPAY // kb * 2 * kb // 4)
 
 
 def post_region_bytes(K: int) -> int:
