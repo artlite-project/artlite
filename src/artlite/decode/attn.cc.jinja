@@ -363,6 +363,7 @@ __attribute__((noinline)) aie::vector<bfloat16, 32> {{ p }}_gmax(const float __a
                                                                  aie::vector<bfloat16, 32> mg, int n)
 {
     AIE_LOOP_MIN_ITERATION_COUNT(1)
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)
     for (int r = 0; r < n; r++) {
         mg = aie::max(mg, aie::accum<accfloat, 32>(aie::load_v<32>(ss)).template to_vector<bfloat16>());
         ss += 32;

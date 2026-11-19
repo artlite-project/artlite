@@ -29,7 +29,8 @@ from __future__ import annotations
 
 from .fn import Fn, check, make
 
-PRAGMAS = {"": "", "min1": "AIE_LOOP_MIN_ITERATION_COUNT(1)"}  # (min1: no hardware loop: smaller, slower)
+# (min1: no hardware loop: smaller, slower; older Peano reads the minimum of 1 that way, newer only the hint)
+PRAGMAS = {"": "", "min1": "AIE_LOOP_MIN_ITERATION_COUNT(1) AIE_LOOP_HINT(enable-aie-hardware-loops, 0)"}
 
 
 def _tag(eps: float) -> str:

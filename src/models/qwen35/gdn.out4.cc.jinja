@@ -33,6 +33,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
     const int l0 = 8 * t0, l1 = 8 * ((t0 + 1) & 7), l2 = 8 * ((t0 + 2) & 7), l3 = 8 * ((t0 + 3) & 7);
     AIE_LOOP_NO_UNROLL
     AIE_LOOP_MIN_ITERATION_COUNT(1)
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)
     for (int kb = 0; kb < 16; kb++) {
         const float *__restrict ok = o + 64 * kb;
         const aie::vector<float, 32> ov = al::concat(aie::load_v<8>(ok + l0), aie::load_v<8>(ok + l1), aie::load_v<8>(ok + l2), aie::load_v<8>(ok + l3));

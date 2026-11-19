@@ -35,6 +35,7 @@ void {{ p }}_gout(int32_t *__restrict ws, bfloat16 *__restrict d)
     const aie::vector<float, 64> iv = al::bcast8(aie::shuffle_down_rotate(aie::load_v<8>(GW(float, {{ g.xy }}) + 64), t0));
     AIE_LOOP_NO_UNROLL
     AIE_LOOP_MIN_ITERATION_COUNT(1)
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)
     for (int kb = 0; kb < 16; kb++) {
         const float *__restrict ok = o + 64 * kb;
         aie::vector<float, 64> ov;

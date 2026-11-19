@@ -287,8 +287,9 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   split such code across ops or cores). `minsize` turns loop rotation off: a `for` loop stays two blocks (its test
   at the top, the delay slots of its `jnz` and of the jump into it empty), no ZOL, ~7 cycles more per iteration. A loop whose ZOL is too big
   (post-pipelined, or a short body padded to the ZOL's 112 B from setup to loop end) takes
-  `AIE_LOOP_MIN_ITERATION_COUNT(1)` without `minsize` instead (`gout`, `norm_rope`, `qpan`): no hardware loop, one
-  block, its `jnz` delay slots filled from the body, smaller and faster than `minsize`. A constant loop of 2-4 trips
+  `AIE_LOOP_MIN_ITERATION_COUNT(1)` and `AIE_LOOP_HINT(enable-aie-hardware-loops, 0)` without `minsize` instead
+  (`gout`, `norm_rope`, `qpan`; older Peano reads the minimum of 1 as no hardware loop, newer only the hint): no
+  hardware loop, one block, its `jnz` delay slots filled from the body, smaller and faster than `minsize`. A constant loop of 2-4 trips
   that Peano left rolled (a pipelined ZOL: loop-hints.md) takes `AIE_LOOP_UNROLL_FULL`: the MoE `collect`'s partial
   sums 160 B and 21 cycles less; vector compares against a lane-index table instead of 64-bit mask arithmetic;
   runtime parameters instead of template instances (each instance is a copy: one dequant routine with a runtime
