@@ -66,10 +66,11 @@ whose windows do not fit the cores' memory), for 3-9% more bytes written. Strix 
 
 On Linux, Artlite's host buffers of 2 MB or more are the process's own memory with 2 MB pages (transparent huge pages,
 `madvise` or `always`; `artlite-probe` prints `host buffers: 2 MB pages`), weights and activations alike. Windows maps
-system memory for the NPU in 4 KB pages: its video memory manager manages system memory in 4 KB pages only
-([GPU virtual address](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-virtual-address)), and
-large pages for an application need a privilege (`SeLockMemoryPrivilege`) and would not change those page tables. The
-probe rows on both Windows laptops behave as Strix Halo's with 4 KB pages, at about half its rate.
+system memory for the NPU in 4 KB pages: its video memory manager uses larger pages for system memory only where the
+device's driver declares them
+([`DXGK_GPUMMUCAPS`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_gpummucaps)),
+and the NPU's driver does not; an application's large pages (`MEM_LARGE_PAGES`) do not change that. The probe rows on
+both Windows laptops behave as Strix Halo's with 4 KB pages, at about half its rate.
 
 What a page visit costs, measured on Strix Halo with 4 KB and with 2 MB pages (16 channels unless noted; 256-byte rows,
 one per page, 4 KB + 256 B apart, so that neighbouring rows' page-table entries are neighbours too; millions of rows
@@ -129,6 +130,11 @@ A 1024-token prefill chunk of Llama 3.2 1B Q4_K_M visits 7.5 million pages:
 
 At Windows' 50-80 million a second that is ~95-150 ms of a chunk whose work takes ~105 ms on Strix Halo: most of the
 prefill's ~2x gap on Windows. As streams, the chunk's 4.6 GB would need ~1.1 million page visits.
+
+Larger pages would remove most of them: the same chunk visits 1.7 million 64 KB pages, 0.22 million 2 MB pages. The
+NPU's DMA is PASID-tagged, and AMD's IOMMU translates such traffic with 4 KB, 2 MB or 1 GB pages only; on Linux a
+driver-built IOMMU mapping in 2 MB pages runs every `--pages` row at the full rate. 2 MB pages from the Windows driver
+are requested in [amd/xdna-driver#1817](https://github.com/amd/xdna-driver/issues/1817).
 
 Decode reads each column's weights as one stream and pays little (Krackan Point on Windows reads 81 GB/s as a stream
 against 97 on Linux).
