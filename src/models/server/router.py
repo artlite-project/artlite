@@ -19,12 +19,15 @@ the feed ``GET /models/sse``): unloaded (``failed`` and its ``exit_code`` when i
 crashed), loading - with the share of its last load's time passed (``progress``) - and loaded.
 
 Requests: the routes of a model (``/v1/chat/completions``, ``/completion``, ``/tokenize``, ..., the readouts'
-``/v1/embeddings``, ``/v1/rerank``, ``/v1/systemone``, ..., ``/props?model=``, ``/slots``) go to the server of the
-model their ``model`` field or parameter names (an id, an alias or the file's path; none: the one model running),
-their responses stream back as they come (``Proxied``; ``/props?model=`` with the router's ``ui``: the web UI leaves
-out the models whose props say they have none); a client that goes away closes the model server's response, which
-cancels its generation. The UI's Stop (``DELETE /v1/stream?conv_id=``) goes to the server of the conversation's last
-request (``X-Conversation-Id``), or cancels the request still waiting for its model.
+``/v1/embeddings``, ``/v1/rerank``, ``/v1/systemone``, ..., the audio's ``/v1/audio/transcriptions`` and
+``/v1/audio/speech``, ``/props?model=``, ``/slots``) go to the server of the model their ``model`` field (JSON or a
+form's) or parameter names (an id, an alias or the file's path; none: the one model running), their responses stream
+back as they come (``Proxied``; ``/props?model=`` with the router's ``ui``: the web UI leaves out the models whose
+props say they have none); a client that goes away closes the model server's response, which cancels its
+generation. The realtime websocket (``/v1/realtime?model=``: the web UI's voice input) is relayed to the model's
+server message by message (``Router.relay``); a model that cannot be had is an error event. The UI's Stop (``DELETE
+/v1/stream?conv_id=``) goes to the server of the conversation's last request (``X-Conversation-Id``), or cancels the
+request still waiting for its model.
 Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
 and with --models-max above 1 its default prompt cache takes its part of the RAM (``settings.ROUTER_MODELS``).
 Models loaded together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
@@ -52,13 +55,16 @@ from typing import Any
 import anyio
 import httpx
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import HTTPConnection
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import WebSocketException
 
 from artlite import portable, settings
 
 from . import cli_options
-from .app_base import NO_CACHE, CancellingResponse, add_ui, add_unsupported, key_check, new_app, sse
+from .app_base import NO_CACHE, CancellingResponse, add_ui, add_unsupported, key_check, key_valid, new_app, sse
 from .catalog import Catalog, Entry, read_preset
 from .errors import ApiError, bad_request
 from .listing import architecture, model_entries, model_meta
@@ -66,11 +72,13 @@ from .process import Server, listen
 
 log = logging.getLogger("artlite.server")
 
-# the routes of a model: POST by the body's "model", GET by the "model" parameter
+# the routes of a model: POST by the body's "model" (JSON or a form's), GET and the websocket by the "model" parameter
 POSTED = ["/v1/chat/completions", "/chat/completions", "/v1/chat/completions/control", "/v1/completions", "/completion", "/completions", "/tokenize",
           "/detokenize", "/apply-template", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses",
           "/responses", "/v1/responses/input_tokens", "/responses/input_tokens", "/v1/embeddings", "/embeddings",
-          "/embedding", "/v1/rerank", "/rerank", "/reranking", "/v1/reranking", "/classify", "/v1/systemone"]
+          "/embedding", "/v1/rerank", "/rerank", "/reranking", "/v1/reranking", "/classify", "/v1/systemone",
+          "/v1/audio/transcriptions", "/audio/transcriptions", "/v1/audio/speech", "/audio/speech", "/tts"]
+FORMS = ("multipart/form-data", "application/x-www-form-urlencoded")
 CONVERSATIONS = 1024  # conversations whose model the router remembers (the UI's Stop)
 PROGRESS_S = 0.5  # seconds between a load's progress events
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer",
@@ -558,10 +566,8 @@ class Router:
             e.set()
         return len(events)
 
-    async def forward(self, request: Request, inst: Instance, body: bytes | None) -> Response:
-        """The request to the model's server; its response, streamed through (``Proxied``)."""
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in REQUEST_DROP} | inst.headers
-        url = inst.url + request.url.path + (f"?{request.url.query}" if request.url.query else "")
+    def hold(self, inst: Instance) -> Callable[[], None]:
+        """A request running at the model's server (it is not stopped under one); the function that ends it."""
         inst.requests += 1
         inst.last_used = time.monotonic()
 
@@ -570,6 +576,13 @@ class Router:
             inst.last_used = time.monotonic()
             self._change()
 
+        return done
+
+    async def forward(self, request: Request, inst: Instance, body: bytes | None) -> Response:
+        """The request to the model's server; its response, streamed through (``Proxied``)."""
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in REQUEST_DROP} | inst.headers
+        url = inst.url + request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        done = self.hold(inst)
         try:
             r = await self.client.send(self.client.build_request(request.method, url, headers=headers, content=body),
                                        stream=True)
@@ -577,6 +590,40 @@ class Router:
             done()
             raise ApiError(502, "server_error", f"{inst.entry.id}: its server did not answer ({e})") from None
         return Proxied(r, done)
+
+    async def relay(self, ws: WebSocket, inst: Instance) -> None:
+        """An accepted websocket (``/v1/realtime``) to the same route of the model's server: the messages both ways
+        until either side closes, then the other (the model server's close code; 1011: it went away)."""
+        url = "ws" + inst.url.removeprefix("http") + ws.url.path + (f"?{ws.url.query}" if ws.url.query else "")
+        done = self.hold(inst)
+        code, reason = 1011, "the model's server did not answer"
+        try:
+            async with ws_connect(url, additional_headers=inst.headers, max_size=None, ping_interval=None,
+                                  compression=None) as up:
+
+                async def client() -> None:
+                    while (m := await ws.receive())["type"] != "websocket.disconnect":
+                        await up.send(m["text"] if m.get("text") is not None else m.get("bytes") or b"")
+
+                async def server() -> None:
+                    async for m in up:
+                        await (ws.send_text(m) if isinstance(m, str) else ws.send_bytes(m))
+
+                tasks = [asyncio.ensure_future(t()) for t in (client, server)]
+                try:
+                    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            if up.close_code not in (None, 1005, 1006):  # (1005, 1006: no close frame, which the client cannot get)
+                code, reason = up.close_code, up.close_reason or ""
+        except (OSError, WebSocketException) as e:
+            log.warning("%s: its realtime websocket failed (%s)", inst.entry.id, e)
+        finally:
+            done()
+        with contextlib.suppress(RuntimeError, OSError, WebSocketDisconnect):  # (the client left first)
+            await ws.close(code=code, reason=reason)
 
 
 class Proxied(CancellingResponse):
@@ -617,12 +664,13 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
     public = APIRouter()
     api = APIRouter(dependencies=[Depends(key_check(options.api_keys))])
 
-    def autoload(request: Request) -> bool:
+    def autoload(request: HTTPConnection) -> bool:
         value = request.query_params.get("autoload")
         return router.autoload if value is None else value.lower() in ("1", "true")
 
-    async def instance(request: Request, name: str | None) -> Instance:
-        """The server of a request's model once it is loaded (module docstring)."""
+    async def instance(request: HTTPConnection, name: str | None) -> Instance:
+        """The server of a request's model once it is loaded (module docstring); a websocket waits for it whatever
+        its client does meanwhile."""
         await router.scanned.wait()
         entry = router.find(name)
         conv_id = request.headers.get("x-conversation-id")
@@ -630,7 +678,7 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
         with router.parking(conv_id) as stop:
 
             async def cancelled() -> bool:
-                return stop.is_set() or await request.is_disconnected()
+                return stop.is_set() or (isinstance(request, Request) and await request.is_disconnected())
 
             try:
                 inst = await router.ensure(entry, load=autoload(request), cancelled=cancelled)
@@ -737,11 +785,18 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
 
     async def posted(request: Request) -> Response:
         body = await request.body()
-        try:
-            data = json.loads(body) if body else {}
-        except ValueError:
-            raise bad_request("the request body is not JSON") from None
-        name = data.get("model") if isinstance(data, dict) else None
+        if request.headers.get("content-type", "").split(";")[0].strip().lower() in FORMS:
+            try:
+                async with request.form() as form:  # (the body read above, parsed again)
+                    name = form.get("model")
+            except (AssertionError, ValueError) as e:  # (python-multipart's errors)
+                raise bad_request(f"the request's form: {e}") from None
+        else:
+            try:
+                data = json.loads(body) if body else {}
+            except ValueError:
+                raise bad_request("the request body is not JSON") from None
+            name = data.get("model") if isinstance(data, dict) else None
         return await route(request, name if isinstance(name, str) else None, body)
 
     for path in POSTED:
@@ -778,6 +833,22 @@ def create_router_app(router: Router, options: RouterOptions) -> FastAPI:
     @api.post("/v1/streams/lookup")
     async def lookup_streams() -> list[Any]:
         return []
+
+    @public.websocket("/v1/realtime")
+    async def realtime(ws: WebSocket) -> None:
+        """OpenAI's realtime API at the model's server (``?model=``); a model that cannot be had: an error event."""
+        if not key_valid(options.api_keys, ws.headers.get("authorization"), ws.headers.get("x-api-key")):
+            await ws.close(code=1008, reason="Invalid API Key")
+            return
+        await ws.accept()
+        try:
+            inst = await instance(ws, ws.query_params.get("model"))
+        except ApiError as e:
+            with contextlib.suppress(RuntimeError, OSError, WebSocketDisconnect):  # (the client left)
+                await ws.send_text(json.dumps({"type": "error", **e.body()}))
+                await ws.close()
+            return
+        await router.relay(ws, inst)
 
     add_unsupported(api)
     app.include_router(public)

@@ -33,7 +33,8 @@ from artlite.operators.toolchain import CACHE_DIR
 TAG = "b12588"
 SHA256 = "071451d62e20fc4479b58e481fc5f9892dcb71d495dcc00c788040e632e803f6"
 URL = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/{tag}/dist.tar.gz?download=true"
-UNCACHED = ("index.html", "sw.js", "build.json", "_app/version.json")  # (the UI checks them for updates)
+# (the UI checks them for updates; sw.js: older builds' worker, which unregisters itself)
+UNCACHED = ("index.html", "service-worker.js", "sw.js", "build.json", "_app/version.json")
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 

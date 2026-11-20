@@ -8,12 +8,14 @@ start). Serving the fake models with the web UI, for a manual check of its model
 """
 
 import argparse
+import base64
 import contextlib
 import json
 import os
 import sys
 import threading
 import time
+import types
 from collections.abc import Iterator
 
 import httpx
@@ -21,13 +23,17 @@ import numpy as np
 import pytest
 import uvicorn
 from gguf import GGMLQuantizationType, GGUFWriter
+from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, InvalidStatus
+from websockets.sync.client import connect as ws_connect
 
 from artlite import settings
+from models.lfm3a.host import wav_bytes
 from models.server import catalog as catalog_module
 from models.server import ui
 from models.server.catalog import Catalog, read_preset, render
 from models.server.cli_options import arg_parser
 from models.server.process import listen
+from models.server.realtime import TRANSCRIPTION_EVENT as TRANSCRIPTION
 from models.server.router import Router, RouterOptions, create_router_app
 
 CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
@@ -497,6 +503,60 @@ def test_router_readouts(models_dir: str, tmp_path: object) -> None:
             assert r.status_code == 501, (path, r.status_code, r.text)  # (A's server's, not the router's 404)
 
 
+def test_router_audio(models_dir: str, tmp_path: object) -> None:
+    """The audio routes go to the model they name: a transcription by its form's model, speech by its body's, the
+    realtime websocket by its ?model= (the web UI's voice input), relayed both ways; a model that cannot be had is an
+    error event; the router's API key."""
+    write_gguf(f"{models_dir}/org/au-GGUF/audio-Q4_0.gguf")
+    A, AU = "org/a-GGUF:Q4_0", "org/au-GGUF:Q4_0"
+    wav = wav_bytes(np.full(1600, 0.25, np.float32))
+    pcm = base64.b64encode((np.full(1600, 0.25) * 32768).astype("<i2").tobytes()).decode()
+    with live_router(models_dir, tmp_path, spare=False) as (url, router):
+        ws_url = "ws" + url.removeprefix("http") + "/v1/realtime?intent=transcription"
+        r = httpx.post(f"{url}/v1/audio/transcriptions", files={"file": ("a.wav", wav, "audio/wav")},
+                       data={"model": AU}, timeout=60)  # (autoload by the form's model)
+        assert r.status_code == 200 and r.json()["text"] == "audio-Q4_0", r.text
+        r = httpx.post(f"{url}/audio/transcriptions", files={"file": ("a.wav", wav, "audio/wav")}, timeout=60)
+        assert r.status_code == 200 and r.json()["text"] == "audio-Q4_0", r.text  # (no model: the one running)
+        r = httpx.post(f"{url}/v1/audio/transcriptions", files={"file": ("a.wav", wav)}, data={"model": "nope"})
+        assert r.status_code == 400 and "not found" in r.json()["error"]["message"]
+        r = httpx.post(f"{url}/v1/audio/speech", json={"model": AU, "input": "hi"}, timeout=60)
+        assert r.status_code == 501 and "speech output" in r.json()["error"]["message"]  # (the model server's)
+        with ws_connect(f"{ws_url}&model={AU}") as ws:
+            assert json.loads(ws.recv())["session"]["type"] == "transcription"
+            assert router.instances[AU].requests == 1  # (a model is not stopped under its session)
+            ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": pcm}))
+            ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            evs = [json.loads(ws.recv()) for _ in range(3)]
+            assert [e["type"] for e in evs] == ["input_audio_buffer.committed", TRANSCRIPTION + ".delta",
+                                                TRANSCRIPTION + ".completed"]
+            assert evs[-1]["transcript"] == "audio-Q4_0"
+        t0 = time.monotonic()
+        while router.instances[AU].requests:
+            assert time.monotonic() - t0 < 5
+            time.sleep(0.02)
+        with ws_connect(f"{ws_url}&model=nope") as ws:
+            ev = json.loads(ws.recv())
+            assert ev["type"] == "error" and "not found" in ev["error"]["message"]
+            with pytest.raises(ConnectionClosed):
+                ws.recv()
+        with ws_connect(f"{ws_url}&model={A}") as ws:  # (A's server: no speech encoder, an error, then its close)
+            ev = json.loads(ws.recv())
+            assert ev["type"] == "error" and "does not support realtime transcription" in ev["error"]["message"]
+            with pytest.raises(ConnectionClosedOK):
+                ws.recv()
+        assert list(router.instances) == [A]
+    with live_router(models_dir, tmp_path, spare=False, api_keys=frozenset({"secret"})) as (url, router):
+        ws_url = "ws" + url.removeprefix("http") + "/v1/realtime?intent=transcription"
+        with pytest.raises(InvalidStatus) as e:  # (refused before the handshake, as a model's server refuses it)
+            ws_connect(f"{ws_url}&model={AU}")
+        assert e.value.response.status_code == 403
+        r = httpx.post(f"{url}/v1/audio/transcriptions", files={"file": ("a.wav", wav)}, data={"model": AU})
+        assert r.status_code == 401
+        with ws_connect(f"{ws_url}&model={AU}", additional_headers={"Authorization": "Bearer secret"}) as ws:
+            assert json.loads(ws.recv())["session"]["type"] == "transcription"
+
+
 def test_router_reload(models_dir: str, tmp_path: object) -> None:
     """GET /v1/models?reload=1: a new file is listed; a running model whose file changed stops; the feed says so."""
     A = "org/a-GGUF:Q4_0"
@@ -520,7 +580,7 @@ def fake_child() -> None:
     """``models.server.child`` with the fake model of ``fakes``: it replies with its file's name (and " mmproj" with a
     vision encoder); ``fail-*`` fails to load, ``waitload-*`` takes 3 s, ``slow-*`` replies with 2000 more words, 5 ms
     each."""
-    from fakes import FakeModel, FakeNpu
+    from fakes import FakeAudio, FakeModel, FakeNpu
 
     from models.server import child, main
 
@@ -537,12 +597,17 @@ def fake_child() -> None:
             npu.replies = [words] * 1000
             return npu
 
+    class AudioModel(FileModel, FakeAudio):  # (a speech encoder without live ASR: commits transcribed alone)
+        def __init__(self, path: str, options: dict):
+            super().__init__(path, options)
+            self.gguf = types.SimpleNamespace(meta={})
+
     def open_model(path: str, **options: object) -> FileModel:
         if os.path.basename(path).startswith("fail"):
             raise NotImplementedError(f"{os.path.basename(path)}: no kernels for it")
         if os.path.basename(path).startswith("waitload"):
             time.sleep(3)
-        return FileModel(path, options)
+        return (AudioModel if os.path.basename(path).startswith("audio") else FileModel)(path, options)
 
     main.open_model = open_model
     child.main()

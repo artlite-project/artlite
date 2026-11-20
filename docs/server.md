@@ -546,8 +546,9 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   failed), `loading`, `loaded`; `?reload=1` reads the directory again, and a running model whose file changed
   unloads. `POST /models/load` and `/models/unload` take `{"model": ...}` (an unload cancels the model's running
   request); `GET /models/sse` streams the status changes. `/props` describes the router (`role: router`);
-  `/props?model=`, `/slots?model=` and the requests go to the model they name, or without a name to the one model
-  loaded; `?autoload=false` does not load it.
+  `/props?model=`, `/slots?model=` and the requests go to the model they name (a transcription's form field
+  `model`; the realtime websocket's `?model=`), or without a name to the one model loaded; `?autoload=false` does not
+  load it.
 
 `--models-preset FILE` sets options per model and adds models from elsewhere, in llama-server's INI format:
 
