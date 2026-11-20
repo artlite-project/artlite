@@ -82,6 +82,7 @@ ARTLITE_BACKEND=xrt pytest tests -m smoke                           # the same o
 pytest tests --run-slow ...                                         # also the whole-model tests
 pytest tests --dump-designs DIR                                     # render every design, no NPU
 python -m tests.schedule_ledger record [APP ...] [--update]          # the apps' kernel schedules vs the baseline, no NPU
+python -m tests.schedule_ledger rank APP [-p 1024]                  # a prefill chunk's loops by weight and slack, no NPU
 ruff check <changed files>                                          # the tree passes: fix all it reports
 cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests -j \
   && ctest --test-dir build-tests                                   # C++ runtime gtests (NPU)
@@ -249,7 +250,9 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   resource bound), call cycles, code bytes, stack and its cores' program memory against `tests/schedule_ledger.jsonl`.
   A change of kernel code or of the toolchain refreshes it in the same commit (`python -m tests.schedule_ledger record
   APP ... --update`; the commit's diff of the file is the change's effect); `record` alone prints the differences
-  worst first (lost pipelining, II / spills up, cores below 256 B free): a toolchain bump's survey.
+  worst first (lost pipelining, II / spills up, cores below 256 B free): a toolchain bump's survey. `rank APP`: a
+  prefill chunk's kinds of items by their busiest cores' static cycles and its loops by weight and by slack (II above
+  the resource bound): which kernel work a session can win back.
 - Host-side refactoring check (the overlays' step building and patching, metadata and command writes, weight
   packing): `python tests/txn_dump.py DIR` before and after, then `python tests/txn_dump.py --diff BEFORE AFTER` (every
   app's decode overlay and media encoder on a fake device, no NPU: per dispatch the transaction's words and the host

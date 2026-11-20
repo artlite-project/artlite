@@ -1,12 +1,13 @@
 """The schedule ledger: the loop schedules, call cycles, code bytes and stack of every kernel the apps ship, and the
 program memory of their cores, as rows of a committed baseline (``schedule_ledger.jsonl``) that
 ``test_app_designs.py`` checks app by app. The apps are ``apps.py``'s (what the models run); a toolchain bump's survey
-is ``record`` against the baseline.
+is ``record`` against the baseline; ``rank`` weights an app's loops by their executions in a prefill chunk.
 
     python -m tests.schedule_ledger record [APP ...]            # the apps present (or those named) against the baseline
     python -m tests.schedule_ledger record [APP ...] --update   # their rows into the baseline (other apps' rows kept)
     python -m tests.schedule_ledger record [APP ...] --out FILE
     python -m tests.schedule_ledger diff BASE NEW               # two ledgers
+    python -m tests.schedule_ledger rank APP [-p TOKENS]        # a prefill chunk's kinds of items and loops by weight
 
 Rows, one JSON object per line, sorted; a function or core row lists the apps it holds for:
 
@@ -29,8 +30,18 @@ do not change) and across a change of shared kernel code (names lose their hashe
 name with other code under one key in one app (arguments the detail does not show) keeps its hash.
 
 Measurements are cached (``CACHE_DIR/ledger``) by translation unit, compile command, precompiled header (the headers'
-key), toolchain versions and the sources of this module and measure_ii; core rows by build directory (named by content).
-A warm ledger costs the apps' construction (their builds cached).
+key), toolchain versions, measure_ii's sources and this module's extraction; core rows by build directory (named by
+content). A warm ledger costs the apps' construction (their builds cached).
+
+Weights (``rank``, ``chunk_weights``): a prefill chunk's items are static (``runlists``), and each item's design runs
+one pass of its cores' main loops, whose bounds and branches are constants or arithmetic on the chunk's scratchpad
+parameters: ``core_calls`` evaluates them (the MLIR's scf / arith ops) to the kernel calls of each core, times
+measure_ii's call cycles. Against the NPU's busy cycles per core (ACTIVE - LOCK_STALL - STREAM_STALL, every item alone)
+on Qwen3.5 9B's 1024-token chunk the sum of the cells' errors was 11% of the busy cycles, mostly the memory stalls the
+static cycles leave out; a kernel whose branches measure_ii counts on both paths (the prefill attentions) is an upper
+bound (1.9x there), shown as each kind's ``upper`` share. A loop's slack, (II - resource bound) x its weight, is what a
+better schedule could save; a loop at its bound only gets faster with fewer operations. The decode overlays' cores run
+what the host's commands say (loop bounds from data): their weights are counted on the NPU (``decode_weights``).
 """
 
 import argparse
@@ -42,10 +53,11 @@ import os
 import re
 import shutil
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from typing import Any
 
 import pytest
 
@@ -438,6 +450,250 @@ def record(apps: Iterable[str], *, log: bool = True) -> Ledger:
     return _ledger(parts, log=log)
 
 
+# Weights: a prefill chunk's calls -----------------------------------------------------------------------------------
+
+_BIN = {
+    "arith.addi": lambda a, b: a + b, "arith.subi": lambda a, b: a - b, "arith.muli": lambda a, b: a * b,
+    "arith.divsi": lambda a, b: int(a / b) if b else None, "arith.divui": lambda a, b: a // b if b else None,
+    "arith.floordivsi": lambda a, b: a // b if b else None, "arith.ceildivsi": lambda a, b: -(-a // b) if b else None,
+    "arith.ceildivui": lambda a, b: -(-a // b) if b else None,
+    "arith.remsi": lambda a, b: a - b * int(a / b) if b else None, "arith.remui": lambda a, b: a % b if b else None,
+    "arith.maxsi": max, "arith.minsi": min, "arith.maxui": max, "arith.minui": min,
+    "arith.andi": lambda a, b: a & b, "arith.ori": lambda a, b: a | b, "arith.xori": lambda a, b: a ^ b,
+    "arith.shli": lambda a, b: a << b, "arith.shrsi": lambda a, b: a >> b, "arith.shrui": lambda a, b: a >> b,
+}
+_CMP = (lambda a, b: a == b, lambda a, b: a != b, lambda a, b: a < b, lambda a, b: a <= b, lambda a, b: a > b,
+        lambda a, b: a >= b, lambda a, b: a < b, lambda a, b: a <= b, lambda a, b: a > b, lambda a, b: a >= b)
+_CAST = {"arith.index_cast", "arith.index_castui", "arith.extsi", "arith.extui", "arith.trunci"}
+_ITERATED = 1 << 16  # iterations walked one by one at most (a loop whose body's control depends on its index)
+
+
+def _int(attr: object) -> int | None:
+    s = str(attr)
+    if s in ("true", "false"):
+        return int(s == "true")
+    m = re.match(r"-?\d+", s)
+    return int(m.group(0)) if m else None
+
+
+class _Calls:
+    """The kernel calls of one run of a core body (``core_calls``): ``calls`` per function, ``unknown`` the walks that
+    met control on a value unknown here (data, a call's result)."""
+
+    def __init__(self, params: dict[str, int]):
+        self.params = params
+        self.calls: Counter[str] = Counter()
+        self.unknown = 0
+
+    def block(self, block: Any, env: dict, mult: int) -> None:
+        for op in block.operations:
+            self.op(op, env, mult)
+
+    def op(self, op: Any, env: dict, mult: int) -> None:
+        name = op.operation.name
+        val = env.get
+        if name == "arith.constant":
+            env[op.results[0]] = _int(op.attributes["value"])
+        elif name == "aiex.read_scratchpad_parameter":
+            env[op.results[0]] = self.params.get(str(op.attributes["parameter"]).lstrip("@"))
+        elif name in _BIN:
+            a, b = (val(x) for x in op.operands)
+            env[op.results[0]] = None if a is None or b is None else _BIN[name](a, b)
+        elif name in _CAST:
+            env[op.results[0]] = val(op.operands[0])
+        elif name == "arith.cmpi":
+            a, b = (val(x) for x in op.operands)
+            env[op.results[0]] = None if a is None or b is None else int(_CMP[_int(op.attributes["predicate"])](a, b))
+        elif name == "arith.select":
+            c, a, b = (val(x) for x in op.operands)
+            env[op.results[0]] = None if c is None else (a if c else b)
+        elif name == "func.call":
+            self.calls[str(op.attributes["callee"]).lstrip("@")] += mult
+        elif name == "scf.if":
+            c = val(op.operands[0])
+            if c is None:
+                self.unknown += 1
+            elif (region := op.regions[0 if c else 1]).blocks:
+                self.block(region.blocks[0], env, mult)
+        elif name == "scf.for":
+            self.loop(op, env, mult)
+        elif name == "scf.while":  # (a core's main loop, while (true): one run is one pass of its body)
+            before = op.regions[0].blocks[0]
+            ops = list(before.operations)
+            self.block(before, env, mult)
+            if len(ops) == 2 and val(ops[-1].operands[0]) == 1:
+                self.block(op.regions[1].blocks[0], env, mult)
+            else:
+                self.unknown += 1
+        for r in op.results:
+            env.setdefault(r, None)
+
+    def loop(self, op: Any, env: dict, mult: int) -> None:
+        lb, ub, step = (env.get(x) for x in op.operands[:3])
+        body = op.regions[0].blocks[0]
+        if lb is None or ub is None or not step:
+            self.unknown += 1
+            return
+        trips = max(0, -(-(ub - lb) // step))
+        if not trips:
+            return
+        probe = _Calls(self.params)  # (the body once with an unknown index: its calls if its control does not need it)
+        probe.block(body, dict(env) | dict.fromkeys(body.arguments), 1)
+        if not probe.unknown:
+            for f, n in probe.calls.items():
+                self.calls[f] += n * trips * mult
+        elif trips > _ITERATED:
+            self.unknown += 1
+        else:
+            for i in range(lb, ub, step):
+                self.block(body, dict(env) | dict.fromkeys(body.arguments) | {body.arguments[0]: i}, mult)
+
+
+def core_calls(mlir: str, params: dict[str, int]) -> dict[str, dict[tuple[int, int], _Calls]]:
+    """Per device of a design (a library's: one per distinct entry design) and core (column, row): the kernel calls of
+    one run (``_Calls``), its loops' bounds and branches evaluated with the scratchpad ``params``."""
+    import aie.dialects.aie  # noqa: F401  (the dialects)
+    from aie.ir import Context, Location, Module
+
+    out: dict[str, dict[tuple[int, int], _Calls]] = {}
+    with Context(), Location.unknown():
+        for dev in Module.parse(mlir).body.operations:
+            if dev.operation.name != "aie.device":
+                continue
+            cores = out[str(dev.attributes["sym_name"]).strip('"')] = {}
+            for op in dev.regions[0].blocks[0].operations:
+                if op.operation.name == "aie.core":
+                    tile = op.operands[0].owner
+                    calls = cores[(_int(tile.attributes["col"]), _int(tile.attributes["row"]))] = _Calls(params)
+                    calls.block(op.regions[0].blocks[0], {}, 1)
+    return out
+
+
+def _kind(op: Any) -> str:
+    """An operator's kind in a ranking: its class, a GEMM's format and shape."""
+    fmt, k, n = getattr(op, "fmt", None), getattr(op, "K", None), getattr(op, "N", None)
+    return type(op).__name__ + (f" {fmt}" if fmt else "") + (f" {k}x{n}" if k and n else "")
+
+
+@dataclass
+class ChunkWeights:
+    """A prefill chunk's static work (``chunk_weights``): per kind of item (items, cycles of the busiest core of each item
+    summed, all cores' cycles, the part of those from functions whose cycles are an upper bound: measure_ii counts both
+    paths of a branch, e.g. an attention's masked and unmasked blocks) and per loop of the library's kernels its weighted cycles (calls x executions x iterations
+    x II) and its slack (the same with II - its resource bound)."""
+
+    T: int
+    items: int
+    kinds: dict[str, list[int]]  # kind -> [items, busiest core's cycles, all cores' cycles, their upper bounds' part]
+    loops: dict[tuple[str, int], tuple[int, int]]  # (function, loop index) -> (weighted cycles, slack cycles)
+    functions: dict[str, dict]  # the library's measured functions by symbol
+    unknown: int  # calls of unknown cost and walks with control on unknown values
+
+
+def chunk_weights(b: AppBuild, tokens: int) -> ChunkWeights:
+    """The static work of an app's prefill chunk of ``tokens`` (its largest chunk size up to it), unpaced: per item the
+    calls per core from its design's core bodies with the chunk's scratchpad parameters (position 0, all tokens valid)
+    times measure_ii's call cycles of the library's kernels (``measured``)."""
+    from artlite.gemm.pacing import PACE
+
+    pf = b.prefill
+    if pf is None:
+        raise ValueError("the app has no chunk prefill")
+    T = max([t for t in pf.sizes if t <= tokens] or [min(pf.sizes)])
+    params = pf.params(T, 0, T) if "n" in inspect.signature(pf.params).parameters else pf.params(T, 0)
+    params = {**params, PACE: 0}
+    lib = pf.lib
+    work_dir = os.path.dirname(lib.elf_path)
+    with open(os.path.join(work_dir, "design.mlir")) as f:
+        mlir = f.read()
+    with open(os.path.join(work_dir, "kernel.cc")) as f:
+        source = f.read()
+    flags = {tuple(op.clang_flags) for op in lib.operators}.pop()
+    res = measured(source, [*toolchain.clang_cmd_common(), f"--target={toolchain.AIE_TARGET}", *flags])
+    if "error" in res:
+        raise RuntimeError(f"measure_ii failed on {work_dir}/kernel.cc: {res['error']}")
+    fns = {f["sym"]: f for f in res["functions"]}
+    devices = core_calls(mlir, params)
+    # (entries of identical designs share the first one's device: main configures each entry's, in entry order)
+    device_of = re.findall(r"aiex\.configure @(\w+)", mlir)
+    entry = {id(op): k for k, (op, *_) in enumerate(lib.runlist)}
+
+    def closure(calls: Counter) -> Counter:
+        out: Counter = Counter()
+        todo = list(calls.items())
+        while todo:
+            f, n = todo.pop()
+            out[f] += n
+            todo += [(g, n * k) for g, k in (fns.get(f, {}).get("calls") or {}).items() if k is not None and g in fns]
+        return out
+
+    kinds: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
+    loops: Counter = Counter()
+    slack: Counter = Counter()
+    unknown = 0
+    per_device: dict[str, tuple[dict[tuple[int, int], int], int, Counter, Counter, int]] = {}
+    for op, *_ in pf.runlists[T]:
+        name = device_of[entry[id(op)]]
+        if name not in per_device:
+            cycles, upper, lw, ls, unk = {}, 0, Counter(), Counter(), 0
+            for core, c in devices[name].items():
+                unk += c.unknown
+                cyc = 0
+                for f, n in c.calls.items():
+                    if (v := fns.get(f, {}).get("cycles")) is None:
+                        unk += n
+                    else:
+                        cyc += n * v
+                        upper += n * v if fns[f]["upper"] else 0
+                cycles[core] = cyc
+                for f, n in closure(c.calls).items():
+                    lps = fns[f]["loops"] if f in fns else []
+                    for i, lp in enumerate(lps):
+                        times, p = n * (lp["iters"] or 0), lp["parent"]
+                        while p >= 0 and times:
+                            times *= lps[p]["iters"] or 0
+                            p = lps[p]["parent"]
+                        if times and lp["ii"] is not None:
+                            lw[(f, i)] += times * lp["ii"]
+                            if lp["bound"] is not None:
+                                ls[(f, i)] += times * max(0, lp["ii"] - lp["bound"])
+            per_device[name] = (cycles, upper, lw, ls, unk)
+        cycles, upper, lw, ls, unk = per_device[name]
+        k = kinds[_kind(op)]
+        k[0] += 1
+        k[1] += max(cycles.values(), default=0)
+        k[2] += sum(cycles.values())
+        k[3] += upper
+        loops.update(lw)
+        slack.update(ls)
+        unknown += unk
+    return ChunkWeights(T, len(pf.runlists[T]), dict(kinds), {key: (v, slack[key]) for key, v in loops.items()},
+                        fns, unknown)
+
+
+def rank_text(app: str, w: ChunkWeights, *, top: int = 15) -> str:
+    """A chunk's ranking: its kinds of items by their busiest cores' cycles, its loops by weighted cycles and by slack."""
+    mhz = 1810.0
+    total = sum(k[1] for k in w.kinds.values())
+    out = [(f"{app}: a prefill chunk of {w.T} tokens, {w.items} items, unpaced; the busiest core of each item: "
+            f"{total / mhz / 1e3:.1f} ms of compute ({w.unknown} calls or branches unknown)"),
+           f"{'kind':44s} {'items':>5s} {'busiest ms':>10s} {'share':>6s} {'all cores Mcy':>13s} {'upper':>6s}"]
+    for name, (n, busiest, cores, upper) in sorted(w.kinds.items(), key=lambda x: -x[1][1]):
+        out.append(f"{name:44s} {n:5d} {busiest / mhz / 1e3:10.2f} {busiest / max(total, 1):6.1%} {cores / 1e6:13.1f} "
+                   f"{upper / max(cores, 1):6.0%}")
+    all_cycles = sum(k[2] for k in w.kinds.values())
+    for title, idx in (("loops by weighted cycles (calls x executions x iterations x II)", 0),
+                       ("loops by slack ((II - resource bound) x the same)", 1)):
+        out.append(f"\n{title}, of all cores' {all_cycles / 1e6:.0f} Mcy:")
+        for (f, i), v in sorted(w.loops.items(), key=lambda x: -x[1][idx])[:top]:
+            if not v[idx]:
+                break
+            fn, lp = w.functions[f], w.functions[f]["loops"][i]
+            out.append(f"  {v[idx] / 1e6:9.1f} Mcy {v[idx] / max(all_cycles, 1):6.1%}  {_HASH.sub('', fn['short'])} "
+                       f"loop {i} ({lp['at']}): {lp['sched']} II {lp['ii']} bound {lp['bound']} x {lp['iters']}")
+    return "\n".join(out)
+
+
 # The diff -----------------------------------------------------------------------------------------------------------
 
 # change classes, worst first (the improvements after the regressions)
@@ -544,11 +800,21 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--update", action="store_true", help="write their rows into the baseline")
     r.add_argument("--out", help="write their ledger to this file")
     r.add_argument("--limit", type=int, default=40, help="lines per change class")
+    k = sub.add_parser("rank", help="an app's prefill chunk: its kinds of items and loops by static weight")
+    k.add_argument("app")
+    k.add_argument("-p", "--tokens", type=int, default=1024, help="the chunk's tokens (its largest size up to it)")
+    k.add_argument("--top", type=int, default=15, help="loops listed")
     d = sub.add_parser("diff", help="compare two ledger files")
     d.add_argument("base")
     d.add_argument("new")
     d.add_argument("--limit", type=int, default=40)
     args = ap.parse_args(argv)
+    if args.cmd == "rank":
+        if args.app not in APPS:
+            ap.error(f"unknown app {args.app}; known: {', '.join(APPS)}")
+        path, builder = APPS[args.app]
+        print(rank_text(args.app, chunk_weights(builder(path), args.tokens), top=args.top))
+        return
     if args.cmd == "diff":
         print(report(diff(Ledger.load(args.base), Ledger.load(args.new)), limit=args.limit))
         return
