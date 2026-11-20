@@ -16,6 +16,10 @@ optimization record YAML plus the emitted assembly, so you can quickly answer:
 - What is the loop cost in cycles: `prologue + iters*II + epilogue`?
 - Are there **spills/reloads** or missing memory-bank annotations?
 
+Every shipped kernel's measurements are kept per app in `tests/schedule_ledger.jsonl` (`tests/schedule_ledger.py`:
+`record` compares the tree with it, `rank APP` weights a prefill chunk's loops; `test_app_designs.py` checks it): a
+change to a kernel shows there as the loops and functions whose schedule moved.
+
 ## What the numbers mean (important!)
 
 The loops are those of the final code: the assembly's loop comments

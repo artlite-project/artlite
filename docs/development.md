@@ -57,9 +57,18 @@ EOF
 # variants of an operator's functions (pragmas, rewrites, parameters) ranked per loop
 python -m artlite.variant_search --help
 
+# every shipped kernel's schedules and every core's program memory against the committed baseline, no NPU
+python -m tests.schedule_ledger record [APP ...]            # the differences, worst first
+python -m tests.schedule_ledger record [APP ...] --update   # refresh tests/schedule_ledger.jsonl (commit it)
+python -m tests.schedule_ledger rank APP                    # a prefill chunk's loops by weight and slack
+
 # build everything a script compiles, ARTLITE_COMPILE_JOBS at a time, then run it
 python -m artlite.parallel_compile python script.py
 ```
+
+`tests/test_app_designs.py` checks each app's ledger: a change to kernel code or a toolchain update refreshes the
+baseline in the same commit, whose diff of `tests/schedule_ledger.jsonl` shows what it did to the kernels' loops
+(pipelined or not, II, spills), cycles, code bytes, stack and the cores' program memory.
 
 On-NPU profiling (hardware counters between a kernel's `event0()` / `event1()` markers, or event traces, as
 Chromium JSON for Perfetto) is switched on by `ARTLITE_PROFILE` (below).
