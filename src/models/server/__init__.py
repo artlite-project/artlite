@@ -41,7 +41,8 @@ Qwen3.6's, Gemma 4's and LFM3's), so a turn extends the last one. ``cache_prompt
 
 Cancelling: a client that goes away, the UI's Stop (``DELETE /v1/stream?conv_id=``, matched by the chat request's
 ``X-Conversation-Id``) and the shutdown stop the request at its next token or prompt chunk; a dispatch is never
-interrupted (one stays under the driver's 2 s).
+interrupted (one stays under the driver's 2 s). A thought ends early at its budget (llama-server's reasoning budget) or
+on ``/v1/chat/completions/control``'s ``reasoning_end`` (the UI's), its end forced as a forced call's opener is.
 
 The API (llama-server's shapes): ``/v1/chat/completions`` (streamed or not, ``reasoning_content``, tool calls,
 ``timings``, ``prompt_progress``, ``usage``), ``/v1/completions``, ``/completion``, ``/v1/models``, ``/props``,

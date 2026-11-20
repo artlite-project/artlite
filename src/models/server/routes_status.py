@@ -38,7 +38,10 @@ def add_routes(public: APIRouter, listed: APIRouter, api: APIRouter, ctx: ApiCon
                 "chat_template_caps": {"supports_tools": ctx.syntax is not None,
                                        "supports_tool_calls": ctx.syntax is not None,
                                        "supports_parallel_tool_calls": ctx.syntax is not None,
-                                       "supports_preserve_reasoning": "preserve_thinking" in info.chat_template},
+                                       "supports_preserve_reasoning": "preserve_thinking" in info.chat_template,
+                                       "supports_typed_content": ctx.typed,
+                                       "supports_reasoning_effort": "reasoning_effort" in info.chat_template,
+                                       "reasoning_effort_levels": ctx.efforts},
                 "build_info": options.build_info, "is_sleeping": False, "cors_proxy_enabled": False}
 
     @listed.get("/v1/models")

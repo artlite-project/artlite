@@ -70,7 +70,13 @@ class ChatRequest(GenerationRequest):
     chat_template_kwargs: dict[str, Any] | None = None
     reasoning_effort: str | None = None
     reasoning_format: str | None = None
-    continue_final_message: bool | None = False
+    # llama-server's reasoning budget (``thinking_budget_tokens``: its alias, the web UI's) and runtime control
+    reasoning_budget_tokens: int | None = None
+    thinking_budget_tokens: int | None = None
+    reasoning_budget_message: str | None = None
+    reasoning_control: bool | None = None
+    continue_final_message: bool | str | None = None  # (true, "content" or "reasoning_content")
+    add_generation_prompt: bool | None = None
     tools: list[Any] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
@@ -96,6 +102,8 @@ class TemplateRequest(BaseModel):
     chat_template_kwargs: dict[str, Any] | None = None
     reasoning_effort: str | None = None
     tools: list[Any] | None = None
+    continue_final_message: bool | str | None = None
+    add_generation_prompt: bool | None = None
 
 
 def chat_request(body: dict[str, Any]) -> ChatRequest:

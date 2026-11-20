@@ -2,9 +2,11 @@
 for a recurrent model's checkpoints), then the tokens, each through the stop strings, the thought split and the tool
 call parser into the job's events, and the prompt cache told what the device holds at the end.
 
-A forced tool call (``Calls.force``) puts its opener at the prompt's end, or - after a thought, where one may come
-first - after the answer began and no call did: the generation ends where every token but the last ran, the device
-rewinds to there and runs the opener."""
+Text the model did not sample is forced: a forced tool call's opener (``Calls.force``) at the prompt's end, or - after
+a thought, where one may come first - after the answer began and no call did; a thought's end (llama-server's
+reasoning budget, ``textflow.ThoughtBudget``: its message and the close marker) once the thought took its tokens or
+the control route asked for it. The generation ends where every token but the last ran, the device rewinds to there
+and runs the forced text."""
 
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from ..detokenizer import StreamDecoder
 from ..structured import Ban, GrammarMask, thought_of
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
-from .textflow import ReasoningSplitter, StopMatcher
+from .textflow import ReasoningSplitter, StopMatcher, ThoughtBudget
 
 if TYPE_CHECKING:
     from .engine import Engine, Lane
@@ -46,7 +48,9 @@ class Generation:
         # (``late``)
         self.force: str | None = None
         self.early: list[int] = []
+        self.early_text = ""  # (the text of ``early``: a thought's end at once, a forced opener)
         self.late = ""
+        self.budget: ThoughtBudget | None = None
         self.mask: Any = None
         self.stop = StopMatcher(job.stop)
         self.split: ReasoningSplitter | None = None
@@ -74,6 +78,7 @@ class Generation:
         npu = self.npu
         self.drafted0, self.accepted0 = npu.drafted, npu.accepted
         self.d0 = npu.dispatches
+        self._budget()
         self._forced_call()
         job.state = "prompt"
         try:
@@ -86,14 +91,26 @@ class Generation:
             self._settle()
         self._report(how, d1, t_npu1, t_host1)
 
+    def _budget(self) -> None:
+        """The thought's budget (``Job.budget``; ``Job.control``: the control route may end it)."""
+        job, model = self.job, self.model
+        if model.reasoning is not None and (job.budget >= 0 or job.control):
+            self.budget = ThoughtBudget(model.reasoning, budget=job.budget, inside=job.opened, once=model.thought_first)
+
     def _forced_call(self) -> None:
-        """The forced call's opener (``Calls.force``): where it goes; the mask of the answer's structured output
-        (``structured.GrammarMask``, after the thought), or of the calls' names."""
+        """The text forced at the prompt's end (a thought the prompt opened with a budget of no token: its end; the
+        forced call's opener, ``Calls.force``, where no thought comes first) and the forced call's opener after the
+        thought; the mask of the answer's structured output (``structured.GrammarMask``, after the thought), or of the
+        calls' names."""
         job, model = self.job, self.model
         tools = job.tools
         self.force = tools.force if tools is not None else None
         thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
-        self.early = model.tokenizer.encode(self.force) if self.force and not thought else []
+        end = job.budget_end if self.budget is not None and self.budget.due() else ""
+        if end:
+            self.budget.feed(end)
+        self.early_text = end + (self.force if self.force and not thought else "")
+        self.early = model.tokenizer.encode(self.early_text) if self.early_text else []
         self.late = (tools.syntax.gap if job.inside else "") + self.force if self.force and thought else ""
         self.mask = None
         if job.grammar is not None:  # (the answer's and its calls'; the thought stays free)
@@ -153,7 +170,7 @@ class Generation:
         tools = job.tools
         self.text = StreamDecoder(model.tokenizer)
         self.split = ReasoningSplitter(model.reasoning, inside=job.inside, once=model.thought_first,
-                                       ends=tools.syntax.ends if tools is not None else ()) \
+                                       ends=tools.syntax.ends if tools is not None else (), lead=not job.continued) \
             if job.reasoning and model.reasoning is not None else None
         self.calls = tools.parser() if tools is not None else None
         post = job.sampling if job.post_sampling else None
@@ -177,17 +194,21 @@ class Generation:
         """The tokens, in steps: a step that ends where a forced opener goes is followed by the opener."""
         npu, model, ids, gen = self.npu, self.model, self.ids, self.gen
         logits = self.logits
-        self._send(self._parse(self.force) if self.early else [])
+        self._send(self._parse(self.early_text))
         while True:
-            forcing = self._tokens(logits)
-            if not forcing or self.finish == "stop":
+            kind = self._tokens(logits)
+            if kind is None or self.finish == "stop":
                 break
+            text = self.job.budget_end if kind == "end" else self.late
             n = npu.rewind(npu.position)  # (the generation stopped where the next request would continue)
-            opener = model.tokenizer.encode(self.late)
-            logits = npu.forward((ids + gen)[n:] + opener)
-            self._forced(opener)
-            self._send(self._parse(self.late))
-            self.late = ""
+            tokens = model.tokenizer.encode(text)
+            logits = npu.forward((ids + gen)[n:] + tokens)
+            self._forced(tokens)
+            self._send(self._parse(text))
+            if kind == "end":
+                self.budget.feed(text)
+            else:
+                self.late = ""
         if self.stop.word is None:
             self._send(self._parse(self.stop.flush()))
         calls = self.calls
@@ -196,11 +217,12 @@ class Generation:
         if calls is not None and calls.calls and not calls.calling:
             self.finish = "tool_calls"
 
-    def _tokens(self, logits: Any) -> bool:
-        """One step of the generation from ``logits``: tokens until the end, a stop, a cancel, or where a forced opener
-        goes; whether the opener goes next."""
+    def _tokens(self, logits: Any) -> str | None:
+        """One step of the generation from ``logits``: tokens until the end, a stop, a cancel, or where forced text
+        goes; which goes next: ``end`` (the thought's), ``opener`` (the forced call's), or None."""
         job, npu, model, ids, gen, calls = self.job, self.npu, self.model, self.ids, self.gen, self.calls
-        left, forcing = job.max_tokens - len(gen) if job.max_tokens >= 0 else -1, False
+        left, kind = max(job.max_tokens - len(gen), 0) if job.max_tokens >= 0 else -1, None  # (forced text counts)
+        budget = self.budget
         self.it = npu.generate(logits, left, self.sampling, ids + gen, self.mask, self.probs, drafts=job.drafts)
         try:
             for token in self.it:
@@ -210,22 +232,32 @@ class Generation:
                 if token in model.eos_token_ids:
                     self.finish = "stop"
                     break
-                s, hit = self.stop.feed(self.text.feed(token))
+                piece = self.text.feed(token)
+                s, hit = self.stop.feed(piece)
                 self._send(self._parse(s))
                 if hit:
                     self.finish = "stop"
                     break
                 if job.cancel.is_set():
                     raise Cancelled
+                ending = False
+                if budget is not None:  # (the thought took its tokens, or its end was asked: its end follows)
+                    budget.feed(piece)
+                    if job.end_thought.is_set():
+                        job.end_thought.clear()
+                        budget.asked = True
+                    ending = not self.text.pending and budget.due()  # (after a whole character)
                 # (the answer began and no call did: the forced call's opener follows)
                 forcing = bool(self.late) and self.split is not None and self.split.answering and not calls.started
-                # the answer is complete, or the opener goes next: end where every token but the last ran (a
+                # the answer is complete, or forced text goes next: end where every token but the last ran (a
                 # step of drafts runs several; the parser drops what follows a call when parallel is off)
-                if (forcing or (calls is not None and calls.done)) and npu.position + 1 <= len(ids) + len(gen):
+                if (ending or forcing or (calls is not None and calls.done)) and \
+                        npu.position + 1 <= len(ids) + len(gen):
+                    kind = "end" if ending else "opener" if forcing else None
                     break
         finally:
             npu.idle()  # (the generator stays suspended where the reading stopped)
-        return forcing
+        return kind
 
     def _settle(self) -> None:
         """The prompt cache told what the device holds: a step of drafts ran tokens past a stop string or a cancel."""

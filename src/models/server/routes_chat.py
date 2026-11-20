@@ -17,7 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from . import answers
 from .app_base import sse
 from .context import ApiContext
-from .errors import unavailable
+from .errors import bad_request, unavailable
 from .ids import hex_id
 from .jobs import timings
 from .schemas import ChatRequest, Message
@@ -85,11 +85,11 @@ class ChatFormat(Format):
 
 
 async def decide(ctx: ApiContext, req: ChatRequest, head: dict[str, Any]) -> dict[str, Any] | None:
-    """A decision's chat completion (``answers``: a response format of options, ``logprobs``; no tools, no thought), or
-    None: a generation."""
+    """A decision's chat completion (``answers``: a response format of options, ``logprobs``; no tools, no thought, no
+    continued message), or None: a generation."""
     opts = answers.request_options({"logprobs": req.logprobs, "response_format": req.response_format,
                                     "json_schema": req.json_schema})
-    if opts is None or req.tools:
+    if opts is None or req.tools or ctx.prompts.continuation(req) is not None:
         return None
     ctx.check(req)
     ids, think = await ctx.prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort)
@@ -141,7 +141,7 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         if decision is not None:
             return decision if not req.stream else StreamingResponse(decision_events(decision),
                                                                      media_type="text/event-stream")
-        j, events = await ctx.start(req, conv_id=x_conversation_id)
+        j, events = await ctx.start(req, conv_id=x_conversation_id, cid=cid)
         custom = customs(req.tools).keys()  # (checked: ``start``)
         if not req.stream:
             blocks, done = await collect(j, events, request)
@@ -159,3 +159,20 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         fmt = ChatFormat(head, timings=bool(req.timings_per_token),
                          include_usage=bool((req.stream_options or {}).get("include_usage")), custom=custom)
         return await stream_response(j, events, ctx.ping_of(req), fmt)
+
+    @api.post("/v1/chat/completions/control")
+    async def control(body: dict[str, Any]) -> dict[str, Any]:
+        """llama-server's control of a running chat completion (its ``id``): ``reasoning_end`` ends its thought where
+        the request armed it (``reasoning_control``)."""
+        cid, action = body.get("id"), body.get("action")
+        if not isinstance(cid, str) or not cid:
+            raise bad_request("missing completion id")
+        if action != "reasoning_end":
+            raise bad_request("unknown control action")
+        j = engine.job_of(cid)
+        if j is None:
+            return {"success": False, "message": "no active completion for this id"}
+        if not j.control:
+            return {"success": False, "message": "reasoning control not enabled for this completion"}
+        j.end_thought.set()
+        return {"success": True}

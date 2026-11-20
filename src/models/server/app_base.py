@@ -22,7 +22,7 @@ from .errors import ApiError, bad_request, not_supported
 log = logging.getLogger("artlite.server")
 
 ANTHROPIC = "/v1/messages"  # (the routes under it answer errors in Anthropic's shape)
-NOT_SUPPORTED = ["/v1/chat/completions/control", "/infill", "/lora-adapters", "/metrics"]
+NOT_SUPPORTED = ["/infill", "/lora-adapters", "/metrics"]
 NO_CACHE = {"Cache-Control": "no-cache"}
 
 

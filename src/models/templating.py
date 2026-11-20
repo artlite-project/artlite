@@ -55,17 +55,66 @@ def render_template(template: str, **variables: object) -> str:
     return _compiled(template).render(**variables)
 
 
+CONTINUE = ("content", "reasoning_content")  # (what of the last message a continued one ends in)
+_END = "\ue000\ue001"  # (where a continued message's text ends: private-use characters, which no template changes)
+
+
 def chat_template(template: str, messages: list[dict[str, object]], *, tools: list[dict[str, object]] | None = None,
-                  **variables: object) -> str:
+                  continue_final_message: str | None = None, **variables: object) -> str:
     """The prompt text of a conversation rendered with a model's chat template (a GGUF file's
     ``tokenizer.chat_template``, Jinja2 in a sandbox, as transformers renders it) up to the assistant's turn;
     ``tools``: the functions the model may call (OpenAI's ``{"type": "function", "function": {...}}``; a tool call's
     ``arguments`` in the messages are objects); ``variables``: the template's own (``enable_thinking``, ``bos_token``,
-    ``date_string``, ...)."""
-    return _compiled(template).render(messages=messages, add_generation_prompt=True, tools=tools or None, **variables)
+    ``date_string``, ...). ``continue_final_message`` (one of ``CONTINUE``): the last message, an assistant's, goes on
+    instead (transformers' and llama.cpp's continuation): the conversation is rendered whole and cut where that
+    message's content (or, ``reasoning_content``, its thought: its content is dropped) ends, in the template's own form
+    of the turn; ValueError: the template does not render that text."""
+    t = _compiled(template)
+    if continue_final_message is None:
+        return t.render(messages=messages, add_generation_prompt=True, tools=tools or None, **variables)
+    last = dict(messages[-1])
+    if continue_final_message == "content":
+        content = last.get("content")
+        last["content"] = [*content, {"type": "text", "text": _END}] if isinstance(content, list) else \
+            str(content or "") + _END
+    else:
+        last["reasoning_content"], last["content"] = str(last.get("reasoning_content") or "") + _END, ""
+    text = t.render(messages=[*messages[:-1], last], add_generation_prompt=False, tools=tools or None, **variables)
+    if (i := text.rfind(_END)) < 0:
+        raise ValueError(f"the chat template does not render the last message's {continue_final_message}: it "
+                         f"cannot be continued")
+    return text[:i]
 
 
-TEMPLATE_RESERVED = frozenset({"messages", "tools", "add_generation_prompt"})  # (no variables: the conversation's)
+# (no variables: the conversation's, how it ends)
+TEMPLATE_RESERVED = frozenset({"messages", "tools", "add_generation_prompt", "continue_final_message"})
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")  # (reasoning_effort levels clients send, lowest first)
+
+
+def effort_levels(template: str) -> list[str]:
+    """The ``reasoning_effort`` levels of ``EFFORTS`` a chat template renders distinctly, lowest first, as llama.cpp
+    finds them (its ``chat_template_caps.reasoning_effort_levels``: the web UI's reasoning menu): a user message
+    rendered with the thought on at each level; a level that fails or renders as an unknown one does is not honored,
+    and levels that render alike are one, named by the highest."""
+    def render(level: str) -> str | None:
+        try:
+            return chat_template(template, [{"role": "user", "content": "User message"}], enable_thinking=True,
+                                 reasoning_effort=level)
+        except Exception:  # noqa: BLE001 (any failure of the template's: not this level)
+            return None
+
+    unknown = render("REASONING_EFFORT_UNKNOWN")
+    renders: list[str] = []
+    levels: list[str] = []
+    for level in EFFORTS:
+        if (r := render(level)) is None or r == unknown:
+            continue
+        if r in renders:
+            levels[renders.index(r)] = level
+        else:
+            renders.append(r)
+            levels.append(level)
+    return levels
 
 
 def check_chat_template(template: str, **variables: object) -> None:

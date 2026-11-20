@@ -26,6 +26,7 @@ from models.sequence import MEDIA
 from models.server import ui
 from models.server.engine import Engine
 from models.server.jobs import Job
+from models.templating import chat_template
 
 from .fakes import (
     BOS,
@@ -187,6 +188,110 @@ def test_reasoning_template_decides() -> None:
             message = chat(client, content).json()["choices"][0]["message"]
             assert message.get("reasoning_content") == ("Hmm" if thinks else None), (rea, content)
             assert message["content"] == "Yes" and temps[-1] is thinks, (rea, content)
+
+
+def test_reasoning_budget() -> None:
+    """llama-server's reasoning budget: after its tokens the thought's end (its message and the close marker) is
+    forced and the answer follows; a budget of 0 ends the thought the prompt opened at once; Gemma's thought, which the
+    model opens, is counted from its opener."""
+    _model, npu, engine = make(reasoning=QWEN)
+    with TestClient(app_of(engine, reasoning="on", reasoning_budget_message=" Enough.")) as client:
+        assert engine.wait_ready(5)
+        npu.replies = [["A", " B", " C", " D"], ["\n\n", "Yes"]]
+        msg = chat(client, "Q", thinking_budget_tokens=2).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "A B Enough."}
+        npu.replies = [["Yes"]]
+        msg = chat(client, "Q", reasoning_budget_tokens=0, reasoning_budget_message="").json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes"}
+        npu.replies = [["A", " B", "\n", "</think>", "\n\n", "Yes"]]  # (a thought within its budget)
+        assert chat(client, "Q", thinking_budget_tokens=5).json()["choices"][0]["message"]["reasoning_content"] == "A B"
+        assert chat(client, "Q", reasoning_budget_tokens=-2).status_code == 400
+    _model, npu, engine = make(reasoning=GEMMA)
+    with TestClient(app_of(engine, reasoning="on", reasoning_budget=2)) as client:
+        npu.replies = [["<|channel>thought", "\n", "Hmm", ",", " yes"], ["Yes", "."]]
+        msg = chat(client, "Q").json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes.", "reasoning_content": "Hmm"}
+
+
+def test_reasoning_control() -> None:
+    """/v1/chat/completions/control ends a running completion's thought (its id), where the request armed it."""
+    _model, npu, engine = make(reasoning=QWEN, delay=0.01)
+    client = TestClient(app_of(engine, reasoning="on"))
+    assert engine.wait_ready(5)
+    out: dict[str, httpx.Response] = {}
+    for armed in (True, False):
+        npu.replies = [[f" w{i}" for i in range(400)], ["\n\n", "Yes"]]
+        t = threading.Thread(target=lambda a=armed: out.update(r=client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "go"}], "reasoning_control": a})))
+        t.start()
+        while engine.current is None or engine.current.n_gen < 3:
+            time.sleep(0.005)
+        job = engine.current
+        r = client.post("/v1/chat/completions/control", json={"id": job.cid, "action": "reasoning_end"})
+        if not armed:
+            assert r.json() == {"success": False, "message": "reasoning control not enabled for this completion"}
+            job.cancel.set()
+            t.join(10)
+            break
+        assert r.json() == {"success": True}
+        t.join(10)
+        msg = out["r"].json()["choices"][0]["message"]
+        assert msg["content"] == "Yes" and 3 <= len(msg["reasoning_content"].split()) < 400
+    assert client.post("/v1/chat/completions/control", json={"id": "chatcmpl-x", "action": "reasoning_end"}).json() \
+        == {"success": False, "message": "no active completion for this id"}
+    assert client.post("/v1/chat/completions/control", json={"id": "x", "action": "pause"}).status_code == 400
+
+
+CONTINUED = ("{% for m in messages %}<|{{ m.role }}|>{% if m.role == 'assistant' %}<think>{{ m.reasoning_content }}"
+             "</think>{% endif %}{{ m.content }}{% endfor %}{% if add_generation_prompt %}<|assistant|>"
+             "{% if enable_thinking %}<think>{% else %}<think></think>{% endif %}{% endif %}")
+
+
+def test_continue_final_message() -> None:
+    """continue_final_message (and a conversation that ends with an assistant's message, --prefill-assistant): the
+    prompt ends where the message's content (or its thought) does, as the template renders it; the answer is the new
+    text."""
+    model, npu, engine = make(reasoning=QWEN)
+
+    def rendered(messages: list[dict[str, object]], *, think: bool = False, tools: object = None,
+                 preserve: bool = False, variables: dict[str, object] | None = None) -> list[int]:
+        return model.tokenizer.encode(chat_template(CONTINUED, messages, enable_thinking=think, **(variables or {})))
+
+    model.chat = rendered
+    q, a = {"role": "user", "content": "Q"}, {"role": "assistant", "content": "The ans", "reasoning_content": "Hmm"}
+    prompt = lambda client, **kw: client.post("/apply-template", json={"messages": [q, a], **kw}).json()["prompt"]
+    with TestClient(app_of(engine, template=CONTINUED)) as client:
+        assert engine.wait_ready(5)
+        assert prompt(client).endswith("<|assistant|><think>Hmm</think>The ans")
+        assert prompt(client, continue_final_message="reasoning_content").endswith("<|assistant|><think>Hmm")
+        npu.replies = [[" wer", "."]]  # (the new text as it comes: its leading space too)
+        assert chat(client, [q, a]).json()["choices"][0]["message"] == {"role": "assistant", "content": " wer."}
+        npu.replies = [[" more", "</think>", "Yes"]]
+        msg = chat(client, [q, {**a, "content": ""}], continue_final_message=True).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": " more"}
+        for body, says in [({"messages": [q], "continue_final_message": True}, "not an assistant's"),
+                           ({"messages": [q, a, a]}, "2 or more assistant messages"),
+                           ({"messages": [q, a], "continue_final_message": True, "add_generation_prompt": True},
+                            "Cannot set both"),
+                           ({"messages": [q, {**a, "tool_calls": [{"id": "1", "type": "function", "function": {
+                               "name": "f", "arguments": "{}"}}]}], "continue_final_message": True},
+                            "contains tool calls")]:
+            r = client.post("/v1/chat/completions", json=body)
+            assert r.status_code == 400 and says in r.json()["error"]["message"], body
+    with TestClient(app_of(engine, template=CONTINUED, prefill_assistant=False)) as client:
+        assert prompt(client).endswith("The ans<|assistant|><think></think>")
+
+
+def test_effort_levels() -> None:
+    """/props' reasoning_effort_levels: the levels the template renders distinctly, aliases under the highest name;
+    a level the template refuses or renders as an unknown one is not offered."""
+    _model, _npu, engine = make()
+    template = ("{% if reasoning_effort == 'xhigh' %}{{ raise_exception('effort') }}{% endif %}"
+                "{{ {'minimal': 'L', 'low': 'L', 'high': 'H', 'max': 'M'}.get(reasoning_effort, '') }}"
+                "{{ messages[0].content }}")
+    with TestClient(app_of(engine, template=template)) as client:
+        caps = client.get("/props").json()["chat_template_caps"]
+        assert caps["reasoning_effort_levels"] == ["low", "high", "max"] and caps["supports_reasoning_effort"]
 
 
 def test_reasoning_gemma() -> None:
@@ -497,7 +602,8 @@ def test_tool_errors(tooled: tuple, fake: tuple) -> None:
     assert fake[3].get("/props").json()["chat_template_caps"]["supports_tools"] is False
     assert client.get("/props").json()["chat_template_caps"] == {
         "supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True,
-        "supports_preserve_reasoning": False}
+        "supports_preserve_reasoning": False, "supports_typed_content": False, "supports_reasoning_effort": False,
+        "reasoning_effort_levels": []}
 
 
 def test_tool_calls_openai_client() -> None:

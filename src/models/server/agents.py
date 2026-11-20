@@ -17,7 +17,9 @@ Where the conversions differ from llama-server's:
 - Anthropic's ``tool_choice`` ``tool`` names its function, ``none`` and ``disable_parallel_tool_use`` apply;
   ``thinking`` ``enabled`` and ``adaptive`` turn the model's thought on, ``disabled`` off (absent: the server's
   ``-rea``), as a Responses request's ``reasoning.effort`` (``none``: off; another level: the template's
-  ``reasoning_effort`` too, as a chat request's); thinking budgets are not enforced;
+  ``reasoning_effort`` too, as a chat request's) and an Anthropic one's ``output_config.effort``; ``enabled``'s
+  ``budget_tokens`` (as llama-server's: 10000 where it names none) is the thought's budget (``thinking_budget_tokens``);
+  a conversation that ends with an assistant's message continues it (Anthropic's prefill: ``--prefill-assistant``);
 - Claude Code's billing header has a stamp per request (``cch=``, which llama.cpp fixes), its version's build hash,
   which differs between sessions, and on the requests its scheduled wakeups send a ``cc_workload``: the stamp and the
   hash are fixed, the workload dropped, so the system prompt's tokens stay a cached prefix;
@@ -252,13 +254,13 @@ def anthropic_chat(body: dict[str, Any], note: Note) -> dict[str, Any]:
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive", "disabled"):
         kwargs.setdefault("enable_thinking", thinking["type"] != "disabled")
-        if thinking.get("budget_tokens") is not None:
-            note("thinking.budget_tokens")
+        if thinking["type"] == "enabled":
+            out["thinking_budget_tokens"] = thinking.get("budget_tokens", 10000)
     if kwargs:
         out["chat_template_kwargs"] = kwargs
     config = body.get("output_config") or {}
     if config.get("effort") is not None:
-        note("output_config.effort")
+        out["reasoning_effort"] = config["effort"]
     fmt = config.get("format")
     if fmt is not None and body.get("output_format") is not None:
         raise ValueError("output_format is output_config.format's deprecated spelling: give one of them")

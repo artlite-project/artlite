@@ -11,7 +11,7 @@ import openai
 import pytest
 from fastapi.testclient import TestClient
 
-from models.server.agents import Blocks, Store, billing
+from models.server.agents import Blocks, Store, anthropic_chat, billing
 from models.server.tools import ToolCall
 
 from .fakes import QWEN, TOOLS_TEMPLATE, WEATHER, FakeModel, FakeNpu, app_of, call_pieces, chat, live, make, rest_of
@@ -175,6 +175,17 @@ def test_messages_conversion(agent: tuple) -> None:
         "x-anthropic-billing-header: cc_version=2.1.101; cc_entrypoint=cli; cch=fffff;You"
     assert billing("x-anthropic-billing-header: cc_version=2.1.311.2db; cc_entrypoint=sdk-cli; cc_workload=cron;") == \
         "x-anthropic-billing-header: cc_version=2.1.311; cc_entrypoint=sdk-cli;"  # (a scheduled wakeup's request)
+
+
+def test_messages_thinking() -> None:
+    """Anthropic's thinking budget and effort as llama-server takes them: enabled's budget_tokens (10000 where it names
+    none) is the thought's budget, output_config.effort the reasoning_effort."""
+    body = {"messages": [{"role": "user", "content": "Q"}], "max_tokens": 9}
+    out = anthropic_chat({**body, "thinking": {"type": "enabled", "budget_tokens": 512}}, print)
+    assert out["thinking_budget_tokens"] == 512 and out["chat_template_kwargs"] == {"enable_thinking": True}
+    out = anthropic_chat({**body, "thinking": {"type": "enabled"}, "output_config": {"effort": "high"}}, print)
+    assert out["thinking_budget_tokens"] == 10000 and out["reasoning_effort"] == "high"
+    assert "thinking_budget_tokens" not in anthropic_chat({**body, "thinking": {"type": "adaptive"}}, print)
 
 
 def test_messages_tool_choice(agent: tuple) -> None:

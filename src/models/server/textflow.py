@@ -1,6 +1,6 @@
-"""The generated text's filters, pure host state machines over a stream of text: stop strings (``StopMatcher``) and the
-split of a thinking model's text into thoughts and answer (``ReasoningSplitter``). Text that may begin a word they look
-for is held back until what follows decides (``held``)."""
+"""The generated text's filters, pure host state machines over a stream of text: stop strings (``StopMatcher``), the
+split of a thinking model's text into thoughts and answer (``ReasoningSplitter``) and a thought's token budget
+(``ThoughtBudget``). Text that may begin a word they look for is held back until what follows decides (``held``)."""
 
 
 def held(text: str, words: tuple[str, ...] | list[str]) -> int:
@@ -51,15 +51,16 @@ class ReasoningSplitter:
     back until what follows decides. A close marker outside a thought is dropped (Gemma may end an answer with one).
     ``inside``: the text starts inside a thought (the prompt opened it); ``ends``: text that ends a thought and begins
     the answer (kept: a Qwen tool call without the close marker); ``once``: a thought only begins the text (Qwen's),
-    markers after it are answer. ``answering``: the answer has begun (a thought ended, or answer text came)."""
+    markers after it are answer; ``lead``: the text's leading white space is dropped (not where it continues a message's
+    text). ``answering``: the answer has begun (a thought ended, or answer text came)."""
 
     def __init__(self, markers: tuple[str, str], *, inside: bool = False, ends: tuple[str, ...] = (),
-                 once: bool = False):
+                 once: bool = False, lead: bool = True):
         self.open, self.close = markers
         self.inside = inside
         self.ends, self.once = ends, once
         self._held = ""
-        self._lead = True  # (a part begins: its leading white space is dropped)
+        self._lead = lead  # (a part begins: its leading white space is dropped)
         self._over = False  # (once: the thought is over, or the text began outside one)
         self.answering = False
 
@@ -110,3 +111,28 @@ class ReasoningSplitter:
         self._part(out, self._held.rstrip())
         self._held = ""
         return out
+
+
+class ThoughtBudget:
+    """llama-server's reasoning budget over a generation's text, a token's at a time (``feed``): the tokens a thought
+    may take (``budget``; < 0: any) and its end on demand (``asked``: the control route's ``reasoning_end``). ``due``:
+    the thought is open and its end goes next (where the thought is: a ``ReasoningSplitter``'s, ``inside`` and
+    ``once`` as its); a thought that opens later gets a budget of its own, and an end asked outside a thought lapses."""
+
+    def __init__(self, markers: tuple[str, str], *, budget: int, inside: bool = False, once: bool = False):
+        self.split = ReasoningSplitter(markers, inside=inside, once=once)
+        self.budget = budget
+        self.spent = 0  # (the open thought's tokens)
+        self.asked = False
+
+    def feed(self, text: str) -> None:
+        """A token's text (forced text too: the thought's end)."""
+        was = self.split.inside
+        self.split.feed(text)
+        self.spent = self.spent + 1 if was and self.split.inside else 0
+
+    def due(self) -> bool:
+        if not self.split.inside:
+            self.asked = False
+            return False
+        return self.asked or 0 <= self.budget <= self.spent

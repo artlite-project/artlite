@@ -40,6 +40,9 @@ class Options:
     reasoning_format: str = "auto"  # auto: thoughts in reasoning_content; none: in content
     preserve_reasoning: bool = True  # earlier answers keep their thoughts (the templates' preserve_thinking)
     reasoning_effort: str | None = None  # the templates' reasoning_effort (None: the template's own)
+    reasoning_budget: int = -1  # a thought's tokens at most (< 0: any; 0: its end at once)
+    reasoning_budget_message: str = ""  # the text before the thought's forced end
+    prefill_assistant: bool = True  # a conversation that ends with an answer continues it
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)  # under each request's
     cache_prompt: bool = True
     constraint: Constraint | None = None  # a request's structured output when it asks for none (--grammar, --json-schema)
@@ -61,6 +64,8 @@ class Options:
                    top_k=args.top_k, top_p=args.top_p, min_p=args.min_p, **penalties, seed=args.seed,
                    reasoning=args.reasoning, reasoning_format="none" if args.reasoning_format == "none" else "auto",
                    preserve_reasoning=args.reasoning_preserve, reasoning_effort=reasoning_effort,
+                   reasoning_budget=args.reasoning_budget, reasoning_budget_message=args.reasoning_budget_message,
+                   prefill_assistant=args.prefill_assistant,
                    chat_template_kwargs=args.chat_template_kwargs, cache_prompt=args.cache_prompt,
                    embedding=args.embedding or args.rerank, pooling=pooling, embd_normalize=args.embd_normalize,
                    sse_ping_interval=args.sse_ping_interval, slots=args.slots,

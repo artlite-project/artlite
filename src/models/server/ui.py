@@ -1,15 +1,19 @@
-"""The web UI: llama.cpp's own (``tools/ui`` of https://github.com/ggml-org/llama.cpp, MIT license, copyright The
-ggml authors), prebuilt and unmodified. ``fetch`` gets the build pinned here - the ``dist.tar.gz`` of llama.cpp build
+"""The web UI: llama.cpp's own, Llama Chat (``ui/apps/chat`` of https://github.com/ggml-org/llama.cpp, MIT license,
+copyright The ggml authors), prebuilt and unmodified. ``fetch`` gets the build pinned here - the ``dist.tar.gz`` of llama.cpp build
 ``TAG`` from the Hugging Face bucket that llama.cpp's CMake downloads it from, checked against ``SHA256`` - into
 ``<cache>/ui/<TAG>/`` on the first start (later starts need no network); ``mount`` serves a UI directory at ``/``.
 
 The UI is a static single-page app (hash routes, relative paths: it works at ``/``) that calls ``GET ./props``
-(retried every second on a 503 while the model loads; a 401 shows its API-key screen), ``GET /v1/models`` and a
-streamed ``POST ./v1/chat/completions``; its other calls (``/tools``, ``/v1/streams/lookup``, ``DELETE /v1/stream``
-for Stop) tolerate the answers ``api`` gives. Bumping the pin: diff the UI's ``src/lib/constants/
-api-endpoints.constants.ts`` and ``src/lib/services/chat.service.ts`` (request fields, the stream fields it reads)
-between the two builds against what ``api`` implements, then set the new tag and the sha256 of its archive (the
-bucket's ``dist.tar.gz.sha256``)."""
+(retried every second on a 503 while the model loads; a 401 shows its API-key screen; ``chat_template_caps``'
+``reasoning_effort_levels`` make its reasoning menu, else token budgets: ``thinking_budget_tokens``), ``GET
+/v1/models``, a streamed ``POST ./v1/chat/completions`` (``reasoning_control``; its Continue:
+``continue_final_message``) and ``POST ./v1/chat/completions/control`` (its end of the thought); voice input through
+``./v1/realtime?intent=transcription``, else ``./v1/audio/transcriptions``; its other calls (``/tools``,
+``/v1/streams/lookup``, ``DELETE /v1/stream`` for Stop) tolerate the answers ``api`` gives. Bumping the pin: diff the
+UI's ``ui/apps/chat/src/lib/constants/api-endpoints.constants.ts``, ``.../services/chat.service.ts`` (request fields,
+the stream fields it reads), ``.../types/api.d.ts`` (``/props``) and ``ui/lib/voice/src`` between the two builds
+against what ``api`` implements, then set the new tag and the sha256 of its archive (the bucket's
+``dist.tar.gz.sha256``)."""
 
 import hashlib
 import mimetypes
@@ -26,8 +30,8 @@ from starlette.types import Scope
 
 from artlite.operators.toolchain import CACHE_DIR
 
-TAG = "b11699"
-SHA256 = "bb99387bab7e55aaad19495e2e617e82bc8ff7ce547f967c4f1e0927fe7764be"
+TAG = "b12588"
+SHA256 = "071451d62e20fc4479b58e481fc5f9892dcb71d495dcc00c788040e632e803f6"
 URL = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/{tag}/dist.tar.gz?download=true"
 UNCACHED = ("index.html", "sw.js", "build.json", "_app/version.json")  # (the UI checks them for updates)
 

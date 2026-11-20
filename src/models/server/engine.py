@@ -287,6 +287,12 @@ class Engine:
         """Jobs in the queue (not running)."""
         return len(self._queue)
 
+    def job_of(self, cid: str) -> Job | None:
+        """The running or queued job of a chat completion (its id, ``Job.cid``), or None."""
+        with self._cv:
+            return next((j for j in (*(lane.current for lane in self.lanes), *self._queue)
+                         if isinstance(j, Job) and cid and j.cid == cid), None)
+
     def cancel(self, conv_id: str) -> int:
         """Cancel the jobs of a conversation (running or queued); returns how many."""
         with self._cv:

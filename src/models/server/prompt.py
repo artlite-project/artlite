@@ -21,10 +21,10 @@ from starlette.concurrency import run_in_threadpool
 from ..model import MEDIA_MARKER
 from ..sequence import data_bytes, token_ids
 from ..structured import ends_inside, prompt_thinks
-from ..templating import TEMPLATE_RESERVED, chat_template
+from ..templating import CONTINUE, TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
-from .schemas import ROLES, ChatRequest, Message
+from .schemas import ROLES, ChatRequest, Message, TemplateRequest
 from .tools import Calls, call_arguments, customs, functions, tool_name
 
 if TYPE_CHECKING:
@@ -189,13 +189,44 @@ class PromptBuilder:
                      if k not in TEMPLATE_RESERVED | {"enable_thinking", "preserve_reasoning", "preserve_thinking"}}
         return think and ctx.engine.model.thinks, preserve, variables
 
+    def continuation(self, req: ChatRequest | TemplateRequest) -> str | None:
+        """What of its last message a request's prompt ends in, where the model continues that message (llama-server's
+        ``continue_final_message``: true, ``content`` or ``reasoning_content``; a conversation that ends with an
+        assistant's message, ``--prefill-assistant``: true, but where it has tool calls): ``content`` (true: where the
+        message has content, or no thought), ``reasoning_content`` (its thought; its content is dropped), or None: a
+        new answer."""
+        cont, msgs = req.continue_final_message, req.messages
+        last = msgs[-1] if msgs else None
+        if cont is None or cont is False:
+            if not self.ctx.options.prefill_assistant or last is None or last.role != "assistant" or \
+                    (last.model_extra or {}).get("tool_calls"):
+                return None
+            if len(msgs) > 1 and msgs[-2].role == "assistant":
+                raise bad_request("Cannot have 2 or more assistant messages at the end of the list.")
+            cont = True
+        elif req.add_generation_prompt:
+            raise bad_request("Cannot set both add_generation_prompt and continue_final_message to true.")
+        if cont is not True and cont not in CONTINUE:
+            raise bad_request('continue_final_message: true, "content" or "reasoning_content"')
+        if last is None or last.role != "assistant":
+            raise bad_request("continue_final_message: the last message is not an assistant's")
+        if (last.model_extra or {}).get("tool_calls"):
+            raise bad_request("Cannot continue an assistant message that contains tool calls.")
+        if cont is True:
+            cont = "reasoning_content" if last.reasoning_content and not text_of(last.content) else "content"
+        if cont == "reasoning_content" and self.ctx.engine.model.reasoning is None:
+            raise bad_request("continue_final_message: reasoning_content, of a model that does not think")
+        return cont
+
     async def render(self, messages: list[Message], kwargs: dict[str, Any] | None, *, effort: str | None = None,
-                     media: bool = False, tools: list[dict[str, Any]] | None = None) -> tuple[list[int], bool]:
+                     media: bool = False, tools: list[dict[str, Any]] | None = None, cont: str | None = None
+                     ) -> tuple[list[int], bool]:
         """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
         engine's worker between its jobs; ``media``: images as text, ``messages_of``; ``tools``: the functions the
         model may call; ``kwargs``, ``effort``: a request's ``chat_template_kwargs`` and ``reasoning_effort``,
-        ``template_options``), and whether the model thinks, as the prompt says where the template decided
-        (``structured.prompt_thinks``: a template's inline tags over ``enable_thinking``). A request's
+        ``template_options``; ``cont``: the prompt ends in the last message, ``continuation``), and whether the model
+        thinks, as the prompt says where the template decided (``structured.prompt_thinks``: a template's inline tags
+        over ``enable_thinking``; a continued thought: it does). A request's
         ``reasoning_effort`` level that the template refuses (Qwen3.8's takes xhigh, medium and low; clients send high
         or minimal) gives way to the server's, else the template's default, with a log line; one in
         ``chat_template_kwargs`` fails the request."""
@@ -203,6 +234,8 @@ class PromptBuilder:
         engine = ctx.engine
         think, preserve, variables = self.template_options(kwargs, effort)
         msgs = self.messages_of(messages, media=media)
+        if cont is not None:
+            variables = {**variables, "continue_final_message": cont}
         tools = tools or None
 
         async def run(variables: dict[str, Any]) -> list[int]:
@@ -233,6 +266,8 @@ class PromptBuilder:
             raise bad_request(f"the chat template failed: {e}") from None
         except (OSError, ValueError) as e:  # (an image or video that does not open, or does not fit the prompt)
             raise bad_request(str(e)) from None
+        if cont == "reasoning_content":
+            return ids, True
         return ids, prompt_thinks(engine.model.tokenizer, token_ids(ids), engine.model.reasoning, think)
 
     def inside(self, ids: list[int]) -> bool:
@@ -295,5 +330,5 @@ class PromptBuilder:
     async def counted(self, req: ChatRequest) -> int:
         """The prompt tokens of a chat request."""
         ids, _ = await self.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
-                                   tools=self.calls_of(req)[0])
+                                   tools=self.calls_of(req)[0], cont=self.continuation(req))
         return len(ids)

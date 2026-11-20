@@ -12,7 +12,7 @@ import pytest
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import flint_gguf, lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
-from models.templating import template_option
+from models.templating import chat_template, effort_levels, template_option
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
@@ -125,6 +125,27 @@ def test_chat_prompt_template() -> None:
     assert "Reasoning effort" not in chat_prompt(g, MESSAGES, reasoning_effort="low")  # (no thought)
     with pytest.raises(jinja2.TemplateError, match="Unexpected reasoning effort high"):
         chat_prompt(g, MESSAGES, enable_thinking=True, reasoning_effort="high")
+
+
+def test_continue_and_efforts() -> None:
+    """A continued last message: the conversation cut where its content (its text parts too) or its thought ends, in the
+    template's own form (Qwen3.6's: the answer after the last user message keeps its thought); a template that does not
+    render the text refuses. The reasoning_effort levels a template renders distinctly (llama.cpp's probe)."""
+    path = qwen_gguf("Q4_K_M", "27B")
+    require(path)
+    t = str(GGUFFile(path).meta["tokenizer.chat_template"])
+    msgs = [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "The ans ", "reasoning_content": "Hmm"}]
+    head = "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    assert chat_template(t, msgs, continue_final_message="content") == head + "Hmm\n</think>\n\nThe ans "
+    assert chat_template(t, msgs, continue_final_message="reasoning_content") == head + "Hmm"
+    parts = [msgs[0], {**msgs[1], "content": [{"type": "text", "text": "The ans"}]}]
+    assert chat_template(t, parts, continue_final_message="content").endswith("</think>\n\nThe ans")
+    with pytest.raises(ValueError, match="does not render the last message's reasoning_content"):
+        chat_template("{{ messages[-1].content }}", msgs, continue_final_message="reasoning_content")
+    assert effort_levels(t) == []
+    path = qwen_gguf("Q4_K_M", "3.8-27B")
+    require(path)
+    assert effort_levels(str(GGUFFile(path).meta["tokenizer.chat_template"])) == ["low", "medium", "xhigh"]
 
 
 LFM3_TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather", "parameters": {

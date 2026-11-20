@@ -67,7 +67,7 @@ from .process import Server, listen
 log = logging.getLogger("artlite.server")
 
 # the routes of a model: POST by the body's "model", GET by the "model" parameter
-POSTED = ["/v1/chat/completions", "/chat/completions", "/v1/completions", "/completion", "/completions", "/tokenize",
+POSTED = ["/v1/chat/completions", "/chat/completions", "/v1/chat/completions/control", "/v1/completions", "/completion", "/completions", "/tokenize",
           "/detokenize", "/apply-template", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses",
           "/responses", "/v1/responses/input_tokens", "/responses/input_tokens", "/v1/embeddings", "/embeddings",
           "/embedding", "/v1/rerank", "/rerank", "/reranking", "/v1/reranking", "/classify", "/v1/systemone"]

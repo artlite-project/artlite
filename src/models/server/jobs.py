@@ -90,6 +90,7 @@ class Job:
     inside: bool = False  # the prompt ends inside a thought (it opened one) and the thoughts are split off
     opened: bool = False  # the prompt ends inside a thought (whether or not the thoughts are split off)
     think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
+    continued: bool = False  # the prompt ends in the last message's text, which the generation continues
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
     grammar: Compiled | None = None  # the answer's structured output and calls (after the thought: ``GrammarMask``)
     ban: tuple[int, ...] = ()  # tokens never sampled (tool_choice none: a call's opener)
@@ -99,6 +100,13 @@ class Job:
     n_probs: int = 0  # per sampled token its probability and the n_probs most likely ones' (0: none; ``prob_entry``)
     post_sampling: bool = False  # the probabilities the sampler drew from (its candidates), not the model's
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
+    cid: str = ""  # the chat completion's id (``/v1/chat/completions/control``'s)
+    # llama-server's reasoning budget: a thought's tokens at most (< 0: any), then ``budget_end`` (its message and the
+    # model's close marker) is forced; ``control``: the control route may force it (``end_thought``)
+    budget: int = -1
+    budget_end: str = ""
+    control: bool = False
+    end_thought: threading.Event = field(default_factory=threading.Event)
     lane: int | None = None  # the engine's lane it runs on (llama-server's id_slot; None: the engine's choice, then set)
     name: str = ""  # for the log
     cancel: threading.Event = field(default_factory=threading.Event)

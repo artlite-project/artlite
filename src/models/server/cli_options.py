@@ -112,6 +112,13 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
     gen.add_argument("--reasoning-effort", metavar="LEVEL", default="default",
                      help="the chat template's reasoning_effort (Qwen3.8's: xhigh, medium, low; default: default, the "
                           "template's own); a request's reasoning_effort overrides it")
+    gen.add_argument("--reasoning-budget", metavar="N", type=int, default=-1,
+                     help="a thought's tokens at most, then its end is forced: -1 any, 0 its end at once (default: -1); "
+                          "a request's reasoning_budget_tokens or thinking_budget_tokens overrides it")
+    gen.add_argument("--reasoning-budget-message", metavar="MESSAGE", default="",
+                     help="text written before the thought's forced end (default: none)")
+    gen.add_argument("--prefill-assistant", action=argparse.BooleanOptionalAction, default=True,
+                     help="a conversation that ends with an assistant message continues it (default: on)")
     gen.add_argument("--chat-template-kwargs", type=json.loads, default={},
                      help="chat template variables as a JSON object, under each request's (enable_thinking, "
                           "reasoning_effort, ...)")

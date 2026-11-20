@@ -77,6 +77,8 @@ def serve_model(args: argparse.Namespace, report: Report | None) -> None:
             ({"reasoning_effort": effort} if effort else {})
         if info.chat_template and (template is not None or variables):  # (the file's own, alone: as it is)
             check_chat_template(info.chat_template, **variables)
+        if args.reasoning_budget < -1:
+            raise ValueError("--reasoning-budget: -1 (no budget) or a number of tokens")
         keys = api_keys(args)
         penalties = {k: getattr(args, k) for k in PENALTIES if getattr(args, k) is not None}
         Sampling(**penalties)  # (ValueError: out of range)

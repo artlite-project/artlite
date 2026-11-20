@@ -25,6 +25,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | route | |
 |---|---|
 | `/v1/chat/completions` | chat, streamed or not, with `reasoning_content`, tool calls, `timings`, `prompt_progress`, `usage` |
+| `/v1/chat/completions/control` | ends a running completion's thought (`{"id": ..., "action": "reasoning_end"}`, the completion asked with `reasoning_control: true`), as llama-server's |
 | `/v1/messages`, `/v1/messages/count_tokens` | Anthropic's Messages API ([agents](#agents)) |
 | `/v1/responses`, `/v1/responses/input_tokens` | OpenAI's Responses API ([agents](#agents)) |
 | `/v1/completions`, `/completion` | raw prompts (OpenAI's and llama-server's shapes) |
@@ -54,6 +55,15 @@ them; the web UI attaches them; audio (LFM3-Audio, LFM3-Omni: [below](#speech)) 
 data URIs; videos (LFM3-VL-2B, LFM3-Omni-2B: [the models](models/lfm3.md#videos); FFmpeg's `ffmpeg` and `ffprobe` on
 the server's PATH) as `input_video` or `video_url` parts (`{"data": ...}` or `{"url": ...}`: a data URL or base64), as
 llama-server takes them (`/props`' `modalities.video`); and a chat's `modalities` with `"audio"` gets a spoken reply.
+
+A thought's budget, as llama-server's: a chat request's `reasoning_budget_tokens` (or `thinking_budget_tokens`, the
+web UI's; an Anthropic request's `thinking.budget_tokens`; default `--reasoning-budget`) caps its thought's tokens,
+then `reasoning_budget_message` (default `--reasoning-budget-message`) and the thought's end are written for the model
+(0: at once), and its answer follows; with `reasoning_control: true` the control route ends the thought on demand
+(the web UI's button). `continue_final_message` (`true`, `"content"` or `"reasoning_content"`) continues the last
+message, an assistant's, from where its content (or its thought) ends, as the chat template renders it (the web UI's
+Continue), and the answer is the new text; a conversation that ends with an assistant's message is continued the same
+way (`--prefill-assistant`, on by default: Anthropic's prefill).
 Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
@@ -220,8 +230,10 @@ thinks can take longer):
 - Messages API: `system`, the blocks `text`, `image` (base64), `thinking`, `tool_use` and `tool_result`, `tools`,
   `tool_choice`, tools' `strict`, `output_config.format` ([Structured output](#structured-output)), `stop_sequences`,
   and Anthropic's event stream. `thinking` turns the model's thought on (`enabled`,
-  `adaptive`) or off (`disabled`; without it, `-rea` decides); its budget is not enforced. A prompt longer than the
-  context answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
+  `adaptive`) or off (`disabled`; without it, `-rea` decides), `enabled`'s `budget_tokens` (10000 where it names none,
+  as llama-server's) is the thought's [budget](#api), `output_config.effort` the template's `reasoning_effort`, and a
+  conversation that ends with an assistant's message continues it (its prefill). A prompt longer than the context
+  answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
 - Responses API: `instructions`, the items `message`, `reasoning`, `function_call`, `function_call_output`,
   `custom_tool_call` and `custom_tool_call_output`, function and [custom](#custom-tools) tools (others, such as
   `web_search`, are left out), `tool_choice`, `text.format`, `reasoning.effort` (`none`: no
@@ -247,8 +259,10 @@ thinks can take longer):
 
 ## Web chat
 
-llama.cpp's own web UI (MIT license, copyright The ggml authors), prebuilt, pinned by build and checksum, downloaded
-on the first start into the build cache (later starts need no network). `--path DIR` serves another build, `--no-ui`
+llama.cpp's own web UI, Llama Chat (MIT license, copyright The ggml authors), prebuilt, pinned by build and checksum,
+downloaded on the first start into the build cache (later starts need no network). Its reasoning menu offers the
+`reasoning_effort` levels the chat template renders distinctly (`/props`' `chat_template_caps.reasoning_effort_levels`,
+as llama-server finds them), else token budgets. `--path DIR` serves another build, `--no-ui`
 none.
 
 ## Embeddings and rerank
@@ -652,6 +666,9 @@ Generation:
 | `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |
 | `--reasoning-preserve`, `--no-reasoning-preserve` | earlier answers keep their thoughts in the prompt where the template can (the templates' `preserve_thinking`; default on); a request's `chat_template_kwargs.preserve_reasoning` (or `preserve_thinking`) overrides it |
 | `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
+| `--reasoning-budget N` | a thought's tokens at most, then its end is written for the model (-1: any, 0: at once; default -1); a request's `reasoning_budget_tokens` or `thinking_budget_tokens` overrides it ([API](#api)) |
+| `--reasoning-budget-message MESSAGE` | text written before the thought's forced end (default none) |
+| `--prefill-assistant`, `--no-prefill-assistant` | a conversation that ends with an assistant's message continues it (default on) |
 | `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
 | `--jinja` | accepted: chat templates always render with Jinja (llama-server's switch to them) |

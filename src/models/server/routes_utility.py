@@ -50,7 +50,7 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         except ValueError as e:
             raise bad_request(str(e)) from None
         ids, _ = await ctx.prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
-                                          media=True, tools=fns)
+                                          media=True, tools=fns, cont=ctx.prompts.continuation(req))
         return {"prompt": engine.model.tokenizer.decode_bytes(ids, special=True).decode("utf-8", errors="replace")}
 
     @api.delete("/v1/stream")
