@@ -20,7 +20,7 @@ import numpy as np
 
 from ... import _native, portable, txn
 from ...elf_parser import ParsedElf
-from ...overlay import SPIN_MARGIN_US, irq_cpu, npu_turn
+from ...overlay import SPIN_MARGIN_US, heap_spare, irq_cpu, npu_turn
 from ..base import ArtcOperator
 from . import locks, program
 from .elf import FusedElf
@@ -97,7 +97,9 @@ class Pieces:
     holds both and RESERVE besides (allocations after them: a vision encoder's PDIs), the heap grown if it must; a heap
     that cannot grow (Linux before 7.2: one 64 MB heap per process) gets pieces of what it has left but RESERVE, in
     whole MB, at least MIN_BYTES: a smaller piece only adds dispatches (a gap of tens of us each). An allocation that
-    does not fit such a heap frees the pair between runs (``release``), and the next run takes what is left then."""
+    does not fit such a heap frees the pair between runs (``release``: the first thing the process spares,
+    ``overlay.heap_spare``), and the next run takes what is left then (MIN_BYTES each from a heap that kept
+    transactions fill: the least recently used of those go, ``overlay.Transactions``)."""
 
     RESERVE = 8 << 20
     MIN_BYTES = 4 << 20
@@ -129,8 +131,7 @@ class Pieces:
         return nbytes
 
     def release(self) -> bool:
-        """Free the pair unless a run holds it (the shim's heap reclaim: ``_native.set_heap_reclaim``); returns
-        whether it did."""
+        """Free the pair unless a run holds it (``overlay.heap_spare``); returns whether it did."""
         if not self.bos or not self.lock.acquire(blocking=False):
             return False
         try:
@@ -155,7 +156,7 @@ class Pieces:
 
 
 _PIECES = Pieces()
-_native.set_heap_reclaim(_PIECES.release)
+heap_spare(_PIECES.release)
 
 
 class Guest(Protocol):

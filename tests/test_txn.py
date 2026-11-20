@@ -230,13 +230,13 @@ def test_hang_notes() -> None:
 
 
 def _fake_device(monkeypatch: pytest.MonkeyPatch, kernel: object, *, prologue: bool) -> OverlayDevice:
-    """An OverlayDevice without a device: its loaded transaction, optionally a stale prologue, and ``kernel``."""
+    """An OverlayDevice without a device: optionally a stale prologue, and ``kernel``."""
     monkeypatch.setattr(overlay, "npu_turn", nullcontext)
     monkeypatch.setattr(_native, "turn_foreign", lambda: 0, raising=False)
     dev = object.__new__(OverlayDevice)
     dev._prog = types.SimpleNamespace(_kernel=lambda: kernel)
-    dev._insts, dev.buffers, dev._turns, dev._submitted = None, {}, 0, None
-    dev._loaded = _transaction_words(9)
+    dev.buffers, dev._turns, dev._submitted = {}, 0, None
+    dev._shared = {"stale": False}  # (its hardware context's)
     dev._prologue = types.SimpleNamespace(buffer=None, words=_transaction_words(3)) if prologue else None
     dev.stale = prologue
     dev._last = portable.uptime()  # (a dispatch just ended: the NPU is awake, the prologue runs when stale)
@@ -248,6 +248,11 @@ def _transaction_words(n: int) -> np.ndarray:
     for i in range(n):
         t.write32(0x100 + 4 * i, i)
     return t.words()
+
+
+def _fake_transaction(words: np.ndarray) -> object:
+    """A Transaction without a buffer: its words, no spin."""
+    return types.SimpleNamespace(buffer=None, words=words, durations=[], spin_after_us=lambda: -1)
 
 
 def _hang(idx: int) -> _native.DispatchError:
@@ -268,27 +273,27 @@ def test_dispatch_notes(monkeypatch: pytest.MonkeyPatch) -> None:
             if len(self.runs) in self.fail:
                 raise _hang(self.fail[len(self.runs)])
 
+    step = _fake_transaction(_transaction_words(9))
     dev = _fake_device(monkeypatch, Kernel({1: 5}), prologue=False)
     with pytest.raises(_native.DispatchError) as info:
-        dev.dispatch()
-    assert len(info.value.__notes__) == 1 and "the loaded transaction: operations 4 .. 6 of 9" in info.value.__notes__[0]
+        dev.dispatch(step)
+    assert len(info.value.__notes__) == 1 and "a transaction: operations 4 .. 6 of 9" in info.value.__notes__[0]
 
     dev = _fake_device(monkeypatch, Kernel({1: txn.NO_OP_INDEX}), prologue=True)
     with pytest.raises(_native.DispatchError) as info:  # (the prologue fails first)
-        dev.dispatch()
+        dev.dispatch(step)
     assert len(info.value.__notes__) == 1
     assert "the prologue's transaction (code pages): 3 operations; the firmware reports no operation index" in \
         info.value.__notes__[0]
 
     dev = _fake_device(monkeypatch, Kernel({2: 1}), prologue=True)  # (the prologue passes, the main one fails)
     with pytest.raises(_native.DispatchError) as info:
-        dev.dispatch()
-    assert len(info.value.__notes__) == 1 and "the loaded transaction: operations 0 .. 2 of 9" in info.value.__notes__[0]
+        dev.dispatch(step)
+    assert len(info.value.__notes__) == 1 and "a transaction: operations 0 .. 2 of 9" in info.value.__notes__[0]
 
     dev = _fake_device(monkeypatch, Kernel({1: 2}), prologue=False)
-    dev._loaded = np.array([1, 2, 3], np.uint32)  # (not a transaction)
     with pytest.raises(_native.DispatchError) as info:
-        dev.dispatch()
+        dev.dispatch(_fake_transaction(np.array([1, 2, 3], np.uint32)))  # (not a transaction)
     assert "not decodable" in info.value.__notes__[0]
     e = _hang(1)
     dev._note(e, types.SimpleNamespace())  # (no words: the note fails, the error stays)

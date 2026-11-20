@@ -73,8 +73,9 @@ struct pdev {
   bool heap_fixed() const;
   // Adds a heap BO; false where the driver cannot grow the heap (then heap_fixed) or at its maximum.
   bool grow_heap() const;
-  // Called, without the heap's lock, when a DEV BO does not fit a heap that cannot grow: frees DEV BOs the process
-  // can spare (true: the BO is tried once more). One for the process (set_heap_reclaim).
+  // Called, without the heap's lock, when a DEV BO does not fit a heap that cannot grow: frees a DEV BO the process
+  // can spare (true: the BO is tried again, and the function called again while it does not fit; false: nothing left
+  // to free). One for the process (set_heap_reclaim).
   inline static std::function<bool()> heap_reclaim;
   // The CPU address of a DEV BO at device address xdna_addr.
   void* dev_bo_address(uint64_t xdna_addr) const;

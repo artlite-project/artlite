@@ -302,9 +302,12 @@ a clean failure, never while a job may be hung (a mailbox timeout destroys the c
   contiguous in the NPU's and the CPU's addresses, added while a DEV BO does not fit, up to
   512 MB. The driver places each DEV BO at 32 KB and takes 128 KB per hardware context from the
   heap (`Device.heap_free` counts both). Linux's driver before 7.2 allows one heap BO: 64 MB per
-  process (`Device.heap_fixed` once it refused one; a full heap raises `HeapFullError`). There a
-  prefill's instruction pieces (`fused.library.Pieces`: two per process) take what the heap has
-  left but 8 MB instead of 24 MB each: only more dispatches.
+  process (`Device.heap_fixed` once it refused one). There a prefill's instruction pieces
+  (`fused.library.Pieces`: two per process) take what the heap has left but 8 MB instead of 24 MB
+  each (only more dispatches), and a DEV BO that does not fit makes the process give up what it
+  can build again (`overlay.heap_spare`): the pieces between two programs, then the models' step
+  transactions, the least recently used first (`overlay.Transactions`: a model's kinds of steps
+  take up to ~50 MB, each built again at its next use); `HeapFullError` once nothing is left.
 - Reading AIE tiles (`HwContext.read_aie_reg`: counter profiling, the paging probes) and a
   context's status are xdna-driver requests; Linux's driver serves neither (NotImplementedError).
 - In PASID mode the NPU addresses BOs by user VA through MMU notifiers: a `munmap`,

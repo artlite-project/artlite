@@ -36,7 +36,7 @@ from ..formats import has_tile_format, tile_format
 from ..gguf_model import GGUFFile
 from ..operators.design import COLS
 from ..operators.util import rup
-from ..overlay import OverlayDevice, Sequence, Transaction, WeightBuffer
+from ..overlay import OverlayDevice, Sequence, Transaction, Transactions, WeightBuffer
 from ..txn import HardwareLimitError
 from . import phases as mp
 from .head import LogitsOrder
@@ -247,7 +247,7 @@ class ModelOverlay:
         # (overlays that hold the same sequences beside this one, selected with it: a drafter's records of each)
         self.followers: list[ModelOverlay] = []
         self._layout: dict[str, int] = {}  # (buffer -> bytes so far: ``_take``)
-        self._steps: dict[StepKey, Any] = {}  # (a step's transaction, built at its first use)
+        self._steps = Transactions()  # (StepKey -> a step's transaction: built at its first use, ``_transaction``)
         self._metas_s: tuple[int, int] = (0, 0)  # (the S and start the phases' metadata objects were written for)
         self._meta_bytes: dict[tuple[int, int], tuple] = {}  # (S, start) -> the objects' ACT bytes (``_metas``)
         self._last_s = 1
@@ -596,8 +596,10 @@ class ModelOverlay:
         return StepKey(S, logits, self._variant(), subs, b)
 
     def _transaction(self, key: StepKey) -> Any:
-        """The transaction of a step (built at its first use)."""
+        """The transaction of a step: built at its first use, and again after the process gave it up for room in the
+        device heap (``overlay.Transactions``; its next run is a first one again: ``once_s``)."""
         if key not in self._steps:
+            self._ran_keys.discard(key)
             self._steps[key] = self._build(key.S, key.logits, key.subs, key.b)
         return self._steps[key]
 

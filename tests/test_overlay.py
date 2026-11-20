@@ -7,7 +7,7 @@ import pytest
 
 from artlite import overlay, txn
 from artlite.operators.design import COLS
-from artlite.overlay import IDLE_S, OverlayDevice, Sequence
+from artlite.overlay import IDLE_S, OverlayDevice, Sequence, Transactions
 
 
 def test_txn_encoding() -> None:
@@ -159,6 +159,27 @@ def test_overlay_idle_prologue(monkeypatch: pytest.MonkeyPatch) -> None:
     assert run(0.1) == ["prologue", "step"] and not other.stale
     dev._prologue = None  # (a design that keeps nothing on the array)
     assert run(10 * IDLE_S) == ["step"]
+
+
+def test_kept_transactions_reclaim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A full device heap that cannot grow (``overlay._reclaim``, the shim's hook: one thing freed per call) gets what
+    ``heap_spare`` named first, then the kept transactions of all owners, the least recently used first; a read marks
+    a key used, a key given up is no longer there."""
+    monkeypatch.setattr(Transactions, "all", set())  # (this test's owners alone)
+    spared: list[str] = []
+    pieces = ["pair"]
+    monkeypatch.setattr(overlay, "_SPARE", [lambda: bool(pieces) and bool(spared.append(pieces.pop()) or True)])
+    model, drafter = Transactions(), Transactions()
+    model["s1"], drafter["d1"], model["s2"], drafter["d2"] = "S1", "D1", "S2", "D2"
+    assert model["s1"] == "S1" and list(model) == ["s2", "s1"] and len(model) == 2  # (s1 used: s2 the older)
+    assert overlay._reclaim() and spared == ["pair"]  # (the named buffers first)
+    order = []
+    while overlay._reclaim():
+        order.append(sorted(set(model) | set(drafter)))
+    assert order == [["d2", "s1", "s2"], ["d2", "s1"], ["s1"], []]  # (d1, s2, d2, s1: by last use)
+    assert "s1" not in model and not len(model) and not overlay._reclaim()
+    model["s1"] = "again"  # (its owner builds it again)
+    assert model["s1"] == "again"
 
 
 def test_process_memory() -> None:

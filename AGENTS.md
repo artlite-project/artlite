@@ -208,7 +208,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   `health["txn_op_idx"]` is the last control-code operation the firmware ran (0xFFFFFFFF: none reported).
 - A runtime-sequence argument stays below 4 GB (ELF relocation addends are 32-bit).
 - An ELF's control code goes into the process's device heap (64 MB heap BOs up to 512 MB; one before Linux 7.2, where
-  `Library`'s pieces shrink to fit and a full heap raises `HeapFullError`); every ConfigureOp inlines its design's
+  `Library`'s pieces shrink to fit, the least recently used step transactions are given up for room
+  (`overlay.Transactions`) and a heap that is still full raises `HeapFullError`); every ConfigureOp inlines its design's
   configuration. Long programs: `fused.Library` + `Library.run`.
   Thousands of entries in one aiecc ELF make aiecc's time explode.
 - `FusedOperator` refuses to run while a buffer read before it is written was never written by the host (declare

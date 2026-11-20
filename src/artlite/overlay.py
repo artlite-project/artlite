@@ -6,8 +6,10 @@ the transaction of a dispatch; ``sync`` closes a group of transfers that must co
 issued (an output that the next phase reads back from DDR). ``OverlayDevice`` owns the compiled design's hardware
 context and dispatches transactions on host buffers; ``Transaction`` keeps one in an instruction buffer of its
 own, to be patched (``txn.bd_words``) and dispatched again (its last durations time a spin on the CPU of the NPU's
-interrupts near its end: ``irq_cpu``). ``WeightBuffer`` packs a weight image in a thread. ``npu_turn`` holds the NPU's
-turn between processes (``csrc/artlite/turn.h``) across a check and the dispatches it decides.
+interrupts near its end: ``irq_cpu``); ``Transactions`` keeps those an owner runs again (a model's steps), the least
+recently used of them given up where the device heap is full and cannot grow (``heap_spare``). ``WeightBuffer`` packs
+a weight image in a thread. ``npu_turn`` holds the NPU's turn between processes (``csrc/artlite/turn.h``) across a
+check and the dispatches it decides.
 
 The design's operator (``OverlayOperator``) names its streams: ``ENDPOINTS`` (stream -> (direction, shim
 channel)), ``BD_BASE`` (stream -> the first of the shim BDs its transfers use in turn: 16 BDs per shim tile;
@@ -20,11 +22,13 @@ from __future__ import annotations
 import collections
 import contextlib
 import functools
+import itertools
 import os
 import threading
 import time
-from collections.abc import Iterator, Mapping
-from typing import ClassVar, Protocol
+import weakref
+from collections.abc import Callable, Hashable, Iterator, Mapping
+from typing import Any, ClassVar, Protocol
 
 import numpy as np
 
@@ -219,7 +223,7 @@ class Sequence:
 class OverlayDevice:
     """The compiled decode design on the NPU and its host buffers."""
 
-    def __init__(self, op: OverlayOperator, *, max_instruction_bytes: int = 1 << 22, device: object = None):
+    def __init__(self, op: OverlayOperator, *, device: object = None):
         """device: an ``artlite.Device`` to share (buffers of both designs, one per hardware context). An op that
         another OverlayDevice attached keeps its program: the devices' dispatches share its hardware context (a
         second context of the same design would make every switch between them a reconfiguration)."""
@@ -232,8 +236,6 @@ class OverlayDevice:
         self.device, self._prog = prog._device, prog
         if backend.ADDRESSES_NEED_CONTEXT:
             prog._kernel()
-        self._insts = self.device.alloc_insts_buffer(max_instruction_bytes)
-        self._loaded = np.zeros(0, np.uint32)  # (the words load() wrote)
         self.buffers: dict[str, object] = {}
         # (names that stand for other buffers: a model's selected sequence's, ``decode.model.ModelOverlay.select``)
         self.alias: dict[str, str] = {}
@@ -340,23 +342,12 @@ class OverlayDevice:
         name itself, whatever the name stands for (``alias``)."""
         return txn.device_address(self.buffers[name] if own else self.named(name), offset, self._prog._ctx)
 
-    def load(self, words: np.ndarray) -> None:
-        """Make ``words`` the transaction of the following dispatches (``dispatch()``)."""
-        assert words.nbytes <= self._insts.size, f"transaction of {words.nbytes} B"
-        txn.verify_if_enabled(words, queues=False)
-        self._insts.map().view(np.uint32)[:words.size] = words
-        self._insts.sync_to_device(words.nbytes, 0)
-        self._loaded = self._insts.map().view(np.uint32)[:words.size]
-
-    def dispatch(self, transaction: Transaction | None = None) -> None:
-        """Run a transaction (default: the loaded one); blocking. The DispatchError of a transaction
-        the driver's hang detection stopped names the operations where the firmware was."""
+    def dispatch(self, transaction: Transaction) -> None:
+        """Run a transaction; blocking. The DispatchError of a transaction the driver's hang detection stopped names
+        the operations where the firmware was."""
         with npu_turn():
             self._fresh()  # (a failure of the prologue is noted as its own)
             try:
-                if transaction is None:
-                    self._prog._kernel().dispatch(self._insts, list(self.buffers.values()))
-                    return
                 t0 = time.perf_counter()
                 self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
                                               spin_after_us=transaction.spin_after_us(), spin_cpu=irq_cpu())
@@ -388,16 +379,80 @@ class OverlayDevice:
         finally:
             self._last = portable.uptime()
 
-    def _note(self, e: DispatchError, transaction: Transaction | None, *, what: str | None = None) -> None:
-        """Add where the firmware was to a DispatchError (``txn.hang_note``): the transaction ``transaction`` (None:
-        the loaded one) or the prologue's. Never raises: a note failing would mask the error."""
+    def _note(self, e: DispatchError, transaction: Transaction, *, what: str = "a transaction") -> None:
+        """Add where the firmware was to a DispatchError (``txn.hang_note``): in the transaction ``transaction`` (a
+        step's, or the prologue's). Never raises: a note failing would mask the error."""
         try:
-            if what is None:
-                what = "the loaded transaction" if transaction is None else "a transaction"
-            words = self._loaded if transaction is None else transaction.words
-            e.add_note(txn.hang_note(words, e.health, what=what))
+            e.add_note(txn.hang_note(transaction.words, e.health, what=what))
         except Exception as note_error:  # noqa: BLE001 (the dispatch's error is the one to see)
             e.add_note(f"(no transaction position: {note_error!r})")
+
+
+_SPARE: list[Callable[[], bool]] = []  # (``heap_spare``)
+
+
+def heap_spare(release: Callable[[], bool]) -> None:
+    """Name device-heap buffers the process gives up before any kept transaction where the heap is full and cannot grow
+    (Linux before 7.2: one heap of 64 MB per process): ``release()`` frees them and returns whether it freed anything
+    (buffers that cost little to have again: the Library programs' pieces)."""
+    _SPARE.append(release)
+
+
+def _reclaim() -> bool:
+    """(``_native.set_heap_reclaim``: a device-heap buffer does not fit a heap that cannot grow) Free one thing the
+    process can have again: what ``heap_spare`` named, else the least recently used of all kept transactions
+    (``Transactions``); whether it freed anything (called again while the buffer does not fit)."""
+    if any(release() for release in _SPARE):
+        return True
+    kept = [t for t in Transactions.all if len(t)]
+    if not kept:
+        return False
+    min(kept, key=Transactions.oldest).drop()
+    return True
+
+
+_native.set_heap_reclaim(_reclaim)
+
+
+class Transactions:
+    """What an owner keeps to run again, by key (a model's steps: per kind of step the object that holds its
+    ``Transaction`` and what patches it): each transaction lies in a device-heap buffer of its own, and a model's
+    kinds of steps together take tens of MB (Qwen3.6 35B-A3B with its drafter: 52 of 0.9 MB). Where the device heap is
+    full and cannot grow, the process gives them up one by one, the least recently used of all owners' first
+    (``_reclaim``): a key that is no longer here is built again by its owner. Reading a key marks it used."""
+
+    all: ClassVar[weakref.WeakSet[Transactions]] = weakref.WeakSet()
+    _uses: ClassVar[Iterator[int]] = itertools.count()
+
+    def __init__(self) -> None:
+        self._kept: dict[Hashable, tuple[int, Any]] = {}  # (key -> its last use, the object; the least recent first)
+        Transactions.all.add(self)
+
+    def __contains__(self, key: Hashable) -> bool:
+        return key in self._kept
+
+    def __len__(self) -> int:
+        return len(self._kept)
+
+    def __iter__(self) -> Iterator[Hashable]:
+        return iter(list(self._kept))
+
+    def __getitem__(self, key: Hashable) -> Any:
+        value = self._kept.pop(key)[1]
+        self._kept[key] = (next(self._uses), value)
+        return value
+
+    def __setitem__(self, key: Hashable, value: Any) -> None:
+        self._kept.pop(key, None)
+        self._kept[key] = (next(self._uses), value)
+
+    def oldest(self) -> int:
+        """The last use of its least recently used key (not empty)."""
+        return next(iter(self._kept.values()))[0]
+
+    def drop(self) -> None:
+        """Give up its least recently used key (not empty)."""
+        del self._kept[next(iter(self._kept))]
 
 
 class Transaction:

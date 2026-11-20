@@ -58,8 +58,9 @@ void bind_errors(nb::module_& m) {
         });
       },
       "f"_a,
-      "f() is called when a DEV BO does not fit a device heap that cannot grow (Linux before 7.2): it frees DEV BOs "
-      "the process can spare and returns True for the allocation to be tried once more.");
+      "f() is called when a DEV BO does not fit a device heap that cannot grow (Linux before 7.2): it frees a DEV BO "
+      "the process can spare and returns True for the allocation to be tried again (f is called again while the BO "
+      "does not fit), False when nothing is left to free.");
   // A full device heap (ENOSPC: a DEV BO that does not fit): HeapFullError, an Error.
   static PyObject* heap_full = PyErr_NewException("artlite._native.HeapFullError", exc_error.ptr(), nullptr);
   m.attr("HeapFullError") = nb::handle(heap_full);

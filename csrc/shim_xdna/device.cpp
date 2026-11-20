@@ -138,7 +138,6 @@ bool pdev::try_add_heap_bo() const {
 
 void pdev::create_dev_bo(amdxdna_drm_create_bo& cbo) const {
   std::unique_lock guard(m_heap_lock);
-  bool reclaimed = false;
   // EAGAIN: the driver placed the BO past the heap BOs; ENOSPC below the maximum: a driver that
   // never places one there (one heap BO: Linux before 7.2)
   while (::ioctl(m_dev_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &cbo) == -1) {
@@ -147,8 +146,8 @@ void pdev::create_dev_bo(amdxdna_drm_create_bo& cbo) const {
     if (err != EAGAIN && err != ENOSPC) shim_err(err, "DRM_IOCTL_AMDXDNA_CREATE_BO IOCTL failed");
     size_t heap = m_heap_bos.size() * heap_bo_size;
     if (err == ENOSPC && heap < heap_max_size) m_heap_fixed = true;
-    if (m_heap_fixed && !reclaimed && heap_reclaim) {  // (its BOs' release takes the lock)
-      reclaimed = true;
+    // (a heap that cannot grow; again while it frees something; its BOs' release takes the lock)
+    if ((m_heap_fixed || heap >= heap_max_size) && heap_reclaim) {
       guard.unlock();
       bool freed = heap_reclaim();
       guard.lock();

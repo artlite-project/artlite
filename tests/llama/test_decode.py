@@ -3,7 +3,8 @@ vocabulary, against the overlay's arithmetic on the host (ref.LlamaNpuRef), in b
 
 - a text from position 0 in steps of 1 .. 4 tokens (record pairs, records and cache groups crossed at every alignment;
   a step of S slots gives each the logits of a step of one): logits, attention outputs, the LM head's input, then the
-  caches and the open record's ring;
+  caches and the open record's ring; on the way the steps' kept transactions are given up once, as for room in a full
+  device heap (``overlay.Transactions``), and built again;
 - steps at positions 960 .. 1039 after a cache filled with random K, V (record, group and object boundaries deep in
   the cache), against the reference attending to the cache as stored;
 - three sequences on one device, alternated and in joint steps: every slot the logits of its sequence alone, bit for bit.
@@ -24,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 
+from artlite import overlay
 from artlite.decode import kv
 from artlite.decode.kv import KV_K
 from artlite.decode.protocol import SLOTS
@@ -93,6 +95,11 @@ def test_llama_decode_steps(case: str, kv_k: str) -> None:
     while p < len(ids):
         n = min(STEPS[i % len(STEPS)], len(ids) - p)
         i += 1
+        if i == 7:  # (as a full device heap that cannot grow has it: every kept transaction given up, the one patched
+            # ahead too; the steps from here on build theirs again)
+            while overlay._reclaim():
+                pass
+            assert not len(ov._steps)
         logits = to_torch(ov.step(x[p:p + n], p)).float()
         for s in range(n):
             keep("logits", logits[s], want[p + s])
@@ -100,6 +107,7 @@ def test_llama_decode_steps(case: str, kv_k: str) -> None:
             for L in layers:
                 keep(f"attn.{L}", ov.attn_out(L, s), trace[f"attn.{L}"][p + s])
         p += n
+    assert len(ov._steps)
     r0 = (len(ids) - 1) // 8 * 8  # (the last record: its values in the ring)
     ov.dev.fetch("KV")
     for L, cache in model.caches.items():  # the caches as the last token left them
