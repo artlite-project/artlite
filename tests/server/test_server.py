@@ -269,6 +269,40 @@ def test_reasoning_budget_end() -> None:
         assert ran().endswith("<|assistant|><think></think>Yes") and next_prompt(msg).startswith(ran())
 
 
+def test_effort_budget() -> None:
+    """A request's reasoning_effort sets its thought's budget where the template renders no levels (minimal: 0, low,
+    medium; high and above, or none given: the server's); an explicit budget comes first; Responses' and Anthropic's
+    efforts are the chat's; a template with levels of its own (Qwen3.8's) takes the level and no budget."""
+    model, npu, engine = make(reasoning=QWEN, capacity=8192)
+    words = [f" w{i}" for i in range(1500)]
+
+    def thought(client: TestClient, path: str = "/v1/chat/completions", **body: object) -> int:
+        npu.replies = [list(words), ["Yes"]]
+        r = client.post(path, json={"messages": [{"role": "user", "content": "Q"}], "max_tokens": 4000, **body})
+        if path == "/v1/messages":
+            return len(next(b["thinking"] for b in r.json()["content"] if b["type"] == "thinking").split())
+        if path == "/v1/responses":
+            item = next(o for o in r.json()["output"] if o["type"] == "reasoning")
+            return len(item["content"][0]["text"].split())
+        return len((r.json()["choices"][0]["message"].get("reasoning_content") or "").split())
+
+    with TestClient(app_of(engine, reasoning="on", reasoning_budget=300, n_ctx=8192)) as client:
+        assert engine.wait_ready(5)
+        assert thought(client, reasoning_effort="low") == 1024 and thought(client, reasoning_effort="medium") == 1500
+        assert thought(client, reasoning_effort="high") == thought(client) == 300  # (the server's)
+        assert thought(client, reasoning_effort="low", reasoning_budget_tokens=10) == 10
+        assert thought(client, reasoning_effort="minimal") == 0
+        assert thought(client, "/v1/responses", input="Q", reasoning={"effort": "low"}) == 1024
+        assert thought(client, "/v1/messages", max_tokens=4000, thinking={"type": "adaptive"},
+                       output_config={"effort": "low"}) == 1024
+        assert thought(client, "/v1/messages", max_tokens=4000, thinking={"type": "enabled", "budget_tokens": 20},
+                       output_config={"effort": "low"}) == 20
+    model.takes = ("low", "medium", "xhigh")
+    levels = "{% if reasoning_effort == 'low' %}{% elif reasoning_effort == 'medium' %}m{% else %}x{% endif %}"
+    with TestClient(app_of(engine, reasoning="on", template=TEMPLATE + levels, n_ctx=8192)) as client:
+        assert thought(client, reasoning_effort="low") == 1500 and model.variables["reasoning_effort"] == "low"
+
+
 def test_reasoning_control() -> None:
     """/v1/chat/completions/control ends a running completion's thought (its id), where the request armed it."""
     _model, npu, engine = make(reasoning=QWEN, delay=0.01)

@@ -43,6 +43,12 @@ OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": 
                 "post_sampling_probs": False, "backend_sampling": False, "lora": []}
 
 
+# a thought's tokens at most per ``reasoning_effort`` level (chat's; Responses' ``reasoning.effort``, Anthropic's
+# ``output_config.effort``) where the template renders no levels; the others (none: no thought; high, xhigh, max):
+# the server's budget
+EFFORT_BUDGETS = {"minimal": 0, "low": 1024, "medium": 4096}
+
+
 class ApiContext:
     """The state of one model's server that its routes share: ``engine``, ``options``, ``info``, the template's
     properties (``syntax``: its tool calls, None: it takes no tools; ``typed``: content as text parts; ``first``: a
@@ -250,8 +256,9 @@ class ApiContext:
 
     def thought_budget(self, req: ChatRequest) -> tuple[int, str, str, bool]:
         """llama-server's reasoning budget of a chat request: a thought's tokens at most (its
-        ``reasoning_budget_tokens``, else ``thinking_budget_tokens``, the web UI's; -1 or none: ``--reasoning-budget``;
-        < 0: any), the message that ends it early (``reasoning_budget_message``, else ``--reasoning-budget-message``;
+        ``reasoning_budget_tokens``, else ``thinking_budget_tokens``, the web UI's and Anthropic's; -1 or none: its
+        ``reasoning_effort``'s, ``EFFORT_BUDGETS``, where the template renders no levels of its own - Qwen3.8's and
+        Spark-X's keep theirs -, else ``--reasoning-budget``; < 0: any), the message that ends it early (``reasoning_budget_message``, else ``--reasoning-budget-message``;
         ``Job.thought_end``: on a paragraph of its own), the template's own end of a thought after it (``thought_end``:
         Qwen's ``"\\n</think>\\n\\n"``, so that the next request, which renders the cut thought again, continues
         the cached tokens; llama-server forces the message and the close marker alone) and whether the control route
@@ -262,7 +269,9 @@ class ApiContext:
             raise bad_request("reasoning_budget_tokens: -1 (no budget) or a number of tokens")
         if model.reasoning is None:
             return -1, "", "", False
-        n = self.options.reasoning_budget if n is None or n == -1 else n
+        if n is None or n == -1:
+            n = EFFORT_BUDGETS.get(req.reasoning_effort or "") if not self.efforts else None
+            n = self.options.reasoning_budget if n is None else n
         message = req.reasoning_budget_message if req.reasoning_budget_message is not None else \
             self.options.reasoning_budget_message
         return n, message.strip(), self.thought_end, bool(req.reasoning_control)
