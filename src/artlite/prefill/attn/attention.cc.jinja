@@ -65,6 +65,7 @@ __attribute__((noinline)) void {{ p }}_ppan(const bfloat16 *__restrict s, uint8_
     AIE_TRY_INITIATION_INTERVAL(16)  // (post-RA II 22)
 {% else %}
     AIE_PREPARE_FOR_POSTPIPELINING  // (II 19; a pre-RA II 38 spilling)
+    AIE_LOOP_REG_REWRITE_SWPAWARE  // (II 21 without)
 {% endif %}
     for (int i = 0; i < {{ RB * CR }}; i++) {
         const aie::accum<accfloat, 32> p0 = {{ p }}_e2(aie::load_v<32>(s), aie::max(aie::load_v<32>(s + 64), h));

@@ -43,6 +43,10 @@ traps).
        only its share (measuring.md "Ablations").
    - In a model's program, rank by share before optimizing anything: per operator kind (its items dropped from a
      library program) and per design switch (data-movement.md "Overlays, libraries and fused ELFs").
+     `python -m tests.schedule_ledger rank APP` (no NPU) ranks a prefill chunk's kinds by their busiest cores'
+     static cycles and its loops by weight and by slack (II above the resource bound): a loop at its bound only gets
+     faster with fewer operations, a loop with no weight does not move the model. Attentions are upper bounds there
+     (both paths of their branches counted); the decode overlays have no static weights (measuring.md, calls).
 2. **Bound the hot loop** (machine-model.md): per-slot and per-port op counts give ResMII, dependence chains give
    RecMII; count live values against the registers (5 `dm` accumulators, 12 `x` / `ex`, 8 `p`). Write the bound down.
    If the achieved II is already near it, change the algorithm (sections 3 and 4), not the syntax.
@@ -287,9 +291,9 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   split such code across ops or cores). `minsize` turns loop rotation off: a `for` loop stays two blocks (its test
   at the top, the delay slots of its `jnz` and of the jump into it empty), no ZOL, ~7 cycles more per iteration. A loop whose ZOL is too big
   (post-pipelined, or a short body padded to the ZOL's 112 B from setup to loop end) takes
-  `AIE_LOOP_MIN_ITERATION_COUNT(1)` and `AIE_LOOP_HINT(enable-aie-hardware-loops, 0)` without `minsize` instead
-  (`gout`, `norm_rope`, `qpan`; older Peano reads the minimum of 1 as no hardware loop, newer only the hint): no
-  hardware loop, one block, its `jnz` delay slots filled from the body, smaller and faster than `minsize`. A constant loop of 2-4 trips
+  `AIE_LOOP_HINT(enable-aie-hardware-loops, 0)` without `minsize` instead (`gout`, `norm_rope`, `gmax`; a minimum
+  trip count no longer keeps a loop out of hardware loops, but `AIE_LOOP_MIN_ITERATION_COUNT(1)` on a runtime count
+  still drops its zero-trip guard: 32 B in `gmax`): no hardware loop, one block, its `jnz` delay slots filled from the body, smaller and faster than `minsize`. A constant loop of 2-4 trips
   that Peano left rolled (a pipelined ZOL: loop-hints.md) takes `AIE_LOOP_UNROLL_FULL`: the MoE `collect`'s partial
   sums 160 B and 21 cycles less; vector compares against a lane-index table instead of 64-bit mask arithmetic;
   runtime parameters instead of template instances (each instance is a copy: one dequant routine with a runtime

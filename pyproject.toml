@@ -15,8 +15,8 @@ requires-python = ">=3.12,<3.15"  # the pinned mlir_aie's wheels: 3.12-3.14
 # Everything artlite-cli, artlite-server (its web chat included), artlite-bench and artlite-probe run on; tools for
 # working on Artlite are the dev group.
 dependencies = [
-    "mlir_aie==1.4.6.dev41+gdca0ca1",  # (dev42+: GemmQd's 4-D padded memtile BDs fail to lower until mlir-aie #4087)
-    "llvm_aie==22.0.0.2026111801+7083001b",
+    "mlir_aie==1.4.6.dev63+g0f76700",
+    "llvm_aie==22.0.0.2026112001+ec5614f1",
     "numpy>=2",  # NEP 50 promotion: the host's float32 arithmetic stays float32
     "ml-dtypes>=0.4",  # (the first built for numpy 2)
     "pyyaml>=6.0.3",

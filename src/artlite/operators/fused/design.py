@@ -5,6 +5,13 @@ changes; in a library at every entry) holds a RunOp of the operator's runtime se
 
 In a library, operators whose devices are equal apart from their runtime sequences share the first one's device (each
 keeps its sequence, renamed): one array design compiled, not one per operator.
+
+With expanded PDI loads (every library; a FusedOperator's default) main ends with the configuration of a device of
+nothing (``CLOSING``: an array reset): aiecc proves a design's shim inputs consumed by its outputs counting on a clean
+start, and refuses a sequence that leaves a device loaded whose last run moves more through an input than that proof
+covers (an attention's V rows, which its cores take as far as the position asks), though with expanded loads every
+dispatch starts with a reset of its own. A library is never dispatched whole: the programs assembled from it
+(``program``) drop the closing configuration.
 """
 
 import math
@@ -19,6 +26,7 @@ from ..mlir_util import device_op, device_ops, runtime_sequence
 from .layout import distinct
 
 _ELEM = 2  # bytes of main's argument elements (bf16)
+CLOSING = "closing"  # (the closing device: module docstring)
 
 
 class Arg(NamedTuple):
@@ -46,9 +54,9 @@ def without_sequences(mlir: str) -> str:
 
 
 def render(entries: Sequence[tuple[ArtcOperator, Sequence[Arg]]], *, arg_bytes: Sequence[int],
-           library: bool) -> str:
+           library: bool, closing: bool) -> str:
     """The fused MLIR of ``entries`` (an operator and where its arguments lie, per run). ``arg_bytes``: the sizes of
-    main's arguments."""
+    main's arguments; ``closing``: main ends with the closing device's configuration (module docstring)."""
     from aie.extras.context import mlir_mod_ctx
 
     ops = distinct(op for op, _ in entries)
@@ -59,7 +67,7 @@ def render(entries: Sequence[tuple[ArtcOperator, Sequence[Arg]]], *, arg_bytes: 
     host = {n: designs.setdefault(without_sequences(t), n) if library else n for n, t in texts.items()}
     with mlir_mod_ctx() as ctx:
         sequences = _merge(ctx, texts, host)
-        _main(device, [(names[id(op)], args) for op, args in entries], arg_bytes, host, sequences, library)
+        _main(device, [(names[id(op)], args) for op, args in entries], arg_bytes, host, sequences, library, closing)
         return str(ctx.module)
 
 
@@ -137,10 +145,15 @@ def _merge(ctx: Any, texts: dict[str, str], host: dict[str, str]) -> dict[str, A
 
 
 def _main(device: Any, entries: list[tuple[str, Sequence[Arg]]], arg_bytes: Sequence[int], host: dict[str, str],
-          sequences: dict[str, Any], library: bool) -> None:
+          sequences: dict[str, Any], library: bool, closing: bool) -> None:
     """The device ``main``: its runtime sequence configures and runs the entries."""
     from aie import ir
     from aie.dialects import aie, aiex, memref
+
+    if closing:
+        @aie.device(device, sym_name=CLOSING)
+        def closing_device():
+            pass
 
     @aie.device(device)
     def main():
@@ -157,6 +170,8 @@ def _main(device: Any, entries: list[tuple[str, Sequence[Arg]]], arg_bytes: Sequ
                     views = [_view(args[a.index], a, ty, memref) for a, ty in zip(op_args, types, strict=True)]
                     seq = "sequence" if host[name] == name else f"sequence_{name}"
                     aiex.RunOp(ir.FlatSymbolRefAttr.get(seq), views)
+            if closing:
+                aiex.ConfigureOp(ir.FlatSymbolRefAttr.get(CLOSING)).body.blocks.append()
 
 
 def _view(buf: Any, arg: Arg, ty: Any, memref: Any) -> Any:

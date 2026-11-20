@@ -400,7 +400,7 @@ def inject_perf_counters(
     placed_path = os.path.join(work_dir, "design_placed.mlir")
     with open(src_path, "w") as f:
         f.write(mlir_text)
-    _run_aie_opt("builtin.module(aie.device(aie-place-tiles))", src_path, placed_path, what="aie-place-tiles")
+    _run_aie_opt("builtin.module(aie-place-tiles)", src_path, placed_path, what="aie-place-tiles")
     with open(placed_path) as f:
         placed = f.read()
 
@@ -458,8 +458,7 @@ def pre_lower_trace(mlir_path: str, cfg: ProfileConfig, work_dir: str) -> str:
     if cfg.trace_lateral:
         opts += "lateral-routing=true"
     _run_aie_opt(
-        "builtin.module(aie.device("
-        "aie-place-tiles,"
+        "builtin.module(aie-place-tiles,aie.device("  # (placement: at module scope)
         f"aie-insert-trace-flows{{{opts}}},"
         "aie-trace-to-config,aie-trace-pack-reg-writes,"
         "aie-inline-trace-config),aie-fuse-trace-buffers)",

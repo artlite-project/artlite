@@ -83,13 +83,21 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
          ) -> tuple[np.ndarray, np.ndarray, list[Block], list[np.ndarray]]:
     """A library ELF's control program (patched, 32-bit words) -> its header, its preamble (the operations before the
     first PDI load: the scratchpad's creation), one ``Block`` per entry and the two PDI loads its configurations
-    alternate between. ``bds``: its data BDs, ``slots``: where the ELF placed each entry's arguments."""
+    alternate between; the closing configuration after the last entry, which enables no core, left out. ``bds``: its
+    data BDs, ``slots``: where the ELF placed each entry's arguments."""
     ops = [(p + 4, op) for p, op in txn.op_offsets(code[4:])]
     starts = [p for p, _ in ops] + [len(code)]
     loads = [i for i, (_, op) in enumerate(ops) if op == txn.OP_LOAD_PDI] + [len(ops)]
-    if loads[-2] == len(ops) - 1:  # (a PDI load closing the control code, after the last entry: not an entry)
-        ops, starts = ops[:-1], starts[:-1]
-        loads[-2:] = [len(ops)]
+
+    def enables(a: int, b: int) -> list[int]:
+        """The operations of ops[a:b] that enable a core."""
+        return [i for i in range(a, b) if ops[i][1] == txn.OP_MASKWRITE
+                and code[starts[i] + 2] & 0xFFFFF == CORE_TILE.control[0] and code[starts[i] + 4] & 1]
+
+    while len(loads) > 2 and not enables(loads[-2], loads[-1]):  # (the closing configuration: ``design.CLOSING``)
+        cut = loads[-2]
+        ops, starts = ops[:cut], starts[:cut + 1]
+        loads[-2:] = [cut]
     assert all(op == txn.OP_CREATE_SCRATCHPAD for _, op in ops[:loads[0]]), "operations before the first PDI load"
     slot_starts = np.array([s[0] for s in slots])
     order = np.argsort(slot_starts)
@@ -98,10 +106,9 @@ def _cut(code: np.ndarray, bds: Sequence[ShimBd], slots: Sequence[Slot]
     designs: dict[bytes, int] = {}  # configuration (after its PDI load) and its packets -> the first entry with them
     blocks: list[Block] = []
     for e, (a, b) in enumerate(itertools.pairwise(loads)):
-        enables = [i for i in range(a, b) if ops[i][1] == txn.OP_MASKWRITE
-                   and code[starts[i] + 2] & 0xFFFFF == CORE_TILE.control[0] and code[starts[i] + 4] & 1]
-        assert enables, f"block {e}: no core enables"
-        r = enables[-1] + 1  # (the RunOp: after the configuration's core enables)
+        enabled = enables(a, b)
+        assert enabled, f"block {e}: no core enables"
+        r = enabled[-1] + 1  # (the RunOp: after the configuration's core enables)
         lo, mid, hi = starts[a], starts[r], starts[b]
         assert not ((bd_at >= lo) & (bd_at < mid)).any(), f"block {e}: a data BD in the configuration"
         sel = (bd_at >= mid) & (bd_at < hi)

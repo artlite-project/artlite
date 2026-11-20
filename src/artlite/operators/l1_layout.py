@@ -48,7 +48,7 @@ def pin_l1_buffers(
     pinned = 0
     placed: dict[tuple[int, int], list[tuple[str, int, int]]] = {}  # core tile -> (name, address, bytes) pinned
     with module.context, ir.Location.unknown():
-        PassManager.parse("builtin.module(aie.device(aie-place-tiles,aie-objectfifo-split))").run(module.operation)
+        PassManager.parse("builtin.module(aie-place-tiles,aie.device(aie-objectfifo-split))").run(module.operation)
         device = device_op(module)
         i32 = ir.IntegerType.get_signless(32)
         for op in list(device.regions[0].blocks[0].operations):

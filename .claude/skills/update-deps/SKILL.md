@@ -22,14 +22,21 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 - No cache clearing needed: RTC cache keys include the `mlir_aie`/`llvm_aie` versions, so kernels recompile automatically. Old `rtc_*` dirs in `~/.cache/artlite/` just become orphaned; delete them to reclaim disk if desired.
 - `requires-python` in `pyproject.toml` ends below the first Python without an `mlir_aie` wheel (uv picks the newest
   allowed Python): raise it when the new wheels add a Python version, then `uv lock`.
-- Run `pytest tests -m smoke` (one NPU case per component and the apps' full designs: a bump can push a core past
-  its program memory), not the full suite unless asked.
+- The survey: `python -m tests.schedule_ledger record` builds every app's designs with the new wheels (cold: ~50
+  minutes, the builds) and prints what changed against the committed baseline, worst first: loops that lost
+  pipelining, II / NS / spills up, function cycles and bytes, cores below 256 B free. Act on each: fix a kernel
+  (`variant_search` on the loop: a hint the new compiler needs) or a design the new mlir-aie refuses; `rank APP` tells
+  whether a slower loop weighs in a prefill chunk. Then `record --update` and commit the refreshed baseline with the
+  pins: its diff is the bump's effect on every shipped kernel. Benches only for the models whose ranked loops changed.
+- Run `pytest tests -m smoke` (one NPU case per component and the apps' full designs and ledgers), not the full suite
+  unless asked.
 - Regenerate the issue slot / shared port tables of `variant_search` and the `ARTLITE_MEASURE_II` report from the new
   llvm-aie commit: `python -m artlite.gen_isa_tables` (reads the .td files of the wheel's commit from the `../llvm-aie`
   checkout: `git -C ../llvm-aie fetch` when it lacks the commit; uses its `build/bin/llvm-tblgen`).
 - `variant_search --why` traces come from the debug build in `../llvm-aie/build`; its report warns while that build's
   commit is not the wheel's. Tell the user if it should be rebuilt.
-- Commit; the diff usually should be `pyproject.toml` + `uv.lock` (+ `src/artlite/aie2p_isa.py`).
+- Commit; the diff usually should be `pyproject.toml` + `uv.lock` + `tests/schedule_ledger.jsonl` (+
+  `src/artlite/aie2p_isa.py`).
 
 ## Gotchas
 
@@ -40,3 +47,8 @@ The script exits non-zero on any failure (no wheels matched, `uv lock`/`uv sync`
 - Only wheels this machine can install count: a nightly can publish its Windows wheel without its Linux one (its
   Linux build job failed), and the script then keeps the newest Linux build. A failed `uv sync` leaves no `.venv`.
 - A toolchain bump can change kernel schedules (II) or break compilation of RTC templates. If a test regresses, compare against the previous pin (`git diff pyproject.toml`) before debugging the operator.
+- Check that every flag Artlite passes still exists: `toolchain.CORE_LLC_FLAGS`, the designs' `AIECC_FLAGS`, the loop
+  hints of `include/operators.h` (llc options; `aie-loop-versioning` is an IR pass's, documented in llvm-aie's
+  PERF_OPT_GUIDE.md, whose "Changes" section lists what a newer Peano reads differently).
+- mlir-aie moves passes between anchors (`aie-place-tiles`: per module, not per device): Artlite's own pass pipelines
+  are `operators/l1_layout.py`'s and `profiling.py`'s.

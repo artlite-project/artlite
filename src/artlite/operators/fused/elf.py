@@ -96,7 +96,7 @@ class FusedElf:
         arg_bytes = [self.layout.space_bytes["input"], self.layout.space_bytes["output"],
                      *(end - start for start, end in self.segments)]
         entries = [(op, [self._arg(n) for n in names]) for op, *names in self.runlist]
-        mlir = design.render(entries, arg_bytes=arg_bytes, library=self.LIBRARY)
+        mlir = design.render(entries, arg_bytes=arg_bytes, library=self.LIBRARY, closing=self.expand_load_pdis)
         return BuildSpec(kind=BuildKind.FUSED, label=self.name,
                          source=translation_unit(sources.values()) if sources else None, mlir=mlir,
                          clang_flags=flags.pop() if flags else (), expand_load_pdis=self.expand_load_pdis,
