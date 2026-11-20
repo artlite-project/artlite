@@ -21,7 +21,7 @@ from .engine import Engine
 from .errors import ApiError, bad_request, not_supported, unavailable
 from .jobs import Job
 from .prompt import PromptBuilder, system_first, takes_parts
-from .schemas import ChatRequest, GenerationRequest
+from .schemas import ChatRequest, GenerationRequest, Message
 from .settings import PENALTIES, ModelInfo, Options
 from .speech import Replies
 from .tools import Calls, syntax_of
@@ -287,13 +287,15 @@ class ApiContext:
                                           tools=fns, cont=cont)
         budget = self.thought_budget(req)
         if budget[:2] == (0, "") and not budget[3] and cont is None and prompts.inside(ids):
-            # a thought of no token and no message: the template's prompt without a thought, where it differs only
-            # at the end (Qwen's "<think>\n\n</think>\n\n": what the next request renders for this empty thought; the
-            # end forced after the opener's newline would be other tokens), else the end forced after the opener
+            # a thought of no token and no message: the template's prompt without a thought where the next request
+            # renders this answer's empty thought in its tokens (Qwen's "<think>\n\n</think>\n\n"; the end forced
+            # after the opener's newline would be other tokens), else the end forced after the opener
             off, _ = await prompts.render(req.messages, {**(req.chat_template_kwargs or {}), "enable_thinking": False},
                                           effort=req.reasoning_effort, tools=fns)
-            a, b = token_ids(ids), token_ids(off)
-            if a[:len(a) - 2] == b[:len(a) - 2] and not prompts.inside(off):
+            empty = Message(role="assistant", content="", reasoning_content="")
+            echo, _ = await prompts.render([*req.messages, empty], req.chat_template_kwargs,
+                                           effort=req.reasoning_effort, tools=fns, cont="content")
+            if token_ids(off) == token_ids(echo):
                 ids, think, budget = off, False, (-1, "", "", False)
         self.fits(ids, api)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
