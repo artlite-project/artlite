@@ -552,13 +552,23 @@ class GrammarMask:
         # (``prefetch``: the masks after the tokens accepted since, its drafts, computed aside; those tokens)
         self._pre: tuple[concurrent.futures.Future, np.ndarray, list[int]] | None = None
         self._since: list[int] = []
+        self._shared = False  # (a fork's matcher is still its origin's: a fork made inside a thought)
 
     def fork(self) -> "GrammarMask":
-        """An independent copy (a drafter's: its guesses follow the grammar, this one does not move)."""
+        """An independent copy (a drafter's: its guesses follow the grammar, this one does not move). Inside a thought
+        it shares the matcher, which neither moves there, and takes a copy of its own where its thought ends (a
+        drafter's guesses go on past the end marker into the answer: Spark-X's DSpark chains, Gemma's MTP)."""
         out = copy.copy(self)
-        out.matcher = self.matcher.deep_copy() if self.phase in ("answer", "maybe") else self.matcher
+        out._shared = self.phase not in ("answer", "maybe")
+        out.matcher = self.matcher if out._shared else self.matcher.deep_copy()
         out._row, out._bits, out._pre, out._since = np.empty_like(self._row), None, None, []
         return out
+
+    def _answer(self) -> None:
+        """The answer begins: the matcher moves from here (a fork that shared its origin's takes a copy)."""
+        self.phase = "answer"
+        if self._shared:
+            self.matcher, self._shared = self.matcher.deep_copy(), False
 
     def valid_prefix(self, tokens: Sequence[int]) -> int:
         """How many of ``tokens`` the grammar takes from here (drafts: a round's are cut there)."""
@@ -670,12 +680,12 @@ class GrammarMask:
         close = th.close.encode()
         for end in th.ends:
             if tail.endswith(end.encode()) and close not in tail:
-                self.phase = "answer"
+                self._answer()
                 self._consume(token)  # (the text that ended the thought begins the answer)
                 return
         i = tail.find(close)
         if i >= 0:
-            self.phase = "answer"
+            self._answer()
             if tail[i + len(close):].strip():
                 self.give_up("the answer's first text came with the thought's end marker")
             return

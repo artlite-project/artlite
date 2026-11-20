@@ -238,6 +238,15 @@ def test_thought() -> None:
     walk(m, "hmm ")
     m.accept(TOK.id("<tool_call>"))
     assert m.active and allowed(m.bits()) == {TOK.encode_plain("x")[0]}
+    # a drafter's fork inside the thought, its guesses past the end marker into the answer: the mask stays put
+    m = mask_of(call, thought=S.Thought(close, inside=True))
+    walk(m, "hmm ")
+    f = m.fork()
+    walk(f, close)
+    f.accept(TOK.id("<tool_call>"))
+    assert allowed(f.bits()) == {TOK.encode_plain("x")[0]}
+    walk(m, close)
+    assert allowed(m.bits()) == {TOK.id("<tool_call>")}
 
 
 def test_give_up() -> None:
