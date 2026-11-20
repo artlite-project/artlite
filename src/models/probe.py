@@ -6,7 +6,11 @@ output: model numbers alone cannot tell a slower clock from a narrower memory pa
 
 ``--pages``: a second table instead, of what the NPU's address translation costs rows on pages of their own
 (``PAGE_CASES``): how many pages its translation cache holds, for reads and writes, per channel or for all; the
-rate of translations with one to 16 channels; page-table locality; rows that share a page; long rows."""
+rate of translations with one to 16 channels; page-table locality; rows that share a page; long rows.
+
+``--kinds -m FILE``: a model's prompt chunk by operator kind instead (``kinds``): each kind's items alone, their time
+and the share of it the platform held PROCHOT, at the paces the model calibrated and unpaced: which kinds a laptop's
+throttle follows (the dense GEMMs are paced where that is faster, ``artlite.prefill.pace``; the others are not)."""
 
 import argparse
 import glob
@@ -27,7 +31,7 @@ from artlite.overlay import OverlayDevice, Transaction, irq_cpu
 from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
 
-from .bench import _git, _read
+from .bench import _git, _read, file_info, token_source
 from .diagnose import telemetry
 from .hostenv import stale_install, windows_power_mode, xrt_smi
 
@@ -152,7 +156,8 @@ PAGE_CASES: list[PageCase] = [
     cycle(4096, first(8), name="8 channels read + 8 write at once, 4096 pages per channel", mixed=True),
 ]
 PAGE_ROWS = [CLOCK, *(case.name for case in PAGE_CASES)]
-# (Strix Halo as in REFERENCES, transparent huge pages madvise and never)
+# (Strix Halo as in REFERENCES, transparent huge pages madvise and never; Krackan Point: a Lenovo Yoga 7 2-in-1 14AKP10 on
+# Windows 11, power mode performance, issue #5)
 PAGE_REFERENCES: list[tuple[str, dict[str, str]]] = [
     ("Strix Halo, 2 MB pages", dict(zip(PAGE_ROWS, (
         "1808", "56.5 / 57.3", "221 / 222", "222 / 224", "221 / 224", "221 / 224", "221 / 224", "221 / 224",
@@ -166,6 +171,12 @@ PAGE_REFERENCES: list[tuple[str, dict[str, str]]] = [
         "122 / 122", "47.4 / 54.7", "90.2 / 108", "143 / 132", "119 / 117", "113 / 100", "114 / 87.3", "163 / 143",
         "370 / 162", "396 / 188", "406 / 251", "421 / 309", "64.8 / 64.6", "385 / 146", "433 / 434", "13.8 / 13.4",
         "3.5 / 3.4", "27.7 / 26.2", "162"), strict=True))),
+    ("Krackan Point, Windows", dict(zip(PAGE_ROWS, (
+        "1927", "68.2 / 49.3", "257 / 232", "276 / 243", "283 / 234", "284 / 230", "173 / 79.7", "81.4 / 74.9",
+        "81.0 / 73.8", "80.6 / 70.4", "78.3 / 68.8", "78.5 / 67.9", "156 / 158", "163 / 183", "165 / 179", "59.5 / 50.9",
+        "59.5 / 49.8", "29.2 / 36.7", "40.4 / 42.9", "68.2 / 60.6", "65.6 / 51.4", "59.6 / 44.1", "59.3 / 42.7",
+        "83.9 / 82.1", "172 / 107", "289 / 133", "343 / 185", "398 / 244", "36.3 / 32.9", "213 / 75.3", "443 / 356",
+        "12.4 / 5.9", "3.5 / 2.3", "24.9 / 16.4", "71.4"), strict=True))),
 ]
 
 
@@ -340,6 +351,81 @@ def pages(seconds: float) -> tuple[list[str], list[tuple[str, str]]]:
     return lines, [(CLOCK, f"{mhz:.0f}"), *((name, " / ".join(_rate(r) for r in v)) for name, v in rates.items())]
 
 
+def kinds(path: str, *, tokens: int, seconds: float) -> tuple[list[str], list[tuple[str, int, str, str, str]]]:
+    """``--kinds``: (lines before the table, its rows (kind, items, ms a chunk, PROCHOT share, the same unpaced)) of the
+    model file's prompt chunk of ``tokens`` tokens (its largest chunk size up to it): the whole program, then each
+    operator kind's items as a program of their own (wrong results, a configuration per design change), each looped for ``seconds`` after as long idle. A paced kind (``prefill.pace``'s classes) also unpaced."""
+    from artlite.gemm.pacing import PACE, PACE_CLASSES
+    from artlite.prefill import pace as pacing
+
+    from . import open_model
+    from .diagnose import model as dm
+
+    model = open_model(path, spec_type="none")
+    npu = model.load(capacity=max(4096, 2 * tokens))
+    npu.prepare(tokens)
+    pf = npu.prefill
+    if pf is None:
+        raise SystemExit(f"artlite-probe --kinds: {os.path.basename(path)} has no chunk prefill")
+    T = max([t for t in pf.sizes if t <= tokens] or [min(pf.sizes)])
+    rng = np.random.default_rng(0)  # (a prompt first: the buffers hold its activations, and zeros draw less)
+    npu.forward(token_source(file_info(path)[1], model.encode("")[:1], rng)(T + 8, 0))
+    items = pf._program(T)
+
+    def kind_of(op: object) -> str:
+        """An operator's kind: a GEMM by its pace class (role and tile kind), format and shape; one with a mode by it
+        (an attention's kind and window); else its class."""
+        mode = getattr(op, "mode", None)
+        if hasattr(op, "fmt") and hasattr(op, "K"):
+            role = f"{PACE_CLASSES[op.pace]} " if getattr(op, "pace", None) is not None else ""
+            return f"{type(op).__name__} {role}{op.fmt} {op.K}x{op.N}"
+        if mode is None or isinstance(mode, str):
+            return type(op).__name__ + (f" {mode}" if mode else "")
+        kind, window = getattr(getattr(mode, "kind", None), "value", ""), getattr(mode, "window", 0)
+        return f"{type(op).__name__} {kind}".strip() + (f", window {window}" if window else "")
+
+    names = [kind_of(op) for op, *_ in pf.runlists[T]]
+    paced = {kind_of(op) for op, *_ in pf.runlists[T] if getattr(op, "pace", None) is not None}
+    word = pf.pace or 0
+
+    def run(prog: list, pace: int) -> tuple[float, float | None]:
+        if pf.paced:
+            pf.lib.set_params({PACE: pace})
+        time.sleep(seconds)
+        p0, t0 = telemetry.prochot_ms(), time.perf_counter()
+        ms = dm._loop_ms(pf, prog, seconds)
+        return ms, telemetry.prochot_share(p0, time.perf_counter() - t0)
+
+    def cell(ms: float, share: float | None) -> tuple[str, str]:
+        return f"{ms:.2f}", "?" if share is None else f"{share:.0%}"
+
+    # (an MoE layer's work-list operators run on control streams the host writes per layer: not alone)
+    lists = {kind_of(op) for op, *_ in pf.runlists[T] if type(op).__module__.startswith("artlite.moe.")}
+    rows = []
+    progs = {"the whole chunk": items} | {k: [it for it, kk in zip(items, names) if kk == k] for k in sorted(set(names))}
+    for kind, prog in progs.items():
+        if kind in lists or (lists and kind == "the whole chunk"):  # (the chunk: the host's steps between its pieces)
+            rows.append((kind, len(prog), "-", "-", "(a work list: not run alone)" if kind in lists else
+                         "(with work lists: not run as one program)"))
+            continue
+        ms, share = cell(*run(prog, word))
+        unpaced = ""
+        if word and (kind in paced or kind == "the whole chunk"):
+            ms0, share0 = cell(*run(prog, 0))
+            unpaced = f"{ms0} ms, {share0}"
+        rows.append((kind + (" (paced)" if word and kind in paced else ""), len(prog), ms, share, unpaced))
+    if pf.paced:
+        pf.lib.set_params({PACE: word})
+    npu.stale()  # (the library ran: an overlay's array state comes back before its next step)
+    paces = pacing.describe(word) or "none (unpaced)"
+    head = f"{os.path.basename(path)}: a chunk of {T} tokens, {len(items)} items; the dense GEMMs' paces: {paces}"
+    note = (f"each kind's items alone for {seconds:g} s after {seconds:g} s idle: their ms, and how much of it the "
+            "platform held PROCHOT (? where the SoC reports none); the kinds' times do not add up to the chunk's (a "
+            "kind alone configures its designs once per run of its items)")
+    lines = [head, note]
+    return lines, rows
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="artlite-probe", description=__doc__.split("\n\n")[0])
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
@@ -349,8 +435,13 @@ def main(argv: list[str] | None = None) -> None:
                    help="instead: everything that can make Artlite slower here, measured and recorded (~5 minutes; "
                         "Linux: as root, sudo $(which artlite-probe) --diagnose); prints a report and writes a JSON "
                         "file to attach")
-    p.add_argument("--model", default="", help="--diagnose: Llama 3.2 1B Q4_K_M's file (default: the issue #5 file "
-                                               "in the models directory)")
+    p.add_argument("--kinds", action="store_true",
+                   help="instead: a model's prompt chunk by operator kind (-m FILE): each kind's time alone and the "
+                        "share of it the platform held PROCHOT (which kinds a laptop throttles; ~1 minute a model)")
+    p.add_argument("-m", "--model", default="",
+                   help="--kinds: the GGUF file (a relative path: in the models directory); --diagnose: Llama 3.2 1B "
+                        "Q4_K_M's file (default: the issue #5 file in the models directory)")
+    p.add_argument("-p", "--n-prompt", type=int, default=1024, help="--kinds: tokens of the chunk (default 1024)")
     p.add_argument("--out-dir", default=".", help="--diagnose: where the JSON file goes (default: here)")
     args = p.parse_args(argv)
     if args.diagnose:
@@ -366,6 +457,21 @@ def main(argv: list[str] | None = None) -> None:
                      out_dir=args.out_dir)
         return
     lines = system() + ([f"warning: {stale}"] if (stale := stale_install()) else [])
+    if args.kinds:
+        from artlite.model_config import model_path
+
+        if not args.model:
+            raise SystemExit("artlite-probe --kinds: -m FILE (a GGUF file)")
+        more, rows = kinds(model_path(args.model), tokens=args.n_prompt, seconds=1.5 * args.seconds)
+        print("artlite-probe --kinds")
+        for line in lines + more:
+            print(line)
+        print("\n| operator kind | items | ms | PROCHOT | unpaced |\n|---|---:|---:|---:|---:|")
+        for row in rows:
+            print("| " + " | ".join(str(v) for v in row) + " |")
+        commit, number = _git("rev-parse", "--short=9", "HEAD") or "unknown", _git("rev-list", "--count", "HEAD") or "0"
+        print(f"\nbuild: {commit} ({number})")
+        return
     p0, t0 = telemetry.prochot_ms(), time.perf_counter()
     if args.pages:
         more, rows = pages(args.seconds)

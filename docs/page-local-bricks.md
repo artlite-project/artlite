@@ -8,7 +8,7 @@ Strix Halo hides. Both concern the rows the NPU's DMA reads and writes in DRAM:
   writes whole lines.
 - **Rows on pages of their own.** The NPU translates the address of every memory page a DMA row touches. With 2 MB
   pages (Linux) that is nearly free; with 4 KB pages, the only size Windows gives the NPU, the translations cap the
-  NPU at about 50 million page visits a second. The prefill's many short rows pay it: this is most of the prefill's
+  NPU at 45-80 million page visits a second. The prefill's many short rows pay it: this is most of the prefill's
   gap on Windows.
 
 The second cost needs a change of the prefill's data layouts: **page-local bricks**, a proposal described in the last
@@ -86,7 +86,8 @@ per second):
 | 128 B rows 512 B apart (8 rows a page, 32 pages per channel visited again): read / write | 437 / 436 | 439 / 435 |
 
 - **One limit for the whole NPU**, not per channel: one or two channels never reach it; from four on, all channels
-  together get ~140-170 million page visits a second on Strix Halo, about 50 million on the Windows laptops.
+  together get ~140-170 million page visits a second on Strix Halo, 45-80 million on the Windows laptops (the lower
+  end where the rows' page-table entries are far apart).
 - **A translation cache**, one for all channels: while they cycle through no more than ~500-1000 pages together,
   page visits cost nothing.
 - **Page-table locality.** Rows 64 KB apart (each row's page-table entry on another 64-byte line of the page table)
@@ -94,6 +95,27 @@ per second):
 - **Rows that share a page are free** once its translation is cached. Written to a page whose translation is not,
   back-to-back rows each pay one: 8 rows of 128 B on each of 512 pages per channel read at 406 million rows a second
   and write at 251; on 8 pages per channel visited again, 433 / 434 (`artlite-probe --pages`).
+
+Windows has the same structure. A Krackan Point laptop on Windows 11 (`artlite-probe --pages`, power mode
+`performance`, [issue #5](https://github.com/artlite-project/artlite/issues/5#issuecomment-6545502050); millions of
+rows a second, read / write, 16 channels):
+
+| pattern | Krackan Point, Windows | Strix Halo, 4 KB pages |
+|---|---:|---:|
+| 256 B rows, a page each: 4 .. 32 pages per channel | 257-284 / 230-243 | 221 / 222-224 |
+| 64 pages per channel | 173 / 79.7 | 157 / 129 |
+| 128 .. 4096 pages per channel | 78-81 / 68-75 | 158-160 / 132-133 |
+| 4096 pages per channel on 1 / 2 / 4 / 8 channels | 29.2 / 40.4 / 59.5 / 68.2 (reads) | 47.4 / 90.2 / 122 / 143 |
+| 128 B rows, 1 / 2 / 4 / 8 / 16 a page (512 pages per channel): reads | 83.9 / 172 / 289 / 343 / 398 | 163 / 370 / 396 / 406 / 421 |
+| the same: writes | 82.1 / 107 / 133 / 185 / 244 | 143 / 162 / 188 / 251 / 309 |
+| 128 B rows, 8 a page, 8 pages per channel visited again | 443 / 356 | 433 / 434 |
+| 2 KB rows 9280 B apart (the weight slices a GEMM reads) | 24.9 / 16.4 | 27.7 / 26.2 |
+
+One translation cache for all channels there too: 512 pages cost nothing (inside it that chip is faster than Strix
+Halo), 1024 already do for writes, and beyond it all 16 channels together get ~80 million reads or ~70 million writes a
+second, half of Strix Halo's 4 KB-page rate, however many channels run. Rows that share a page pay less there as well
+(16 rows a page: 4.7x the reads, 3x the writes of a row a page), so bricks are enough. Its streams lose too: 16
+channels read 68 GB/s (97.8 on Linux).
 
 A 1024-token prefill chunk of Llama 3.2 1B Q4_K_M visits 7.5 million pages:
 
@@ -105,7 +127,7 @@ A 1024-token prefill chunk of Llama 3.2 1B Q4_K_M visits 7.5 million pages:
 | GEMM inputs (bfp16 panels) | 576 bytes per 8 tokens and 64 columns, a panel row apart | 0.6 M |
 | gate/up outputs, norm and attention outputs | 128-576 bytes | 0.7 M |
 
-At Windows' ~50 million a second that is ~150 ms of a chunk whose work takes ~105 ms on Strix Halo: most of the
+At Windows' 50-80 million a second that is ~95-150 ms of a chunk whose work takes ~105 ms on Strix Halo: most of the
 prefill's ~2x gap on Windows. As streams, the chunk's 4.6 GB would need ~1.1 million page visits.
 
 Decode reads each column's weights as one stream and pays little (Krackan Point on Windows reads 81 GB/s as a stream
@@ -151,9 +173,10 @@ better (writing a short-K GEMM's output in long rows is already faster there: ~2
 
 ### Plan
 
-1. **Measure Windows' side**: `artlite-probe --pages` ([probe](probe.md#pages---pages)) on Windows, to see whether
-   its translation cache is as large as Strix Halo's and what rows sharing a page cost there. If it is, bricks are
-   enough; if not, only long contiguous rows are.
+1. **Windows' side, measured** (`artlite-probe --pages`, [probe](probe.md#pages---pages); the table above): its
+   translation cache is as large as Strix Halo's for reads and half of it for writes (512 pages), and rows sharing a
+   page pay less: bricks are enough, with a working set of at most ~512 pages across all channels for what a pass
+   writes.
 2. **Design**: G, F and Tb per buffer, and for every prefill operator (GEMMs, norms, attention preps and attentions,
    the recurrent layers' operators, the mixture-of-experts gathers) its DMA patterns in the new layout, with BD counts
    and page visits per chunk.
@@ -162,7 +185,8 @@ better (writing a short-K GEMM's output in long rows is already faster there: ~2
 5. **Weights**, with a redesign of the weight formats, measured on decode as well.
 
 Each step is measured on Strix Halo (prefill speed of every model, the page-visit count, the tests) before it lands;
-on Windows by a report in [issue #5](https://github.com/artlite-project/artlite/issues/5).
+on Windows by a report in [issue #5](https://github.com/artlite-project/artlite/issues/5). The work is tracked in
+[issue #23](https://github.com/artlite-project/artlite/issues/23).
 
 ## Measuring on your machine
 

@@ -1,13 +1,15 @@
 """artlite-probe (models.probe) on the NPU: its table, the array clock and the DDR rates in their ranges; the rows of
-``--pages`` on the host."""
+``--pages`` on the host; ``--kinds`` on the 1B's prompt chunk."""
 
 
 import numpy as np
 import pytest
 
+from artlite.model_config import llama_gguf
 from models import probe
 
 from .dma_model import channel_rows
+from .model_files import require
 
 BUFFER = 16 * probe.CHANNEL_BYTES
 
@@ -77,3 +79,18 @@ def test_probe_pages(capsys: pytest.CaptureFixture[str]) -> None:
     assert all(len(v) == (1 if case.mixed else 2) for case, v in zip(probe.PAGE_CASES, rates.values(), strict=True))
     assert all(10 < x < 1000 for x in rates[probe.PAGE_CASES[0].name]), out  # (GB/s)
     assert all(0.5 < x < 2000 for v in rates.values() for x in v), out
+
+
+@pytest.mark.slow
+def test_probe_kinds(capsys: pytest.CaptureFixture[str]) -> None:
+    """``--kinds``: the whole chunk and every operator kind of the 1B's 1024-token chunk with a time; the kinds' items
+    are the chunk's; the dense GEMMs unpaced on a machine that throttles nothing (no "unpaced" column entries)."""
+    path = llama_gguf("Q4_K_M", "1B")
+    require(path)
+    probe.main(["--kinds", "-m", path, "--seconds", "0.1"])
+    out = capsys.readouterr().out
+    rows = [[c.strip() for c in line.split("|")[1:-1]] for line in out.splitlines() if line.startswith("| ")][1:]
+    assert rows[0][0] == "the whole chunk" and len(rows) > 6, out
+    assert sum(int(r[1]) for r in rows[1:]) == int(rows[0][1]), out
+    assert all(float(r[2]) > 0 for r in rows), out
+    assert any(r[0].startswith("GemmQOperator gu Q4_K") for r in rows) and any("Attn" in r[0] for r in rows), out

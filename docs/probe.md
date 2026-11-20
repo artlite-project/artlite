@@ -152,10 +152,23 @@ above level 1 (duty 0.89) is the fastest for its Q4_K GEMMs and its Q6_K ones ne
 0), `recalibrate`, or levels by GEMM class (`gu=3,qkv=2`; `4` for every class), which also pins them for a service
 (the router passes it to its model processes).
 
+Only the dense GEMMs are paced. Where `artlite-bench` still warns about PROCHOT for a model that ran paced,
+`artlite-probe --kinds -m FILE` tells which of that model's operator kinds the platform throttles: after a prompt, each
+kind of a 1024-token chunk (every dense GEMM by format and shape, the attention, the norms, a model's own operators)
+runs alone for a second and a half after as long idle, and the table gives its time and the share of it PROCHOT was
+held, for the paced kinds at their level and unpaced. An MoE layer's routed operators run on work lists the host
+writes per layer: they are listed, not run. No root; about a minute per model.
+
+```console
+$ artlite-probe --kinds -m lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
+```
+
 | option | |
 |---|---|
-| `--seconds S` | seconds of dispatches per measurement (default 1) |
+| `--seconds S` | seconds of dispatches per measurement (default 1; `--kinds`: 1.5 times it per kind) |
 | `--pages` | the page table instead of the hardware numbers |
+| `--kinds` | a model's prompt chunk by operator kind instead: time and PROCHOT share of each (`-m`) |
 | `--diagnose` | the diagnosis instead (root on Linux) |
-| `--model FILE` | `--diagnose`: Llama 3.2 1B Q4_K_M's file (default: the one in the models directory) |
+| `-m FILE`, `--model` | `--kinds`: the GGUF file (a relative path: in the models directory); `--diagnose`: Llama 3.2 1B Q4_K_M's file (default: the one in the models directory) |
+| `-p N`, `--n-prompt` | `--kinds`: the chunk's tokens (default 1024) |
 | `--out-dir DIR` | `--diagnose`: where the JSON file goes (default: the current directory) |
