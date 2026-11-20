@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..cxx_scan import Statement, loop_statements, tokenize
 from .asm import AsmFunction, AsmLoop, asm_loops, parse_assembly, zol_iterations
-from .demangle import demangle_short
+from .demangle import demangle_all, demangle_short
 from .remarks import GENERIC_REJECTS
 from .report import KernelReport, LoopReport, SourceLoop
 from .statements import locate, read_statements
@@ -318,6 +318,8 @@ def enrich_from_assembly(report: KernelReport) -> None:
         path = report.clean_assembly
     functions = parse_assembly(path.read_text(errors="replace")) if path is not None and path.exists() else {}
     report.functions = [name for name, function in functions.items() if function.blocks]
+    demangle_all([*functions, *(n for f in functions.values() for b in f.blocks for n in (b.name, *b.calls)),
+                  *(n for loop in report.loops for n in (loop.function, loop.block))])
     for loops in report.source_loops.values():
         read_statements(loops, source=report.source)
 

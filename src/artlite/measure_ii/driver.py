@@ -23,6 +23,7 @@ def measure(
     clang_cmd: list[str] | None = None,
     verbose: bool = True,
     trip_count: int = 32,
+    cache: bool = True,
 ) -> KernelReport:
     """Compile a kernel and report its final AIE loop schedules.
 
@@ -33,6 +34,9 @@ def measure(
         trip_count: fallback trip count used to evaluate loop costs when
             neither the ZOL iteration count nor the source for-header yields
             a trip count.
+        cache: keep the report for a textually identical source measured
+            again in this process (a caller that measures each source once
+            passes False: reports of large sources are large).
     """
     if trip_count < 0:
         raise ValueError("trip_count must be non-negative")
@@ -44,7 +48,7 @@ def measure(
     source_key = hashlib.sha256(
         source.read_bytes() + repr(resolved_clang_cmd).encode()
     ).hexdigest()
-    if source_key in _REPORT_CACHE:
+    if cache and source_key in _REPORT_CACHE:
         first = _REPORT_CACHE[source_key]
         if verbose:
             print(
@@ -129,7 +133,7 @@ def measure(
     _mark_shared_blocks(report)
     collect_issues(report)
 
-    if report.returncode == 0:
+    if cache and report.returncode == 0:
         _REPORT_CACHE[source_key] = report
     if verbose:
         print_report(report)

@@ -3,6 +3,7 @@
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 _demangle_cache: dict[str, str] = {}
@@ -18,6 +19,24 @@ def _demangle_tool() -> str | None:
     except (ImportError, ToolchainError):
         pass
     return shutil.which("llvm-cxxfilt") or shutil.which("c++filt")
+
+
+def demangle_all(names: Iterable[str]) -> None:
+    """Demangle the Itanium names of ``names`` not demangled yet in one llvm-cxxfilt run (it reads them from stdin, one
+    per line): a large kernel has thousands of symbols and block names, a process each costs seconds."""
+    todo = sorted({n for n in names if n.startswith("_Z") and n not in _demangle_cache and "\n" not in n})
+    tool = _demangle_tool() if todo else None
+    if not tool:
+        return
+    try:
+        result = subprocess.run([tool], input="\n".join(todo) + "\n", capture_output=True, text=True, timeout=60,
+                                check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    lines = result.stdout.splitlines()
+    if result.returncode == 0 and len(lines) == len(todo):
+        for name, line in zip(todo, lines):
+            _demangle_cache[name] = line.strip() or name
 
 
 def demangle(mangled: str) -> str:

@@ -1,10 +1,11 @@
 """Constant trip counts parsed from a for-header and the template arguments of its function."""
 
+import functools
 import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from ..cxx_scan import function_bodies, tokenize
+from ..cxx_scan import Token, function_bodies, tokenize
 from .demangle import demangle, function_name
 
 _FOR_HEADER = re.compile(
@@ -12,6 +13,17 @@ _FOR_HEADER = re.compile(
     r"\s*(\w+)\s*(<=|<|!=)\s*([^;]+?)\s*;"  # i < B;
     r"\s*(?:\+\+\s*(\w+)|(\w+)\s*\+\+|(\w+)\s*\+=\s*([^)]+?))\s*\)"  # ++i | i++ | i += S
 )
+
+
+@functools.lru_cache(maxsize=8)
+def _tokens(text: str) -> list[Token]:
+    """A source's tokens (by its text: a kernel's loops are looked up in the same file)."""
+    return tokenize(text)
+
+
+@functools.lru_cache(maxsize=8)
+def _lines(text: str) -> list[str]:
+    return text.splitlines()
 
 
 def _constant(expr: str) -> int | None:
@@ -34,7 +46,7 @@ def template_arguments(source: Path, line_no: int, function: str) -> dict[str, s
         return {}
     arguments = [text.strip() for _, text in _split_top_level(name[name.index("<") + 1 : name.rindex(">")])]
     try:
-        tokens = tokenize(source.read_text(errors="replace"))
+        tokens = _tokens(source.read_text(errors="replace"))
     except OSError:
         return {}
     bodies = [body for body in function_bodies(tokens) if tokens[body[0]].line <= line_no <= tokens[body[1]].line]
@@ -91,7 +103,7 @@ def parse_source_trip(source: Path, line_no: int, constants: Mapping[str, str] |
     """Parse a constant trip count from a `for (i = A; i < B; i += S)` header (also `<=`, `!=`, `i++`);
     constants: names to substitute (template parameters of the function instance)."""
     try:
-        lines = source.read_text(errors="replace").splitlines()
+        lines = _lines(source.read_text(errors="replace"))
     except OSError:
         return None
     if not 1 <= line_no <= len(lines):

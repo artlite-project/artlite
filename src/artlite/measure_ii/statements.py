@@ -1,10 +1,17 @@
 """The loop statements of the source files the remarks name: their location, extent and trip count."""
 
+import functools
 from pathlib import Path
 
 from ..cxx_scan import Statement, loop_statements, tokenize
 from .report import SourceLoop
 from .trips import parse_source_trip
+
+
+@functools.lru_cache(maxsize=8)
+def _statements(text: str) -> list[Statement]:
+    """A source's loop statements (by its text: each function's loops are located in the same files)."""
+    return loop_statements(tokenize(text))
 
 
 def _loop_statement(statements: list[Statement], line: int, column: int) -> Statement | None:
@@ -57,7 +64,7 @@ def read_statements(loops: list[SourceLoop], *, source: Path) -> None:
         if loop.path not in statements_by_path:
             try:
                 text = _source_path(loop.path, source=source).read_text(errors="replace")
-                statements_by_path[loop.path] = loop_statements(tokenize(text))
+                statements_by_path[loop.path] = _statements(text)
             except OSError:
                 statements_by_path[loop.path] = None
         statements = statements_by_path[loop.path]

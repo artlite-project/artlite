@@ -12,7 +12,7 @@ from .demangle import demangle_short
 from .report import BlockInfo, HardwareLoop, KernelReport, LoopReport, SourceLoop
 
 
-class LLVMLoader(yaml.SafeLoader):
+class LLVMLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):  # (libyaml: a large kernel's record ~10x faster)
     pass
 
 
