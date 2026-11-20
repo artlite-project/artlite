@@ -58,8 +58,10 @@ llama-server takes them (`/props`' `modalities.video`); and a chat's `modalities
 
 A thought's budget, as llama-server's: a chat request's `reasoning_budget_tokens` (or `thinking_budget_tokens`, the
 web UI's; an Anthropic request's `thinking.budget_tokens`; default `--reasoning-budget`) caps its thought's tokens,
-then `reasoning_budget_message` (default `--reasoning-budget-message`) and the thought's end are written for the model
-(0: at once), and its answer follows; with `reasoning_control: true` the control route ends the thought on demand
+then `reasoning_budget_message` (default `--reasoning-budget-message`) and the thought's end as the chat template
+writes it (Qwen's `\n</think>\n\n`: the next request, which renders the thought again, continues the cache) are written
+for the model (0: at once; a template whose prompt without a thought differs only at its end gets that prompt), and
+its answer follows; with `reasoning_control: true` the control route ends the thought on demand
 (the web UI's button). `continue_final_message` (`true`, `"content"` or `"reasoning_content"`) continues the last
 message, an assistant's, from where its content (or its thought) ends, as the chat template renders it (the web UI's
 Continue), and the answer is the new text; a conversation that ends with an assistant's message is continued the same

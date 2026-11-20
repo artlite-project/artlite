@@ -191,15 +191,15 @@ def test_reasoning_template_decides() -> None:
 
 
 def test_reasoning_budget() -> None:
-    """llama-server's reasoning budget: after its tokens the thought's end (its message and the close marker) is
-    forced and the answer follows; a budget of 0 ends the thought the prompt opened at once; Gemma's thought, which the
-    model opens, is counted from its opener."""
+    """llama-server's reasoning budget: after its tokens the thought's end (its message on a paragraph of its own and
+    the close marker) is forced and the answer follows; a budget of 0 ends the thought the prompt opened at once;
+    Gemma's thought, which the model opens, is counted from its opener."""
     _model, npu, engine = make(reasoning=QWEN)
     with TestClient(app_of(engine, reasoning="on", reasoning_budget_message=" Enough.")) as client:
         assert engine.wait_ready(5)
         npu.replies = [["A", " B", " C", " D"], ["\n\n", "Yes"]]
         msg = chat(client, "Q", thinking_budget_tokens=2).json()["choices"][0]["message"]
-        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "A B Enough."}
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "A B\n\nEnough."}
         npu.replies = [["Yes"]]
         msg = chat(client, "Q", reasoning_budget_tokens=0, reasoning_budget_message="").json()["choices"][0]["message"]
         assert msg == {"role": "assistant", "content": "Yes"}
@@ -211,6 +211,50 @@ def test_reasoning_budget() -> None:
         npu.replies = [["<|channel>thought", "\n", "Hmm", ",", " yes"], ["Yes", "."]]
         msg = chat(client, "Q").json()["choices"][0]["message"]
         assert msg == {"role": "assistant", "content": "Yes.", "reasoning_content": "Hmm"}
+
+
+QWEN_ENDS = ("{% for m in messages %}<|{{ m.role }}|>{% if m.role == 'assistant' %}"
+             "{{ '<think>\\n' + (m.reasoning_content or '')|trim + '\\n</think>\\n\\n' }}{% endif %}{{ m.content }}"
+             "{% endfor %}{% if add_generation_prompt %}<|assistant|>"
+             "{{ '<think>\\n' if enable_thinking else '<think>\\n\\n</think>\\n\\n' }}{% endif %}")
+# (Qwen3.5's: a thought trimmed, then "\n</think>\n\n"; thinking off: an empty thought)
+
+
+def test_reasoning_budget_end() -> None:
+    """A thought a budget cuts ends as the chat template writes a thought's end ("\\n</think>\\n\\n", after a token
+    that is not white space; a message before it), so the device ran the text the next request renders when it echoes
+    the thought (it continues the cache); a budget of no token without a message gets the template's prompt without a
+    thought (the tokens it renders for an empty thought), with one the message alone in the thought."""
+    model, npu, engine = make(reasoning=QWEN)
+    model.chat = lambda messages, *, think=False, tools=None, preserve=False, variables=None: \
+        model.tokenizer.encode(chat_template(QWEN_ENDS, messages, enable_thinking=think))
+    q = {"role": "user", "content": "Q"}
+
+    def ran() -> str:  # (the device's text, without its end token)
+        return model.tokenizer.decode_bytes(npu.seq[:npu.position], special=True).decode().removesuffix("</s>")
+
+    def next_prompt(msg: dict[str, object]) -> str:
+        return chat_template(QWEN_ENDS, [q, msg, {"role": "user", "content": "Q2"}], enable_thinking=True)
+
+    with TestClient(app_of(engine, template=QWEN_ENDS, reasoning="on")) as client:
+        assert engine.wait_ready(5)
+        npu.replies = [["A", " B", "\n", " C", " D"], ["Yes"]]  # (the budget spent at a newline: the end after " C")
+        msg = chat(client, "Q", reasoning_budget_tokens=3).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "A B\n C"}
+        assert ran().endswith("<think>\nA B\n C\n</think>\n\nYes") and next_prompt(msg).startswith(ran())
+        npu.replies = [["A", " B"], ["Yes"]]
+        msg = chat(client, "Q", reasoning_budget_tokens=1, reasoning_budget_message="Enough. ").json()
+        msg = msg["choices"][0]["message"]
+        assert msg["reasoning_content"] == "A\n\nEnough." and next_prompt(msg).startswith(ran())
+        npu.replies = [["Yes"]]
+        msg = chat(client, "Q", reasoning_budget_tokens=0).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes"}
+        assert ran().endswith("<think>\n\n</think>\n\nYes") and next_prompt(msg).startswith(ran())
+        npu.replies = [["Yes"]]
+        msg = chat(client, "Q", reasoning_budget_tokens=0, reasoning_budget_message="Enough.").json()
+        msg = msg["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "Enough."}
+        assert ran().endswith("<think>\nEnough.\n</think>\n\nYes") and next_prompt(msg).startswith(ran())
 
 
 def test_reasoning_control() -> None:

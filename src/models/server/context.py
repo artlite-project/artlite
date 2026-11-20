@@ -5,6 +5,7 @@ replies. The prompts of chat requests: ``prompt.PromptBuilder``."""
 
 import asyncio
 import dataclasses
+import functools
 import logging
 from typing import Any
 
@@ -12,7 +13,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import structured
 from ..sampling import TOP_K_ALL, Sampling
-from ..templating import effort_levels
+from ..sequence import token_ids
+from ..templating import effort_levels, thought_end
 from . import agents, call_grammar
 from .constraints import constraint_of
 from .engine import Engine
@@ -44,8 +46,9 @@ OTHER_PARAMS = {"dynatemp_range": 0.0, "dynatemp_exponent": 1.0, "top_n_sigma": 
 class ApiContext:
     """The state of one model's server that its routes share: ``engine``, ``options``, ``info``, the template's
     properties (``syntax``: its tool calls, None: it takes no tools; ``typed``: content as text parts; ``first``: a
-    system message only first; ``efforts``: the ``reasoning_effort`` levels it renders distinctly), ``store`` (the Responses API's, for ``previous_response_id``), ``replies`` (the spoken
-    replies: their audio ids in later turns)."""
+    system message only first; ``efforts``: the ``reasoning_effort`` levels it renders distinctly; ``thought_end``: what
+    it writes after a thought, ``templating.thought_end``), ``store`` (the Responses API's, for
+    ``previous_response_id``), ``replies`` (the spoken replies: their audio ids in later turns)."""
 
     def __init__(self, engine: Engine, options: Options, info: ModelInfo):
         self.engine, self.options, self.info = engine, options, info
@@ -57,6 +60,14 @@ class ApiContext:
         self.store = agents.Store()
         self.replies = Replies()
         self.prompts = PromptBuilder(self)
+
+    @functools.cached_property
+    def thought_end(self) -> str:
+        """What the template writes after a thought (``templating.thought_end``; once the model is loaded)."""
+        reasoning = self.engine.model.reasoning
+        if reasoning is None:
+            return ""
+        return thought_end(self.info.chat_template, reasoning[1]) if self.info.chat_template else reasoning[1]
 
     def warn_once(self, key: tuple[str, str], message: str, *args: object) -> None:
         """Log a line the first time ``key`` comes up."""
@@ -196,7 +207,7 @@ class ApiContext:
     def job(self, req: GenerationRequest, ids: list[int], *, think: bool, reasoning: bool = False,
             max_tokens: int | None = None, conv_id: str | None = None, tools: Calls | None = None,
             answer_mark: bool = False, grammar: structured.Compiled | None = None, ban: tuple[int, ...] = (),
-            opened: bool | None = None, budget: tuple[int, str, bool] = (-1, "", False), cid: str = "",
+            opened: bool | None = None, budget: tuple[int, str, str, bool] = (-1, "", "", False), cid: str = "",
             continued: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
         ``Job.answer_mark``; ``grammar``: the answer's structured output, ``constrained``; ``ban``: tokens it never
@@ -229,28 +240,32 @@ class ApiContext:
                 cache_prompt=options.cache_prompt if req.cache_prompt is None else req.cache_prompt,
                 progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark,
                 grammar=grammar, ban=ban, lane=req.id_slot if req.id_slot is not None and req.id_slot >= 0 else None,
-                budget=budget[0], budget_end=budget[1], control=budget[2], cid=cid, continued=continued)
+                budget=budget[0], budget_message=budget[1], budget_end=budget[2], control=budget[3], cid=cid,
+                continued=continued)
         try:
             self.engine.submit(j)
         except RuntimeError as e:
             raise unavailable(str(e)) from None
         return j, events
 
-    def thought_budget(self, req: ChatRequest) -> tuple[int, str, bool]:
+    def thought_budget(self, req: ChatRequest) -> tuple[int, str, str, bool]:
         """llama-server's reasoning budget of a chat request: a thought's tokens at most (its
         ``reasoning_budget_tokens``, else ``thinking_budget_tokens``, the web UI's; -1 or none: ``--reasoning-budget``;
-        < 0: any), the text that ends it early (``reasoning_budget_message``, else ``--reasoning-budget-message``, then
-        the model's close marker) and whether the control route may end it (``reasoning_control``)."""
+        < 0: any), the message that ends it early (``reasoning_budget_message``, else ``--reasoning-budget-message``;
+        ``Job.thought_end``: on a paragraph of its own), the template's own end of a thought after it (``thought_end``:
+        Qwen's ``"\\n</think>\\n\\n"``, so that the next request, which renders the cut thought again, continues
+        the cached tokens; llama-server forces the message and the close marker alone) and whether the control route
+        may end it (``reasoning_control``)."""
         model = self.engine.model
         n = req.reasoning_budget_tokens if req.reasoning_budget_tokens is not None else req.thinking_budget_tokens
         if n is not None and n < -1:
             raise bad_request("reasoning_budget_tokens: -1 (no budget) or a number of tokens")
         if model.reasoning is None:
-            return -1, "", False
+            return -1, "", "", False
         n = self.options.reasoning_budget if n is None or n == -1 else n
         message = req.reasoning_budget_message if req.reasoning_budget_message is not None else \
             self.options.reasoning_budget_message
-        return n, message + model.reasoning[1], bool(req.reasoning_control)
+        return n, message.strip(), self.thought_end, bool(req.reasoning_control)
 
     async def start(self, req: ChatRequest, *, api: str = "chat", conv_id: str | None = None, cid: str = ""
                     ) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
@@ -270,11 +285,21 @@ class ApiContext:
             ban = tuple(opener) if len(opener) == 1 else ()  # (an opener of one token: Qwen's, Gemma's; Llama's: none)
         ids, think = await prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
                                           tools=fns, cont=cont)
+        budget = self.thought_budget(req)
+        if budget[:2] == (0, "") and not budget[3] and cont is None and prompts.inside(ids):
+            # a thought of no token and no message: the template's prompt without a thought, where it differs only
+            # at the end (Qwen's "<think>\n\n</think>\n\n": what the next request renders for this empty thought; the
+            # end forced after the opener's newline would be other tokens), else the end forced after the opener
+            off, _ = await prompts.render(req.messages, {**(req.chat_template_kwargs or {}), "enable_thinking": False},
+                                          effort=req.reasoning_effort, tools=fns)
+            a, b = token_ids(ids), token_ids(off)
+            if a[:len(a) - 2] == b[:len(a) - 2] and not prompts.inside(off):
+                ids, think, budget = off, False, (-1, "", "", False)
         self.fits(ids, api)
         reasoning = (req.reasoning_format or options.reasoning_format) != "none"
         # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
         keeps = prompts.template_options(req.chat_template_kwargs)[1] and "preserve_thinking" in self.info.chat_template
         return self.job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens,
                         conv_id=conv_id, tools=calls, answer_mark=not keeps, grammar=grammar, ban=ban,
-                        opened=True if cont == "reasoning_content" else None, budget=self.thought_budget(req), cid=cid,
+                        opened=True if cont == "reasoning_content" else None, budget=budget, cid=cid,
                         continued=cont is not None)

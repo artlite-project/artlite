@@ -117,6 +117,22 @@ def effort_levels(template: str) -> list[str]:
     return levels
 
 
+def thought_end(template: str, close: str) -> str:
+    """What a chat template writes between an answer's thought and its text, the close marker among it (Qwen3.5's
+    ``"\\n</think>\\n\\n"``; ``close`` alone where it writes the thought no other way): the text that ends a thought
+    a budget cuts, so that the next request, which renders the thought again, continues the tokens the device ran."""
+    thought, answer = "\ue002", "\ue003"  # (private-use characters, which no template changes)
+    try:
+        text = chat_template(template, [{"role": "user", "content": "Q"},
+                                        {"role": "assistant", "content": answer, "reasoning_content": thought}],
+                             enable_thinking=True, preserve_thinking=True)
+    except Exception:  # noqa: BLE001 (any failure of the template's: the marker alone)
+        return close
+    i, j = text.find(thought), text.find(answer)
+    end = text[i + len(thought):j] if 0 <= i < j else ""
+    return end if close in end else close
+
+
 def check_chat_template(template: str, **variables: object) -> None:
     """ValueError unless a chat template renders a user message with ``variables`` (llama.cpp's check of a template
     it is given: a broken one fails at load, not at the first request)."""

@@ -12,7 +12,7 @@ import pytest
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import flint_gguf, lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
-from models.templating import chat_template, effort_levels, template_option
+from models.templating import chat_template, effort_levels, template_option, thought_end
 from models.tokenizer import BpeTokenizer, chat_prompt
 
 from .common import ESSAYS_DIR, essay
@@ -130,7 +130,8 @@ def test_chat_prompt_template() -> None:
 def test_continue_and_efforts() -> None:
     """A continued last message: the conversation cut where its content (its text parts too) or its thought ends, in the
     template's own form (Qwen3.6's: the answer after the last user message keeps its thought); a template that does not
-    render the text refuses. The reasoning_effort levels a template renders distinctly (llama.cpp's probe)."""
+    render the text refuses. The reasoning_effort levels a template renders distinctly (llama.cpp's probe). What the
+    template writes after a thought (a budget's forced end of one; the close marker alone where it writes none)."""
     path = qwen_gguf("Q4_K_M", "27B")
     require(path)
     t = str(GGUFFile(path).meta["tokenizer.chat_template"])
@@ -143,6 +144,8 @@ def test_continue_and_efforts() -> None:
     with pytest.raises(ValueError, match="does not render the last message's reasoning_content"):
         chat_template("{{ messages[-1].content }}", msgs, continue_final_message="reasoning_content")
     assert effort_levels(t) == []
+    assert thought_end(t, "</think>") == "\n</think>\n\n"
+    assert thought_end("{{ messages[-1].content }}", "</think>") == "</think>"
     path = qwen_gguf("Q4_K_M", "3.8-27B")
     require(path)
     assert effort_levels(str(GGUFFile(path).meta["tokenizer.chat_template"])) == ["low", "medium", "xhigh"]

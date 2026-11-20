@@ -101,9 +101,11 @@ class Job:
     post_sampling: bool = False  # the probabilities the sampler drew from (its candidates), not the model's
     conv_id: str | None = None  # the UI's conversation (X-Conversation-Id), for its Stop
     cid: str = ""  # the chat completion's id (``/v1/chat/completions/control``'s)
-    # llama-server's reasoning budget: a thought's tokens at most (< 0: any), then ``budget_end`` (its message and the
-    # model's close marker) is forced; ``control``: the control route may force it (``end_thought``)
+    # llama-server's reasoning budget: a thought's tokens at most (< 0: any), then its end is forced (``thought_end``:
+    # ``budget_message`` and ``budget_end``, the template's end of a thought; ``ApiContext.thought_budget``);
+    # ``control``: the control route may force it (``end_thought``)
     budget: int = -1
+    budget_message: str = ""
     budget_end: str = ""
     control: bool = False
     end_thought: threading.Event = field(default_factory=threading.Event)
@@ -119,6 +121,12 @@ class Job:
     beside: int = 0
     waited: float = 0.0
     keeps: dict[int, tuple[int, int]] = field(default_factory=dict)
+
+    def thought_end(self, *, empty: bool) -> str:
+        """The text that ends a thought early: the message on a paragraph of its own after the thought's text (``empty``:
+        it has none: the message alone), then the template's end of a thought."""
+        m = self.budget_message
+        return (m if empty else "\n\n" + m) + self.budget_end if m else self.budget_end
 
 
 @dataclass(eq=False)

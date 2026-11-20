@@ -4,9 +4,9 @@ call parser into the job's events, and the prompt cache told what the device hol
 
 Text the model did not sample is forced: a forced tool call's opener (``Calls.force``) at the prompt's end, or - after
 a thought, where one may come first - after the answer began and no call did; a thought's end (llama-server's
-reasoning budget, ``textflow.ThoughtBudget``: its message and the close marker) once the thought took its tokens or
-the control route asked for it. The generation ends where every token but the last ran, the device rewinds to there
-and runs the forced text."""
+reasoning budget, ``textflow.ThoughtBudget``: its message and the template's end of a thought) once the thought took
+its tokens, after a token that is not white space, or the control route asked for it. The generation ends where every
+token but the last ran, the device rewinds to there and runs the forced text."""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ class Generation:
         tools = job.tools
         self.force = tools.force if tools is not None else None
         thought = job.reasoning and model.reasoning is not None and (job.inside or job.think)
-        end = job.budget_end if self.budget is not None and self.budget.due() else ""
+        end = job.thought_end(empty=not job.continued) if self.budget is not None and self.budget.due() else ""
         if end:
             self.budget.feed(end)
         self.early_text = end + (self.force if self.force and not thought else "")
@@ -199,7 +199,7 @@ class Generation:
             kind = self._tokens(logits)
             if kind is None or self.finish == "stop":
                 break
-            text = self.job.budget_end if kind == "end" else self.late
+            text = self.job.thought_end(empty=self.budget.spent == 0) if kind == "end" else self.late
             n = npu.rewind(npu.position)  # (the generation stopped where the next request would continue)
             tokens = model.tokenizer.encode(text)
             logits = npu.forward((ids + gen)[n:] + tokens)
@@ -246,7 +246,9 @@ class Generation:
                     if job.end_thought.is_set():
                         job.end_thought.clear()
                         budget.asked = True
-                    ending = not self.text.pending and budget.due()  # (after a whole character)
+                    # (after a whole character that is not white space: the template trims the thought it renders
+                    # again, and its own end follows)
+                    ending = not self.text.pending and budget.due() and not piece[-1:].isspace()
                 # (the answer began and no call did: the forced call's opener follows)
                 forcing = bool(self.late) and self.split is not None and self.split.answering and not calls.started
                 # the answer is complete, or forced text goes next: end where every token but the last ran (a
