@@ -113,7 +113,8 @@ class Pager:
     """The pages of the cores that share them: where they go (``slot``), the pager's state words (data-memory byte
     ``state``), the wake lock, the packets' stream id (their route to the core's TileControl). Page ids count from 1
     in ``pages``' order (0 in the state: no page). ``data``: words a page writes into data memory besides (per page
-    (byte address, words) runs: a table its code reads), before its state words."""
+    (byte address, words) runs: a table its code reads), before its state words. ``cores``: the (column, row) of the
+    cores that load them."""
 
     slot: int
     state: int
@@ -121,6 +122,7 @@ class Pager:
     stream_id: int
     pages: dict[str, Page]
     data: dict[str, tuple[tuple[int, np.ndarray], ...]] = field(default_factory=dict)
+    cores: tuple[tuple[int, int], ...] = ()
 
     def page_id(self, name: str) -> int:
         return list(self.pages).index(name) + 1
@@ -384,7 +386,8 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     if os.path.exists(cached):
         with np.load(cached) as z:
             return Pager(int(z["slot"]), state, wake, stream_id,
-                         {n: Page(z[f"code_{i}"], tuple(int(e) for e in z[f"entries_{i}"])) for i, n in enumerate(pages)})
+                         {n: Page(z[f"code_{i}"], tuple(int(e) for e in z[f"entries_{i}"])) for i, n in enumerate(pages)},
+                         cores=tuple(cores))
     c0, r0 = cores[0]
     ref_path = _core_elf(prj, c0, r0)
     ref = read_object(ref_path)
@@ -449,7 +452,7 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     np.savez(tmp, slot=slot, **{f"code_{i}": p.code for i, p in enumerate(out.values())},
              **{f"entries_{i}": np.array(p.entries, np.int64) for i, p in enumerate(out.values())})
     os.replace(tmp, cached)
-    return Pager(slot, state, wake, stream_id, out)
+    return Pager(slot, state, wake, stream_id, out, cores=tuple(cores))
 
 
 def _key(*args: object) -> str:
