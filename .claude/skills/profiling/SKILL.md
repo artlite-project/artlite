@@ -10,7 +10,8 @@ or `perfetto`; grep-able).
 
 Fused operators and libraries (`operators/fused/`) and the decode overlays (host-built transactions, no MLIR runtime
 sequence) are outside the hook: program the same counters by hand (aie-kernel-perf-optimization
-`reference/measuring.md` "Per-core event windows and counters").
+`reference/measuring.md` "Per-core event windows and counters": an overlay's through `overlay.Sequence.TILE_WRITES`, a
+library's items one per dispatch).
 
 ## Modes
 

@@ -85,6 +85,12 @@ operator's sequence (`prefill.attn.AttnOperator(ablate=("ev_<region>",))`) and r
 `fused._ctx.read_aie_reg` around a dispatch, with `FusedOperator(expand_load_pdis=False)`: an
 expanded PDI load ends the ELF with an array reset that zeroes the counters.
 
+Every item of a library program (a prefill chunk's), each core's counters: run the items one per dispatch
+(`Library.run([item])`: each piece starts with an array reset) from an `Assembler.assemble` that writes the counters'
+zeroing and control words right after the item's configuration and zeroes the control words after its run (which ends
+waiting for its outputs): the counters stop there, and are read at leisure. ACTIVE - LOCK_STALL - STREAM_STALL per core
+and item is each item's own compute (no overlap with the next one); a 1024-token Qwen3.5 9B chunk's 1272 items take 4 s.
+
 ### Designs driven by host-built transactions (the decode overlay: Gemma, Qwen3.5, Llama)
 
 These have no MLIR runtime sequence, so the profiling hook does not apply. Do it by hand:
@@ -103,8 +109,9 @@ These have no MLIR runtime sequence, so the profiling hook does not apply. Do it
    Example: `DecodeOverlayOperator(win="tile")` (the main core's tile; regions in `decode.protocol.WINS`, the Gemma
    attention cores' (Gemma, Llama) in `decode.attn.WINS`). Spans across kernel calls are explicit `event0()` / `event1()` at
    their two ends, e.g. `"gap"`: a phase's last tile to the next X object.
-2. **Program the counters in the transaction**, once per dispatch, for every core:
-   `seq.txn.write32(txn.tile_address(col, row, reg), value)` (a `Sequence` subclass that writes them first).
+2. **Program the counters in the transaction**, once per dispatch, for every core: `overlay.Sequence.TILE_WRITES`
+   ((column, row, register, value) words every transaction starts with), set before the model builds its step
+   transactions; to change them later, drop the kept ones (`overlay.Transactions.all`, `drop()`: they are rebuilt).
 3. **Read them** with `ctx.read_aie_reg(col, row, addr)` before and after one dispatch
    (`ctx = op._program._ctx`). Each read is one firmware round trip (~20 µs), so read outside
    the timed region.
@@ -189,7 +196,14 @@ in near-equal pairs (banks 2i and 2i + 1 share 16 KB region i).
 - **Inside page code**: PC_RANGE_0_1 (event 20, PC_Event0 / 1 at 0x32020 / 0x32024 with bit 31 set) over the page slot,
   and COMBO_EVENT_0 (event 9: Combo_event_inputs 0x34400, control 0x34404, 0 = A and B) of MEMORY_STALL and the range,
   count a core's cycles and memory stall in its pages; with every other format's page entries emptied the range can
-  cover one format's functions (their addresses: `llvm-nm -n` on the build's `page_<format>.elf`, the helper's).
+  cover one format's functions (their addresses: `llvm-nm -n` on the build's `page_<col>_<row>_<format>.elf`, a core
+  kind's first core: row 4 the main cores', row 3 the helpers').
+- **Calls of a function** (an overlay's, whose loops run what the commands say): PC_Event0..3 (`npu_regs.PC_EVENTS`,
+  the address | `PC_VALID`) at four functions' entry addresses (`llvm-nm` on the core's ELF; a page's function in its
+  page's ELF, where no other function of the core starts at that address: every page's entry shares the slot), and
+  start == stop counters on `EVENT_PC` (16 .. 19): calls per step, four functions per core per pass. The counts follow
+  the call structure (a tile's kernels one each per command). Calls x measure_ii's own cycles did not give an overlay
+  core's busy time (36% off on a Qwen 9B decode step: trip counts from arguments, branches counted on every path).
 - Example: restructurings.md R1 (570 -> 437 cycles per unit, memory stall 7.25 -> 0.24 ms per core and chunk).
 
 ## Reading core L1 from the host

@@ -40,8 +40,11 @@ measure_ii's call cycles. Against the NPU's busy cycles per core (ACTIVE - LOCK_
 on Qwen3.5 9B's 1024-token chunk the sum of the cells' errors was 11% of the busy cycles, mostly the memory stalls the
 static cycles leave out; a kernel whose branches measure_ii counts on both paths (the prefill attentions) is an upper
 bound (1.9x there), shown as each kind's ``upper`` share. A loop's slack, (II - resource bound) x its weight, is what a
-better schedule could save; a loop at its bound only gets faster with fewer operations. The decode overlays' cores run
-what the host's commands say (loop bounds from data): their weights are counted on the NPU (``decode_weights``).
+better schedule could save; a loop at its bound only gets faster with fewer operations. The decode overlays have no
+static weights (their cores run what the host's commands say: loop bounds from data); counted on the NPU (PC events at
+the functions' entries), their calls times the static cycles missed a Qwen3.5 9B step's busy cycles by 36% (their
+kernels' trip counts come from arguments, their dispatchers' branches are counted on every path): ``rank`` covers the
+prefill.
 """
 
 import argparse

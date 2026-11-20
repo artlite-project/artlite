@@ -15,6 +15,8 @@ register there, e.g. 0x91030) wedges the hardware context: ``CounterModule.addre
 
 - ``CORE``: a core tile's core module (4 counters), ``MEM``: its memory module (the 64 KB data memory with locks and
   DMAs, 2 counters), ``MEMTILE``: the memory tile's module (row 1, 4), ``SHIM``: the shim tile's PL module (row 0, 2).
+- ``PC_EVENTS``: a core's four instruction addresses whose execution raises the events ``EVENT_PC`` (a counter of one
+  counts the calls of the function that starts there).
 - ``window_counter_writes``: the control writes of the event0 / event1 windows of a kernel (``event0()`` /
   ``event1()``) that the timing builds of the prefill and MoE operators program.
 """
@@ -33,6 +35,9 @@ EVENT_INSTR_0 = 33  # the kernel's event0()
 EVENT_INSTR_1 = 34  # event1()
 EVENT_LOCK_STALL = 26  # (core module)
 EVENT_MEMORY_STALL = 23
+EVENT_STREAM_STALL = 24
+EVENT_ACTIVE = 28  # (the core enabled and not done: running or stalled)
+EVENT_PC = (16, 17, 18, 19)  # PC_0..3: the core reaches the instruction at its PC_EVENTS register's address (pulses)
 
 
 # --- tile registers ---------------------------------------------------------------------------------------------------
@@ -180,6 +185,10 @@ class CounterModule:
             for group in range((len(pairs) + 1) // 2)
         ]
 
+
+# a core module's PC event registers, PC_Event0..3: an instruction address (bits 13:0) and PC_VALID; the events EVENT_PC
+PC_EVENTS = (0x32020, 0x32024, 0x32028, 0x3202C)
+PC_VALID = 1 << 31
 
 CORE = CounterModule("core", "CoreEvent", (0x31500, 0x31504), 0x31520, 4, "core")
 MEM = CounterModule("mem", "MemEvent", (0x11000,), 0x11020, 2, "core")

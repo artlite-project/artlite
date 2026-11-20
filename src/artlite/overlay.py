@@ -89,6 +89,11 @@ class Sequence:
     ``fill`` / ``drain`` return the word index of the transfer's BD in ``words()`` (``drain``: in a one-element list):
     its length and address may be rewritten there before another dispatch (``txn.bd_words``)."""
 
+    # tile register writes (column, row, register, value) every transaction starts with: performance counters and PC
+    # events of the designs driven by host-built transactions (the profiling skill); set before the model builds its
+    # transactions (they are kept)
+    TILE_WRITES: ClassVar[tuple[tuple[int, int, int, int], ...]] = ()
+
     def __init__(self, op: OverlayOperator, *, inputs: tuple[str, ...] = ()):
         """Every transfer is issued at once; a channel with 4 queued tasks first waits for its oldest: the transaction
         runs ahead of the array, ``sync`` waits for the drains only. A task carries a task-complete token only when a
@@ -111,6 +116,8 @@ class Sequence:
         # per channel the push ops not waited for (None: a task the array pushed)
         self._queued: dict[tuple[int, str], list[int | None]] = {}
         self._array_tasks = False  # (``device_task`` was used: the words do not show those tasks' retirement)
+        for col, row, reg, value in self.TILE_WRITES:
+            self.txn.write32(txn.tile_address(col, row, reg), value)
 
     def _controller(self, col: int, direction: int, channel: int) -> None:
         if (col, direction, channel) not in self._controlled:

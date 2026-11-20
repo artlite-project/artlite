@@ -315,7 +315,7 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   four or more do not fit (`DecodeOverlayOperator(paged=)`: Llama 3B Q3_K_M, a few loads per step, the main core 2.4 KB
   freer). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
   1.7 KB off the resident code). The vision overlay's pages hold 7232 B (16 KB less its 9152-B resident code; sizes:
-  `llvm-readelf -S design.mlir.prj/page_<role>.elf`, `.ptxt`): a feature for a full role goes into a role of its own
+  `llvm-readelf -S design.mlir.prj/page_0_2_<role>.elf`, `.ptxt`): a feature for a full role goes into a role of its own
   (a template instance of the role's code with the feature on and its unused paths off: role g), not into a helper the
   roles share (each page that reaches it grows: +192 B in four pages); per-element math a consumer needs (LFM3's
   attention gate, 1 / sigmoid) goes into its producer GEMM's epilogue (a page with room), leaving the consumer a

@@ -166,6 +166,19 @@ def test_counter_registers(h: Header) -> None:
         ]
 
 
+def test_core_events(h: Header) -> None:
+    """The core events Artlite programs (mlir-aie's event names for the NPU) and the PC event registers."""
+    from aie.utils.trace.events import get_events_for_device
+
+    ev = get_events_for_device("npu2p").CoreEvent
+    assert [npu_regs.EVENT_TRUE, npu_regs.EVENT_INSTR_0, npu_regs.EVENT_INSTR_1, npu_regs.EVENT_LOCK_STALL,
+            npu_regs.EVENT_MEMORY_STALL, npu_regs.EVENT_STREAM_STALL, npu_regs.EVENT_ACTIVE, *npu_regs.EVENT_PC] == [
+        ev.TRUE.value, ev.INSTR_EVENT_0.value, ev.INSTR_EVENT_1.value, ev.LOCK_STALL.value, ev.MEMORY_STALL.value,
+        ev.STREAM_STALL.value, ev.ACTIVE.value, *(getattr(ev, f"PC_{k}").value for k in range(4))]
+    assert list(npu_regs.PC_EVENTS) == [h.reg(f"CORE_MODULE_PC_EVENT{k}") for k in range(4)]
+    assert npu_regs.PC_VALID == 1 << h.lsb("CORE_MODULE_PC_EVENT0_VALID")
+
+
 def test_bd_locks() -> None:
     """A core tile's BD word 5 and a memory tile's BD word 7."""
     w = 1 << 25 | 7 << 18 | 9 << 13 | 1 << 12 | (-2 & 0x7F) << 5 | 3  # (valid, release 7 of 9, acquire 3 >= 2)

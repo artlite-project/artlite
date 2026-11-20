@@ -377,9 +377,9 @@ def link(work_dir: str, *, pages: dict[str, tuple[str, ...]], pager: str, calls:
     ``pages`` maps a page's name to its entries (the state's entry words in order); ``pager``: the pager function
     (``pg_self`` / ``pg_request``), ``calls``: per resident function the entries it calls (through the state words),
     ``roots``: the core's kernels (their stack, ``stack`` bytes). Names are kernel names (``{p}_<local>``: ``symbols``; a
-    caller or root may be a template). Each page's ELF is kept in the project directory (``page_<name>.elf``), the
-    result too (``pages_<key>.npz``: a design's directory is named by its content, the key is the arguments and this
-    module's source)."""
+    caller or root may be a template). Each page's ELF is kept in the project directory (``page_<col>_<row>_<name>.elf``,
+    named by the first core: two kinds of cores may have pages of one name), the result too (``pages_<key>.npz``: a
+    design's directory is named by its content, the key is the arguments and this module's source)."""
     prj = os.path.join(work_dir, "design.mlir.prj")
     key = _key(pages, pager, calls, roots, stack, cores, state, wake, stream_id)
     cached = os.path.join(prj, f"pages_{key}.npz")
@@ -486,9 +486,9 @@ def _stack(work_dir: str, calls: dict[str, set[str]]) -> dict[str, int]:
 
 def _link_page(prj: str, obj: ObjectFile, own: set[int], script: str, slot: int, name: str,
                core: tuple[int, int]) -> str:
-    """Link page ``name``: kernel.o with its sections ``own`` renamed .text. -> .ptxt., placed at ``slot`` (the crt's
-    startup code after it, outside program memory: it ran before any page)."""
-    path = os.path.join(prj, f"page_{name}.elf")
+    """Link page ``name`` of the cores like ``core``: kernel.o with its sections ``own`` renamed .text. -> .ptxt., placed
+    at ``slot`` (the crt's startup code after it, outside program memory: it ran before any page)."""
+    path = os.path.join(prj, f"page_{core[0]}_{core[1]}_{name}.elf")
     raw = bytearray(obj.raw)
     for s in own:
         at = obj.sections[s].name_offset
