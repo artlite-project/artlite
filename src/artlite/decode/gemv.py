@@ -29,12 +29,12 @@ frame, which every core's stack must hold): pop the sums per super-block instead
 
 A weight panel is 8 rows x 8 k of the tile's integer codes as bfp16 mantissas at exponent 133 (value = code), so the
 MMUL sums exact products: C[a][r] = sum_k X[a][k] W[r][k] in fp32. The codes of a row are words of 8 consecutive k
-(``formats``' layouts), so 8 rows' words are transposed into panels first (``_tr8``: two shuffle stages per 8x8
-words). Per sub-block (32 k, Q6_K, Q2_K, Q3_K: 16 k) the partial sums of the hi and lo rows are added and rounded
+(``formats``' layouts): a word-major tile's panels are loaded as they lie (Q4_K: 32 B of a word's 16 rows), a row-major
+tile's 8 rows' words are transposed into panels first (``_tr8``: two shuffle stages per 8x8 words). Per sub-block (32 k, Q6_K, Q2_K, Q3_K: 16 k) the partial sums of the hi and lo rows are added and rounded
 once to bf16 (c, 32 lanes [slot 4][r 8]), with the codes centered (q - 8, - 16, - 32: the sum panels against -z e_i
 start each chain; Q2_K, Q3_K: x against a constant -z panel), so that c stays small; then y += c (d sc) with d sc
 (exact in fp32) as bf16 hi + lo (``_sc``; Q2_K, Q3_K: the integer scales, ``formats.k23``). Each core
-keeps its transposed codes, its tables and partial sums in its scratch (``SCR_BYTES``; Q4_K: the codes in place).
+keeps its transposed codes, its tables and partial sums in its scratch (``SCR_BYTES``).
 
 Output: y [g 2][slot][r 8] fp32 (rows 8 g ..), accumulated.
 """

@@ -170,8 +170,9 @@ def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
                 elif fmt == "BFP16":  # [16-row block][k8][8-row half][panel of 18 words]
                     w = [base[2 * b + h] + (8 * kt + q) * 18 + e
                          for b in range(4) for q in range(8) for h in range(2) for e in range(18)]
-                else:  # [tile][i % 2][s][row 16]: word (s, i = 2 kt + i % 2) of each row
-                    w = [base[t] + r * 32 + s * 8 + 2 * kt + il
+                else:  # [tile][i % 2][s][row 16]: word (s, i = 2 kt + i % 2) of each row (a word-major slice: [i][s][row])
+                    wm = FORMATS[fmt].word_major
+                    w = [base[t] + (((2 * kt + il) * 4 + s) * 16 + r if wm else r * 32 + s * 8 + 2 * kt + il)
                          for t in range(half * op.tq, (half + 1) * op.tq)
                          for il in range(2) for s in range(4) for r in range(16)]
                 words.append(np.array(w))

@@ -17,7 +17,11 @@ s = 0..3 walks the 32 elements of each group.
 Layout: the per-row scale planes come first ("header", R x ``header_sb`` B per
 super-block), then the codes super-block major (``slice_bytes``: one super-block of all
 rows), so a GEMM fetches one super-block of several tiles as long DDR runs (the slots'
-docstrings give each format's bytes per row and super-block).
+docstrings give each format's bytes per row and super-block). A MMUL panel is 8 rows x 8 k, a word of each of 8 rows:
+a word-major tile (``TileFormat.word_major``: [word][row][4 B]; Q4_K, Q2_K, Q3_K, the IQ formats' panels) holds the
+panels as its readers load them, a row-major one ([row][its words]; Q4_0, Q4_1, Q5_K, Q6_K) has the decode GEMV
+transpose 8 rows' words first (a third of a Q4_K half tile's cycles before it was word-major) and the prefill GEMMs'
+memtiles walk them into place.
 """
 
 import math

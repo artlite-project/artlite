@@ -89,10 +89,10 @@ class Dataflow:
             # holds needs a padding, if only of zeros)
             if not geo.units and (geo.n > geo.n_read or geo.n_read < TR):
                 rpad = [(0, 0)] * (len(rdims) - 1) + [(0, geo.n - geo.n_read)]
-        elif (dims := slot(geo.fmt).tile_major_dims(geo)) is not None:  # (BFP16)
+        elif (dims := slot(geo.fmt).tile_major_dims(geo)) is not None:  # (BFP16; Q4_K: word-major, no S2MM walk)
             wdims, rdims = dims
         else:
-            # Q4: tile rows store words of 8 consecutive k ((s, i) = k in [32 i + 8 s, +8)), a MMUL panel
+            # Q4_0, Q4_1: tile rows store words of 8 consecutive k ((s, i) = k in [32 i + 8 s, +8)), a MMUL panel
             # is 8 rows x 8 k: S2MM writes each slice [tile][i][s][row], MM2S reads k-tile objects
             # [kt][tile][i % 2][s][row] (i = 2 kt + i % 2) = packed panels in the dequant's order
             # (pair: the memtile object in two segments of tq tiles, each written and read the same way: a

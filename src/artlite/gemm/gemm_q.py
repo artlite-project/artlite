@@ -28,8 +28,9 @@ shared memory, no DMA). Both run the MAC loop (``mac.py`` split; A as bfp16 pane
 then the partner's, so the pair never streams B from one memory at once, into the L1 C tile (bf16 between
 k-tiles). The k-tiles alternate between two C tiles in different 16 KB regions (in one region the MAC loop's C loads
 and stores conflict, ~90 per k-tile); the second one (``st``) also collects the Q4_K header at a K chunk's start and
-is the SiLU epilogue's scratch (the sum is in the first after every even number of k-tiles). The scale header passes
-through the same permutation; ``_hdr`` (Q4_K: ``_hcp`` + ``_hdr_q4k``) expands the core's two tiles' scales into a
+is the SiLU epilogue's scratch (the sum is in the first after every even number of k-tiles). The scale header comes
+as a unit through the same memtile objects (a row-major tile's through the same permutation; Q4_K's word-major one as
+it lies); ``_hdr`` (Q4_K: ``_hcp`` + ``_hdr_q4k``) expands the core's two tiles' scales into a
 workspace. (Every core converting whole k-tiles cost ~980 instead of ~800 cycles per k-tile: 9B qwen35 gate/up 2.19 ->
 1.71 ms.) BFP16 tiles hold MMUL operands: the MAC reads the k-tile objects.
 
@@ -48,7 +49,7 @@ writes the gate/up SiLU output in the same layout for the down GEMM.
 Tiles of 1024 columns (``kc=1024``: the Llama and Qwen images): a row tile's K chunks are consecutive tiles
 (``kc_group``: in groups of the decode's activation objects for down). A Q4_K tile's header (1 KB)
 is half a slice; it is read as a slice-sized unit starting 1 KB before the tile (``hdr_skip``: every
-unit the memtile permutes is then one slice of the pass's tiles; ~10% more weight bytes). The
+unit the memtile holds is then one slice of the pass's tiles; ~10% more weight bytes). The
 per-pass pattern [chunk][unit][tile][words] has more dimensions than a shim BD (3 + repeat), so the
 weights of all passes come as one chained task per column and token chunk (``dataflow.Dataflow.b_chain``).
 ``gemm_qd.GemmQdOperator`` runs the dequant on one core per column instead of on every core; it

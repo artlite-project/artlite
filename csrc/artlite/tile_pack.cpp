@@ -1,8 +1,9 @@
 // The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q6h.py, q4.py, q8.py, q2k.py, q3k.py, iq1.py, iq2.py,
 // iq3.py, iq3s.py, iq4.py, bf16.py:
-// ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A super-block's 256 codes go out in the tiles' word-major order
-// (``formats.common._word_order``: [sb][s][i][j] = k 256 sb + 32 i + 8 s + j, two codes per byte, the lower k in the
-// low nibble), so byte 32 s + 4 i + jj of a super-block's low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1).
+// ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A
+// super-block's 256 codes go out as words of 8 consecutive k (``formats.common._word_order``: [sb][s][i][j] = k 256 sb +
+// 32 i + 8 s + j, two codes per byte, the lower k in the low nibble), so byte 32 s + 4 i + jj of a super-block's
+// low-nibble planes holds codes 32 i + 8 s + 2 jj (+ 1); a word-major tile (Q4_K) takes them word by word, [i][s][row].
 // Compiled with -march=znver5 (CMakeLists.txt).
 
 #include "artlite/tile_pack.h"
@@ -164,23 +165,34 @@ inline void scales_k(const uint8_t* s, uint8_t* sc, uint8_t* mn) {
 
 inline uint8_t nib(uint8_t lo, uint8_t hi) { return static_cast<uint8_t>((lo & 15) | (hi << 4)); }
 
-/// Q4_K (q4k.py): per row [sl | ml | sh | mh | d | -dmin] (16 nsb bytes), then [sb][row] 128 code bytes.
+/// Where a row's code words of a super-block's low-nibble planes go in a word-major slice [i 8][s 4][row R] (dwords from
+/// the slice's start, less the row): word 16 half + 8 s' + i (step s = 2 half + s') -> (4 i + s) R.
+inline __m512i word_major_index(int half, int R) {
+  alignas(64) int32_t idx[16];
+  for (int j = 0; j < 16; j++) idx[j] = (4 * (j & 7) + 2 * half + (j >> 3)) * R;
+  return _mm512_load_si512(idx);
+}
+
+/// Q4_K (q4k.py, word-major [word][row] 4 bytes): the header words of a row's record [sl | ml | sh | mh | d | -dmin] (4
+/// nsb words), then per super-block the code words [i 8][s 4][row].
 void tile_q4k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   const __m512i lo = load_idx(kQ4Lo), hi = load_idx(kQ4Hi);
-  const int g = 8 * nsb;
-  uint8_t* codes = t + 16 * nsb * R;
+  const __m512i at0 = word_major_index(0, R), at1 = word_major_index(1, R);
+  const int g = 8 * nsb, nw = 4 * nsb;
+  uint32_t* hw = reinterpret_cast<uint32_t*>(t);
+  uint32_t* codes = hw + size_t(nw) * R;
   for (int r = 0; r < R; r++) {
     uint8_t sc[8 * kMaxNsb], mn[8 * kMaxNsb];
-    uint8_t* h = t + 16 * nsb * r;
+    uint8_t h[16 * kMaxNsb];  // the row's record
     for (int sb = 0; sb < nsb; sb++) {
       const uint8_t* b = src[r] + 144 * sb;
       scales_k(b + 4, sc + 8 * sb, mn + 8 * sb);
       put16(h + 12 * nsb + 2 * sb, bf16_of(b));
       put16(h + 14 * nsb + 2 * sb, bf16_of(b + 2, true));
       __m512i x0 = nibble_pairs(_mm512_loadu_si512(b + 16)), x1 = nibble_pairs(_mm512_loadu_si512(b + 80));
-      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
-      _mm512_storeu_si512(c, _mm512_permutex2var_epi8(x0, lo, x1));
-      _mm512_storeu_si512(c + 64, _mm512_permutex2var_epi8(x0, hi, x1));
+      uint32_t* c = codes + size_t(sb) * 32 * R + r;
+      _mm512_i32scatter_epi32(c, at0, _mm512_permutex2var_epi8(x0, lo, x1), 4);
+      _mm512_i32scatter_epi32(c, at1, _mm512_permutex2var_epi8(x0, hi, x1), 4);
     }
     for (int k = 0; k < g / 2; k++) {
       h[k] = nib(sc[2 * k], sc[2 * k + 1] & 15);
@@ -191,6 +203,7 @@ void tile_q4k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
       h[8 * nsb + k] = nib(top(sc, 2 * k), top(sc, 2 * k + 1));
       h[10 * nsb + k] = nib(top(mn, 2 * k), top(mn, 2 * k + 1));
     }
+    for (int w = 0; w < nw; w++) std::memcpy(hw + size_t(w) * R + r, h + 4 * w, 4);
   }
 }
 

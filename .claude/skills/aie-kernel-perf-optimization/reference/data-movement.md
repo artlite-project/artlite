@@ -40,15 +40,18 @@ on Krackan; GemmQd's cost model (`gemm_qd.k_tile_cycles`) assumes Halo's.
 Decode streams every weight once per token, so its tokens/s is this ceiling / bytes per token: the iGPU (~190-199
 GB/s) decodes the same model ~3.6x faster. Single-token decode reads ~55-56 GB/s, ~97-98% of the ceiling (Llama 1B:
 the A channels starved on memory half the time, backpressured 1%); the remaining levers are fewer bytes per token
-(speculative decoding on the multi-token step, MoE, low-bit formats, tile padding). On Krackan the same decode reads
-64-70 GB/s (Llama 1B, Gemma E4B, Qwen 27B), ~70% of that chip's 16-channel rate. Two limits sit there that Halo's port
-hides. Each column streams its weights on one shim channel (A: MM2S 0): Halo's 8 such channels read 56.4 GB/s (the
-port), Krackan's 76.5-80.1 (~5.5 B per array cycle per column: a 9280-B tile every ~1700 cycles). The main core's work
-per tile (its half-tile GEMV, the helper's handoff, the collect) caps a column at ~5.9 B per array cycle on Q4_K and
-~4.3 on Q6_K (a period of ~2150 cycles), against ~12 on Q4_0: on Krackan the Q6_K tiles bind, 26-42% of a Q4_K_M
-file's bytes. Measured in Halo's
-steps with the event windows: 1B 10.9 of 14.7 ms, 27B 200 of 296 ms, Gemma 25 of 55 ms. A second weight channel per
-column and a cheaper K-quant tile on the main core would speed up a chip with a wider path, not Halo.
+(speculative decoding on the multi-token step, MoE, low-bit formats, tile padding). On Krackan Point two limits sit
+that Halo's port hides. Each column streams its weights on one shim channel (A: MM2S 0): Halo's 8 such channels read
+56.4 GB/s (the port), Krackan's 80.1 (~5.5 B per array cycle per column: a 9280-B tile every ~1700 cycles; all 16
+channels: 97.8). And the main core: a decode step there is the larger of its bytes at that rate and the main core's
+busy time plus about a millisecond of phase boundaries (Llama 1B Q4_K_M with row-major Q4_K tiles: 10.9 ms measured
+there, 9.2 ms of main-core work counted on Halo). Count it on Halo: per core all cycles less lock stall over a step
+(the cores' counters programmed in the step's transaction, measuring.md), and the tile windows
+(`DecodeOverlayOperator(win=)`). Llama 1B's main core is busy 6.7 of 11.9 ms on Q4_0, 7.6 of 12.6 on Q4_K_M
+(word-major Q4_K tiles: 1086 cycles a half tile in the file's mix, and 285 a tile for the row epilogues), 12.8 of 15.0
+on Q5_K_M, 13.7 of 17.0 on Q6_K (row-major: the transposes are a quarter of a half tile). A format whose main-core time
+exceeds its bytes' time at 80 GB/s is bound by the core on such a chip, and a second weight channel per column pays
+only below that.
 
 Where the columns' streams start in DRAM matters, though no microbenchmark showed it: the 8 column streams of a
 column-major image at an odd multiple of 256 KB apart (`decode/image.py` `_col_stride`: each in its own 256 KB slot
@@ -63,7 +66,17 @@ bandwidth.
 - **Deliver data in consumption order**:
   - memtile `to_stream` (4 dims, 32-bit granularity) can re-lay a tile into the order the
     kernel pops;
-  - host prepacking of weights is free (at load time, lossless, the same size);
+  - host prepacking of weights is free (at load time, lossless, the same size): store a weight tile as its kernels load
+    it. A MMUL panel is 8 rows x 8 k, one 4-byte word of each of 8 rows; a row-major tile ([row][its words]) has every
+    reader build the panels, the decode GEMV by transposes on the core (Q4_K: 416 of ~1180 cycles a half tile, and its
+    stores into the tile met the tile stream's DMA: memory stall 0.74 -> 0.36 ms a step once gone), the prefill by a
+    memtile walk and header kernels that picked rows apart. Word-major ([word][row][4 B]: the 32 B of a word's 8 rows
+    are a panel, `TileFormat.word_major`) costs nothing to read: the main core's work on the Llama 1B Q4_K_M 9.2 ->
+    7.6 ms a step, every logit the same. Choose the word order the decode pops ([i][s][row]) and check the prefill
+    side: its S2MM walk within 4 dimensions (none here: the slice lies as the memtile holds it), and the header unit,
+    which comes through the same walk from before the tile (a tile of rows that are no multiple of 8, Q5_K's 13 or
+    Q6_K's 11, needs load-FIFO pops for its words and a way for its header unit, whose bytes a word-major walk would
+    interleave with the tile before's);
   - producers write the format the next consumer reads (the prefill norms and GdnOut emit the next GEMM's
     bfp16 A panels; the decode's producers drain into the GEMV's token-interleaved layout).
 - **bfp16 panels** `[rows / 8][K / 8][8 x 9 B]` carry activations in 56% of bf16's bytes.

@@ -174,7 +174,8 @@ class Slot:
         return False
 
     def tile_major_dims(self, op: object) -> tuple[list, list] | None:
-        """(memtile write, read dims) of the tile-major permutation; None: gemm_q's 16-row nibble tiles."""
+        """(memtile write, read dims) of the tile-major permutation (write dims None: the slices as they come, a
+        word-major tile's); None: gemm_q's 16-row row-major nibble tiles."""
         return None
 
     def gemm_q_header(self, op: object, kernel: KernelFn, B_l1_ty: object, ws_ty: object,
