@@ -119,6 +119,8 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      help="a Jinja chat template in place of the model file's (tokenizer.chat_template)")
     gen.add_argument("--chat-template-file", metavar="FILE",
                      help="the same from a file (one template for several models: a preset's sections)")
+    gen.add_argument("--jinja", action="store_true",
+                     help="llama-server's switch to Jinja chat templates: always on (accepted, no effect)")
     structured.add_arguments(gen)
     vis = p.add_argument_group("images and audio (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3-VL, LFM3-Audio)")
     vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf): images "

@@ -65,6 +65,8 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--chat-template", metavar="JINJA_TEMPLATE",
                    help="a Jinja chat template in place of the model file's (tokenizer.chat_template)")
     p.add_argument("--chat-template-file", metavar="FILE", help="the same from a file")
+    p.add_argument("--jinja", action="store_true",
+                   help="llama-cli's switch to Jinja chat templates: always on (accepted, no effect)")
     p.add_argument("-n", "--n-predict", type=int, default=-1,
                    help="tokens to generate (default: -1, until an end-of-sequence token or a full KV cache)")
     p.add_argument("-c", "--ctx-size", type=int, default=0,
@@ -344,7 +346,10 @@ def main(argv: list[str] | None = None) -> None:
         system = args.system_prompt or (asr_system(args.language) if asr else None)
         ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
                            videos=args.video, variables=variables)
-        sampling = model.sampling(think=args.think)
+        # (as the prompt says where the template decided: its inline tags over --think)
+        think = args.think if args.raw else structured.prompt_thinks(model.tokenizer, token_ids(ids), model.reasoning,
+                                                                     args.think)
+        sampling = model.sampling(think=think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
                  "repeat_last_n": args.repeat_last_n, "presence_penalty": args.presence_penalty,
                  "frequency_penalty": args.frequency_penalty}
@@ -358,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
             opened = not args.raw and model.reasoning is not None and \
                 structured.ends_inside(model.tokenizer, token_ids(ids), model.reasoning[0])
             thought = structured.thought_of(model.reasoning, model.tokenizer, opened=opened,
-                                            think=args.think and not args.raw)
+                                            think=think and not args.raw)
             mask = structured.GrammarMask(v, structured.compiled(constraint, v).grammar, thought=thought,
                                           digits=constraint.json)
     except jinja2.TemplateError as e:  # (the template refuses the prompt or a variable)

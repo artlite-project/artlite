@@ -462,11 +462,27 @@ def from_args(args: argparse.Namespace) -> Constraint | None:
 # ----------------------------------------------------------------------
 
 
+def _tail(tokenizer: Any, ids: Sequence[int]) -> str:
+    """A prompt's last text (token ids; an image's rows, negative, are none), without trailing white space."""
+    last = [int(t) for t in list(ids)[-8:] if t >= 0]
+    return tokenizer.decode_bytes(last, special=True).decode("utf-8", errors="replace").rstrip()
+
+
 def ends_inside(tokenizer: Any, ids: Sequence[int], opener: str) -> bool:
     """Whether a prompt (token ids; an image's rows, negative, are none) ends inside a thought: its last text is the
     model's open marker (the template opened it)."""
-    last = [int(t) for t in list(ids)[-8:] if t >= 0]
-    return tokenizer.decode_bytes(last, special=True).decode("utf-8", errors="replace").rstrip().endswith(opener)
+    return _tail(tokenizer, ids).endswith(opener)
+
+
+def prompt_thinks(tokenizer: Any, ids: Sequence[int], reasoning: tuple[str, str] | None, think: bool) -> bool:
+    """Whether the model thinks first after a prompt, as its template rendered it: the prompt ends inside a thought
+    (the template opened one) or after an empty one (it closed it), else ``think`` (what the template was asked; a
+    model that opens its thought itself). A template may decide against ``enable_thinking`` (inline tags such as
+    ``<|think_off|>``, its own spellings of ``reasoning_effort``); every model's own template follows it."""
+    if reasoning is None:
+        return think
+    tail = _tail(tokenizer, ids)
+    return True if tail.endswith(reasoning[0]) else False if tail.endswith(reasoning[1]) else think
 
 
 def thought_of(reasoning: tuple[str, str] | None, tokenizer: Any, *, opened: bool, think: bool,

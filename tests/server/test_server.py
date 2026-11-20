@@ -165,6 +165,30 @@ def test_reasoning_qwen() -> None:
             "messages": [{"role": "user", "content": "Q"}]}).json()["prompt"]  # (-rea off: an empty thought)
 
 
+def test_reasoning_template_decides() -> None:
+    """A template that opens or closes the thought against enable_thinking (inline tags in a message): the prompt
+    decides the thought's split and the sampling defaults (the fake's: temperature 0.6 thinking, else 0.7)."""
+    model, npu, engine = make(reasoning=QWEN)
+    plain = model.chat
+
+    def tagged(messages: list[dict[str, object]], *, think: bool = False, **kw: object) -> list[int]:
+        text = str(messages[-1]["content"])
+        return plain(messages, think="<|think_on|>" in text or think and "<|think_off|>" not in text, **kw)
+
+    model.chat = tagged
+    temps = []
+    sampling = model.sampling
+    model.sampling = lambda *, think=False: temps.append(think) or sampling(think=think)
+    for rea, content, thinks in [("on", "Q <|think_off|>", False), ("off", "Q <|think_on|>", True),
+                                 ("on", "Q", True), ("off", "Q", False)]:
+        with TestClient(app_of(engine, reasoning=rea)) as client:
+            assert engine.wait_ready(5)
+            npu.replies = [["Hmm", "\n", "</think>", "\n\n", "Yes"] if thinks else ["Yes"]]
+            message = chat(client, content).json()["choices"][0]["message"]
+            assert message.get("reasoning_content") == ("Hmm" if thinks else None), (rea, content)
+            assert message["content"] == "Yes" and temps[-1] is thinks, (rea, content)
+
+
 def test_reasoning_gemma() -> None:
     """The model opens and closes the thought, and may end with a stray close marker."""
     _model, npu, engine = make(reasoning=GEMMA)

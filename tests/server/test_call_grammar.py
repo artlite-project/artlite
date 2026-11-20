@@ -308,6 +308,12 @@ def test_agreement() -> None:
         p = QWEN_XML.parser(fns)
         parts = p.parts([("content", text)]) + p.flush()
         assert json.loads("".join(c.arguments for k, c in parts if k == "tool_call")) == want, text
+    # a Qwen value ends at its first closing tag, as the parser reads it (the newline before it optional)
+    tight = "<tool_call>\n<function=m>\n<parameter=u>\nx</parameter>\n</function>\n</tool_call>"
+    assert takes(g, TOY.encode(tight)) and not takes(g, TOY.encode(tight.replace("x<", "x</parameter>\n<")))
+    p = QWEN_XML.parser(fns)
+    parts = p.parts([("content", tight)]) + p.flush()
+    assert json.loads("".join(c.arguments for k, c in parts if k == "tool_call")) == {"u": "x"}
     gemma = '<|tool_call>call:m{id:<|"|>a<tool_call|>b<|"|>}<tool_call|>'
     assert takes(grammar(GEMMA4, fns), TOY.encode(gemma))
     p = GEMMA4.parser(fns)

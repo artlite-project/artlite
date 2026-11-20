@@ -166,7 +166,9 @@ rewriting the GGUF file, and, as a preset's key (`chat-template-file = ...`), to
 It gets the variables the file's template gets (`enable_thinking`, `preserve_thinking`, `bos_token`, ...), and the
 server reads from it what it reads from the file's (the tool-call syntax, whether it takes a message as text parts
 and a system message after the first); `/props` and `/apply-template` show it. A template that does not render a user
-message fails at load.
+message fails at load. Where a template opens or closes the thought against `enable_thinking` (inline switches in a
+message such as `<|think_off|>` or `<|think_low|>`), the prompt decides, as llama.cpp's parser reads it: the thought's
+split, the model's thinking or plain sampling defaults and a forced call's place follow it.
 
 A request's `chat_template_kwargs` and the server's `--chat-template-kwargs` are the template's variables, as in
 llama-server (the request's over the server's). A request's `reasoning_effort` (and a Responses request's
@@ -652,6 +654,7 @@ Generation:
 | `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
 | `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
+| `--jinja` | accepted: chat templates always render with Jinja (llama-server's switch to them) |
 | `--grammar GRAMMAR`, `--grammar-file FILE` | a GBNF grammar (Lark after `%llguidance`) that the answers follow where a request asks for no constraint of its own and has no tools ([Structured output](#structured-output)) |
 | `-j SCHEMA`, `--json-schema`; `-jf FILE`, `--json-schema-file` | a JSON schema the same (`{}`: any JSON object); beside a request's tools, the answer that is no call |
 

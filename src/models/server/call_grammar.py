@@ -22,7 +22,8 @@ call begins with ``{``. A call's name is one of the functions', its arguments th
 | ``Llama3`` | the JSON ``{"name": NAME, "parameters": {...}}`` |
 
 A Qwen or GLM-4.5 value is the raw text of a parameter whose schema allows only strings (its ``enum``, ``const``,
-``pattern``, ``minLength``, ``maxLength`` held; up to the closing tag, which it cannot contain), else the schema's JSON
+``pattern``, ``minLength``, ``maxLength`` held; up to the closing tag, which it cannot contain, Qwen's newline before it
+optional: the parser ends the value at the first one, as vLLM's ``qwen3_xml``), else the schema's JSON
 (Qwen's booleans also ``True`` / ``False``: the parser maps them); a Gemma value is its own syntax, numbers, booleans
 and null its JSON. A function's schema compiles exactly when the tool is ``strict`` (a keyword not held: an error that
 names it), else leniently; an object that declares properties takes no others unless ``additionalProperties`` says so
@@ -239,14 +240,17 @@ def _check_grammar(grammar: str) -> str | None:
 # ----------------------------------------------------------------------
 
 
+_QWEN_END = rf"(\n)?{_escape(QwenParser.END)}"  # (a raw value's end: QwenParser's, the first closing tag)
+
+
 def _qwen_value(t: Tool, k: str, schema: dict[str, Any]) -> str:
     """A Qwen parameter after ``<parameter=K>\\n``: its value, ``\\n</parameter>\\n``."""
     g, end = t.g, "\n" + QwenParser.END
     if t.sub is not None:  # (the newline optional where a lexeme of the input may take it: ``lexemes``)
         return f'{t.sub} "\\n"{"?" if t.newline else ""} {lit(QwenParser.END + chr(10))}'
     raw = t.raw_string(schema)
-    if raw is not None:
-        v = g.rule(f"/{raw}{_escape(end)}/", "v", attrs="[lazy]")
+    if raw is not None:  # (up to the first closing tag, as the parser reads it: the newline before it optional)
+        v = g.rule(f"/{raw}{_QWEN_END}/", "v", attrs="[lazy]")
         return f'{v} "\\n"'
     alt = t.json_value(schema)
     types = _types(_ref(t.root, schema))
@@ -262,7 +266,7 @@ def _qwen_call(t: Tool) -> str:
     items = [(g.rule(f"{lit(QwenParser.PARAM_HEAD + k + QwenParser.NAME_END + chr(10))} {_qwen_value(t, k, s)}", "p"),
               req) for k, s, req in props]
     if extra:
-        any_value = g.rule(f"/{ANY}{_escape(chr(10) + QwenParser.END)}/", "v", attrs="[lazy]")
+        any_value = g.rule(f"/{ANY}{_QWEN_END}/", "v", attrs="[lazy]")
         items.append((g.rule(f'({lit(QwenParser.PARAM_HEAD)} /[^>\\n]+/ ">\\n" {any_value} "\\n")*', "x"), False))
     return f'{lit(t.name + QwenParser.NAME_END + chr(10))} {_seq(g, items, "")} ' \
            f'{lit(QwenParser.FUNCTION_END + chr(10))} {g.token(QwenParser.CLOSE)}'

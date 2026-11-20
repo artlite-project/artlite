@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from ..model import MEDIA_MARKER
 from ..sequence import data_bytes, token_ids
-from ..structured import ends_inside
+from ..structured import ends_inside, prompt_thinks
 from ..templating import TEMPLATE_RESERVED, chat_template
 from .errors import bad_request
 from .listing import Modalities
@@ -194,9 +194,11 @@ class PromptBuilder:
         """The prompt's tokens through the chat template (with images: ids and embedding rows, the encoder run on the
         engine's worker between its jobs; ``media``: images as text, ``messages_of``; ``tools``: the functions the
         model may call; ``kwargs``, ``effort``: a request's ``chat_template_kwargs`` and ``reasoning_effort``,
-        ``template_options``), and whether the model thinks. A request's ``reasoning_effort`` level that the template
-        refuses (Qwen3.8's takes xhigh, medium and low; clients send high or minimal) gives way to the server's, else
-        the template's default, with a log line; one in ``chat_template_kwargs`` fails the request."""
+        ``template_options``), and whether the model thinks, as the prompt says where the template decided
+        (``structured.prompt_thinks``: a template's inline tags over ``enable_thinking``). A request's
+        ``reasoning_effort`` level that the template refuses (Qwen3.8's takes xhigh, medium and low; clients send high
+        or minimal) gives way to the server's, else the template's default, with a log line; one in
+        ``chat_template_kwargs`` fails the request."""
         ctx = self.ctx
         engine = ctx.engine
         think, preserve, variables = self.template_options(kwargs, effort)
@@ -214,7 +216,7 @@ class PromptBuilder:
 
         try:
             try:
-                return await run(variables), think
+                ids = await run(variables)
             except jinja2.TemplateError as e:
                 if not effort or variables.get("reasoning_effort") != engine.model.efforts.get(effort, effort) or \
                         "reasoning_effort" in (kwargs or {}):
@@ -227,11 +229,11 @@ class PromptBuilder:
                 ctx.warn_once(("reasoning_effort", effort), "reasoning_effort %r: the chat template refuses it (%s): "
                               "%s instead", effort, e, f"the server's {default!r}" if default else "the template's "
                               "default")
-                return ids, think
         except jinja2.TemplateError as e:
             raise bad_request(f"the chat template failed: {e}") from None
         except (OSError, ValueError) as e:  # (an image or video that does not open, or does not fit the prompt)
             raise bad_request(str(e)) from None
+        return ids, prompt_thinks(engine.model.tokenizer, token_ids(ids), engine.model.reasoning, think)
 
     def inside(self, ids: list[int]) -> bool:
         """Whether a prompt ends inside a thought (its last text is the model's open marker)."""
