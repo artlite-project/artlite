@@ -27,13 +27,15 @@ from .common import (
 _GEMM = templating.source("artlite/formats/q4k.gemm.cc.jinja")
 
 
-# the decode GEMV (``decode.gemv``)
+# the decode GEMV (``decode.gemv``): the codes' MMUL (``mmv/q4kmm``, also P4_128's: ``formats.awq``), the tables and offsets
 _MMV = templating.source("artlite/formats/q4k.mmv.cc.jinja")
+
+_MM = templating.source("artlite/formats/q4k.mm.cc.jinja")
 
 
 class Q4KSlot(Slot):
     formats = (TileFormat("Q4_K", 3, 144, 16, 8, 128, 16, planes=4, ws_planes=2, word_major=True, mmv="q4k"),)
-    sources: ClassVar[dict[str, str]] = {"gemm/Q4_K": _GEMM, "mmv/Q4_K": _MMV}
+    sources: ClassVar[dict[str, str]] = {"gemm/Q4_K": _GEMM, "mmv/q4kmm": _MM, "mmv/Q4_K": _MMV}
 
     def pack(self, fmt: str, f: dict[str, np.ndarray], R: int, nsb: int) -> list[np.ndarray]:
         g = 8 * nsb  # groups of the chunk (g = 8 sb + i)
@@ -79,6 +81,9 @@ class Q4KSlot(Slot):
 
     def mmv_slots(self, fmt: str) -> tuple[int, ...]:
         return (4, 8)
+
+    def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
+        return ("mmv/q4kmm", f"mmv/{fmt}")
 
 
 SLOT = Q4KSlot()

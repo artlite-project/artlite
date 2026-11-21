@@ -1,0 +1,53 @@
+// P4_128 (formats.awq): the header unit holds a row's words word-major, as the codes: [word 16][row 16][4 B], words 0 .. 3
+// s, 4 .. 7 B = bf16(-s z), each the bf16 pair of groups 2 w, 2 w + 1 of super-block w (128 k each). ws plane 0 <- A = s,
+// plane 1 <- B, per 32-k group (a group's value in its 4), in the layout dq reads ([group / 2][tile][group % 2][row 16]).
+// The header (16 words x 16 rows) is the upper half of a slice-sized unit read from 1 KB before the tile: the unit's k-tile
+// slots 2, 3 (of {{ 128 * tq }} words in hb) hold words 0 .. 7, 8 .. 15 of the {{ tq }} tiles.
+// the 16 rows' word w of tile t (64 B) in hb, bytes
+#define {{ p }}_HW(t, w) (4 * (((2 + ((w) >> 3)) * {{ tq }} + (t)) * 128 + ((w) & 7) * 16))
+// k-tile slot kt of the header (one {{ tq // 2 }} KB L1 object) -> hb + {{ tq // 2 }} KB kt (the unit's first half: the
+// tile before's bytes)
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
+{
+    if (kt < 2)
+        return;
+    al::copy<{{ 256 * tq }}, 32>(hb + {{ 256 * tq }} * kt, b);
+}
+
+// super-block sb's groups of tile t, plane pl: the word's [row 16][j 2] -> o [group 8 / 2][tile][group % 2][row 16]
+[[clang::always_inline]] inline void {{ p }}_p4w(const uint8_t *__restrict b, bfloat16 *__restrict o)
+{
+    const aie::vector<bfloat16, 32> v = aie::load_v<32>((const bfloat16 *)b);
+    const aie::vector<bfloat16, 16> e = aie::filter_even(v, 1), d = aie::filter_odd(v, 1);
+    aie::store_v(o, aie::concat(e, e));
+    aie::store_v(o + {{ 32 * tq }}, aie::concat(e, e));
+    aie::store_v(o + {{ 64 * tq }}, aie::concat(d, d));
+    aie::store_v(o + {{ 96 * tq }}, aie::concat(d, d));
+}
+{% if dqb %}
+// super-block sb's words of the 4 tiles (GemmQd expands them before the super-block's k-tiles)
+void {{ p }}_hdr_sb(const uint8_t *__restrict b, bfloat16 *__restrict ws, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tq }}; t++) {
+        {{ p }}_p4w(b + {{ p }}_HW(t, 0) + 64 * sb, ws + sb * {{ 128 * tq }} + t * 32);
+        {{ p }}_p4w(b + {{ p }}_HW(t, 4) + 64 * sb, ws + {{ 128 * tq * nsb }} + sb * {{ 128 * tq }} + t * 32);
+    }
+}
+{% else %}
+void {{ p }}_hdr_p4(const uint8_t *__restrict b, bfloat16 *__restrict ws)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < {{ tq }}; t++)
+        AIE_LOOP_NO_UNROLL
+        for (int sb = 0; sb < 4; sb++) {
+            {{ p }}_p4w(b + {{ p }}_HW(t, 0) + 64 * sb, ws + sb * {{ 128 * tq }} + t * 32);
+            {{ p }}_p4w(b + {{ p }}_HW(t, 4) + 64 * sb, ws + {{ 128 * tq * nsb }} + sb * {{ 128 * tq }} + t * 32);
+        }
+}
+{% endif %}
+
+{% include "gemm/dq_tile_major" %}

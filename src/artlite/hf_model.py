@@ -400,8 +400,8 @@ class _Adapter:
             raise ValueError(f"{hf.path}: PARO linear {prefix} without {', '.join(sorted(missing)) or 'its fifth bits'}")
         q = hf._hf[f"{prefix}.qweight"]
         K, N = q.shape[0], q.shape[1] * 8
-        return _Entry(f"PARO{hf.paro_bits}", (N, K), q.shard, q.offset, sum(hf._hf[p].nbytes for p in parts),
-                      paro=prefix)
+        return _Entry(f"P{hf.paro_bits}_{hf.paro_group}", (N, K), q.shard, q.offset,
+                      sum(hf._hf[p].nbytes for p in parts), paro=prefix)
 
     def filter(self, name: str) -> str | None:
         """A language-model tensor's name as the tensor map knows it (None: skip the tensor)."""

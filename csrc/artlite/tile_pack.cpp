@@ -207,6 +207,48 @@ void tile_q4k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// P4_128 (awq.py, Q4_K's tile): the header words of a row [s | B = -s z | V hi | V lo] (bf16 pairs, a word per
+/// super-block each: 4 nsb words; V = s (8 - z) exact in fp32), then Q4_K's code words, from awq_rows' blocks.
+void tile_p4(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  const __m512i lo = load_idx(kQ4Lo), hi = load_idx(kQ4Hi);
+  const __m512i at0 = word_major_index(0, R), at1 = word_major_index(1, R);
+  const int nw = 4 * nsb;
+  uint32_t* hw = reinterpret_cast<uint32_t*>(t);
+  uint32_t* codes = hw + size_t(nw) * R;
+  auto bf = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+  };
+  auto val = [](uint16_t b) {
+    const uint32_t u = uint32_t(b) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  for (int r = 0; r < R; r++) {
+    uint16_t h[8 * kMaxNsb];  // the row's words: [s | B | V hi | V lo] x 2 nsb groups
+    const int g = 2 * nsb;
+    for (int sb = 0; sb < nsb; sb++) {
+      const uint8_t* b = src[r] + 144 * sb;
+      for (int j = 0; j < 2; j++) {
+        const uint16_t s = bf16_of(b + 2 * j);
+        const float sv = val(s), z = float(b[4 + j]), v = sv * (8.0f - z);
+        const uint16_t vh = bf(v);
+        h[2 * sb + j] = s;
+        h[g + 2 * sb + j] = bf(-sv * z);
+        h[2 * g + 2 * sb + j] = vh;
+        h[3 * g + 2 * sb + j] = bf(v - val(vh));
+      }
+      __m512i x0 = nibble_pairs(_mm512_loadu_si512(b + 16)), x1 = nibble_pairs(_mm512_loadu_si512(b + 80));
+      uint32_t* c = codes + size_t(sb) * 32 * R + r;
+      _mm512_i32scatter_epi32(c, at0, _mm512_permutex2var_epi8(x0, lo, x1), 4);
+      _mm512_i32scatter_epi32(c, at1, _mm512_permutex2var_epi8(x0, hi, x1), 4);
+    }
+    for (int w = 0; w < nw; w++) std::memcpy(hw + size_t(w) * R + r, h + 2 * w, 4);
+  }
+}
+
 /// Q5_K (q5k.py): [pair][row] 32-byte records [sc lo 2 x 4 | mn lo 2 x 4 | crumbs 2 x 4 | d 2 | -dmin 2], then
 /// [sb][plane: 4 low-nibble planes, the high bits][row] 32 bytes.
 void tile_q5k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -800,6 +842,8 @@ constexpr FormatInfo kFormats[] = {
      [](int R, int nsb) { return 4 * (q2k_header_words(nsb) + 16 * size_t(nsb)) * R; }, plain<tile_q6kh>},
     {TileFormat::Q4_1_64, "Q4_1_64", 160, false, false, [](int R, int nsb) { return 144 * size_t(nsb) * R; },
      plain<tile_q4_1_64>},
+    {TileFormat::P4_128, "P4_128", 144, true, false, [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; },
+     plain<tile_p4>},
     {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<false>>},
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },

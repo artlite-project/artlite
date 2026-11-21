@@ -213,6 +213,20 @@ def _q4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return y + x.fold(o)
 
 
+def _p4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (P4_128, ``formats.awq``: Q4_K's codes centered at 8, per sub-block c s (s of its 128-group, bf16, exact: no lo
+    # part); the offsets XS V, V = s (8 - z) exact in fp32 as bfp16 hi + lo blocks of a super-block's 8 sub-blocks)
+    q = f["q"].astype(np.float64)
+    R, K = q.shape
+    C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32)) - 8 * x.xs32[..., None]
+    s = _bf64(f["s"]).reshape(R, -1)
+    y = (x.csum(C) * np.repeat(s, 4, 1).T[None]).sum(1)
+    V = np.repeat(s * (8 - f["z"].astype(np.float64).reshape(R, -1)), 4, 1).astype(np.float32)
+    Vh = bfp16.values(V)
+    Vhl = Vh.astype(np.float64) + bfp16.values((V - Vh).astype(np.float32))
+    return y + x.fold(x.xs32 @ Vhl.T)
+
+
 def _q8(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     q = f["q"].astype(np.float64)
     R, K = q.shape
@@ -390,12 +404,12 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q4_1_64": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
          "IQ1_S": _iq1, "IQ1_M": _iq1, "IQ2_XXS": _iq2, "IQ2_XS": _iq2, "IQ2_S": _iq2, "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
-         "BFP16": _bfp16, "Q6_KH": _q6h}
+         "BFP16": _bfp16, "Q6_KH": _q6h, "P4_128": _p4}
 
 
 # (the formats with kernels of 8 slots)
 GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
-                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16", "Q6_KH")
+                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16", "Q6_KH", "P4_128")
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:

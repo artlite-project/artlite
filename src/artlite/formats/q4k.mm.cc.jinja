@@ -1,0 +1,51 @@
+{% from "artlite/formats/common.macros.cc.jinja" import store_chain with context %}
+// ---- The codes of a word-major Q4_K-shaped tile (Q4_K, P4_128: mmv/Q4_K, mmv/P4_128): [sb][i 8][s 4][row 16][4 B], a row's
+// word (s, i) its 8 consecutive k; per sub-block their sums against the x panels, centered at 8
+{% if slots == 8 %}
+// Pass 2: c_g,sb,i = bf16(C) -> c [sb][i][g][64]; C = -8 XS_i + sum_s X(sb, i, s) W_g(sb, s, i) (the unsigned codes,
+// centered; XS: the sums' hi and lo panels)
+{% else %}
+// Pass 2: c_g,sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][g][32]; C = -8 XS_i + sum_s X(sb, i, s) W_g(sb, s, i)
+// (the unsigned codes, centered)
+{% endif %}
+__attribute__((noinline)) void {{ p }}_q4k_mm(const uint8_t *__restrict xp, const uint8_t *__restrict xsum,
+                                              const uint8_t *__restrict w, bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    al::BIn<aie_dm_resource::d> xz((const bfp16ebs8 *)xsum);
+    const uint8_t __aie_dm_resource_b *__restrict pw = (const uint8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    AIE_LOOP_NO_UNROLL
+    for (int sb = 0; sb < 2; sb++) {
+        const v64bfp16ebs8 Z = xz.pop();
+{% if slots == 8 %}
+        const v64bfp16ebs8 ZL = xz.pop();
+{% endif %}
+        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int i = 0; i < 8; i++) {
+            const v64bfp16ebs8 N = {{ p }}_np(pn);
+            pn += 64;
+            const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
+{% if slots == 8 %}
+            v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+            v64accfloat C1 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
+{% else %}
+            v64accfloat C0 = mul_8x8_8x8T(Z, 1, N, 1);
+            v64accfloat C1 = mul_8x8_8x8T(Z, 1, N, 1);
+{% endif %}
+            C0 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw), 0, C0);  // (step s: the row groups' panels at 64 s, 64 s + 32)
+            C1 = mac_8x8_8x8T(x0, 1, {{ p }}_wu(pw + 32), 0, C1);
+            C0 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 64), 0, C0);
+            C1 = mac_8x8_8x8T(x1, 1, {{ p }}_wu(pw + 96), 0, C1);
+            C0 = mac_8x8_8x8T(x2, 1, {{ p }}_wu(pw + 128), 0, C0);
+            C1 = mac_8x8_8x8T(x2, 1, {{ p }}_wu(pw + 160), 0, C1);
+            C0 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 192), 0, C0);
+            C1 = mac_8x8_8x8T(x3, 1, {{ p }}_wu(pw + 224), 0, C1);
+            {{ store_chain(2, 64, 32) | indent(12) }}
+            pw += 256;
+            pc += {{ 2 * L }};
+        }
+    }
+}

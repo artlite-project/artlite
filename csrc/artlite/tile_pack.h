@@ -15,12 +15,13 @@ namespace artlite {
 /// F32 tensors).
 enum class TileFormat {
   Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, Q4_1, Q2_K, Q3_K, IQ3_XXS, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S, IQ4_NL,
-  IQ4_XS, Q6_KH, Q4_1_64, BFP16_BF16, BFP16_F16, BFP16_F32
+  IQ4_XS, Q6_KH, Q4_1_64, P4_128, BFP16_BF16, BFP16_F16, BFP16_F32
 };
 
 /// "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q8_0", "Q4_1", "Q2_K", "Q3_K", "IQ3_XXS", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
 /// "IQ2_S", "IQ3_S", "IQ4_NL", "IQ4_XS", "Q6_KH" (Q6_K's high plane, from Q6_K blocks), "Q4_1_64" (from Q4_1 blocks in
-/// equal pairs), "BFP16/BF16", "BFP16/F16", "BFP16/F32" -> the format (throws on others).
+/// equal pairs), "P4_128" (from awq_rows' blocks), "BFP16/BF16", "BFP16/F16", "BFP16/F32" -> the format (throws on
+/// others).
 TileFormat tile_format(std::string_view name);
 
 /// Bytes of a GGUF row per 256 columns of a format (its blocks; BF16 / F16: 512, F32: 1024).

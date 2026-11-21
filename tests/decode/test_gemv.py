@@ -4,6 +4,8 @@ format it reads: the C++ tile packer against the slots' ``pack_tile``, and the t
 scales)."""
 
 
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
@@ -12,9 +14,11 @@ from artlite import _native
 from artlite.decode import gemv
 from artlite.decode.image import pack_rows
 from artlite.formats import DERIVED, FORMATS, pack_tile, q4, q6h, slice_fields, tile_format
-from artlite.gguf_model import IQ4_VALUES, GGUFFile, QTensor
-from artlite.model_config import flint_gguf, gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
+from artlite.gguf_model import IQ4_VALUES, QTensor
+from artlite.hf_model import open_weights
+from artlite.model_config import checkpoint, flint_gguf, gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
+from artlite.paro import ParoTensor
 
 from ..model_files import require
 from ..numerics import bf16_round
@@ -154,6 +158,8 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         v = IQ4_VALUES[f["q"]].astype(np.float64)
         return per(f["d"], 32) * v if fmt == "IQ4_NL" else \
             per(f["d"], 256) * np.repeat(f["ls"].astype(np.float64) - 32, 32, 1) * v
+    if fmt == "P4_128":
+        return per(f["s"], 128) * (q - np.repeat(f["z"].astype(np.float64), 128, 1))
     if fmt == "Q6_KH":  # (Q6_K's fields: its high plane's weights, ``formats.q6h``)
         h = q6h.fields(f)
         return per(h["d"], 256) * np.repeat(h["sc"].astype(np.float64).reshape(q.shape[0], -1), 16, 1) * ((f["q"] >> 4) - 1.5)
@@ -193,10 +199,13 @@ GEMV = [
     ("IQ1_S", 9280, 4, ("random",), "IQ1_S"),  # (32 rows)
     ("IQ1_M", 9280, 4, ("random",), "IQ1_M"),
     ("Q4_1_64", 9216, 4, ("flint",), "blk.0.attn_q.weight"),
+    ("P4_128", 9216, 4, ("paro",), "blk.0.ffn_down.weight"),  # (Qwen3-0.6B-PARO: AWQ codes, integer zeros)
 ]
 
 
 def _path(key: tuple[str, ...]) -> str:
+    if key[0] == "paro":
+        return checkpoint("qwen3-0.6B-paro")
     if key[0] == "flint":
         return flint_gguf()
     if key[0] in ("occamy", "swift"):
@@ -229,13 +238,16 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
     else:
         path = _path(key)
         require(path)
-        t = GGUFFile(path).tensor(name)
+        t = open_weights(path).tensor(name)
     assert t.qtype == DERIVED[fmt] if fmt in DERIVED else tile_format(t.qtype) == fmt
     KC = 256 * NSB
     n_tiles = 3
     op = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, nsb=NSB, slots=slots)
     R = op.rows
-    t.rows, t.raw = n_tiles * R, t.raw[:n_tiles * R]
+    if isinstance(t, ParoTensor):
+        t = dataclasses.replace(t, rows=n_tiles * R, rows_of=np.arange(n_tiles * R))
+    else:
+        t.rows, t.raw = n_tiles * R, t.raw[:n_tiles * R]
     f = t.fields()
     rng = np.random.default_rng(0)
     # (the second K chunk)

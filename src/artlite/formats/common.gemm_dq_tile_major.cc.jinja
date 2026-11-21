@@ -23,7 +23,7 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
     const uint4 __aie_dm_resource_a *__restrict pb = (const uint4 __aie_dm_resource_a *)b;
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)stage);
     const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
-{% if fmt in ("Q4_1", "Q4_1_64", "Q4_K") %}
+{% if fmt in ("Q4_1", "Q4_1_64", "Q4_K", "P4_128") %}
     // w = d q + m = (128 + q) d + (m - 128 d), exact in fp32 (Q4_K: d = d sc, m = -dmin mn)
     const bfloat16 __aie_dm_resource_d *__restrict hm = (const bfloat16 __aie_dm_resource_d *)(hd + {{ 128 * tq * nsb }});
     const aie::vector<bfloat16, 64> k128 = aie::broadcast<bfloat16, 64>(-128.0f);
@@ -36,7 +36,7 @@ void {{ p }}_dq(const uint8_t *__restrict b, const bfloat16 *__restrict ws, uint
         aie::vector<bfloat16, 64> D0, D1;
         al::expand16_bc(aie::load_v<16>(hd), D0, D1);
         hd += 16;
-{% if fmt in ("Q4_1", "Q4_1_64", "Q4_K") %}
+{% if fmt in ("Q4_1", "Q4_1_64", "Q4_K", "P4_128") %}
         aie::vector<bfloat16, 64> M0, M1;
         al::expand16_bc(aie::load_v<16>(hm), M0, M1);
         hm += 16;

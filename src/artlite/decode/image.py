@@ -41,6 +41,7 @@ from .. import _native
 from ..formats import FORMATS, choose_tile_bytes, gu_tiles, has_tile_format, iq1, packs_from, slot, tile_format
 from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
+from ..paro import ParoTensor
 from .protocol import NX_PER_NORM, OBJ_K, POST_K
 
 PAD = 64 * 1024
@@ -260,10 +261,17 @@ class TileImage:
         self.slabs: list[Region] = []
         self._own: dict[str, QTensor] = {}  # (tensors a model substitutes: re-laid-out copies in memory)
         self._views: dict[str, QTensor] = {}  # (the file's tensors as rows of another width: ``view``)
+        self._chans: dict[str, np.ndarray] = {}  # (PARO linears: their K order, ``tensor``)
 
     def tensor(self, name: str) -> QTensor:
-        """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``)."""
-        return self._own.get(name) or self._views.get(name) or self.gguf.tensor(name)
+        """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``; a PARO linear with
+        its K in the image's order: ``paro_rows``)."""
+        t = self._own.get(name) or self._views.get(name) or self.gguf.tensor(name)
+        if isinstance(t, ParoTensor) and t.chan is None:
+            if name not in self._chans:
+                self._chans[name] = t.rot().tan_form().chan
+            t.chan = self._chans[name]
+        return t
 
     def view(self, name: str, row_sb: int) -> None:
         """The blocks read the file's tensor ``name`` as rows of row_sb super-blocks (a row of the file: several rows of
@@ -461,14 +469,29 @@ class TileImage:
         device buffer)."""
         assert out.dtype == np.uint8 and out.size >= self.nbytes
         blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
-        own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (tensors in memory of their own)
-        mapped = [x for x in blocks if x not in own]
+        paro = [x for x in blocks if any(isinstance(self.tensor(t), ParoTensor) for t in x[1].tensors)]
+        own = [x for x in blocks if set(x[1].tensors) & set(self._own) and not _member(x, paro)]  # (tensors in memory)
+        mapped = [x for x in blocks if not _member(x, own) and not _member(x, paro)]
         _pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
                     files=self.gguf.files)
         if own:
             _pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
+        for r, b in paro:  # (a block of PARO linears: transcoded into rows of blocks, packed, freed, block by block)
+            names = [t for t in b.tensors if t not in self._own]
+            self._own.update({t: self.paro_rows(t) for t in names})
+            _pack_tiles(out, self._native_blocks(r, b), threads=threads)
+            for t in names:
+                del self._own[t]
         self._fill_data(out)
         return any(r.data for r in self.regions)
+
+    def paro_rows(self, name: str) -> QTensor:
+        """A PARO linear's rows of blocks for the packer (``paro.ParoTensor.blocks``), its K in the storage order of its
+        rotation's tan form within each group (``paro.TanForm.chan``: the decode and the prefill hand the GEMMs x' in
+        that order)."""
+        t = self.tensor(name)
+        assert isinstance(t, ParoTensor)
+        return t.blocks()
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
         """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer), with
@@ -536,6 +559,11 @@ class NormedImage(TileImage):
         out = np.zeros((n, T), np.uint8)
         out[:, :b.shape[1]] = b
         return out
+
+
+def _member(x: tuple, xs: list[tuple]) -> bool:
+    """Whether the (region, block) x is one of xs (by identity)."""
+    return any(x[0] is r and x[1] is b for r, b in xs)
 
 
 def _native_format(fmt: str, tensors: list[QTensor]) -> str:

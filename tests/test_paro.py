@@ -1,11 +1,14 @@
 """PARO checkpoints on the host (``artlite.paro``, ``artlite.hf_model``): the AWQ and fifth-bit unpacking against a
 packer written here, a checkpoint's linears as ``ParoTensor`` (their fields, W_eff = W M^T against the rotation applied
 to rows), the tan form of the rounds against the exact transform (and with a norm's gamma folded into D_0) on every
-linear of a layer, the rows / groups in another order as index maps, the quantization_config checks (no NPU)."""
+linear of a layer, the rows / groups in another order as index maps, the quantization_config checks, the native
+transcode and P4_128 packer against the slot's tiles (no NPU)."""
 
 import numpy as np
 import pytest
 
+from artlite.decode.image import pack_rows
+from artlite.formats import pack_tile, slice_fields
 from artlite.hf_model import HfModel
 from artlite.model_config import checkpoint
 from artlite.paro import ParoTensor, Rotation, awq_unpack, bitplane_unpack, check_config
@@ -38,7 +41,7 @@ def random_paro(K: int, N: int, *, g: int = 128, bits: int = 4, seed: int = 0) -
     pairs = np.stack([np.concatenate([rng.permutation(g) for _ in range(K // g)]) for _ in range(8)])
     rot = Rotation(rng.uniform(-3, 3, (8, K // 2)), pairs, rng.uniform(-2, 2, K), g)
     hi = {"qweight_hi": bitplane_pack(q >> 4), "qzeros_hi": bitplane_pack(z >> 4)} if bits == 5 else {}
-    t = ParoTensor(name="w", qtype=f"PARO{bits}", rows=N, cols=K, raw=awq_pack(q & 15), qweight=awq_pack(q & 15),
+    t = ParoTensor(name="w", qtype=f"P{bits}_{g}", rows=N, cols=K, raw=awq_pack(q & 15), qweight=awq_pack(q & 15),
                    qzeros=awq_pack(z & 15), scales=s, group=g, rotation=rot, **hi)
     return t, {"q": q, "z": z, "s": s.astype(np.float32)}
 
@@ -68,7 +71,7 @@ def test_permuted() -> None:
 def _linears(case: str) -> tuple[HfModel, list[str]]:
     require(checkpoint(case))
     hf = HfModel(checkpoint(case))
-    return hf, [n for n, (_, q, _, _) in hf.tensor_info.items() if q.startswith("PARO") and n.startswith("blk.3.")]
+    return hf, [n for n, (_, q, _, _) in hf.tensor_info.items() if q.startswith("P4_") and n.startswith("blk.3.")]
 
 
 @pytest.mark.parametrize("case", ["qwen3-0.6B-paro", "qwen3.5-0.8B-paro"])
@@ -80,7 +83,7 @@ def test_checkpoint_linears(case: str) -> None:
     rng = np.random.default_rng(0)
     for n in names:
         t = hf.tensor(n)
-        assert isinstance(t, ParoTensor) and t.qtype == "PARO4" and t.group == 128
+        assert isinstance(t, ParoTensor) and t.qtype == "P4_128" and t.group == 128
         x = rng.standard_normal((4, t.cols))
         xr = t.rot().apply(x)
         y = xr @ t.dequantize().astype(np.float64).T
@@ -110,3 +113,18 @@ def test_config_checks() -> None:
     for qc in ({"bits": 3}, {"bits": 4, "group_size": 32}, {"bits": 5}, {"bits": 4, "format": "mxfp4"}):
         with pytest.raises(NotImplementedError):
             check_config("x", qc)
+
+
+def test_pack_native() -> None:
+    """``ParoTensor.blocks`` (``_native.awq_rows``) and the native packer give the slot's tiles (``formats.awq.pack``) of
+    the fields: rows, groups and each group's channels in another order, 3 K chunks."""
+    t, _ = random_paro(3072, 256, seed=2)
+    rng = np.random.default_rng(3)
+    t = ParoTensor(**{**t.__dict__, "rows": 48, "rows_of": rng.permutation(256)[:48], "groups_of": rng.permutation(24),
+                      "chan": np.concatenate([rng.permutation(128) for _ in range(24)])})
+    tiles = pack_rows([t.blocks()], np.arange(48), "P4_128", 16, 9216, 3, kc=1024)
+    f = t.fields()
+    for g in range(3):
+        for k in range(3):
+            fc = slice_fields(f, np.arange(16 * g, 16 * g + 16), k0=1024 * k, cols=t.cols, kc=1024)
+            assert np.array_equal(tiles[g, k], pack_tile("P4_128", fc, 9216)), (g, k)

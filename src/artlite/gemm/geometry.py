@@ -435,7 +435,7 @@ class Geometry:
         hb = 0 if units else FORMATS[fmt].header_bytes(rows, nsb)
         hdr_units = -(-hb // slice_bytes)
         hdr_skip = hdr_units * slice_bytes - hb
-        assert hdr_skip == 0 or (fmt in ("Q4_K", "Q4_0", "Q4_1_64") and nsb == 4) or is_planar, (fmt, nsb)
+        assert hdr_skip == 0 or (fmt in ("Q4_K", "Q4_0", "Q4_1_64", "P4_128") and nsb == 4) or is_planar, (fmt, nsb)
         # Gemma's 512-column Q4_0 tiles of 32 rows (a 1 KB header, a quarter of a slice): a header unit holds the
         # headers of up to ``hg`` = 4 consecutive K chunks of a row tile ([chunk][1 KB], ``hdr_groups``), so the fills
         # read the tiles' bytes once (a slice-sized unit per chunk from hdr_skip before the tile: 1.33x; gate / up at

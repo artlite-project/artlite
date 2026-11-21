@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "artlite/awq_rows.h"
 #include "artlite/error.h"
 #include "artlite/slot_pack.h"
 #include "artlite/tile_pack.h"
@@ -95,6 +96,55 @@ void bind_pack(nb::module_& m) {
       "packer's own, read into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping "
       "stays untouched), any other as the memory it is; "
       "iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), which IQ1_S blocks need.");
+
+  m.def(
+      "awq_rows",
+      [](nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> out,
+         nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> qweight,
+         nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> qzeros,
+         nb::ndarray<const uint16_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> scales, int group,
+         std::optional<nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> chan,
+         std::optional<nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> rows_of,
+         std::optional<nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> groups_of,
+         unsigned threads) {
+        artlite::AwqSource s;
+        s.qweight = qweight.data();
+        s.qzeros = qzeros.data();
+        s.scales = scales.data();
+        s.K = static_cast<int64_t>(qweight.shape(0));
+        s.N = static_cast<int64_t>(qweight.shape(1)) * 8;
+        s.group = group;
+        const int64_t G = group > 0 ? s.K / group : 0;
+        const int64_t n = rows_of ? static_cast<int64_t>(rows_of->shape(0)) : s.N;
+        if (qzeros.shape(0) != size_t(G) || qzeros.shape(1) != qweight.shape(1) || scales.shape(0) != size_t(G) ||
+            scales.shape(1) != size_t(s.N) || (chan && chan->shape(0) != size_t(s.K)) ||
+            (groups_of && groups_of->shape(0) != size_t(G)) || out.shape(0) != size_t(n) ||
+            out.shape(1) != size_t(s.K / 256) * artlite::kAwqBlockBytes)
+          throw artlite::Error("awq_rows: inconsistent shapes");
+        if (chan) s.chan = chan->data();
+        if (rows_of) {
+          s.rows_of = rows_of->data();
+          s.n_rows = n;
+          for (int64_t i = 0; i < n; i++)
+            if (s.rows_of[i] < 0 || s.rows_of[i] >= s.N) throw artlite::Error("awq_rows: a row outside the linear");
+        }
+        if (groups_of) {
+          s.groups_of = groups_of->data();
+          for (int64_t i = 0; i < G; i++)
+            if (s.groups_of[i] < 0 || s.groups_of[i] >= G) throw artlite::Error("awq_rows: a group outside the linear");
+        }
+        if (chan)
+          for (int64_t i = 0; i < s.K; i++)
+            if (s.chan[i] < 0 || s.chan[i] >= group) throw artlite::Error("awq_rows: a channel outside its group");
+        nb::gil_scoped_release release_gil;
+        artlite::awq_rows(out.data(), s, threads);
+      },
+      "out"_a, "qweight"_a, "qzeros"_a, "scales"_a, "group"_a, "chan"_a = nb::none(), "rows_of"_a = nb::none(),
+      "groups_of"_a = nb::none(), "threads"_a = 0,
+      "An AWQ linear (artlite.paro.ParoTensor: qweight (K, N / 8) int32, qzeros (K / group, N / 8) int32, scales "
+      "(K / group, N) fp16 bits) as rows of P4_128 blocks (artlite::awq_rows) into out (rows, K / 256 * 144): its rows "
+      "(rows_of: the columns of these rows), groups (groups_of) and each group's channels (chan: K group-local "
+      "indices, the storage order of the rows' codes) in another order; threads: 0 = one per physical core.");
 
   m.def(
       "pack_slots",

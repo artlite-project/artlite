@@ -141,7 +141,8 @@ class TanForm:
 
 @dataclass
 class ParoTensor(QTensor):
-    """A PARO linear in GGUF orientation (``QTensor``: rows = N, cols = K; ``qtype`` "PARO4" / "PARO5"; ``raw``: its
+    """A PARO linear in GGUF orientation (``QTensor``: rows = N, cols = K; ``qtype`` its tile format, "P4_128",
+    "P4_64", "P5_128": bits and group size; ``raw``: its
     ``qweight`` as stored) with the checkpoint's arrays (``qweight``, ``qzeros``, ``scales``, int5's ``qweight_hi`` /
     ``qzeros_hi``), ``group`` its group size, its ``rotation`` (shared with the linears that share it), and the order of
     its rows (``rows_of``: output n is checkpoint column rows_of[n]) and groups (``groups_of``: group G is checkpoint
@@ -156,6 +157,7 @@ class ParoTensor(QTensor):
     qzeros_hi: np.ndarray | None = None
     rows_of: np.ndarray | None = None
     groups_of: np.ndarray | None = None
+    chan: np.ndarray | None = None  # (K,) group-local: position p of group G holds channel chan[G g + p] (``TanForm``)
 
     @property
     def bits(self) -> int:
@@ -181,7 +183,23 @@ class ParoTensor(QTensor):
             q, z, s = q[k], z[self.groups_of], s[self.groups_of]
         if self.rows_of is not None:
             q, z, s = q[:, self.rows_of], z[:, self.rows_of], s[:, self.rows_of]
+        if self.chan is not None:
+            q = q[np.arange(self.cols) // self.group * self.group + np.asarray(self.chan, np.int64)]
         return {"q": np.ascontiguousarray(q.T), "z": np.ascontiguousarray(z.T), "s": np.ascontiguousarray(s.T)}
+
+    def blocks(self, *, threads: int = 0) -> QTensor:
+        """The linear as rows of P4_128 blocks (``_native.awq_rows``: a QTensor the tile packer takes, (rows, K / 256 *
+        144) uint8 in memory: its rows, groups and channel order as this tensor's)."""
+        from . import _native
+
+        assert self.bits == 4 and self.group == 128, (self.bits, self.group)
+        out = np.empty((self.rows, self.cols // 256 * 144), np.uint8)
+        _native.awq_rows(out, np.ascontiguousarray(self.qweight), np.ascontiguousarray(self.qzeros),
+                         np.ascontiguousarray(self.scales).view(np.uint16), self.group,
+                         None if self.chan is None else np.ascontiguousarray(self.chan, np.int32),
+                         None if self.rows_of is None else np.ascontiguousarray(self.rows_of, np.int64),
+                         None if self.groups_of is None else np.ascontiguousarray(self.groups_of, np.int64), threads)
+        return QTensor(name=self.name, qtype=self.qtype, rows=self.rows, cols=self.cols, raw=out)
 
     def dequantize(self) -> np.ndarray:
         """W (rows, cols) fp32 = s (q - z): the quantized weight (its input transform not applied: ``effective``)."""
