@@ -25,23 +25,31 @@ from .common import (
 
 # GemmQd: the 6-bit scale expansion (the shared plane8) and the planar kernels
 _GEMM = templating.source("artlite/formats/q5k.gemm.cc.jinja")
+# its expansion and dequant (P5_128's too: ``formats.awq``)
+_DQ = templating.source("artlite/formats/q5k.dq.cc.jinja")
 
 
 # the decode GEMV (``decode.gemv``)
 _MMV = templating.source("artlite/formats/q5k.mmv.cc.jinja")
 
 
+def q5k_codes(q: np.ndarray, R: int, nsb: int) -> np.ndarray:
+    """Code planes [sb][plane 5][row][32 B] of 5-bit codes q (R, 256 nsb): the low nibbles of step s (plane s), then qh
+    (nibble of lane l: bit s = the high bit of step s)."""
+    p = q[:, _word_order(nsb)].reshape(R, nsb, 4, 64)  # [row][sb][s][lane]
+    ql = _nibbles((p & 15).reshape(R, -1)).reshape(R, nsb, 4, 32)
+    hb = (p >> 4).astype(np.uint8)
+    qh = _nibbles((hb[:, :, 0] | hb[:, :, 1] << 1 | hb[:, :, 2] << 2 | hb[:, :, 3] << 3).reshape(R, -1))
+    return np.concatenate([ql, qh.reshape(R, nsb, 1, 32)], axis=2).transpose(1, 2, 0, 3)
+
+
 class Q5KSlot(Slot):
     formats = (TileFormat("Q5_K", 6, 176, 16, 1, 160, 16, planes=5, plane_major=True, ws_planes=2,
                           dq_row_cycles=10.5, mmv="q5k"),)
-    sources: ClassVar[dict[str, str]] = {"gemm/Q5_K": _GEMM, "mmv/Q5_K": _MMV}
+    sources: ClassVar[dict[str, str]] = {"gemm/Q5_K": _GEMM, "gemm/q5k_dq": _DQ, "mmv/Q5_K": _MMV}
 
     def pack(self, fmt: str, f: dict[str, np.ndarray], R: int, nsb: int) -> list[np.ndarray]:
-        p = f["q"][:, _word_order(nsb)].reshape(R, nsb, 4, 64)  # [row][sb][s][lane]
-        ql = _nibbles((p & 15).reshape(R, -1)).reshape(R, nsb, 4, 32)
-        hb = (p >> 4).astype(np.uint8)
-        qh = _nibbles((hb[:, :, 0] | hb[:, :, 1] << 1 | hb[:, :, 2] << 2 | hb[:, :, 3] << 3).reshape(R, -1))
-        codes = np.concatenate([ql, qh.reshape(R, nsb, 1, 32)], axis=2).transpose(1, 2, 0, 3)  # [sb][plane][row][32]
+        codes = q5k_codes(f["q"], R, nsb)
         sc, mn = f["sc"].reshape(R, nsb, 8), f["mn"].reshape(R, nsb, 8)
 
         def lo(v: np.ndarray) -> np.ndarray:  # the low nibbles: [row][pair][sb][4 B]

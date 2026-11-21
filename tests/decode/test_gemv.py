@@ -158,7 +158,7 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         v = IQ4_VALUES[f["q"]].astype(np.float64)
         return per(f["d"], 32) * v if fmt == "IQ4_NL" else \
             per(f["d"], 256) * np.repeat(f["ls"].astype(np.float64) - 32, 32, 1) * v
-    if fmt == "P4_128":
+    if fmt in ("P4_128", "P5_128"):
         return per(f["s"], 128) * (q - np.repeat(f["z"].astype(np.float64), 128, 1))
     if fmt == "Q6_KH":  # (Q6_K's fields: its high plane's weights, ``formats.q6h``)
         h = q6h.fields(f)
@@ -200,12 +200,13 @@ GEMV = [
     ("IQ1_M", 9280, 4, ("random",), "IQ1_M"),
     ("Q4_1_64", 9216, 4, ("flint",), "blk.0.attn_q.weight"),
     ("P4_128", 9216, 4, ("paro",), "blk.0.ffn_down.weight"),  # (Qwen3-0.6B-PARO: AWQ codes, integer zeros)
+    ("P5_128", 9280, 4, ("paro5",), "blk.0.ffn_down.weight"),  # (Qwen3.8-27B-PARO-int5: 13 rows)
 ]
 
 
 def _path(key: tuple[str, ...]) -> str:
-    if key[0] == "paro":
-        return checkpoint("qwen3-0.6B-paro")
+    if key[0] in ("paro", "paro5"):
+        return checkpoint("qwen3-0.6B-paro" if key[0] == "paro" else "qwen3.8-27B-paro-int5")
     if key[0] == "flint":
         return flint_gguf()
     if key[0] in ("occamy", "swift"):

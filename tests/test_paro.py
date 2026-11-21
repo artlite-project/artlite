@@ -115,16 +115,18 @@ def test_config_checks() -> None:
             check_config("x", qc)
 
 
-def test_pack_native() -> None:
-    """``ParoTensor.blocks`` (``_native.awq_rows``) and the native packer give the slot's tiles (``formats.awq.pack``) of
-    the fields: rows, groups and each group's channels in another order, 3 K chunks."""
-    t, _ = random_paro(3072, 256, seed=2)
+@pytest.mark.parametrize("bits", [4, 5])
+def test_pack_native(bits: int) -> None:
+    """``ParoTensor.blocks`` (``_native.awq_rows``) and the native packer give the slot's tiles (``formats.awq.pack``:
+    P4_128, int5 P5_128) of the fields: rows, groups and each group's channels in another order, 3 K chunks."""
+    t, _ = random_paro(3072, 256, bits=bits, seed=2)
     rng = np.random.default_rng(3)
     t = ParoTensor(**{**t.__dict__, "rows": 48, "rows_of": rng.permutation(256)[:48], "groups_of": rng.permutation(24),
                       "chan": np.concatenate([rng.permutation(128) for _ in range(24)])})
-    tiles = pack_rows([t.blocks()], np.arange(48), "P4_128", 16, 9216, 3, kc=1024)
+    fmt, S = t.qtype, 9216 if bits == 4 else 11264
+    tiles = pack_rows([t.blocks()], np.arange(48), fmt, 16, S, 3, kc=1024)
     f = t.fields()
     for g in range(3):
         for k in range(3):
             fc = slice_fields(f, np.arange(16 * g, 16 * g + 16), k0=1024 * k, cols=t.cols, kc=1024)
-            assert np.array_equal(tiles[g, k], pack_tile("P4_128", fc, 9216)), (g, k)
+            assert np.array_equal(tiles[g, k], pack_tile(fmt, fc, S)), (g, k)

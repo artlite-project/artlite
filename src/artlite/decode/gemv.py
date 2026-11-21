@@ -67,7 +67,7 @@ def scr_bytes(slots: int = SLOTS) -> int:
     return SCR_BYTES if slots == 4 else 9216
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
 RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS", "Q8_0", "Q4_1_64")  # (``render(rg=)``) the formats of row-group tiles
-NZ_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q4_K", "Q5_K", "Q6_K", "P4_128")  # the formats whose kernels read the -z e_i panels (``_nz``)
+NZ_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q4_K", "Q5_K", "Q6_K", "P4_128", "P5_128")  # the formats whose kernels read the -z e_i panels (``_nz``)
 
 
 def supported(fmt: str, nsb: int, slots: int = SLOTS) -> bool:

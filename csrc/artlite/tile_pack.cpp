@@ -287,6 +287,52 @@ void tile_q5k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// P5_128 (awq.py, Q5_K's tile): [pair][row] 32-byte records of the AWQ words [s (2 p) | s (2 p + 1) | B = -s z (..) |
+/// V hi (..) | V lo (..)] (bf16 pairs; V = s (16 - z) exact in fp32), then Q5_K's code planes, from awq_rows' 176-byte
+/// blocks (the codes at a Q5_K block's offsets: qh at 16, the nibbles at 48).
+void tile_p5(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  const __m512i lo = load_idx(kQ4Lo), hi = load_idx(kQ4Hi);
+  const __m256i gather = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kQ5Gather.data()));
+  const __m256i order = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kQ5Out.data()));
+  const __m256i ident = _mm256_set1_epi64x(0x8040201008040201);
+  uint8_t* codes = t + 16 * nsb * R;
+  auto bf = [](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return static_cast<uint16_t>((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+  };
+  auto val = [](uint16_t b) {
+    const uint32_t u = uint32_t(b) << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  for (int r = 0; r < R; r++) {
+    for (int sb = 0; sb < nsb; sb++) {
+      const uint8_t* b = src[r] + 176 * sb;
+      uint8_t* rec = t + (size_t(sb / 2) * R + r) * 32 + 4 * (sb & 1);  // (word 2 field + sb % 2)
+      for (int j = 0; j < 2; j++) {
+        const uint16_t s = bf16_of(b + 2 * j);
+        const float sv = val(s), z = float(b[4 + j]), v = sv * (16.0f - z);
+        const uint16_t vh = bf(v);
+        put16(rec + 2 * j, s);
+        put16(rec + 8 + 2 * j, bf(-sv * z));
+        put16(rec + 16 + 2 * j, vh);
+        put16(rec + 24 + 2 * j, bf(v - val(vh)));
+      }
+      __m512i x0 = nibble_pairs(_mm512_loadu_si512(b + 48)), x1 = nibble_pairs(_mm512_loadu_si512(b + 112));
+      __m512i p01 = _mm512_permutex2var_epi8(x0, lo, x1), p23 = _mm512_permutex2var_epi8(x0, hi, x1);
+      auto plane = [&](int p) { return reinterpret_cast<__m256i*>(codes + ((size_t(sb) * 5 + p) * R + r) * 32); };
+      _mm256_storeu_si256(plane(0), _mm512_castsi512_si256(p01));
+      _mm256_storeu_si256(plane(1), _mm512_extracti64x4_epi64(p01, 1));
+      _mm256_storeu_si256(plane(2), _mm512_castsi512_si256(p23));
+      _mm256_storeu_si256(plane(3), _mm512_extracti64x4_epi64(p23, 1));
+      __m256i m = _mm256_permutexvar_epi8(gather, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 16)));
+      _mm256_storeu_si256(plane(4), _mm256_permutexvar_epi8(order, _mm256_gf2p8affine_epi64_epi8(ident, m, 0)));
+    }
+  }
+}
+
 /// Q6_K (q6k.py): [row][sb] bf16 d (padded to 32 bytes), [pair][row] 32-byte scale planes ([sb % 2][h][i] = sc[2 i +
 /// h]), then [half super-block 2 sb + h][plane: low-nibble planes s = 2 h, 2 h + 1, the high crumbs][row] 32 bytes.
 void tile_q6k(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -844,6 +890,7 @@ constexpr FormatInfo kFormats[] = {
      plain<tile_q4_1_64>},
     {TileFormat::P4_128, "P4_128", 144, true, false, [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; },
      plain<tile_p4>},
+    {TileFormat::P5_128, "P5_128", 176, true, false, [](int R, int nsb) { return 176 * size_t(nsb) * R; }, plain<tile_p5>},
     {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<false>>},
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },

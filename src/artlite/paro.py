@@ -262,17 +262,20 @@ class ParoTensor(QTensor):
         return {"q": np.ascontiguousarray(q.T), "z": np.ascontiguousarray(z.T), "s": np.ascontiguousarray(s.T)}
 
     def blocks(self, *, threads: int = 0) -> QTensor:
-        """The linear as rows of P4_128 blocks (``_native.awq_rows``: a QTensor the tile packer takes, (rows, K / 256 *
-        144) uint8 in memory: its rows, groups and channel order as this tensor's)."""
+        """The linear as rows of P4_128 blocks (int5: P5_128; ``_native.awq_rows``: a QTensor the tile packer takes,
+        (rows, K / 256 * 144, or 176) uint8 in memory: its rows, groups and channel order as this tensor's)."""
         from . import _native
 
-        assert self.bits == 4 and self.group == 128, (self.bits, self.group)
-        out = np.empty((self.rows, self.cols // 256 * 144), np.uint8)
+        assert self.group == 128, self.group
+        five = self.bits == 5
+        out = np.empty((self.rows, self.cols // 256 * (176 if five else 144)), np.uint8)
         _native.awq_rows(out, np.ascontiguousarray(self.qweight), np.ascontiguousarray(self.qzeros),
                          np.ascontiguousarray(self.scales).view(np.uint16), self.group,
                          None if self.chan is None else np.ascontiguousarray(self.chan, np.int32),
                          None if self.rows_of is None else np.ascontiguousarray(self.rows_of, np.int64),
-                         None if self.groups_of is None else np.ascontiguousarray(self.groups_of, np.int64), threads)
+                         None if self.groups_of is None else np.ascontiguousarray(self.groups_of, np.int64),
+                         np.ascontiguousarray(self.qweight_hi) if five else None,
+                         np.ascontiguousarray(self.qzeros_hi) if five else None, threads)
         return QTensor(name=self.name, qtype=self.qtype, rows=self.rows, cols=self.cols, raw=out)
 
     def dequantize(self) -> np.ndarray:

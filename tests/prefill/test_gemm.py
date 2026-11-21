@@ -3,7 +3,7 @@ qwen35's ``QwenImage``, Gemma 4's ``GemmaImage``: slices of a few layers, read i
 model's prefill plans them, with random bfp16 activations, against the dequantized GGUF rows: input projections at
 their column-slice layout, output projections at d_pitch (K parts: the parts' sum), gate/up's act(gate) up panels.
 The files cover the tile formats: Q4_K (tile-major GemmQ), Q5_K / Q6_K (planar GemmQd, 13 / 11 / 12-row tiles), Q4_0 /
-Q4_1 (planar at 1024 columns; Gemma's at 512), Q4_1_64 (tile-major: Flint's), P4_128 (tile-major: Qwen3-0.6B-PARO's), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
+Q4_1 (planar at 1024 columns; Gemma's at 512), Q4_1_64 (tile-major: Flint's), P4_128 (tile-major: Qwen3-0.6B-PARO's), P5_128 (planar: Qwen3.8-27B-PARO-int5's, 13-row tiles), Q2_K / Q3_K (word-major planar), BFP16 (tile-major, 8-row tiles of a BF16
 file), Q8_0 (super-block units: Occamy's GDN z; vllm-d3's d3-lite: GDN in, attn in, gate/up in half groups, down; Gemma's
 16-row copy of the per-layer projection), F32 rows as BFP16 plane pairs (Occamy's GDN alpha: fp32 sums); LFM3's conv layers'
 in / out and its qkv with a gate block of one tile (two rows a column). The GEMMs
@@ -102,7 +102,10 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("flint", "int4", "", (0, 2), 0, "gate_up", 256), ("flint", "int4", "", (0, 2), 0, "down", 256),
          # P4_128 (a PARO checkpoint's linears: tile-major GemmQ, the K of each group in its rotation's storage order)
          ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "qkv", 64), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "gate_up", 256),
-         ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "down", 256), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "o", 64)]
+         ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "down", 256), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "o", 64),
+         # P5_128 (int5: GemmQd, Q5_K's dequant; 13-row tiles of a qwen35 image): Qwen3.8-27B-PARO-int5's
+         ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gin_q", 256), ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gdn_out", 256),
+         ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gate", 128), ("qwen35-paro5", "P5_128", "27B", (0, 3), 3, "down", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -121,7 +124,8 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             "gemma4": lambda: gemma_gguf(quant), "occamy": occamy_gguf, "d3-lite": decision_gguf, "swift": swift_gguf,
             "kev": lambda: decision_gguf("kev"), "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
             "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski"),
-            "flint": lambda: flint_gguf(quant), "qwen3-paro": lambda: checkpoint("qwen3-0.6B-paro")}[base]()
+            "flint": lambda: flint_gguf(quant), "qwen3-paro": lambda: checkpoint("qwen3-0.6B-paro"),
+            "qwen35-paro5": lambda: checkpoint("qwen3.8-27B-paro-int5")}[base]()
     require(path)
     key = (path, layers, model)
     if key not in _images:
@@ -130,7 +134,7 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
         layout = {"tails": model != base}
         if base in ("llama", "qwen3", "qwen3-paro"):
             from models.llama.image import LlamaImage as Image
-        elif base in ("qwen35", "occamy", "d3-lite", "swift", "kev"):
+        elif base in ("qwen35", "occamy", "d3-lite", "swift", "kev", "qwen35-paro5"):
             from models.qwen35.image import QwenImage as Image
         elif base == "lfm":
             from models.lfm.image import LfmImage as Image

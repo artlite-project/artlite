@@ -106,6 +106,8 @@ void bind_pack(nb::module_& m) {
          std::optional<nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> chan,
          std::optional<nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> rows_of,
          std::optional<nb::ndarray<const int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> groups_of,
+         std::optional<nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>> qweight_hi,
+         std::optional<nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>> qzeros_hi,
          unsigned threads) {
         artlite::AwqSource s;
         s.qweight = qweight.data();
@@ -119,8 +121,15 @@ void bind_pack(nb::module_& m) {
         if (qzeros.shape(0) != size_t(G) || qzeros.shape(1) != qweight.shape(1) || scales.shape(0) != size_t(G) ||
             scales.shape(1) != size_t(s.N) || (chan && chan->shape(0) != size_t(s.K)) ||
             (groups_of && groups_of->shape(0) != size_t(G)) || out.shape(0) != size_t(n) ||
-            out.shape(1) != size_t(s.K / 256) * artlite::kAwqBlockBytes)
+            out.shape(1) != size_t(s.K / 256) * (qweight_hi ? artlite::kAwq5BlockBytes : artlite::kAwqBlockBytes) ||
+            !qweight_hi != !qzeros_hi ||
+            (qweight_hi && (qweight_hi->shape(0) != size_t(s.K) || qweight_hi->shape(1) != size_t(s.N / 32) ||
+                            qzeros_hi->shape(0) != size_t(G) || qzeros_hi->shape(1) != size_t(s.N / 32))))
           throw artlite::Error("awq_rows: inconsistent shapes");
+        if (qweight_hi) {
+          s.qweight_hi = qweight_hi->data();
+          s.qzeros_hi = qzeros_hi->data();
+        }
         if (chan) s.chan = chan->data();
         if (rows_of) {
           s.rows_of = rows_of->data();
@@ -140,9 +149,10 @@ void bind_pack(nb::module_& m) {
         artlite::awq_rows(out.data(), s, threads);
       },
       "out"_a, "qweight"_a, "qzeros"_a, "scales"_a, "group"_a, "chan"_a = nb::none(), "rows_of"_a = nb::none(),
-      "groups_of"_a = nb::none(), "threads"_a = 0,
+      "groups_of"_a = nb::none(), "qweight_hi"_a = nb::none(), "qzeros_hi"_a = nb::none(), "threads"_a = 0,
       "An AWQ linear (artlite.paro.ParoTensor: qweight (K, N / 8) int32, qzeros (K / group, N / 8) int32, scales "
-      "(K / group, N) fp16 bits) as rows of P4_128 blocks (artlite::awq_rows) into out (rows, K / 256 * 144): its rows "
+      "(K / group, N) fp16 bits; int5: qweight_hi (K, N / 32), qzeros_hi (K / group, N / 32) int32, the fifth bits) as "
+      "rows of P4_128 blocks (int5: P5_128; artlite::awq_rows) into out (rows, K / 256 * 144, or 176): its rows "
       "(rows_of: the columns of these rows), groups (groups_of) and each group's channels (chan: K group-local "
       "indices, the storage order of the rows' codes) in another order; threads: 0 = one per physical core.");
 

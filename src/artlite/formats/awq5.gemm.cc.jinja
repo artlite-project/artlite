@@ -1,0 +1,30 @@
+// P5_128 (GemmQd, formats.awq): Q5_K's weight objects and header unit (gemm/Q5_K), the scale records holding the AWQ
+// words: of a plane, word w in slot w / 2, word w % 2: s (sb % 2), B = bf16(-s z) (2 + sb % 2), V hi, V lo (the
+// decode's), each the bf16 pair of the super-block's groups 0, 1 (128 k each).
+void {{ p }}_hcp(const bfloat16 *__restrict b, bfloat16 *__restrict hb, int32_t kt)
+{
+    const bfloat16 *s = b + {{ 4 * hp0 * n }};  // (before the call: al::copy)
+    al::copy<{{ 2 * hs }}, 32>(hb + {{ 2 * hs }} * kt, s);
+}
+
+// super-block sb's words of the pass's rows: ws [16-row block][A | B][group i 8][row 16] = s, B of the 128-group of
+// 32-k group i (zero for the padding rows, whose words are zero)
+void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int32_t sb)
+{
+{% if "hdr" in ablate %}
+    return;
+{% endif %}
+    const uint32_t *__restrict w = hb + 2 * ({{ 5 - nsb // 2 - hp0 }} + (sb >> 1)) * {{ n }} + (sb & 1) * {{ n }};
+    AIE_LOOP_NO_UNROLL
+    for (int g = 0; g < {{ n }}; g += 16) {
+        AIE_LOOP_UNROLL_FULL
+        for (int k = 0; k < 2; k++) {  // (A = s: slot 0; B: slot 1)
+            const aie::vector<bfloat16, 32> v = aie::vector_cast<bfloat16>(aie::load_v<16>(w + {{ hs }} * k + g));
+            const aie::vector<bfloat16, 16> e = aie::filter_even(v, 1), d = aie::filter_odd(v, 1);  // (groups 0, 1)
+            aie::store_v(ws + 16 * g + 128 * k, aie::concat(e, e, e, e));
+            aie::store_v(ws + 16 * g + 128 * k + 64, aie::concat(d, d, d, d));
+        }
+    }
+}
+
+{% include "gemm/q5k_dq" %}

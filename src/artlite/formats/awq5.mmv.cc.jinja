@@ -1,0 +1,74 @@
+// ---- P5_128 (formats.awq; R = {{ R5 }} rows): Q5_K's tile, its scale records [pair 2][row R][8 words] holding the
+// AWQ words s (2 p), s (2 p + 1), B (2 p), B (2 p + 1), V hi (2 p), (2 p + 1), V lo (2 p), (2 p + 1) (V = s (16 - z)),
+// each the bf16 pair of the super-block's groups 0, 1 (128 k each); codes as Q5_K's (mmv/Q5_K's passes, centered at 16).
+// w = s (q - 16) + V. Scratch as Q5_K's: the codes (4 KB) | tab [g][hl][i][r] | c [i][g][32]
+
+// a word panel's 8 rows (lanes 0 .. 7: the bf16 pair [group 0 | group 1]) -> [r][i 8]: group j's value in its
+// sub-blocks 4 j .. 4 j + 3
+[[clang::always_inline]] inline aie::vector<bfloat16, 64> {{ p }}_p5x(v16int32 o)
+{
+    const aie::vector<bfloat16, 16> v = aie::vector_cast<bfloat16>(aie::vector<int32, 16>(o)).template extract<16>(0);
+    const auto [a, b] = aie::interleave_zip(v, v, 1);
+    const aie::vector<bfloat16, 32> c = aie::concat(a, b);
+    const auto [d, e] = aie::interleave_zip(c, c, 1);
+    return aie::concat(d, e);
+}
+
+// Pass 2: the table (s [i][r], lo 0) of super-block sb -> tab [g][hl][i][r]; y[g] += the offsets XS V (V [r][i] = hi +
+// lo words, exact in fp32, as bfp16 hi + lo panels against the 32-k sum panels)
+__attribute__((noinline)) void {{ p }}_p5_tab(const uint8_t *__restrict a, const uint8_t *__restrict xs,
+                                              bfloat16 *__restrict tab, float *__restrict y, int sb)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int sbl = sb & 1;
+    const al::BV nI = al::neg_eye();
+    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);
+    al::BIn<> xsp((const bfp16ebs8 *)xs);  // (the pair's slot: the panel of sb is the (sbl + 1)-th; 8 slots: its hi, lo)
+{% if slots == 8 %}
+    v64bfp16ebs8 X = xsp.pop(), XL = xsp.pop();
+    if (sbl) {
+        X = xsp.pop();
+        XL = xsp.pop();
+    }
+{% else %}
+    v64bfp16ebs8 X = xsp.pop();
+    if (sbl)
+        X = xsp.pop();
+{% endif %}
+    AIE_LOOP_NO_UNROLL
+    for (int g = 0; g < 2; g++) {
+        v16int32 o0, o1, o2, o3;  // word panels of the pair's records, rows 8 g ..: [s | s], [B | B], [V hi | V hi], ..
+        {{ p }}_tr8<32>(a + {{ 32 * R5 }} * (sb >> 1) + 256 * g, o0, o1, o2, o3);
+        o0 = shift_bytes(o0, o0, 32 * sbl);  // (the words of sb: of each pair the first or the second)
+        o2 = shift_bytes(o2, o2, 32 * sbl);
+        o3 = shift_bytes(o3, o3, 32 * sbl);
+        aie::store_v(tab + 128 * g, aie::transpose({{ p }}_p5x(o0), 8, 8));
+        aie::store_v(tab + 128 * g + 64, aie::zeros<bfloat16, 64>());
+        al::BV hi, lo;
+        al::split_hilo(aie::mac(aie::mul({{ p }}_p5x(o2), one), {{ p }}_p5x(o3), one), nI, hi, lo);
+{% if slots == 8 %}
+        const aie::accum<accfloat, 64> Y(mac_8x8_8x8T(XL, 1, lo, 1, mac_8x8_8x8T(XL, 1, hi, 1, mac_8x8_8x8T(X, 1, lo, 1, mul_8x8_8x8T(X, 1, hi, 1)))));
+        {{ p }}_yadd8(y + 64 * g, Y);
+{% else %}
+        const aie::accum<accfloat, 64> Y(mac_8x8_8x8T(X, 1, lo, 1, mul_8x8_8x8T(X, 1, hi, 1)));
+        {{ p }}_yadd(y + 32 * g, Y);
+{% endif %}
+    }
+}
+
+// super-blocks 2 HI, 2 HI + 1 of a P5_128 tile
+template <int HI>
+__attribute__((noinline)) void {{ p }}_p5(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                          float *__restrict y, uint8_t *__restrict scr)
+{
+    bfloat16 *__restrict tab = (bfloat16 *)(scr + 4096);  // [g][hl][i][r]
+    bfloat16 *__restrict c = (bfloat16 *)(scr + 4608);  // [i][g][32]
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        const int sb = 2 * HI + u;
+        {{ p }}_q5k_tr(a + {{ q5_codes }} + {{ 5 * 32 * R5 }} * sb, scr);
+        {{ p }}_p5_tab(a, xs + {{ XS_SLOT }} * HI, tab, y, sb);
+        {{ p }}_q5k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * HI, scr, c, u);
+        {{ p }}_sc(c, tab, y, 128, 8, {{ 2 * L }});
+    }
+}

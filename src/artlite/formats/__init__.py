@@ -3,7 +3,7 @@ slots.
 
 A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1 / Q4_1_64, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
 (of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0), ``iq1`` (IQ1_S, IQ1_M), ``iq2`` (IQ2_XXS, IQ2_XS, IQ2_S), ``iq3``
-(IQ3_XXS), ``iq3s`` (IQ3_S), ``iq4`` (IQ4_NL, IQ4_XS), ``awq`` (P4_128: a ParoQuant checkpoint's linears); ``k23``: their
+(IQ3_XXS), ``iq3s`` (IQ3_S), ``iq4`` (IQ4_NL, IQ4_XS), ``awq`` (P4_128, P5_128: a ParoQuant checkpoint's linears); ``k23``: their
 shared parts, a slot without formats) holds for its formats the ``TileFormat`` records (tile geometry), the host-side packing (a lossless re-layout of the
 GGUF fields; only fp16 -> bf16 scales change, BFP16 rounds bf16 weights once), the kernel-source fragments of the
 prefill GEMMs (``gemm/<fmt>``: ``gemm_q``, ``gemm_qd``) and of the decode GEMV (``mmv/<fmt>``: ``decode.gemv``, which
@@ -38,7 +38,7 @@ __all__ = ["DERIVED", "FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", 
 
 # the slots
 SLOTS: tuple[Slot, ...] = (q4.SLOT, bf16.SLOT, q4k.SLOT, q5k.SLOT, q6k.SLOT, k23.SLOT, q2k.SLOT, q3k.SLOT, q8.SLOT,
-                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT, q6h.SLOT, awq.SLOT)
+                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT, q6h.SLOT, awq.SLOT, awq.SLOT5)
 
 FORMATS: dict[str, TileFormat] = {f.name: f for f in sorted((f for s in SLOTS for f in s.formats), key=lambda f: f.fid)}
 _SLOT_OF = {f.name: s for s in SLOTS for f in s.formats}
