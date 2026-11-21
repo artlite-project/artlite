@@ -51,7 +51,7 @@ def _rotation(K: int, rng: np.random.Generator, layer: int = 1) -> Rotation:
         return HfModel(checkpoint("qwen3-0.6B-paro")).tensor(name).rot()
     except (OSError, FileNotFoundError, KeyError):
         pairs = np.stack([np.concatenate([rng.permutation(128) for _ in range(K // 128)]) for _ in range(8)])
-        return Rotation(rng.uniform(-3, 3, (8, K // 2)), pairs, rng.uniform(-2, 2, K), 128)
+        return Rotation(rng.uniform(-1.2, 1.2, (8, K // 2)), pairs, rng.uniform(-2, 2, K), 128)  # (|tan| <= 2.6: PARO's)
 
 
 def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -64,9 +64,10 @@ def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.
 
 
 # (tokens, channels, gu, copies): a norm's / o's input (a norm's q, k, v copies: the objects broadcast; gate, up of 256
-# tokens: a column's own), Qwen3-0.6B's down (16-token items: 2 rounds of a group; 128 tokens: 4 groups a round),
+# tokens: a column's own; an 8B's q, k, v: the copies' panels a row apart), Qwen3-0.6B's down (16-token items: 2 rounds of a group; 128 tokens: 4 groups a round),
 # Qwen3.5-0.8B's ffn (28 groups, 256 tokens: 2 groups a round)
 CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), (256, 1024, False, 2),
+         (1024, 4096, False, 3),
          (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1)]
 
 
@@ -83,10 +84,10 @@ def test_prefill_rotate(T: int, K: int, gu: bool, copies: int) -> None:
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
     op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies)
     ro = np.concatenate([tf.pair_objects(row_floats(gu)).reshape(-1) for tf in tfs])
-    out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16))).reshape(copies, -1)
+    out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16))).reshape(T // 8, copies, -1)  # ([token group][copy])
     for c, tf in enumerate(tfs):
         want = model(x, tf)
-        got = bfp16.from_panels(out[c], T, K)
+        got = bfp16.from_panels(out[:, c].reshape(-1), T, K)
         exp = bfp16.from_panels(bfp16.to_panels(want), T, K)  # (the output panels' rounding of the model's x')
         bad = np.argwhere(got != exp)
         assert not len(bad), f"copy {c}: {len(bad)} of {got.size} values differ, first {bad[:4].tolist()}"

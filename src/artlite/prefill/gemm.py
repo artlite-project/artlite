@@ -332,10 +332,11 @@ def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
     return Layout(max(-(-col // 64) * 64, pitch), off)
 
 
-def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None
-                      ) -> PhasePlan:
+def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
+                      a_width: int = 0) -> PhasePlan:
     """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
-    from the caller's slices): one GEMM design for both (a pass of tile-major 16-row tiles: 64 outputs), its C as bf16
+    from the caller's slices, panels ``a_width`` columns wide: ``plan_phase``'s): one GEMM design for both (a pass of
+    tile-major 16-row tiles: 64 outputs), its C as bf16
     panels into GU, [T / 8][ffn / 8][gate 64 | up 64] (``c_panels``; up's C argument 64 elements in), which down's
     rotation reads (``prefill.rotate``'s ``gu``: the activation on the way)."""
     (bg,), (bu,) = gate.blocks, up.blocks
@@ -346,7 +347,8 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
         kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * groups * 64, "tile_bytes": r.tile_bytes,
               "col_bytes": r.col_stride, "passes": groups,
               "out_cols": [[64 * (groups * c + j) for j in range(groups)] for c in range(COLS)], "kc": KC,
-              "kc_group": r.kc_group, "blocks": ((0, groups),), "region_rt": r.n_rt, "c_panels": 128}
+              "kc_group": r.kc_group, "blocks": ((0, groups),), "region_rt": r.n_rt, "c_panels": 128,
+              **({"a_cols": (0, a_width)} if a_width else {})}
         op = gemm_op(kw, T, "gu", ops)
         assert type(op) is GemmQOperator, "bf16 C panels: GemmQ"
         gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU", c_off=64 * part))
@@ -354,14 +356,17 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
 
 
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
-               act: str = "silu", k_part: int = 0, layout_T: int = 0, layout: Layout | None = None) -> PhasePlan:
+               act: str = "silu", k_part: int = 0, layout_T: int = 0, layout: Layout | None = None,
+               a_width: int = 0) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
     projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
     reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu, gelu_erf). ``k_part``: an output
     projection in K parts of that many chunks (dividing a chunk group: each part's A strip may stay in the memtile, and
     each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input
     projection's layout (its planar passes) as planned for that many tokens (the layout of buffers that outlive a chunk,
-    e.g. qwen35's conv states in G's rows; default T); ``layout``: an input projection's (``joined_layout``)."""
+    e.g. qwen35's conv states in G's rows; default T); ``layout``: an input projection's (``joined_layout``);
+    ``a_width``: an input projection's A as K columns of panels that wide (a PARO checkpoint's rotated copies side by
+    side: the caller's slice starts at its copy)."""
     name, K, S, KC = region.name, region.K_in, region.tile_bytes, region.kc
     which = WHICH[name]
     if name == "gate_up" and region.blocks[0].fmt2:
@@ -450,6 +455,8 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
             oc = [[lay.pitch * c + o + 64 * p for i, o in zip(run, col0s)
                    for p in range(-(-region.blocks[i].tiles // _tp(region.blocks[i])))] for c in range(COLS)]
         kw = _kw(region, run, T, K, lay.N, oc, few=False, plan_T=TL)
+        if a_width:
+            kw["a_cols"] = (0, a_width)
         if b0.pairs:
             assert len(run) == 1 and b0.fmt == "BFP16", "plane pairs: one BFP16 block"
             kw["c_pairs"] = True

@@ -19,7 +19,9 @@ group's object to them (once per run of rounds of the group) and splits the colu
 the shim. Where every core works on one group at a time (32 items a group or more), one shim broadcasts the objects to
 all 32 cores instead (the columns' reads of them: 12% of the pass's bytes at 1024 tokens). Runtime sequence: (X, RO,
 OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's ``copies`` for several projections (q, k, v;
-gate, up): x read once, each item rotated per copy (RO [copy][group][OBJ], OUT [copy][the panels])."""
+gate, up): x read once, each item rotated per copy (RO [copy][group][OBJ], OUT [token group][copy][K / 8 panels]: a
+copy's panels one row apart, whatever the prompt's size: a GEMM reads its copy as K columns of panels ``copies`` K
+wide)."""
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
@@ -137,10 +139,10 @@ class PrefillRotOperator(ArtcOperator):
         no, orow, ow = T * K * 9 // 16, K // 8 * 36, 16 * 36
         nro = C * G * OBJ // 2
 
-        def walk(c: int, size: int, row: int, run: int, nc: int = 1) -> TensorAccessPattern:
+        def walk(c: int, size: int, row: int, run: int, nc: int = 1, cstep: int = 0) -> TensorAccessPattern:
             """Column c's walk over the rounds of an argument of ``size`` elements in token-group rows of ``row``, a
             group's ``run`` of each (runs of 1024 elements: a shim BD's inner dimension holds at most 1023 words):
-            [group (or round)][the column's token groups][run]; ``nc`` copies: [round][copy, size apart][..][run]."""
+            [group (or round)][the column's token groups][run]; ``nc`` copies: [round][copy, ``cstep`` apart][..][run]."""
             cut = min(run, 1024)
             if nb >= COLS * ROWS:  # (a group's items over t = nb / 32 rounds: the column's 4 t of them)
                 base, dims, steps = 4 * t * ntg * c * row, [G, 4 * t * ntg], [run, row]
@@ -149,7 +151,7 @@ class PrefillRotOperator(ArtcOperator):
                 base, dims, steps = 4 * c % nb * ntg * row + 4 * c // nb * run, [n, 4 * ntg], [s * run, row]
             if nc > 1:
                 assert cut == run
-                return TensorAccessPattern((nc * size,), base, [dims[0], nc, dims[1], run], [steps[0], size, steps[1], 1])
+                return TensorAccessPattern((size,), base, [dims[0], nc, dims[1], run], [steps[0], cstep, steps[1], 1])
             if cut < run:
                 return TensorAccessPattern((size,), base, [*dims, run // cut, cut], [*steps, cut, 1])
             return TensorAccessPattern((size,), base, [1, *dims, run], [0, *steps, 1])
@@ -168,7 +170,7 @@ class PrefillRotOperator(ArtcOperator):
                 xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
                 if c < len(rh):
                     rh[c].fill(RO, ro_tap(c), group=tg)
-                oh[c].drain(OUT, walk(c, no, orow, ow, C), group=tg, wait=True)
+                oh[c].drain(OUT, walk(c, C * no, C * orow, ow, C, orow), group=tg, wait=True)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(nx,), np.dtype[bfloat16]], np.ndarray[(nro,), np.dtype[bfloat16]],

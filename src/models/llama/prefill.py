@@ -27,8 +27,9 @@ groups); the padding tokens after the valid ones write cache records that later 
 
 A PARO checkpoint (``llama.image``'s regions; the decode's "Rotated inputs"): the norms' weights are ones (each is
 folded into its consumers' rotations) and every projection's input goes through ``prefill.rotate`` first: the norm's
-panels into XR, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once, the attention's A
-into AR; q, k and v write G in one
+panels into XR, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once (side by side:
+[token group][copy][hidden / 8 panels], each GEMM reading its copy's columns), the attention's A into AR; q, k and v
+write G in one
 layout (``prefill.gemm.joined_layout``), gate and up GU as bf16 panels (``plan_gate_up_pair``: one design), which down's
 rotation reads, the activation on the way (``prefill.rotate``'s ``gu``), into HR. The rotation objects
 (``paro.TanForm.pair_objects``) are in RO, compiled at bind.
@@ -201,11 +202,11 @@ class LlamaPrefill(ChunkPrefill):
             for L in self.layers:
                 regs = [img.region(L, n) for n in "qkv"]
                 lay = PG.joined_layout(regs, qt, pitch)
-                gs = [dataclasses.replace(g, a=f"XR{PARO_COPY[r.name]}")
-                      for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay).gemms]
+                gs = [dataclasses.replace(g, a=f"XR3{PARO_COPY[r.name]}")
+                      for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay, a_width=3 * self.kh).gemms]
                 plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
-                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms)
-                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR0", "XR1"))]
+                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms, 2 * self.kh)
+                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
                 plans[(L, "gate_up")] = gu
                 for name in ("o", "down"):
                     plans[(L, name)] = plan_gemm(img, img.region(L, name), t, ops=gemms, pitch=dp, k_parts=self._k_parts)
@@ -341,13 +342,15 @@ class LlamaPrefill(ChunkPrefill):
         def rot(L: int, name: str, src: str, dst: str) -> list[tuple]:  # (PARO: a projection's rotated input(s))
             op = o.rots[name]
             ro = self.ro_off[(L, {"qkv": "q", "gate_up": "gate"}.get(name, name))]  # (copies: their objects in turn)
-            return [(op, tok(src, j, op, i=0), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", tok(dst, j, op, i=2))
-                    for j in range(S)]
+            out = [sl("XR", j * t * op.copies * rb["PXN"], op, i=2) if dst == "XR" else tok(dst, j, op, i=2)
+                   for j in range(S)]  # (XR: the copies side by side)
+            return [(op, tok(src, j, op, i=0), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", out[j]) for j in range(S)]
 
-        def a_in(g: PG.Gemm, tk: int) -> str:  # (a GEMM's A from token tk on: the norm's panels, or a copy in XR)
+        def a_in(g: PG.Gemm, tk: int) -> str:  # (a GEMM's A from token tk on: the norm's panels, or copy c of C in XR)
             if not g.a.startswith("XR"):
                 return sl(g.a or "PXN", tk * rb[g.a or "PXN"], g.op, i=0)
-            return sl("XR", (tk // t * 3 + int(g.a[2:])) * t * rb["PXN"] + tk % t * rb["PXN"], g.op, i=0)
+            C, c = int(g.a[2]), int(g.a[3])
+            return sl("XR", (tk * C + 8 * c) * rb["PXN"], g.op, i=0)
 
         if self.paro:
             rl += rot(self.layers[0], "qkv", "PXN", "XR")
