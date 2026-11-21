@@ -81,11 +81,17 @@ class Rotation:
         """The rounds as ``u <- u + T * u[partner]`` on storage positions (module docstring of ``TanForm``), from the
         stored parameters in fp64; ``gamma``: a per-channel scale before the transform (a norm's weight) folded into
         D_0. ``unit``: D_0 chosen so that the final scales D are 1 and the input scaled instead (``TanForm.w``: x' =
-        rounds(x w), no multiply after the rounds; the scales' paths through the rounds do not depend on D_0)."""
+        rounds(x w), no multiply after the rounds; the scales' paths through the rounds do not depend on D_0); gamma's
+        zero entries (a dead channel of a fine-tuned norm, Qwen3.8-27B-PARO-int5's layer 7) then a zero in w, the rounds
+        those of a weight of 1."""
         G, g = self.K // self.group, self.group
         d0 = np.asarray(self.channel_scales, np.float64).reshape(G, g).copy()
+        dead = None
         if gamma is not None:
-            d0 *= np.asarray(gamma, np.float64).reshape(G, g)
+            gm = np.asarray(gamma, np.float64).reshape(G, g)
+            dead = gm == 0  # (a norm's zero weights: those channels' inputs are zero)
+            assert unit or not dead.any(), "a zero weight in a scaled tan form"
+            d0 *= np.where(dead, 1.0, gm)
         if not unit:
             return self._rounds(d0)[0]
         tf, origin = self._rounds(d0)
@@ -94,7 +100,8 @@ class Rotation:
         out = self._rounds(d1)[0]
         assert np.allclose(out.D, 1, rtol=1e-9, atol=0), np.abs(out.D - 1).max()
         out.D = np.ones_like(out.D)
-        out.w = (d0 / d1).reshape(-1)
+        # (the input's scales; a dead channel's zero: the rounds as for a weight of 1, its input zeroed first)
+        out.w = np.where(dead, 0.0, d0 / d1).reshape(-1) if dead is not None else (d0 / d1).reshape(-1)
         return out
 
     def _rounds(self, d0: np.ndarray) -> tuple[TanForm, np.ndarray]:

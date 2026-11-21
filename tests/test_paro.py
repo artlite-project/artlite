@@ -130,3 +130,17 @@ def test_pack_native(bits: int) -> None:
         for k in range(3):
             fc = slice_fields(f, np.arange(16 * g, 16 * g + 16), k0=1024 * k, cols=t.cols, kc=1024)
             assert np.array_equal(tiles[g, k], pack_tile(fmt, fc, S)), (g, k)
+
+
+def test_tan_dead_channel() -> None:
+    """A norm weight of zero (a dead channel, Qwen3.8-27B-PARO-int5's layer 7): the unit tan form zeroes that channel's
+    input (w), the rounds as for a weight of 1, exactly the transform of x * gamma."""
+    t, _ = random_paro(512, 64, seed=4)
+    r = t.rot()
+    gamma = np.random.default_rng(5).uniform(0.5, 2.0, 512)
+    gamma[[3, 200, 511]] = 0.0
+    tf = r.tan_form(gamma, unit=True)
+    x = np.random.default_rng(6).standard_normal((3, 512))
+    assert np.isfinite(tf.T).all() and np.isfinite(tf.w).all()
+    want = r.apply(x * gamma)[:, tf.chan_index()]
+    assert np.abs(tf.apply(x) - want).max() < 1e-12 * np.abs(want).max()
