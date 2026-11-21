@@ -464,7 +464,7 @@ class TileImage:
         own = [x for x in blocks if set(x[1].tensors) & set(self._own)]  # (tensors in memory of their own)
         mapped = [x for x in blocks if x not in own]
         _pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
-                    file=(self.gguf.path, self.gguf.data))
+                    files=self.gguf.files)
         if own:
             _pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
         self._fill_data(out)

@@ -55,6 +55,7 @@ import numpy as np
 
 from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import ClipConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
@@ -483,7 +484,7 @@ class Qwen(Model):
     def __init__(self, path: str, *, mmproj: str | None = None, max_slices: int | None = None,
                  image_min_tokens: int | None = None, image_max_tokens: int | None = None, spec_type: str = "auto",
                  draft_model: str | None = None):
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = QwenConfig.from_gguf(self.gguf)
         self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
         # (a readout model drafts nothing: its prompts only)

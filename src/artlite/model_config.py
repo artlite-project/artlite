@@ -6,8 +6,9 @@ repository a file comes from):
 
     <org>/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf, ...
 
-:func:`llama_gguf`, :func:`gemma_gguf`, :func:`qwen_gguf` (and the others below) name the files there and
-:func:`model_path` resolves a path given relative to it, so nothing else spells the location.
+:func:`llama_gguf`, :func:`gemma_gguf`, :func:`qwen_gguf` (and the others below) name the files there, :func:`checkpoint`
+the Hugging Face checkpoint directories (``artlite.hf_model``), and :func:`model_path` resolves a path given relative to
+it, so nothing else spells the location.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ def llama_gguf(quant: str, size: str = "1B") -> str:
 
 
 def llama_safetensors(size: str = "1B") -> str:
-    """The bf16 ``model.safetensors`` of the Llama 3.2 Instruct Hugging Face model."""
+    """The bf16 ``model.safetensors`` of the Llama 3.2 Instruct Hugging Face model (its directory: ``checkpoint``)."""
     return os.path.join(MODELS_DIR, LLAMA_ORG, f"Llama-3.2-{size}-Instruct", "model.safetensors")
 
 
@@ -302,6 +303,18 @@ def flint_gguf(quant: str = "int4") -> str:
     return os.path.join(MODELS_DIR, FLINT_FILES[quant])
 
 
+# Hugging Face checkpoint directories (``artlite.hf_model``: a directory opens as a model file): bf16 / fp16 originals,
+# and z-lab's ParoQuant (PARO) checkpoints
+HF_CHECKPOINTS = {"qwen3-0.6B": "Qwen/Qwen3-0.6B", "qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
+                  "llama-1B": "lmstudio-community/Llama-3.2-1B-Instruct",
+                  "qwen3-0.6B-paro": "z-lab/Qwen3-0.6B-PARO", "qwen3.5-0.8B-paro": "z-lab/Qwen3.5-0.8B-PARO"}
+
+
+def checkpoint(name: str) -> str:
+    """A Hugging Face checkpoint directory of ``HF_CHECKPOINTS`` (by its key)."""
+    return os.path.join(MODELS_DIR, HF_CHECKPOINTS[name])
+
+
 def sd15_dir() -> str:
     """The diffusers directory of Stable Diffusion 1.5 (``model_index.json``, ``tokenizer/``, ``text_encoder/``,
     ``unet/``, ``vae/``, ``scheduler/``)."""
@@ -317,7 +330,8 @@ class LlamaConfig:
     i turning by p base^(-2 i / head_dim) / ``rope_freq_factors[i]``: llama.cpp's ``rope_freqs`` tensor, the llama3
     frequency scaling of Llama 3.1 / 3.2 (low frequencies stretched for the 128K context) that its converter computes
     from the ``rope_scaling`` of the model's config.json. ``neox``: the pairs are dims (i, i + head_dim / 2) of the
-    file's Q / K rows (Qwen3); else llama.cpp's converter interleaved them (Llama: ``gguf_model.unpermute_rows``).
+    file's Q / K rows (Qwen3, a Llama checkpoint directory: ``hf_model.HfModel.unpermuted``); else llama.cpp's converter
+    interleaved them (a Llama GGUF: ``gguf_model.unpermute_rows``).
     ``qk_norm``: q and k RMS-normed per head with a weight per dim (``attn_q_norm``, ``attn_k_norm``) before RoPE
     (Qwen3)."""
 
@@ -368,7 +382,7 @@ class LlamaConfig:
             rope_freq_factors=None if freqs is None else tuple(float(x) for x in freqs),
             max_position_embeddings=int(m("context_length")),
             eos_token_ids=tuple(dict.fromkeys(eos)),
-            neox=gguf.arch != "llama",
+            neox=gguf.arch != "llama" or getattr(gguf, "unpermuted", False),
             qk_norm="blk.0.attn_q_norm.weight" in gguf,
         )
 

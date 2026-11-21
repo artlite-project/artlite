@@ -169,7 +169,7 @@ def _file_pages() -> int | None:
 def test_pack_reads_own_views(tmp_path: Path) -> None:
     """``_native.pack_tiles`` reads a file's tensors through views of its own: the tiles are those of the tensor's
     copy in memory, the process holds no more of the file after it than before (the caller's mapping untouched, the
-    views unmapped), and a tensor that is not in the file's mapping is refused."""
+    views unmapped), and a tensor outside the files' mappings is read as the memory it is."""
     rows, cols, R, nsb = 4096, 4096, 16, 4  # (9.2 MB of Q4_0 rows)
     path = tmp_path / "w.gguf"
     raw = _write_gguf(path, rows, cols)
@@ -184,13 +184,14 @@ def test_pack_reads_own_views(tmp_path: Path) -> None:
     want, got = np.zeros(n_rt * n_kc * S, np.uint8), np.zeros(n_rt * n_kc * S, np.uint8)
     _native.pack_tiles(want, [block(np.array(raw))], threads=2)
     before = _file_pages()
-    _native.pack_tiles(got, [block(g.tensor("w.weight").raw)], threads=2, file=(str(path), g.data))
+    _native.pack_tiles(got, [block(g.tensor("w.weight").raw)], threads=2, files=g.files)
     after = _file_pages()
     assert want.any() and np.array_equal(got, want)
     if before is not None:
         assert after - before < 1 << 20, (before, after)
-    with pytest.raises(_native.Error, match="outside the mapping"):
-        _native.pack_tiles(got, [block(np.array(raw))], threads=1, file=(str(path), g.data))
+    got[:] = 0
+    _native.pack_tiles(got, [block(np.array(raw))], threads=1, files=g.files)
+    assert np.array_equal(got, want)
 
 
 def test_gguf_page_hints(tmp_path: Path) -> None:

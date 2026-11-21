@@ -842,7 +842,11 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
   std::vector<std::vector<uint32_t>> block_tensors(blocks.size());
   std::vector<Item> items;
   size_t max_S = 64;
-  const int file = opt.file.path.empty() ? -1 : 0;
+  auto file_of = [&](const uint8_t* data) {  // (the mapping that holds a tensor's first byte; -1: memory)
+    for (size_t f = 0; f < opt.files.size(); f++)
+      if (data >= opt.files[f].map && data < opt.files[f].map + opt.files[f].size) return static_cast<int>(f);
+    return -1;
+  };
   for (size_t bi = 0; bi < blocks.size(); bi++) {
     const PackBlock& b = blocks[bi];
     const FormatInfo& fi = info(b.fmt);
@@ -872,7 +876,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     for (auto [data, rows] : b.tensors) {
       total += rows;
       auto [it, added] = tensor_of.try_emplace(data, static_cast<uint32_t>(run.tensors.size()));
-      if (added) run.tensors.push_back({data, 0, file});
+      if (added) run.tensors.push_back({data, 0, file_of(data)});
       pack::Tensor& x = run.tensors[it->second];  // (the bytes any block reads of it)
       x.bytes = std::max(x.bytes, size_t(rows) * row_bytes);
       block_tensors[bi].push_back(it->second);
@@ -892,7 +896,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       }
   }
 
-  pack::Views views(run, file == 0 ? std::vector<pack::MappedFile>{opt.file} : std::vector<pack::MappedFile>{});
+  pack::Views views(run, opt.files);
   std::vector<std::vector<const uint8_t*>> rows_of(blocks.size());  // (per block its tensors' bytes: the views')
   for (size_t bi = 0; bi < blocks.size(); bi++)
     for (uint32_t t : block_tensors[bi]) rows_of[bi].push_back(run.tensors[t].data);

@@ -13,9 +13,9 @@ artlite-cli -m stable-diffusion-v1-5/stable-diffusion-v1-5 -p "a photograph of a
     -o astronaut.png
 ```
 
-`-m` (required) is a GGUF file or a diffusers directory, or a path relative to the models directory
-(`ARTLITE_MODELS_DIR`, default `~/.artlite/models`). A GGUF file's architecture comes from its metadata; the files
-that run: [Models](models/README.md). The first run of a model builds its NPU designs
+`-m` (required) is a GGUF file, a Hugging Face checkpoint directory or a diffusers directory, or a path relative to
+the models directory (`ARTLITE_MODELS_DIR`, default `~/.artlite/models`). A GGUF file's architecture comes from its
+metadata, a checkpoint's from its `config.json`; the files that run: [Models](models/README.md). The first run of a model builds its NPU designs
 ([build cache](install.md#build-cache)).
 
 ## Text

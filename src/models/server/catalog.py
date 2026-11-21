@@ -40,7 +40,7 @@ from typing import Any
 
 from artlite import settings
 from artlite.formats import has_tile_format
-from artlite.gguf_model import GGUFFile
+from artlite.hf_model import is_checkpoint, open_weights
 from artlite.operators.toolchain import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
@@ -98,7 +98,7 @@ def header(path: str) -> dict[str, Any]:
     that have no tile format (``unsupported``)."""
     from ..bench import file_type_name
 
-    g = GGUFFile(path)
+    g = open_weights(path)
     meta, arch = g.meta, g.arch
     if arch == "clip":
         vision = str(meta.get("clip.vision.projector_type", meta.get("clip.projector_type", "")))
@@ -294,7 +294,8 @@ class Catalog:
     # ------------------------------------------------------------------
 
     def files(self) -> list[str]:
-        """The GGUF files under the models directory (symbolic links followed, each directory once)."""
+        """The GGUF files and Hugging Face checkpoint directories (``artlite.hf_model``) under the models directory
+        (symbolic links followed, each directory once)."""
         out, seen = [], set()
         for root, dirs, names in os.walk(self.models_dir, followlinks=True):
             real = os.path.realpath(root)
@@ -303,6 +304,8 @@ class Catalog:
                 continue
             seen.add(real)
             dirs.sort()
+            if root != self.models_dir and is_checkpoint(root):
+                out.append(root)
             out += [os.path.join(root, n) for n in sorted(names) if n.endswith(".gguf")]
         return out
 
@@ -406,6 +409,10 @@ class Catalog:
         for e in entries:
             rel = self.rel(e.path)
             d = os.path.dirname(rel)
+            if os.path.isdir(e.path):  # (a checkpoint directory: its repository)
+                e.id, e.names = rel, [rel]
+                out[e.id] = e
+                continue
             e.id = (f"{d}:{e.tag}" if e.tag and tags[d, e.tag] == 1 else f"{d}:{e.name}") if d else e.name
             e.names = [rel] + ([os.path.basename(rel)] if names[os.path.basename(rel)] == 1 and d else [])
             out[e.id] = e

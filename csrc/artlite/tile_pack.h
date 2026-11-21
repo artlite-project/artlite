@@ -70,10 +70,11 @@ struct PackBlock {
 
 struct PackOptions {
   unsigned threads = 0;  // 0: one per physical core
-  /// The file the tensors lie in and the caller's mapping of it (pack::MappedFile; no path: tensors of memory). The
-  /// packer reads them through views of its own, read into the page cache a window ahead of the workers (a file not in
-  /// the page cache streams from the disk while they pack) and unmapped tensor by tensor (pack::Views).
-  pack::MappedFile file{};
+  /// The files the tensors lie in and the caller's mappings of them (pack::MappedFile): a tensor inside a mapping is read
+  /// through views of the packer's own, read into the page cache a window ahead of the workers (a file not in the page
+  /// cache streams from the disk while they pack) and unmapped tensor by tensor (pack::Views); a tensor outside every
+  /// mapping is memory of the caller's, read as it is.
+  std::vector<pack::MappedFile> files;
   /// IQ1_S tiles' grid masks (``formats.iq1.grid_masks``: 2048 entries A | B << 8): the blocks of IQ1_S need them.
   const uint16_t* iq1_masks = nullptr;
 };

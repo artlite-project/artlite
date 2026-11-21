@@ -29,6 +29,7 @@ import numpy as np
 
 from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
@@ -107,7 +108,7 @@ class Llama(Model):
 
     def __init__(self, path: str, *, kv_k: str = "single"):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = LlamaConfig.from_gguf(self.gguf)
         image = LlamaImage(self.gguf, self.cfg)
         check_formats(image)

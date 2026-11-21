@@ -32,6 +32,7 @@ import numpy as np
 
 from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
 from artlite.vision.shell import shared_device
@@ -189,7 +190,7 @@ class Lfm(Model):
     def __init__(self, path: str, *, kv_k: str = "single", mmproj: str | None = None, image_min_tokens: int | None = None,
                  image_max_tokens: int | None = None):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = LfmConfig.from_gguf(self.gguf)
         self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
         # (a readout model's image: no LM head)

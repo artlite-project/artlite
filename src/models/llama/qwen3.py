@@ -10,7 +10,7 @@ of Qwen3 0.6B against ~0 with hi + lo, the CPU model with the cache's roundings)
 """
 
 from artlite.decode.kv import kv_precision
-from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import LlamaConfig
 from artlite.overlay import WeightBuffer
 
@@ -41,7 +41,7 @@ class Qwen3(Model):
 
     def __init__(self, path: str, *, kv_k: str = "hilo"):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = LlamaConfig.from_gguf(self.gguf)
         self.generates = not readout_model(self.gguf.meta, self.gguf.arch)
         # (a readout model's image: no LM head, its half regions unpaired; ``llama.image``)

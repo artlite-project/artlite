@@ -3,9 +3,9 @@ template, the inputs the host computes) or diffusers pipeline, what they share (
 ``overlay_model``, ``speculative``, ``sampling``, ``templating``, ...) and the command lines (``cli``: ``artlite-cli``;
 ``bench``: ``artlite-bench``; ``server``: ``artlite-server``, an OpenAI-compatible server with a web chat).
 
-``open_model`` reads a GGUF file's architecture from its metadata (``general.architecture``) and opens it with the
-``Model`` of its package; ``open_pipeline`` opens a diffusers directory by the pipeline class of its
-``model_index.json``:
+``open_model`` reads a GGUF file's architecture from its metadata (``general.architecture``; a Hugging Face checkpoint
+directory: the GGUF architecture it opens as, ``artlite.hf_model``) and opens it with the ``Model`` of its package;
+``open_pipeline`` opens a diffusers directory by the pipeline class of its ``model_index.json``:
 
 | architecture / pipeline | package | models |
 |---|---|---|
@@ -29,6 +29,8 @@ import os
 from typing import TYPE_CHECKING
 
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import architecture as hf_architecture
+from artlite.hf_model import is_checkpoint
 
 from .model import Model
 
@@ -54,9 +56,14 @@ PIPELINES = {
 
 
 def architecture(path: str) -> str:
-    """The architecture of a GGUF file (``general.architecture``: ``llama``, ``gemma4``, ...)."""
+    """The architecture of a GGUF file (``general.architecture``: ``llama``, ``gemma4``, ...) or of a Hugging Face
+    checkpoint directory (the GGUF architecture it opens as: ``artlite.hf_model``)."""
     if is_diffusers(path):
         raise ValueError(f"{path}: a diffusers pipeline, not a GGUF file")
+    if is_checkpoint(path):
+        return hf_architecture(path)
+    if os.path.isdir(path):
+        raise ValueError(f"{path}: a directory without config.json and safetensors (not a checkpoint)")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"{path}: no such file")
     with open(path, "rb") as f:
@@ -74,7 +81,7 @@ def model_class(arch: str) -> type[Model]:
 
 
 def open_model(path: str, *, chat_template: str | None = None, **options: object) -> Model:
-    """Open a GGUF file with the ``Model`` of its architecture; ``chat_template``: a Jinja chat template in place of the
+    """Open a GGUF file or a Hugging Face checkpoint directory with the ``Model`` of its architecture; ``chat_template``: a Jinja chat template in place of the
     file's (``Model.chat_template``); ``options``: that class's keyword arguments (one given as False or "none": where
     the class has it, a value that turns a feature off applies to every model, ``spec_type="none"`` to one without a
     drafter)."""

@@ -27,6 +27,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedOK, InvalidS
 from websockets.sync.client import connect as ws_connect
 
 from artlite import settings
+from artlite.model_config import checkpoint
 from models.lfm3a.host import wav_bytes
 from models.server import catalog as catalog_module
 from models.server import ui
@@ -35,6 +36,8 @@ from models.server.cli_options import arg_parser
 from models.server.process import listen
 from models.server.realtime import TRANSCRIPTION_EVENT as TRANSCRIPTION
 from models.server.router import Router, RouterOptions, create_router_app
+
+from ..model_files import require
 
 CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
 
@@ -150,6 +153,18 @@ def test_catalog_omni(tmp_path: object) -> None:
     cat.entries = entries
     m = Router(cat, spare=False).listing()["data"][0]["architecture"]
     assert m["input_modalities"] == ["text", "image", "audio", "video"] and m["output_modalities"] == ["text", "audio"]
+
+
+def test_catalog_checkpoint(tmp_path: object) -> None:
+    """A Hugging Face checkpoint directory in the models directory: a model named by its path."""
+    src = checkpoint("qwen3-0.6B")
+    require(src)
+    d = tmp_path / "models"
+    (d / "Qwen").mkdir(parents=True)
+    os.symlink(src, d / "Qwen" / "Qwen3-0.6B")
+    entries = catalog_of(str(d), tmp_path).scan()
+    assert list(entries) == ["Qwen/Qwen3-0.6B"] and entries["Qwen/Qwen3-0.6B"].header["arch"] == "qwen3"
+    assert entries["Qwen/Qwen3-0.6B"].names == ["Qwen/Qwen3-0.6B"]
 
 
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,

@@ -516,7 +516,7 @@ class GGUFFile:
         per, nb = _BLOCKS[t.qtype]
         width = cols // per * nb if per > 1 else cols
         if prefetch and len(idx) > 1:
-            self._prefetch(self.tensor_info[name][2], t.raw.strides[0], idx, width * t.raw.itemsize)
+            self._prefetch(name, t.raw.strides[0], idx, width * t.raw.itemsize)
         raw = np.ascontiguousarray(t.raw[idx, :width])
         if _native.dequant_supported(t.qtype):
             out = np.empty((len(idx), cols), np.float32)
@@ -524,38 +524,51 @@ class GGUFFile:
             return out
         return QTensor(name=name, qtype=t.qtype, rows=len(idx), cols=cols, raw=raw).dequantize()
 
-    def _prefetch(self, off: int, stride: int, idx: np.ndarray, nbytes: int) -> None:
-        """Ask for the pages of rows ``idx`` (their first ``nbytes``; rows ``stride`` bytes apart from file offset
-        ``off``) at once. A table outside the NPU image (Gemma's per-layer rows, an untied ``token_embd``) is in the
-        page cache only once read, and after a reboot or under memory pressure a lookup faulted its rows in one at a
-        time: Gemma's per-layer rows of 1024 tokens 152 ms from disk, 10-17 ms with their reads issued together (0.7
-        ms when cached)."""
-        self._hint("willneed", off + np.unique(idx).astype(np.int64) * stride, nbytes)
+    @property
+    def files(self) -> list[tuple[str, np.ndarray]]:
+        """The model's files and their mappings (``_native.pack_tiles``: the packer reads the tensors of these mappings
+        through views of its own)."""
+        return [(self.path, self.data)]
 
-    def _hint(self, hint: str, offsets: np.ndarray | int, nbytes: int) -> None:
-        """``_native.page_hint`` for the mapping's ranges of nbytes at the file offsets."""
-        _native.page_hint(self.data, hint, np.atleast_1d(np.asarray(offsets, np.int64)), nbytes)
+    def _mapped(self, name: str) -> tuple[np.ndarray, int, int] | None:
+        """A tensor's (file mapping, file offset, bytes); None: a tensor of memory (``hf_model``'s computed ones)."""
+        _, _, off, nbytes = self.tensor_info[name]
+        return self.data, off, nbytes
+
+    def _prefetch(self, name: str, stride: int, idx: np.ndarray, nbytes: int) -> None:
+        """Ask for the pages of rows ``idx`` of a tensor (their first ``nbytes``; rows ``stride`` bytes apart) at once. A
+        table outside the NPU image (Gemma's per-layer rows, an untied ``token_embd``) is in the page cache only once
+        read, and after a reboot or under memory pressure a lookup faulted its rows in one at a time: Gemma's per-layer
+        rows of 1024 tokens 152 ms from disk, 10-17 ms with their reads issued together (0.7 ms when cached)."""
+        if (m := self._mapped(name)) is not None:
+            _hint(m[0], "willneed", m[1] + np.unique(idx).astype(np.int64) * stride, nbytes)
 
     def release(self) -> None:
-        """Give the mapping's resident pages back (after a loader read what it needs: the metadata, the tensors it
+        """Give the mappings' resident pages back (after a loader read what it needs: the metadata, the tensors it
         converts on the host): they leave this process, stay in the system's file cache while it has room, and come
-        back on the next access. (A weight image's tensors never come through this mapping: the packers read the file
-        through views of their own, ``_native.pack_tiles``.)"""
-        self._hint("dontneed", 0, self.data.size)
+        back on the next access. (A weight image's tensors never come through these mappings: the packers read the
+        files through views of their own, ``_native.pack_tiles``.)"""
+        for _, data in self.files:
+            _hint(data, "dontneed", 0, data.size)
 
     def willneed(self, name: str) -> None:
         """Ask for a tensor's pages at once, read ahead into the file cache (a table read by scattered rows every
         decode step: its first reads would fault each page in from disk, one at a time)."""
-        _, _, off, nbytes = self.tensor_info[name]
-        self._hint("willneed", off, nbytes)
+        if (m := self._mapped(name)) is not None:
+            _hint(m[0], "willneed", m[1], m[2])
 
     def populate(self, name: str) -> None:
         """Map a tensor's pages into this process now (from the page cache, or the file), so that reads of scattered
         rows find them mapped: after ``release`` each first touch of a page is a fault of ~3 us (a screened LM head's
         rows of every choice, ``decode.screen``). Linux's MADV_POPULATE_READ; elsewhere, or where the kernel has none,
         nothing: the reads fault as they come."""
-        _, _, off, nbytes = self.tensor_info[name]
-        self._hint("populate", off, nbytes)
+        if (m := self._mapped(name)) is not None:
+            _hint(m[0], "populate", m[1], m[2])
+
+
+def _hint(data: np.ndarray, hint: str, offsets: np.ndarray | int, nbytes: int) -> None:
+    """``_native.page_hint`` for a mapping's ranges of nbytes at the file offsets."""
+    _native.page_hint(data, hint, np.atleast_1d(np.asarray(offsets, np.int64)), nbytes)
 
 
 def tensor_f32(gguf: GGUFFile, name: str) -> np.ndarray:
@@ -570,7 +583,9 @@ def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bo
     tokens (types 3, 4) as added tokens, recognized in a text (llama.cpp's ``parse_special``; ``special`` False: the
     control ones left out, their text encoding as text, the user-defined ones kept: text a model writes, Qwen's
     ``<tool_call>``); ``pattern`` the split regex in its tokenizer.json form (one of the schemes
-    gigatoken implements; None: no split, each text one piece, the caller's pieces); ``ignore_merges``: a pre-token
+    gigatoken implements; None: no split, each text one piece, the caller's pieces); the text NFC-normalized first where
+    the file says so (``tokenizer.ggml.normalizer.nfc``: llama.cpp's converter writes it for an NFC tokenizer.json, and
+    llama.cpp then normalizes); ``ignore_merges``: a pre-token
     that is a token is not merged (Llama 3's tokenizer.json, llama.cpp's llama3 vocabulary)."""
     assert gguf.meta.get("tokenizer.ggml.model") == "gpt2", gguf.meta.get("tokenizer.ggml.model")
     types = np.asarray(gguf.meta["tokenizer.ggml.token_type"])
@@ -583,7 +598,7 @@ def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bo
         "version": "1.0", "truncation": None, "padding": None,
         "added_tokens": [{"id": i, "content": t, "single_word": False, "lstrip": False, "rstrip": False,
                           "normalized": False, "special": bool(types[i] == 3)} for t, i in added.items()],
-        "normalizer": None,
+        "normalizer": {"type": "NFC"} if gguf.meta.get("tokenizer.ggml.normalizer.nfc") else None,
         "pre_tokenizer": byte_level if pattern is None else {"type": "Sequence", "pretokenizers": [
             {"type": "Split", "pattern": {"Regex": pattern}, "behavior": "Isolated", "invert": False}, byte_level]},
         "post_processor": None,

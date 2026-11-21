@@ -13,6 +13,7 @@ import numpy as np
 
 from artlite.decode.protocol import C_LEN
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.operators.design import COLS
 
 POOLING = ("none", "mean", "cls", "last", "rank")  # (a GGUF's ``pooling_type``: llama.cpp's LLAMA_POOLING_TYPE_*)
@@ -123,7 +124,7 @@ class Readouts:
 
     @classmethod
     def of(cls, path: str) -> "Readouts":
-        g = GGUFFile(path)
+        g = open_weights(path)
         m, arch = g.meta, g.arch
         head = None
         if "cls.output.weight" in g:

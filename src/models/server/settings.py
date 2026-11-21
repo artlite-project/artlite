@@ -98,11 +98,11 @@ class ModelInfo:
 
     @classmethod
     def from_gguf(cls, path: str) -> ModelInfo:
-        from artlite.gguf_model import GGUFFile
+        from artlite.hf_model import open_weights
 
         from ..bench import file_info, file_type_name
 
-        g = GGUFFile(path)
+        g = open_weights(path)
         meta, arch = g.meta, str(g.arch)
         fields, n_vocab = file_info(path, gguf=g)
         ids = {k: int(meta[f"tokenizer.ggml.{k}_token_id"]) for k in ("bos", "eos") if f"tokenizer.ggml.{k}_token_id" in meta}

@@ -44,6 +44,7 @@ from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.decode.head import HeadTable
 from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import FlintConfig, flint_dflash_of
 from artlite.overlay import WeightBuffer
 
@@ -333,7 +334,7 @@ class Flint(Model):
         self.dflash = (draft_model or flint_dflash_of(path)) if kind in ("auto", "draft-dflash") else None
         if kind == "draft-dflash" and self.dflash is None:
             raise ValueError(f"{path}: no DFlash2 drafter (a Flint-DFlash2-GGUF of Q4_K_M) in the models directory")
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = FlintConfig.from_gguf(self.gguf)
         self.weights = WeightBuffer(FlintImage(self.gguf, self.cfg, head=self.dflash is not None))
         self.tokenizer = BpeTokenizer(self.gguf)

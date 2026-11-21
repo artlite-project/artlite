@@ -53,6 +53,7 @@ from typing import Any, Self
 import numpy as np
 
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 
 from ..model import MEDIA_MARKER
 from ..sequence import Sequence, data_bytes, splice
@@ -304,7 +305,7 @@ class Decisions:
     def of(cls, path: str, encode: Callable[[str], list[int]]) -> "Decisions | None":
         """The decision context of a model file (None: not a decision model); ``encode``: the model's tokenizer
         (special tokens parsed, no BOS). Raises ValueError for a type Artlite does not answer."""
-        g = GGUFFile(path)
+        g = open_weights(path)
         meta, arch = g.meta, g.arch
         t = decision_type(meta, arch)
         if t is None:

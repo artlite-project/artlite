@@ -544,6 +544,7 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
 
 - **Models.** Each GGUF file of the directory that Artlite runs, named `<account>/<repository>:<quantization>`
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
+  A Hugging Face checkpoint directory ([Models](models/README.md)) is named by its path, `<account>/<repository>`.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
   says why. Drafters (`mtp-`, `<name>-mtp-`, the `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
   qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
@@ -640,7 +641,7 @@ Each option also reads `ARTLITE_ARG_<NAME>`, the long option's name in upper cas
 
 | option | |
 |---|---|
-| `-m FILE`, `--model` | the GGUF file (as [artlite-cli](cli.md)'s `-m`); without: router mode |
+| `-m FILE`, `--model` | the GGUF file or Hugging Face checkpoint directory (as [artlite-cli](cli.md)'s `-m`); without: router mode |
 | `-a NAME`, `--alias` | the model's id in the API (default: the file name) |
 
 Router mode (without `-m`):

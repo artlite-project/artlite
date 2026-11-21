@@ -39,6 +39,7 @@ import numpy as np
 
 from artlite import settings
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import MODELS_DIR, model_path
 from artlite.prefill import pace
 
@@ -174,7 +175,7 @@ def file_type_name(ftype: object) -> str:
 def file_info(path: str, *, gguf: GGUFFile | None = None) -> tuple[dict[str, object], int]:
     """A GGUF file's fields (llama.cpp's model_type, size and parameters) and its vocabulary size; ``gguf``: the file
     already open."""
-    f = gguf or GGUFFile(path)
+    f = gguf or open_weights(path)
     info = {"model_filename": path,
             "model_type": f"{f.arch} {f.meta.get('general.size_label', '?B')} "
                           f"{file_type_name(f.meta.get('general.file_type'))}",

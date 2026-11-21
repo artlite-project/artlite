@@ -34,7 +34,7 @@ largest test (`n_ctx` in the results). `backends` is `NPU` and `gpu_info` is the
 
 | option | |
 |---|---|
-| `-m FILES`, `--model` | GGUF files, comma-separated or repeated; a relative path is looked up in the models directory |
+| `-m FILES`, `--model` | GGUF files or Hugging Face checkpoint directories, comma-separated or repeated; a relative path is looked up in the models directory |
 | `-p N`, `--n-prompt` | prompt tokens (default 512) |
 | `-n N`, `--n-gen` | generated tokens (default 128) |
 | `-pg PP,TG` | a prompt, then generated tokens, timed together (repeatable) |

@@ -25,7 +25,7 @@ void bind_pack(nb::module_& m) {
   m.def(
       "pack_tiles",
       [](nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> out, nb::list blocks, unsigned threads,
-         std::optional<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>>> file,
+         nb::list files,
          std::optional<nb::ndarray<const uint16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>> iq1_masks) {
         using Rows = nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
         using Raw = nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
@@ -67,7 +67,10 @@ void bind_pack(nb::module_& m) {
           bs.push_back(std::move(b));
         }
         artlite::PackOptions opt{threads};
-        if (file) opt.file = {file->first, file->second.data(), file->second.shape(0)};
+        for (nb::handle h : files) {
+          auto f = nb::cast<std::pair<std::string, nb::ndarray<const uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>>>(h);
+          opt.files.push_back({f.first, f.second.data(), f.second.shape(0)});
+        }
         if (iq1_masks) {
           if (iq1_masks->shape(0) != 2048) throw artlite::Error("pack_tiles: iq1_masks holds the grid's 2048 entries");
           opt.iq1_masks = iq1_masks->data();
@@ -75,9 +78,9 @@ void bind_pack(nb::module_& m) {
         nb::gil_scoped_release release_gil;
         artlite::pack_tiles(out.data(), out.shape(0), bs, opt);
       },
-      "out"_a, "blocks"_a, "threads"_a = 0, "file"_a = nb::none(), "iq1_masks"_a = nb::none(),
+      "out"_a, "blocks"_a, "threads"_a = 0, "files"_a = nb::list(), "iq1_masks"_a = nb::none(),
       nb::sig("def pack_tiles(out: numpy.ndarray[numpy.uint8], blocks: list[tuple], threads: int = 0, "
-              "file: tuple[str, numpy.ndarray[numpy.uint8]] | None = None, "
+              "files: list[tuple[str, numpy.ndarray[numpy.uint8]]] = [], "
               "iq1_masks: numpy.ndarray[numpy.uint16] | None = None) -> None"),
       "Pack weight tiles (every tile format: bit-identical to the formats' pack_tile) into out. A block: "
       "(format, R, S, nsb, n_kc, kc_group, n_rt, rt0, offset, col_stride, tensors, rows, row_sb, G) as "
@@ -87,9 +90,10 @@ void bind_pack(nb::module_& m) {
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
       "consecutive in rows, along K), or that and (tile0, pair, col_tiles): a Region.half region's block, its tiles "
       "from tile tile0 of a column block of col_tiles tiles, pair 1: row tiles in pairs sharing their tail tile "
-      "(artlite::PackBlock). threads: 0 = one per physical core; file: (path, the caller's mapping of the "
-      "whole file) when the tensors are arrays of that mapping: the packer reads them through views of its own, read "
-      "into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping stays untouched); "
+      "(artlite::PackBlock). threads: 0 = one per physical core; files: (path, the caller's mapping of the "
+      "whole file) of the files the tensors lie in: a tensor inside one of these mappings is read through views of the "
+      "packer's own, read into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping "
+      "stays untouched), any other as the memory it is; "
       "iq1_masks: the IQ1_S grid's masks (formats.iq1.grid_masks), which IQ1_S blocks need.");
 
   m.def(

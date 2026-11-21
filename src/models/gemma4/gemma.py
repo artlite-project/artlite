@@ -41,6 +41,7 @@ from ml_dtypes import bfloat16
 from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS as BATCH  # tokens per dispatch
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import GemmaConfig, assistant_of
 
 from ..lanes import alone
@@ -315,7 +316,7 @@ class Gemma(Model):
         if kind == "draft-mtp" and draft_model is None and not os.path.exists(assistant_of(path)):
             raise ValueError(f"{path}: no MTP drafter ({os.path.basename(assistant_of(path))} next to it)")
         self.drafter = None if kind == "none" else draft_model or ""  # (``NpuGemma``'s)
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.tokenizer = GemmaTokenizer(self.gguf)
         self.eos_token_ids = GemmaConfig.from_gguf(self.gguf).eos_token_ids
 

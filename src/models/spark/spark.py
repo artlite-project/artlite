@@ -22,6 +22,7 @@ from collections.abc import Iterator, Sequence
 import numpy as np
 
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import SparkConfig, spark_dspark_of
 
 from ..dspark import MarkovChain
@@ -285,7 +286,7 @@ class Spark(Model):
     efforts = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "high"}  # noqa: RUF012
 
     def __init__(self, path: str, *, spec_type: str = "auto", draft_model: str | None = None):
-        self.gguf = GGUFFile(path)
+        self.gguf = open_weights(path)
         self.cfg = SparkConfig.from_gguf(self.gguf)
         self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
