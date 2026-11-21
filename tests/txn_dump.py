@@ -36,8 +36,10 @@ import numpy as np
 from artlite import _native, txn
 from artlite.decode.image import TileImage
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import (
     QwenConfig,
+    checkpoint,
     decision_gguf,
     decision_mmproj,
     flint_gguf,
@@ -232,7 +234,7 @@ def _llama(path: str, kv_k: str) -> Callable[[Callable[[object], _Log]], None]:
     def run(attach: Callable[[object], _Log]) -> None:
         from models.llama.overlay import LlamaOverlay
 
-        ov = LlamaOverlay(GGUFFile(path), kv_k=kv_k)
+        ov = LlamaOverlay(open_weights(path), kv_k=kv_k)
         log = attach(ov.op)
         _run_plain(ov, log, lambda x, p, lg: ov.step(x, p, logits=lg), lm=False)
 
@@ -697,6 +699,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "llama-3B-Q4_K_M-sequences": (llama_gguf("Q4_K_M", "3B"), _llama_sequences),
     "llama-8B-Q4_K_S": (llama_gguf("Q4_K_S", "8B"), lambda p: _llama(p, "single")),
     "qwen3-0.6B-Q4_1": (qwen3_gguf("0.6B"), lambda p: _llama(p, "hilo")),
+    "qwen3-0.6B-PARO": (checkpoint("qwen3-0.6B-paro"), lambda p: _llama(p, "hilo")),  # (a checkpoint directory)
     "qwen3-embedding-4B-Q4_K_M": (qwen3_gguf("embedding-4B"), lambda p: _llama(p, "hilo")),  # (half regions in pairs)
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "gemma-E4B-Q4_0-sequences": (gemma_gguf("Q4_0"), _gemma_sequences),
