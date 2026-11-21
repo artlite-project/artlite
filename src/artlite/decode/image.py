@@ -43,6 +43,7 @@ from ..gguf_model import GGUFFile, QTensor
 from ..operators.design import COLS
 from ..paro import ParoTensor
 from .protocol import NX_PER_NORM, OBJ_K, POST_K
+from .screen import HALF, derived, plane_rows
 
 PAD = 64 * 1024
 BLOCK_BYTES = 3 << 30  # a column-major layout block at most (8 columns of its layers' regions)
@@ -328,7 +329,8 @@ class TileImage:
         for bname, tensors, rows, *own in parts:  # (own: the block's tile format, a plane of its tensors': ``packs_from``)
             fmts = [self.fmt(t) for t in tensors]
             if own:
-                assert all(packs_from(own[0], self.qtype(t)) for t in tensors) and G == 1, (bname, own, fmts)
+                assert all(packs_from(own[0], self.qtype(t)) or derived(own[0], self.qtype(t)) for t in tensors) \
+                    and G == 1, (bname, own, fmts)
                 fmts = list(own)
             if len(set(fmts)) > 1:
                 if name not in GU_REGIONS or len(tensors) != 2 or G > 1:
@@ -474,6 +476,8 @@ class TileImage:
         assert out.dtype == np.uint8 and out.size >= self.nbytes
         blocks = [(r, b) for r in self.regions + self.slabs for b in r.blocks]
         paro = [x for x in blocks if any(isinstance(self.tensor(t), ParoTensor) for t in x[1].tensors)]
+        # (a half-precision head's Q4_0 plane: rows quantized here, ``decode.screen``)
+        paro += [x for x in blocks if any(derived(x[1].fmt, self.qtype(t)) for t in x[1].tensors)]
         own = [x for x in blocks if set(x[1].tensors) & set(self._own) and not _member(x, paro)]  # (tensors in memory)
         mapped = [x for x in blocks if not _member(x, own) and not _member(x, paro)]
         _pack_tiles(out, [x for r, b in mapped for x in self._native_blocks(r, b)], threads=threads,
@@ -492,9 +496,11 @@ class TileImage:
     def paro_rows(self, name: str) -> QTensor:
         """A PARO linear's rows of blocks for the packer (``paro.ParoTensor.blocks``), its K in the storage order of its
         rotation's tan form within each group (``paro.TanForm.chan``: the decode and the prefill hand the GEMMs x' in
-        that order)."""
+        that order); a half-precision head's Q4_0 plane (``decode.screen.plane_rows``)."""
         t = self.tensor(name)
-        assert isinstance(t, ParoTensor)
+        if not isinstance(t, ParoTensor):
+            assert t.qtype in HALF, (name, t.qtype)
+            return QTensor(name=name, qtype="Q4_0", rows=t.rows, cols=t.cols, raw=plane_rows(t))
         return t.blocks()
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:

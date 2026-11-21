@@ -63,7 +63,7 @@ from artlite.decode.head import (
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
-from artlite.decode.screen import screened
+from artlite.decode.screen import plane, screened
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import QwenConfig
 from artlite.moe.image import MoeImage
@@ -144,7 +144,7 @@ class QwenImage(MoeImage, TileImage):
         # ``decode.design``'s "Designs of 8 slots")
         self.screen = (screen and self.SCREEN and not (cfg.nextn_layers and not cfg.moe)
                        and screened(self.qtype(lm), self.formats()))
-        self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *(("Q6_KH",) if self.screen else ()))], H)
+        self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *((plane(self.qtype(lm)),) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()
         if self.draft_cols and mtp:

@@ -43,7 +43,7 @@ import numpy as np
 from artlite.decode.design import ROT_GROUP
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
 from artlite.decode.protocol import C_LEN, MAX_K, rot_objects
-from artlite.decode.screen import screened
+from artlite.decode.screen import plane, screened
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
@@ -82,9 +82,10 @@ class LlamaImage(NormedImage):
         self.lm = lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         rows = column_rows(self.vocab)
         self._norm(-1, "lm")
-        # (a Q6_K head as its high plane, the logits that matter exactly on the host: ``decode.screen``)
+        # (a Q6_K head as its high plane, an F16 / BF16 one as a Q4_0 plane, the logits that matter exactly on the host:
+        # ``decode.screen``)
         self.screen = screened(self.qtype(lm), self.formats())
-        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1), *(("Q6_KH",) if self.screen else ()))], H)
+        self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1), *((plane(self.qtype(lm)),) if self.screen else ()))], H)
         self._place()
 
     def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:

@@ -1,13 +1,15 @@
-"""A screened LM head: the NPU reads the head's high plane (``formats.q6h``: a Q6_K head's scales and the top 2 bits of
-its codes, 39% of its bytes), and the host computes the logits that can matter exactly, from the model file's own rows
-(read in place, as an embedding lookup).
+"""A screened LM head: the NPU reads the head's plane (``PLANES``: a Q6_K head's high plane, ``formats.q6h``: its scales
+and the top 2 bits of its codes, 39% of its bytes; an F16 / BF16 head's Q4_0 plane, quantized from its rows at load:
+28% of its bytes), and the host computes the logits that can matter exactly, from the model file's own rows (read in
+place, as an embedding lookup).
 
 With a row's weights d sc (q - 32) = a (p + r), p the plane's part of a code and r the rest (its low 4 bits less 8), the
 plane's logit of row i is sum a p g against the exact sum a (p + r) g (g: the head's input, the normed hidden state).
 Per row, from the file's codes at load (``_native.screen_stats``): rho_i = sum a^2 r (p + r) / sum a^2 (p + r)^2, the
 share of a logit the plane lacks in the mean (~0.083: a row's largest logits are 8% short, 2 - 3 logits of a token's
 best), and what is left once that is put back, a deviation sigma_i = sqrt(mean a^2 (r - rho (p + r))^2) |g| / (1 - rho)
-(~0.75 of a logit on Qwen3.6-35B-A3B). So a logit lies within ``Z`` sigma_i of its estimate, the screened value / (1 -
+(~0.75 of a logit on Qwen3.6-35B-A3B; a Q4_0 plane's: rho ~0, and its largest 32-value block's deviation of what it
+rounds away, ``_native.screen_stats_plane``: the input's outlier channels put a row's error in a few blocks). So a logit lies within ``Z`` sigma_i of its estimate, the screened value / (1 -
 rho_i): its bounds (of a generation's 200 K largest logits the furthest lay 4.7 sigma off; without rho the largest
 logits lie 4 - 6 sigma low). The rows computed exactly for the k largest logits (``Screen.candidates``; the passes
 over the vocabulary: ``_native.screen_*``, which read the logits and the rows' numbers and write nothing):
@@ -40,7 +42,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native, settings
-from ..formats import q6h, tile_format
+from ..formats import q6h
 from ..gguf_model import GGUFFile
 
 Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
@@ -52,17 +54,43 @@ IDS = 16384  # the rows a native pass collects (past them: numpy's)
 FILE_FORMATS = 3  # a screened head: in files of this many tile formats at most (``screened``)
 
 
+PLANES = {q6h.SOURCE: "Q6_KH", "F16": "Q4_0", "BF16": "Q4_0"}  # an LM head's GGUF type -> its plane's tile format
+HALF = ("F16", "BF16")  # (heads whose plane the image quantizes at load: ``derived``)
+
+
 def screens(qtype: str) -> bool:
-    """Whether an LM head of this GGUF type can be screened (its high plane has a tile format)."""
-    return qtype == q6h.SOURCE
+    """Whether an LM head of this GGUF type can be screened (its plane has a tile format)."""
+    return qtype in PLANES
+
+
+def plane(qtype: str) -> str:
+    """The tile format of an LM head's plane."""
+    return PLANES[qtype]
+
+
+def derived(fmt: str, qtype: str) -> bool:
+    """Whether tiles of format ``fmt`` of a tensor of GGUF type ``qtype`` are a half-precision head's Q4_0 plane: rows
+    the image quantizes at load (``_native.q4_0_rows``), the packer packing those."""
+    return qtype in HALF and fmt == PLANES[qtype]
 
 
 def screened(qtype: str, formats: set[str]) -> bool:
-    """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a high
-    plane, in a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices). Each paged
-    format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its largest page that short
-    with an eighth."""
-    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {tile_format(qtype)}) <= FILE_FORMATS
+    """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a plane, in
+    a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices). Each paged format's dispatch
+    takes 64 B of the main cores' page slot, and Occamy's seven leave its largest page that short with an eighth."""
+    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {PLANES[qtype]}) <= FILE_FORMATS
+
+
+def half_rows(t: object) -> np.ndarray:
+    """A half-precision tensor's rows as (rows, cols) uint16 words (a view of its mapping)."""
+    return np.asarray(t.raw).view(np.uint16).reshape(t.rows, t.cols)
+
+
+def plane_rows(t: object, threads: int = 0) -> np.ndarray:
+    """A half-precision head's Q4_0 plane as GGUF rows (rows, cols / 32 * 18) uint8 (``_native.q4_0_rows``)."""
+    out = np.empty((t.rows, t.cols // 32 * 18), np.uint8)
+    _native.q4_0_rows(half_rows(t), t.qtype == "BF16", t.cols, out, threads)
+    return out
 
 
 class Screen:
@@ -72,12 +100,18 @@ class Screen:
     def __init__(self, gguf: GGUFFile, name: str, norm: np.ndarray, eps: float, n: int):
         t = gguf.tensor(name)
         assert screens(t.qtype) and n <= t.rows, (name, t.qtype, n)
-        self.raw, self.eps, self.n = t.raw, eps, n  # (the file's rows: its mapping)
+        self.half = t.qtype in HALF  # (a half-precision head: rows of words, bf16 or fp16)
+        self.bf16 = t.qtype == "BF16"
+        self.raw = half_rows(t) if self.half else t.raw  # (the file's rows: its mapping)
+        self.eps, self.n = eps, n
         self._populate: Callable[[], None] | None = lambda: gguf.populate(name)  # (before the first rows: ``exact``)
         self.norm = np.ascontiguousarray(norm, np.float32)
         # (per row: 1 / (1 - rho_i), and Z sigma_i per unit of |g|)
         self.scale, self.bound = np.empty(n, np.float32), np.empty(n, np.float32)
-        _native.screen_stats(t.raw, t.cols, self.scale, self.bound)
+        if self.half:
+            _native.screen_stats_plane(self.raw, self.bf16, plane_rows(t)[:n], t.cols, self.scale, self.bound)
+        else:
+            _native.screen_stats(t.raw, t.cols, self.scale, self.bound)
         self.bound *= np.float32(Z)
         self.rows = 0  # (rows computed exactly so far)
         self.taken = 0  # (choices so far: ``candidates``)
@@ -94,6 +128,8 @@ class Screen:
             self._populate()
             self._populate = None
         self.rows += len(ids)
+        if self.half:
+            return _native.screen_exact_half(self.raw, self.bf16, np.ascontiguousarray(ids, np.int32), g)
         return _native.screen_exact(self.raw, np.ascontiguousarray(ids, np.int32), g)
 
     def _above(self, bits: np.ndarray, gnorm: float, thr: float, mask: np.ndarray | None = None) -> np.ndarray:

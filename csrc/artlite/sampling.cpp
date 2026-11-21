@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <thread>
 #include <vector>
 
 namespace artlite {
@@ -413,6 +414,106 @@ void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size
       uint16_t d16;
       std::memcpy(&d16, b + 208, 2);
       total += double(_mm512_reduce_add_ps(acc)) * double(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+    }
+    out[r] = float(total);
+  }
+}
+
+namespace {
+
+// 16 half-precision values as fp32
+inline __m512 half16(const uint16_t* x, bool bf16) {
+  const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x));
+  return bf16 ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16)) : _mm512_cvtph_ps(h);
+}
+
+// a Q4_0 block's values (18 B: fp16 d, 16 bytes of nibbles, value j < 16 low, j + 16 high) as two fp32 vectors
+inline void q4_0_block(const uint8_t* b, __m512& lo, __m512& hi) {
+  uint16_t d16;
+  std::memcpy(&d16, b, 2);
+  const __m512 d = _mm512_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+  const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 2));
+  const __m128i m15 = _mm_set1_epi8(15), c8 = _mm_set1_epi8(8);
+  const __m128i l = _mm_sub_epi8(_mm_and_si128(q, m15), c8), h = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(q, 4), m15), c8);
+  lo = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(l)), d);
+  hi = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(h)), d);
+}
+
+void q4_0_row(const uint16_t* x, bool bf16, size_t cols, uint8_t* out) {
+  for (size_t k = 0; k < cols; k += 32, out += 18) {
+    float v[32];
+    _mm512_storeu_ps(v, half16(x + k, bf16));
+    _mm512_storeu_ps(v + 16, half16(x + k + 16, bf16));
+    float amax = 0.0f, mx = 0.0f;
+    for (int j = 0; j < 32; j++)
+      if (std::fabs(v[j]) > amax) {
+        amax = std::fabs(v[j]);
+        mx = v[j];
+      }
+    const float d = mx / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    const uint16_t d16 = uint16_t(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(d), _MM_FROUND_TO_NEAREST_INT), 0));
+    std::memcpy(out, &d16, 2);
+    for (int j = 0; j < 16; j++) {
+      const int a = std::min(15, int(int8_t(v[j] * id + 8.5f))), b = std::min(15, int(int8_t(v[j + 16] * id + 8.5f)));
+      out[2 + j] = uint8_t(a | (b << 4));
+    }
+  }
+}
+
+}  // namespace
+
+void q4_0_rows(const uint16_t* x, bool bf16, size_t stride, size_t n, size_t cols, uint8_t* out, unsigned threads) {
+  const size_t rb = cols / 32 * 18;
+  const unsigned nt = std::max(1u, threads ? threads : std::thread::hardware_concurrency() / 2);
+  std::vector<std::thread> pool;
+  for (unsigned t = 0; t < nt; t++)
+    pool.emplace_back([=] {
+      for (size_t i = n * t / nt; i < n * (t + 1) / nt; i++) q4_0_row(x + i * stride, bf16, cols, out + i * rb);
+    });
+  for (auto& t : pool) t.join();
+}
+
+void screen_stats_plane(const uint16_t* w, bool bf16, size_t stride, const uint8_t* q, size_t n, size_t cols,
+                        float* scale, float* bound) {
+  const size_t rb = cols / 32 * 18;
+  for (size_t i = 0; i < n; i++) {
+    const uint16_t* x = w + i * stride;
+    const uint8_t* b = q + i * rb;
+    __m512 rw = _mm512_setzero_ps(), ww = _mm512_setzero_ps();
+    for (size_t k = 0; k < cols; k += 32, b += 18) {
+      __m512 lo, hi;
+      q4_0_block(b, lo, hi);
+      const __m512 w0 = half16(x + k, bf16), w1 = half16(x + k + 16, bf16);
+      rw = _mm512_fmadd_ps(_mm512_sub_ps(w0, lo), w0, _mm512_fmadd_ps(_mm512_sub_ps(w1, hi), w1, rw));
+      ww = _mm512_fmadd_ps(w0, w0, _mm512_fmadd_ps(w1, w1, ww));
+    }
+    const double sww = _mm512_reduce_add_ps(ww);
+    const double rho = sww > 0 ? double(_mm512_reduce_add_ps(rw)) / sww : 0.0;
+    const __m512 vr = _mm512_set1_ps(float(rho));
+    double nv = 0.0;  // (the largest block's mean square of r - rho w)
+    b = q + i * rb;
+    for (size_t k = 0; k < cols; k += 32, b += 18) {
+      __m512 lo, hi;
+      q4_0_block(b, lo, hi);
+      const __m512 w0 = half16(x + k, bf16), w1 = half16(x + k + 16, bf16);
+      const __m512 e0 = _mm512_fnmadd_ps(vr, w0, _mm512_sub_ps(w0, lo)), e1 = _mm512_fnmadd_ps(vr, w1, _mm512_sub_ps(w1, hi));
+      nv = std::max(nv, double(_mm512_reduce_add_ps(_mm512_fmadd_ps(e0, e0, _mm512_mul_ps(e1, e1)))) / 32.0);
+    }
+    scale[i] = float(1.0 / (1.0 - rho));
+    bound[i] = float(std::sqrt(nv) / (1.0 - rho));
+  }
+}
+
+void screen_exact_half(const uint16_t* w, bool bf16, size_t stride, const int32_t* ids, size_t m, const float* g,
+                       size_t cols, float* out) {
+  for (size_t r = 0; r < m; r++) {
+    const uint16_t* x = w + size_t(ids[r]) * stride;
+    double total = 0.0;
+    for (size_t k = 0; k < cols; k += 256) {  // (fp32 sums of 256 products, the row's in fp64)
+      __m512 acc = _mm512_setzero_ps();
+      for (size_t j = k; j < std::min(cols, k + 256); j += 16)
+        acc = _mm512_fmadd_ps(half16(x + j, bf16), _mm512_loadu_ps(g + j), acc);
+      total += double(_mm512_reduce_add_ps(acc));
     }
     out[r] = float(total);
   }

@@ -60,7 +60,6 @@ from artlite.decode.design import ROT_GROUP
 from artlite.decode.model import InputRegion, paged_formats
 from artlite.decode.protocol import (
     C_LEN,
-    DIMS_OBJ,
     F_EMITR,
     F_GU,
     F_MAIN,
@@ -212,12 +211,11 @@ class LlamaOverlay(AttentionOverlay):
         L, name = phase
         if name == "rot_in":
             regs = [InputRegion(self._take("ACT", XB), 0, 0)]
-        elif name == "rot_o":
-            K = self.nh * self.hd * COLS
-            regs = [InputRegion(self._take("ACT", region_bytes(K)), 0, K)]
-        elif name == "rot_down":
-            K = self.cfg.intermediate_size
-            regs = [InputRegion(self._take("ACT", region_bytes(K, 2 * SLOTS)), 0, K)]
+        elif name in ("rot_o", "rot_down"):  # (a metadata object per sub-phase: ``_rot_subs``, then x)
+            n, mul = self._rot_slice(name)
+            K, subs = n * COLS, len(self._rot_subs(name, SLOTS))
+            off = self._take("ACT", region_bytes(K, mul * SLOTS) + (subs - 1) * XB)
+            regs = [InputRegion(off + i * XB, 0, K, x0=(subs - i) * XB) for i in range(subs)]
         else:
             r = self.image.region(L, name)
             assert len(mp.group_chunks(r)) == 1, f"{name}: one K group"
@@ -233,21 +231,36 @@ class LlamaOverlay(AttentionOverlay):
         """(PARO, rot_o / rot_down) A column's slice of the input: (channels, x's slots per k block for S = 4)."""
         return (self.nh * self.hd, 1) if name == "rot_o" else (self.cfg.intermediate_size // COLS, 2)
 
+    def _rot_subs(self, name: str, S: int) -> list[tuple[int, int]]:
+        """(PARO, rot_o / rot_down) The sub-phases of a rotation phase of S slots: (first group, groups) of the column's
+        slice, an X object each. A rotation phase of several X objects deadlocks: the main core takes an X object's
+        rotation objects before the next X object, the attention cores (on the same broadcast streams) skip a phase's X
+        objects before its A objects, and each stream stalls on the consumer whose L1 objects are full."""
+        n, mul = self._rot_slice(name)
+        per = XPAY // (2 * mul * packed_slots(S) * ROT_GROUP)  # (groups of an X object)
+        G = n // ROT_GROUP
+        return [(g, min(per, G - g)) for g in range(0, G, per)]
+
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
         if not self.paro or name in ("lm",):
             return super()._groups(L, name, S)
         flags, per = self._flags(L, name), 4 if S == 1 else (2 if S == 2 else 1)  # (per: strips of an input object)
         nrot = self._rot_objects(L, name)
-        if name in ("rot_in", "rot_o", "rot_down"):  # (no tiles: the rotation objects only)
+        if name == "rot_in":  # (no tiles: the rotation objects only)
             m = np.zeros(META, np.int32)
-            m[M_FLAGS], m[M_NS], m[M_NT], m[M_NRA] = F_MAIN | flags, S, nrot, nrot
-            if name == "rot_in":
-                m[M_NRC] = 3
-            else:  # (the column's slice as X objects: counted as the other cores' strips, ``decode.attn``)
-                n, mul = self._rot_slice(name)
-                m[M_RGN] = n // ROT_GROUP
-                m[M_NX] = -(-2 * mul * packed_slots(S) * n // XPAY) * per
+            m[M_FLAGS], m[M_NS], m[M_NT], m[M_NRA], m[M_NRC] = F_MAIN | flags, S, nrot, nrot, 3
             return [mp.Group(0, 0, m, 0, 0)]
+        if name in ("rot_o", "rot_down"):  # (per sub-phase its X object, counted as the other cores' strips:
+            # ``decode.attn``, and its rotation objects)
+            out = []
+            for _, ng in self._rot_subs(name, S):
+                m = np.zeros(META, np.int32)
+                m[M_FLAGS], m[M_NS], m[M_NX], m[M_RGN] = F_MAIN | flags, S, per, ng
+                m[M_NT] = m[M_NRA] = -(-ng // 2)
+                out.append(mp.Group(0, 0, m, 0, 0))
+            assert sum(int(g.meta[M_NT]) for g in out) == nrot, (name, nrot)
+            # (the regions' metadata objects past S's sub-phases: unread, written as zeros: every S writes the same bytes)
+            return out + [mp.Group(0, 0, np.zeros(META, np.int32), 0, 0) for _ in self.inp[(L, name)][len(out):]]
         out = super()._groups(L, name, S)
         for i, g in enumerate(out):
             if flags & F_PSQ:  # (the partial sums object counted in: the other cores skip it)
@@ -271,14 +284,18 @@ class LlamaOverlay(AttentionOverlay):
             if name == "rot_in":  # (the metadata object: the copies come from the residual)
                 for c in range(COLS):
                     seq.fill("X", c, self.dev.address("ACT", rg.off), XB)
-            elif name in ("rot_o", "rot_down"):  # (the metadata object, then the column's slice)
+            elif name in ("rot_o", "rot_down"):  # (per sub-phase its metadata object, then its X object: the XB
+                # bytes ending with the slice's part, ``_rot_subs``; the drains first: past 4 queued fills a column's
+                # next fill waits for its oldest, whose room the cores make only while their outputs drain)
+                self._outputs(seq, st, phase)
                 n, mul = self._rot_slice(name)
-                nobj = -(-2 * mul * sp * n // XPAY)
-                for c in range(COLS):
-                    seq.fill("X", c, self.dev.address("ACT", rg.off), XB)
-                    at = rg.off + XB + 2 * mul * sp * n * c - (XB - XPAY)  # (object i: the XB bytes ending with the
-                    # slice's i-th XPAY bytes)
-                    seq.fill("X", c, self.dev.address("ACT", at), nobj * XB, DIMS_OBJ)
+                x = rg.off + rg.x0
+                for i, (g0, _) in enumerate(self._rot_subs(name, st.S)):
+                    for c in range(COLS):
+                        seq.fill("X", c, self.dev.address("ACT", self.inp[phase][i].off), XB)
+                        at = x + 2 * mul * sp * (n * c + ROT_GROUP * g0) - (XB - XPAY)
+                        seq.fill("X", c, self.dev.address("ACT", at), XB)
+                return
             elif rg.x0 != XB:  # (F_PSQ: the partial sums object after the metadata object)
                 for c in range(COLS):
                     seq.fill("X", c, self.dev.address("ACT", rg.off), *rot_input_fill(rg.K, sp))
@@ -291,7 +308,7 @@ class LlamaOverlay(AttentionOverlay):
         """(PARO) n output values per slot of column c (objects (j, slot) of C_LEN values) -> the elements e0 .. e0 + n
         of a phase's x ([k block][slot mul sp][8]: rot_down's [gate | up]; ``so``: from slot so on), per K group."""
         sp = packed_slots(S)
-        for rg in self.inp[phase]:
+        for rg in self.inp[phase][:1] if phase[1] in ("rot_o", "rot_down") else self.inp[phase]:  # (sub-phases: one x)
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
             j = a
             while j < b:  # (repeated BDs: at most 64 iterations)
@@ -331,7 +348,8 @@ class LlamaOverlay(AttentionOverlay):
             elif name in ("gate", "up"):
                 self._x_to(seq, c, (L, "rot_down"), e0=ffn * c, n=ffn, S=S, mul=2, so=packed_slots(S) if name == "up" else 0)
             elif name == "rot_down":
-                self._x_to(seq, c, (L, "down"), e0=ffn * c, n=ffn, S=S)
+                n = self._rot_slice(name)[0]
+                self._x_to(seq, c, (L, "down"), e0=n * c, n=n, S=S)
             elif name == "down" and nxt is not None:
                 self._rot_copies(seq, c, S, [(nxt, n) for n in "qkv"])
             elif name == "down":

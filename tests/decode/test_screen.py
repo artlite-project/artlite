@@ -1,6 +1,7 @@
-"""A screened LM head's host side (``artlite.decode.screen``) on a random Q6_K matrix, no NPU: the exact rows
-(``_native.screen_exact``) against the dequantized matrix, and from screened logits computed as the cores compute them
-(the high plane's weights, ``formats.q6h``, rounded to bf16) the exact largest logits, the dense row, and
+"""A screened LM head's host side (``artlite.decode.screen``) on a random Q6_K matrix and random F16 / BF16 ones, no NPU:
+the exact rows (``_native.screen_exact``, ``screen_exact_half``) against the dequantized matrix, and from screened
+logits computed as the cores compute them (the high plane's weights, ``formats.q6h``; a half-precision head's Q4_0 plane,
+quantized at load: ``screen.plane_rows``; rounded to bf16) the exact largest logits, the dense row, and
 ``models.sampling``'s choices (penalties, a mask) against those of the exact logits."""
 
 import numpy as np
@@ -31,9 +32,27 @@ class _File:
         pass
 
 
-@pytest.fixture(scope="module")
-def head() -> tuple[SC.Screen, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """A screen of a random Q6_K head, its exact weights (V, H) and its high plane's (float64), its fields."""
+def _half_head(qtype: str) -> tuple[SC.Screen, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """A screen of a random half-precision head (``qtype`` F16, BF16), its exact weights (V, H) and its Q4_0 plane's
+    (float64), no fields."""
+    rng = np.random.default_rng(7)
+    dt = np.float16 if qtype == "F16" else bfloat16
+    w = (rng.standard_normal((V, H)) * rng.uniform(0.01, 0.05, (V, 1))).astype(dt)
+    t = QTensor(name="output.weight", qtype=qtype, rows=V, cols=H, raw=w.view(np.uint16))
+    q = SC.plane_rows(t).reshape(V, H // 32, 18)
+    d = q[..., :2].copy().view(np.float16)[..., 0].astype(np.float64)
+    codes = np.concatenate([q[..., 2:] & 15, q[..., 2:] >> 4], -1).astype(np.float64) - 8
+    plane = (codes * d[..., None]).reshape(V, H)
+    norm = np.random.default_rng(1).uniform(0.5, 2.0, H).astype(np.float32)
+    return SC.Screen(_File(t), "output.weight", norm, 1e-6, V), w.astype(np.float64), plane, {}
+
+
+@pytest.fixture(scope="module", params=["Q6_K", "F16", "BF16"])
+def head(request: pytest.FixtureRequest) -> tuple[SC.Screen, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """A screen of a random Q6_K head, its exact weights (V, H) and its high plane's (float64), its fields; of a random
+    F16 / BF16 head, with its Q4_0 plane (``_half_head``)."""
+    if request.param != "Q6_K":
+        return _half_head(request.param)
     t = random_tensor("Q6_K", V, H, 7)
     f = t.fields()
     a = np.repeat((f["d"][..., None] * f["sc"].astype(np.float64)).reshape(V, -1), 16, 1)
@@ -201,8 +220,16 @@ def test_native_passes() -> None:
 
 def test_stats(head: tuple) -> None:
     """``_native.screen_stats``: a row's share rho of a logit that its high plane lacks and the deviation left, from
-    its codes and scales, against numpy on the tensor's fields."""
+    its codes and scales, against numpy on the tensor's fields; a half-precision head's (``screen_stats_plane``) from its
+    weights and its Q4_0 plane's."""
     sc, f = head[0], head[3]
+    if not f:
+        w, r = head[1], head[1] - head[2]
+        rho = (r * w).sum(1) / (w * w).sum(1)
+        nv = ((r - rho[:, None] * w) ** 2).reshape(V, -1, 32).mean(-1).max(1)  # (the largest block's)
+        assert np.allclose(sc.scale, 1 / (1 - rho), rtol=1e-5)
+        assert np.allclose(sc.bound, SC.Z * np.sqrt(nv) / (1 - rho), rtol=1e-3)
+        return
     a2 = np.repeat((f["d"][..., None] * f["sc"].astype(np.float64)).reshape(V, -1) ** 2, 16, 1)
     wq, r = f["q"].astype(np.float64) - 32, (f["q"] & 15).astype(np.float64) - 8
     rho = (a2 * r * wq).sum(1) / (a2 * wq * wq).sum(1)

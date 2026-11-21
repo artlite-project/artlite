@@ -336,7 +336,7 @@ class ModelOverlay:
         for rg in self.inp[phase]:
             if rg.k0 <= e < rg.k0 + rg.K:
                 at = rg.off + STAGED_X + staged_cell(self.SLOTS) * ((e - rg.k0) // 8) if rg.staged else \
-                    rg.off + XB + 2 * sp * (e - rg.k0)
+                    rg.off + rg.x0 + 2 * sp * (e - rg.k0)
                 return at, 2 * sp * (rg.k0 + rg.K - e), 2 * self.SLOTS * rg.K
         raise ValueError(e)
 
@@ -509,14 +509,14 @@ class ModelOverlay:
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
             if whole:
                 if a < b:
-                    seq.drain(stream, c, self.dev.address("ACT", rg.off + XB + 2 * sp * (a - rg.k0)), 2 * sp * (b - a))
+                    seq.drain(stream, c, self.dev.address("ACT", rg.off + rg.x0 + 2 * sp * (a - rg.k0)), 2 * sp * (b - a))
                 continue
             j = a
             while j < b:  # (repeated BDs: at most 64 iterations)
                 m = min(b - j, 64 * C_LEN)
                 assert (j - rg.k0) % C_LEN == 0 and m % C_LEN == 0, (j, rg.k0, m)
                 nobj = m // C_LEN
-                seq.drain(stream, c, self.dev.address("ACT", rg.off + XB + 2 * sp * (j - rg.k0)), S * 2 * C_LEN,
+                seq.drain(stream, c, self.dev.address("ACT", rg.off + rg.x0 + 2 * sp * (j - rg.k0)), S * 2 * C_LEN,
                           (4, 8, 4 * sp, 4), nobj, (4 * sp * 8, nobj))
                 j += m
 
@@ -668,13 +668,13 @@ class ModelOverlay:
 
     def _write_input(self, rg: InputRegion, xi: np.ndarray) -> None:
         """A plain input's x (``protocol.interleave``, as bytes) -> the x of its (first) K group's region."""
-        self.dev.view("ACT")[rg.off + XB:rg.off + XB + xi.size] = xi
-        self.dev.flush("ACT", rg.off + XB, xi.size)
+        self.dev.view("ACT")[rg.off + rg.x0:rg.off + rg.x0 + xi.size] = xi
+        self.dev.flush("ACT", rg.off + rg.x0, xi.size)
 
     def _read_input(self, rg: InputRegion, slot: int, n: int) -> np.ndarray:
         """The first n input elements of a plain input's region in the last step, of a slot ([k block][slot sp][8] bf16:
         ``protocol.interleave``): bf16 values as fp32."""
-        sp, off = self._sp(self._last_s), rg.off + XB
+        sp, off = self._sp(self._last_s), rg.off + rg.x0
         self.dev.fetch("ACT", off, 2 * sp * n)
         v = self.dev.view("ACT")[off:off + 2 * sp * n].view(np.uint16).reshape(-1, sp, 8)[:, slot]
         return np.ascontiguousarray(v.reshape(-1)).view(bfloat16).astype(np.float32)

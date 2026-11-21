@@ -405,7 +405,7 @@ class AttentionOverlay(ModelOverlay):
                         st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[src]), 2 * self.at.d_len),
                                            L, h, u, i))
                 o = next(rg for rg in self._o_inputs(L) if rg.k0 <= nq * h < rg.k0 + rg.K)  # (its K group)
-                at = dev.address("ACT", o.off + XB + 2 * sp * (nq * h - o.k0) + 16 * a)  # ([k block][slot sp][8])
+                at = dev.address("ACT", o.off + o.x0 + 2 * sp * (nq * h - o.k0) + 16 * a)  # ([k block][slot sp][8])
                 seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
 
     def _o_inputs(self, L: int) -> list[InputRegion]:

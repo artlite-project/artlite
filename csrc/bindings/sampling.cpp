@@ -207,6 +207,55 @@ void bind_sampling(nb::module_& m) {
               "g: numpy.ndarray[numpy.float32]) -> numpy.ndarray[numpy.float32]"),
       "The exact logits of rows ids of a Q6_K matrix (raw: (rows, row bytes) of its GGUF blocks) against g (cols,) "
       "fp32: artlite::screen_exact.");
+  m.def(
+      "q4_0_rows",
+      [](nb::ndarray<const uint16_t, nb::ndim<2>, nb::device::cpu> raw, bool bf16, size_t cols,
+         nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> out, unsigned threads) {
+        const size_t n = out.shape(0);
+        if (cols % 32 || cols > raw.shape(1) || raw.stride(1) != 1 || n > raw.shape(0) || out.shape(1) != cols / 32 * 18)
+          throw artlite::Error("q4_0_rows: half-precision rows of cols columns, Q4_0 rows of cols / 32 blocks");
+        nb::gil_scoped_release release;
+        artlite::q4_0_rows(raw.data(), bf16, size_t(raw.stride(0)), n, cols, out.data(), threads);
+      },
+      "raw"_a, "bf16"_a, "cols"_a, "out"_a, "threads"_a = 0,
+      nb::sig("def q4_0_rows(raw: numpy.ndarray[numpy.uint16], bf16: bool, cols: int, out: numpy.ndarray[numpy.uint8], "
+              "threads: int = 0) -> None"),
+      "The first len(out) rows of a half-precision matrix (bf16 or fp16 words) as Q4_0 GGUF rows (a screened head's "
+      "plane): artlite::q4_0_rows.");
+  m.def(
+      "screen_stats_plane",
+      [](nb::ndarray<const uint16_t, nb::ndim<2>, nb::device::cpu> raw, bool bf16,
+         nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> q, size_t cols, FloatsOut scale,
+         FloatsOut bound) {
+        const size_t n = scale.shape(0);
+        if (cols % 32 || cols > raw.shape(1) || raw.stride(1) != 1 || n > raw.shape(0) || n > q.shape(0) ||
+            q.shape(1) != cols / 32 * 18 || bound.shape(0) != n)
+          throw artlite::Error("screen_stats_plane: half-precision rows, their Q4_0 plane, a scale and a bound per row");
+        nb::gil_scoped_release release;
+        artlite::screen_stats_plane(raw.data(), bf16, size_t(raw.stride(0)), q.data(), n, cols, scale.data(),
+                                    bound.data());
+      },
+      "raw"_a, "bf16"_a, "q"_a, "cols"_a, "scale"_a, "bound"_a,
+      nb::sig("def screen_stats_plane(raw: numpy.ndarray[numpy.uint16], bf16: bool, q: numpy.ndarray[numpy.uint8], "
+              "cols: int, scale: numpy.ndarray[numpy.float32], bound: numpy.ndarray[numpy.float32]) -> None"),
+      "Per half-precision row what its Q4_0 plane says of its logits (screen_stats'): artlite::screen_stats_plane.");
+  m.def(
+      "screen_exact_half",
+      [](nb::ndarray<const uint16_t, nb::ndim<2>, nb::device::cpu> raw, bool bf16, Ints ids, Floats g) {
+        const size_t rows = raw.shape(0), cols = g.shape(0), m = ids.shape(0);
+        if (cols % 16 || cols > raw.shape(1) || raw.stride(1) != 1)
+          throw artlite::Error("screen_exact_half: g's columns in half-precision rows");
+        for (size_t j = 0; j < m; j++)
+          if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact_half: a row past the matrix");
+        auto out = std::make_unique<float[]>(m);
+        artlite::screen_exact_half(raw.data(), bf16, size_t(raw.stride(0)), ids.data(), m, g.data(), cols, out.get());
+        return owned(std::move(out), m);
+      },
+      "raw"_a, "bf16"_a, "ids"_a, "g"_a,
+      nb::sig("def screen_exact_half(raw: numpy.ndarray[numpy.uint16], bf16: bool, ids: numpy.ndarray[numpy.int32], "
+              "g: numpy.ndarray[numpy.float32]) -> numpy.ndarray[numpy.float32]"),
+      "The exact logits of rows ids of a half-precision matrix (bf16 or fp16 words) against g (cols,) fp32: "
+      "artlite::screen_exact_half.");
 }
 
 }  // namespace artlite::bindings
