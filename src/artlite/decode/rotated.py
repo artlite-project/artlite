@@ -36,7 +36,6 @@ from .protocol import (
     SLOTS,
     XB,
     XPAY,
-    packed_slots,
     region_bytes,
     rot_input_fill,
     rot_region_bytes,
@@ -64,8 +63,9 @@ class RotatedOverlay:
         """The copies an F_ROTE phase emits."""
         raise NotImplementedError
 
-    def _add_rot_inputs(self, phase: tuple[int, str]) -> None:
-        """The input region of a rotated phase (module docstring)."""
+    def _add_rot_inputs(self, phase: tuple[int, str], extra: int = 0) -> None:
+        """The input region of a rotated phase (module docstring; ``extra``: a "rotx" input's bytes per element past its
+        x, ``model.ModelOverlay._add_inputs``')."""
         L, name = phase
         kind = self.rot_kind(name)
         if kind == "in":
@@ -73,7 +73,7 @@ class RotatedOverlay:
         elif kind == "rotx":  # (a metadata object per sub-phase: ``rot_subs``, then x)
             n, mul = self.rot_slice(name)
             K, subs = n * COLS, len(self.rot_subs(name, SLOTS))
-            off = self._take("ACT", region_bytes(K, mul * SLOTS) + (subs - 1) * XB)
+            off = self._take("ACT", region_bytes(K, mul * SLOTS) + (subs - 1) * XB + extra * K)
             regs = [InputRegion(off + i * XB, 0, K, x0=(subs - i) * XB) for i in range(subs)]
         else:
             r = self.image.region(L, name)
@@ -87,14 +87,14 @@ class RotatedOverlay:
         the next X object, the attention cores (on the same broadcast streams) skip a phase's X objects before its A
         objects, and each stream stalls on the consumer whose L1 objects are full."""
         n, mul = self.rot_slice(name)
-        per = XPAY // (2 * mul * packed_slots(S) * ROT_GROUP)  # (groups of an X object)
+        per = XPAY // (2 * mul * self._sp(S) * ROT_GROUP)  # (groups of an X object)
         G = n // ROT_GROUP
         return [(g, min(per, G - g)) for g in range(0, G, per)]
 
     def _rot_groups(self, L: int, name: str, S: int, flags: int, groups: list[mp.Group]) -> list[mp.Group]:
         """A rotated phase's groups: "in" and "rotx" phases' own; an F_PSQ / F_ROTE phase's from the plain ones
         (``groups``: the phase's as any other's)."""
-        per = 4 if S == 1 else (2 if S == 2 else 1)  # (strips of an input object)
+        per = SLOTS // self._sp(S)  # (strips of an input object)
         nrot = self.rot_objects(L, name)
         kind = self.rot_kind(name)
         if kind == "in":  # (no tiles: the rotation objects only)
@@ -127,7 +127,7 @@ class RotatedOverlay:
         first: past 4 queued fills a column's next fill waits for its oldest, whose room the cores make only while
         their outputs drain)."""
         name = phase[1]
-        kind, sp = self.rot_kind(name), packed_slots(st.S)
+        kind, sp = self.rot_kind(name), self._sp(st.S)
         for rg in self.inp[phase]:
             if kind == "in":  # (the metadata object: the copies come from the residual)
                 for c in range(COLS):
@@ -154,7 +154,7 @@ class RotatedOverlay:
              so: int = 0) -> None:
         """n output values per slot of column c (objects (j, slot) of C_LEN values) -> the elements e0 .. e0 + n of a
         phase's x ([k block][slot mul sp][8]: an F_RACT phase's [gate | up]; ``so``: from slot so on), per K group."""
-        sp = packed_slots(S)
+        sp = self._sp(S)
         regions = self.inp[phase]
         for rg in regions[:1] if self.rot_kind(phase[1]) == "rotx" else regions:  # (sub-phases: one x)
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
@@ -166,6 +166,13 @@ class RotatedOverlay:
                 seq.drain("C", c, self.dev.address("ACT", rg.off + rg.x0 + 2 * spx * (j - rg.k0) + 16 * so),
                           S * 2 * C_LEN, (4, 8, 4 * spx, 4), nobj, (4 * spx * 8, nobj))
                 j += m
+
+    def sink_out(self, seq: Sequence, c: int, n: int, S: int) -> None:
+        """n output values per slot of column c (whole C objects) -> the sink (``rot_sink``: ACT bytes the model takes
+        for outputs no phase reads, a rotation's padding groups past its consumer's K)."""
+        if n:
+            assert n % C_LEN == 0, n
+            seq.drain("C", c, self.dev.address("ACT", self.rot_sink), S * 2 * n)
 
     def emit_copies(self, seq: Sequence, c: int, S: int, to: list[tuple[int, str]]) -> None:
         """An F_ROTE emission of column c: per copy its partial sums object, then its x (the consumer's)."""

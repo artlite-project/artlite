@@ -79,20 +79,24 @@ class GdnTransfers:
         elif self.ov.g4:
             self._chunkwise(seq, st, L, S, wide=False)
         else:
-            self._token(seq, L, S)
+            self._token(seq, L, S, st)
 
-    def _gdn_in(self, seq: Sequence, L: int, S: int) -> None:
-        """gdn_in's weights and input."""
+    def _gdn_in(self, seq: Sequence, L: int, S: int, st: Step | None = None) -> None:
+        """gdn_in's weights and input (a PARO checkpoint's: gin_q's and gin_z's, ``paro_steps``)."""
         ov = self.ov
+        if ov.paro:
+            for name in ("gin_q", "gin_z"):
+                ov.paro_phase(seq, st, (L, name))
+            return
         ov._weights(seq, (L, "gdn_in"), 0)
         seq.sync()
         ov._inputs(seq, ov.inp[(L, "gdn_in")][0], S, (L, "gdn_in"))
 
-    def _token(self, seq: Sequence, L: int, S: int) -> None:
+    def _token(self, seq: Sequence, L: int, S: int, st: Step | None = None) -> None:
         """The token-by-token core: its objects whole, the conv q / k and K objects, then per pair of v heads."""
         ov = self.ov
         dev, sh = ov.dev, ov.gsh
-        self._gdn_in(seq, L, S)
+        self._gdn_in(seq, L, S, st)
         for c in range(COLS):
             seq.fill("X", c, dev.address("GOBJ", ov.gobj[L] + c * ov.gcol), 5 * XB, DIMS_OBJ)
         for c in range(COLS):
@@ -104,14 +108,13 @@ class GdnTransfers:
                 seq.fill("X", c, dev.address("GSTATE", ov.gstate[L] + c * ov.ps + 32 * p * gdn.PANEL - 256), 32 * XB,
                          DIMS_OBJ)
             for c in range(COLS):
-                h0 = gdn_v_heads(ov.cfg, c)[2 * p]
                 seq.drain("D", c, dev.address("GOBJ", ov.gdn_payload(L, c, 5 + 3 * p) + 2048), gdn.D_BYTES,
                           (512, 2, 1024, 1024))
                 seq.drain("D", c, dev.address("GSTATE", ov.gstate[L] + c * ov.ps + 32 * p * gdn.PANEL), 32 * gdn.PANEL)
                 seq.drain("D", c, dev.address("GOBJ", ov.gdn_payload(L, c, 7 + 3 * p)), gdn.D_BYTES)
-                # the pair's outputs (2 KB) at its heads in gdn_out's x, its padding (2 KB) in the sink past that K
-                # group's x (its x bytes on)
-                at, left, xg = ov.x_slot((L, "gdn_out"), gdn.D * h0, S)
+                # the pair's outputs (2 KB) at its heads in gdn_out's x (``gdn_x``), its padding (2 KB) in the sink past
+                # that K group's x (its x bytes on)
+                at, left, xg = ov.x_slot(*ov.gdn_x(L, c, 2 * p), S)
                 assert left >= 2048
                 seq.drain("D", c, dev.address("ACT", at), gdn.D_BYTES, (512, 2, xg // 4, 1024))
         assert sh.ch == (4 + sh.hc) * gdn.D
@@ -130,7 +133,6 @@ class GdnTransfers:
         self._gdn_in(seq, L, S)
         if wide:
             self._rows_wide(seq, L, S, pay)
-        vh = [gdn_v_heads(ov.cfg, c) for c in range(COLS)]
         last = hc - 1  # (the last v head the core runs: k head 1's last)
         kh_span, v_span = (gdn.KH_SPAN, gdn.V_SPAN) if wide else (gdn.KH_SPAN4, gdn.V_SPAN4)
 
@@ -170,7 +172,7 @@ class GdnTransfers:
                 seq.drain("D", c, pay(c, sh.v_slot(h)) + 2048, 3 * gdn.D_BYTES // 2)
 
         def v_do(h: int, c: int) -> None:
-            at, left, xg = ov.x_slot((L, "gdn_out"), gdn.D * vh[c][h], S)
+            at, left, xg = ov.x_slot(*ov.gdn_x(L, c, h), S)
             if not wide:  # (its gated outputs (1 KB) at its head in gdn_out's x, 1 KB of padding into the sink past that K
                 # group's x)
                 assert left >= 2 * ov.SLOTS * gdn.D

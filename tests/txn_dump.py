@@ -511,7 +511,7 @@ def _qwen(path: str, *, draft: str | None = None, dflash: str | None = None
         from models.qwen35.image import QwenImage
         from models.qwen35.overlay import QwenOverlay
 
-        gguf = GGUFFile(path)
+        gguf = open_weights(path)
         mtp = GGUFFile(draft) if draft else None
         if dflash:
             ov = QwenOverlay(gguf, max_positions=4096, image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False),
@@ -706,6 +706,7 @@ APPS: dict[str, tuple[str, Callable[[str], Callable[[Callable[[object], _Log]], 
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
     "kev-4B": (decision_gguf("kev"), _qwen),  # (half regions in pairs, a design of 4 slots)
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
+    "qwen3.5-0.8B-PARO": (checkpoint("qwen3.5-0.8B-paro"), _qwen),  # (a checkpoint directory: its inputs rotated)
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
     "qwen-27B-Q4_K_M-sequences": (qwen_gguf("Q4_K_M", "27B"), _qwen_sequences),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),

@@ -103,7 +103,7 @@ from artlite.operators.util import Attr, bf16_hilo, bf16_hilo_bits, mask64, regi
 from artlite.operators.words import WordMap
 
 from .gdn_math import MATH, PANEL, D, GdnDims
-from .words import FLAGS, GDN_IN
+from .words import FLAGS, GDN_IN, MP_CONT, MP_MORE
 
 D_BYTES = 4096  # bytes of a D object
 HIST = 3 + SLOTS  # history rows of a conv object
@@ -128,7 +128,7 @@ G_BN = _G.word("G_BN")  # (8 slots) a branching step's branch chunk: the block's
 
 def consts() -> dict[str, int]:
     """The words and flags the GDN core's kernels take: the metadata words of its objects and its state words."""
-    return XMETA.consts(PHASE, GDN_IN, FLAGS) | STATE.consts()
+    return XMETA.consts(PHASE, GDN_IN, FLAGS) | STATE.consts() | {"MP_MORE": MP_MORE, "MP_CONT": MP_CONT}
 
 
 # (8 slots) the GDN tile's locks of the k and v heads' constants, which the helper core computes (``hgdn``): asked, done;
@@ -182,17 +182,20 @@ class GdnShape(GdnDims):
     chunk: bool
 
     def __new__(cls, cfg: QwenConfig | None = None, /, *, slots: int = SLOTS, chunk: bool = False,
-                c_len: int = 64, xpay: int = 4096, meta: int = 64) -> Self:
+                c_len: int = 64, xpay: int = 4096, meta: int = 64, parts: bool = False) -> Self:
         if cls is GdnShape:
             assert slots in (SLOTS, 8)
             return super().__new__(Gdn8 if slots == 8 else Gdn4Chunk if chunk else Gdn4)
         return super().__new__(cls)
 
     def __init__(self, cfg: QwenConfig, *, c_len: int = 64, xpay: int = 4096, meta: int = 64, slots: int | None = None,
-                 chunk: bool | None = None):
+                 chunk: bool | None = None, parts: bool = False):
+        """parts: the step's message in parts (``words.M_MPART``: a PARO checkpoint's gin_q, gin_z; the cores that take a
+        whole message keep their program memory: the 27B's is 32 B short of more)."""
         assert slots in (None, self.slots) and (chunk is None or (chunk or self.slots == 8) == self.chunk)
+        assert not parts or self.slots == SLOTS, "a message in parts: a core of 4 slots"
         super().__init__(cfg)
-        self.c_len, self.xpay, self.meta = c_len, xpay, meta
+        self.c_len, self.xpay, self.meta, self.parts = c_len, xpay, meta, parts
         self.msg_values = self.ch + self.hc * D + 4 * self.hc  # (alpha, beta as fp32: 2 bf16 each)
         self.n_msg = -(-self.msg_values // c_len)
         self.msgp = self.n_msg * c_len  # bf16 elements of a slot's message
@@ -219,7 +222,7 @@ class Gdn4(GdnShape):
     def render(self, p: str) -> str:
         return _SRC.render(p=p, g=Attr(self.workspace()), gm=MATH, sigmoid=False, CH=self.ch, HC=self.hc, D=D, n_msg=self.n_msg,
                            MSGP=self.msgp, C_LEN=self.c_len, META=self.meta, XPAY=self.xpay, D_BYTES=D_BYTES,
-                           PANEL=PANEL, SMAX=SLOTS, HIST=HIST, eps=repr(self.eps),
+                           PANEL=PANEL, SMAX=SLOTS, HIST=HIST, eps=repr(self.eps), parts=self.parts,
                            rs=bf16_hilo(1 / math.sqrt(D)), **consts())
 
 
@@ -280,7 +283,7 @@ class Gdn4Chunk(GdnShape):
         return _SRC4.render(p=p, g=Attr(self.workspace()), gm=MATH, HC=self.hc, CH=self.ch, D=D, C_LEN=self.c_len, META=self.meta,
                             MSGP=self.msgp, n_msg=self.n_msg, SMAX=self.slots, eps=repr(self.eps), rs=bf16_hilo(1 / math.sqrt(D)),
                             PAN=PANEL_BYTES, P_D=P_D, P_PRM=P_PRM, strict=f"{strict:016X}", lower=f"{lower:016X}", TAB=SILU_TAB,
-                            **consts())
+                            parts=self.parts, **consts())
 
 
 class Gdn8(GdnShape):

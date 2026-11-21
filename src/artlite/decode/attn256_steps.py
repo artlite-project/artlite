@@ -246,33 +246,56 @@ class AttentionSteps:
     # ------------------------------------------------------------------
 
     def build(self, seq: Sequence, st: AttnStep, L: int, S: int, run: list[tuple[int, str]] | None = None, *,
-              phase: str = "attn_in", out: str = "attn_out") -> None:
+              phase: str | None = "attn_in", out: str = "attn_out") -> None:
         """attn_in and the attention, per sub-step (each after the last one's records are in DDR: it reads them);
         ``run``: the weights after it (a column-major image), after the last sub-step's cache reads. ``phase``: the
         phase of the attention's input (another than attn_in: K and V alone, a drafter's injection; its rows' q objects
-        as they are), ``out``: the phase whose x takes o (``x_slot``)."""
+        as they are; None: the caller's phases filled the q objects and the raw K / V objects, a PARO checkpoint's
+        attn_q, attn_k, attn_v), ``out``: the phase whose x takes o (``x_slot``)."""
+        if phase is not None:
+            self._input_phase(seq, L, S, phase)
+        self._sub_steps(seq, st, L, S, run, out)
+
+    def _input_phase(self, seq: Sequence, L: int, S: int, phase: str) -> None:
+        """The attention's input phase: its weights and input, its outputs into the q objects and the raw K / V
+        objects."""
         ov = self.ov
         dev, ash = ov.dev, ov.ash
-        nph = ash.nph
-        per = ash.kvh * attn.HD // COLS  # (K and V rows of a column: its part of KV head per c // HD)
         qkv = phase == "attn_in"
         gh = ash.spec.gate == "head" and qkv  # (the heads' gate logits after K and V: one C object, its first QC values)
         ov._weights(seq, (L, phase), 0)
         seq.sync()
         ov._inputs(seq, ov.inp[(L, phase)][0], S, (L, phase))
         for c in range(COLS):  # [q + gate | K part | V part (| gates)] per slot -> its q object, the slot's raw K, V object
-            h, e0 = divmod(per * c, attn.HD)
             q0 = ov.q_object(L, c, 0) + 4 * META
             if qkv:
-                seq.drain("C", c, dev.address("ACT", q0), S * ash.qc * 2 * (1 if ash.spec.gate == "head" else 2) * attn.HD,
-                          (C_LEN // 2, S, XB // 4, C_LEN // 2))
-            raw = ov.rawkv[L] + 4 * META
+                self.q_drain(seq, L, S, c)
             for part in (0, 1):
-                seq.drain("C", c, dev.address("ACT", raw + 2 * (2 * attn.HD * h + attn.HD * part + e0)), S * 2 * per,
-                          (C_LEN // 2, S, XB // 4, C_LEN // 2))
+                self.kv_drain(seq, L, S, c, part)
             if gh:  # (the q object's QC gates after its heads' q)
                 seq.drain("C", c, dev.address("ACT", q0 + 2 * ash.qc * attn.HD), S * 2 * C_LEN,
                           (C_LEN // 2, S, XB // 4, C_LEN // 2))
+
+    def q_drain(self, seq: Sequence, L: int, S: int, c: int) -> None:
+        """Column c's q rows (with their gates) of S slots -> its q objects."""
+        ov, ash = self.ov, self.ov.ash
+        seq.drain("C", c, ov.dev.address("ACT", ov.q_object(L, c, 0) + 4 * META),
+                  S * ash.qc * 2 * (1 if ash.spec.gate == "head" else 2) * attn.HD, (C_LEN // 2, S, XB // 4, C_LEN // 2))
+
+    def kv_drain(self, seq: Sequence, L: int, S: int, c: int, part: int) -> None:
+        """Column c's K (part 0) or V (part 1) rows of S slots -> the slots' raw K / V objects (its part of a KV head)."""
+        ov = self.ov
+        per = ov.ash.kvh * attn.HD // COLS
+        h, e0 = divmod(per * c, attn.HD)
+        raw = ov.rawkv[L] + 4 * META
+        seq.drain("C", c, ov.dev.address("ACT", raw + 2 * (2 * attn.HD * h + attn.HD * part + e0)), S * 2 * per,
+                  (C_LEN // 2, S, XB // 4, C_LEN // 2))
+
+    def _sub_steps(self, seq: Sequence, st: AttnStep, L: int, S: int, run: list[tuple[int, str]] | None,
+                   out: str) -> None:
+        """The attention's sub-steps (``build``)."""
+        ov = self.ov
+        ash, nph = ov.ash, ov.ash.nph
         nf = 2 if self.ring_groups(L) else 1  # (the cache's fills of a one-pass column: ``_cache``)
         for u, (a, n, split) in enumerate(st.subs):
             rnd = split & 3 == attn.SPLIT_ROUND  # (a round: both chains on its KV head, the cache shared 4 columns apart)

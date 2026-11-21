@@ -33,6 +33,15 @@ tiles, data region "<name>_norm") when every region's decode K groups are whole 
 (``contiguous``: the 9B, MiniCPM-V), so that a decode step streams a column's weights between two attentions as one run;
 else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its down's 17 chunk-major in groups of 5).
 
+PARO: a checkpoint whose linears are PARO tensors (``artlite.paro``; the decode's ``paro_steps``) takes each
+projection's input as its own rotated copy: the GDN layers' gdn_in in two regions, "gin_q" (attn_qkv's rows) and "gin_z"
+(attn_gate's, then ssm_alpha's and ssm_beta's rows folded into attn_gate's rotation: F32 substitutes as BFP16 planes,
+``_ab_folded``), the attention layers' attn_in in "attn_q", "attn_k", "attn_v", gate_up in "gate", "up"; the rotation
+objects of each column in data regions (``decode.rotated.RotatedImage``): "rot_in" (the first layer's copies), "rot_g" (the
+GDN outputs of the column's v heads, ssm_out's rotation), "rot_o" (the column's attention heads, attn_output's),
+"<mixer out>_rot" (gate's and up's copies of the residual slice), "rot_down" (down's, the ffn in whole groups a column:
+``down_slice``, padding groups of zeros), "down_rot" (the next layer's copies). A PARO image is region-major.
+
 An input half a chunk short of whole chunks in one K group (``decode.image.Region.half`` regions, ``tails``; a dense
 model's) is the hidden size where it is so (Kev-4B's 2560: gdn_in, attn_in, gate_up, the LM head) and down's ffn
 (MiniCPM-V's and d3-lite's 3584 in 4 chunks): those phases' inputs are of that K, the prefill's GEMMs read 2.5 of 3 (3.5
@@ -50,6 +59,7 @@ next to its experts' partials (``decode.design``'s "MoE").
 import numpy as np
 
 from artlite.decode.attn256 import OBJ_BYTES
+from artlite.decode.design import ROT_GROUP as ROT
 from artlite.decode.head import (
     DFLASH_HEAD_ROWS,
     HEAD_ROWS,
@@ -63,11 +73,13 @@ from artlite.decode.head import (
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
+from artlite.decode.rotated import RotatedImage, column_groups
 from artlite.decode.screen import plane, screened
-from artlite.gguf_model import GGUFFile
+from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.moe.image import MoeImage
 from artlite.operators.design import COLS
+from artlite.paro import ParoTensor
 from artlite.prefill.gemm import pair_tails
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
@@ -95,7 +107,7 @@ def contiguous(region: Region) -> bool:
     return all(g == region.kc_group for _, g in group_chunks(region))
 
 
-class QwenImage(MoeImage, TileImage):
+class QwenImage(RotatedImage, MoeImage, TileImage):
     """The weight image of a qwen35 GGUF file. ``draft_cols``: its MTP block's drafter's head rows per column (0: no
     block laid out; module docstring)."""
 
@@ -119,6 +131,12 @@ class QwenImage(MoeImage, TileImage):
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         self.paired = pairs
+        first = f"blk.{self.layers[0]}.ffn_gate.weight"  # (module docstring; an MoE layer has none: S8)
+        self.paro = first in gguf.tensor_info and isinstance(gguf.tensor(first), ParoTensor)
+        self._rot_init()
+        if self.paro:
+            assert not cfg.moe, "a PARO checkpoint: dense models"
+            mtp = False  # (the drafters of a PARO checkpoint: GGUF files of their own)
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab,
                          tails=TAILS if tails and not cfg.moe else frozenset())
@@ -127,10 +145,13 @@ class QwenImage(MoeImage, TileImage):
         assert cfg.num_key_value_heads * cfg.head_dim % (COLS * 64) == 0
         assert self.vocab % COLS == 0
         for layer in self.layers:
-            self._layer(layer)
+            if self.paro:
+                self._paro_layer(layer)
+            else:
+                self._layer(layer)
         trunk = all(contiguous(r) for r in self.regions)
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
-        if cfg.nextn_layers == 1 and not cfg.moe and not trunk:  # (its head: a view of a region-major image's rows)
+        if cfg.nextn_layers == 1 and not cfg.moe and not trunk and not self.paro:  # (its head: a view of a region-major image's rows)
             self.draft_cols = self._draft_cols(self.R[self.fmt(lm)], HEAD_ROWS if mtp else DFLASH_HEAD_ROWS)
         if self.draft_cols:
             F = COLS * self.draft_cols - TABLE_ROWS
@@ -152,7 +173,7 @@ class QwenImage(MoeImage, TileImage):
             self._add(L, "eh", [("eh", (f"blk.{L}.nextn.eh_proj.weight",), column_rows(H))], 2 * H)
             self._layer(L, attention=True)
         self.n_norm = -(-H // (NX_PER_NORM * OBJ_K))  # norm-weight objects of a normed phase
-        self.column_major = all(contiguous(r) for r in self.regions)
+        self.column_major = all(contiguous(r) for r in self.regions) and not self.paro
         if self.column_major:  # (each normed phase's norm-weight objects before its tiles)
             regions, self.regions = self.regions, []
             for r in regions:
@@ -201,7 +222,7 @@ class QwenImage(MoeImage, TileImage):
             b = f"blk.{L}."
             if self.cfg.moe:
                 names += self.scaled_planes(b + "post_attention_norm.weight", self.router_planes(L))
-            if not self.cfg.attention[L] and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
+            if not self.cfg.attention[L] and not self.paro and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
                 names += self.scaled_planes(b + "attn_norm.weight", (b + "ssm_alpha.weight",))
         try:
             return super().pack(out, threads=threads)
@@ -214,31 +235,139 @@ class QwenImage(MoeImage, TileImage):
         w = self.gguf.tensor("output_norm.weight" if layer < 0 else f"blk.{layer}.{NORMS[name]}.weight").dequantize()
         return norm_objects(w.reshape(-1), self.tile_bytes).view(np.uint8)
 
+    def data_objects(self, layer: int, name: str) -> np.ndarray:
+        if self.rot_region(layer, name):
+            return self._rot_objs[(layer, name)]
+        return super().data_objects(layer, name)
+
+    def _paro_layer(self, layer: int) -> None:
+        """A PARO checkpoint's layer (module docstring's "PARO")."""
+        cfg, b = self.cfg, f"blk.{layer}."
+        H, I, h8 = cfg.hidden_size, cfg.intermediate_size, cfg.hidden_size // COLS
+        if layer == self.layers[0]:
+            self.rot_data(layer, "rot_in", self._in_rot(layer))
+        if cfg.attention[layer]:
+            qh, hd = cfg.num_attention_heads // COLS, cfg.head_dim
+            q, kv = self._attn_rows(cfg)
+            self._add(layer, "attn_q", [("q", (b + "attn_q.weight",), q)], H)
+            self._add(layer, "attn_k", [("k", (b + "attn_k.weight",), kv)], H)
+            self._add(layer, "attn_v", [("v", (b + "attn_v.weight",), kv)], H)
+            self.rot_data(layer, "rot_o", [(b + "attn_output.weight", None, column_groups(0, qh * hd))])
+            self._add(layer, "attn_out", [("out", (b + "attn_output.weight",), column_rows(H))],
+                      cfg.num_attention_heads * hd)
+            out = "attn_out"
+        else:
+            qkv, z, ab = self._gdn_rows(cfg)
+            d = cfg.ssm_state
+            alpha, beta = self._ab_folded(layer)  # (F32: BFP16 planes, B_PAIR)
+            a, bt = ab[:, :ab.shape[1] // 2], ab[:, ab.shape[1] // 2:] - cfg.ssm_v_heads
+            self._add(layer, "gin_q", [("qkv", (b + "attn_qkv.weight",), qkv)], H)
+            self._add(layer, "gin_z", [("z", (b + "attn_gate.weight",), z),
+                                       ("alpha", (alpha,), np.stack([2 * a, 2 * a + 1], -1).reshape(COLS, -1)),
+                                       ("beta", (beta,), np.stack([2 * bt, 2 * bt + 1], -1).reshape(COLS, -1))], H)
+            groups = [np.concatenate([d * j // ROT + np.arange(d // ROT) for j in gdn_v_heads(cfg, c)])
+                      for c in range(COLS)]
+            self.rot_data(layer, "rot_g", [(b + "ssm_out.weight", None, groups)])
+            self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
+            out = "gdn_out"
+        g = self._vec(b + "post_attention_norm.weight")
+        self.rot_data(layer, out + "_rot", [(b + "ffn_gate.weight", g, column_groups(0, h8)),
+                                            (b + "ffn_up.weight", g, column_groups(0, h8))])
+        self._add(layer, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
+        self._add(layer, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
+        n = self.down_slice(cfg)  # (a column's slice of down's input: whole groups, the last ones padding past the ffn)
+        self.rot_data(layer, "rot_down", [(b + "ffn_down.weight", None,
+                                           [np.where(gs < I // ROT, gs, -1) for gs in column_groups(0, n)])])
+        self._add(layer, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
+        i = self.layers.index(layer)
+        if i + 1 < len(self.layers):
+            self.rot_data(layer, "down_rot", self._in_rot(self.layers[i + 1]))
+
+    @staticmethod
+    def down_slice(cfg: QwenConfig) -> int:
+        """(PARO) A column's slice of down's input in rot_down: the ffn over the columns in whole rotation groups."""
+        return -(-cfg.intermediate_size // (COLS * ROT)) * ROT
+
+    def _in_rot(self, layer: int) -> list[tuple[str, np.ndarray, list[np.ndarray]]]:
+        """(PARO) The copies of layer ``layer``'s input (the residual: its norm's weight folded into each rotation): a
+        GDN layer's for gin_q and gin_z, an attention layer's for attn_q, attn_k, attn_v."""
+        b = f"blk.{layer}."
+        g, cg = self._vec(b + "attn_norm.weight"), column_groups(0, self.cfg.hidden_size // COLS)
+        names = ("attn_q", "attn_k", "attn_v") if self.cfg.attention[layer] else ("attn_qkv", "attn_gate")
+        return [(f"{b}{n}.weight", g, cg) for n in names]
+
+    def _vec(self, name: str) -> np.ndarray:
+        return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
+
+    def tensor_name(self, layer: int, name: str) -> str:
+        """(PARO) The tensor of a layer's region (whose rotation its input takes)."""
+        return f"blk.{layer}." + {"attn_q": "attn_q", "attn_k": "attn_k", "attn_v": "attn_v", "attn_out": "attn_output",
+                                  "gin_q": "attn_qkv", "gin_z": "attn_gate", "gdn_out": "ssm_out", "gate": "ffn_gate",
+                                  "up": "ffn_up", "down": "ffn_down"}[name] + ".weight"
+
+    def _ab_folded(self, layer: int) -> list[str]:
+        """(PARO) ssm_alpha and ssm_beta (F16) as F32 substitutes W A^-1 (``_own``, kept: 2 x 16 rows a layer) that read
+        gin_z's input, as BFP16 planes [hi, lo] (``decode.image.Block.pairs``, B_PAIR: their sums the rows, exact to
+        ~2^-16): A the exact transform of attn_gate's rotation without the norm's weight (its copy x' = A (w x), so
+        W (w x) = W A^-1 x'; one plane of bfp16 is 1-4% off on the folded rows, whose channels the rotation mixes)."""
+        b = f"blk.{layer}."
+        rot = self.gguf.tensor(b + "attn_gate.weight").rot()
+        tf = rot.tan_form(None, unit=True)
+        K, g = rot.K, rot.group
+        inv = np.zeros((K, K))
+        eye = np.eye(g)
+        for j in range(K // g):  # (A per group: the rows the group's unit vectors become)
+            x = np.zeros((g, K))
+            x[:, g * j:g * (j + 1)] = eye
+            a = tf.apply(x)[:, g * j:g * (j + 1)].T  # (A's block: column i the image of e_i)
+            inv[g * j:g * (j + 1), g * j:g * (j + 1)] = np.linalg.inv(a)
+        names = []
+        for n in ("ssm_alpha", "ssm_beta"):
+            name = f"{b}{n}.weight"
+            t = self.gguf.tensor(name)
+            raw = (np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols) @ inv).astype(np.float32)
+            self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
+            names.append(name)
+        return names
+
+    def _attn_rows(self, cfg: QwenConfig) -> tuple[np.ndarray, np.ndarray]:
+        """An attention layer's rows of column c: q heads with their gate rows ([q | gate] per head), half a KV head of
+        K and V."""
+        cols = np.arange(COLS)[:, None]
+        qh, hd = cfg.num_attention_heads // COLS, cfg.head_dim
+        q = 2 * qh * hd * cols + np.arange(2 * qh * hd)[None]
+        kv = (cfg.num_key_value_heads * hd // COLS) * cols + np.arange(cfg.num_key_value_heads * hd // COLS)[None]
+        return q, kv
+
+    def _gdn_rows(self, cfg: QwenConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """A GDN layer's rows of column c: of attn_qkv, attn_gate (z) and ssm_alpha | ssm_beta (module docstring)."""
+        d, hk = cfg.ssm_state, cfg.ssm_k_heads
+        kpc = hk // COLS
+        qkv, z, ab = [], [], []
+        for c in range(COLS):
+            vh = gdn_v_heads(cfg, c)
+            qk = np.arange(kpc * d) + kpc * d * c
+            v = np.concatenate([2 * hk * d + j * d + np.arange(d) for j in vh])
+            qkv.append(np.concatenate([qk, hk * d + qk, v]))
+            z.append(np.concatenate([j * d + np.arange(d) for j in vh]))
+            ab.append(np.concatenate([vh, cfg.ssm_v_heads + np.asarray(vh)]))  # (alpha | beta stacked)
+        return np.stack(qkv), np.stack(z), np.stack(ab)
+
     def _layer(self, layer: int, attention: bool | None = None) -> None:
         """(``attention``: whether it is a full-attention layer, default ``cfg.attention``'s: an MTP block's is)"""
         cfg, b = self.cfg, f"blk.{layer}."
-        H, I, cols = cfg.hidden_size, cfg.intermediate_size, np.arange(COLS)[:, None]
+        H, I = cfg.hidden_size, cfg.intermediate_size
         if cfg.attention[layer] if attention is None else attention:
-            qh, hd = cfg.num_attention_heads // COLS, cfg.head_dim
-            q = 2 * qh * hd * cols + np.arange(2 * qh * hd)[None]  # (per head [q | gate])
-            kv = (cfg.num_key_value_heads * hd // COLS) * cols + np.arange(cfg.num_key_value_heads * hd // COLS)[None]
+            hd = cfg.head_dim
+            q, kv = self._attn_rows(cfg)  # (per head [q | gate])
             self._add(layer, "attn_in", [("q", (b + "attn_q.weight",), q), ("k", (b + "attn_k.weight",), kv),
                                          ("v", (b + "attn_v.weight",), kv)], H)
             self._add(layer, "attn_out", [("out", (b + "attn_output.weight",), column_rows(H))],
                       cfg.num_attention_heads * hd)
         else:
-            d, hk = cfg.ssm_state, cfg.ssm_k_heads
-            kpc = hk // COLS
-            qkv, z, ab = [], [], []
-            for c in range(COLS):
-                vh = gdn_v_heads(cfg, c)
-                qk = np.arange(kpc * d) + kpc * d * c
-                v = np.concatenate([2 * hk * d + j * d + np.arange(d) for j in vh])
-                qkv.append(np.concatenate([qk, hk * d + qk, v]))
-                z.append(np.concatenate([j * d + np.arange(d) for j in vh]))
-                ab.append(np.concatenate([vh, cfg.ssm_v_heads + np.asarray(vh)]))  # (alpha | beta stacked)
+            d = cfg.ssm_state
+            qkv, z, ab = self._gdn_rows(cfg)
             alpha, beta = b + "ssm_alpha.weight", b + "ssm_beta.weight"
-            ab = np.stack(ab)
             if self.fmt(alpha) == self.fmt(beta):
                 abp = [("ab", (alpha, beta), ab)]
             else:  # (an F32 alpha: its planes [hi, lo] per head, module docstring; their sums: the design's B_PAIR)
@@ -246,8 +375,7 @@ class QwenImage(MoeImage, TileImage):
                 a = ab[:, :ab.shape[1] // 2]
                 abp = [("alpha", (alpha,), np.stack([2 * a, 2 * a + 1], -1).reshape(COLS, -1)),
                        ("beta", (beta,), ab[:, ab.shape[1] // 2:] - cfg.ssm_v_heads)]
-            self._add(layer, "gdn_in", [("qkv", (b + "attn_qkv.weight",), np.stack(qkv)),
-                                        ("z", (b + "attn_gate.weight",), np.stack(z)), *abp], H)
+            self._add(layer, "gdn_in", [("qkv", (b + "attn_qkv.weight",), qkv), ("z", (b + "attn_gate.weight",), z), *abp], H)
             self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
         if cfg.moe:
             self._moe(layer, gated=True)
@@ -265,6 +393,7 @@ class MtpView:
     order = None
     column_major = False
     screen = False  # (the drafter reads its head's rows as they are)
+    paro = False  # (a PARO checkpoint's drafters: GGUF files of their own)
 
     def __init__(self, image: QwenImage, cfg: QwenConfig):
         self.model, self.cfg, self.gguf = image, cfg, image.gguf

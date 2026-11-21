@@ -5,7 +5,8 @@ and words: ``decode.attn256``).
 - the gdn_in phase's metadata object (``GDN_IN``: a phase object, its words extend the phase's) tells the GDN core the
   step's replay count (``M_NREP``), the conv shift (``M_CSHIFT``: the accepted tokens of the previous step), the commit
   flag (``M_COMMIT``) and, in the chunkwise cores, the k / v histories' base row (``M_KSHIFT``); a design of 8 slots
-  also the helper's requests per step (``M_HPAN``);
+  also the helper's requests per step (``M_HPAN``); a PARO checkpoint's two phases each their part of the message
+  (``M_MPART``);
 - a step whose last slots branch off an earlier one: its word ``M_BRANCH`` (its parent slot + 1 | its slots << 8, or
   0), the attention's kind ``decode.attn256.BRANCH``, which the F_ATT objects extend too.
 """
@@ -20,3 +21,8 @@ F_GIN = FLAGS.flag("F_GIN", 9)  # (8 slots) M_FLAGS of the gdn_in phase's metada
 GDN_IN = XMETA.kind("qwen35 gdn_in", extends=(PHASE, BRANCH))
 M_NREP, M_CSHIFT, M_COMMIT, M_KSHIFT = GDN_IN.words("M_NREP M_CSHIFT M_COMMIT M_KSHIFT", at=M_MODEL)
 M_HPAN = GDN_IN.word("M_HPAN", at=35)
+# (a PARO checkpoint: gdn_in in two phases, each on its own rotated input) the phase's part of the step's message: its
+# objects per slot | MP_MORE (more parts follow: the step waits) | MP_CONT (a later part: the step's words came with the
+# first); 0: the whole message
+M_MPART = GDN_IN.word("M_MPART")
+MP_MORE, MP_CONT = 1 << 16, 1 << 17

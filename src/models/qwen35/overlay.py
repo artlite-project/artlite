@@ -105,6 +105,7 @@ from .cursor import GdnCursor
 from .decode import QwenDecodeOperator
 from .gdn_steps import GdnTransfers
 from .image import NORMS, QwenImage, gdn_v_heads
+from .paro_steps import ParoSteps, gdn_in_rows
 from .steps import PanelTable, Step
 from .words import F_GDN, F_GIN, M_HPAN
 
@@ -145,7 +146,7 @@ def _text_rope(n: int) -> np.ndarray:
     return np.repeat(np.arange(n, dtype=np.int64)[:, None], 3, 1)
 
 
-class QwenOverlay(ModelOverlay):
+class QwenOverlay(ParoSteps, ModelOverlay):
     """A qwen35 GGUF model on the multi-slot decode overlay. ``layers``: the layers to run (default: all; tests run
     slices), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the KV caches' capacity, ``weights``: the
     image's buffer allocated ahead (its image's layers and vocabulary), ``formats``: tile formats the design runs
@@ -180,18 +181,21 @@ class QwenOverlay(ModelOverlay):
         tokens run, default: the file has an MTP layer of its own)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
+        self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``, a design of 4 slots, one sequence)
+        if self.paro and (sequences > 1 or slots not in (None, 4)):
+            raise ValueError("a PARO checkpoint: one sequence on the design of 4 slots")
         fmts = img.formats() | set(formats)
         gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
         # (several sequences: the design of 8 slots where the file's formats run on one)
-        slots = slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
-                          slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts))
+        slots = 4 if self.paro else slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
+                                              slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts))
         if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
             raise ValueError(f"{sequences} sequences: a dense model whose formats run on the design of 8 slots "
                              f"(``runs_eight``: its tile formats, an image whose LM head is not screened)")
         if sequences > 8:
             raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
-        self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg)) if not all(att) else None
+        self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg), parts=self.paro) if not all(att) else None
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots,
                                   passes=sequences) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
@@ -203,12 +207,15 @@ class QwenOverlay(ModelOverlay):
         self._ropes = [_text_rope(self.max_positions) for _ in range(sequences)]  # (per sequence: ``rope``)
         self.period = 4 * attn.POS_PER_GROUP  # (the steps' sub-steps repeat from group 3 on: ``subs``)
         self.moe = cfg.moe
-        paged = paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16 or gu_win))
+        tiles = {f: sum(len(b.rows[0]) for r in img.regions for b in r.blocks if b.fmt == f) for f in fmts}
+        paged = paged_formats(gguf, fmts, wide=cfg.moe and (max(img.R[f] for f in fmts) > 16 or gu_win), rot=self.paro,
+                              nbytes=tiles if self.paro else None)  # (PARO: its image's rows, not the file's F16 tensors)
         if slots == 8 and not paged and len(fmts) > 2:  # (a design of 8 slots holds two formats' kernels: Qwen3.5 9B's
             # three overflow the main core's program by 0.7 KB, and one of them beside a page slot leaves the slot
             # 0.1 KB short of a page)
             paged = tuple(sorted(fmts))
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
+                                      **({"rot": True} if self.paro else {}),
                                       eps=cfg.rms_norm_eps, gdn=self.gsh, attn=self.ash,
                                       moe=(cfg.n_experts, cfg.n_experts_used) if cfg.moe else None,
                                       max_k=MOE_MAX_K if cfg.moe else MAX_K,
@@ -247,6 +254,8 @@ class QwenOverlay(ModelOverlay):
     # ------------------------------------------------------------------
 
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
+        if self.paro and name != "lm":
+            return self.paro_groups(L, name, S)
         out = mp.groups(self.image.region(L, name), self.flags[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None,
                         f32_ab=name == "gdn_in" and self.g8, slots=self.SLOTS)
         if self.op.packed and self.SLOTS == 8:  # (the input's slots per k block, the host's per phase)
@@ -271,6 +280,8 @@ class QwenOverlay(ModelOverlay):
         return out + self.moe_steps.meta_writes(S) if self.moe else out
 
     def _phases(self) -> list[tuple[int, str]]:
+        if self.paro:
+            return self.paro_phases()
         cfg = self.cfg
         ffn = ("moe_in", "sdown") if self.moe else ("gate_up", "down")
         out = [(L, name) for L in self.layers for name in
@@ -287,10 +298,15 @@ class QwenOverlay(ModelOverlay):
         self._layout = dict.fromkeys(("ACT", "NORM", "GOBJ", "GSTATE", "KV", "GHDR"), 0)
         take = self._take
         self.loadr = take("ACT", COLS * self.SLOTS * XB)  # [column][slot]
-        for L, name in self._phases():  # (gdn_out: the GDN pads' sink past each x; several sequences: the x that the
-            # attention's passes and the GDN chains write staged)
-            self._add_inputs((L, name), extra=2 * self.SLOTS if name == "gdn_out" else 0,
-                             staged=self.sequences > 1 and name in ("attn_out", "gdn_out"))
+        if self.paro:  # (rot_down's padding groups' outputs: ``decode.rotated.sink_out``)
+            self.rot_sink = take("ACT", 2 * self.SLOTS * QwenImage.down_slice(self.cfg))
+        for L, name in self._phases():  # (the GDN step's outputs' x (gdn_out's, PARO's rot_g): the GDN pads' sink past
+            # it; several sequences: the x that the attention's passes and the GDN chains write staged)
+            sink = 2 * self.SLOTS if name == ("rot_g" if self.paro else "gdn_out") else 0
+            if self.rot_kind(name) is not None:
+                self._add_rot_inputs((L, name), extra=sink)
+                continue
+            self._add_inputs((L, name), extra=sink, staged=self.sequences > 1 and name in ("attn_out", "gdn_out"))
         self.norm_off: dict[tuple[int, str], int] = {}
         self.n_norm = -(-self.H // (NX_PER_NORM * OBJ_K))  # norm-weight A objects of a phase
         nw = 2 * NX_PER_NORM * OBJ_K * (self.n_norm - 1) + self.T  # (the last object's extent)
@@ -331,7 +347,7 @@ class QwenOverlay(ModelOverlay):
         # (the F_ATT objects' first words: [transaction buffer][layer][column][sub-step])
         self.fobj = np.array([[[[self.fatt_object(L, c, u, b) // 4 for u in range(self.ash.u)] for c in range(COLS)]
                                for L in self.fatt] for b in range(2 if self.AHEAD else 1)], np.int64)
-        self.gin = np.array([self.inp[(L, "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
+        self.gin = np.array([self.inp[(L, "gin_q" if self.paro else "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
         self._branch: tuple | None = None  # (the step words as the metadata objects hold them: ``_set_branch``; None: unknown)
         r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
@@ -401,7 +417,7 @@ class QwenOverlay(ModelOverlay):
         """Layer L's GOBJ: the header, the conv objects (weights, zero histories, pads), zero K and delta objects."""
         sh, cfg = self.gsh, self.cfg
         gobj = self.dev.view("GOBJ")
-        blk = self.image.region(L, "gdn_in").block("qkv")
+        rows_qkv = gdn_in_rows(self.image, L)
         cw = np.asarray(self.gguf.tensor(f"blk.{L}.ssm_conv1d.weight").raw, np.float32)
         dt, A = self._f32(f"blk.{L}.ssm_dt.bias"), self._f32(f"blk.{L}.ssm_a")
         norm = self._f32(f"blk.{L}.ssm_norm.weight")
@@ -412,7 +428,7 @@ class QwenOverlay(ModelOverlay):
             m[M_HPAN] = sh.hc + 3
         for c in range(COLS):
             vh = gdn_v_heads(cfg, c)
-            rows = blk.rows[c][blk.rows[c] >= 0]
+            rows = rows_qkv[c][rows_qkv[c] >= 0]
             o = self.gobj[L] + c * self.gcol
             gobj[o:o + self.gcol] = 0
             gobj[o:o + 4 * META] = m.view(np.uint8)
@@ -526,6 +542,8 @@ class QwenOverlay(ModelOverlay):
     def _build(self, S: int, lm: bool, subs: tuple[tuple[int, int, int], ...], b: int) -> Step:
         """The transaction of a step of S slots (``lm``: with the LM head; ``subs``: the attention's sub-steps; ``b``: its
         buffer, one: no ``AHEAD``)."""
+        if self.paro:
+            return self.paro_build(S, lm, subs, b)
         dev, cfg = self.dev, self.cfg
         seq = Sequence(self.op, inputs=("X",))
         st = Step(S, subs, b=b)
@@ -766,8 +784,9 @@ class QwenOverlay(ModelOverlay):
         cur.committed = commit
         self._kept_rows = None
         self._write_loadr(x)
-        first = self._input(self.layers[0])
-        self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
+        if not self.paro:  # (PARO: rot_in's copies of the residual)
+            first = self._input(self.layers[0])
+            self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
         out = self._run(S, position, logits)
         cur.accepted = False
         if commit:  # (all S accepted)

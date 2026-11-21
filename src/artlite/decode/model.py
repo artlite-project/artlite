@@ -64,7 +64,8 @@ from .step import Part
 from .vring import VRing
 
 
-def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tuple[str, ...]:
+def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False, rot: bool = False,
+                  nbytes: dict[str, int] | None = None) -> tuple[str, ...]:
     """The formats whose kernels are code pages (``DecodeOverlayOperator(paged=)``): the main cores' program memory holds
     the kernels of three formats; of four (Llama's Q3_K_M: Q3_K, Q4_K, Q5_K, Q6_K; Qwen3.6-35B-A3B's Q4_K, Q6_K,
     BFP16 with its drafter's Q4_0) the one of the most bytes in the file stays and the others share a page slot (two would leave the slot less than a page: the pager and the paged
@@ -75,15 +76,20 @@ def paged_formats(gguf: GGUFFile, fmts: set[str], *, wide: bool = False) -> tupl
     head's Q6_K, a few per step). By the whole file: the same choice for any layers and vocabulary the overlay runs.
     A screened head's Q6_KH (``decode.screen``: tiles of 27 rows, read once a step) is always a page, and with it
     every format but the largest: three resident ones with its wide frame overflow a main core of 4096 hidden (Qwen3.5
-    9B's layers of Q4_K and Q6_K alone: by 0.4 KB of program and 1.6 KB of data memory)."""
-    if len(fmts) < (2 if "Q6_KH" in fmts else 4):
+    9B's layers of Q4_K and Q6_K alone: by 0.4 KB of program and 1.6 KB of data memory). A rotated design (``rot``:
+    ``decode.design``'s "Rotated inputs", the rounds' kernels) holds two formats' kernels; of three all are pages
+    (qwen35's PARO checkpoints: their P4_128, the GDN a / b rows' BFP16, the head plane's Q4_0, whose page beside a
+    resident P4_128 is 0.3 KB short). ``nbytes``: the formats' bytes to rank them by (default: the file's tensors'; an
+    image's own where the file holds others it reads none of: a checkpoint's F16 embeddings)."""
+    if len(fmts) < (2 if "Q6_KH" in fmts else 3 if rot else 4):
         return ()
-    if len(fmts) > 4 or wide:
+    if len(fmts) > 4 or wide or rot:
         return tuple(sorted(fmts))
-    nbytes = dict.fromkeys(fmts, 0)
-    for _, qtype, _, n in gguf.tensor_info.values():
-        if has_tile_format(qtype) and tile_format(qtype) in nbytes:
-            nbytes[tile_format(qtype)] += n
+    if nbytes is None:
+        nbytes = dict.fromkeys(fmts, 0)
+        for _, qtype, _, n in gguf.tensor_info.values():
+            if has_tile_format(qtype) and tile_format(qtype) in nbytes:
+                nbytes[tile_format(qtype)] += n
     return tuple(sorted(sorted(fmts, key=lambda f: -nbytes[f])[1:]))
 
 

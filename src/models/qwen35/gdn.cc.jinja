@@ -52,10 +52,19 @@ void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
         st[{{ G_NSKIP }}] = m[{{ M_NX }}];
     if (!(flags & {{ F_MSG }}))
         return;
+{% if parts %}
+    const int S = m[{{ M_NS }}], part = m[{{ M_MPART }}];  // (a part of the message: words.M_MPART)
+    st[{{ G_NMSG }}] = S * (part & 0xFFFF);
+    st[{{ G_ON }}] = !(part & {{ MP_MORE }});
+    if (part & {{ MP_CONT }})
+        return;
+    st[{{ G_NS }}] = S;
+{% else %}
     const int S = m[{{ M_NS }}];
     st[{{ G_NS }}] = S;
     st[{{ G_NMSG }}] = S * {{ n_msg }};
     st[{{ G_ON }}] = 1;
+{% endif %}
     st[{{ G_NCP }}] = 2 + {{ HC // 2 }};
     st[{{ G_NREP }}] = m[{{ M_NREP }}];
     st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];

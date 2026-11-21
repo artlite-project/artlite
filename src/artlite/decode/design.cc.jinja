@@ -1929,9 +1929,11 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
         return;
     }
 {% endif %}
-{% if rot %}
+{% if rot and packed %}
     const int nx = m[{{ M_NX }}] - ((flags & {{ F_PSQ }}) ? (m[{{ M_NS }}] == 1 ? 4 : (m[{{ M_NS }}] == 2 ? 2 : 1)) : 0);  // (F_PSQ: the
     // partial sums object counted in, for the other cores)
+{% elif rot %}
+    const int nx = m[{{ M_NX }}] - ((flags & {{ F_PSQ }}) ? 1 : 0);  // (F_PSQ: the partial sums object counted in)
 {% else %}
     const int nx = m[{{ M_NX }}];
 {% endif %}
@@ -1940,6 +1942,9 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     const int sp = m[{{ M_SP }}], lper = sp == 1 ? 3 : (sp == 2 ? 2 : (sp == 4 ? 1 : 0));  // (the host's: gdn_out 8)
 {% elif packed %}
     const int sp = m[{{ M_NS }}] == 1 ? 1 : (m[{{ M_NS }}] == 2 ? 2 : 4), lper = sp == 1 ? 2 : (sp == 2 ? 1 : 0);
+{% elif rot %}
+    const int lper = 0;  // (inputs of the design's slots: an object a strip; the rotations read S_SP)
+    st[{{ S_SP }}] = {{ SLOTS }};
 {% endif %}
 {% if packed %}
     st[{{ S_SP }}] = sp;
