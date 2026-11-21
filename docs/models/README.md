@@ -19,7 +19,7 @@ ParoQuant (PARO) checkpoints, int4 with groups of 128 (`quantization_config.quan
 checkpoint directories of `Qwen3ForCausalLM` and `LlamaForCausalLM`: their linears as 4-bit tiles of the checkpoint's
 size (4.5 bits per weight with their scales), each projection's input rotated on the NPU as the checkpoint prescribes
 (its channel scales and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested:
-z-lab/Qwen3-0.6B-PARO (KL 0.0012 against the checkpoint computed exactly on the CPU).
+z-lab/Qwen3-0.6B-PARO (KL 0.0011 against the checkpoint computed exactly on the CPU).
 
 ## Tested files and plans
 
