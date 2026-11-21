@@ -52,8 +52,8 @@ side by side (XR: gin_q's and gin_z's, or attn_q's, attn_k's and attn_v's), each
 copy as K columns of panels C K wide into one layout of G (``prefill.gemm.joined_layout``: the GDN and attention
 operators' as ever; the GDN's alpha and beta, folded into gin_z's rotation as F32 planes, in fp32: GdnPrep's
 ``ab32``); the mixer's output rotated for its projection (AR); gate's and up's copies (XR), gate and up as bf16
-panels into GU (one GEMM design, ``prefill.gemm.plan_gate_up_pair``), down's rotation with the activation on the way
-(HR).
+panels into GU (one GEMM design, ``prefill.gemm.plan_gate_up_pair``; tiles whose passes are not 64 outputs, P5_128's:
+rows into GJ, ``plan_gate_up_rows``), down's rotation with the activation on the way (HR).
 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
 a chunk at position 0, each from a state of its own. The operators that keep them apart: GdnPrep / GdnScan's packed
@@ -143,6 +143,9 @@ class QwenPrefill(ChunkPrefill):
         if self.split:
             default += (SPLIT_T,)
         self.paro = overlay.paro  # (rotated inputs: module docstring's "PARO")
+        # (PARO: gate and up as panels of one GEMM design, else rows: ``prefill.gemm.gate_up_paired``)
+        self.gu_paired = not self.paro or all(PG.gate_up_paired(overlay.image.region(L, "gate"),
+                                                                overlay.image.region(L, "up")) for L in overlay.layers)
         if self.paro:  # (``prefill.rotate``: a sub-chunk's items over 32 cores from 128 tokens on)
             assert draft is None and dflash is None and not pack and not overlay.cfg.moe, "a dense chat model's"
             default = tuple(t for t in default if t >= 128)
@@ -223,9 +226,13 @@ class QwenPrefill(ChunkPrefill):
                 C = len(regs)
                 return PG.PhasePlan([dataclasses.replace(g, a=f"XR{C}{i}") for i, r in enumerate(regs) for g in
                                      PG.plan_phase(img, r, t, ops=self._gemms, layout=lay, a_width=C * self.kh).gemms], lay)
-            if self.paro and name == "gate_up":  # (one design, bf16 panels into GU: down's rotation takes them)
-                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, self._gemms, 2 * self.kh)
-                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
+            if self.paro and name == "gate_up":  # (one design, bf16 panels into GU, or rows into GJ: down's rotation
+                # takes them)
+                gate, up = img.region(L, "gate"), img.region(L, "up")
+                gu = (PG.plan_gate_up_rows, PG.plan_gate_up_pair)[self.gu_paired](img, gate, up, t, self._gemms,
+                                                                                    2 * self.kh)
+                n = len(gu.gemms) // 2  # (gate's GEMMs, then up's)
+                gu.gemms = [dataclasses.replace(g, a="XR20" if i < n else "XR21") for i, g in enumerate(gu.gemms)]
                 return gu
             region = img.region(L, name)
             pitch = self.pitch.get(name, dpt) if name != "gate_up" else 0
@@ -256,7 +263,11 @@ class QwenPrefill(ChunkPrefill):
                 return self._gemms.setdefault(("rot", t, *sorted(kw.items())), PrefillRotOperator(T=t, **kw))
 
             rots["gu"] = rot(K=self.kh, copies=2, bf16=True)
-            rots["down"] = rot(K=cfg.intermediate_size, gu=True)
+            # (down's rotation: of GU's panels, or of GJ's rows: the layout's pitch and up's offset)
+            lay = plans[(self.layers[0], "gate_up")].layout
+            assert self.gu_paired or all(plans[(L, "gate_up")].layout == lay for L in self.layers), "one GJ layout"
+            rots["down"] = rot(K=cfg.intermediate_size, gu=True,
+                               rows=None if self.gu_paired else (lay.pitch, lay.off["up"]))
             if self.gdn:
                 rots["in_gdn"] = rots["gu"]
                 rots["o_gdn"] = rot(K=cfg.ssm_v_heads * GD.D)
@@ -350,7 +361,9 @@ class QwenPrefill(ChunkPrefill):
         self.rb_a = {"gdn_in": 9 * cfg.ssm_v_heads * GD.D // 8, "attn_in": 9 * cfg.num_attention_heads * AP.HD // 8}
         if self.paro:  # (the rotated copies, side by side: [token group][copy][hidden / 8 panels]; the mixer's rotated
             # output; gate and up's panels; down's rotated input)
-            self.rb |= {"XR": 3 * self.pr, "AR": max(self.rb_a.values()), "GU": 4 * cfg.intermediate_size,
+            gj = max(2 * COLS * o.plans[(L, "gate_up")].layout.pitch for o in self.sz.values() for L in self.layers) \
+                if not self.gu_paired else 0  # (GJ's rows: [column][gate | up] bf16)
+            self.rb |= {"XR": 3 * self.pr, "AR": max(self.rb_a.values()), "GU": 4 * cfg.intermediate_size, "GJ": gj,
                         "HR": self.rb["HP"]}
             self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO: ``_bind``)
             k = 0
@@ -510,7 +523,7 @@ class QwenPrefill(ChunkPrefill):
                 rl += [(gu.act, tok("GU", j, gu.act, i=0), tok("HP", j, gu.act, i=1)) for j in range(S)]
             hp = "HP"
             if paro:  # (gate and up's panels, their activation on the way: down's rotated input)
-                rl += rot(L, "down", "GU", "HR")
+                rl += rot(L, "down", "GU" if self.gu_paired else "GJ", "HR")
                 hp = "HR"
             down = o.plans[(L, "down")]
             nxt = self._next_norm(L)

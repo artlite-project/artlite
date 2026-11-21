@@ -10,6 +10,7 @@ import torch
 from ml_dtypes import bfloat16
 
 from artlite.operators import bfp16, kmath
+from artlite.operators.design import COLS
 from artlite.paro import Rotation
 from artlite.prefill.rotate import PrefillRotOperator, row_floats
 
@@ -71,18 +72,30 @@ def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.
 CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), (256, 1024, False, 2),
          (1024, 4096, False, 3),
          (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1),
-         (256, 1024, "bf16", 3), (128, 4096, "bf16", 2)]
+         (256, 1024, "bf16", 3), (128, 4096, "bf16", 2),
+         (256, 2048, "rows", 1), (128, 3072, "rows", 1)]
 
 
 @pytest.mark.parametrize(("T", "K", "gu", "copies"), CASES,
-                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16"}.get(gu, "")) + (f"-c{c}" if c > 1 else "")
+                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows"}.get(gu, "")) +
+                              (f"-c{c}" if c > 1 else "")
                               for T, K, gu, c in CASES])
 @pytest.mark.usefixtures("vtanh")
 def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     rng = np.random.default_rng(0)
-    xb, gu = gu == "bf16", gu is True
+    xb, rows, gu = gu == "bf16", gu == "rows", gu is True or gu == "rows"
     tfs = [_rotation(K, rng, 1 + c).tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True) for c in range(copies)]
-    if gu:
+    if rows:  # (GU as rows [token][block 8][gate | up], a block's gate from its start, up 32 past its gate, padding)
+        gp, x = _gu_input(T, K, rng)
+        gu4 = gp.reshape(T // 8, K // 8, 2, 8, 8)
+        gate, up = (gu4[:, :, i].transpose(0, 2, 1, 3).reshape(T, K) for i in range(2))
+        kb = K // COLS
+        geo = (2 * kb + 96, kb + 32)  # (a block's width, up's offset in it)
+        grid = np.zeros((T, COLS, geo[0]), bfloat16)
+        grid[:, :, :kb] = gate.reshape(T, COLS, kb)
+        grid[:, :, geo[1]:geo[1] + kb] = up.reshape(T, COLS, kb)
+        xp = grid.reshape(-1)
+    elif gu:
         xp, x = _gu_input(T, K, rng)
     elif xb:  # (bf16 blocks [T / 8][K / 8][8 tokens][8 channels])
         x = (rng.standard_normal((T, K)) * np.exp(rng.standard_normal((T, 1)))).astype(bfloat16).astype(np.float32)
@@ -90,7 +103,7 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     else:
         xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
-    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb)
+    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None)
     ro = np.concatenate([tf.pair_objects(row_floats(gu)).reshape(-1) for tf in tfs])
     out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16))).reshape(T // 8, copies, -1)  # ([token group][copy])
     for c, tf in enumerate(tfs):

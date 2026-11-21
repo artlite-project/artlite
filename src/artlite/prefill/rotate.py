@@ -21,7 +21,11 @@ all 32 cores instead (the columns' reads of them: 12% of the pass's bytes at 102
 OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's ``copies`` for several projections (q, k, v;
 gate, up): x read once, each item rotated per copy (RO [copy][group][OBJ], OUT [token group][copy][K / 8 panels]: a
 copy's panels one row apart, whatever the prompt's size: a GEMM reads its copy as K columns of panels ``copies`` K
-wide)."""
+wide). ``rows`` (``gu`` of gate and up GEMMs that write rows, ``prefill.gemm.plan_gate_up_rows``: tiles whose passes
+are not 64 rows, P5_128's 13): GU as bf16 rows [token][column block][gate | up] (a block's gate channels from its start,
+its up ones ``rows[1]`` later, ``rows[0]`` a block's width): an item's L1 object [token][gate 128 | up 128], each round's
+[the column's tokens][gate | up][128] a fill whose repeat is the round, a fill per column block (the groups of a block
+are linear in it, not across blocks: a block's padding past its channels)."""
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
@@ -55,14 +59,16 @@ class PrefillRotOperator(ArtcOperator):
     STACK = 1024
     p = kernel_prefix("prot")
 
-    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1, bf16: bool = False):
+    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1, bf16: bool = False,
+                 rows: tuple[int, int] | None = None):
         G = K // GROUP
         self.tok = row_floats(gu)
         assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
         assert rounds % 2 == 0 and 512 * rounds + 4 * GROUP == OBJ, rounds
         assert copies == 1 or (not gu and T // self.tok <= COLS * ROWS), "copies: a round per group"
-        assert not (gu and bf16)
-        self.T, self.K, self.rounds, self.gu, self.copies, self.bf16 = T, K, rounds, gu, copies, bf16
+        assert not (gu and bf16) and (rows is None or (gu and K % COLS == 0 and K // COLS % GROUP == 0
+                                                      and rows[0] >= 2 * K // COLS and rows[1] >= K // COLS))
+        self.T, self.K, self.rounds, self.gu, self.copies, self.bf16, self.rows = T, K, rounds, gu, copies, bf16, rows
         super().__init__()
 
     @property
@@ -76,11 +82,12 @@ class PrefillRotOperator(ArtcOperator):
         return 128 if self.gu else 64 if self.bf16 else 36
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16)
+        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16, gurows=self.rows is not None)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         n = self.T * self.K * 9 // 16  # (bf16 elements of the panels)
-        return [ArgSpec("in", (self.T * self.K // 64 * self.unit,), bfloat16),
+        nx = self.T * COLS * self.rows[0] if self.rows else self.T * self.K // 64 * self.unit
+        return [ArgSpec("in", (nx,), bfloat16),
                 ArgSpec("in", (self.copies * self.K // GROUP * OBJ // 2,), bfloat16),
                 ArgSpec("out", (self.copies * n,), bfloat16)]
 
@@ -138,6 +145,8 @@ class PrefillRotOperator(ArtcOperator):
         # (bf16 elements: the input, its token group's row, a group's run of it in a token group; the output's; the
         # rotation objects)
         nx, xr, xw = T * K // 64 * self.unit, K // 8 * self.unit, 16 * self.unit
+        if self.rows:
+            nx = T * COLS * self.rows[0]
         no, orow, ow = T * K * 9 // 16, K // 8 * 36, 16 * 36
         nro = C * G * OBJ // 2
 
@@ -166,13 +175,34 @@ class PrefillRotOperator(ArtcOperator):
             s = COLS * ROWS // nb
             return TensorAccessPattern((nro,), 4 * c // nb * OBJ // 2, [1, n, C, OBJ // 2], [0, s * OBJ // 2, go, 1])
 
+        def rows_taps(c: int) -> list[TensorAccessPattern]:
+            """(rows) Column c's fills, one per column block: [round (repeat)][the column's 4 items' tokens][gate | up]
+            [128] (a round's s = 32 / nb groups: the column's the s r + 4 c / nb-th)."""
+            P, U = self.rows
+            W, bg = COLS * P, K // COLS // GROUP  # (a row's elements; a block's groups)
+            s = COLS * ROWS // nb
+            e, t0 = 4 * c // nb, 4 * c % nb * tok
+            out = []
+            for b in range(COLS):
+                r0, r1 = -(-(bg * b - e) // s), (bg * (b + 1) - 1 - e) // s + 1  # (rounds whose group is in block b)
+                if r1 > r0:
+                    g0 = s * r0 + e
+                    out.append(TensorAccessPattern((nx,), t0 * W + b * P + GROUP * (g0 - bg * b), [r1 - r0, 4 * tok, 2, GROUP],
+                                                   [s * GROUP, W, U, 1]))
+            assert sum(t.sizes[0] for t in out) == n, (c, [t.sizes for t in out])
+            return out
+
         def seq(X, RO, OUT, xh, rh, oh):
             tg = TaskGroup()
             for c in range(COLS):
-                xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
+                if not self.rows:
+                    xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
                 if c < len(rh):
                     rh[c].fill(RO, ro_tap(c), group=tg)
                 oh[c].drain(OUT, walk(c, C * no, C * orow, ow, C, orow), group=tg, wait=True)
+                for tap in rows_taps(c) if self.rows else ():  # (after the column's drain: past 4 queued tasks a fill
+                    # waits for its first to complete, which the cores reach only while their outputs drain)
+                    xh[c].fill(X, tap, group=tg)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(nx,), np.dtype[bfloat16]], np.ndarray[(nro,), np.dtype[bfloat16]],

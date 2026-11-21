@@ -34,7 +34,7 @@ Every path dequantizes the weights into bfp16 panels (GemmQ: pairs of cores spli
 is within ~1.35 2^-9 sqrt(K / 64) of the exact product (relative rms; ``tests/prefill/test_gemm.py``).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..decode.image import Block, Region, TileImage
 from ..formats import gu_tiles, slot
@@ -54,7 +54,7 @@ OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # project
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
          "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv", "gin_q": "qkv", "gin_z": "qkv", "attn_q": "qkv", "attn_k": "qkv",
-         "attn_v": "qkv"}
+         "attn_v": "qkv", "up": "qkv"}
 assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
@@ -358,6 +358,24 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
         assert type(op) is GemmQOperator, "bf16 C panels: GemmQ"
         gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU", c_off=64 * part))
     return PhasePlan(gemms, None)
+
+
+def gate_up_paired(gate: Region, up: Region) -> bool:
+    """Whether ``plan_gate_up_pair`` takes a PARO checkpoint's gate and up: tile-major tiles of 16 rows (passes of 64
+    outputs); else ``plan_gate_up_rows``."""
+    (bg,), (bu,) = gate.blocks, up.blocks
+    return all(not planar(b.fmt, b.R, gate.kc) and _tp(b) * b.R == ROWS and not b.pt for b in (bg, bu))
+
+
+def plan_gate_up_rows(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
+                      a_width: int = 0) -> PhasePlan:
+    """Gate and up of a PARO checkpoint whose tiles ``plan_gate_up_pair`` does not take (P5_128's of 13 rows: passes
+    that are not 64 outputs, their padding outputs past a column's): as input projections that write one buffer of rows
+    (``joined_layout``: per column [gate | up], C "GJ"), which down's rotation reads (``prefill.rotate``'s ``rows``: the
+    layout's pitch and up's offset)."""
+    lay = joined_layout([gate, up], T)
+    return PhasePlan([replace(g, c="GJ") for r in (gate, up)
+                      for g in plan_phase(image, r, T, ops=ops, layout=lay, a_width=a_width).gemms], lay)
 
 
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
