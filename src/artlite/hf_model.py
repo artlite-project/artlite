@@ -16,6 +16,7 @@ Supported: ``Qwen3ForCausalLM`` (``qwen3``), ``LlamaForCausalLM`` (``llama``), `
 ``Qwen3_5ForCausalLM`` (``qwen35``; its MTP block as the nextn layer). Vision towers are not read here.
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 import gguf
 import numpy as np
 
+from . import paro
 from .gguf_model import GGUFFile, QTensor
 
 # safetensors dtypes -> (GGUF type, numpy dtype of the raw view)
@@ -68,6 +70,9 @@ class _Entry:
     offset: int = 0
     nbytes: int = 0
     compute: Callable[[], np.ndarray] | None = None
+    paro: str = ""  # (a PARO linear: its checkpoint name's prefix; ``ParoTensor``)
+    rows_of: np.ndarray | None = None  # (PARO) its rows / groups in another order (``ParoTensor``)
+    groups_of: np.ndarray | None = None
 
 
 class HfModel(GGUFFile):
@@ -82,6 +87,13 @@ class HfModel(GGUFFile):
         with open(os.path.join(path, "config.json")) as f:
             self.config = json.load(f)
         self.hparams = {**self.config, **self.config.get("text_config", {})}
+        qc = self.config.get("quantization_config") or self.hparams.get("quantization_config")
+        self.paro_bits = self.paro_group = 0  # (a PARO checkpoint's: ``artlite.paro``)
+        if qc:
+            if qc.get("quant_method") != "paroquant":
+                raise NotImplementedError(f"{path}: quantization method {qc.get('quant_method')!r} (Artlite runs "
+                                          f"unquantized and ParoQuant checkpoints)")
+            self.paro_bits, self.paro_group = paro.check_config(path, qc)
         hf_arch = (self.config.get("architectures") or [""])[0]
         if hf_arch not in _ADAPTERS:
             raise NotImplementedError(f"{path}: Hugging Face architecture {hf_arch!r} is not supported (supported: "
@@ -163,11 +175,24 @@ class HfModel(GGUFFile):
 
     def tensor(self, name: str) -> QTensor:
         e = self._entries[name]
+        if e.paro:
+            return self._paro(name, e)
         a = self._array(e)
         if a.ndim < 2:
             a = a.reshape(1, -1)
         a = a.reshape(-1, a.shape[-1])
         return QTensor(name=name, qtype=e.qtype, rows=a.shape[0], cols=a.shape[1], raw=a)
+
+    def _paro(self, name: str, e: _Entry) -> paro.ParoTensor:
+        """A PARO linear's ``ParoTensor``."""
+        a = {p: self.hf_array(f"{e.paro}.{p}") for p in _PARO_PARTS if f"{e.paro}.{p}" in self._hf}
+        N, K = e.shape
+        rot = paro.Rotation(np.asarray(a["theta"], np.float64), np.asarray(a["pairs"], np.int64),
+                            np.asarray(a["channel_scales"], np.float64).reshape(-1), self.paro_group)
+        return paro.ParoTensor(name=name, qtype=e.qtype, rows=N, cols=K, raw=a["qweight"], qweight=a["qweight"],
+                               qzeros=a["qzeros"], scales=a["scales"], group=self.paro_group, rotation=rot,
+                               qweight_hi=a.get("qweight_hi"), qzeros_hi=a.get("qzeros_hi"), rows_of=e.rows_of,
+                               groups_of=e.groups_of)
 
 
 # ----------------------------------------------------------------------
@@ -207,11 +232,16 @@ class _Adapter:
 
     # metadata
 
-    def metadata(self) -> tuple[dict[str, object], dict[str, list[str]]]:
-        w = gguf.GGUFWriter(path=None, arch=self.arch)
+    def write_metadata(self, w: gguf.GGUFWriter) -> None:
+        """The metadata into a GGUF writer."""
         self.params(w)
         self.vocab(w)
         self.sampling(w)
+
+    def metadata(self) -> tuple[dict[str, object], dict[str, list[str]]]:
+        """(meta, string arrays) as ``GGUFFile`` holds them."""
+        w = gguf.GGUFWriter(path=None, arch=self.arch)
+        self.write_metadata(w)
         meta: dict[str, object] = {}
         strings: dict[str, list[str]] = {}
         for k, v in w.kv_data[0].items():
@@ -341,14 +371,37 @@ class _Adapter:
         return self.names.get_name(name, try_suffixes=(".weight", ".bias"))
 
     def tensors(self, name: str) -> list[tuple[str, _Entry]]:
-        """The GGUF tensors of a checkpoint tensor (none: not a language-model tensor)."""
+        """The GGUF tensors of a checkpoint tensor (none: not a language-model tensor; a PARO linear's parts: one
+        tensor at its ``qweight``)."""
         hf_name = self.filter(name)
         if hf_name is None:
             return []
+        if (part := name.rpartition(".")[2]) in _PARO_PARTS or name.endswith(_PARO_SHARED):
+            if part != "qweight":
+                return []
+            if ".experts." in name:
+                raise NotImplementedError(f"{self.hf.path}: PARO experts ({name})")
+            prefix = name.removesuffix(".qweight")
+            hf_name = hf_name.removesuffix(".qweight") + ".weight"
+            e = self.paro_entry(prefix)
+        else:
+            e = self.hf._hf[name]
         g = self.gguf_name(hf_name)
         if g is None:
             raise NotImplementedError(f"{self.hf.path}: no GGUF name for {name}")
-        return [(g, self.transform(name, hf_name, self.hf._hf[name]))]
+        return [(g, self.transform(name, hf_name, e))]
+
+    def paro_entry(self, prefix: str) -> _Entry:
+        """The entry of the PARO linear whose checkpoint tensors are ``<prefix>.qweight`` ..."""
+        hf = self.hf
+        parts = [f"{prefix}.{p}" for p in _PARO_PARTS if f"{prefix}.{p}" in hf._hf]
+        missing = {"qweight", "qzeros", "scales", "theta", "pairs", "channel_scales"} - {p.rpartition(".")[2] for p in parts}
+        if missing or (hf.paro_bits == 5) != (f"{prefix}.qweight_hi" in hf._hf):
+            raise ValueError(f"{hf.path}: PARO linear {prefix} without {', '.join(sorted(missing)) or 'its fifth bits'}")
+        q = hf._hf[f"{prefix}.qweight"]
+        K, N = q.shape[0], q.shape[1] * 8
+        return _Entry(f"PARO{hf.paro_bits}", (N, K), q.shard, q.offset, sum(hf._hf[p].nbytes for p in parts),
+                      paro=prefix)
 
     def filter(self, name: str) -> str | None:
         """A language-model tensor's name as the tensor map knows it (None: skip the tensor)."""
@@ -648,11 +701,23 @@ class _Qwen35(_Adapter):
         return super().transform(name, hf_name, e)
 
     def permuted(self, e: _Entry, perm: np.ndarray, axis: int) -> _Entry:
-        """A matrix with its rows (axis 0) or columns (axis 1) in the order ``perm``, in memory."""
+        """A matrix with its rows (axis 0) or columns (axis 1) in the order ``perm``, in memory; a PARO linear's as its
+        index maps (columns: whole groups move, ``ParoTensor.groups_of``)."""
         hf = self.hf
+        if e.paro:
+            if axis == 0:
+                return dataclasses.replace(e, rows_of=perm)
+            g = hf.paro_group
+            groups = perm.reshape(-1, g)[:, 0] // g
+            assert np.array_equal(perm.reshape(-1, g), groups[:, None] * g + np.arange(g)), "columns not in whole groups"
+            return dataclasses.replace(e, groups_of=groups)
         return _Entry(e.qtype, e.shape, nbytes=e.nbytes,
                       compute=lambda: np.ascontiguousarray(np.take(hf._array(e), perm, axis=axis)))
 
+
+# a PARO linear's checkpoint tensors (``artlite.paro``) and the suffixes of an MoE layer's shared rotations
+_PARO_PARTS = ("qweight", "qzeros", "scales", "theta", "pairs", "channel_scales", "qweight_hi", "qzeros_hi")
+_PARO_SHARED = ("_weight_theta", "_weight_pairs", "_weight_channel_scales")
 
 # the MTP block's tensors (the converter's names past the tensor map)
 _NEXTN = {"eh_proj": "nextn.eh_proj", "enorm": "nextn.enorm", "hnorm": "nextn.hnorm",
