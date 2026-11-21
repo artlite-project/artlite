@@ -279,7 +279,7 @@ Transfers the array chooses (control packets into a shim) [measured]:
   packets' MM2S BD acquires it (word 7), both pushed at once. A core's release of the packets -> the first 9 KB object
   of the BD they pushed in its L1: ~2.6 us on 8 columns (~7.6 us with a TCT sync between drain and read).
 - The packets may write whole BDs (two 4-word packets each, no host template) and push them, chained behind one push.
-  Validate them on the host: a BD id past 15 writes the channels' control and queue registers, a nonzero AxQoS hangs.
+  Validate them on the host: a BD id past 15 writes the channels' control and queue registers, AxQoS 1 or 15 hangs (8 does nothing: keep 0).
 - Device and host pushes share a queue of 4; the firmware's TCT waits count device-pushed tokens. Host pushes after a
   device push keep their order only once the transaction has seen it (the packets' last write sets a shim lock that
   it maskpolls); without that they overtake it.

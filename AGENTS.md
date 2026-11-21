@@ -14,7 +14,8 @@ use any modern SIMD (AVX-512 included).
 
 ## Rules
 
-- **Never write a nonzero shim BD AxQoS.** It hung the NPU; only a reboot recovered it.
+- **Never write a nonzero shim BD AxQoS.** 1 and 15 hung the NPU (only a reboot recovered it); 8 changes nothing,
+  even next to CPU or iGPU memory load.
 - **Never kill a process that holds an NPU context** (let it finish or time out). A killed process has wedged the
   NPU beyond a driver reload. Give compile-only scripts, which open no context, short timeouts instead.
 - **Kernel names**: every namespace-scope name of a kernel source (entry points, helpers, tables, types, macros) is

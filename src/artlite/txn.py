@@ -17,7 +17,7 @@ Rules of the shim DMA (AM029, NOC module):
 - 16 BDs per shim tile, shared by its 2 MM2S (DDR -> array) and 2 S2MM channels; a
   BD may be rewritten once the task that used it is complete;
 - a channel queues at most 4 tasks (a push on a full queue blocks the firmware);
-- a BD's AxQoS field must stay 0 (a nonzero value hangs the NPU until reboot);
+- a BD's AxQoS field must stay 0 (1 and 15 hang the NPU until a reboot, 8 changes nothing);
 - a BD may walk DDR in three dimensions (``dims``): gathering a stream from strips
   of several buffers (MM2S) or scattering one over them (S2MM).
 
@@ -487,8 +487,8 @@ def verify(words: np.ndarray, *, queues: bool = True) -> None:
     """Check a finished transaction against the hazards that hang or corrupt the NPU (HardwareLimitError naming the
     operation index, and the channel or BD):
 
-    - every shim BD blockwrite: AxQoS 0 (a nonzero one hangs the NPU until a reboot), the valid bit, a length, no
-      iteration state, the dimension words' unused bits clear;
+    - every shim BD blockwrite: AxQoS 0 (1 and 15 hang the NPU until a reboot, 8 changes nothing), the valid bit, a
+      length, no iteration state, the dimension words' unused bits clear;
     - a task-complete token on a channel (a shim's or a memory tile's) only after the channel's token controller was
       written (else the token is lost, and the ``sync`` hangs);
     - ``queues``: the shim channels' task queues, modelled as the host sequencers drive them (``overlay.Sequence``): a
@@ -525,7 +525,7 @@ def verify(words: np.ndarray, *, queues: bool = True) -> None:
                 elif k == 3 and (v >> 30 or v & 0xFFFFF):
                     bad = f"word 3 = {v:#x}: bits 31:30 and 19:0 are zero"
                 elif k == 5 and v & BD_QOS_MASK:
-                    bad = f"AxQoS {(v >> 20) & 0xF} (must be 0: a nonzero value hangs the NPU)"
+                    bad = f"AxQoS {(v >> 20) & 0xF} (must be 0: classes 1 and 15 hang the NPU)"
                 elif k == 6 and v >> 26:
                     bad = f"word 6 = {v:#x}: Iteration_Current (bits 31:26) is not written"
                 elif k == 7 and not v & BD_VALID:
