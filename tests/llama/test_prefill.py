@@ -4,7 +4,8 @@ prefill/test_norm.py):
 - the attention (prefill/attn/): ``PrepOperator`` then ``AttnOperator`` on random projections of a chunk
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
-  logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-4B: q / k norms, a hidden size of 2560 in padded K chunks), and
+  logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-4B: q / k norms, a hidden size of 2560 in padded K chunks;
+  Qwen3-0.6B-PARO: rotated inputs), and
   packed chunks on Qwen3-Embedding-0.6B Q8_0 (all-Q8_0 GEMMs).
 """
 
@@ -280,7 +281,7 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
 # (GGUF quantization, model size, K format, tokens, decode steps first; "qwen3:<name>": model_config.qwen3_gguf's file)
 CACHES = [("Q4_K_M", "1B", "single", 300, 0), ("Q4_K_M", "1B", "hilo", 300, 128), ("Q4_K_M", "3B", "single", 600, 64),
           ("Q4_K_S", "8B", "hilo", 300, 0), ("Q4_1", "qwen3:0.6B", "hilo", 300, 64),
-          ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64)]
+          ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64), ("PARO", "qwen3-0.6B-paro", "hilo", 300, 64)]
 
 
 @pytest.mark.slow
@@ -300,8 +301,16 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
     from ..common import essay
 
     qwen3 = size.startswith("qwen3:")
-    path = llama_path(quant, size)
-    g = GGUFFile(path)
+    if quant == "PARO":  # (a checkpoint directory: its inputs rotated, ``prefill.rotate``)
+        from artlite.hf_model import HfModel
+        from artlite.model_config import checkpoint
+
+        path = checkpoint(size)
+        require(path)
+        g, qwen3 = HfModel(path), True
+    else:
+        path = llama_path(quant, size)
+        g = GGUFFile(path)
     layers = [0, 1, 2, 3]
     ids = (BpeTokenizer(g) if qwen3 else load_tokenizer(path)).encode(essay("apple.txt"))[:p0 + n]
     x = g.rows("token_embd.weight", ids)

@@ -139,6 +139,11 @@ class LlamaImage(NormedImage):
         if i + 1 < len(self.layers):
             self._rot_data(L, "down_rot", self._qkv_rot(self.layers[i + 1]))
 
+    def tensor_name(self, L: int, name: str) -> str:
+        """(PARO) The tensor of a layer's region."""
+        return f"blk.{L}." + {"q": "attn_q", "k": "attn_k", "v": "attn_v", "o": "attn_output", "gate": "ffn_gate",
+                              "up": "ffn_up", "down": "ffn_down"}[name] + ".weight"
+
     def _qkv_rot(self, L: int) -> list[tuple[str, np.ndarray, tuple[int, int]]]:
         """Layer L's q, k, v copies of the residual (their rotations, the input norm's weight folded in)."""
         g, h8 = self._vec(f"blk.{L}.attn_norm.weight"), self.cfg.hidden_size // COLS

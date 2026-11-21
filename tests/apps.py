@@ -1,6 +1,6 @@
 """The apps' designs as the apps build them (no NPU): per app its model file and its builder, which compiles the app's
 designs and returns what it built (``AppBuild``): the decode overlays and prefill libraries of the models present
-(Qwen3 on Llama's path with its q / k norm weights; Qwen3.6-35B-A3B also with its MTP drafter file, the app's default:
+(Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's checkpoint directory: its rotated inputs; Qwen3.6-35B-A3B also with its MTP drafter file, the app's default:
 the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block and with its DFlash2
 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision overlay (the Stable
 Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them, ``schedule_ledger.py`` reads
@@ -14,7 +14,9 @@ import pytest
 
 from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_weights
 from artlite.model_config import (
+    checkpoint,
     flint_gguf,
     gemma_gguf,
     lfm3_gguf,
@@ -56,7 +58,7 @@ def _llama(path: str, kv_k: str) -> tuple[str, Callable[[str], AppBuild]]:
         from models.llama.overlay import LlamaOverlay
         from models.llama.prefill import LlamaPrefill
 
-        ov = LlamaOverlay(GGUFFile(path), kv_k=kv_k)
+        ov = LlamaOverlay(open_weights(path), kv_k=kv_k)
         pf = LlamaPrefill(ov)
         return _built([ov.op, pf.lib], pf, ov)
 
@@ -164,6 +166,7 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "llama-8B-Q4_K_S": _llama(llama_gguf("Q4_K_S", "8B"), "single"),
     "qwen3-0.6B-Q4_1": _llama(qwen3_gguf("0.6B"), "hilo"),
     "qwen3-embedding-4B-Q4_K_M": _llama(qwen3_gguf("embedding-4B"), "hilo"),
+    "qwen3-0.6B-PARO": _llama(checkpoint("qwen3-0.6B-paro"), "hilo"),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),

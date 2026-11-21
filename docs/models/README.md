@@ -15,6 +15,12 @@ vocabulary, chat template and weights, read from the safetensors at every load: 
 weights run as BFP16 tiles, as a BF16 GGUF does. Tested: Qwen/Qwen3-0.6B, Qwen/Qwen3.5-0.8B,
 lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGUFs).
 
+ParoQuant (PARO) checkpoints, int4 with groups of 128 (`quantization_config.quant_method` `paroquant`), run as
+checkpoint directories of `Qwen3ForCausalLM` and `LlamaForCausalLM`: their linears as 4-bit tiles of the checkpoint's
+size (4.5 bits per weight with their scales), each projection's input rotated on the NPU as the checkpoint prescribes
+(its channel scales and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested:
+z-lab/Qwen3-0.6B-PARO (KL 0.0012 against the checkpoint computed exactly on the CPU).
+
 ## Tested files and plans
 
 ✅ runs on the NPU, 🤔 planned. Files are named by Hugging Face account and quant.
@@ -46,7 +52,7 @@ lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGU
 | | ✅ Flint's DFlash2 drafter | incoai Q4_K_M | |
 | | ✅ Spark-X2.6 4B's and 1.7B's DSpark drafters | XHToken BF16 | |
 | | 🤔 MiniCPM-V 4.7 1B's DSpark drafter | | openbmb F16, Q4_K_M |
-| qwen3 | ✅ Qwen3 0.6B | unsloth Q4_1; Qwen's checkpoint directory (BF16) | |
+| qwen3 | ✅ Qwen3 0.6B | unsloth Q4_1; Qwen's checkpoint directory (BF16); z-lab's PARO checkpoint (int4) | |
 | | ✅ Qwen3-Embedding-0.6B ([embeddings](../server.md#embeddings-and-rerank)) | Qwen Q8_0 | |
 | | ✅ Qwen3-Embedding-4B ([embeddings](../server.md#embeddings-and-rerank)) | Qwen Q4_K_M | |
 | | ✅ Qwen3-Reranker-0.6B ([rerank](../server.md#embeddings-and-rerank)) | ggml-org Q8_0 | |

@@ -53,7 +53,7 @@ OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # project
 # drafter's, fc: a DFlash2 drafter's, out: LFM3's conv layers')
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
-         "ple": "qkv"}
+         "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv"}
 assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
@@ -81,6 +81,7 @@ class Gemm:
     part: int = 0  # K part (output projections split over K: each into its own C)
     a_off: int = 0  # the A argument from this bf16 element of the panels on (K parts of one design: the part's columns)
     c: str = ""  # its C buffer when not the phase's (a split gate / up block's parts: "GU")
+    a: str = ""  # its A buffer when not the phase's (a PARO checkpoint's projections: their rotated inputs)
 
 
 @dataclass
@@ -318,15 +319,53 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
     return PhasePlan(gemms, None, act=ops[key] if ops is not None else act_op)
 
 
+def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
+    """The output layout of input projections of one block each that write one buffer (a PARO checkpoint's q, k, v: their
+    inputs differ), per column [block of region 0 | block of region 1 | ...] as ``_in_layout``'s blocks of one region."""
+    off: dict[str, int] = {}
+    col = 0
+    for r in regions:
+        (b,) = r.blocks
+        off[b.name] = col
+        col = -(-(col + _extents(r, [0], T, r.K_in, False)[0]) // 32) * 32
+    return Layout(max(-(-col // 64) * 64, pitch), off)
+
+
+def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
+                      act: str = "silu") -> PhasePlan:
+    """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
+    from the caller's slices): a GEMM of plain bf16 rows into GU per region ([column][group][gate W | up W], ``gate_up``:
+    a pass of tile-major 16-row tiles is one group of 64), then the activation into the phase's output (HP), as a split
+    block's (``_split_gate_up``)."""
+    (bg,), (bu,) = gate.blocks, up.blocks
+    groups, W, KC = image.cfg.intermediate_size // COLS // 64, 64, gate.kc
+    P = groups * 2 * W
+    gemms = []
+    for part, (r, b) in enumerate(((gate, bg), (up, bu))):
+        assert not planar(b.fmt, b.R, KC) and _tp(b) * b.R == ROWS and not b.pt, (b.fmt, b.R)
+        kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * P, "tile_bytes": r.tile_bytes,
+              "col_bytes": r.col_stride, "passes": groups,
+              "out_cols": [[P * c + 2 * W * j + W * part for j in range(groups)] for c in range(COLS)], "kc": KC,
+              "kc_group": r.kc_group, "blocks": ((0, groups),), "region_rt": r.n_rt}
+        op = gemm_op(kw, T, "gu", ops)
+        gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU"))
+    key = ("act", T, groups, W, image.region(gate.layer, "down").K_in, act)
+    if ops is None or key not in ops:
+        act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-2], act=act)
+        if ops is not None:
+            ops[key] = act_op
+    return PhasePlan(gemms, None, act=ops[key] if ops is not None else act_op)
+
+
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
-               act: str = "silu", k_part: int = 0, layout_T: int = 0) -> PhasePlan:
+               act: str = "silu", k_part: int = 0, layout_T: int = 0, layout: Layout | None = None) -> PhasePlan:
     """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
     projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
     reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu, gelu_erf). ``k_part``: an output
     projection in K parts of that many chunks (dividing a chunk group: each part's A strip may stay in the memtile, and
     each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input
     projection's layout (its planar passes) as planned for that many tokens (the layout of buffers that outlive a chunk,
-    e.g. qwen35's conv states in G's rows; default T)."""
+    e.g. qwen35's conv states in G's rows; default T); ``layout``: an input projection's (``joined_layout``)."""
     name, K, S, KC = region.name, region.K_in, region.tile_bytes, region.kc
     which = WHICH[name]
     if name == "gate_up" and region.blocks[0].fmt2:
@@ -403,7 +442,7 @@ def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops:
             gemms.append(Gemm(op, region.offset + k0 * region.n_rt * S - op.hdr_skip, part=i, a_off=k0 * KC // 8 * 36))
         return PhasePlan(gemms, None, parts)
     TL = layout_T or T
-    lay = _in_layout(region, TL, pitch)
+    lay = layout or _in_layout(region, TL, pitch)
     off = lay.off
     gemms = []
     for run in _runs(region):
