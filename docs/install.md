@@ -35,6 +35,11 @@ printf '* soft memlock unlimited\n* hard memlock unlimited\n' | sudo tee /etc/se
 A shell or tmux server started before keeps the old limit. A systemd service (`artlite-server` as one) takes its own:
 `LimitMEMLOCK=infinity` in its unit.
 
+Optional: the driver's `turbo` power mode turns the array's clock gating off (more power while the NPU works). Only
+root can set it, and Artlite keeps the driver's `default`; where XRT is installed, `sudo xrt-smi configure --pmode
+turbo` sets it until the next reboot. On Strix Halo it made Llama 3.2 1B Q4_K_M's decode 0.5% faster and its prefill
+0.25% faster (each dispatch ~5 us shorter, ~15 us for a full ELF).
+
 ## Build (Linux)
 
 ```bash
