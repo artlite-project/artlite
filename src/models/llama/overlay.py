@@ -15,6 +15,13 @@ per layer L (column c = KV head c):
 and the LM head: output_norm -> LOGITS [slot][vocab] bf16 (the vocabulary padded to whole C objects per column: the
 padding rows' logits are cut off, ``ModelOverlay._logits``).
 
+A PARO checkpoint (``llama.image``'s regions; the decode design's "Rotated inputs"): the step starts with rot_in (the
+embeddings' rotated copies for the first layer's q, k, v, each with the columns' partial sums of squares), then per layer
+q, k, v (F_PSQ: each on its own rotated input), att (o into rot_o's input), rot_o (each column rotates o of its heads into
+o's input), o (its residual's copies for gate and up), gate and up (F_PSQ; their rows into rot_down's input, [gate SP |
+up SP] per k block), rot_down (each column's act(gate) up, rotated, into down's input), down (the next layer's q, k, v
+copies; the last layer's residual as it is, for the LM head).
+
 The KV caches (KV): per layer and KV head linear groups of kp + 1 objects of the tile size T (``decode.kv``: kp K
 objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``), 128 positions per group at
 head_dim 64, 64 at 128 for objects of ~9.3 KB; then per layer and KV head a ring of two slots of T bytes with the
@@ -46,20 +53,39 @@ import math
 import numpy as np
 
 from artlite.decode import gemv
+from artlite.decode import phases as mp
 from artlite.decode.attn import Attn, rope_tables, score_bits
 from artlite.decode.attn_overlay import AttentionOverlay, CacheKind, CacheUse
-from artlite.decode.model import paged_formats
+from artlite.decode.design import ROT_GROUP
+from artlite.decode.model import InputRegion, paged_formats
 from artlite.decode.protocol import (
     C_LEN,
+    DIMS_OBJ,
     F_EMITR,
     F_GU,
+    F_MAIN,
     F_NORM,
+    F_PSQ,
+    F_RACT,
     F_RESID,
+    F_ROTE,
+    F_ROTX,
+    M_FLAGS,
+    M_NRA,
+    M_NRC,
+    M_NS,
+    M_NT,
+    M_NX,
+    M_RGN,
     META,
     SLOTS,
     XB,
+    XPAY,
     interleave,
     packed_slots,
+    region_bytes,
+    rot_input_fill,
+    rot_region_bytes,
 )
 from artlite.decode.screen import Screen
 from artlite.decode.step import Part, StepPlan
@@ -74,6 +100,13 @@ from .image import LlamaImage
 
 PHASES = ("qkv", "att", "o", "gate_up", "down")
 FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM}
+# (a PARO checkpoint: module docstring) the phases of a layer, their flags (the last layer's down: F_ROTE off), each
+# rotation's data region (``llama.image``) and the phases its copies go to
+PARO_PHASES = ("q", "k", "v", "att", "rot_o", "o", "gate", "up", "rot_down", "down")
+PARO_FLAGS = {"rot_in": F_EMITR | F_ROTE, "q": F_PSQ, "k": F_PSQ, "v": F_PSQ, "rot_o": F_ROTX,
+              "o": F_RESID | F_EMITR | F_ROTE, "gate": F_PSQ, "up": F_PSQ, "rot_down": F_ROTX | F_RACT,
+              "down": F_RESID | F_EMITR | F_ROTE, "lm": F_NORM}
+ROT_DATA = {"rot_in": "rot_in", "rot_o": "rot_o", "o": "o_rot", "rot_down": "rot_down", "down": "down_rot"}
 KV_PAD = 4096  # positions past the caches (the last layer's): the prefill's slices of a cache (its largest chunk's
 # runtime offsets range over the caches and this pad, the range every chunk size's parameter takes: ``prefill.MAX_T``)
 
@@ -110,12 +143,18 @@ class LlamaOverlay(AttentionOverlay):
         self.q_heads = self.nh
         self.at = at = Attn(hds=(self.hd,), rot=(self.hd // 2,), chain=1, heads=self.nh, kp=self.kp,
                             qk_norm=cfg.qk_norm, qk_weights=cfg.qk_norm, eps=cfg.rms_norm_eps, a_bytes=self.T)
-        gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R}
+        gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R} \
+            if not img.paro else {16}
+        self.paro = img.paro
+        if self.paro:  # (gate and up: phases of their own)
+            assert self.H % 1024 == 0 and self.H // COLS % ROT_GROUP == 0, \
+                f"a PARO checkpoint of hidden size {self.H}: whole K chunks and rotation groups per column"
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                       eps=cfg.rms_norm_eps, attn=at, gu_win=gu != {16} or img.split,
                                       paged=paged_formats(gguf, fmts), split=img.split,
                                       tails=any(r.half for r in img.regions),
-                                      tail_pairs=any(b.pt for r in img.regions for b in r.blocks))
+                                      tail_pairs=any(b.pt for r in img.regions for b in r.blocks),
+                                      **({"rot": True} if self.paro else {}))  # (the GGUF designs' keys as they were)
         self.pg = at.pg[self.hd]  # positions per cache group
         groups = -(-max_positions // self.pg)
         self.max_positions = groups * self.pg
@@ -134,9 +173,15 @@ class LlamaOverlay(AttentionOverlay):
 
     def phases(self, lm: bool = True) -> list[tuple[int, str]]:
         """The step's phases in order (``lm`` False: without the LM head)."""
+        if self.paro:
+            return [(self.layers[0], "rot_in")] + [(L, n) for L in self.layers for n in PARO_PHASES] + \
+                ([(-1, "lm")] if lm else [])
         return [(L, n) for L in self.layers for n in PHASES] + ([(-1, "lm")] if lm else [])
 
     def _flags(self, L: int, name: str) -> int:
+        if self.paro:
+            last = L == self.layers[-1] and name == "down"
+            return PARO_FLAGS[name] & ~(F_ROTE if last else 0)
         return FLAGS[name]
 
     def _plan(self) -> None:
@@ -147,7 +192,11 @@ class LlamaOverlay(AttentionOverlay):
         self.toks = (take("ACT", SLOTS * XB), take("ACT", SLOTS * XB))
         self.loadr = take("ACT", COLS * SLOTS * XB)
         for L, name in self.phases():
-            if name != "att":
+            if name == "att":
+                continue
+            if self.paro and name in ("rot_in", "q", "k", "v", "rot_o", "gate", "up", "rot_down"):
+                self._add_paro_inputs((L, name))
+            else:
                 self._add_inputs((L, name))
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
         # object of the sub-step from slot a on (its token a)
@@ -155,6 +204,143 @@ class LlamaOverlay(AttentionOverlay):
         # (past the last layer's caches: the prefill's slices)
         self._plan_caches(self.layers, pad=2 * KV_PAD // self.pg * self.G * self.T)
         self._sizes()
+
+    def _add_paro_inputs(self, phase: tuple[int, str]) -> None:
+        """(PARO) The input region of a rotated phase (module docstring): rot_in's metadata object; an F_PSQ phase's
+        [metadata object | partial sums object | x] (one K group); rot_o's (o of every head) and rot_down's ([gate | up]
+        per k block: x of twice the slots) [metadata object | x]."""
+        L, name = phase
+        if name == "rot_in":
+            regs = [InputRegion(self._take("ACT", XB), 0, 0)]
+        elif name == "rot_o":
+            K = self.nh * self.hd * COLS
+            regs = [InputRegion(self._take("ACT", region_bytes(K)), 0, K)]
+        elif name == "rot_down":
+            K = self.cfg.intermediate_size
+            regs = [InputRegion(self._take("ACT", region_bytes(K, 2 * SLOTS)), 0, K)]
+        else:
+            r = self.image.region(L, name)
+            assert len(mp.group_chunks(r)) == 1, f"{name}: one K group"
+            regs = [InputRegion(self._take("ACT", rot_region_bytes(r.K)), 0, r.K, x0=XB + XPAY)]
+        self.inp[phase] = regs
+
+    def _rot_objects(self, L: int, name: str) -> int:
+        """(PARO) The rotation objects of a phase per column (its data region's: ``ROT_DATA``), 0 without."""
+        r = ROT_DATA.get(name)
+        return self.image.rot_groups(L, r) if r is not None and (L, r) in self.image._index else 0
+
+    def _rot_slice(self, name: str) -> tuple[int, int]:
+        """(PARO, rot_o / rot_down) A column's slice of the input: (channels, x's slots per k block for S = 4)."""
+        return (self.nh * self.hd, 1) if name == "rot_o" else (self.cfg.intermediate_size // COLS, 2)
+
+    def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
+        if not self.paro or name in ("lm",):
+            return super()._groups(L, name, S)
+        flags, per = self._flags(L, name), 4 if S == 1 else (2 if S == 2 else 1)  # (per: strips of an input object)
+        nrot = self._rot_objects(L, name)
+        if name in ("rot_in", "rot_o", "rot_down"):  # (no tiles: the rotation objects only)
+            m = np.zeros(META, np.int32)
+            m[M_FLAGS], m[M_NS], m[M_NT], m[M_NRA] = F_MAIN | flags, S, nrot, nrot
+            if name == "rot_in":
+                m[M_NRC] = 3
+            else:  # (the column's slice as X objects: counted as the other cores' strips, ``decode.attn``)
+                n, mul = self._rot_slice(name)
+                m[M_RGN] = n // ROT_GROUP
+                m[M_NX] = -(-2 * mul * packed_slots(S) * n // XPAY) * per
+            return [mp.Group(0, 0, m, 0, 0)]
+        out = super()._groups(L, name, S)
+        for i, g in enumerate(out):
+            if flags & F_PSQ:  # (the partial sums object counted in: the other cores skip it)
+                g.meta[M_NX] += per
+            last = i + 1 == len(out)
+            if not last:
+                g.meta[M_FLAGS] &= ~F_ROTE
+            elif flags & F_ROTE:
+                g.meta[M_NRA], g.meta[M_NRC] = nrot, 2 if name == "o" else 3
+                g.meta[M_NT] += nrot
+        return out
+
+    def _gemv(self, seq: Sequence, st: StepPlan, phase: tuple[int, str]) -> None:
+        if not self.paro:
+            return super()._gemv(seq, st, phase)
+        name = phase[1]
+        if name not in ("k", "v", "up"):  # (k, v, up: their inputs came with q's / gate's, after its sync)
+            seq.sync()  # (its inputs' producers)
+        sp = packed_slots(st.S)
+        for rg in self.inp[phase]:
+            if name == "rot_in":  # (the metadata object: the copies come from the residual)
+                for c in range(COLS):
+                    seq.fill("X", c, self.dev.address("ACT", rg.off), XB)
+            elif name in ("rot_o", "rot_down"):  # (the metadata object, then the column's slice)
+                n, mul = self._rot_slice(name)
+                nobj = -(-2 * mul * sp * n // XPAY)
+                for c in range(COLS):
+                    seq.fill("X", c, self.dev.address("ACT", rg.off), XB)
+                    at = rg.off + XB + 2 * mul * sp * n * c - (XB - XPAY)  # (object i: the XB bytes ending with the
+                    # slice's i-th XPAY bytes)
+                    seq.fill("X", c, self.dev.address("ACT", at), nobj * XB, DIMS_OBJ)
+            elif rg.x0 != XB:  # (F_PSQ: the partial sums object after the metadata object)
+                for c in range(COLS):
+                    seq.fill("X", c, self.dev.address("ACT", rg.off), *rot_input_fill(rg.K, sp))
+            else:
+                self._inputs(seq, rg, st.S, phase)
+        self._outputs(seq, st, phase)
+
+    def _x_to(self, seq: Sequence, c: int, phase: tuple[int, str], *, e0: int, n: int, S: int, mul: int = 1,
+              so: int = 0) -> None:
+        """(PARO) n output values per slot of column c (objects (j, slot) of C_LEN values) -> the elements e0 .. e0 + n
+        of a phase's x ([k block][slot mul sp][8]: rot_down's [gate | up]; ``so``: from slot so on), per K group."""
+        sp = packed_slots(S)
+        for rg in self.inp[phase]:
+            a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
+            j = a
+            while j < b:  # (repeated BDs: at most 64 iterations)
+                m = min(b - j, 64 * C_LEN)
+                assert (j - rg.k0) % C_LEN == 0 and m % C_LEN == 0, (j, rg.k0, m)
+                nobj, spx = m // C_LEN, mul * sp
+                seq.drain("C", c, self.dev.address("ACT", rg.off + rg.x0 + 2 * spx * (j - rg.k0) + 16 * so), S * 2 * C_LEN,
+                          (4, 8, 4 * spx, 4), nobj, (4 * spx * 8, nobj))
+                j += m
+
+    def _rot_copies(self, seq: Sequence, c: int, S: int, to: list[tuple[int, str]]) -> None:
+        """(PARO) An F_ROTE emission of column c: per copy its partial sums object, then its x (the consumer's)."""
+        h8 = self.H // COLS
+        for ph in to:
+            seq.drain("C", c, self.dev.address("ACT", self.inp[ph][0].off + XB + 2 * C_LEN * c), 2 * C_LEN)
+            self._x_to(seq, c, ph, e0=h8 * c, n=h8, S=S)
+
+    def _paro_outputs(self, seq: Sequence, st: StepPlan, phase: tuple[int, str]) -> None:
+        L, name = phase
+        S, dev = st.S, self.dev
+        ffn, nq = self.cfg.intermediate_size // COLS, self.nh * self.hd
+        i = self.layers.index(L) if L >= 0 else -1
+        nxt = self.layers[i + 1] if 0 <= i < len(self.layers) - 1 else None
+        for c in range(COLS):
+            reg = self.att_reg[(L, c)] if name in ("q", "k", "v") else 0
+            if name == "rot_in":
+                self._rot_copies(seq, c, S, [(L, n) for n in "qkv"])
+            elif name == "q":  # -> its q object per slot
+                seq.drain("C", c, dev.address("ACT", reg + 4 * META), S * 2 * nq, (C_LEN // 2, S, XB // 4, C_LEN // 2))
+            elif name in ("k", "v"):  # -> the K / V part of its K / V object per slot
+                at = reg + SLOTS * XB + 4 * META + (2 * self.hd if name == "v" else 0)
+                seq.drain("C", c, dev.address("ACT", at), S * 2 * self.hd, (C_LEN // 2, S, XB // 4, C_LEN // 2))
+            elif name == "rot_o":
+                self._x_to(seq, c, (L, "o"), e0=nq * c, n=nq, S=S)
+            elif name == "o":
+                self._rot_copies(seq, c, S, [(L, "gate"), (L, "up")])
+            elif name in ("gate", "up"):
+                self._x_to(seq, c, (L, "rot_down"), e0=ffn * c, n=ffn, S=S, mul=2, so=packed_slots(S) if name == "up" else 0)
+            elif name == "rot_down":
+                self._x_to(seq, c, (L, "down"), e0=ffn * c, n=ffn, S=S)
+            elif name == "down" and nxt is not None:
+                self._rot_copies(seq, c, S, [(nxt, n) for n in "qkv"])
+            elif name == "down":
+                self._values_to(seq, c, (-1, "lm"), e0=self.H // COLS * c, n=self.H // COLS, S=S)
+            else:
+                self._logits_out(seq, c, S)
+
+    def _o_inputs(self, L: int) -> list[InputRegion]:
+        return self.inp[(L, "rot_o")] if self.paro else super()._o_inputs(L)
 
     # ------------------------------------------------------------------
     # Load
@@ -175,6 +361,8 @@ class LlamaOverlay(AttentionOverlay):
     # ------------------------------------------------------------------
 
     def _outputs(self, seq: Sequence, st: StepPlan, phase: tuple[int, str]) -> None:
+        if self.paro:
+            return self._paro_outputs(seq, st, phase)
         L, name = phase
         S, dev, h8, ffn = st.S, self.dev, self.H // COLS, self.cfg.intermediate_size // COLS
         nq = self.nh * self.hd
@@ -222,7 +410,8 @@ class LlamaOverlay(AttentionOverlay):
             self._metas(S)
         xf = x
         self._write_loadr(xf)
-        self._write_input(self.inp[(self.layers[0], "qkv")][0], interleave(xf, packed_slots(S)).view(np.uint8).reshape(-1))
+        if not self.paro:  # (PARO: rot_in's copies of the residual)
+            self._write_input(self.inp[(self.layers[0], "qkv")][0], interleave(xf, packed_slots(S)).view(np.uint8).reshape(-1))
         return self._run(S, position, logits)
 
     def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
@@ -232,7 +421,7 @@ class LlamaOverlay(AttentionOverlay):
 
     def attn_out(self, L: int, slot: int = 0) -> np.ndarray:
         """The attention's output o (heads hd) of layer L in the last step, of a slot (bf16 values, fp32)."""
-        rg = self.inp[(L, "o")][0]
+        rg = self._o_inputs(L)[0]
         return self._read_input(rg, slot, rg.K)
 
 

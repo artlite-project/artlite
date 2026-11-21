@@ -98,6 +98,7 @@ class InputRegion:
     K: int
     post: bool = False
     staged: bool = False
+    x0: int = XB  # (x's offset in the region: after the metadata object; a rotated input's after its partial sums object)
 
 
 def host_bytes(shape: tuple[int, ...]) -> np.ndarray:

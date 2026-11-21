@@ -418,11 +418,15 @@ class TileImage:
         each column's own; the model's)."""
         raise NotImplementedError
 
+    def data_objects(self, layer: int, name: str) -> np.ndarray:
+        """The objects of data region ``name`` (``_fill_data``): a "<phase>_norm" region's ``norm_objects``."""
+        return self.norm_objects(layer, name.removesuffix("_norm"))
+
     def _fill_data(self, out: np.ndarray) -> None:
-        """Write the data regions: every column's copy of a phase's ``norm_objects`` (or its own)."""
+        """Write the data regions: every column's copy of a region's ``data_objects`` (or its own)."""
         for r in self.regions:
             if r.data:
-                objs = self.norm_objects(r.layer, r.name.removesuffix("_norm"))
+                objs = self.data_objects(r.layer, r.name)
                 per = objs.reshape(COLS, -1) if objs.ndim == 3 else np.broadcast_to(objs.reshape(1, -1), (COLS, objs.size))
                 for c in range(COLS):
                     out[r.offset + c * r.col_stride:][:per.shape[1]] = per[c]

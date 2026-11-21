@@ -27,16 +27,27 @@ Per-column rows (layer L, column c = KV head c, qh query heads per KV head):
   objects per column (128256 -> 128512; padding rows -1: zero tiles).
 
 down's K chunks go in groups of the overlay's K group (``decode.protocol.MAX_K``: 1B / 3B 2 groups of 4, 8B 7 of 2).
+
+A PARO checkpoint's linears (``paro``: their inputs rotated, the decode design's "Rotated inputs") take inputs of their
+own: per layer the regions "q", "k", "v", "o", "gate", "up", "down" (each one block; q / k / v / gate / up without norm
+weights: a norm's weight is in its consumers' rotations), and the columns' rotation objects (``protocol.rot_objects``:
+column c's groups of each rotation, in the order the cores rotate them) in data regions on its A run: "rot_in" (before
+the first layer: its q, k, v copies of the residual, rotated from the embeddings), "rot_o" (the attention's output: o's
+rotation of the column's heads), "o_rot" (after o's tiles: gate's and up's copies of the residual slice), "rot_down"
+(after up: down's rotation of the column's h), "down_rot" (after down: the next layer's q, k, v copies; none after the
+last, whose residual goes to the LM head as it is).
 """
 
 import numpy as np
 
+from artlite.decode.design import ROT_GROUP
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
-from artlite.decode.protocol import C_LEN, MAX_K
+from artlite.decode.protocol import C_LEN, MAX_K, rot_objects
 from artlite.decode.screen import screened
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators.design import COLS
+from artlite.paro import ParoTensor
 from artlite.prefill.gemm import pair_tails
 
 KC = 1024  # K chunk of a tile
@@ -56,12 +67,18 @@ class LlamaImage(NormedImage):
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         self.paired = pairs
+        L0 = (list(range(cfg.num_hidden_layers)) if layers is None else layers)[0]
+        self.paro = isinstance(gguf.tensor(f"blk.{L0}.attn_q.weight"), ParoTensor)  # (module docstring)
         super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K, tile_bytes=tile_bytes, vocab=vocab,
                          tails=TAILS if tails else frozenset())
         assert cfg.num_key_value_heads == COLS, f"one KV head per column: {cfg.num_key_value_heads} KV heads"
         assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
+        self._rot_objs: dict[tuple[int, str], np.ndarray] = {}
         for L in self.layers:
-            self._layer(L)
+            if self.paro:
+                self._paro_layer(L)
+            else:
+                self._layer(L)
         self.lm = lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         rows = column_rows(self.vocab)
         self._norm(-1, "lm")
@@ -78,6 +95,54 @@ class LlamaImage(NormedImage):
     def norms(self, L: int, name: str) -> tuple[str, None]:
         """(w1, None) tensor names of a normed phase: plain inputs (pre-norm residual updates)."""
         return "output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight", None
+
+    def _rot_data(self, L: int, name: str, parts: list[tuple[str, np.ndarray | None, tuple[int, int]]]) -> None:
+        """A data region of rotation objects (module docstring): per column the objects of each part (a tensor, a norm
+        weight folded in or None, the column's K range: (start, per column)) in order, two groups per A object."""
+        objs = [(self.gguf.tensor(t).rot().tan_form(gamma, unit=True).objects(), k0, n) for t, gamma, (k0, n) in parts]
+        g = ROT_GROUP
+        per = [rot_objects(np.concatenate([o[(k0 + n * c) // g:(k0 + n * (c + 1)) // g] for o, k0, n in objs]),
+                           self.tile_bytes) for c in range(COLS)]
+        self._rot_objs[(L, name)] = np.stack(per)
+        self._add_data(L, name, per[0].size)
+
+    def data_objects(self, layer: int, name: str) -> np.ndarray:
+        if name in ("rot_in", "rot_o", "o_rot", "rot_down", "down_rot"):
+            return self._rot_objs[(layer, name)]
+        return super().data_objects(layer, name)
+
+    def rot_groups(self, layer: int, name: str) -> int:
+        """Rotation objects (A objects) of a rotation data region per column."""
+        return self._rot_objs[(layer, name)].shape[1]
+
+    def _paro_layer(self, L: int) -> None:
+        """A PARO layer's regions (module docstring)."""
+        cfg, b = self.cfg, f"blk.{L}."
+        H, I, hd, nh = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim, cfg.num_attention_heads
+        q = (np.arange(nh * hd) if cfg.neox else unpermute_rows(nh, nh * hd)).reshape(COLS, cfg.q_per_kv * hd)
+        k = (np.arange(COLS * hd) if cfg.neox else unpermute_rows(COLS, COLS * hd)).reshape(COLS, hd)
+        h8 = H // COLS
+        if L == self.layers[0]:
+            self._rot_data(L, "rot_in", self._qkv_rot(L))
+        self._add(L, "q", [("q", (b + "attn_q.weight",), q)], H)
+        self._add(L, "k", [("k", (b + "attn_k.weight",), k)], H)
+        self._add(L, "v", [("v", (b + "attn_v.weight",), column_rows(COLS * hd))], H)
+        self._rot_data(L, "rot_o", [(b + "attn_output.weight", None, (0, cfg.q_per_kv * hd))])
+        self._add(L, "o", [("o", (b + "attn_output.weight",), column_rows(H))], nh * hd)
+        g = self._vec(f"{b}ffn_norm.weight")
+        self._rot_data(L, "o_rot", [(b + "ffn_gate.weight", g, (0, h8)), (b + "ffn_up.weight", g, (0, h8))])
+        self._add(L, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
+        self._add(L, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
+        self._rot_data(L, "rot_down", [(b + "ffn_down.weight", None, (0, I // COLS))])
+        self._add(L, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
+        i = self.layers.index(L)
+        if i + 1 < len(self.layers):
+            self._rot_data(L, "down_rot", self._qkv_rot(self.layers[i + 1]))
+
+    def _qkv_rot(self, L: int) -> list[tuple[str, np.ndarray, tuple[int, int]]]:
+        """Layer L's q, k, v copies of the residual (their rotations, the input norm's weight folded in)."""
+        g, h8 = self._vec(f"blk.{L}.attn_norm.weight"), self.cfg.hidden_size // COLS
+        return [(f"blk.{L}.attn_{n}.weight", g, (0, h8)) for n in "qkv"]
 
     def _layer(self, L: int) -> None:
         cfg, b = self.cfg, f"blk.{L}."

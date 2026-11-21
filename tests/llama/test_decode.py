@@ -9,7 +9,8 @@ vocabulary, against the overlay's arithmetic on the host (ref.LlamaNpuRef), in b
   the cache), against the reference attending to the cache as stored;
 - three sequences on one device, alternated and in joint steps: every slot the logits of its sequence alone, bit for bit.
 
-Files: 1B Q4_K_M (head_dim 64, 4 query heads per KV head; layer 0's V / down Q6_K), 1B Q5_K_M (13-row Q5_K tiles), 1B
+Files: Qwen3-0.6B-PARO (a PARO checkpoint directory: P4_128 tiles, the inputs rotated: ``decode.design``'s "Rotated
+inputs"; its reference: the linears' effective weights), 1B Q4_K_M (head_dim 64, 4 query heads per KV head; layer 0's V / down Q6_K), 1B Q5_K_M (13-row Q5_K tiles), 1B
 Q6_K (12-row tiles of 10112 B), 3B Q4_K_M (head_dim 128, 3 query heads per KV head), 8B Q4_K_S (hidden 4096, Q4_K, Q5_K
 and Q6_K tiles; down in 7 K groups), 1B BF16 (8-row BFP16 tiles of 9216 B), 1B Q4_0 (Q4_0 of 16 rows, layer 0's down
 Q4_1 of 14); Qwen3 0.6B Q4_1 (16 rows, 10240 B; 2 query heads per KV head, q / k norms with weights per dim:
@@ -32,13 +33,14 @@ from artlite.decode.protocol import SLOTS
 from artlite.decode.step import Part
 from artlite.decode.vring import ring_rows
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import llama_gguf
+from artlite.hf_model import HfModel
+from artlite.model_config import checkpoint, llama_gguf
 from artlite.operators.design import COLS
 from models.llama.image import LlamaImage
 from models.llama.overlay import LlamaOverlay
 
 from ..common import as_torch, essay, to_torch
-from ..model_files import llama_path
+from ..model_files import llama_path, require
 from ..numerics import rel_finite
 from . import ref
 
@@ -50,14 +52,18 @@ CASES = {"1B_Q4_K_M": ("Q4_K_M", "1B", [0, 2]), "1B_Q5_K_M": ("Q5_K_M", "1B", [0
          "3B_Q2_K": ("Q2_K", "3B", [0, 3]), "3B_Q3_K_M": ("Q3_K_M", "3B", [0, 3]),
          "1B_Q3_K_L": ("Q3_K_L", "1B", [0, 2]), "qwen3_0.6B_Q4_1": ("Q4_1", "qwen3:0.6B", [0, 1]),
          "qwen3_emb_Q8_0": ("Q8_0", "qwen3:embedding-0.6B", [0, 1]),
-         "qwen3_emb4b_Q4_K_M": ("Q4_K_M", "qwen3:embedding-4B", [0, 2])}
+         "qwen3_emb4b_Q4_K_M": ("Q4_K_M", "qwen3:embedding-4B", [0, 2]), "qwen3_0.6B_PARO": ("PARO", "qwen3-0.6B-paro", [0, 1])}
 STEPS = (1, 4, 3, 2, 4, 4, 1, 3, 3, 2, 1, 4)  # (step sizes, repeated: every alignment to the records and their pairs)
 # relative rms error: the reference leaves out the GEMV's panels (14 bits) and its 32-k sums rounded to bf16, which move
 # a projection's rows by ~1% (the NPU's o projection is bit-exact to ``mmv.ref_rows``); up to 4.2% here
 TOL = 0.05
 
 
-def _gguf(quant: str, size: str) -> GGUFFile:
+def _gguf(quant: str, size: str) -> GGUFFile | HfModel:
+    if quant == "PARO":  # (a checkpoint directory)
+        path = checkpoint(size)
+        require(path)
+        return HfModel(path)
     return GGUFFile(llama_path(quant, size))
 
 

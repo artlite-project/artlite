@@ -64,7 +64,7 @@ from .attn import (
     Attn,
     U,
 )
-from .model import CacheRows, ModelOverlay, Snapshot, host_bytes
+from .model import CacheRows, InputRegion, ModelOverlay, Snapshot, host_bytes
 from .protocol import (
     C_LEN,
     F_POST,
@@ -404,9 +404,13 @@ class AttentionOverlay(ModelOverlay):
                     for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
                         st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[src]), 2 * self.at.d_len),
                                            L, h, u, i))
-                o = next(rg for rg in self.inp[(L, "o")] if rg.k0 <= nq * h < rg.k0 + rg.K)  # (its K group)
+                o = next(rg for rg in self._o_inputs(L) if rg.k0 <= nq * h < rg.k0 + rg.K)  # (its K group)
                 at = dev.address("ACT", o.off + XB + 2 * sp * (nq * h - o.k0) + 16 * a)  # ([k block][slot sp][8])
                 seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
+
+    def _o_inputs(self, L: int) -> list[InputRegion]:
+        """The input regions the attention of layer L writes o into (o's)."""
+        return self.inp[(L, "o")]
 
     def _token_at(self, b: int) -> int:
         """The token objects' offset in ACT of the transaction buffer ``b``."""

@@ -10,7 +10,9 @@ updates, the attention cores; Llama and Qwen3): fp32 math on the dequantized wei
   record, encoded from the bf16 values of its positions up to the attending one, exact softmax of the scores q k /
   sqrt(head_dim), o rounded to bf16. (Not modelled: the Q panels' 14 bits, the P panels, exp2's bf16-level polynomial.)
 
-``LlamaNpuRef`` runs a list of layers of a GGUF file (and a truncated LM head) that way, one token after the other.
+``LlamaNpuRef`` runs a list of layers of a GGUF file (and a truncated LM head) that way, one token after the other. A
+PARO checkpoint's linears are the plain linears they compute (``ParoTensor.effective``: their rotations exact; the
+overlay rotates inputs in fp32 and rounds them to bf16 where the plain path rounds x).
 """
 
 import math
@@ -22,6 +24,7 @@ from artlite.formats import has_tile_format, tile_format
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
 from artlite.operators import bfp16
+from artlite.paro import ParoTensor
 
 from ..decode.attn_ref import AttentionRef, inv_rms
 from ..numerics import bf16_round as bf
@@ -48,7 +51,8 @@ class LlamaNpuRef:
         (as the image's)."""
         if name not in self._mats:
             t = self.gguf.tensor(name)
-            w = torch.from_numpy(t.dequantize())
+            # (a PARO linear: the plain linear it computes, its rotation exact)
+            w = torch.from_numpy(t.effective().astype(np.float32) if isinstance(t, ParoTensor) else t.dequantize())
             if has_tile_format(t.qtype) and tile_format(t.qtype) == "BFP16":
                 w = torch.from_numpy(bfp16.values(w.numpy()))
             cfg = self.cfg

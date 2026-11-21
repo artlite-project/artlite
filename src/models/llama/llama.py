@@ -62,7 +62,9 @@ class NpuLlama(OverlayModel):
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.generates = not readout
-        self.prefill = LlamaPrefill(self.overlay, sizes=sizes, precise=readout, pack=readout) if prefill else None
+        # (a PARO checkpoint's prompts: decode steps)
+        self.prefill = LlamaPrefill(self.overlay, sizes=sizes, precise=readout, pack=readout) \
+            if prefill and not self.overlay.paro else None
         self._open(threads=threads)
         self._w_out = gguf.tensor("output_norm.weight").dequantize().reshape(-1)
         gguf.release()

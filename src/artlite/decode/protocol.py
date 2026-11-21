@@ -26,7 +26,7 @@ The main core's program, per X object (``_begin``):
   rows). Per tile the main core posts the helper's command, runs its half, adds the helper's partial rows; a
   complete row tile's rows per slot: ``F_RESID`` into the residual (fp32), ``F_GU`` (rows 0 .. 7 gate, 8 .. 15 up) ->
   bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
-  after the tiles the residual goes out (bf16).
+  after the tiles the residual goes out (bf16; ``F_ROTE``: as rotated copies, ``decode.design``'s "Rotated inputs").
 
 Metadata words (``XMETA``): the words from 0 to ``M_MODEL`` are every object's header. The kinds of object own the words
 past it, each its own (``objects``: one kind's words may reuse another's offsets): a phase's metadata object (``PHASE``),
@@ -92,6 +92,9 @@ M_SCALE = PHASE.word("M_SCALE")
 # model's hidden size or a drafter's (``hidden_meta``)
 M_H8, M_IH = PHASE.words("M_H8 M_IH", at=42)
 M_XC0 = PHASE.word("M_XC0", at=55)  # (moe) a phase's first chunk of x / sum panels
+# (rot) the rotation objects (A objects of 2 groups' ``paro.TanForm.objects``: counted in M_NT, after the tiles), the
+# copies of an F_ROTE emission (each of the column's residual slice), F_ROTX's groups (of the column's slice)
+M_NRA, M_NRC, M_RGN = PHASE.words("M_NRA M_NRC M_RGN", at=28)
 F_NORM = PHASE.flag("F_NORM", 0)  # RMSNorm of the input (norm-weight objects); the outputs scaled by 1 / rms
 F_LOADR = PHASE.flag("F_LOADR", 1)  # the payload is a slot's residual slice (fp32)
 F_RESID = PHASE.flag("F_RESID", 2)  # the rows add into the residual
@@ -106,6 +109,14 @@ F_PLI = PHASE.flag("F_PLI", 14)  # the rows' outputs gelu(bf16(y)) pli, pli = bf
 # [p: slot 4][256] | [e: slot 4][256] bf16 (p: the per-layer projection's rows, ``gemma4.overlay``; rms over the 256),
 # w (bf16 hi | lo) after [w1 | w_post] in the phase's first norm-weight object
 F_PZERO = PHASE.flag("F_PZERO", 15)  # pend = 0 first (an F_VOUT phase's first K group)
+# (``rot`` designs: PARO linears, ``decode.design``'s "Rotated inputs") the residual goes out (F_EMITR) as M_NRC rotated
+# copies of M_RGN groups each, each after its partial sums object; an input of rotated x after a partial sums object (the
+# outputs scaled by the slots' 1 / rms); a rotation phase: per column its slice of the input (X objects) rotated and out
+# (F_RACT: the slice is [gate | up] per k block, rotated is act(bf16(gate)) up)
+F_ROTE = PHASE.flag("F_ROTE", 7)
+F_PSQ = PHASE.flag("F_PSQ", 27)
+F_ROTX = PHASE.flag("F_ROTX", 28)
+F_RACT = PHASE.flag("F_RACT", 29)
 F_KPAIR = PHASE.flag("F_KPAIR", 18)  # (a header) its tiles hold row pairs of a matrix of K = POST_K (a row's super-blocks: two
 # rows), run as two slots of one token: slot 0 = [x | 0], slot 1 = [0 | x] (the helper mirrors strip 0 into slot 1 for strip 1)
 # (``moe`` designs: an MoE layer, ``decode.design``'s "MoE")
@@ -181,6 +192,11 @@ S_NAS = TOK_STATE.block("S_NAS", N_TOK, at=52)  # (``tok``) the cache objects pe
 MOE_STATE = STATE.kind("moe", exclusive_with=(POST_STATE,))
 S_NSUB, S_NLS, S_XC0, S_SUB = MOE_STATE.words("S_NSUB S_NLS S_XC0 S_SUB", at=44)
 S_SG = MOE_STATE.block("S_SG", SLOTS, at=48)
+# (rot) the partial sums object (a trip count), F_ROTE's rotation objects, the groups of the next rotation object, F_ROTX's
+# X objects, the rotation objects of the next one (trip counts); the copy (F_ROTX: the group in its X object), the group
+# and the groups of the phase's rotations
+ROT_STATE = STATE.kind("rot", exclusive_with=(POST_STATE, MOE_STATE))
+S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_NRA S_NGA S_NRX S_NRP S_RC S_RG S_RN", at=44)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -214,7 +230,7 @@ WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6,
 
 def consts() -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``)."""
-    return XMETA.consts(PHASE, TOKEN, MOE) | STATE.consts(POST_STATE, TOK_STATE, MOE_STATE) | CMD.consts() | \
+    return XMETA.consts(PHASE, TOKEN, MOE) | STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE) | CMD.consts() | \
         {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
 
 
@@ -290,6 +306,29 @@ def post_input_fill(K: int, sp: int = SLOTS) -> tuple[int, tuple[int, int, int, 
     """(bytes, shim BD dims) of the X fill of a header phase's input (as ``input_fill``: the metadata object, the
     partial sums object, then the input objects: K / POST_K strips, SLOTS / sp per object)."""
     return (2 + -(-(K // POST_K) * sp // SLOTS)) * XB, (XB // 8, 2, XB // 8, XPAY // 4)
+
+
+def rot_region_bytes(K: int, sp: int = SLOTS) -> int:
+    """(rot) Bytes of an F_PSQ phase's input in DDR: [metadata object | the partial sums object's payload (the 8 columns'
+    C objects at 128 c) | x: [k block K / 8][slot sp][8] bf16] (as ``post_region_bytes``)."""
+    return XB + XPAY + 2 * sp * K
+
+
+def rot_input_fill(K: int, sp: int = SLOTS, slots: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
+    """(bytes, shim BD dims) of the X fill of an F_PSQ phase's input (``input_fill`` with the partial sums object after
+    the metadata object)."""
+    return (2 + -(-n_inputs(K, slots) * sp // slots)) * XB, DIMS_OBJ
+
+
+def rot_objects(objs: np.ndarray, tile_bytes: int) -> np.ndarray:
+    """(rot) Rotation objects (G, 3328) uint8 (``paro.TanForm.objects``, a column's groups in order) -> the A objects
+    of two groups each (ceil(G / 2), tile_bytes)."""
+    G, n = objs.shape
+    assert 2 * n <= tile_bytes, (n, tile_bytes)
+    out = np.zeros((-(-G // 2), tile_bytes), np.uint8)
+    for i in range(G):
+        out[i // 2, n * (i % 2):n * (i % 2 + 1)] = objs[i]
+    return out
 
 
 def interleave(x: np.ndarray, sp: int = SLOTS) -> np.ndarray:

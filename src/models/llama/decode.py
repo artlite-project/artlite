@@ -23,7 +23,7 @@ class LlamaDecodeOperator(AttentionDecodeOperator):
     columns (``tile_bytes``); ``attn``: the attention cores' shapes (None: without); ``gu_win``: the gate / up
     tiles hold fewer than 16 rows (Q5_K, Q6_K: ``DecodeOverlayOperator``); ``paged``: formats whose kernels are code
     pages; ``split``: gate / up blocks of two formats; ``tails``, ``tail_pairs``: half regions' inputs and their pairs
-    of row tiles (``DecodeOverlayOperator``)."""
+    of row tiles; ``rot``: rotated inputs (a PARO checkpoint's: ``DecodeOverlayOperator``)."""
 
     PREFIX = "l3d"
     CHAIN = 1
@@ -31,8 +31,8 @@ class LlamaDecodeOperator(AttentionDecodeOperator):
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float = 1e-5, attn: Attn | None = None,
                  gu_win: bool = False, paged: tuple[str, ...] = (), win: str = "", split: bool = False,
-                 tails: bool = False, tail_pairs: bool = False):
+                 tails: bool = False, tail_pairs: bool = False, rot: bool = False):
         assert all(gemv.supported(f, 4) for f in rows), rows
         super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu",
                          packed=True, tok=True, gu_win=gu_win, paged=paged, win=win, split=split, tails=tails,
-                         tail_pairs=tail_pairs)
+                         tail_pairs=tail_pairs, rot=rot)

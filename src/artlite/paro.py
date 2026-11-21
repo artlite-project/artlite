@@ -77,14 +77,32 @@ class Rotation:
         eye[np.arange(g), :, np.arange(g)] = 1.0
         return self.apply(eye.reshape(g, self.K)).reshape(g, G, g).transpose(1, 0, 2)
 
-    def tan_form(self, gamma: np.ndarray | None = None) -> TanForm:
+    def tan_form(self, gamma: np.ndarray | None = None, *, unit: bool = False) -> TanForm:
         """The rounds as ``u <- u + T * u[partner]`` on storage positions (module docstring of ``TanForm``), from the
         stored parameters in fp64; ``gamma``: a per-channel scale before the transform (a norm's weight) folded into
-        D_0."""
-        G, g, R = self.K // self.group, self.group, self.rounds
-        d = np.asarray(self.channel_scales, np.float64).reshape(G, g).copy()
+        D_0. ``unit``: D_0 chosen so that the final scales D are 1 and the input scaled instead (``TanForm.w``: x' =
+        rounds(x w), no multiply after the rounds; the scales' paths through the rounds do not depend on D_0)."""
+        G, g = self.K // self.group, self.group
+        d0 = np.asarray(self.channel_scales, np.float64).reshape(G, g).copy()
         if gamma is not None:
-            d *= np.asarray(gamma, np.float64).reshape(G, g)
+            d0 *= np.asarray(gamma, np.float64).reshape(G, g)
+        if not unit:
+            return self._rounds(d0)[0]
+        tf, origin = self._rounds(d0)
+        d1 = np.empty_like(d0)
+        np.put_along_axis(d1, origin, np.take_along_axis(d0, origin, 1) / tf.D.reshape(G, g), 1)
+        out = self._rounds(d1)[0]
+        assert np.allclose(out.D, 1, rtol=1e-9, atol=0), np.abs(out.D - 1).max()
+        out.D = np.ones_like(out.D)
+        out.w = (d0 / d1).reshape(-1)
+        return out
+
+    def _rounds(self, d0: np.ndarray) -> tuple[TanForm, np.ndarray]:
+        """The tan form from the initial scales d0 (G, g): and per final storage position the channel whose initial scale
+        flows into its final one (G, g)."""
+        G, g, R = self.K // self.group, self.group, self.rounds
+        d = d0.copy()
+        origin = np.tile(np.arange(g), (G, 1))  # (per channel: whose initial scale its scale carries)
         pos = np.tile(np.arange(g), (G, 1))  # pos[G, c]: the storage position of channel c
         p = np.asarray(self.pairs, np.int64).reshape(R, G, g // 2, 2)
         th = np.asarray(self.theta, np.float64).reshape(R, G, g // 2)
@@ -96,17 +114,20 @@ class Rotation:
             c, s = np.cos(th[r]), np.sin(th[r])
             P, Q = pos[gi, i], pos[gi, j]
             di, dj = d[gi, i], d[gi, j]
+            oi, oj = origin[gi, i], origin[gi, j]
             cf = np.abs(c) >= np.abs(s)  # (else the outputs swap storage: the tangent stays at most 1)
             t = np.where(cf, s / np.where(cf, c, 1), c / np.where(cf, 1, s))
             partner[r, gi, P], partner[r, gi, Q] = Q, P
             coef[r, gi, P] = np.where(cf, t * dj / di, -t * dj / di)
             coef[r, gi, Q] = np.where(cf, -t * di / dj, t * di / dj)
             d[gi, i], d[gi, j] = np.where(cf, c * di, s * dj), np.where(cf, c * dj, -s * di)
+            origin[gi, i], origin[gi, j] = np.where(cf, oi, oj), np.where(cf, oj, oi)
             pos[gi, i], pos[gi, j] = np.where(cf, P, Q), np.where(cf, Q, P)
         chan = np.empty_like(pos)  # chan[G, s]: the channel at storage position s
         chan[gi, pos] = np.arange(g)[None, :]
-        return TanForm(partner.reshape(R, -1).astype(np.uint8), coef.reshape(R, -1),
-                       np.take_along_axis(d, chan, 1).reshape(-1), chan.reshape(-1), g)
+        tf = TanForm(partner.reshape(R, -1).astype(np.uint8), coef.reshape(R, -1),
+                     np.take_along_axis(d, chan, 1).reshape(-1), chan.reshape(-1), g)
+        return tf, np.take_along_axis(origin, chan, 1)
 
 
 @dataclass
@@ -122,11 +143,29 @@ class TanForm:
     D: np.ndarray  # (K,) fp64
     chan: np.ndarray  # (K,) group-local
     group: int
+    w: np.ndarray | None = None  # (K,) fp64: (``Rotation.tan_form(unit=True)``) the input's scales: u = x w at first
+
+    def objects(self) -> np.ndarray:
+        """The NPU's rotation object of each group (G, 3328) uint8: the rounds' coefficients (``kmath.rotate.coefs``) and
+        w (bf16; a unit form's: D is 1)."""
+        from ml_dtypes import bfloat16
+
+        from .operators.kmath.rotate import coefs
+
+        assert self.w is not None, "a unit tan form (Rotation.tan_form(unit=True))"
+        R, g = self.T.shape[0], self.group
+        G = self.T.shape[1] // g
+        T, part = self.T.reshape(R, G, g), self.partner.reshape(R, G, g)
+        out = np.zeros((G, 3328), np.uint8)
+        for k in range(G):
+            out[k, :3072] = coefs(T[:, k], part[:, k])
+        out[:, 3072:] = np.asarray(self.w, np.float32).astype(bfloat16).view(np.uint8).reshape(G, 2 * g)
+        return out
 
     def apply(self, x: np.ndarray) -> np.ndarray:
-        """D u of rows x (T, K) in fp64: x' in storage order (``chan``)."""
+        """D u of rows x (T, K) in fp64 (times w first: a unit form's): x' in storage order (``chan``)."""
         n, K, g = x.shape[0], x.shape[1], self.group
-        u = np.asarray(x, np.float64).reshape(n, K // g, g).copy()
+        u = np.asarray(x, np.float64).reshape(n, K // g, g) * (1 if self.w is None else self.w.reshape(1, K // g, g))
         gi = np.arange(K // g)[:, None]
         for r in range(self.T.shape[0]):
             part = self.partner[r].reshape(K // g, g).astype(np.int64)
