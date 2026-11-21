@@ -228,6 +228,10 @@ PACE = _declare(
 LM_SCREEN = _declare(
     "LM_SCREEN", "flag", ON, "a Q6_K LM head is screened: the NPU reads its high plane (39% of its bytes), the host "
     "computes the logits that matter exactly (``decode.screen``; off: the NPU reads the whole head)", _off_when_zero)
+LARGE_PAGES = _declare(
+    "LARGE_PAGES", "flag", OFF, "Windows: host buffers of 2 MB and more on 2 MB pages (``MEM_LARGE_PAGES``) where the "
+    "account holds the \"Lock pages in memory\" right, else 4 KB pages (``artlite-probe --pages`` reports which)",
+    _on_when_one, read="first use", why="the XRT backend reads it at its first host allocation", native=True)
 NB_LEAK_WARNINGS = _declare(
     "NB_LEAK_WARNINGS", "flag", "off; any value turns it on",
     "nanobind's leak warnings at exit (set to anything to show them)", _present, native=True)

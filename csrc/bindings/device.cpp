@@ -39,6 +39,28 @@ void bind_device(nb::module_& m) {
       "Device.alloc_host_buffer's buffers from this size on are user BOs (2 MB pages; 2 MB by default), smaller ones "
       "the driver's (4 KB pages): artlite-probe --diagnose measures both.");
   m.def("user_bo_bytes", [] { return size_t(user_bo_bytes); }, "set_user_bo_bytes' size.");
+  m.def(
+      "large_pages",
+      []() -> nb::object {
+#ifdef ARTLITE_SHIM_XRT
+        const shim_xdna::large_pages_state s = shim_xdna::large_pages();
+        nb::dict d;
+        d["page"] = s.page;
+        d["asked"] = s.asked;
+        d["privilege"] = s.privilege;
+        d["large_bytes"] = s.large_bytes;
+        d["small_bytes"] = s.small_bytes;
+        d["refused"] = s.refused;
+        return d;
+#else
+        return nb::none();
+#endif
+      },
+      nb::sig("def large_pages() -> dict[str, int | bool] | None"),
+      "The XRT backend's host allocations of a large page or more so far (None on the xdna backend, whose pages "
+      "transparent huge pages decide): page (the large page's size; 0 unless ARTLITE_LARGE_PAGES=1 on Windows "
+      "found the account's 'Lock pages in memory' right), asked (ARTLITE_LARGE_PAGES=1), privilege, large_bytes "
+      "(on large pages), small_bytes (on 4 KB pages), refused (large-page allocations Windows refused).");
 
   // --- The NPU's turn between processes (turn.h) ---
   m.def(

@@ -34,6 +34,19 @@ struct properties {
 // Tag of the user-memory constructor.
 struct user_memory {};
 
+// The process's host allocations of a large page or more so far. Windows with ARTLITE_LARGE_PAGES=1: on large pages
+// (MEM_LARGE_PAGES, 2 MB) where the account holds "Lock pages in memory" (SeLockMemoryPrivilege, which no account
+// holds by default) and Windows finds the free 2 MB frames, else 4 KB pages (bo.cpp).
+struct large_pages_state {
+  size_t page = 0;  // (the large page's size: 0 unless asked for on Windows)
+  bool asked = false;  // (ARTLITE_LARGE_PAGES=1)
+  bool privilege = false;  // (the process enabled SeLockMemoryPrivilege)
+  uint64_t large_bytes = 0;  // (on large pages)
+  uint64_t small_bytes = 0;  // (of allocations of a large page or more, on 4 KB pages)
+  uint64_t refused = 0;  // (large-page allocations Windows refused: no free 2 MB frames)
+};
+large_pages_state large_pages();
+
 // Host memory pinned as one XRT buffer of the device (xrt::ext::bo, of no memory group), made at its first use in a
 // context (XRT creates a buffer only on a device object with a context): the commands of every context list it, at one
 // address. (A buffer of the group kernel.group_id gives belongs to that context's xclbin slot: every context would pin

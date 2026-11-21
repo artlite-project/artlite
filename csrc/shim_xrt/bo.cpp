@@ -10,6 +10,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <span>
@@ -30,11 +32,47 @@ namespace {
 constexpr size_t kPage = 4096;
 size_t round_up(size_t n) { return (std::max<size_t>(n, 1) + kPage - 1) / kPage * kPage; }
 
+std::atomic<uint64_t> g_large_bytes{0}, g_small_bytes{0}, g_refused{0};
+
 #ifdef _WIN32
+// ARTLITE_LARGE_PAGES=1: the large page's size once the process enabled SeLockMemoryPrivilege (an account that lacks
+// the right gets ERROR_NOT_ALL_ASSIGNED), else 0. Read at the first allocation.
+const large_pages_state& large_page_setup() {
+  static const large_pages_state setup = [] {
+    large_pages_state s;
+    const char* v = std::getenv("ARTLITE_LARGE_PAGES");
+    s.asked = v && std::strcmp(v, "1") == 0;
+    HANDLE token = nullptr;
+    if (!s.asked || !::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+      return s;
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    s.privilege = ::LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid) &&
+                  ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) && ::GetLastError() == ERROR_SUCCESS;
+    ::CloseHandle(token);
+    if (s.privilege) s.page = ::GetLargePageMinimum();
+    return s;
+  }();
+  return setup;
+}
+
+// Zeroed memory, populated; from a large page on, on large pages where large_page_setup allows and Windows has the
+// free frames (the allocation rounded up to whole large pages).
 void* host_alloc(size_t size) {
-  const size_t n = round_up(size);
-  void* p = ::VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-  if (!p) throw std::bad_alloc();
+  const size_t n = round_up(size), large = large_page_setup().page;
+  void* p = nullptr;
+  if (large && n >= large) {
+    const size_t whole = (n + large - 1) / large * large;
+    p = ::VirtualAlloc(nullptr, whole, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    if (p) g_large_bytes += whole;
+    else g_refused++;
+  }
+  if (!p) {
+    p = ::VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) throw std::bad_alloc();
+    if (n >= (size_t(2) << 20)) g_small_bytes += n;
+  }
   artlite::memory::populate_zeroed(p, n);
   return p;
 }
@@ -81,6 +119,17 @@ bool has_ddr_patch(std::span<const uint32_t> w) {
   return false;
 }
 }  // namespace
+
+large_pages_state large_pages() {
+  large_pages_state s;
+#ifdef _WIN32
+  s = large_page_setup();
+#endif
+  s.large_bytes = g_large_bytes;
+  s.small_bytes = g_small_bytes;
+  s.refused = g_refused;
+  return s;
+}
 
 region::region(size_t n) : host(host_alloc(n)), size(round_up(n)) {}
 

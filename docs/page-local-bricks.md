@@ -66,11 +66,10 @@ whose windows do not fit the cores' memory), for 3-9% more bytes written. Strix 
 
 On Linux, Artlite's host buffers of 2 MB or more are the process's own memory with 2 MB pages (transparent huge pages,
 `madvise` or `always`; `artlite-probe` prints `host buffers: 2 MB pages`), weights and activations alike. Windows maps
-system memory for the NPU in 4 KB pages: its video memory manager uses larger pages for system memory only where the
-device's driver declares them
-([`DXGK_GPUMMUCAPS`](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/ns-d3dkmddi-_dxgk_gpummucaps)),
-and the NPU's driver does not; an application's large pages (`MEM_LARGE_PAGES`) do not change that. The probe rows on
-both Windows laptops behave as Strix Halo's with 4 KB pages, at about half its rate.
+system memory for the NPU in 4 KB pages: the probe rows on both Windows laptops behave as Strix Halo's with 4 KB pages,
+at about half its rate. Whether buffers on the process's own large pages (`MEM_LARGE_PAGES`: `ARTLITE_LARGE_PAGES=1`,
+where the account holds the "Lock pages in memory" right) reach the NPU as 2 MB translations is not measured yet
+(`artlite-probe --pages` prints which pages its rows' buffers have).
 
 What a page visit costs, measured on Strix Halo with 4 KB and with 2 MB pages (16 channels unless noted; 256-byte rows,
 one per page, 4 KB + 256 B apart, so that neighbouring rows' page-table entries are neighbours too; millions of rows

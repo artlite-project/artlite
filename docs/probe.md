@@ -79,6 +79,12 @@ otherwise, rows of 256 B, each on a page of its own, a channel's pages 4 KB apar
 spread over the DRAM channels) and visited in turn. The reference columns are Strix Halo with 2 MB pages (no
 translations: the DMA's own rates for each pattern) and with 4 KB pages (transparent huge pages `never`).
 
+A line before the table names the pages of the rows' buffers and whether the NPU reaches them at their host addresses
+(Linux: the IOMMU walks the process's page tables, so their pages are its translations) or at addresses of their own (a
+mapping the driver or the OS builds, which chooses the page size). On Windows they have 4 KB pages; with
+`ARTLITE_LARGE_PAGES=1` 2 MB pages where the account holds the "Lock pages in memory" right (secpol.msc, User Rights
+Assignment; effective from the next sign-in).
+
 | rows | what they tell | Strix Halo, 4 KB pages |
 |---|---|---|
 | n pages per channel, 16 channels | how many pages the translation cache holds: past them, every row pays a translation | up to 32 per channel free, from 64 on 160 / 130 |

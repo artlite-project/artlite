@@ -100,6 +100,7 @@ table is the registry's (`tests/test_settings.py` compares it).
 | `ARTLITE_PDI_RESET` | every library configuration with the array reset (none without it after another of the same piece). | off; `1` turns it on |
 | `ARTLITE_PACE` | the prefill GEMMs' pace levels: `auto` (calibrated per machine and cached), `off`, `recalibrate`, or levels (`gu=3,qkv=2`, or one level for every class). | auto |
 | `ARTLITE_LM_SCREEN` | a Q6_K LM head is screened: the NPU reads its high plane (39% of its bytes), the host computes the logits that matter exactly (`decode.screen`; off: the NPU reads the whole head). | on; `0` turns it off |
+| `ARTLITE_LARGE_PAGES` | Windows: host buffers of 2 MB and more on 2 MB pages (`MEM_LARGE_PAGES`) where the account holds the "Lock pages in memory" right, else 4 KB pages (`artlite-probe --pages` reports which). Read at first use. | off; `1` turns it on |
 | `ARTLITE_NB_LEAK_WARNINGS` | nanobind's leak warnings at exit (set to anything to show them). | off; any value turns it on |
 | `ARTLITE_ROUTER_MODELS` | a router's model server: the router's `--models-max`, which divides the default prompt cache's part of the RAM (set by the router). | 1 |
 | `ARTLITE_ARG_<OPTION>` | `artlite-server`'s options, one variable per option (`ARTLITE_ARG_CTX_SIZE`). | the option's own |

@@ -26,7 +26,8 @@ from typing import NamedTuple
 import numpy as np
 
 import artlite
-from artlite import backend, portable, settings
+from artlite import _native as native
+from artlite import backend, portable, settings, txn
 from artlite.overlay import OverlayDevice, Transaction, irq_cpu
 from artlite.parallel_compile import compile_all
 from artlite.probe import ClockProbeOperator, DmaProbeOperator, Rows, dma_transaction
@@ -36,6 +37,7 @@ from .diagnose import telemetry
 from .hostenv import stale_install, windows_power_mode, xrt_smi
 
 MB = 1 << 20
+GB = 1 << 30
 CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)
 POWER_MODES = ("default", "low", "medium", "high", "turbo")
 
@@ -237,13 +239,14 @@ def page_transaction(case: PageCase, reads: list[tuple[int, int]], writes: list[
                            rows=case.rows, region=case.region, skew=case.skew, iteration=case.iteration)
 
 
-def page_rates(op: DmaProbeOperator, *, seconds: float) -> dict[str, list[float]]:
+def page_rates(op: DmaProbeOperator, *, seconds: float) -> tuple[dict[str, list[float]], str]:
     """Each of PAGE_CASES' rates, read and write (or both at once): millions of rows a second (a stream: GB/s) over
-    the median dispatch."""
+    the median dispatch; and where the NPU reaches the buffers (``npu_addresses``)."""
     dev = OverlayDevice(op)
     n = 16 * CHANNEL_BYTES
     dev.alloc_all({"src": n, "dst": n})
     src, dst = dev.address("src"), dev.address("dst")
+    where = npu_addresses(dev, "src")
     out = {}
     for i, case in enumerate([PAGE_CASES[0], *PAGE_CASES]):  # (first: the DPM ramp's warm-up)
         rates = []
@@ -254,7 +257,17 @@ def page_rates(op: DmaProbeOperator, *, seconds: float) -> dict[str, list[float]
             rates.append(total / t / 1e9 if case.rows is None else total / case.rows.run / t / 1e6)
         if i:
             out[case.name] = rates
-    return out
+    return out, where
+
+
+def npu_addresses(dev: OverlayDevice, name: str) -> str:
+    """Whether the NPU reaches buffer ``name`` at its host address: the IOMMU walks the process's page tables (Linux),
+    whose page sizes are the NPU's translations; or at an address of its own: a mapping the driver or the OS builds,
+    whose page size it chooses."""
+    npu, host = dev.address(name) - txn.DDR_AIE_ADDR_OFFSET, dev.view(name).ctypes.data
+    if npu == host:
+        return "the NPU reaches them at their host addresses"
+    return f"the NPU reaches them at addresses of their own (0x{npu:x} for host 0x{host:x})"
 
 
 def _rate(x: float) -> str:
@@ -281,11 +294,27 @@ def host_pages() -> str:
     """The page size of the host buffers the NPU reads and writes (a DMA row on a page of its own costs a translation:
     with 4 KB pages 128-byte rows write at a fifth of the rate, ``docs/probe.md``)."""
     if platform.system() == "Windows":
-        return "4 KB pages (Windows maps system memory for the NPU in 4 KB pages)"
+        return _large_pages()
     thp = _read("/sys/kernel/mm/transparent_hugepage/enabled")
     if "[never]" in thp:
         return "4 KB pages (transparent huge pages are off: /sys/kernel/mm/transparent_hugepage/enabled)"
     return "2 MB pages" if thp else "? pages"
+
+
+def _large_pages() -> str:
+    """Windows: the XRT backend's host allocations of 2 MB or more so far (``_native.large_pages``)."""
+    s = native.large_pages()
+    if not s or not s["asked"]:
+        return "4 KB pages (ARTLITE_LARGE_PAGES=1: 2 MB pages where the account holds 'Lock pages in memory')"
+    if not s["privilege"]:
+        return "4 KB pages (ARTLITE_LARGE_PAGES=1, but the account lacks the 'Lock pages in memory' right)"
+    if not s["large_bytes"] and not s["small_bytes"]:
+        return "2 MB pages from 2 MB on (ARTLITE_LARGE_PAGES=1)"
+    text = f"2 MB pages for {s['large_bytes'] / GB:.1f} GB"
+    if s["small_bytes"]:
+        text += (f", 4 KB pages for {s['small_bytes'] / GB:.1f} GB (Windows refused {s['refused']} large-page "
+                 "allocations: no free 2 MB frames)")
+    return text + " (ARTLITE_LARGE_PAGES=1)"
 
 
 def _cpu_name() -> str:
@@ -340,11 +369,12 @@ def pages(seconds: float) -> tuple[list[str], list[tuple[str, str]]]:
               and xrt_smi("configure", "--pmode", "performance") is not None)
     try:
         mhz, _ = array_clock(clock, seconds=seconds)
-        rates = page_rates(dma, seconds=seconds)
+        rates, where = page_rates(dma, seconds=seconds)
     finally:
         if raised:
             xrt_smi("configure", "--pmode", "default")
     lines = ["NPU power mode: default -> performance for these rows (default again after)"] if raised else []
+    lines.append(f"the rows' buffers: {host_pages()}; {where}")
     lines.append("M rows a second, read / write; rows of 256 B, each on a page of its own, a channel's pages 4 KB apart "
                  "(the rows 4 KB + 256 B) and visited in turn, unless the row says otherwise; rows sharing a page 256 B "
                  "apart (docs/probe.md)")
