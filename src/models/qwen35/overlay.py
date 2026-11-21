@@ -185,7 +185,9 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         if self.paro and (sequences > 1 or slots not in (None, 4)):
             raise ValueError("a PARO checkpoint: one sequence on the design of 4 slots")
         fmts = img.formats() | set(formats)
-        gu_win = img.gu_rows() | gu != {16} or img.split  # (``decode.design``'s gate / up windows)
+        gu_rows = img.gu_rows() | gu  # (``decode.design``'s gate / up windows: tiles of gate / up phases of other rows; a
+        # PARO checkpoint has none, its gate and up phases of their own)
+        gu_win = bool(gu_rows) and gu_rows != {16} or img.split
         # (several sequences: the design of 8 slots where the file's formats run on one)
         slots = 4 if self.paro else slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
                                               slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts))
@@ -196,8 +198,10 @@ class QwenOverlay(ParoSteps, ModelOverlay):
             raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
         self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg), parts=self.paro) if not all(att) else None
-        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots,
-                                  passes=sequences) if any(att) else None
+        # (a PARO checkpoint's: the gates in the attention core, the main core's program memory for the rotations and a
+        # page of the formats: the 27B's int5)
+        self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots, passes=sequences,
+                                  core_gates=self.paro) if any(att) else None
         self.max_positions = self.ash.max_positions if self.ash else max_positions
         self.AHEAD = self.STEPS_AHEAD and slots == 4 and self.ash is not None
         # (the positions whose ``rope`` rows the last position patch took, and the rows it took: ``_ring_state``)

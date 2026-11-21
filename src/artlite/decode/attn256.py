@@ -278,9 +278,11 @@ class AttnShape:
     memory."""
 
     def __init__(self, cfg: AttnConfig, max_positions: int, *, c_len: int = 64, a_bytes: int = OBJ_BYTES, xpay: int = 4096,
-                 slots: int = SLOTS, spec: AttnSpec = QWEN, passes: int = 1):
+                 slots: int = SLOTS, spec: AttnSpec = QWEN, passes: int = 1, core_gates: bool = False):
         """slots: a step's slots at most (a design of 8: ``one``); spec: the model's attention (``AttnSpec``); passes:
-        (one pass) a step's passes at most (the sequences whose slots a step may hold: module docstring)."""
+        (one pass) a step's passes at most (the sequences whose slots a step may hold: module docstring); core_gates: a
+        dense model's gates in the attention core all the same (its sub-steps of fewer slots: the main core's program
+        memory for other code, a PARO checkpoint's rotations)."""
         assert cfg.head_dim == HD and cfg.rope_dims == 2 * ROT and cfg.num_attention_heads % COLS == 0
         self.one = slots == 8  # (module docstring "One pass")
         self.spec = spec
@@ -296,7 +298,8 @@ class AttnShape:
         # (a sub-step's slots: as many as the core holds the chain's query rows for; then a step takes up to u
         # sub-steps, one more where its slots cross a group. A dense model's main core has the program memory to apply
         # the gates: then the core takes more rows)
-        self.sub1 = slots if self.one else min(SLOTS, (MAX_ROWS if cfg.moe else MAX_ROWS_G) // (self.nph * self.qc))
+        self.sub1 = slots if self.one else min(SLOTS, (MAX_ROWS if cfg.moe or core_gates else MAX_ROWS_G)
+                                               // (self.nph * self.qc))
         assert self.sub1 >= 1
         # (more slots than a chain of 4 holds: two rounds, one per KV head, of both chains, each with half its heads; the
         # first chain's shims read the round's cache for the column 4 away too)

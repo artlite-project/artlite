@@ -56,19 +56,26 @@ __attribute__((noinline)) void {{ p }}_p5_tab(const uint8_t *__restrict a, const
     }
 }
 
-// super-blocks 2 HI, 2 HI + 1 of a P5_128 tile
-template <int HI>
-__attribute__((noinline)) void {{ p }}_p5(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
-                                          float *__restrict y, uint8_t *__restrict scr)
+// super-blocks 2 hi, 2 hi + 1 of a P5_128 tile (one body for both core halves: a paged format's code is the page's)
+__attribute__((noinline)) void {{ p }}_p5r(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                           float *__restrict y, uint8_t *__restrict scr, int hi)
 {
     bfloat16 *__restrict tab = (bfloat16 *)(scr + 4096);  // [g][hl][i][r]
     bfloat16 *__restrict c = (bfloat16 *)(scr + 4608);  // [i][g][32]
+    const uint8_t *__restrict xh = xs + {{ XS_SLOT }} * hi;
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
-        const int sb = 2 * HI + u;
+        const int sb = 2 * hi + u;
         {{ p }}_q5k_tr(a + {{ q5_codes }} + {{ 5 * 32 * R5 }} * sb, scr);
-        {{ p }}_p5_tab(a, xs + {{ XS_SLOT }} * HI, tab, y, sb);
-        {{ p }}_q5k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * HI, scr, c, u);
+        {{ p }}_p5_tab(a, xh, tab, y, sb);
+        {{ p }}_q5k_mm(xp + {{ 32 * PANEL }} * u, xh, scr, c, u);
         {{ p }}_sc(c, tab, y, 128, 8, {{ 2 * L }});
     }
+}
+
+template <int HI>
+[[clang::always_inline]] inline void {{ p }}_p5(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                                float *__restrict y, uint8_t *__restrict scr)
+{
+    {{ p }}_p5r(a, xp, xs, y, scr, HI);
 }

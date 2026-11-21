@@ -100,7 +100,8 @@ class ParoSteps(RotatedOverlay):
                                                                            slots=self.SLOTS)
         out = self._rot_groups(L, name, S, flags, plain)
         if name in ("gin_q", "gin_z"):  # (the GDN core's message in two parts: gin_q's qkv rows, then gin_z's z and ab)
-            nq = -(-self.image.region(L, "gin_q").block("qkv").rows.shape[1] // C_LEN)
+            # (the qkv rows the main core emits: the block's valid ones, not the padding of its last row tile)
+            nq = -(-int((self.image.region(L, "gin_q").block("qkv").rows[0] >= 0).sum()) // C_LEN)
             out[0].meta[M_MPART] = nq | MP_MORE if name == "gin_q" else (self.gsh.n_msg - nq) | MP_CONT
         return out
 
@@ -167,9 +168,14 @@ class ParoSteps(RotatedOverlay):
                 self.attn_steps.q_drain(seq, L, S, c)
             elif name in ("attn_k", "attn_v"):
                 self.attn_steps.kv_drain(seq, L, S, c, int(name == "attn_v"))
-            elif name == "rot_g":  # (the column's v heads, each at its place in gdn_out's x)
-                for j in gdn_v_heads(cfg, c):
-                    self.x_to(seq, c, (L, "gdn_out"), e0=cfg.ssm_state * j, n=cfg.ssm_state, S=S)
+            elif name == "rot_g":  # (the column's v heads at their places in gdn_out's x, a drain per run of consecutive
+                # heads: a rotx phase's drains are queued before its inputs, at most 4 a shim channel; the 27B's 6 heads a
+                # column in 3 runs)
+                heads = gdn_v_heads(cfg, c)
+                runs = np.split(heads, np.flatnonzero(np.diff(heads) != 1) + 1)
+                assert len(runs) <= 4, runs
+                for r in runs:
+                    self.x_to(seq, c, (L, "gdn_out"), e0=cfg.ssm_state * int(r[0]), n=cfg.ssm_state * len(r), S=S)
             elif name == "rot_o":
                 n = self.rot_slice(name)[0]
                 self.x_to(seq, c, (L, "attn_out"), e0=n * c, n=n, S=S)
@@ -179,7 +185,8 @@ class ParoSteps(RotatedOverlay):
                 self.x_to(seq, c, (L, "rot_down"), e0=ffn * c, n=ffn, S=S, mul=2,
                           so=self._sp(S) if name == "up" else 0)
             elif name == "rot_down":  # (past down's K, the padding groups' outputs: into the sink)
-                n, K = self.rot_slice(name)[0], self.inp[(L, "down")][-1].K
+                last = self.inp[(L, "down")][-1]
+                n, K = self.rot_slice(name)[0], last.k0 + last.K  # (down's whole K: its K groups')
                 real = max(0, min(n, K - n * c))
                 self.x_to(seq, c, (L, "down"), e0=n * c, n=real, S=S)
                 self.sink_out(seq, c, n - real, S)

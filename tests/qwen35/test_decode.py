@@ -781,23 +781,27 @@ def test_overlay_slice(mode: str, size: str) -> None:
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
-@pytest.mark.parametrize("S", [1, 4], ids=["s1", "s4"])
-def test_overlay_paro(S: int) -> None:
-    """Qwen3.5-0.8B-PARO (a checkpoint directory: its inputs rotated, ``paro_steps``; its GDN layers' a / b rows folded
-    into gin_z's rotation, F32 planes) up to its first full-attention layer over 34 positions, by steps of S tokens: the
-    residual into the LM head after each token within llama.cpp's on its pseudo-quantized GGUF (``goldens.paro``: the
-    checkpoint's linears computed exactly) as close as the GGUF files' slices are (1.2% at most, 0.5% on average)."""
+@pytest.mark.parametrize(("case", "S"), [("qwen3.5-0.8B-paro", 1), ("qwen3.5-0.8B-paro", 4), ("qwen3.8-27B-paro-int5", 1),
+                                         ("qwen3.8-27B-paro-int5", 4)], ids=["0.8B-s1", "0.8B-s4", "27B-s1", "27B-s4"])
+def test_overlay_paro(case: str, S: int) -> None:
+    """Qwen3.5-0.8B-PARO and Qwen3.8-27B-PARO-int5 (checkpoint directories: their inputs rotated, ``paro_steps``; their
+    GDN layers' a / b rows folded into gin_z's rotation, F32 planes; the 27B's P5_128 tiles of 13 rows, several K groups
+    an input, 6 v heads and 17 rotation groups of down's input a column) up to the first full-attention layer over 34
+    positions, by steps of S tokens: the residual into the LM head after each token within llama.cpp's on the
+    pseudo-quantized model (``goldens.paro``: the checkpoint's linears computed exactly; the 27B's first layers, F16) as
+    close as the GGUF files' slices are (1.2% at most, 0.5% on average; the 27B: 0.6%, 0.2%)."""
     from artlite.hf_model import HfModel
     from artlite.model_config import checkpoint
     from models.qwen35.overlay import QwenOverlay
 
     from ..goldens.paro import pseudo_gguf
 
-    path = checkpoint("qwen3.5-0.8B-paro")
+    path = checkpoint(case)
     require(path)
-    ref = pseudo_gguf(path)
     g = HfModel(path)
     La = QwenConfig.from_gguf(g).attention_layers[0]
+    # (a slice one layer past the compared one: llama.cpp keeps a last layer's output rows of the logits only)
+    ref = pseudo_gguf(path, f16=True, layers=La + 2) if "27B" in case else pseudo_gguf(path)
     n, layers = 34, list(range(La + 1))
     tokens = llama_tokenize(ref, essay("apple.txt"))[:n]
     G_ = golden(ref, tokens, ubatch=1, layers=("g", La), names="l_out|model.input_embed", logits="none")
