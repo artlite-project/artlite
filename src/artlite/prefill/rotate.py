@@ -1,17 +1,23 @@
 """The rotations of a PARO checkpoint's linear inputs in a prompt's prefill (``artlite.paro``, the decode's "Rotated
 inputs"): a projection's input x (T tokens x K channels as the GEMMs' bfp16ebs8 panels, [T / 8][K / 8][72 B]: a norm's
-x / rms, the attention's o, the activation's h) -> x' (the same panels), each 128-channel group by its rotation
-(``paro.TanForm.pair_objects``: a norm's weight folded in), x' in the group's storage order (the tiles' K order).
+x / rms, the attention's o) -> x' (the same panels), each 128-channel group by its rotation
+(``paro.TanForm.pair_objects``: a norm's weight folded in), x' in the group's storage order (the tiles' K order). The
+down projection's: ``gu`` = the activation of a split gate / up block on the way (``prefill.gemm.plan_gate_up_pair``:
+GU = gate and up as bf16 panels, [T / 8][K / 8][gate 64 | up 64]), x = bf16(silu(gate) up), the gate / up epilogue's
+arithmetic, rotated before any rounding to bfp16.
 
-The tokens lie in the vector lanes (u fp32 rows of 32 tokens, a row per channel): each round updates its 64 Givens
+The tokens lie in the vector lanes (u fp32 rows of ``tok`` tokens, a row per channel): each round updates its 64 Givens
 pairs (s, p) from the round's old values, no gathers (the decode's 4 slots need them: ``kmath.rotate``): u lies in the
 round's pair order (pair i in rows 2 i, 2 i + 1), read in a row, each output stored where the next round reads it (II 9
-per pair: ~1.1 cycles per element for 8 rounds); the partner's value as bf16 times T in bf16 on the fp32 MAC (the decode's
-numerics). An item: 32 tokens of a group; round j gives core (c, r) item 32 j + 4 c + r - 2 of the group-major list
-(items [group][32 tokens]), so a column's 4 cores share the round's group: its memtile broadcasts the group's object to them (once per run
-of rounds of the group) and splits the column's 4 items' panels; their outputs join for the shim. Runtime sequence: (X, RO, OUT): RO the groups' objects
-[group][3328 B], OUT x' as X. A norm's copies for several projections: a run per copy (the runs of one design share its
-configuration)."""
+per pair of 32-token rows: ~1.1 cycles per element for 8 rounds); the partner's value as bf16 times T in bf16 on the fp32
+MAC (the decode's numerics). An item: ``tok`` tokens of a group (32; ``gu``: 16, its 8 KB of gate / up panels fit L1
+next to the state); the items in group-major order, each group's split evenly over the 8 columns, a column's run of
+token groups contiguous (four shim dimensions: [group][token group][run]): column c takes the group's items 4 t c ..
+4 t (c + 1) in t rounds of its 4 cores (core r: item 4 t c + 4 i + r - 2 in round i; fewer than 32 items a group: a
+round's 32 items span 32 / items groups), so a column's 4 cores share the round's group: its memtile broadcasts the
+group's object to them (once per run of rounds of the group) and splits the column's 4 items; their outputs join for
+the shim. Runtime sequence: (X, RO, OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's copies
+for several projections: a run per copy (the runs of one design share its configuration)."""
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
@@ -28,101 +34,125 @@ from ..operators.kernel_source import kernel_prefix
 
 _SRC = templating.load("artlite/prefill/rotate.cc.jinja")
 
-GROUP, TOK = 128, 32  # channels of a rotation group, tokens of an item
+GROUP = 128  # channels of a rotation group
 OBJ = 4608  # bytes of a group's rotation object of 8 rounds (``paro.TanForm.pair_objects``)
-PANELS = TOK // 8 * GROUP // 8  # panels of an item (4 token groups x 16 channel blocks)
 ROWS = 4  # cores per column (rows 2 .. 5)
 
 
+def row_floats(gu: bool) -> int:
+    """Tokens of an item (u's row: ``paro.TanForm.pair_objects``'s ``row``)."""
+    return 16 if gu else 32
+
+
 class PrefillRotOperator(ArtcOperator):
-    """A rotated copy of T tokens x K channels (module docstring; ``rounds``: of the tan form)."""
+    """A rotated copy of T tokens x K channels (module docstring; ``rounds``: of the tan form; ``gu``: of a split gate /
+    up block's GU, its activation on the way)."""
 
     STACK = 1024
     p = kernel_prefix("prot")
 
-    def __init__(self, *, T: int, K: int, rounds: int = 8):
+    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False):
         G = K // GROUP
-        assert K % GROUP == 0 and T % (TOK * ROWS) == 0 and (G * T // TOK) % (COLS * ROWS) == 0, (T, K)
+        self.tok = row_floats(gu)
+        assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
         assert rounds % 2 == 0 and 512 * rounds + 4 * GROUP == OBJ, rounds
-        self.T, self.K, self.rounds = T, K, rounds
+        self.T, self.K, self.rounds, self.gu = T, K, rounds, gu
         super().__init__()
 
     @property
     def n_rounds(self) -> int:
         """Rounds of the cores' program (an item per core each)."""
-        return self.K // GROUP * self.T // TOK // (COLS * ROWS)
+        return self.K // GROUP * self.T // self.tok // (COLS * ROWS)
+
+    @property
+    def unit(self) -> int:
+        """bf16 elements of an input panel ([gate 64 | up 64] bf16, or a bfp16 panel's 72 bytes)."""
+        return 128 if self.gu else 36
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, R=self.rounds)
+        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         n = self.T * self.K * 9 // 16  # (bf16 elements of the panels)
-        return [ArgSpec("in", (n,), bfloat16), ArgSpec("in", (self.K // GROUP * OBJ // 2,), bfloat16),
-                ArgSpec("out", (n,), bfloat16)]
+        return [ArgSpec("in", (self.T * self.K // 64 * self.unit,), bfloat16),
+                ArgSpec("in", (self.K // GROUP * OBJ // 2,), bfloat16), ArgSpec("out", (n,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
-        T, K, p = self.T, self.K, self.p
-        G, nb = K // GROUP, T // TOK  # (groups, items per group)
+        T, K, p, tok, gu = self.T, self.K, self.p, self.tok, self.gu
+        G, nb = K // GROUP, T // tok  # (groups, items per group)
         u8, f32 = np.dtype[np.uint8], np.dtype[np.float32]
-        item = PANELS * 72
-        x_ty, xc_ty = np.ndarray[(item,), u8], np.ndarray[(ROWS * item,), u8]
+        ntg = tok // 8  # (token groups of an item)
+        x_item, o_item = ntg * 16 * self.unit * 2, ntg * 16 * 72  # (bytes)
+        x_ty, xc_ty = np.ndarray[(x_item,), u8], np.ndarray[(ROWS * x_item,), u8]
+        o_ty, oc_ty = np.ndarray[(o_item,), u8], np.ndarray[(ROWS * o_item,), u8]
         r_ty = np.ndarray[(OBJ,), u8]
-        u_ty = np.ndarray[(GROUP * TOK,), f32]
-        k_rot = Kernel(f"{p}_rot", "kernel.o", [x_ty, r_ty, x_ty, u_ty, u_ty])
+        u_ty = np.ndarray[(GROUP * tok,), f32]
+        y_ty = np.ndarray[(ntg * 1024,), np.dtype[bfloat16]]  # (gu: the gates' silu)
+        k_rot = Kernel(f"{p}_rot", "kernel.o", [x_ty, r_ty, o_ty, u_ty, u_ty, *([y_ty, np.int32] if gu else [])])
         n = self.n_rounds
         x3 = [ObjectFifo(xc_ty, name=f"pr_x{c}", depth=2) for c in range(COLS)]
         r3 = [ObjectFifo(r_ty, name=f"pr_r{c}", depth=2) for c in range(COLS)]
-        o3 = [ObjectFifo(xc_ty, name=f"pr_o{c}", depth=2) for c in range(COLS)]
-        xs = [x3[c].cons().split([item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[x_ty] * ROWS,
+        o3 = [ObjectFifo(oc_ty, name=f"pr_o{c}", depth=2) for c in range(COLS)]
+        xs = [x3[c].cons().split([x_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[x_ty] * ROWS,
                                  names=[f"pr_x{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
         rs = [r3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"pr_rb{c}") for c in range(COLS)]
-        os_ = [o3[c].prod().join([item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[x_ty] * ROWS,
+        os_ = [o3[c].prod().join([o_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[o_ty] * ROWS,
                                  names=[f"pr_o{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
 
         t = max(nb // (COLS * ROWS), 1)  # (consecutive rounds of one group)
 
-        def core(x_f, r_f, o_f, rot, ua, ub):
+        def core(x_f, r_f, o_f, rot, ua, ub, *y):
             for _ in forever_():
                 for _ in range_(n // t):
                     r = r_f.acquire(1)
                     for _ in range_(t):
                         x, o = x_f.acquire(1), o_f.acquire(1)
-                        rot(x, r, o, ua, ub)
+                        rot(x, r, o, ua, ub, *([y[0], 0] if gu else []))  # (gu: silu's opaque runtime zero)
                         o_f.release(1)
                         x_f.release(1)
                     r_f.release(1)
 
         workers = [Worker(core, [xs[c][m].cons(), rs[c].cons(), os_[c][m].prod(), k_rot,
-                                 Buffer(u_ty, name=f"pr_ua{c}_{m}"), Buffer(u_ty, name=f"pr_ub{c}_{m}")],
+                                 Buffer(u_ty, name=f"pr_ua{c}_{m}"), Buffer(u_ty, name=f"pr_ub{c}_{m}"),
+                                 *([Buffer(y_ty, name=f"pr_y{c}_{m}")] if gu else [])],
                           tile=Tile(c, 2 + m), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for m in range(ROWS)]
-        # (bf16 elements: the panels, a token group's row of them, an item's token group of its 16 channel blocks; the
+        # (bf16 elements: the input, its token group's row, a group's run of it in a token group; the output's; the
         # rotation objects)
-        nx, kp, w, no = T * K * 9 // 16, K // 8 * 36, 16 * 36, G * OBJ // 2
+        nx, xr, xw = T * K // 64 * self.unit, K // 8 * self.unit, 16 * self.unit
+        no, orow, ow = T * K * 9 // 16, K // 8 * 36, 16 * 36
+        nro = G * OBJ // 2
 
-        def taps(c: int) -> tuple[TensorAccessPattern, TensorAccessPattern]:
-            """Column c's x (and output) walk and its rotation objects' over the rounds: round j, items 32 j + 4 c ..
-            (16 token groups of a group's 16 channel blocks)."""
-            if nb >= COLS * ROWS:  # (a group's items over t = nb / 32 rounds: the columns' blocks of 4 items in each)
-                x = TensorAccessPattern((nx,), 16 * c * kp, [G, t, 16, w], [w, 128 * kp, kp, 1])
-                r = TensorAccessPattern((no,), 0, [1, 1, G, OBJ // 2], [0, 0, OBJ // 2, 1])
+        def walk(c: int, size: int, row: int, run: int) -> TensorAccessPattern:
+            """Column c's walk over the rounds of an argument of ``size`` elements in token-group rows of ``row``, a
+            group's ``run`` of each (runs of 1024 elements: a shim BD's inner dimension holds at most 1023 words):
+            [group (or round)][the column's token groups][run]."""
+            cut = min(run, 1024)
+            if nb >= COLS * ROWS:  # (a group's items over t = nb / 32 rounds: the column's 4 t of them)
+                base, dims, steps = 4 * t * ntg * c * row, [G, 4 * t * ntg], [run, row]
             else:  # (a round's items over 32 / nb groups)
                 s = COLS * ROWS // nb
-                x = TensorAccessPattern((nx,), 16 * c % (4 * nb) * kp + 4 * c // nb * w, [1, n, 16, w], [0, s * w, kp, 1])
-                r = TensorAccessPattern((no,), 4 * c // nb * OBJ // 2, [1, 1, n, OBJ // 2], [0, 0, s * OBJ // 2, 1])
-            return x, r
+                base, dims, steps = 4 * c % nb * ntg * row + 4 * c // nb * run, [n, 4 * ntg], [s * run, row]
+            if cut < run:
+                return TensorAccessPattern((size,), base, [*dims, run // cut, cut], [*steps, cut, 1])
+            return TensorAccessPattern((size,), base, [1, *dims, run], [0, *steps, 1])
+
+        def ro_tap(c: int) -> TensorAccessPattern:
+            if nb >= COLS * ROWS:
+                return TensorAccessPattern((nro,), 0, [1, 1, G, OBJ // 2], [0, 0, OBJ // 2, 1])
+            s = COLS * ROWS // nb
+            return TensorAccessPattern((nro,), 4 * c // nb * OBJ // 2, [1, 1, n, OBJ // 2], [0, 0, s * OBJ // 2, 1])
 
         def seq(X, RO, OUT, xh, rh, oh):
             tg = TaskGroup()
             for c in range(COLS):
-                x, r = taps(c)
-                xh[c].fill(X, x, group=tg)
-                rh[c].fill(RO, r, group=tg)
-                oh[c].drain(OUT, x, group=tg, wait=True)
+                xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
+                rh[c].fill(RO, ro_tap(c), group=tg)
+                oh[c].drain(OUT, walk(c, no, orow, ow), group=tg, wait=True)
             tg.finish()
 
-        rt = Runtime(seq, [np.ndarray[(nx,), np.dtype[bfloat16]], np.ndarray[(no,), np.dtype[bfloat16]],
-                           np.ndarray[(nx,), np.dtype[bfloat16]],
+        rt = Runtime(seq, [np.ndarray[(nx,), np.dtype[bfloat16]], np.ndarray[(nro,), np.dtype[bfloat16]],
+                           np.ndarray[(no,), np.dtype[bfloat16]],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(x3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(r3)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])

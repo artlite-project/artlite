@@ -33,7 +33,7 @@ TILES_1K = {"Q4_K": (16, 9280), "Q4_0": (16, 9280), "Q4_1": (16, 10240), "BFP16"
 
 
 def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False, fmt: str = "Q4_K",
-          nrows: int = 4) -> GemmQOperator:
+          nrows: int = 4, c_panels: int = 0) -> GemmQOperator:
     """Tiles of 1024 columns (Q4_K and Q4_0: Llama's 9280-B objects, the header half a slice), a row tile's chunks
     consecutive (or in groups of kc_group)."""
     R, S = TILES_1K[fmt]
@@ -43,7 +43,8 @@ def _op3b(*, M: int, K: int, passes: int, kc_group: int = 0, silu: bool = False,
     N = COLS * passes * step
     out_cols = [[c * passes * step + step * p for p in range(passes)] for c in range(COLS)]
     return GemmQOperator(fmt=fmt, rows=R, M=M, K=K, N=N, tile_bytes=S, col_bytes=col_bytes, passes=passes,
-                         out_cols=out_cols, silu=silu, c_bfp16=silu, kc=1024, kc_group=kc_group, nrows=nrows)
+                         out_cols=out_cols, silu=silu, c_bfp16=silu, kc=1024, kc_group=kc_group, nrows=nrows,
+                         c_panels=c_panels)
 
 
 def _op_planar(fmt: str, *, R: int, S: int, kc: int, M: int, K: int, tiles: int, blocks: tuple[tuple[int, int], ...],
@@ -202,6 +203,7 @@ CASES = [
     # Q4_0 tiles of 1024 columns (Llama 1B Q4_0: the header half a slice, as Q4_K's)
     ("Q4_0-1K", "Q4_0", {"M": 256, "K": 2048, "passes": 3}),
     ("Q4_0-1K", "Q4_0", {"M": 1024, "K": 2048, "passes": 2, "silu": True}),
+    ("Q4_K-gu", "Q4_K", {"M": 1024, "K": 1024, "passes": 6, "c_panels": 128}),  # (PARO's gate / up: bf16 panels)
 ]
 
 
@@ -282,7 +284,7 @@ def _check_activations(op: GemmQOperator, df: object) -> None:
 def _check_outputs(op: GemmQOperator, df: object) -> None:
     """Outputs: numbered per (chunk, pass, core row, element) in the kernel's C layout."""
     m, no, N = op.m, op.n_out, op.N
-    c_len = op.M * N * 9 // 16 if op.c_bfp16 else op.M * N
+    c_len = op.c_elems
     for c in (0, COLS - 1):
         C = np.full(c_len, -1, np.int64)
         expect = np.full(c_len, -1, np.int64)
@@ -303,6 +305,12 @@ def _check_outputs(op: GemmQOperator, df: object) -> None:
                         assert start % LINE == 0 and op.win % LINE == 0 and N % LINE == 0
                         for tok in range(m):
                             expect[(t0 + tok) * N + start + np.arange(op.win)] = ids[tok * op.n_c + np.arange(op.win)]
+                    elif op.c_panels:  # bf16 panels [group][col block][c_panels units], the C object's first
+                        v = ids.reshape(m // 8, no // 8, 64)
+                        for g in range(m // 8):
+                            for j in range(no // 8):
+                                dst = ((t0 // 8 + g) * (N // 8) + cols[8 * j] // 8) * op.c_panels
+                                expect[dst:dst + 64] = v[g, j]
                     elif op.c_bfp16:  # panels [group][col block][36 units] (two parts: [part][group][...], a
                         # group's row of both parts' panels in C; ``ptail``: a pass pair's even and odd tiles in turn)
                         v = ids.reshape(op.c_parts, m // 8, no // 8, 36)

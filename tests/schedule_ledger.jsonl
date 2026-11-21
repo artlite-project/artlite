@@ -190,9 +190,6 @@
 {"section": "041725626f98", "label": "ExpertGemmOperator (artlite/moe/expert_gemm.py)", "detail": "kind='gu', fmt='Q4_1_64', R=16, row_tiles=32, G=1, K=2048, tile_bytes=9216, kc=1024, kc_group=2, cap=64, out=512"}
 {"section": "4d9bcc712958", "label": "ExpertGemmOperator (artlite/moe/expert_gemm.py)", "detail": "kind='gu', fmt='Q4_K', R=16, row_tiles=32, G=1, K=2048, tile_bytes=9280, kc=1024, kc_group=2, cap=54, out=512"}
 {"section": "ab3d202129d4", "label": "FlintDecodeOperator (models/flint/decode.py)", "detail": "hidden=2048, tile_bytes=9216, eps=1e-06, experts=256, used=6"}
-{"section": "e950d7a3f69d", "label": "GateUpActOperator (artlite/prefill/gate_up.py)", "detail": "T=1024, groups=6, W=64, K=3072, act='silu'"}
-{"section": "fa36b9536afd", "label": "GateUpActOperator (artlite/prefill/gate_up.py)", "detail": "T=128, groups=6, W=64, K=3072, act='silu'"}
-{"section": "233624920eca", "label": "GateUpActOperator (artlite/prefill/gate_up.py)", "detail": "T=256, groups=6, W=64, K=3072, act='silu'"}
 {"section": "b25dc4feeb15", "label": "GatherNormOperator (artlite/moe/gather.py)", "detail": "E=2048, eps=1e-06, cap=54"}
 {"section": "95aaf1077908", "label": "GatherNormOperator (artlite/moe/gather.py)", "detail": "E=2048, eps=1e-06, cap=64"}
 {"section": "a58f530f818d", "label": "GdnOutOperator (models/qwen35/gdn_prefill.py)", "detail": "T=128, hslot=12288, cs_off=896, gc_rows=2048"}
@@ -325,17 +322,17 @@
 {"section": "7b4425192e9e", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=137625600, passes=2, kc=1024, kc_group=2, region_rt=17, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "4b4e31e5c8ec", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=172228608, passes=2, kc=1024, kc_group=2, region_rt=19, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "85f37f0b275f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=8192, K=2048, N=512, tile_bytes=9216, col_bytes=120848384, passes=1, kc=1024, kc_group=2, region_rt=24, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
-{"section": "ab2aee7bed53", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=1024, N=6144, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, pace=4"}
+{"section": "42d1f9f5e1e7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
 {"section": "90a618bf50c1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2048, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=2, region_rt=8, pace=2"}
 {"section": "f79127e69a17", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=3072, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=3, region_rt=8, pace=6"}
+{"section": "993a209fd3c9", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
 {"section": "dc4500f95b66", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=1, region_rt=8, pace=0"}
 {"section": "aaf4bf13391a", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=4, kc=1024, kc_group=1, region_rt=16, pace=0"}
-{"section": "c0d5fd97a826", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=6144, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, pace=4"}
 {"section": "ca2ab4b4a986", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=2048, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=2, region_rt=8, pace=2"}
 {"section": "72562e77cd61", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=3072, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=3, region_rt=8, pace=6"}
+{"section": "a9830f40f9ba", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
 {"section": "68e330e385d0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=1, region_rt=8, pace=0"}
 {"section": "ac731b12b3c6", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=4, kc=1024, kc_group=1, region_rt=16, pace=0"}
-{"section": "1478af02a7c7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=6144, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, pace=4"}
 {"section": "334f3e8e2ee3", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2048, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=2, region_rt=8, pace=2"}
 {"section": "94961214e1a1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=3072, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=3, region_rt=8, pace=6"}
 {"section": "7e579d0fca3d", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='Q4_0', rows=16, M=1024, K=2048, N=2048, tile_bytes=9280, col_bytes=133431296, passes=4, kc=1024, kc_group=2, region_rt=16, pace=2"}
@@ -929,12 +926,12 @@
 {"section": "a4003c6985cf", "label": "PrefillNormOperator (artlite/prefill/norm/prefill_norm.py)", "detail": "T=64, add=False, E=5120, eps=1e-06, raw=True, out_pitch=25600, out_col=0"}
 {"section": "09f8f3d281c3", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024"}
 {"section": "c07661d60d4d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2048"}
-{"section": "c26855ba5693", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=3072"}
+{"section": "e7d0b5e980d0", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=3072, gu=True"}
 {"section": "7b2b3def9faf", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024"}
 {"section": "f94bc29fc053", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048"}
-{"section": "2e171ef61b09", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3072"}
+{"section": "36d58b8e6116", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3072, gu=True"}
 {"section": "813938ace329", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048"}
-{"section": "20ea161ff7d6", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3072"}
+{"section": "6becf8da681d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3072, gu=True"}
 {"section": "691c1721af6c", "label": "PrepOperator (artlite/prefill/attn/prep.py)", "detail": "T=1024, kv_bytes=1187840, cs_positions=8192, kv_pad=1187840, norm=False, eps=1e-05"}
 {"section": "effa5c5741df", "label": "PrepOperator (artlite/prefill/attn/prep.py)", "detail": "T=1024, kv_bytes=1187840, cs_positions=8192, kv_pad=74240, norm=True, eps=1e-05, kv0=0"}
 {"section": "d2e1f5d385a7", "label": "PrepOperator (artlite/prefill/attn/prep.py)", "detail": "T=1024, kv_bytes=1262080, cs_positions=8192, kv_pad=74240, norm=True, eps=1e-05, kv0=74240"}
@@ -1401,7 +1398,6 @@
 {"fn": "km_exp2_v64_zero", "in": "ab3d202129d4", "apps": ["flint-int4"], "cycles": 88, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": []}
 {"fn": "km_silu_lut<32>", "in": "ab3d202129d4", "apps": ["flint-int4"], "cycles": 64, "upper": false, "bytes": 64, "stack": 0, "calls": [["ab3d202129d4", "km_silu_tab<32>", 1]], "loops": []}
 {"fn": "km_silu_tab<32>", "in": "ab3d202129d4", "apps": ["flint-int4"], "cycles": 52, "upper": false, "bytes": 272, "stack": 0, "calls": [], "loops": []}
-{"fn": "guact_act", "in": "e950d7a3f69d", "apps": ["qwen3-0.6B-PARO"], "cycles": 1102, "upper": false, "bytes": 2352, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 29, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 28, "spills": 0, "bytes": 96}, {"at": "guact_act+11", "parent": -1, "sched": "none", "ii": 141, "ns": 1, "bound": 96, "iters": 2, "spills": 0, "bytes": 848}, {"at": "guact_act+26", "parent": -1, "sched": "post-RA", "ii": 4, "ns": 6, "bound": 4, "iters": 11, "spills": 0, "bytes": 48}]}
 {"fn": "mg_b", "in": "b25dc4feeb15", "apps": ["occamy-1.0-APEX", "qwen-35B-A3B-Q4_K_M", "qwen-35B-A3B-Q4_K_M-mtp"], "cycles": 848, "upper": true, "bytes": 576, "stack": 64, "calls": [["b25dc4feeb15", "mg_inv", 1]], "loops": [{"at": "mg_b+16", "parent": -1, "sched": "post-RA", "ii": 19, "ns": 3, "bound": 8, "iters": 30, "spills": 0, "bytes": 112}]}
 {"fn": "mg_co", "in": "b25dc4feeb15", "apps": ["occamy-1.0-APEX", "qwen-35B-A3B-Q4_K_M", "qwen-35B-A3B-Q4_K_M-mtp"], "cycles": 137, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "mg_co+7", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 5, "bound": 2, "iters": 60, "spills": 0, "bytes": 32}]}
 {"fn": "mg_cs", "in": "b25dc4feeb15", "apps": ["occamy-1.0-APEX", "qwen-35B-A3B-Q4_K_M", "qwen-35B-A3B-Q4_K_M-mtp"], "cycles": 424, "upper": false, "bytes": 400, "stack": 0, "calls": [], "loops": [{"at": "mg_cs+11", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 194}, {"at": "mg_cs+14", "parent": 0, "sched": "post-RA", "ii": 4, "ns": 5, "bound": 2, "iters": 4, "spills": 0, "bytes": 64}]}
@@ -3175,9 +3171,14 @@
 {"fn": "pn_b", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 247, "upper": true, "bytes": 480, "stack": 64, "calls": [["5271d2ad8011", "pn_inv", 1]], "loops": [{"at": "pn_b+17", "parent": -1, "sched": "post-RA", "ii": 25, "ns": 2, "bound": 8, "iters": 3, "spills": 0, "bytes": 128}]}
 {"fn": "pn_inv", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 106, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": []}
 {"fn": "pn_w", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 16, "upper": false, "bytes": 80, "stack": 0, "calls": [], "loops": []}
-{"fn": "prot_rot", "in": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "cycles": 7200, "upper": false, "bytes": 992, "stack": 192, "calls": [["c26855ba5693", "prot_round", 8], ["c26855ba5693", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 24, "ns": 1, "bound": 9, "iters": 4, "spills": 3, "bytes": 112}, {"at": "prot_rot+15", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 2, "bytes": 530}, {"at": "prot_rot+16", "parent": 1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_round", "in": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "cycles": 658, "upper": false, "bytes": 368, "stack": 0, "calls": [], "loops": [{"at": "prot_round+5", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 3, "bound": 7, "iters": 62, "spills": 0, "bytes": 112}]}
-{"fn": "prot_u0", "in": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+19", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
+{"fn": "prot_out", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 7237, "upper": false, "bytes": 272, "stack": 64, "calls": [["c07661d60d4d", "prot_out", 1], ["c07661d60d4d", "prot_round", 8], ["c07661d60d4d", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 658, "upper": false, "bytes": 368, "stack": 0, "calls": [], "loops": [{"at": "prot_round+5", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 3, "bound": 7, "iters": 62, "spills": 0, "bytes": 112}]}
+{"fn": "prot_u0", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+19", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
+{"fn": "prot_out", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 7669, "upper": false, "bytes": 272, "stack": 64, "calls": [["e7d0b5e980d0", "prot_out", 1], ["e7d0b5e980d0", "prot_round", 8], ["e7d0b5e980d0", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 592, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+5", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 2379, "upper": false, "bytes": 1504, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 60, "spills": 0, "bytes": 96}, {"at": "prot_u0+10", "parent": -1, "sched": "none", "ii": 64, "ns": 1, "bound": 27, "iters": 16, "spills": 0, "bytes": 368}]}
 {"fn": "pap_k", "in": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "cycles": 1405, "upper": false, "bytes": 928, "stack": 64, "calls": [["691c1721af6c", "pap_rope", 8], ["691c1721af6c", "pap_scatter", 8]], "loops": [{"at": "kernel_lib.h:599", "parent": -1, "sched": "pre-RA", "ii": 5, "ns": 3, "bound": 4, "iters": 14, "spills": 0, "bytes": 80}]}
 {"fn": "pap_q0", "in": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "cycles": 2134, "upper": false, "bytes": 16, "stack": 0, "calls": [["691c1721af6c", "pap_qh", 1]], "loops": []}
 {"fn": "pap_q1", "in": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "cycles": 2134, "upper": false, "bytes": 16, "stack": 0, "calls": [["691c1721af6c", "pap_qh", 1]], "loops": []}
@@ -5421,9 +5422,6 @@
 {"core": 3, "design": "llama_prefill", "entry": "9259a4558541", "apps": ["llama-1B-Q4_K_M-hilo"], "bytes": 10096}
 {"core": 4, "design": "llama_prefill", "entry": "9259a4558541", "apps": ["llama-1B-Q4_K_M-hilo"], "bytes": 10096}
 {"core": 5, "design": "llama_prefill", "entry": "9259a4558541", "apps": ["llama-1B-Q4_K_M-hilo"], "bytes": 10096}
-{"core": 2, "design": "llama_prefill", "entry": "e950d7a3f69d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
-{"core": 2, "design": "llama_prefill", "entry": "fa36b9536afd", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
-{"core": 2, "design": "llama_prefill", "entry": "233624920eca", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
 {"core": 2, "design": "llama_prefill", "entry": "451ccaba8a3d", "apps": ["qwen3-0.6B-Q4_1"], "bytes": 8496}
 {"core": 3, "design": "llama_prefill", "entry": "451ccaba8a3d", "apps": ["qwen3-0.6B-Q4_1"], "bytes": 5616}
 {"core": 2, "design": "llama_prefill", "entry": "d63d93f96ed1", "apps": ["qwen3-0.6B-Q4_1"], "bytes": 4864}
@@ -5464,10 +5462,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "c3f55e6b0664", "apps": ["llama-8B-Q4_K_S"], "bytes": 4160}
 {"core": 2, "design": "llama_prefill", "entry": "f6e91b8163ae", "apps": ["llama-8B-Q4_K_S"], "bytes": 5808}
 {"core": 3, "design": "llama_prefill", "entry": "f6e91b8163ae", "apps": ["llama-8B-Q4_K_S"], "bytes": 4160}
-{"core": 2, "design": "llama_prefill", "entry": "ab2aee7bed53", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "ab2aee7bed53", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "ab2aee7bed53", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "ab2aee7bed53", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 2, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
+{"core": 3, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 4, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 5, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 2, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 5232}
 {"core": 3, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
 {"core": 4, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
@@ -5476,6 +5474,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 4, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 5, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
+{"core": 2, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
+{"core": 3, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 4, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 5, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 2, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
 {"core": 3, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
 {"core": 4, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
@@ -5484,10 +5486,6 @@
 {"core": 3, "design": "llama_prefill", "entry": "aaf4bf13391a", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 4, "design": "llama_prefill", "entry": "aaf4bf13391a", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 5, "design": "llama_prefill", "entry": "aaf4bf13391a", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 2, "design": "llama_prefill", "entry": "c0d5fd97a826", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "c0d5fd97a826", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "c0d5fd97a826", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "c0d5fd97a826", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 2, "design": "llama_prefill", "entry": "ca2ab4b4a986", "apps": ["qwen3-0.6B-PARO"], "bytes": 5232}
 {"core": 3, "design": "llama_prefill", "entry": "ca2ab4b4a986", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
 {"core": 4, "design": "llama_prefill", "entry": "ca2ab4b4a986", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
@@ -5496,6 +5494,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 4, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 5, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
+{"core": 2, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
+{"core": 3, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 4, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 5, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 2, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
 {"core": 3, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
 {"core": 4, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
@@ -5504,10 +5506,6 @@
 {"core": 3, "design": "llama_prefill", "entry": "ac731b12b3c6", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 4, "design": "llama_prefill", "entry": "ac731b12b3c6", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 5, "design": "llama_prefill", "entry": "ac731b12b3c6", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 2, "design": "llama_prefill", "entry": "1478af02a7c7", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "1478af02a7c7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "1478af02a7c7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "1478af02a7c7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
 {"core": 2, "design": "llama_prefill", "entry": "334f3e8e2ee3", "apps": ["qwen3-0.6B-PARO"], "bytes": 5232}
 {"core": 3, "design": "llama_prefill", "entry": "334f3e8e2ee3", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
 {"core": 4, "design": "llama_prefill", "entry": "334f3e8e2ee3", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
@@ -6015,38 +6013,38 @@
 {"core": 2, "design": "llama_prefill", "entry": "8bcb7183ac26", "apps": ["qwen3-embedding-4B-Q4_K_M"], "bytes": 4736}
 {"core": 2, "design": "llama_prefill", "entry": "208b3e15f74e", "apps": ["llama-3B-Q4_K_M"], "bytes": 4000}
 {"core": 2, "design": "llama_prefill", "entry": "a39d5ea6c629", "apps": ["llama-8B-Q4_K_S"], "bytes": 4704}
-{"core": 2, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 2, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 2, "design": "llama_prefill", "entry": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "c26855ba5693", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 2, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 3, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 4, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 5, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 2, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 3, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 4, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 5, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 2, "design": "llama_prefill", "entry": "2e171ef61b09", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "2e171ef61b09", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "2e171ef61b09", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "2e171ef61b09", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 2, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 2, "design": "llama_prefill", "entry": "20ea161ff7d6", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 3, "design": "llama_prefill", "entry": "20ea161ff7d6", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 4, "design": "llama_prefill", "entry": "20ea161ff7d6", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
-{"core": 5, "design": "llama_prefill", "entry": "20ea161ff7d6", "apps": ["qwen3-0.6B-PARO"], "bytes": 2848}
+{"core": 2, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 3, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 4, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 5, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 2, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 3, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 4, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 5, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 2, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 3, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 4, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 5, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 2, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 3, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 4, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 5, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 2, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 3, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 4, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 5, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 2, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 3, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 4, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 5, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 2, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 3, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 4, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 5, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 2, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 3, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 4, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 5, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 2, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "bytes": 1856}
 {"core": 3, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-3B-Q4_K_M"], "bytes": 1808}
 {"core": 3, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-8B-Q4_K_S"], "bytes": 1856}

@@ -57,13 +57,13 @@ def c_join(df: Dataflow, l2_ty: Any, l1_ty: Any, rows: int, depth: int) -> tuple
     return l3, l1
 
 
-def resolve(op: Any, workers: list[Any], streams: tuple[list, list, list], rows: int, *, c_bfp16: bool) -> Module:
+def resolve(op: Any, workers: list[Any], streams: tuple[list, list, list], rows: int) -> Module:
     """The design's module: the runtime sequence (``op._sequence``) over the shim's side of the A, B and C streams
     (A_l3, B_l3, C_l3) with the operator's A panels, weights and C as arguments."""
     a_l3, b_l3, c_l3 = streams
     A_ty = np.ndarray[(op.M * op.a_K * 9 // 16,), np.dtype[bfloat16]]
     W_ty = np.ndarray[(op.w_bytes // 2,), np.dtype[bfloat16]]  # bf16: fused ELFs pass bf16 buffers
-    C_ty = np.ndarray[(op.M * op.N * 9 // 16 if c_bfp16 else op.M * op.N,), np.dtype[bfloat16]]
+    C_ty = np.ndarray[(op.c_elems,), np.dtype[bfloat16]]
     a_prods = [a_l3[row].prod(tile=Tile(2 * row, 0)) for row in range(rows)]
     b_prods = [b_l3[c].prod(tile=Tile(c, 0)) for c in range(COLS)]
     c_conses = [c_l3[c].cons(tile=Tile(c, 0)) for c in range(COLS)]

@@ -145,6 +145,7 @@ class GemmSpec:
     pace: int | None = None
     pass_step: int = 0
     ptail: bool = False
+    c_panels: int = 0
 
     def __post_init__(self) -> None:
         for name in ("out_cols", "blocks", "a_cols", "ablate"):
@@ -232,6 +233,7 @@ class Geometry:
     carry: tuple[tuple[int, int], ...] | None
     win: int
     c_parts: int
+    c_panels: int = 0  # (C as bf16 MMUL panels [M / 8][N / 8][c_panels]: the GEMM's 64 values first in each slot)
     m: int = 0
 
     @property
@@ -400,6 +402,8 @@ class Geometry:
         assert len(out_cols) == COLS and all(len(o) == passes for o in out_cols)
         c_bfp16 = spec.c_bfp16
         assert c_bfp16 == silu, "the gate/up epilogue: bfp16 C panels"
+        assert not spec.c_panels or (spec.c_panels % 64 == 0 and not (silu or spec.c_pack or c_pairs or groups > 1
+                                                                       or is_planar or dq_core)), "bf16 C panels"
         assert not (c_pairs or k_rep > 1) or (fmt == "BFP16" and not silu and not spec.c_pack), \
             "router pairs: BFP16 tiles"
         # (whole 16-row blocks: the memtile un-panelizes the MAC tile; two slots per C object: packed)
@@ -486,7 +490,8 @@ class Geometry:
             blocks=blocks, pass_step=step, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
             tail=tail, ptail=spec.ptail,
             KA=KA, a_k0=a_k0, a_K=a_K, overrun=overrun, w_bytes=w_bytes, halves=halves, n_read=n_read, n=n, nm=nm,
-            c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1)
+            c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1,
+            c_panels=spec.c_panels)
         if spec.ptail:  # (a pass pair's even and odd row tiles: the two parts of one C object, their panels in turn)
             assert silu and c_parts == 2 and halves == 1, "ptail: gate / up passes in pairs (lines)"
             return replace(plain, c_parts=2), None

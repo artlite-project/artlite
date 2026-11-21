@@ -1,15 +1,19 @@
 """``prefill.rotate.PrefillRotOperator`` on the NPU against its host model bit for bit (Qwen3-0.6B-PARO's rotations, or
-random ones without the checkpoint): the panels of x -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16
-value times T on the fp32 MAC), x' as hi + lo into bfp16 panels; and the model against the exact transform (fp64)."""
+random ones without the checkpoint): the panels of x (``gu``: gate and up's bf16 panels, x = bf16(silu(gate) up),
+kmath.silu_tanh's model) -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16 value times T on the fp32
+MAC), x' as hi + lo into bfp16 panels; and the model against the exact transform (fp64)."""
 
 import numpy as np
 import pytest
+import torch
+from ml_dtypes import bfloat16
 
-from artlite.operators import bfp16
+from artlite.operators import bfp16, kmath
 from artlite.paro import Rotation
-from artlite.prefill.rotate import PrefillRotOperator
+from artlite.prefill.rotate import PrefillRotOperator, row_floats
 
 from ..operators import kmath_sim as ks
+from .test_gate_up import vtanh  # noqa: F401 (the fixture)
 
 
 def _f32(x: np.ndarray) -> np.ndarray:
@@ -37,23 +41,46 @@ def model(x: np.ndarray, tf: object) -> np.ndarray:
     return ks.add(hi, ks.bf16(ks.add(u, -hi))).astype(np.float32).reshape(T, K)
 
 
-@pytest.mark.parametrize(("T", "K"), [(256, 1024), (1024, 3072)], ids=["256x1024", "1024x3072"])
-def test_prefill_rotate(T: int, K: int) -> None:
-    rng = np.random.default_rng(0)
+def _rotation(K: int, rng: np.random.Generator) -> Rotation:
+    """Qwen3-0.6B-PARO's rotation of a K (layer 1's q or down), or a random one (another K, or no checkpoint)."""
     try:
         from artlite.hf_model import HfModel
         from artlite.model_config import checkpoint
 
-        name = "blk.1.ffn_down.weight" if K == 3072 else "blk.1.attn_q.weight"
-        rot = HfModel(checkpoint("qwen3-0.6B-paro")).tensor(name).rot()
-    except (OSError, FileNotFoundError):
+        name = {3072: "blk.1.ffn_down.weight", 1024: "blk.1.attn_q.weight"}[K]
+        return HfModel(checkpoint("qwen3-0.6B-paro")).tensor(name).rot()
+    except (OSError, FileNotFoundError, KeyError):
         pairs = np.stack([np.concatenate([rng.permutation(128) for _ in range(K // 128)]) for _ in range(8)])
-        rot = Rotation(rng.uniform(-3, 3, (8, K // 2)), pairs, rng.uniform(-2, 2, K), 128)
-    tf = rot.tan_form(rng.uniform(0.5, 2.0, K), unit=True)
-    xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
-    x = bfp16.from_panels(xp, T, K)  # (the panels' values)
-    op = PrefillRotOperator(T=T, K=K)
-    out = op.compile().run(xp, tf.pair_objects().reshape(-1).view(bfp16.bfloat16))
+        return Rotation(rng.uniform(-3, 3, (8, K // 2)), pairs, rng.uniform(-2, 2, K), 128)
+
+
+def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """GU's panels [T / 8][K / 8][gate 64 | up 64] (bf16, [token][channel] each) and x = bf16(silu(gate) up) (T, K)."""
+    gu = (rng.standard_normal((T // 8, K // 8, 2, 8, 8)) * 2).astype(bfloat16)
+    g = gu[:, :, 0].astype(np.float32)
+    y = np.asarray(ks.emulate(kmath.silu_tanh(walk=(2, 128)), g.reshape(-1)), np.float32).reshape(g.shape)
+    h = (torch.from_numpy(y).bfloat16().float() * torch.from_numpy(gu[:, :, 1].astype(np.float32))).bfloat16().float()
+    return gu.reshape(-1), h.numpy().transpose(0, 2, 1, 3).reshape(T, K)
+
+
+# (tokens, channels, gu): a norm's / o's input, Qwen3-0.6B's down (16-token items: 2 rounds of a group; 128 tokens: 4
+# groups a round), Qwen3.5-0.8B's ffn (28 groups, 256 tokens: 2 groups a round)
+CASES = [(256, 1024, False), (1024, 3072, False), (1024, 3072, True), (128, 3072, True), (256, 3584, True)]
+
+
+@pytest.mark.parametrize(("T", "K", "gu"), CASES, ids=[f"{T}x{K}" + ("-gu" if gu else "") for T, K, gu in CASES])
+@pytest.mark.usefixtures("vtanh")
+def test_prefill_rotate(T: int, K: int, gu: bool) -> None:
+    rng = np.random.default_rng(0)
+    rot = _rotation(K, rng)
+    tf = rot.tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True)
+    if gu:
+        xp, x = _gu_input(T, K, rng)
+    else:
+        xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
+        x = bfp16.from_panels(xp, T, K)  # (the panels' values)
+    op = PrefillRotOperator(T=T, K=K, gu=gu)
+    out = op.compile().run(xp, tf.pair_objects(row_floats(gu)).reshape(-1).view(bfp16.bfloat16))
     want = model(x, tf)
     got = bfp16.from_panels(np.asarray(out), T, K)
     exp = bfp16.from_panels(bfp16.to_panels(want), T, K)  # (the output panels' rounding of the model's x')

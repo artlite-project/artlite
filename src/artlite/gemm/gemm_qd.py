@@ -585,7 +585,7 @@ class GemmQdOperator(GemmQOperator):
                                                k_mm, *extra],
                                       tile=Tile(c, 3 + row), stack_size=self.mac_stack, dynamic_objfifo_lowering=True))
 
-        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), MR, c_bfp16=cb)
+        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), MR)
         # the L1 budget / pinned layout describe these buffers (csplit: ``acc`` is a tile's first half)
         mac = self._buffers(self.geo, self.plan)
         actual = {"A": DP.nbytes(A_l1_ty), "B": DP.nbytes(B_l1_ty), "D": DP.nbytes(D_ty), "C": DP.nbytes(C_l1_ty),

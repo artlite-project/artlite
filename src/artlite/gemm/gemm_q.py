@@ -147,6 +147,7 @@ class GemmQOperator(ArtcOperator):
         pace: int | None = None,
         pass_step: int = 0,
         ptail: bool = False,
+        c_panels: int = 0,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -190,7 +191,8 @@ class GemmQOperator(ArtcOperator):
             out_cols=out_cols, silu=silu, act=act, nrows=nrows, c_bfp16=c_bfp16, ablate=ablate, kc=kc,
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
-            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail)
+            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail,
+            c_panels=c_panels)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()
@@ -362,8 +364,13 @@ class GemmQOperator(ArtcOperator):
         return [
             ArgSpec("in", (self.M * self.a_K * 9 // 16,), bfloat16),
             ArgSpec("in", (self.w_bytes // 2,), bfloat16),
-            ArgSpec("out", (self.M * self.N * 9 // 16,) if self.c_bfp16 else (self.M, self.N), bfloat16),
+            ArgSpec("out", (self.M, self.N) if self.c_elems == self.M * self.N else (self.c_elems,), bfloat16),
         ]
+
+    @property
+    def c_elems(self) -> int:
+        """bf16 elements of the C argument (``Dataflow.c_elems``)."""
+        return self.flow.c_elems
 
     def get_kernel_src(self) -> str:
         # the MAC: B as the dequantized bfp16 panels, or BFP16 tiles
@@ -578,7 +585,7 @@ class GemmQOperator(ArtcOperator):
                                                  st, *extra],
                                       tile=Tile(c, row + 2), stack_size=2048, dynamic_objfifo_lowering=True))
 
-        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), ROWS, c_bfp16=cb)
+        module = DP.resolve(self, workers, (a_l3, b_l3, c_l3), ROWS)
         # the L1 budget / pinned layout describe these buffers
         actual = {"A": DP.nbytes(A_l1_ty), "B": DP.nbytes(B_l1_ty), "C": DP.nbytes(C_l1_ty), "acc": DP.nbytes(acc_ty),
                   "st": DP.nbytes(st_ty), **({"ws": DP.nbytes(ws_ty), "X": DP.nbytes(X_ty)} if pair else {}),

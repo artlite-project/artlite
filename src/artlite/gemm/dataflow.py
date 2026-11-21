@@ -130,7 +130,7 @@ class Dataflow:
                     if geo.c_parts == 2 else
                     stream_walk(c_l1, [(m, geo.n_c), (geo.win, 1)], [(0, 0), (0, 0)])
                     if geo.n_c != geo.win else
-                    None if cb or geo.c_pack or geo.c_pairs else
+                    None if cb or geo.c_pack or geo.c_pairs or geo.c_panels else
                     stream_walk(c_l1, [(m // r, r * no), (r, t), (no // t, r * t), (t, 1)])))
 
     def _hg_bds(self, c: int, j0: int, np_: int) -> list[TensorAccessPattern]:
@@ -281,6 +281,14 @@ class Dataflow:
                                    (ch * geo.nrows + row) * (m // 8) * (aK // 8) * 36 + geo.a_k0 // 8 * 36,
                                    [n, K // KT, m // 8, 8 * 36], [0, 8 * 36, aK // 8 * 36, 1])
 
+    @property
+    def c_elems(self) -> int:
+        """bf16 elements of the C argument (``c_panels``: through the last panel, its slot's 64 values first)."""
+        geo = self.geo
+        if geo.c_panels:
+            return geo.M * geo.N // 64 * geo.c_panels - (geo.c_panels - 64)
+        return geo.M * geo.N * 9 // 16 if geo.c_bfp16 else geo.M * geo.N
+
     def c_chain(self, ch: int, c: int) -> list[TensorAccessPattern]:
         """Row groups: the C drain of column c for token chunk ``ch`` as one chained task, a BD per C object of a pass
         (its slots' rows of the pass's tiles: [token][tile G R apart][slots R]), each iterating over the passes (bf16
@@ -313,7 +321,11 @@ class Dataflow:
             cols, no = [o - cr for o, (cr, _) in zip(cols, geo.carry, strict=True)], geo.win
         taps = []
         for p0, cnt, step in drain_runs(cols):
-            if geo.c_bfp16:  # panels [group][N / 8][36]: [pass][the chunk's groups][no / 8 blocks][panel]
+            if geo.c_panels:  # bf16 panels [group][N / 8][c_panels]: [pass][the chunk's groups][no / 8 blocks][64]
+                pp = geo.c_panels
+                taps.append(TensorAccessPattern((self.c_elems,), (ch * rows * m // 8 * geo.N + cols[p0]) // 8 * pp,
+                                                [cnt, rows * m // 8, no // 8, 64], [step // 8 * pp, geo.N // 8 * pp, pp, 1]))
+            elif geo.c_bfp16:  # panels [group][N / 8][36]: [pass][the chunk's groups][no / 8 blocks][panel]
                 taps.append(TensorAccessPattern((geo.M * geo.N * 9 // 16,),
                                                 (ch * rows * m // 8 * geo.N + cols[p0]) // 8 * 36,
                                                 [cnt, rows * m // 8, no // 8, 36],

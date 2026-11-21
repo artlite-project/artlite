@@ -1,13 +1,50 @@
-// A PARO rotation of a prompt's activations (prefill.rotate): per item 32 tokens x a group of 128 channels, the panels
-// in (bfp16ebs8, [token group 4][channel block 16][72 B]) -> u = x w' (fp32 rows of 32 tokens: the tokens in the lanes,
-// no gathers), the {{ R }} rounds of the tan form on Givens pairs, the panels out. Round r holds u in its pair order (rows
-// 2 i, 2 i + 1: pair i), reads it in a row and writes each output where round r + 1 reads it (the last round: the
-// position's own row): u ping-pongs between two buffers. The object (paro.TanForm.pair_objects): per round 64 x [the two
-// rows' destinations (offsets of 32 floats) as u16 | u16], then 64 x [T_s | T_p] bf16; the first round's row of each
-// channel (u16), w' (bf16).
+// A PARO rotation of a prompt's activations (prefill.rotate): per item {{ TOK }} tokens x a group of 128 channels,
+{% if gu %}
+// gate and up as bf16 panels ([token group {{ TOK // 8 }}][channel block 16][gate 64 | up 64]) -> x = bf16(silu(gate) up),
+{% else %}
+// the panels in (bfp16ebs8, [token group {{ TOK // 8 }}][channel block 16][72 B]) -> x,
+{% endif %}
+// u = x w' (fp32 rows of {{ TOK }} tokens: the tokens in the lanes, no gathers), the {{ R }} rounds of the tan form on
+// Givens pairs, the panels out. Round r holds u in its pair order (rows 2 i, 2 i + 1: pair i), reads it in a row and
+// writes each output where round r + 1 reads it (the last round: the position's own row): u ping-pongs between two
+// buffers. The object (paro.TanForm.pair_objects): per round 64 x [the two rows' destinations (offsets in floats) as
+// u16 | u16], then 64 x [T_s | T_p] bf16; the first round's row of each channel (u16), w' (bf16).
+{% if gu %}
+{% set act_t = km.silu_tanh(walk=(2, 128)) %}
+{{ act_t.src }}
 
-// the item's panels x [token group 4][channel block 16] (bfp16, values exact in bf16) times w (bf16 per channel) -> u:
-// channel c's 32 tokens at row d[c] (offsets in floats)
+// the item's gate / up panels x [token group {{ TOK // 8 }}][channel block 16][gate 64 | up 64]: the gates' silu into y,
+// h = bf16(silu(gate) up) (the gate / up epilogue's), times w (bf16 per channel) -> u: channel c's tokens at row d[c]
+// (offsets in floats)
+__attribute__((noinline)) void {{ p }}_u0(const bfloat16 *__restrict x, const uint16_t *__restrict d, const bfloat16 *__restrict w,
+                                          float *__restrict u, bfloat16 *__restrict y, int32_t zero)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {{ act_t }}<{{ TOK // 8 * 1024 }}>(x, y, zero);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int kb = 0; kb < 16; kb++) {
+        const aie::vector<bfloat16, 64> wt = aie::transpose(aie::load_v<8>(w + 8 * kb).template grow_replicate<64>(), 8, 8);
+        const uint16_t *__restrict dk = d + 8 * kb;
+        int dd[8];
+        AIE_LOOP_UNROLL_FULL
+        for (int c = 0; c < 8; c++)
+            dd[c] = dk[c];
+        AIE_LOOP_UNROLL_FULL
+        for (int tg = 0; tg < {{ TOK // 8 }}; tg++) {  // (panel [tg][kb]: tokens 8 tg .., channels 8 kb ..)
+            const int i = 16 * tg + kb;
+            const aie::vector<bfloat16, 64> h = aie::mul(aie::load_v<64>(y + 64 * i), aie::load_v<64>(x + 128 * i + 64))
+                                                    .template to_vector<bfloat16>();
+            const aie::vector<float, 64> a = aie::mul(aie::transpose(h, 8, 8), wt).template to_vector<float>();  // ([channel][token])
+            AIE_LOOP_UNROLL_FULL
+            for (int c = 0; c < 8; c++)
+                aie::store_v(u + 8 * tg + dd[c], a.template extract<8>(c));
+        }
+    }
+}
+{% else %}
+
+// the item's panels x [token group {{ TOK // 8 }}][channel block 16] (bfp16, values exact in bf16) times w (bf16 per
+// channel) -> u: channel c's tokens at row d[c] (offsets in floats)
 __attribute__((noinline)) void {{ p }}_u0(const uint8_t *__restrict x, const uint16_t *__restrict d, const bfloat16 *__restrict w,
                                           float *__restrict u)
 {
@@ -22,7 +59,7 @@ __attribute__((noinline)) void {{ p }}_u0(const uint8_t *__restrict x, const uin
         for (int c = 0; c < 8; c++)
             dd[c] = dk[c];
         AIE_LOOP_UNROLL_FULL
-        for (int tg = 0; tg < 4; tg++) {  // (panel [tg][kb]: tokens 8 tg .., channels 8 kb ..)
+        for (int tg = 0; tg < {{ TOK // 8 }}; tg++) {  // (panel [tg][kb]: tokens 8 tg .., channels 8 kb ..)
             al::BIn<> xi((const bfp16ebs8 *)(x + 72 * (16 * tg + kb)));
             al::MM8 m;
             m.mul(xi.pop(), aie::op_transpose(I));
@@ -34,54 +71,67 @@ __attribute__((noinline)) void {{ p }}_u0(const uint8_t *__restrict x, const uin
         }
     }
 }
+{% endif %}
 
 // one round: the pairs' rows of ui in a row -> their outputs at the destinations dt[2 i] in uo (coefficients dt[2 i + 1])
 __attribute__((noinline)) void {{ p }}_round(const float *__restrict ui, float *__restrict uo, const int32_t *__restrict dt)
 {
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < 64; i++) {
-        const aie::vector<float, 32> a = aie::load_v<32>(ui), b = aie::load_v<32>(ui + 32);
-        ui += 64;
-        const aie::vector<bfloat16, 32> ah = aie::accum<accfloat, 32>(a).template to_vector<bfloat16>();
-        const aie::vector<bfloat16, 32> bh = aie::accum<accfloat, 32>(b).template to_vector<bfloat16>();
+        const aie::vector<float, {{ TOK }}> a = aie::load_v<{{ TOK }}>(ui), b = aie::load_v<{{ TOK }}>(ui + {{ TOK }});
+        ui += {{ 2 * TOK }};
+        const aie::vector<bfloat16, {{ TOK }}> ah = aie::accum<accfloat, {{ TOK }}>(a).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, {{ TOK }}> bh = aie::accum<accfloat, {{ TOK }}>(b).template to_vector<bfloat16>();
         const int dd = dt[0];
         const bfloat16 *__restrict t = (const bfloat16 *)(dt + 64);
         const bfloat16 ta = t[0], tb = t[1];
         dt += 1;
         const int da = dd & 0xFFFF, db = (unsigned)dd >> 16;
-        aie::store_v(uo + da, aie::mac(aie::accum<accfloat, 32>(a), aie::broadcast<bfloat16, 32>(ta), bh).template to_vector<float>());
-        aie::store_v(uo + db, aie::mac(aie::accum<accfloat, 32>(b), aie::broadcast<bfloat16, 32>(tb), ah).template to_vector<float>());
+        aie::store_v(uo + da, aie::mac(aie::accum<accfloat, {{ TOK }}>(a), aie::broadcast<bfloat16, {{ TOK }}>(ta), bh)
+                                  .template to_vector<float>());
+        aie::store_v(uo + db, aie::mac(aie::accum<accfloat, {{ TOK }}>(b), aie::broadcast<bfloat16, {{ TOK }}>(tb), ah)
+                                  .template to_vector<float>());
     }
 }
 
-extern "C" {
-
-// One item: the input panels x (4 token groups x 16 channel blocks), the group's rotation object ro -> the panels of x'
-// at o
-void {{ p }}_rot(const uint8_t *__restrict x, const uint8_t *__restrict ro, uint8_t *__restrict o, float *__restrict ua,
-                 float *__restrict ub)
+// u's rows in position order -> the item's panels at o ([token group {{ TOK // 8 }}][channel block 16]: x' as hi + lo,
+// rounded once into bfp16)
+__attribute__((noinline)) void {{ p }}_out(const float *__restrict u, uint8_t *__restrict o)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_u0(x, (const uint16_t *)(ro + {{ 512 * R }}), (const bfloat16 *)(ro + {{ 512 * R + 256 }}), ua);
-    AIE_LOOP_NO_UNROLL
-    for (int r = 0; r < {{ R }}; r += 2) {
-        {{ p }}_round(ua, ub, (const int32_t *)(ro + 512 * r));
-        {{ p }}_round(ub, ua, (const int32_t *)(ro + 512 * (r + 1)));
-    }
     al::BOut<> oo((bfp16ebs8 *)o);
     AIE_LOOP_NO_UNROLL
-    for (int tg = 0; tg < 4; tg++)
+    for (int tg = 0; tg < {{ TOK // 8 }}; tg++)
         for (int kb = 0; kb < 16; kb++) {  // rows 8 kb .. (tokens 8 tg ..) -> [token][channel] as hi + lo, a panel
-            const float *__restrict q = ua + 256 * kb + 8 * tg;
+            const float *__restrict q = u + {{ 8 * TOK }} * kb + 8 * tg;
             const aie::vector<float, 64> v = aie::concat(
-                aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + 32), aie::load_v<8>(q + 64), aie::load_v<8>(q + 96)),
-                aie::concat(aie::load_v<8>(q + 128), aie::load_v<8>(q + 160), aie::load_v<8>(q + 192), aie::load_v<8>(q + 224)));
+                aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + {{ TOK }}), aie::load_v<8>(q + {{ 2 * TOK }}),
+                            aie::load_v<8>(q + {{ 3 * TOK }})),
+                aie::concat(aie::load_v<8>(q + {{ 4 * TOK }}), aie::load_v<8>(q + {{ 5 * TOK }}), aie::load_v<8>(q + {{ 6 * TOK }}),
+                            aie::load_v<8>(q + {{ 7 * TOK }})));
             aie::vector<bfloat16, 64> hi, lo;
             al::split2<64>(v, hi, lo);
             const aie::accum<accfloat, 64> t = aie::mac(aie::mul(aie::transpose(hi, 8, 8), aie::broadcast<bfloat16, 64>(1.0f)),
                                                         aie::transpose(lo, 8, 8), aie::broadcast<bfloat16, 64>(1.0f));
             oo.push(t.template to_vector<bfp16ebs8>());
         }
+}
+
+extern "C" {
+
+// One item: the input x ({{ "gate / up panels" if gu else "panels" }}), the group's rotation object ro -> the panels of x' at o
+void {{ p }}_rot(const uint8_t *__restrict x, const uint8_t *__restrict ro, uint8_t *__restrict o, float *__restrict ua,
+                 float *__restrict ub{{ ", bfloat16 *__restrict y, int32_t zero" if gu else "" }})
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    {{ p }}_u0({{ "(const bfloat16 *)x" if gu else "x" }}, (const uint16_t *)(ro + {{ 512 * R }}), (const bfloat16 *)(ro + {{ 512 * R + 256 }}),
+               ua{{ ", y, zero" if gu else "" }});
+    AIE_LOOP_NO_UNROLL
+    for (int r = 0; r < {{ R }}; r += 2) {
+        {{ p }}_round(ua, ub, (const int32_t *)(ro + 512 * r));
+        {{ p }}_round(ub, ua, (const int32_t *)(ro + 512 * (r + 1)));
+    }
+    {{ p }}_out(ua, o);
 }
 
 }  // extern "C"

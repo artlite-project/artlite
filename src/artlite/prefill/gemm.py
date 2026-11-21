@@ -82,6 +82,7 @@ class Gemm:
     a_off: int = 0  # the A argument from this bf16 element of the panels on (K parts of one design: the part's columns)
     c: str = ""  # its C buffer when not the phase's (a split gate / up block's parts: "GU")
     a: str = ""  # its A buffer when not the phase's (a PARO checkpoint's projections: their rotated inputs)
+    c_off: int = 0  # its C argument from this bf16 element of the buffer on (a PARO checkpoint's up: its panels' half)
 
 
 @dataclass
@@ -331,30 +332,25 @@ def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
     return Layout(max(-(-col // 64) * 64, pitch), off)
 
 
-def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
-                      act: str = "silu") -> PhasePlan:
+def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None
+                      ) -> PhasePlan:
     """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
-    from the caller's slices): a GEMM of plain bf16 rows into GU per region ([column][group][gate W | up W], ``gate_up``:
-    a pass of tile-major 16-row tiles is one group of 64), then the activation into the phase's output (HP), as a split
-    block's (``_split_gate_up``)."""
+    from the caller's slices): one GEMM design for both (a pass of tile-major 16-row tiles: 64 outputs), its C as bf16
+    panels into GU, [T / 8][ffn / 8][gate 64 | up 64] (``c_panels``; up's C argument 64 elements in), which down's
+    rotation reads (``prefill.rotate``'s ``gu``: the activation on the way)."""
     (bg,), (bu,) = gate.blocks, up.blocks
-    groups, W, KC = image.cfg.intermediate_size // COLS // 64, 64, gate.kc
-    P = groups * 2 * W
+    groups, KC = image.cfg.intermediate_size // COLS // 64, gate.kc
     gemms = []
     for part, (r, b) in enumerate(((gate, bg), (up, bu))):
         assert not planar(b.fmt, b.R, KC) and _tp(b) * b.R == ROWS and not b.pt, (b.fmt, b.R)
-        kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * P, "tile_bytes": r.tile_bytes,
+        kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * groups * 64, "tile_bytes": r.tile_bytes,
               "col_bytes": r.col_stride, "passes": groups,
-              "out_cols": [[P * c + 2 * W * j + W * part for j in range(groups)] for c in range(COLS)], "kc": KC,
-              "kc_group": r.kc_group, "blocks": ((0, groups),), "region_rt": r.n_rt}
+              "out_cols": [[64 * (groups * c + j) for j in range(groups)] for c in range(COLS)], "kc": KC,
+              "kc_group": r.kc_group, "blocks": ((0, groups),), "region_rt": r.n_rt, "c_panels": 128}
         op = gemm_op(kw, T, "gu", ops)
-        gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU"))
-    key = ("act", T, groups, W, image.region(gate.layer, "down").K_in, act)
-    if ops is None or key not in ops:
-        act_op = GateUpActOperator(T=T, groups=groups, W=W, K=key[-2], act=act)
-        if ops is not None:
-            ops[key] = act_op
-    return PhasePlan(gemms, None, act=ops[key] if ops is not None else act_op)
+        assert type(op) is GemmQOperator, "bf16 C panels: GemmQ"
+        gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU", c_off=64 * part))
+    return PhasePlan(gemms, None)
 
 
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,

@@ -173,12 +173,12 @@ class TanForm:
         q = np.take_along_axis(part, s, -1)
         return np.stack([s, q], -1), np.stack([np.take_along_axis(T, s, -1), np.take_along_axis(T, q, -1)], -1)
 
-    def pair_objects(self) -> np.ndarray:
-        """The prefill's rotation object of each group (G, 512 rounds + 512) uint8 (``prefill.rotate``): u lies in each
-        round's pair order (pair i: rows 2 i, 2 i + 1, s < partner[s]); per round 64 x [the destinations of the pair's
-        two outputs: their rows in the next round's order (the last round: the positions themselves), times 32, as u16 |
-        u16] then 64 x [T_s | T_p] bf16; the first round's row of each channel (u16, times 32) and w (bf16; a unit
-        form's)."""
+    def pair_objects(self, row: int = 32) -> np.ndarray:
+        """The prefill's rotation object of each group (G, 512 rounds + 512) uint8 (``prefill.rotate``, its u in rows of
+        ``row`` floats): u lies in each round's pair order (pair i: rows 2 i, 2 i + 1, s < partner[s]); per round 64 x
+        [the destinations of the pair's two outputs: their rows in the next round's order (the last round: the positions
+        themselves), times ``row``, as u16 | u16] then 64 x [T_s | T_p] bf16; the first round's row of each channel (u16,
+        times ``row``) and w (bf16; a unit form's)."""
         from ml_dtypes import bfloat16
 
         assert self.w is not None, "a unit tan form (Rotation.tan_form(unit=True))"
@@ -186,14 +186,14 @@ class TanForm:
         G, R = pairs.shape[:2]
         g = self.group
         order = pairs.reshape(G, R, g)  # (round r: the position at each row)
-        row = np.empty_like(order)
-        np.put_along_axis(row, order, np.broadcast_to(np.arange(g), order.shape).copy(), -1)  # (position -> row)
-        dest = np.concatenate([np.take_along_axis(row[:, 1:], order[:, :-1], -1), order[:, -1:]], 1)  # (G, R, g)
+        at = np.empty_like(order)
+        np.put_along_axis(at, order, np.broadcast_to(np.arange(g), order.shape).copy(), -1)  # (position -> row)
+        dest = np.concatenate([np.take_along_axis(at[:, 1:], order[:, :-1], -1), order[:, -1:]], 1)  # (G, R, g)
         out = np.zeros((G, 512 * R + 4 * g), np.uint8)
         rounds = out[:, :512 * R].reshape(G, R, 512)
-        rounds[..., :256] = (32 * dest).astype(np.uint16).view(np.uint8).reshape(G, R, 256)
+        rounds[..., :256] = (row * dest).astype(np.uint16).view(np.uint8).reshape(G, R, 256)
         rounds[..., 256:] = np.asarray(coef, np.float32).astype(bfloat16).reshape(G, R, g).view(np.uint8).reshape(G, R, 256)
-        out[:, 512 * R:512 * R + 2 * g] = (32 * row[:, 0]).astype(np.uint16).view(np.uint8).reshape(G, 2 * g)
+        out[:, 512 * R:512 * R + 2 * g] = (row * at[:, 0]).astype(np.uint16).view(np.uint8).reshape(G, 2 * g)
         out[:, 512 * R + 2 * g:] = np.asarray(self.w, np.float32).astype(bfloat16).view(np.uint8).reshape(G, 2 * g)
         return out
 
