@@ -42,7 +42,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native, settings
-from ..formats import q6h
+from ..formats import q6h, tile_format
 from ..gguf_model import GGUFFile
 
 Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
@@ -76,9 +76,10 @@ def derived(fmt: str, qtype: str) -> bool:
 
 def screened(qtype: str, formats: set[str]) -> bool:
     """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a plane, in
-    a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices). Each paged format's dispatch
-    takes 64 B of the main cores' page slot, and Occamy's seven leave its largest page that short with an eighth."""
-    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {PLANES[qtype]}) <= FILE_FORMATS
+    a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices; the head's own counts, not
+    its plane's). Each paged format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its
+    largest page that short with an eighth."""
+    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {tile_format(qtype)}) <= FILE_FORMATS
 
 
 def half_rows(t: object) -> np.ndarray:

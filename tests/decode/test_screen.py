@@ -236,3 +236,11 @@ def test_stats(head: tuple) -> None:
     nv = (a2 * (r - rho[:, None] * wq) ** 2).mean(1)
     assert np.allclose(sc.scale, 1 / (1 - rho), rtol=1e-5)
     assert np.allclose(sc.bound, SC.Z * np.sqrt(nv) / (1 - rho), rtol=1e-4)
+
+
+def test_screened_counts_file_formats() -> None:
+    """A head is screened in a file of up to FILE_FORMATS tile formats, its own type counting (not its plane's): a Q4_K_M
+    file's Q4_K, Q5_K, Q6_K (Qwen3.6-35B-A3B) keeps its Q6_K head screened; a fourth format does not."""
+    assert SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q6_K"})
+    assert not SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q8_0"})
+    assert SC.screened("F16", {"P4_128"}) and not SC.screened("Q8_0", {"Q4_K"})
