@@ -13,7 +13,7 @@ from artlite.operators import bfp16, kmath
 from artlite.operators.kernel_source import KernelSource
 
 from . import kmath_sim
-from .elementwise import InvOperator, KmOperator, RowOperator, SoftmaxOperator, VtanhOperator
+from .elementwise import InvOperator, KmOperator, RotOperator, RowOperator, SoftmaxOperator, VtanhOperator
 
 CASES = {  # id: the function and its arguments
     "exp2": ("exp2", {"lanes": 32}),
@@ -304,3 +304,48 @@ def test_kmath_softmax(case: str) -> None:
             ref = np.exp2(y.astype(np.float64)).sum(0)
             rel = np.abs(sums - ref) / ref
             assert rel.max() <= 2.0 ** -7, f"run {run}: l error {rel.max():.3g}"
+
+
+@pytest.mark.parametrize("f32", [True, False], ids=["f32", "bf16"])
+def test_kmath_rotate(f32: bool) -> None:
+    """``kmath.rotate`` on the NPU against its model (``kmath_sim.rotate``) bit for bit, on the tan form of Qwen3-0.6B-PARO's
+    rotations (random rotations without the checkpoint), and the model against the exact transform (fp64)."""
+    from artlite.model_config import checkpoint
+    from artlite.operators.kmath.rotate import coefs
+    from artlite.paro import Rotation
+
+    rng = np.random.default_rng(0)
+    G, calls = 4, 2
+    try:
+        from artlite.hf_model import HfModel
+
+        rot = HfModel(checkpoint("qwen3-0.6B-paro")).tensor("blk.2.ffn_down.weight").rot()
+    except (OSError, FileNotFoundError):
+        pairs = np.stack([np.concatenate([rng.permutation(128) for _ in range(24)]) for _ in range(8)])
+        rot = Rotation(rng.uniform(-3, 3, (8, 3072 // 2)), pairs, rng.uniform(-2, 2, 3072), 128)
+    tf = rot.tan_form()
+    n = G * calls
+    T = tf.T.reshape(8, -1, 128)[:, :n].transpose(1, 0, 2)  # (groups, rounds, 128)
+    part = tf.partner.reshape(8, -1, 128)[:, :n].transpose(1, 0, 2)
+    x = kmath_sim.bf16(rng.standard_normal((n, 128, 4)) * np.exp(rng.standard_normal((n, 1, 4))))
+    w = kmath_sim.bf16(rng.uniform(0.5, 2.0, (n, 128)))
+    Tb = kmath_sim.bf16(T)
+    op = RotOperator(groups=G, calls=calls, f32=f32)
+    inp = np.zeros((calls, op.group_ints), np.int32)
+    for c in range(calls):
+        g = slice(G * c, G * (c + 1))
+        parts = [x[g].astype(bfloat16).view(np.uint8).reshape(-1), w[g].astype(bfloat16).view(np.uint8).reshape(-1),
+                 np.concatenate([coefs(T[i], part[i]) for i in range(G * c, G * (c + 1))])]
+        b = np.concatenate(parts)
+        inp[c].view(np.uint8)[:b.size] = b
+    out = op.compile().run(inp.reshape(-1)).reshape(calls, op.group_ints)
+    got = out[:, :G * 512].view(np.float32).reshape(n, 128, 4)
+    want = kmath_sim.rotate(x, w, Tb, part, f32=f32)
+    assert np.array_equal(got.view(np.uint32), np.asarray(want, np.float32).view(np.uint32)), np.argwhere(got != want)[:4]
+    # (against the exact rounds of the same inputs: fp64 on x w')
+    exact = x.astype(np.float64) * w[..., None]
+    gi = np.arange(n)[:, None]
+    for r in range(8):
+        exact = exact + T[:, r, :, None] * exact[gi, part[:, r]]
+    err = np.sqrt(((got - exact) ** 2).mean() / (exact ** 2).mean())
+    assert err < (2e-3 if f32 else 6e-3), err

@@ -459,3 +459,18 @@ def exact(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     if fn.func in funcs:
         return funcs[fn.func]()
     raise ValueError(f"{fn.name}: no exact function")
+
+
+def rotate(x: np.ndarray, w: np.ndarray, T: np.ndarray, partner: np.ndarray, *, f32: bool = True) -> np.ndarray:
+    """``kmath.rotate`` on groups (G, 128, 4) of x (bf16 values) times w' (G, 128; bf16): u = x w' exactly, its bf16
+    copy, then per round u[c] = mac(u[c], T[r][c], copy[partner[r][c]]) (``f32``; else the copy itself is the state:
+    mac(copy[c], ...)) and the copy re-rounded; T (G, rounds, 128) bf16 values, partner (G, rounds, 128). Returns u
+    (fp32), or the last copy."""
+    u = mul(x, np.asarray(w)[..., None])
+    b = bf16(u)
+    gi = np.arange(x.shape[0])[:, None]
+    for r in range(T.shape[1]):
+        p = b[gi, partner[:, r]]
+        u = mac(u if f32 else b, T[:, r, :, None], p)
+        b = bf16(u)
+    return u if f32 else b

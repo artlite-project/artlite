@@ -1,0 +1,92 @@
+// The {{ rounds }} rounds of a PARO rotation's tan form on {{ groups }} group(s) of 128 channels of 4 lanes (kmath.rotate):
+// per round r u[c] += T[r][c] u'[partner[r][c]] (u {{ "fp32" if f32 else "bf16" }} [group][c][4]{{ " in place" if f32 }}, u' the
+// previous round's bf16 copy, gathered a channel's 64 bits at a time), the result's copy into the other buffer (b0 holds
+// u's copy at entry); coef per group (``cstride`` bytes apart) and round [T 128 bf16 | partner 128 u8]. A copy is laid
+// out as the 4x64 gather reads (kmath.gather's lane mapping): channels 4 q .. 4 q + 3 ([4] bf16 each) twice in 64 bytes
+// (q 0 .. 31: 2 KB a group), channel c's entry at 16 c (address bits 5:4: the entry; odd lanes read the second copy)
+
+// 16 channels' partners (u8 at p) -> the gather addresses of their copies (16 c from the group's source, broadcast)
+[[clang::always_inline]] inline aie::vector<int32, 16> {{ name }}_ad(const uint8_t *__restrict p, aie::vector<int32, 16> base)
+{
+    return aie::add(base, aie::upshift(aie::load_v<16>(p).unpack().unpack().template cast_to<int32>(), 4));
+}
+
+// 8 channels' bf16 values ([c][4]) -> the copy at d: each half's 4 channels twice (32-byte stores: no shuffles)
+template <typename P>
+[[clang::always_inline]] inline void {{ name }}_put(P d, aie::vector<bfloat16, 32> v)
+{
+    const aie::vector<bfloat16, 16> a = v.template extract<16>(0), b = v.template extract<16>(1);
+    aie::store_v(d, a);
+    aie::store_v(d + 16, a);
+    aie::store_v(d + 32, b);
+    aie::store_v(d + 48, b);
+}
+
+// the 8 channels' copies at addresses a (lanes 0 .. 7) -> 32 bf16 [channel][4]
+[[clang::always_inline]] inline aie::vector<bfloat16, 32> {{ name }}_g8(v8int32 a)
+{
+    v32bfloat16 q = undef_v32bfloat16();
+    q = insert(q, 0, (v16bfloat16)load_4x64_lo(a));
+    q = insert(q, 1, (v16bfloat16)load_4x64_hi(a));
+    return aie::vector<bfloat16, 32>(q);
+}
+
+// one round: the gathers' base a select of two broadcasts of pointer arguments used for nothing else (a gather then
+// carries a memory operand, llvm-aie's read-only table: else every gather is a barrier to every load and store). Out of
+// line: a call orders a round's gathers after the round before's stores (the table is read-only to the compiler)
+__attribute__((noinline)) void {{ name }}_round({{ "float" if f32 else "bfloat16" }} *__restrict u, const bfloat16 *ga,
+                                                const bfloat16 *gb, bfloat16 *__restrict dst, const uint8_t *__restrict rc)
+{
+    const aie::vector<int32, 16> b0 = aie::vector<int32, 16>(::sel(broadcast_s32((int32)(intptr_t)ga),
+                                                                    broadcast_s32((int32)(intptr_t)gb), 0xCCCC));
+{% if f32 %}
+    float __aie_dm_resource_c *__restrict pu = (float __aie_dm_resource_c *)u;
+{% else %}
+    const bfloat16 __aie_dm_resource_c *__restrict pu = (const bfloat16 __aie_dm_resource_c *)u;
+{% endif %}
+    bfloat16 __aie_dm_resource_d *__restrict pd = (bfloat16 __aie_dm_resource_d *)dst;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int v = 0; v < {{ 8 * groups }}; v++) {  // 16 channels, group v / 8
+        const int g = v >> 3, j = v & 7;
+        const uint8_t __aie_dm_resource_a *__restrict pc = (const uint8_t __aie_dm_resource_a *)(rc + {{ cstride }} * g);
+        const aie::vector<int32, 16> a = {{ name }}_ad(pc + 256 + 16 * j, aie::add(b0, aie::broadcast<int32, 16>(2048 * g)));
+        const aie::vector<bfloat16, 32> gl = {{ name }}_g8(extract_v8int32((v16int32)a, 0));
+        const aie::vector<bfloat16, 32> gh = {{ name }}_g8(extract_v8int32((v16int32)a, 1));
+        // T of the 16 channels, each over its 4 lanes: [4][16] -> [16][4]
+        const aie::vector<bfloat16, 64> t = aie::transpose(aie::load_v<16>((const bfloat16 *)pc + 16 * j).template grow_replicate<64>(), 4, 16);
+{% if f32 %}
+        aie::accum<accfloat, 32> c0(aie::load_v<32>(pu)), c1(aie::load_v<32>(pu + 32));
+        c0 = aie::mac(c0, t.template extract<32>(0), gl);
+        c1 = aie::mac(c1, t.template extract<32>(1), gh);
+        aie::store_v(pu, c0.template to_vector<float>());
+        aie::store_v(pu + 32, c1.template to_vector<float>());
+        {{ name }}_put(pd, c0.template to_vector<bfloat16>());
+        {{ name }}_put(pd + 64, c1.template to_vector<bfloat16>());
+        pu += 64;
+{% else %}
+        const aie::vector<bfloat16, 64> s = aie::concat(aie::load_v<16>(pu), aie::load_v<16>(pu + 32), aie::load_v<16>(pu + 64),
+                                                        aie::load_v<16>(pu + 96));  // (the 4 groups' first copies)
+        const aie::accum<accfloat, 64> c = aie::mac(aie::accum<accfloat, 64>(s), t, aie::concat(gl, gh));
+        {{ name }}_put(pd, c.template to_vector<bfloat16>().template extract<32>(0));
+        {{ name }}_put(pd + 64, c.template to_vector<bfloat16>().template extract<32>(1));
+        pu += 128;
+{% endif %}
+        pd += 128;
+    }
+}
+
+// (the caller passes each copy twice: its gather bases, ga0 = gb0 = b0, ga1 = gb1 = b1)
+{{ attr }} void {{ name }}({{ "float *__restrict u, " if f32 }}const bfloat16 *ga0, const bfloat16 *gb0, const bfloat16 *ga1,
+                           const bfloat16 *gb1, bfloat16 *__restrict b0, bfloat16 *__restrict b1,
+                           const uint8_t *__restrict coef)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int r = 0; r < {{ rounds }}; r += 2) {
+        {{ name }}_round({{ "u" if f32 else "b0" }}, ga0, gb0, b1, coef + {{ RB }} * r);
+{% if rounds % 2 %}
+        if (r + 1 == {{ rounds }})
+            break;
+{% endif %}
+        {{ name }}_round({{ "u" if f32 else "b1" }}, ga1, gb1, b0, coef + {{ RB }} * (r + 1));
+    }
+}

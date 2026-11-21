@@ -399,3 +399,59 @@ class KmOperator(StreamOperator):
 
     def get_kernel_src(self) -> str:
         return _KM.render(fn=self.fn, name=self.kernel_name, ts=self.tile)
+
+
+_ROT = JINJA_ENV.from_string(r"""
+{{ fn.src }}
+extern "C"
+void {{ name }}(int32_t *__restrict input, int32_t *__restrict output)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const bfloat16 *__restrict x = (const bfloat16 *)input;
+    const bfloat16 *__restrict w = x + {{ 512 * G }};
+    const uint8_t *__restrict coef = (const uint8_t *)(w + {{ 128 * G }});
+    float *__restrict u = (float *)output;
+    bfloat16 *__restrict b0 = (bfloat16 *)(u + {{ 512 * G }}), *__restrict b1 = b0 + {{ 1024 * G }};
+    for (int c = 0; c < {{ 128 * G }}; c += 8) {  // u = x w' ([group][channel][4]), its bf16 copy (each 4 channels twice)
+        const aie::vector<bfloat16, 32> xv = aie::load_v<32>(x + 4 * c);
+        const aie::vector<bfloat16, 8> w8 = aie::load_v<8>(w + c);
+        const auto [a, b] = aie::interleave_zip(w8.template grow<16>(), w8.template grow<16>(), 1);
+        const auto [c0, c1] = aie::interleave_zip(a, a, 1);
+        const aie::accum<accfloat, 32> u0 = aie::mul(xv, aie::concat(c0, c1));
+        aie::store_v(u + 4 * c, u0.template to_vector<float>());
+        const aie::vector<bfloat16, 32> h = u0.template to_vector<bfloat16>();
+        aie::store_v(b0 + 8 * c, aie::concat(h.template extract<16>(0), h.template extract<16>(0)));
+        aie::store_v(b0 + 8 * c + 32, aie::concat(h.template extract<16>(1), h.template extract<16>(1)));
+    }
+    event0();
+    {{ fn }}({{ "u, " if f32 }}b0, b0, b1, b1, b0, b1, coef);
+    event1();
+{% if not f32 %}
+    for (int c = 0; c < {{ 128 * G }}; c += 4)  // (the state's last copy -> u as fp32)
+        aie::store_v(u + 4 * c, aie::accum<accfloat, 16>(aie::load_v<16>({{ "b0" if rounds % 2 == 0 else "b1" }} + 8 * c)).template to_vector<float>());
+{% endif %}
+}
+""")
+
+
+class RotOperator(StreamOperator):
+    """``kmath.rotate`` (one core, ``groups`` groups per call, ``calls`` calls): the input per call [x: G x 128 x 4 bf16
+    ([group][channel][lane]) | w': G x 128 bf16 | the coefficients: G x rounds x 384 B], the output per call u (G x 512
+    fp32), then the two bf16 copies (and padding): u = x w', then the rounds (``f32``: the state in fp32, else bf16)."""
+
+    MAX_TILE_BYTES: ClassVar[int] = 4 * 6144  # (a call's argument: four groups)
+
+    def __init__(self, *, groups: int = 4, calls: int = 2, rounds: int = 8, f32: bool = True):
+        self.fn, self.rounds, self.groups, self.f32 = kmath.rotate(rounds, groups=groups, f32=f32), rounds, groups, f32
+        n = groups * (256 + 64 + 96 * rounds)
+        self.group_ints = max(-(-n // 32) * 32, groups * 1536)  # (the output: u and the two copies)
+        super().__init__(size=calls * self.group_ints, num_columns=1, tile_size=None, dtypes_in=(np.int32,),
+                         dtypes_out=(np.int32,))
+        self.tile = self.group_ints  # (a call per group set)
+
+    @property
+    def kernel_name(self) -> str:
+        return "kmrot_" + self.fn.name.removeprefix(kmath.KM + "_")
+
+    def get_kernel_src(self) -> str:
+        return _ROT.render(fn=self.fn, name=self.kernel_name, G=self.groups, f32=self.f32, rounds=self.rounds)
