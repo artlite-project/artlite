@@ -73,19 +73,23 @@ __attribute__((noinline)) void {{ p }}_u0(const uint8_t *__restrict x, const uin
 }
 {% endif %}
 
-// one round: the pairs' rows of ui in a row -> their outputs at the destinations dt[2 i] in uo (coefficients dt[2 i + 1])
+// one round: the pairs' rows of ui in a row -> their outputs at the destinations dt[i] in uo (coefficients dt[64 + i]: T_s,
+// T_p as one word); a pair's two rows through the two load units (their banks' qualifiers)
 __attribute__((noinline)) void {{ p }}_round(const float *__restrict ui, float *__restrict uo, const int32_t *__restrict dt)
 {
+    const float __aie_dm_resource_a *__restrict pa = (const float __aie_dm_resource_a *)ui;
+    const float __aie_dm_resource_b *__restrict pb = (const float __aie_dm_resource_b *)(ui + {{ TOK }});
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int i = 0; i < 64; i++) {
-        const aie::vector<float, {{ TOK }}> a = aie::load_v<{{ TOK }}>(ui), b = aie::load_v<{{ TOK }}>(ui + {{ TOK }});
-        ui += {{ 2 * TOK }};
+        const aie::vector<float, {{ TOK }}> a = aie::load_v<{{ TOK }}>(pa), b = aie::load_v<{{ TOK }}>(pb);
+        pa += {{ 2 * TOK }};
+        pb += {{ 2 * TOK }};
         const aie::vector<bfloat16, {{ TOK }}> ah = aie::accum<accfloat, {{ TOK }}>(a).template to_vector<bfloat16>();
         const aie::vector<bfloat16, {{ TOK }}> bh = aie::accum<accfloat, {{ TOK }}>(b).template to_vector<bfloat16>();
         const int dd = dt[0];
-        const bfloat16 *__restrict t = (const bfloat16 *)(dt + 64);
-        const bfloat16 ta = t[0], tb = t[1];
+        const unsigned tt = (unsigned)dt[64];
         dt += 1;
+        const bfloat16 ta = std::bit_cast<bfloat16>((uint16_t)(tt & 0xFFFF)), tb = std::bit_cast<bfloat16>((uint16_t)(tt >> 16));
         const int da = dd & 0xFFFF, db = (unsigned)dd >> 16;
         aie::store_v(uo + da, aie::mac(aie::accum<accfloat, {{ TOK }}>(a), aie::broadcast<bfloat16, {{ TOK }}>(ta), bh)
                                   .template to_vector<float>());

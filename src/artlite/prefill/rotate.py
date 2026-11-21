@@ -16,8 +16,10 @@ token groups contiguous (four shim dimensions: [group][token group][run]): colum
 4 t (c + 1) in t rounds of its 4 cores (core r: item 4 t c + 4 i + r - 2 in round i; fewer than 32 items a group: a
 round's 32 items span 32 / items groups), so a column's 4 cores share the round's group: its memtile broadcasts the
 group's object to them (once per run of rounds of the group) and splits the column's 4 items; their outputs join for
-the shim. Runtime sequence: (X, RO, OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's copies
-for several projections: a run per copy (the runs of one design share its configuration)."""
+the shim. Where every core works on one group at a time (32 items a group or more), one shim broadcasts the objects to
+all 32 cores instead (the columns' reads of them: 12% of the pass's bytes at 1024 tokens). Runtime sequence: (X, RO,
+OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's ``copies`` for several projections (q, k, v;
+gate, up): x read once, each item rotated per copy (RO [copy][group][OBJ], OUT [copy][the panels])."""
 
 import numpy as np
 from aie.helpers.taplib import TensorAccessPattern
@@ -51,12 +53,13 @@ class PrefillRotOperator(ArtcOperator):
     STACK = 1024
     p = kernel_prefix("prot")
 
-    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False):
+    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1):
         G = K // GROUP
         self.tok = row_floats(gu)
         assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
         assert rounds % 2 == 0 and 512 * rounds + 4 * GROUP == OBJ, rounds
-        self.T, self.K, self.rounds, self.gu = T, K, rounds, gu
+        assert copies == 1 or (not gu and T // self.tok <= COLS * ROWS), "copies: a round per group"
+        self.T, self.K, self.rounds, self.gu, self.copies = T, K, rounds, gu, copies
         super().__init__()
 
     @property
@@ -75,10 +78,11 @@ class PrefillRotOperator(ArtcOperator):
     def get_arg_spec(self) -> list[ArgSpec]:
         n = self.T * self.K * 9 // 16  # (bf16 elements of the panels)
         return [ArgSpec("in", (self.T * self.K // 64 * self.unit,), bfloat16),
-                ArgSpec("in", (self.K // GROUP * OBJ // 2,), bfloat16), ArgSpec("out", (n,), bfloat16)]
+                ArgSpec("in", (self.copies * self.K // GROUP * OBJ // 2,), bfloat16),
+                ArgSpec("out", (self.copies * n,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
-        T, K, p, tok, gu = self.T, self.K, self.p, self.tok, self.gu
+        T, K, p, tok, gu, C = self.T, self.K, self.p, self.tok, self.gu, self.copies
         G, nb = K // GROUP, T // tok  # (groups, items per group)
         u8, f32 = np.dtype[np.uint8], np.dtype[np.float32]
         ntg = tok // 8  # (token groups of an item)
@@ -91,11 +95,12 @@ class PrefillRotOperator(ArtcOperator):
         k_rot = Kernel(f"{p}_rot", "kernel.o", [x_ty, r_ty, o_ty, u_ty, u_ty, *([y_ty, np.int32] if gu else [])])
         n = self.n_rounds
         x3 = [ObjectFifo(xc_ty, name=f"pr_x{c}", depth=2) for c in range(COLS)]
-        r3 = [ObjectFifo(r_ty, name=f"pr_r{c}", depth=2) for c in range(COLS)]
+        bc = nb >= COLS * ROWS  # (every core on one group at a time: the objects broadcast)
+        r3 = [ObjectFifo(r_ty, name="pr_r" if bc else f"pr_r{c}", depth=2) for c in range(1 if bc else COLS)]
         o3 = [ObjectFifo(oc_ty, name=f"pr_o{c}", depth=2) for c in range(COLS)]
         xs = [x3[c].cons().split([x_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[x_ty] * ROWS,
                                  names=[f"pr_x{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
-        rs = [r3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"pr_rb{c}") for c in range(COLS)]
+        rs = r3 * COLS if bc else [r3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"pr_rb{c}") for c in range(COLS)]
         os_ = [o3[c].prod().join([o_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[o_ty] * ROWS,
                                  names=[f"pr_o{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
 
@@ -104,6 +109,15 @@ class PrefillRotOperator(ArtcOperator):
         def core(x_f, r_f, o_f, rot, ua, ub, *y):
             for _ in forever_():
                 for _ in range_(n // t):
+                    if C > 1:  # (t = 1: the item's copies in turn, x held)
+                        x = x_f.acquire(1)
+                        for _ in range(C):
+                            r, o = r_f.acquire(1), o_f.acquire(1)
+                            rot(x, r, o, ua, ub)
+                            o_f.release(1)
+                            r_f.release(1)
+                        x_f.release(1)
+                        continue
                     r = r_f.acquire(1)
                     for _ in range_(t):
                         x, o = x_f.acquire(1), o_f.acquire(1)
@@ -121,38 +135,44 @@ class PrefillRotOperator(ArtcOperator):
         # rotation objects)
         nx, xr, xw = T * K // 64 * self.unit, K // 8 * self.unit, 16 * self.unit
         no, orow, ow = T * K * 9 // 16, K // 8 * 36, 16 * 36
-        nro = G * OBJ // 2
+        nro = C * G * OBJ // 2
 
-        def walk(c: int, size: int, row: int, run: int) -> TensorAccessPattern:
+        def walk(c: int, size: int, row: int, run: int, nc: int = 1) -> TensorAccessPattern:
             """Column c's walk over the rounds of an argument of ``size`` elements in token-group rows of ``row``, a
             group's ``run`` of each (runs of 1024 elements: a shim BD's inner dimension holds at most 1023 words):
-            [group (or round)][the column's token groups][run]."""
+            [group (or round)][the column's token groups][run]; ``nc`` copies: [round][copy, size apart][..][run]."""
             cut = min(run, 1024)
             if nb >= COLS * ROWS:  # (a group's items over t = nb / 32 rounds: the column's 4 t of them)
                 base, dims, steps = 4 * t * ntg * c * row, [G, 4 * t * ntg], [run, row]
             else:  # (a round's items over 32 / nb groups)
                 s = COLS * ROWS // nb
                 base, dims, steps = 4 * c % nb * ntg * row + 4 * c // nb * run, [n, 4 * ntg], [s * run, row]
+            if nc > 1:
+                assert cut == run
+                return TensorAccessPattern((nc * size,), base, [dims[0], nc, dims[1], run], [steps[0], size, steps[1], 1])
             if cut < run:
                 return TensorAccessPattern((size,), base, [*dims, run // cut, cut], [*steps, cut, 1])
             return TensorAccessPattern((size,), base, [1, *dims, run], [0, *steps, 1])
 
         def ro_tap(c: int) -> TensorAccessPattern:
-            if nb >= COLS * ROWS:
-                return TensorAccessPattern((nro,), 0, [1, 1, G, OBJ // 2], [0, 0, OBJ // 2, 1])
+            """The objects [copy][group] of column c's rounds (broadcast: every core's), a round's copies in turn."""
+            go = G * OBJ // 2
+            if bc:
+                return TensorAccessPattern((nro,), 0, [1, G, C, OBJ // 2], [0, OBJ // 2, go, 1])
             s = COLS * ROWS // nb
-            return TensorAccessPattern((nro,), 4 * c // nb * OBJ // 2, [1, 1, n, OBJ // 2], [0, 0, s * OBJ // 2, 1])
+            return TensorAccessPattern((nro,), 4 * c // nb * OBJ // 2, [1, n, C, OBJ // 2], [0, s * OBJ // 2, go, 1])
 
         def seq(X, RO, OUT, xh, rh, oh):
             tg = TaskGroup()
             for c in range(COLS):
                 xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
-                rh[c].fill(RO, ro_tap(c), group=tg)
-                oh[c].drain(OUT, walk(c, no, orow, ow), group=tg, wait=True)
+                if c < len(rh):
+                    rh[c].fill(RO, ro_tap(c), group=tg)
+                oh[c].drain(OUT, walk(c, no, orow, ow, C), group=tg, wait=True)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(nx,), np.dtype[bfloat16]], np.ndarray[(nro,), np.dtype[bfloat16]],
-                           np.ndarray[(no,), np.dtype[bfloat16]],
+                           np.ndarray[(C * no,), np.dtype[bfloat16]],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(x3)],
                            [f.prod(tile=Tile(c, 0)) for c, f in enumerate(r3)],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])

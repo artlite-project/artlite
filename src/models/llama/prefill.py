@@ -27,7 +27,8 @@ groups); the padding tokens after the valid ones write cache records that later 
 
 A PARO checkpoint (``llama.image``'s regions; the decode's "Rotated inputs"): the norms' weights are ones (each is
 folded into its consumers' rotations) and every projection's input goes through ``prefill.rotate`` first: the norm's
-panels into XQ, XK, XV (q, k, v; after o: gate into XQ, up into XK), the attention's A into AR; q, k and v write G in one
+panels into XR, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once, the attention's A
+into AR; q, k and v write G in one
 layout (``prefill.gemm.joined_layout``), gate and up GU as bf16 panels (``plan_gate_up_pair``: one design), which down's
 rotation reads, the activation on the way (``prefill.rotate``'s ``gu``), into HR. The rotation objects
 (``paro.TanForm.pair_objects``) are in RO, compiled at bind.
@@ -84,7 +85,7 @@ SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
 MAX_T = SIZES[-1]
 PHASES = ("qkv", "o", "gate_up", "down")
 PARO_REGIONS = ("q", "k", "v", "o", "gate", "up", "down")  # (a PARO checkpoint's image regions)
-PARO_ROT = {"q": "XQ", "k": "XK", "v": "XV", "gate": "XQ", "up": "XK"}  # (their rotated copies' buffers)
+PARO_COPY = {"q": 0, "k": 1, "v": 2, "gate": 0, "up": 1}  # (each norm-fed projection's rotated copy in XR)
 NORMS = ("o", "d")  # a layer's residual adds (after o, after down)
 DOWN_CHUNKS = 4  # K chunks per down part (1B / 3B: 2 parts of 4; each part's A strip stays in the memtile, each sums 64
 # k-tiles in its bf16 C tile; the norm adds the parts in fp32)
@@ -114,7 +115,7 @@ class _Ops:
     """The operators of a sub-chunk size: the GEMM plans, the norms, the attention preps (one per qkv layout)."""
 
     plans: dict[tuple[int, str], PG.PhasePlan]
-    rots: dict[int | str, PrefillRotOperator]  # (PARO: the rotations of a sub-chunk per K; "gu": down's)
+    rots: dict[str, PrefillRotOperator]  # (PARO: the rotations of a sub-chunk: "qkv", "gate_up", "o", "down")
     qt: int  # (qkv's tokens per item)
     pitch: int  # (the qkv layouts' column pitch)
     d_pitch: int  # (the output projections')
@@ -193,25 +194,26 @@ class LlamaPrefill(ChunkPrefill):
         cfg, img, H = self.cfg, self.img, self.H
         qt = SUB if t == BIG else t
         dp = PG.d_pitch(img, t)
-        rots: dict[int | str, PrefillRotOperator] = {}
+        rots: dict[str, PrefillRotOperator] = {}
         if self.paro:
             pitch = max(PG.joined_layout([img.region(L, n) for n in "qkv"], qt).pitch for L in self.layers)
             plans = {}
             for L in self.layers:
                 regs = [img.region(L, n) for n in "qkv"]
                 lay = PG.joined_layout(regs, qt, pitch)
-                gs = [dataclasses.replace(g, a=PARO_ROT[r.name])
+                gs = [dataclasses.replace(g, a=f"XR{PARO_COPY[r.name]}")
                       for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay).gemms]
                 plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
                 gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms)
-                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XQ", "XK"))]
+                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR0", "XR1"))]
                 plans[(L, "gate_up")] = gu
                 for name in ("o", "down"):
                     plans[(L, name)] = plan_gemm(img, img.region(L, name), t, ops=gemms, pitch=dp, k_parts=self._k_parts)
-            for K in sorted({img.region(L, n).K_in for L in self.layers for n in PARO_REGIONS if n != "down"}):
-                rots[K] = gemms.setdefault(("rot", t, K), PrefillRotOperator(T=t, K=K))
-            ffn = cfg.intermediate_size  # (down's: of GU, the activation on the way)
-            rots["gu"] = gemms.setdefault(("rot", t, "gu"), PrefillRotOperator(T=t, K=ffn, gu=True))
+            # (a norm's copies: q, k, v and gate, up; o's; down's: of GU, the activation on the way)
+            (ko,) = {img.region(L, "o").K_in for L in self.layers}
+            for name, kw in (("qkv", {"K": self.kh, "copies": 3}), ("gate_up", {"K": self.kh, "copies": 2}),
+                             ("o", {"K": ko}), ("down", {"K": cfg.intermediate_size, "gu": True})):
+                rots[name] = gemms.setdefault(("rot", t, *kw.items()), PrefillRotOperator(T=t, **kw))
         else:
             pitch = PG.phase_pitch(img, "qkv", qt)
             plans = {(L, name): plan_gemm(img, img.region(L, name), qt if name == "qkv" else t, ops=gemms,
@@ -280,8 +282,8 @@ class LlamaPrefill(ChunkPrefill):
         if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
             self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         if self.paro:  # (GU: gate and up's rows; the rotated inputs as the panels they replace)
-            self.rb |= {"GU": 2 * 2 * cfg.intermediate_size, "XQ": self.rb["PXN"], "XK": self.rb["PXN"],
-                        "XV": self.rb["PXN"], "AR": self.rb["A"], "HR": self.rb["HP"]}
+            self.rb |= {"GU": 2 * 2 * cfg.intermediate_size, "XR": 3 * self.rb["PXN"], "AR": self.rb["A"],
+                        "HR": self.rb["HP"]}
             self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO)
             k = 0
             for L in self.layers:
@@ -336,19 +338,24 @@ class LlamaPrefill(ChunkPrefill):
         rl: list[tuple] = [(o.n_in, tok("PX", j, o.n_in, i=0), self._np("in"), tok("PXN", j, o.n_in, i=2))
                            for j in range(S)]
 
-        def rot(L: int, name: str, src: str, dst: str) -> list[tuple]:  # (PARO: a projection's rotated input)
-            op = o.rots["gu" if name == "down" else self.img.region(L, name).K_in]
-            ro = self.ro_off[(L, name)]
+        def rot(L: int, name: str, src: str, dst: str) -> list[tuple]:  # (PARO: a projection's rotated input(s))
+            op = o.rots[name]
+            ro = self.ro_off[(L, {"qkv": "q", "gate_up": "gate"}.get(name, name))]  # (copies: their objects in turn)
             return [(op, tok(src, j, op, i=0), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", tok(dst, j, op, i=2))
                     for j in range(S)]
 
+        def a_in(g: PG.Gemm, tk: int) -> str:  # (a GEMM's A from token tk on: the norm's panels, or a copy in XR)
+            if not g.a.startswith("XR"):
+                return sl(g.a or "PXN", tk * rb[g.a or "PXN"], g.op, i=0)
+            return sl("XR", (tk // t * 3 + int(g.a[2:])) * t * rb["PXN"] + tk % t * rb["PXN"], g.op, i=0)
+
         if self.paro:
-            rl += [x for n in "qkv" for x in rot(self.layers[0], n, "PXN", PARO_ROT[n])]
+            rl += rot(self.layers[0], "qkv", "PXN", "XR")
         starts = []
         for li, L in enumerate(self.layers):
             starts.append(len(rl))
             qt = o.qt
-            rl += [(g.op, sl(g.a or "PXN", j * qt * rb["PXN"], g.op, i=0), self._w(g), sl("G", j * qt * rg, g.op, i=2))
+            rl += [(g.op, a_in(g, j * qt), self._w(g), sl("G", j * qt * rg, g.op, i=2))
                    for g in o.plans[(L, "qkv")].gemms for j in range(S * t // qt)]
             pt = self._pt(S * t)  # (the prep's blocks of the chunk)
             prep = o.preps[(o.plans[(L, "qkv")].layout.key, pt)]
@@ -372,9 +379,9 @@ class LlamaPrefill(ChunkPrefill):
                            self._np((L, "o")), tok("PX", 0, n, i=3, extra=a * rb["PX"]),
                            tok("PXN", 0, n, i=4, extra=a * rb["PXN"])))
             if self.paro:
-                rl += rot(L, "gate", "PXN", "XQ") + rot(L, "up", "PXN", "XK")
+                rl += rot(L, "gate_up", "PXN", "XR")
             gu = o.plans[(L, "gate_up")]
-            rl += [(g.op, tok(g.a or "PXN", j, g.op, i=0), self._w(g), tok(g.c or "HP", j, g.op, i=2, extra=2 * g.c_off))
+            rl += [(g.op, a_in(g, j * t), self._w(g), tok(g.c or "HP", j, g.op, i=2, extra=2 * g.c_off))
                    for g in gu.gemms for j in range(S)]
             if gu.act is not None:  # (a split block: its GEMMs' rows into the down's panels)
                 rl += [(gu.act, tok("GU", j, gu.act, i=0), tok("HP", j, gu.act, i=1)) for j in range(S)]
@@ -388,7 +395,7 @@ class LlamaPrefill(ChunkPrefill):
                 rl.append((n, tok("PX", 0, n, i=0, extra=a * rb["PX"]), sl("F", base, n, i=1), self._np((L, "d")),
                            tok("PX", 0, n, i=3, extra=a * rb["PX"]), tok("PXN", 0, n, i=4, extra=a * rb["PXN"])))
             if self.paro and li + 1 < len(self.layers):
-                rl += [x for n in "qkv" for x in rot(self.layers[li + 1], n, "PXN", PARO_ROT[n])]
+                rl += rot(self.layers[li + 1], "qkv", "PXN", "XR")
         self._starts[S * t] = [*starts, len(rl)]
         return rl
 

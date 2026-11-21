@@ -924,12 +924,16 @@
 {"section": "257c64f8a16f", "label": "PrefillNormOperator (artlite/prefill/norm/prefill_norm.py)", "detail": "T=64, add=False, E=5120, eps=1e-06, out_pitch=10240, out_col=0"}
 {"section": "5e4d4673e35e", "label": "PrefillNormOperator (artlite/prefill/norm/prefill_norm.py)", "detail": "T=64, add=False, E=5120, eps=1e-06, pre=True, out_pitch=10240, out_col=5120"}
 {"section": "a4003c6985cf", "label": "PrefillNormOperator (artlite/prefill/norm/prefill_norm.py)", "detail": "T=64, add=False, E=5120, eps=1e-06, raw=True, out_pitch=25600, out_col=0"}
-{"section": "09f8f3d281c3", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024"}
+{"section": "aa1cad27099a", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024, copies=2"}
+{"section": "90d72d110ef4", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024, copies=3"}
 {"section": "c07661d60d4d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2048"}
 {"section": "e7d0b5e980d0", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=3072, gu=True"}
-{"section": "7b2b3def9faf", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024"}
+{"section": "14cf71eed041", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024, copies=2"}
+{"section": "2198eede3c56", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024, copies=3"}
 {"section": "f94bc29fc053", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048"}
 {"section": "36d58b8e6116", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3072, gu=True"}
+{"section": "3adeefd06f95", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=1024, copies=2"}
+{"section": "bd1f13b97167", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=1024, copies=3"}
 {"section": "813938ace329", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048"}
 {"section": "6becf8da681d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3072, gu=True"}
 {"section": "691c1721af6c", "label": "PrepOperator (artlite/prefill/attn/prep.py)", "detail": "T=1024, kv_bytes=1187840, cs_positions=8192, kv_pad=1187840, norm=False, eps=1e-05"}
@@ -3171,13 +3175,13 @@
 {"fn": "pn_b", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 247, "upper": true, "bytes": 480, "stack": 64, "calls": [["5271d2ad8011", "pn_inv", 1]], "loops": [{"at": "pn_b+17", "parent": -1, "sched": "post-RA", "ii": 25, "ns": 2, "bound": 8, "iters": 3, "spills": 0, "bytes": 128}]}
 {"fn": "pn_inv", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 106, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": []}
 {"fn": "pn_w", "in": "5271d2ad8011", "apps": ["swift-1.5-APEX"], "cycles": 16, "upper": false, "bytes": 80, "stack": 0, "calls": [], "loops": []}
-{"fn": "prot_out", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_rot", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 7237, "upper": false, "bytes": 272, "stack": 64, "calls": [["c07661d60d4d", "prot_out", 1], ["c07661d60d4d", "prot_round", 8], ["c07661d60d4d", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_round", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 658, "upper": false, "bytes": 368, "stack": 0, "calls": [], "loops": [{"at": "prot_round+5", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 3, "bound": 7, "iters": 62, "spills": 0, "bytes": 112}]}
-{"fn": "prot_u0", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+19", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
+{"fn": "prot_out", "in": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["aa1cad27099a", "prot_out", 1], ["aa1cad27099a", "prot_round", 8], ["aa1cad27099a", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "cycles": 593, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 6, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+19", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
 {"fn": "prot_out", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_rot", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 7669, "upper": false, "bytes": 272, "stack": 64, "calls": [["e7d0b5e980d0", "prot_out", 1], ["e7d0b5e980d0", "prot_round", 8], ["e7d0b5e980d0", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_round", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 592, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+5", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_rot", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 7677, "upper": false, "bytes": 272, "stack": 64, "calls": [["e7d0b5e980d0", "prot_out", 1], ["e7d0b5e980d0", "prot_round", 8], ["e7d0b5e980d0", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "prot_u0", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 2379, "upper": false, "bytes": 1504, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 60, "spills": 0, "bytes": 96}, {"at": "prot_u0+10", "parent": -1, "sched": "none", "ii": 64, "ns": 1, "bound": 27, "iters": 16, "spills": 0, "bytes": 368}]}
 {"fn": "pap_k", "in": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "cycles": 1405, "upper": false, "bytes": 928, "stack": 64, "calls": [["691c1721af6c", "pap_rope", 8], ["691c1721af6c", "pap_scatter", 8]], "loops": [{"at": "kernel_lib.h:599", "parent": -1, "sched": "pre-RA", "ii": 5, "ns": 3, "bound": 4, "iters": 14, "spills": 0, "bytes": 80}]}
 {"fn": "pap_q0", "in": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "cycles": 2134, "upper": false, "bytes": 16, "stack": 0, "calls": [["691c1721af6c", "pap_qh", 1]], "loops": []}
@@ -6013,34 +6017,50 @@
 {"core": 2, "design": "llama_prefill", "entry": "8bcb7183ac26", "apps": ["qwen3-embedding-4B-Q4_K_M"], "bytes": 4736}
 {"core": 2, "design": "llama_prefill", "entry": "208b3e15f74e", "apps": ["llama-3B-Q4_K_M"], "bytes": 4000}
 {"core": 2, "design": "llama_prefill", "entry": "a39d5ea6c629", "apps": ["llama-8B-Q4_K_S"], "bytes": 4704}
-{"core": 2, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 3, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 4, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 5, "design": "llama_prefill", "entry": "09f8f3d281c3", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 2, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 3, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 4, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 5, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 2, "design": "llama_prefill", "entry": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 3, "design": "llama_prefill", "entry": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 4, "design": "llama_prefill", "entry": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 5, "design": "llama_prefill", "entry": "aa1cad27099a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 2, "design": "llama_prefill", "entry": "90d72d110ef4", "apps": ["qwen3-0.6B-PARO"], "bytes": 2928}
+{"core": 3, "design": "llama_prefill", "entry": "90d72d110ef4", "apps": ["qwen3-0.6B-PARO"], "bytes": 2928}
+{"core": 4, "design": "llama_prefill", "entry": "90d72d110ef4", "apps": ["qwen3-0.6B-PARO"], "bytes": 2928}
+{"core": 5, "design": "llama_prefill", "entry": "90d72d110ef4", "apps": ["qwen3-0.6B-PARO"], "bytes": 2928}
+{"core": 2, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 3, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 4, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 5, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 2, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 3, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 4, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 5, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 2, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 3, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 4, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 5, "design": "llama_prefill", "entry": "7b2b3def9faf", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 2, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 3, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 4, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
-{"core": 5, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2816}
+{"core": 2, "design": "llama_prefill", "entry": "14cf71eed041", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 3, "design": "llama_prefill", "entry": "14cf71eed041", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 4, "design": "llama_prefill", "entry": "14cf71eed041", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 5, "design": "llama_prefill", "entry": "14cf71eed041", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 2, "design": "llama_prefill", "entry": "2198eede3c56", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 3, "design": "llama_prefill", "entry": "2198eede3c56", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 4, "design": "llama_prefill", "entry": "2198eede3c56", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 5, "design": "llama_prefill", "entry": "2198eede3c56", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 2, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 3, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 4, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
+{"core": 5, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
 {"core": 2, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 3, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 4, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 5, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 2, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 3, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 4, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
-{"core": 5, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2832}
+{"core": 2, "design": "llama_prefill", "entry": "3adeefd06f95", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 3, "design": "llama_prefill", "entry": "3adeefd06f95", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 4, "design": "llama_prefill", "entry": "3adeefd06f95", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 5, "design": "llama_prefill", "entry": "3adeefd06f95", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 2, "design": "llama_prefill", "entry": "bd1f13b97167", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 3, "design": "llama_prefill", "entry": "bd1f13b97167", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 4, "design": "llama_prefill", "entry": "bd1f13b97167", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 5, "design": "llama_prefill", "entry": "bd1f13b97167", "apps": ["qwen3-0.6B-PARO"], "bytes": 2912}
+{"core": 2, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 3, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 4, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
+{"core": 5, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 2, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 3, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
 {"core": 4, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
