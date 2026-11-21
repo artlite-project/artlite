@@ -40,9 +40,9 @@ last, whose residual goes to the LM head as it is).
 
 import numpy as np
 
-from artlite.decode.design import ROT_GROUP
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
-from artlite.decode.protocol import C_LEN, MAX_K, rot_objects
+from artlite.decode.protocol import C_LEN, MAX_K
+from artlite.decode.rotated import RotatedImage, column_groups
 from artlite.decode.screen import plane, screened
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
@@ -55,7 +55,7 @@ NORMS = {"qkv": "attn_norm", "gate_up": "ffn_norm"}  # a layer's normed phases: 
 TAILS = frozenset({"qkv", "gate_up", "lm"})  # (``tails``: the regions of the hidden's input)
 
 
-class LlamaImage(NormedImage):
+class LlamaImage(RotatedImage, NormedImage):
     """The weight image of a Llama GGUF file (layers: the layers to lay out, default all; vocab: LM rows, default the
     padded vocabulary; tile_bytes: the object size, default chosen from the file's formats; tails: the hidden's regions
     half regions where it is half a chunk short, pairs: their pairs of row tiles, module docstring)."""
@@ -73,7 +73,7 @@ class LlamaImage(NormedImage):
                          tails=TAILS if tails else frozenset())
         assert cfg.num_key_value_heads == COLS, f"one KV head per column: {cfg.num_key_value_heads} KV heads"
         assert H % (COLS * 64) == 0 and I % (COLS * 64) == 0 and self.vocab % COLS == 0
-        self._rot_objs: dict[tuple[int, str], np.ndarray] = {}
+        self._rot_init()
         for L in self.layers:
             if self.paro:
                 self._paro_layer(L)
@@ -97,24 +97,10 @@ class LlamaImage(NormedImage):
         """(w1, None) tensor names of a normed phase: plain inputs (pre-norm residual updates)."""
         return "output_norm.weight" if L < 0 else f"blk.{L}.{NORMS[name]}.weight", None
 
-    def _rot_data(self, L: int, name: str, parts: list[tuple[str, np.ndarray | None, tuple[int, int]]]) -> None:
-        """A data region of rotation objects (module docstring): per column the objects of each part (a tensor, a norm
-        weight folded in or None, the column's K range: (start, per column)) in order, two groups per A object."""
-        objs = [(self.gguf.tensor(t).rot().tan_form(gamma, unit=True).objects(), k0, n) for t, gamma, (k0, n) in parts]
-        g = ROT_GROUP
-        per = [rot_objects(np.concatenate([o[(k0 + n * c) // g:(k0 + n * (c + 1)) // g] for o, k0, n in objs]),
-                           self.tile_bytes) for c in range(COLS)]
-        self._rot_objs[(L, name)] = np.stack(per)
-        self._add_data(L, name, per[0].size)
-
     def data_objects(self, layer: int, name: str) -> np.ndarray:
-        if name in ("rot_in", "rot_o", "o_rot", "rot_down", "down_rot"):
+        if self.rot_region(layer, name):
             return self._rot_objs[(layer, name)]
         return super().data_objects(layer, name)
-
-    def rot_groups(self, layer: int, name: str) -> int:
-        """Rotation objects (A objects) of a rotation data region per column."""
-        return self._rot_objs[(layer, name)].shape[1]
 
     def _paro_layer(self, L: int) -> None:
         """A PARO layer's regions (module docstring)."""
@@ -124,31 +110,31 @@ class LlamaImage(NormedImage):
         k = (np.arange(COLS * hd) if cfg.neox else unpermute_rows(COLS, COLS * hd)).reshape(COLS, hd)
         h8 = H // COLS
         if L == self.layers[0]:
-            self._rot_data(L, "rot_in", self._qkv_rot(L))
+            self.rot_data(L, "rot_in", self._qkv_rot(L))
         self._add(L, "q", [("q", (b + "attn_q.weight",), q)], H)
         self._add(L, "k", [("k", (b + "attn_k.weight",), k)], H)
         self._add(L, "v", [("v", (b + "attn_v.weight",), column_rows(COLS * hd))], H)
-        self._rot_data(L, "rot_o", [(b + "attn_output.weight", None, (0, cfg.q_per_kv * hd))])
+        self.rot_data(L, "rot_o", [(b + "attn_output.weight", None, column_groups(0, cfg.q_per_kv * hd))])
         self._add(L, "o", [("o", (b + "attn_output.weight",), column_rows(H))], nh * hd)
         g = self._vec(f"{b}ffn_norm.weight")
-        self._rot_data(L, "o_rot", [(b + "ffn_gate.weight", g, (0, h8)), (b + "ffn_up.weight", g, (0, h8))])
+        self.rot_data(L, "o_rot", [(b + "ffn_gate.weight", g, column_groups(0, h8)), (b + "ffn_up.weight", g, column_groups(0, h8))])
         self._add(L, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
         self._add(L, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
-        self._rot_data(L, "rot_down", [(b + "ffn_down.weight", None, (0, I // COLS))])
+        self.rot_data(L, "rot_down", [(b + "ffn_down.weight", None, column_groups(0, I // COLS))])
         self._add(L, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
         i = self.layers.index(L)
         if i + 1 < len(self.layers):
-            self._rot_data(L, "down_rot", self._qkv_rot(self.layers[i + 1]))
+            self.rot_data(L, "down_rot", self._qkv_rot(self.layers[i + 1]))
 
     def tensor_name(self, L: int, name: str) -> str:
         """(PARO) The tensor of a layer's region."""
         return f"blk.{L}." + {"q": "attn_q", "k": "attn_k", "v": "attn_v", "o": "attn_output", "gate": "ffn_gate",
                               "up": "ffn_up", "down": "ffn_down"}[name] + ".weight"
 
-    def _qkv_rot(self, L: int) -> list[tuple[str, np.ndarray, tuple[int, int]]]:
+    def _qkv_rot(self, L: int) -> list[tuple[str, np.ndarray, list[np.ndarray]]]:
         """Layer L's q, k, v copies of the residual (their rotations, the input norm's weight folded in)."""
         g, h8 = self._vec(f"blk.{L}.attn_norm.weight"), self.cfg.hidden_size // COLS
-        return [(f"blk.{L}.attn_{n}.weight", g, (0, h8)) for n in "qkv"]
+        return [(f"blk.{L}.attn_{n}.weight", g, column_groups(0, h8)) for n in "qkv"]
 
     def _layer(self, L: int) -> None:
         cfg, b = self.cfg, f"blk.{L}."

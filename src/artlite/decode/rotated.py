@@ -41,6 +41,7 @@ from .protocol import (
     rot_input_fill,
     rot_region_bytes,
 )
+from .protocol import rot_objects as pack_rot_objects
 from .step import StepPlan
 
 
@@ -172,3 +173,45 @@ class RotatedOverlay:
         for ph in to:
             seq.drain("C", c, self.dev.address("ACT", self.inp[ph][0].off + XB + 2 * C_LEN * c), 2 * C_LEN)
             self.x_to(seq, c, ph, e0=h8 * c, n=h8, S=S)
+
+
+def column_groups(k0: int, n: int, g: int = ROT_GROUP) -> list[np.ndarray]:
+    """Per column the rotation groups of a slice of n channels a column from k0 on."""
+    return [np.arange((k0 + n * c) // g, (k0 + n * (c + 1)) // g) for c in range(COLS)]
+
+
+class RotatedImage:
+    """The mixin of a ``image.TileImage`` whose linears take rotated inputs: data regions of rotation objects on the A
+    runs (``rot_data``: per column the objects of each part, two groups per A object, ``protocol.rot_objects``)."""
+
+    def _rot_init(self) -> None:
+        self._rot_objs: dict[tuple[int, str], np.ndarray] = {}
+
+    def rot_data(self, L: int, name: str, parts: list[tuple[str, np.ndarray | None, list[np.ndarray]]]) -> None:
+        """A data region of rotation objects: per column the objects of each part (a tensor, a norm weight folded in or
+        None, per column its groups: -1, a padding group of zeros) in order."""
+        per = []
+        for c in range(COLS):
+            objs = []
+            for t, gamma, groups in parts:
+                o = self._rot_tan(t, gamma)
+                objs += [o[i] if i >= 0 else np.zeros_like(o[0]) for i in groups[c]]
+            per.append(pack_rot_objects(np.stack(objs), self.tile_bytes))
+        self._rot_objs[(L, name)] = np.stack(per)
+        self._add_data(L, name, per[0].size)
+
+    def _rot_tan(self, tensor: str, gamma: np.ndarray | None) -> np.ndarray:
+        """(G, bytes) the groups' rotation objects of a tensor's tan form (``paro.TanForm.objects``), cached."""
+        cache = self.__dict__.setdefault("_rot_tans", {})
+        key = (tensor, None if gamma is None else gamma.tobytes())
+        if key not in cache:
+            cache[key] = self.gguf.tensor(tensor).rot().tan_form(gamma, unit=True).objects()
+        return cache[key]
+
+    def rot_region(self, layer: int, name: str) -> bool:
+        """Whether (layer, name) is a data region of rotation objects."""
+        return (layer, name) in self._rot_objs
+
+    def rot_groups(self, layer: int, name: str) -> int:
+        """Rotation objects (A objects) of a rotation data region per column."""
+        return self._rot_objs[(layer, name)].shape[1]

@@ -200,7 +200,7 @@ class LlamaOverlay(RotatedOverlay, AttentionOverlay):
 
     def rot_objects(self, L: int, name: str) -> int:
         r = ROT_DATA.get(name)
-        return self.image.rot_groups(L, r) if r is not None and (L, r) in self.image._index else 0
+        return self.image.rot_groups(L, r) if r is not None and self.image.rot_region(L, r) else 0
 
     def rot_slice(self, name: str) -> tuple[int, int]:
         return (self.nh * self.hd, 1) if name == "rot_o" else (self.cfg.intermediate_size // COLS, 2)
