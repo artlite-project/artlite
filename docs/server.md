@@ -209,9 +209,10 @@ codex -m qwen3.6-35b-a3b -c model_provider=artlite \
 
 Codex needs a model name it does not know (`-m`; a server started with `-m` answers to any name): for its own models
 it sends a JavaScript tool of its own instead of functions, which the server refuses. opencode takes the server as a
-provider in
-`~/.config/opencode/opencode.json`, without a timeout (its default ends a request after 5 minutes, and a turn that
-thinks can take longer):
+provider in `~/.config/opencode/opencode.json`, without a timeout (its default ends a request after 5 minutes, and a
+turn that thinks can take longer), and with a title model that does not think: opencode asks its `small_model` for
+each session's title before the first turn, and a thinking model spends 0.5-2K tokens on a title of 50 characters
+(Qwen3.5-9B: 235 s of a 249 s question):
 
 ```json
 {
@@ -223,26 +224,36 @@ thinks can take longer):
       "options": {"baseURL": "http://127.0.0.1:8080/v1", "timeout": false},
       "models": {
         "qwen3.6-35b-a3b": {"name": "Qwen3.6 35B-A3B", "tool_call": true, "reasoning": true,
-                            "limit": {"context": 131072, "output": 32768}}
+                            "limit": {"context": 131072, "output": 32768}},
+        "title": {"id": "qwen3.6-35b-a3b", "name": "Titles", "tool_call": false, "reasoning": false,
+                  "options": {"chat_template_kwargs": {"enable_thinking": false}}}
       }
     }
   },
   "model": "artlite/qwen3.6-35b-a3b",
-  "small_model": "artlite/qwen3.6-35b-a3b"
+  "small_model": "artlite/title"
 }
 ```
+
+A model's `options` go into its requests as they are: `"reasoningEffort": "low"` sends `reasoning_effort`, and
+`"reasoning_budget_tokens": 4096` a thought's budget.
 
 - Messages API: `system`, the blocks `text`, `image` (base64), `thinking`, `tool_use` and `tool_result`, `tools`,
   `tool_choice`, tools' `strict`, `output_config.format` ([Structured output](#structured-output)), `stop_sequences`,
   and Anthropic's event stream. `thinking` turns the model's thought on (`enabled`,
   `adaptive`) or off (`disabled`; without it, `-rea` decides), `enabled`'s `budget_tokens` (10000 where it names none,
-  as llama-server's) is the thought's [budget](#api), `output_config.effort` the template's `reasoning_effort`, and a
-  conversation that ends with an assistant's message continues it (its prefill). A prompt longer than the context
+  as llama-server's) is the thought's [budget](#api), `output_config.effort` the template's `reasoning_effort` or the
+  budget of its level ([API](#api)), and a conversation that ends with an assistant's message continues it (its
+  prefill). Claude Code sends `thinking: {type: adaptive}` and its effort (`--effort low|medium|high|xhigh|max`,
+  `CLAUDE_CODE_EFFORT_LEVEL` or the setting `effortLevel`; `high` by default), and no `budget_tokens` for a model name
+  that is not Claude's (`MAX_THINKING_TOKENS` does not reach the server); `CLAUDE_CODE_DISABLE_THINKING=1` turns the
+  thought off. A prompt longer than the context
   answers "prompt is too long: N tokens > M maximum", which Claude Code acts on.
 - Responses API: `instructions`, the items `message`, `reasoning`, `function_call`, `function_call_output`,
   `custom_tool_call` and `custom_tool_call_output`, function and [custom](#custom-tools) tools (others, such as
   `web_search`, are left out), `tool_choice`, `text.format`, `reasoning.effort` (`none`: no
-  thought; another: a thought, and the template's `reasoning_effort`: [above](#chat-template)), `max_output_tokens`,
+  thought; another: a thought, and the template's `reasoning_effort`, [above](#chat-template), or its level's budget,
+  [API](#api); Codex sends `-c model_reasoning_effort=LEVEL`'s, none by default), `max_output_tokens`,
   and OpenAI's event stream. `previous_response_id` continues one of the last 1024
   responses the server keeps (not those with `store: false`); `GET` and `DELETE /v1/responses/{id}` read and drop
   one. A prompt longer than the context fails with the code `context_length_exceeded`.
