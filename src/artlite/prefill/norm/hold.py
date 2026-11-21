@@ -31,8 +31,9 @@ def hold_design(op: "PrefillNormOperator") -> Module:
     bf = np.dtype[bfloat16]
     chunk_ty = np.ndarray[(HG * HCH,), bf]
     dch_ty = np.ndarray[(nd * HG * HCH,), bf]
-    pan_ty = np.ndarray[(HCH // 8 * 18,), bf]  # (HCH / 8 half panels of 36 B)
-    row_ty = np.ndarray[(E // 8 * 36,), bf]  # (a panel row: 8 tokens)
+    U = op.unit  # (bf16 elements of a panel, or of a bf16 block)
+    pan_ty = np.ndarray[(HCH // 8 * U // 2,), bf]  # (HCH / 8 half panels of 36 B)
+    row_ty = np.ndarray[(E // 8 * U,), bf]  # (a panel row: 8 tokens)
     v_ty, w_ty = np.ndarray[(HG * E,), bf], np.ndarray[(E,), bf]
     st_ty = np.ndarray[(4 * 32 + 64,), np.dtype[np.float32]]
     k_w = Kernel(f"{p}_w", "kernel.o", [chunk_ty, w_ty, np.int32])
@@ -40,7 +41,7 @@ def hold_design(op: "PrefillNormOperator") -> Module:
     k_b = Kernel(f"{p}_b", "kernel.o", [v_ty, w_ty, st_ty, pan_ty, np.int32])
     relay = stream_walk(nd * HG * E, [(n_kc, HCH), (nd, HG * E), (HG, E), (HCH, 1)])
     # (the memtile: a group's deltas double-buffered where they fit next to two panel rows)
-    d_depth = 2 if 2 * nd * HG * E * 2 + 2 * E // 8 * 72 <= 500 * 1024 else 1
+    d_depth = 2 if 2 * nd * HG * E * 2 + 2 * E // 8 * 2 * U <= 500 * 1024 else 1
 
     def deltas(c: int) -> tuple[ObjectFifo, ObjectFifo]:  # (a group's deltas [delta][HG][E] -> chunks)
         l2 = ObjectFifo(np.ndarray[(nd * HG * E,), bf], name=f"pnhd{c}", depth=d_depth)
@@ -49,7 +50,7 @@ def hold_design(op: "PrefillNormOperator") -> Module:
     def panels(c: int) -> tuple[ObjectFifo, ObjectFifo]:  # (two groups' half panels [half][panel][36 B] -> a row)
         rows = ObjectFifo(row_ty, name=f"pnhr{c}", depth=2)
         (halves,) = rows.prod().join([0], tile=Tile(c, 1), obj_types=[pan_ty], depths=[2], names=[f"pnhp{c}"],
-                                     from_stream=[stream_walk(E // 8 * 36, [(2, 18), (E // 8, 36), (18, 1)])])
+                                     from_stream=[stream_walk(E // 8 * U, [(2, U // 2), (E // 8, U), (U // 2, 1)])])
         return halves, rows
 
     xf = [ObjectFifo(chunk_ty, name=f"pnh_x{c}", depth=2) for c in range(cols)]
@@ -90,8 +91,9 @@ def hold_design(op: "PrefillNormOperator") -> Module:
     o_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]
     p_h = [f[1].cons(tile=Tile(c, 0)) for c, f in enumerate(pf)]
     n_ds = (nd - 1) * op.d_stride + n_d
-    rb = E // 8 * 36  # (a panel row's bf16; in runs of 1152)
-    assert rb % 1152 == 0
+    rb = E // 8 * U  # (a panel row's bf16; in runs of 1152, or 1024)
+    run = 1152 if U == 36 else 1024
+    assert rb % run == 0
 
     def seq(x, d, w, xo, xn, xh, dh, oh, ph):
         tg = TaskGroup()
@@ -103,10 +105,10 @@ def hold_design(op: "PrefillNormOperator") -> Module:
                                                         [n_g, 1, HG * COLS, E // COLS], [HG * ed, 0, dp, 1])
                                     for k in range(nd)], tg)
             oh[c].drain(xo, chunks(c), group=tg, wait=True)
-            ph[c].drain(xn, TensorAccessPattern((n * 9 // 16,), n_r * rb * c, [1, n_r, rb // 1152, 1152],
-                                                [0, rb, 1152, 1]), group=tg, wait=True)
+            ph[c].drain(xn, TensorAccessPattern((n // 64 * U,), n_r * rb * c, [1, n_r, rb // run, run],
+                                                [0, rb, run, 1]), group=tg, wait=True)
         tg.finish()
 
     vt = np.ndarray[(n,), bf]
-    rt = Runtime(seq, [vt, np.ndarray[(n_ds,), bf], w_ty, vt, np.ndarray[(n * 9 // 16,), bf], x_h, d_h, o_h, p_h])
+    rt = Runtime(seq, [vt, np.ndarray[(n_ds,), bf], w_ty, vt, np.ndarray[(n // 64 * U,), bf], x_h, d_h, o_h, p_h])
     return Program(NPU2(), rt, workers=workers).resolve_program()

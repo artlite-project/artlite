@@ -166,10 +166,14 @@ class GdnPrepOperator(ArtcOperator):
     K_MASK = QB_ELEMS // 2  # (packed: the fp32 of the mask's second copy, the k core's part of the object)
     pfx = kernel_prefix("gdp")
 
-    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False, tree: bool = False):
+    def __init__(self, *, T: int, cfg: QwenConfig, layout: Layout, pack: bool = False, tree: bool = False,
+                 ab32: bool = False):
+        """ab32: the "ab" block's alpha and beta both fp32 (plane pairs: a PARO checkpoint's folded ``ssm_alpha`` /
+        ``ssm_beta``)."""
         assert T % C == 0 and 4 * T <= 2 * QB_ELEMS and not (pack and tree)
+        assert not (ab32 and ab_f32(layout)), "ab32: one block of both"
         check_bd_iterations(T // 8, "GdnPrep")
-        self.T, self.cfg, self.layout, self.pack, self.tree = T, cfg, layout, pack, tree
+        self.T, self.cfg, self.layout, self.pack, self.tree, self.ab32 = T, cfg, layout, pack, tree, ab32
         self.hc = GdnDims(cfg).hc
         self.vh = self.hc // 2
         assert {"qkv", "z"} <= set(layout.off) and ("ab" in layout.off or {"alpha", "beta"} <= set(layout.off)) \
@@ -184,7 +188,7 @@ class GdnPrepOperator(ArtcOperator):
     def get_kernel_src(self) -> str:
         return _PREP.render(p=self.pfx, g=GDN, gm=MATH, helpers=helpers_source(self.cfg.rms_norm_eps), w=Attr(self.workspace()),
                             D=D, HC=self.hc,
-                            F32A=ab_f32(self.layout),
+                            F32A=ab_f32(self.layout) or self.ab32, F32B=self.ab32,
                             VH=self.vh, T=self.T, PAN=PANEL_BYTES, KP_BYTES=KP_BYTES, eps=repr(self.cfg.rms_norm_eps),
                             rs=bf16_hilo(1 / math.sqrt(D)), PACK=self.pack, TREE=self.tree,
                             SEG=self.pack or self.tree)

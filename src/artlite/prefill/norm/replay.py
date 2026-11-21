@@ -27,7 +27,8 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     n_kc = E // CH
     bf = np.dtype[bfloat16]
     chunk_ty = np.ndarray[(8 * CH,), bf]
-    pan_ty = np.ndarray[(CH // 8 * 36,), bf]
+    U = op.unit
+    pan_ty = np.ndarray[(CH // 8 * U,), bf]
     w_ty = np.ndarray[(E,), bf]
     st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
     k_w = Kernel(f"{p}_wc", "kernel.o", [chunk_ty, w_ty, np.int32])
@@ -120,6 +121,9 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     o_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]
     p_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(pf)]
 
+    # (a group's row in pieces: bf16 blocks' within a shim BD's inner dimension, panels' as ever)
+    ps = next(k for k in (1, 2, 4, 5, 8) if E // 64 % k == 0 and (U == 36 or E // 64 // k * U <= 2046))
+
     def seq(*a):
         if add:
             x, d, w, xo, xn, xh, ph, dh, oh = a
@@ -142,8 +146,9 @@ def replay_design(op: "PrefillNormOperator") -> Module:
                 # x_out chunks [group][kc][8 tokens][CH]
                 oh[c].drain(xo, TensorAccessPattern((n,), 8 * E * c, [n_g, n_kc, 8, CH], [8 * op.cols * E, CH, E, 1]),
                             group=tg, wait=True)
-            ph[c].drain(xn, TensorAccessPattern((T * P * 9 // 16,), (c * (P // 8) + col // 8) * 36,
-                                                [1, n_g, 8, E // 64 * 36], [0, op.cols * (P // 8) * 36, E // 64 * 36, 1]),
+            ph[c].drain(xn, TensorAccessPattern((T * P // 64 * U,), (c * (P // 8) + col // 8) * U,
+                                                [1, n_g, 8 * ps, E // 64 // ps * U],
+                                                [0, op.cols * (P // 8) * U, E // 64 // ps * U, 1]),
                         group=tg, wait=True)
         tg.finish()
 
@@ -151,6 +156,6 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     n_ds = (nd - 1) * op.d_stride + n_d
     types = [vt] + ([np.ndarray[(n_ds,), bf]] if add else []) + [np.ndarray[((2 if pre else 1) * E,), bf]]
     types += [vt] if add else []
-    types.append(np.ndarray[(T * P * 9 // 16,), bf])
+    types.append(np.ndarray[(T * P // 64 * U,), bf])
     rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
     return Program(NPU2(), rt, workers=workers).resolve_program()

@@ -1,6 +1,8 @@
 // A PARO rotation of a prompt's activations (prefill.rotate): per item {{ TOK }} tokens x a group of 128 channels,
 {% if gu %}
 // gate and up as bf16 panels ([token group {{ TOK // 8 }}][channel block 16][gate 64 | up 64]) -> x = bf16(silu(gate) up),
+{% elif xb %}
+// x as bf16 blocks ([token group {{ TOK // 8 }}][channel block 16][8 tokens x 8 channels]) -> x,
 {% else %}
 // the panels in (bfp16ebs8, [token group {{ TOK // 8 }}][channel block 16][72 B]) -> x,
 {% endif %}
@@ -35,6 +37,32 @@ __attribute__((noinline)) void {{ p }}_u0(const bfloat16 *__restrict x, const ui
             const aie::vector<bfloat16, 64> h = aie::mul(aie::load_v<64>(y + 64 * i), aie::load_v<64>(x + 128 * i + 64))
                                                     .template to_vector<bfloat16>();
             const aie::vector<float, 64> a = aie::mul(aie::transpose(h, 8, 8), wt).template to_vector<float>();  // ([channel][token])
+            AIE_LOOP_UNROLL_FULL
+            for (int c = 0; c < 8; c++)
+                aie::store_v(u + 8 * tg + dd[c], a.template extract<8>(c));
+        }
+    }
+}
+{% elif xb %}
+
+// the item's bf16 blocks x [token group {{ TOK // 8 }}][channel block 16] times w (bf16 per channel) -> u: channel c's
+// tokens at row d[c] (offsets in floats)
+__attribute__((noinline)) void {{ p }}_u0(const bfloat16 *__restrict x, const uint16_t *__restrict d, const bfloat16 *__restrict w,
+                                          float *__restrict u)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int kb = 0; kb < 16; kb++) {
+        const aie::vector<bfloat16, 64> wt = aie::transpose(aie::load_v<8>(w + 8 * kb).template grow_replicate<64>(), 8, 8);
+        const uint16_t *__restrict dk = d + 8 * kb;
+        int dd[8];
+        AIE_LOOP_UNROLL_FULL
+        for (int c = 0; c < 8; c++)
+            dd[c] = dk[c];
+        AIE_LOOP_UNROLL_FULL
+        for (int tg = 0; tg < {{ TOK // 8 }}; tg++) {  // (block [tg][kb]: tokens 8 tg .., channels 8 kb ..)
+            const aie::vector<float, 64> a = aie::mul(aie::transpose(aie::load_v<64>(x + 64 * (16 * tg + kb)), 8, 8), wt)
+                                                 .template to_vector<float>();  // ([channel][token])
             AIE_LOOP_UNROLL_FULL
             for (int c = 0; c < 8; c++)
                 aie::store_v(u + 8 * tg + dd[c], a.template extract<8>(c));
@@ -123,12 +151,12 @@ __attribute__((noinline)) void {{ p }}_out(const float *__restrict u, uint8_t *_
 
 extern "C" {
 
-// One item: the input x ({{ "gate / up panels" if gu else "panels" }}), the group's rotation object ro -> the panels of x' at o
+// One item: the input x ({{ "gate / up panels" if gu else "bf16 blocks" if xb else "panels" }}), the group's rotation object ro -> the panels of x' at o
 void {{ p }}_rot(const uint8_t *__restrict x, const uint8_t *__restrict ro, uint8_t *__restrict o, float *__restrict ua,
                  float *__restrict ub{{ ", bfloat16 *__restrict y, int32_t zero" if gu else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    {{ p }}_u0({{ "(const bfloat16 *)x" if gu else "x" }}, (const uint16_t *)(ro + {{ 512 * R }}), (const bfloat16 *)(ro + {{ 512 * R + 256 }}),
+    {{ p }}_u0({{ "(const bfloat16 *)x" if gu or xb else "x" }}, (const uint16_t *)(ro + {{ 512 * R }}), (const bfloat16 *)(ro + {{ 512 * R + 256 }}),
                ua{{ ", y, zero" if gu else "" }});
     AIE_LOOP_NO_UNROLL
     for (int r = 0; r < {{ R }}; r += 2) {

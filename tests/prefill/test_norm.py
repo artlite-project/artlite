@@ -166,6 +166,41 @@ def test_prefill_norm_deltas(T: int, E: int, d_pitch: int, cols: int, rows: int,
     assert ((xn - ref).norm() / ref.norm()).item() < 1e-2
 
 
+# (T, E, d_pitch, cols, deltas): the plain design (E 2048: the output rows in two pieces), replay (two deltas too), hold
+BF16 = [(256, 1024, 0, 8, 1), (64, 2048, 0, 8, 0), (256, 4096, 528, 8, 1), (256, 4096, 528, 8, 2), (256, 5120, 660, 8, 4)]
+
+
+@pytest.mark.parametrize(("T", "E", "d_pitch", "cols", "n"), BF16,
+                         ids=[f"T{a}-E{b}-dp{c}-c{d}-n{e}" for a, b, c, d, e in BF16])
+def test_prefill_norm_bf16(T: int, E: int, d_pitch: int, cols: int, n: int) -> None:
+    """xn as bf16 blocks (``bf16``: a PARO checkpoint's rotations' input, [T / 8][E / 8][8 tokens x 8 columns]) in
+    each design: within bf16's rounding of x / rms(x) w, x the bf16 sum."""
+    g = torch.Generator().manual_seed(T + E + n)
+    x = (torch.randn(T, E, generator=g) * 2).bfloat16()
+    w = (torch.rand(E, generator=g) + 0.5).bfloat16()
+    dp = d_pitch or E // 8
+    kw = {"deltas": n, "d_stride": T * 8 * dp} if n > 1 else {}
+    op = PrefillNormOperator(T=T, E=E, d_pitch=d_pitch if n else 0, cols=cols, add=n > 0, bf16=True, **kw).compile()
+    dev = op.device
+    xb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev)
+    xnb = artlite.empty((T * E,), dtype=bfloat16, device=dev)
+    xs = x.float()
+    args = [xb]
+    if n:
+        d = torch.randn(n, T, E, generator=g).bfloat16()
+        dpad = torch.full((n, T, 8, dp), 1e30).bfloat16()  # (padding: garbage)
+        dpad[:, :, :, :E // 8] = d.view(n, T, 8, E // 8)
+        args.append(artlite.from_numpy(to_numpy(dpad.flatten()), dev))
+        xs = (x.float() + d.float().sum(0)).bfloat16().float()
+    args += [artlite.from_numpy(to_numpy(w), dev), *([xb] if n else []), xnb]
+    op.dispatch(*args)
+    xnb.sync_from_device()
+    ref = xs.double() * torch.rsqrt((xs.double() ** 2).mean(-1, keepdim=True) + 1e-5) * w.double()
+    xn = to_torch(xnb.numpy()).double().view(T // 8, E // 8, 8, 8).transpose(1, 2).reshape(T, E)
+    err = ((xn - ref).norm() / ref.norm()).item()
+    assert err < 3e-3, err  # (bf16's rounding: ~1.6e-3)
+
+
 def _residual_reference(x: torch.Tensor, d: torch.Tensor | None, w_post: torch.Tensor | None, w1: torch.Tensor | None,
                         scale: float, eps: float, mode: str) -> tuple[torch.Tensor, torch.Tensor]:
     """(x', xn values before the bfp16 rounding) in fp64 of fp32 x (T, E), d (T, E) the (summed) delta."""

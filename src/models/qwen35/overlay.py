@@ -393,7 +393,11 @@ class QwenOverlay(ParoSteps, ModelOverlay):
             MR.check_route(cdo.values(os.path.dirname(self.op._program.insts_path)), range(COLS))
         norm = self.dev.view("NORM")
         for (L, name), off in self.norm_off.items():
-            w = self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight").astype(bfloat16)
+            if self.paro and L >= 0:  # (the layers' norm weights are in their consumers' rotations: the prefill's norms
+                # read ones)
+                w = np.ones(self.H, bfloat16)
+            else:
+                w = self._f32("output_norm.weight" if L < 0 else f"blk.{L}.{name}.weight").astype(bfloat16)
             norm[off:off + 2 * self.H] = w.view(np.uint8)
         self.dev.flush("NORM")
         for L in self.fatt:

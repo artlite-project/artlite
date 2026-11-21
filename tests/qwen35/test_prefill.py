@@ -91,3 +91,55 @@ def test_prefill_slice(size: str, La: int) -> None:
     else:
         assert np.max(err) < 8e-2 and np.mean(err) < np.mean(dec) + 8e-3
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3
+
+
+def test_prefill_paro() -> None:
+    """Qwen3.5-0.8B-PARO (a checkpoint directory: each projection on its rotated copy of its input, ``prefill.rotate``)
+    up to its first full-attention layer: a chunk of two sub-chunks (the second part padding), then a chunk of 128 (the
+    last tokens padding), from the embeddings, against llama.cpp on its pseudo-quantized GGUF (``goldens.paro``); then
+    decode steps continuing from the state the prefill left, against llama.cpp and against the overlay running every
+    position as a decode step. (Measured: prefill mean 1.7%, max 7.1%: bfp16 GEMM inputs against the decode's bf16
+    ones, whose error is 0.5%; the decode after the prefill as close as the decode alone.)"""
+    from artlite.hf_model import HfModel
+    from artlite.model_config import checkpoint
+    from models.qwen35.overlay import QwenOverlay
+    from models.qwen35.prefill import QwenPrefill
+
+    from ..goldens.paro import pseudo_gguf
+
+    path = checkpoint("qwen3.5-0.8B-paro")
+    require(path)
+    ref = pseudo_gguf(path)
+    g = HfModel(path)
+    La = QwenConfig.from_gguf(g).attention_layers[0]
+    n1, n2, K = 288, 100, 4
+    P = n1 + n2
+    tokens = llama_tokenize(ref, essay("apple.txt"))[:P + K]
+    want = np.asarray(golden(ref, tokens, layers=("g", La), names="l_out", logits="none")["l_out", La], np.float32)
+    emb = g.rows("token_embd.weight", tokens)
+    ov = QwenOverlay(g, layers=list(range(La + 1)), vocab=512, max_positions=1024)
+    pf = QwenPrefill(ov, sizes=(128, 512)).compile()
+    ov.load()
+    pf.bind()
+    err = []
+    for t0, n, T in [(0, n1, 512), (n1, n2, 128)]:
+        pf.run(emb[t0:t0 + n], t0, T)
+        got = pf.hidden(0, n)
+        err += [rel_max(got[i], want[t0 + i]) for i in range(n)]
+
+    def steps(t0: int) -> list[float]:
+        out = []
+        for t in range(t0, P + K):
+            ov.step(emb[t:t + 1], t, logits=False)
+            if t >= P:
+                out.append(rel_max(ov.hidden(-1), want[t]))
+            ov.accept(1)
+        return out
+
+    cont = steps(P)
+    ov.reset()
+    dec = steps(0)
+    print(f"prefill error mean {np.mean(err):.4f} max {np.max(err):.4f}; decode after the prefill {np.mean(cont):.4f}, "
+          f"decode only {np.mean(dec):.4f}")
+    assert np.max(err) < 9e-2 and np.mean(err) < 2.2e-2
+    assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3

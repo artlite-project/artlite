@@ -1,3 +1,7 @@
+{# (bf16: xn as bf16 blocks of 64 [8 tokens][8 columns], else bfp16 panels) #}
+{% macro out_decl() %}{% if bf16 %}bfloat16 *__restrict o = out;{% else %}aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);{% endif %}{% endmacro %}
+{% macro push(acc) %}{% if bf16 %}aie::store_v(o, {{ acc }}.template to_vector<bfloat16>());
+        o += 64;{% else %}o.push({{ acc }}.template to_vector<bfp16ebs8>());{% endif %}{% endmacro %}
 
 namespace {
 // st: ss[8][32] -> inv_hi[64] | inv_lo[64] at st + 256 (bf16, lane 8 t + e = token t's 1 / rms)
@@ -190,7 +194,7 @@ void {{ p }}_rb{{ sfx }}(const bfloat16 *__restrict x, {{ "const bfloat16 *__res
         }
     }
 {% endif %}
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    {{ out_decl() }}
     const bfloat16 *__restrict px = {{ "xo" if nd == 2 else "x" }};
 {% if nd == 1 %}
     const bfloat16 *__restrict pd = d;
@@ -205,7 +209,7 @@ void {{ p }}_rb{{ sfx }}(const bfloat16 *__restrict x, {{ "const bfloat16 *__res
 {% endif %}
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
                                            .template to_vector<bfloat16>();
-        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        {{ push("aie::mac(aie::mul(xw, vh), xw, vl)") }}
         px += 8;
         pw += 8;
     }
@@ -257,7 +261,7 @@ void {{ p }}_rb0p(const bfloat16 *__restrict x, const bfloat16 *__restrict w1, c
         {{ p }}_inv(st);
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    {{ out_decl() }}
     const bfloat16 *__restrict px = x;
     const bfloat16 *__restrict pw1 = w1 + {{ C }} * kc;
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
@@ -268,7 +272,7 @@ void {{ p }}_rb0p(const bfloat16 *__restrict x, const bfloat16 *__restrict w1, c
                                                 .template to_vector<bfloat16>();
         const aie::vector<bfloat16, 64> xw = aie::mul(g, aie::load_v<8>(pw).template grow_replicate<64>())
                                                  .template to_vector<bfloat16>();
-        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        {{ push("aie::mac(aie::mul(xw, vh), xw, vl)") }}
         px += 8;
         pw1 += 8;
         pw += 8;
@@ -288,7 +292,7 @@ void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float
         {{ p }}_inv(st);
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    {{ out_decl() }}
     const bfloat16 *__restrict pg = g + {{ C }} * kc;
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
@@ -296,7 +300,7 @@ void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float
         aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
                                            .template to_vector<bfloat16>();
-        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        {{ push("aie::mac(aie::mul(xw, vh), xw, vl)") }}
         pg += 8;
         pw += 8;
     }
@@ -317,7 +321,7 @@ void {{ p }}_bl(const bfloat16 *__restrict g, const bfloat16 *__restrict w, floa
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
     const al::BV nI = al::neg_eye();
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    {{ out_decl() }}
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> ol((bfp16ebs8 *)out + {{ C }});  // (C / 8 panels of 8 blocks)
     const bfloat16 *__restrict pg = g + {{ C }} * kc;
     const bfloat16 *__restrict pw = w + {{ C }} * kc;

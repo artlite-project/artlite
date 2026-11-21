@@ -35,8 +35,8 @@ else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its d
 
 PARO: a checkpoint whose linears are PARO tensors (``artlite.paro``; the decode's ``paro_steps``) takes each
 projection's input as its own rotated copy: the GDN layers' gdn_in in two regions, "gin_q" (attn_qkv's rows) and "gin_z"
-(attn_gate's, then ssm_alpha's and ssm_beta's rows folded into attn_gate's rotation: F32 substitutes as BFP16 planes,
-``_ab_folded``), the attention layers' attn_in in "attn_q", "attn_k", "attn_v", gate_up in "gate", "up"; the rotation
+(attn_gate's, then block "ab": ssm_alpha's and ssm_beta's rows folded into attn_gate's rotation, F32 substitutes as
+BFP16 planes, ``_ab_folded``), the attention layers' attn_in in "attn_q", "attn_k", "attn_v", gate_up in "gate", "up"; the rotation
 objects of each column in data regions (``decode.rotated.RotatedImage``): "rot_in" (the first layer's copies), "rot_g" (the
 GDN outputs of the column's v heads, ssm_out's rotation), "rot_o" (the column's attention heads, attn_output's),
 "<mixer out>_rot" (gate's and up's copies of the residual slice), "rot_down" (down's, the ffn in whole groups a column:
@@ -259,12 +259,10 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         else:
             qkv, z, ab = self._gdn_rows(cfg)
             d = cfg.ssm_state
-            alpha, beta = self._ab_folded(layer)  # (F32: BFP16 planes, B_PAIR)
-            a, bt = ab[:, :ab.shape[1] // 2], ab[:, ab.shape[1] // 2:] - cfg.ssm_v_heads
+            alpha, beta = self._ab_folded(layer)  # (F32: BFP16 planes, B_PAIR; one block: one prefill GEMM)
             self._add(layer, "gin_q", [("qkv", (b + "attn_qkv.weight",), qkv)], H)
             self._add(layer, "gin_z", [("z", (b + "attn_gate.weight",), z),
-                                       ("alpha", (alpha,), np.stack([2 * a, 2 * a + 1], -1).reshape(COLS, -1)),
-                                       ("beta", (beta,), np.stack([2 * bt, 2 * bt + 1], -1).reshape(COLS, -1))], H)
+                                       ("ab", (alpha, beta), np.stack([2 * ab, 2 * ab + 1], -1).reshape(COLS, -1))], H)
             groups = [np.concatenate([d * j // ROT + np.arange(d // ROT) for j in gdn_v_heads(cfg, c)])
                       for c in range(COLS)]
             self.rot_data(layer, "rot_g", [(b + "ssm_out.weight", None, groups)])
@@ -306,10 +304,11 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
                                   "up": "ffn_up", "down": "ffn_down"}[name] + ".weight"
 
     def _ab_folded(self, layer: int) -> list[str]:
-        """(PARO) ssm_alpha and ssm_beta (F16) as F32 substitutes W A^-1 (``_own``, kept: 2 x 16 rows a layer) that read
-        gin_z's input, as BFP16 planes [hi, lo] (``decode.image.Block.pairs``, B_PAIR: their sums the rows, exact to
-        ~2^-16): A the exact transform of attn_gate's rotation without the norm's weight (its copy x' = A (w x), so
-        W (w x) = W A^-1 x'; one plane of bfp16 is 1-4% off on the folded rows, whose channels the rotation mixes)."""
+        """(PARO) ssm_alpha and ssm_beta (F16) as substitutes W A^-1 (``_own``, kept: 2 x 16 rows a layer) that read
+        gin_z's input: A the exact transform of attn_gate's rotation without the norm's weight (its copy x' = A (w x), so
+        W (w x) = W A^-1 x'), F32: BFP16 planes [hi, lo] (``decode.image.Block.pairs``, B_PAIR: their sums the rows,
+        exact to ~2^-16; one plane of bfp16 is 1-4% off on the folded rows, whose channels the rotation mixes: a slice of
+        34 tokens up to the first attention layer 2.5% off at most with a beta of one plane, 0.7% on average)."""
         b = f"blk.{layer}."
         rot = self.gguf.tensor(b + "attn_gate.weight").rot()
         tf = rot.tan_form(None, unit=True)

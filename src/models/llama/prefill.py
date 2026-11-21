@@ -27,7 +27,8 @@ groups); the padding tokens after the valid ones write cache records that later 
 
 A PARO checkpoint (``llama.image``'s regions; the decode's "Rotated inputs"): the norms' weights are ones (each is
 folded into its consumers' rotations) and every projection's input goes through ``prefill.rotate`` first: the norm's
-panels into XR, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once (side by side:
+x / rms as bf16 blocks (``PrefillNormOperator``'s ``bf16``: bfp16 panels before the rotation round each block's small
+channels to its outlier's exponent) into XR's panels, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once (side by side:
 [token group][copy][hidden / 8 panels], each GEMM reading its copy's columns), the attention's A into AR; q, k and v
 write G in one
 layout (``prefill.gemm.joined_layout``), gate and up GU as bf16 panels (``plan_gate_up_pair``: one design), which down's
@@ -212,7 +213,8 @@ class LlamaPrefill(ChunkPrefill):
                     plans[(L, name)] = plan_gemm(img, img.region(L, name), t, ops=gemms, pitch=dp, k_parts=self._k_parts)
             # (a norm's copies: q, k, v and gate, up; o's; down's: of GU, the activation on the way)
             (ko,) = {img.region(L, "o").K_in for L in self.layers}
-            for name, kw in (("qkv", {"K": self.kh, "copies": 3}), ("gate_up", {"K": self.kh, "copies": 2}),
+            for name, kw in (("qkv", {"K": self.kh, "copies": 3, "bf16": True}),
+                             ("gate_up", {"K": self.kh, "copies": 2, "bf16": True}),
                              ("o", {"K": ko}), ("down", {"K": cfg.intermediate_size, "gu": True})):
                 rots[name] = gemms.setdefault(("rot", t, *kw.items()), PrefillRotOperator(T=t, **kw))
         else:
@@ -235,7 +237,7 @@ class LlamaPrefill(ChunkPrefill):
                                                              norm=cfg.qk_norm, eps=cfg.rms_norm_eps)
         o = _Ops(plans, rots, qt, pitch, dp, parts, f_part,
                  PrefillNormOperator(T=t, add=False, E=H, eps=cfg.rms_norm_eps, cols=self._norm_cols(t),
-                                     out_pitch=self._out_pitch), {}, preps)
+                                     out_pitch=self._out_pitch, bf16=self.paro), {}, preps)
         for n in {t, *(m for m in NORM_SIZES if t <= m <= max(T for T in self.sizes if self._t(T) == t))}:
             o.norms[n] = self._norms(n, o)
         return o
@@ -254,7 +256,7 @@ class LlamaPrefill(ChunkPrefill):
             key = (n, dp, deltas, cols)
             if key not in self._norm_ops:
                 self._norm_ops[key] = PrefillNormOperator(T=n, E=H, eps=eps, d_pitch=dp, deltas=deltas, cols=cols,
-                                                          out_pitch=self._out_pitch,
+                                                          out_pitch=self._out_pitch, bf16=self.paro,
                                                           d_stride=n * COLS * dp if deltas > 1 else 0)
             return self._norm_ops[key]
 
@@ -276,14 +278,15 @@ class LlamaPrefill(ChunkPrefill):
         cfg, H, s = self.cfg, self.H, self.shape
         pitch, dp = max(o.pitch for o in self.ops.values()), max(o.d_pitch for o in self.ops.values())
         # (the GEMMs' A rows: of their K, ``Region.K_in``: the norms' ``kh``, down's ffn padded to whole chunks)
-        self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
+        self.pr = 9 * self.kh // 8  # (a token's row of panels; PXN: a PARO checkpoint's bf16 blocks, its rotations')
+        self.rb = {"PX": 2 * H, "PXN": 2 * self.kh if self.paro else self.pr, "G": 2 * COLS * pitch, "QS": COLS * s.qh * s.qunit // 8,
                    "A": 9 * COLS * s.qh * s.hd // 8, "Y": 2 * COLS * dp, "HP": 9 * PG.input_k(self.img, ("down",)) // 8}
         split = [] if self.paro else \
             [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
         if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
             self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         if self.paro:  # (GU: gate and up's rows; the rotated inputs as the panels they replace)
-            self.rb |= {"GU": 2 * 2 * cfg.intermediate_size, "XR": 3 * self.rb["PXN"], "AR": self.rb["A"],
+            self.rb |= {"GU": 2 * 2 * cfg.intermediate_size, "XR": 3 * self.pr, "AR": self.rb["A"],
                         "HR": self.rb["HP"]}
             self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO)
             k = 0
@@ -342,7 +345,7 @@ class LlamaPrefill(ChunkPrefill):
         def rot(L: int, name: str, src: str, dst: str) -> list[tuple]:  # (PARO: a projection's rotated input(s))
             op = o.rots[name]
             ro = self.ro_off[(L, {"qkv": "q", "gate_up": "gate"}.get(name, name))]  # (copies: their objects in turn)
-            out = [sl("XR", j * t * op.copies * rb["PXN"], op, i=2) if dst == "XR" else tok(dst, j, op, i=2)
+            out = [sl("XR", j * t * op.copies * self.pr, op, i=2) if dst == "XR" else tok(dst, j, op, i=2)
                    for j in range(S)]  # (XR: the copies side by side)
             return [(op, tok(src, j, op, i=0), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", out[j]) for j in range(S)]
 
@@ -350,7 +353,7 @@ class LlamaPrefill(ChunkPrefill):
             if not g.a.startswith("XR"):
                 return sl(g.a or "PXN", tk * rb[g.a or "PXN"], g.op, i=0)
             C, c = int(g.a[2]), int(g.a[3])
-            return sl("XR", (tk * C + 8 * c) * rb["PXN"], g.op, i=0)
+            return sl("XR", (tk * C + 8 * c) * self.pr, g.op, i=0)
 
         if self.paro:
             rl += rot(self.layers[0], "qkv", "PXN", "XR")

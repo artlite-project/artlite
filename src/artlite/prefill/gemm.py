@@ -53,7 +53,8 @@ OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # project
 # drafter's, fc: a DFlash2 drafter's, out: LFM3's conv layers')
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
-         "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv"}
+         "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv", "gin_q": "qkv", "gin_z": "qkv", "attn_q": "qkv", "attn_k": "qkv",
+         "attn_v": "qkv"}
 assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
@@ -321,15 +322,19 @@ def _split_gate_up(image: TileImage, region: Region, T: int, ops: dict[tuple, Ge
 
 
 def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
-    """The output layout of input projections of one block each that write one buffer (a PARO checkpoint's q, k, v: their
-    inputs differ), per column [block of region 0 | block of region 1 | ...] as ``_in_layout``'s blocks of one region."""
+    """The output layout of input projections that write one buffer (a PARO checkpoint's q, k, v; gdn_in's gin_q and
+    gin_z: their inputs differ), per column the regions' blocks one after the other as ``_in_layout``'s blocks of one
+    region."""
     off: dict[str, int] = {}
-    col = 0
+    col = end = 0
     for r in regions:
-        (b,) = r.blocks
-        off[b.name] = col
-        col = -(-(col + _extents(r, [0], T, r.K_in, False)[0]) // 32) * 32
-    return Layout(max(-(-col // 64) * 64, pitch), off)
+        for run in _runs(r):
+            for i, e in zip(run, _extents(r, run, T, r.K_in, False)):
+                b = r.blocks[i]
+                off[b.name] = col
+                end = max(end, col + e)
+                col = col + int((b.rows[0] >= 0).sum()) if b.pairs else -(-(col + e) // 32) * 32
+    return Layout(max(-(-max(col, end) // 64) * 64, pitch), off)
 
 
 def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,

@@ -43,6 +43,18 @@ runs the packed GDN operators with one segment from its first token (``fresh_siz
 itself, so the model's reset zeroes none, ``QwenOverlay.reset``; the states it leaves are no sequence's), a larger one
 zeroes the states first.
 
+A PARO checkpoint (``image``'s "PARO": a region per projection, each reading its input rotated) runs chunks from 128
+tokens (a rotation's items: 32 tokens a core), a dense chat model's: its norms' weights are ones, each folded into its
+consumers' rotations (``prefill.rotate``, their objects in RO), and the norms write x / rms as bf16 blocks
+(``PrefillNormOperator``'s ``bf16``: bfp16 panels before the rotation would round each block's small channels to its
+outlier's exponent: Qwen3-0.6B-PARO's KL 4x). After the input norm the rotated copies of the layer's input projections
+side by side (XR: gin_q's and gin_z's, or attn_q's, attn_k's and attn_v's), each GEMM reading its
+copy as K columns of panels C K wide into one layout of G (``prefill.gemm.joined_layout``: the GDN and attention
+operators' as ever; the GDN's alpha and beta, folded into gin_z's rotation as F32 planes, in fp32: GdnPrep's
+``ab32``); the mixer's output rotated for its projection (AR); gate's and up's copies (XR), gate and up as bf16
+panels into GU (one GEMM design, ``prefill.gemm.plan_gate_up_pair``), down's rotation with the activation on the way
+(HR).
+
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
 a chunk at position 0, each from a state of its own. The operators that keep them apart: GdnPrep / GdnScan's packed
 variants (the mask PM per token: 1 + its distance from its segment's first token; the state reset there exactly, a
@@ -59,6 +71,7 @@ writes the prefix's conv state back from CVL. The chunk leaves the prefix's stat
 p0 are the next prompt's to overwrite).
 """
 
+import dataclasses
 import functools
 import math
 from types import SimpleNamespace
@@ -77,14 +90,19 @@ from artlite.prefill.chunks import PIECE_BUDGET_S, ChunkPrefill
 from artlite.prefill.dflash import DFlashPrefill
 from artlite.prefill.drafter import DrafterPrefill
 from artlite.prefill.norm import PrefillNormOperator
+from artlite.prefill.rotate import OBJ as ROT_OBJ
+from artlite.prefill.rotate import PrefillRotOperator, row_floats
 
 from . import gdn as GD
 from . import gdn_prefill as GP
 from .conv_state import CS_OFF
 from .draft_prefill import DraftPrefill
 from .overlay import KV_PAD, QwenOverlay
+from .paro_steps import gdn_in_rows
 
 SUB = 256  # tokens per sub-chunk (the operators' T)
+# (a PARO checkpoint) a layer's input projections, each on its rotated copy of the norm's panels (``image``'s PARO)
+PARO_IN = {True: ("attn_q", "attn_k", "attn_v"), False: ("gin_q", "gin_z")}
 SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each)
 MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
@@ -124,19 +142,24 @@ class QwenPrefill(ChunkPrefill):
         self.split = SPA.applies(overlay.cfg) and not precise and not pack and draft is None and dflash is None
         if self.split:
             default += (SPLIT_T,)
-        super().__init__(overlay, sizes or default)
+        self.paro = overlay.paro  # (rotated inputs: module docstring's "PARO")
+        if self.paro:  # (``prefill.rotate``: a sub-chunk's items over 32 cores from 128 tokens on)
+            assert draft is None and dflash is None and not pack and not overlay.cfg.moe, "a dense chat model's"
+            default = tuple(t for t in default if t >= 128)
+        super().__init__(overlay, tuple(t for t in sizes or default if t >= 128 or not self.paro))
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)
         cfg, img = self.cfg, self.img
         self.layers = overlay.layers
         self.gdn = [L for L in self.layers if not cfg.attention[L]]
         self.att = [L for L in self.layers if cfg.attention[L]]
         self.kv_layers = self.att
-        self.pitch = {name: PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att))
-                      if ls}
+        self.pitch = {name: max(PG.joined_layout(self._paro_in(L), SUB).pitch for L in ls) if self.paro else
+                      PG.phase_pitch(img, name, SUB) for name, ls in (("gdn_in", self.gdn), ("attn_in", self.att)) if ls}
         self.d_pitch = PG.d_pitch(img, SUB)
         # the norms' panel rows: the K of the GEMMs that read them (``Region.K_in``: the hidden size, or padded to whole
         # K chunks, the padding columns never written: zero)
-        self.kh = PG.input_k(img, ("gdn_in", "attn_in", "gate_up", "moe_in"))
+        self.kh = PG.input_k(img, ("gdn_in", "attn_in", "gate_up", "moe_in") if not self.paro else
+                             (*PARO_IN[True], *PARO_IN[False], "gate", "up"))
         self._out_pitch = self.kh if self.kh != cfg.hidden_size else 0
         # (an MoE model's FFN: ``moe.prefill``; its marks per size: (layer, the items that start its pieces: the shared
         # expert's, the gathered norm's, the expert GEMMs'))
@@ -194,6 +217,16 @@ class QwenPrefill(ChunkPrefill):
         dpt = PG.d_pitch(img, t)
 
         def plan(L: int, name: str) -> PG.PhasePlan:
+            if self.paro and name in ("gdn_in", "attn_in"):  # (each input projection on its copy, one layout: G's)
+                regs = self._paro_in(L)
+                lay = PG.joined_layout(regs, SUB, self.pitch[name])
+                C = len(regs)
+                return PG.PhasePlan([dataclasses.replace(g, a=f"XR{C}{i}") for i, r in enumerate(regs) for g in
+                                     PG.plan_phase(img, r, t, ops=self._gemms, layout=lay, a_width=C * self.kh).gemms], lay)
+            if self.paro and name == "gate_up":  # (one design, bf16 panels into GU: down's rotation takes them)
+                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, self._gemms, 2 * self.kh)
+                gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
+                return gu
             region = img.region(L, name)
             pitch = self.pitch.get(name, dpt) if name != "gate_up" else 0
             key = (name, region.K_in, region.kc_group, tuple(b.formats for b in region.blocks), t)
@@ -216,15 +249,48 @@ class QwenPrefill(ChunkPrefill):
         # one norm adds them, per P)
         parted = [g.op for p in plans.values() if p.parts > 1 for g in p.gemms]
         f_part = max(arg_bytes(op, 2) for op in parted) if parted else 0
+        rots: dict[str, PrefillRotOperator] = {}
+        if self.paro:  # (a layer's input copies, the mixer's output, gate / up's copies, down's with the activation)
+
+            def rot(**kw: object) -> PrefillRotOperator:
+                return self._gemms.setdefault(("rot", t, *sorted(kw.items())), PrefillRotOperator(T=t, **kw))
+
+            rots["gu"] = rot(K=self.kh, copies=2, bf16=True)
+            rots["down"] = rot(K=cfg.intermediate_size, gu=True)
+            if self.gdn:
+                rots["in_gdn"] = rots["gu"]
+                rots["o_gdn"] = rot(K=cfg.ssm_v_heads * GD.D)
+            if self.att:
+                rots["in_attn"] = rot(K=self.kh, copies=3, bf16=True)
+                rots["o_attn"] = rot(K=cfg.num_attention_heads * AP.HD)
         return SimpleNamespace(
-            plans=plans, d_pitch=dpt, f_part=f_part, rb_y=2 * COLS * dpt,
-            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out, cols=cols),
-            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, out_pitch=out, cols=cols),
+            plans=plans, d_pitch=dpt, f_part=f_part, rb_y=2 * COLS * dpt, rots=rots,
+            pn0=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=out, cols=cols, bf16=self.paro),
+            pn=PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, out_pitch=out, cols=cols, bf16=self.paro),
             # (an MoE layer's delta: rows of H)
             pnm=PrefillNormOperator(T=t, E=H, eps=eps, out_pitch=out, cols=cols) if dp else None,
             pnd={P: PrefillNormOperator(T=t, E=H, eps=eps, d_pitch=dp, deltas=P, d_stride=f_part // 2, out_pitch=out,
-                                        cols=cols)
+                                        cols=cols, bf16=self.paro)
                  for P in sorted({p.parts for p in plans.values() if p.parts > 1})})
+
+    def _regions(self, L: int) -> tuple[str, ...]:
+        """The image regions of layer L's GEMMs (a PARO checkpoint's: a region per projection)."""
+        if not self.paro:
+            return self._phases(L)
+        return (*PARO_IN[bool(self.cfg.attention[L])], "attn_out" if self.cfg.attention[L] else "gdn_out", "gate", "up",
+                "down")
+
+    def rot_bytes(self, L: int) -> list[int]:
+        """(PARO) Bytes per token that layer L's rotations read and write (``_rot_parts``: panels of 9 / 8 bytes per
+        channel; down's input gate and up, bf16)."""
+        cfg, att = self.cfg, bool(self.cfg.attention[L])
+        C, I = len(PARO_IN[att]), cfg.intermediate_size
+        mix = cfg.num_attention_heads * AP.HD if att else cfg.ssm_v_heads * GD.D
+        return [9 * self.kh * (1 + C) // 8, 9 * mix // 4, 9 * self.kh * 3 // 8, 4 * I + 9 * I // 8]
+
+    def _paro_in(self, L: int) -> list[object]:
+        """(PARO) Layer L's input projections' regions."""
+        return [self.img.region(L, n) for n in PARO_IN[bool(self.cfg.attention[L])]]
 
     def _phases(self, L: int) -> tuple[str, ...]:
         """(an MoE layer's FFN: ``moe``)"""
@@ -245,7 +311,8 @@ class QwenPrefill(ChunkPrefill):
         those variants; a tree chunk's GdnOut reads the conv state from the layer's 3 rows of CVL)"""
         t = self._t(T)
         pk = {"pack": True} if packed else {"tree": True} if tree else {}
-        return (self._op(GP.GdnPrepOperator, lay, T=t, **pk), self._op(GP.GdnScanOperator, lay, T=T, sub=t, **pk),
+        ab = {"ab32": True} if self.paro else {}  # (a PARO checkpoint's alpha and beta: fp32 planes, ``image``'s PARO)
+        return (self._op(GP.GdnPrepOperator, lay, T=t, **pk, **ab), self._op(GP.GdnScanOperator, lay, T=T, sub=t, **pk),
                 self._op(GP.GdnOutOperator, lay, T=t, hslot=self.ov.hslot, cs_off=CS_OFF,
                          gc_rows=3 if tree else self.max_t))
 
@@ -265,19 +332,51 @@ class QwenPrefill(ChunkPrefill):
     def _rows(self) -> None:
         """Bytes per token of the chunk's buffers (G and A: per phase kind)."""
         cfg, H = self.cfg, self.H
-        self.rb = {"PX": 2 * H, "PXN": 9 * self.kh // 8, "Y": 2 * COLS * self.d_pitch, "F": 2 * COLS * self.d_pitch, "PM": 4}
+        # (PXN: the norms' panels; a PARO checkpoint's: bf16 blocks, which its rotations read)
+        self.pr = 9 * self.kh // 8  # (a token's row of panels)
+        self.rb = {"PX": 2 * H, "PXN": 2 * self.kh if self.paro else self.pr, "Y": 2 * COLS * self.d_pitch,
+                   "F": 2 * COLS * self.d_pitch, "PM": 4}
         if self.moe:
             self.rb |= self.moe.rows()
         else:  # (down's K: the ffn padded to whole K chunks)
             self.rb["HP"] = 9 * PG.input_k(self.img, ("down",)) // 8
-            split = [self.img.region(L, "gate_up") for L in self.layers if self.img.region(L, "gate_up").blocks[0].fmt2]
+            split = [] if self.paro else [self.img.region(L, "gate_up") for L in self.layers
+                                          if self.img.region(L, "gate_up").blocks[0].fmt2]
             if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
                 self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         for d in self.drafters:
             self.rb |= d.rows()
         self.rb_g = {k: 2 * COLS * p for k, p in self.pitch.items()}  # (gdn_in / attn_in rows)
         self.rb_a = {"gdn_in": 9 * cfg.ssm_v_heads * GD.D // 8, "attn_in": 9 * cfg.num_attention_heads * AP.HD // 8}
+        if self.paro:  # (the rotated copies, side by side: [token group][copy][hidden / 8 panels]; the mixer's rotated
+            # output; gate and up's panels; down's rotated input)
+            self.rb |= {"XR": 3 * self.pr, "AR": max(self.rb_a.values()), "GU": 4 * cfg.intermediate_size,
+                        "HR": self.rb["HP"]}
+            self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO: ``_bind``)
+            k = 0
+            for L in self.layers:
+                for kind, n in self._rot_parts(L):
+                    self.ro_off[(L, kind)] = k
+                    k += n * ROT_OBJ
         self.rb_o = 2 * cfg.ssm_v_heads * GD.D
+
+    def _rot_parts(self, L: int) -> list[tuple[str, int]]:
+        """(PARO) Layer L's rotations (kind, groups): its input copies, its mixer's output, gate / up's copies, down's."""
+        cfg, att = self.cfg, bool(self.cfg.attention[L])
+        G = self.kh // 128
+        mix = cfg.num_attention_heads * AP.HD if att else cfg.ssm_v_heads * GD.D
+        return [("in", len(PARO_IN[att]) * G), ("o", mix // 128), ("gu", 2 * G), ("down", cfg.intermediate_size // 128)]
+
+    def _rot_tensors(self, L: int, kind: str) -> list[tuple[str, str | None]]:
+        """(PARO) The tensors of a rotation of layer L (``_rot_parts``) and the norm folded in."""
+        att, img = bool(self.cfg.attention[L]), self.img
+        if kind == "in":
+            return [(img.tensor_name(L, n), "attn_norm") for n in PARO_IN[att]]
+        if kind == "o":
+            return [(img.tensor_name(L, "attn_out" if att else "gdn_out"), None)]
+        if kind == "gu":
+            return [(img.tensor_name(L, n), "post_attention_norm") for n in ("gate", "up")]
+        return [(img.tensor_name(L, "down"), None)]
 
     def _norm(self, L: int, name: str) -> str:
         o = self.ov.norm_off[(L, name)]
@@ -308,6 +407,24 @@ class QwenPrefill(ChunkPrefill):
         ry = o.rb_y  # (bytes per token of Y and F at these operators' pitch)
         rl: list[tuple] = [(o.pn0, tok("PX", j, o.pn0, i=0), self._norm(self.layers[0], "attn_norm"),
                             tok("PXN", j, o.pn0, i=2)) for j in range(S)]
+        paro = self.paro
+
+        def rot(L: int, kind: str, src: str, dst: str, row: int = 0) -> list[tuple]:  # (PARO: a rotation of layer L)
+            att = bool(cfg.attention[L])
+            op = o.rots[{"in": "in_" + ("attn" if att else "gdn"), "o": "o_" + ("attn" if att else "gdn")}.get(kind, kind)]
+            ro = self.ro_off[(L, kind)]
+            out = [sl("XR", j * t * op.copies * self.pr, op, i=2) if dst == "XR" else tok(dst, j, op, i=2, row=row)
+                   for j in range(S)]  # (XR: the copies side by side)
+            return [(op, tok(src, j, op, i=0, row=row), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", out[j]) for j in range(S)]
+
+        def a_in(g: PG.Gemm, tk: int) -> str:  # (a GEMM's A from token tk on: the norm's panels, or copy c of C in XR)
+            if not g.a.startswith("XR"):
+                return sl("PXN", tk * self.rb["PXN"], g.op, i=0)
+            C, c = int(g.a[2]), int(g.a[3])
+            return sl("XR", (tk * C + 8 * c) * self.pr, g.op, i=0)
+
+        if paro:
+            rl += rot(self.layers[0], "in", "PXN", "XR")
         for d in self.drafters:
             rl += d.start_items(T, tok)
         starts = []
@@ -319,7 +436,7 @@ class QwenPrefill(ChunkPrefill):
             kind = self._phases(L)[0]
             p_in = o.plans[(L, kind)]
             g_rb, a_rb = self.rb_g[kind], self.rb_a[kind]
-            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok("G", j, g.op, i=2, row=g_rb))
+            rl += [(g.op, a_in(g, j * t), self._w(g), tok("G", j, g.op, i=2, row=g_rb))
                    for g in p_in.gemms for j in range(S)]
             if cfg.attention[L]:
                 prep, attn = self._prep(p_in.layout, T), (self.pattn if packed or tree else self.attn)[T]
@@ -352,6 +469,10 @@ class QwenPrefill(ChunkPrefill):
                         tok("A", j, gout, i=5, row=a_rb)) for j in range(S)]
             out, fp = o.plans[(L, self._phases(L)[1])], o.f_part
             pan = self._norm(L, "post_attention_norm")
+            ain = "A"
+            if paro:  # (the mixer's output rotated for its projection)
+                rl += rot(L, "o", "A", "AR", row=a_rb)
+                ain = "AR"
             if self.moe:  # (the out projection, the norm with lo panels, the MoE block, the residual norm)
                 assert out.parts == 1, "an MoE layer's out projection in one part"
                 (g,) = out.gemms
@@ -370,34 +491,42 @@ class QwenPrefill(ChunkPrefill):
                 continue
             if out.parts == 1:
                 (g,) = out.gemms
-                rl += [(g.op, tok("A", j, g.op, i=0, row=a_rb), self._w(g), tok("Y", j, g.op, i=2, row=ry))
+                rl += [(g.op, tok(ain, j, g.op, i=0, row=a_rb), self._w(g), tok("Y", j, g.op, i=2, row=ry))
                        for j in range(S)]
                 rl += [(o.pn, tok("PX", j, o.pn, i=0), tok("Y", j, o.pn, i=1, row=ry), pan, tok("PX", j, o.pn, i=3),
                         tok("PXN", j, o.pn, i=4)) for j in range(S)]
             else:  # (sub-chunk j's part k at (P j + k) f_part)
                 P, pn = out.parts, o.pnd[out.parts]
-                rl += [(g.op, tok("A", j, g.op, i=0, row=a_rb, extra=2 * g.a_off), self._w(g),
+                rl += [(g.op, tok(ain, j, g.op, i=0, row=a_rb, extra=2 * g.a_off), self._w(g),
                         sl("Y", (P * j + g.part) * fp, g.op, i=2)) for g in out.gemms for j in range(S)]
                 rl += [(pn, tok("PX", j, pn, i=0), sl("Y", P * j * fp, pn, i=1), pan, tok("PX", j, pn, i=3),
                         tok("PXN", j, pn, i=4)) for j in range(S)]
+            if paro:  # (gate's and up's copies of the norm's panels)
+                rl += rot(L, "gu", "PXN", "XR")
             gu = o.plans[(L, "gate_up")]
-            rl += [(g.op, tok("PXN", j, g.op, i=0), self._w(g), tok(g.c or "HP", j, g.op, i=2))
+            rl += [(g.op, a_in(g, j * t), self._w(g), tok(g.c or "HP", j, g.op, i=2, extra=2 * g.c_off))
                    for g in gu.gemms for j in range(S)]
             if gu.act is not None:  # (a split block: its GEMMs' rows into the down's panels)
                 rl += [(gu.act, tok("GU", j, gu.act, i=0), tok("HP", j, gu.act, i=1)) for j in range(S)]
+            hp = "HP"
+            if paro:  # (gate and up's panels, their activation on the way: down's rotated input)
+                rl += rot(L, "down", "GU", "HR")
+                hp = "HR"
             down = o.plans[(L, "down")]
             nxt = self._next_norm(L)
             if down.parts == 1:
                 (g,) = down.gemms
-                rl += [(g.op, tok("HP", j, g.op, i=0), self._w(g), tok("F", j, g.op, i=2, row=ry)) for j in range(S)]
+                rl += [(g.op, tok(hp, j, g.op, i=0), self._w(g), tok("F", j, g.op, i=2, row=ry)) for j in range(S)]
                 rl += [(o.pn, tok("PX", j, o.pn, i=0), tok("F", j, o.pn, i=1, row=ry), nxt, tok("PX", j, o.pn, i=3),
                         tok("PXN", j, o.pn, i=4)) for j in range(S)]
             else:
                 P, pn = down.parts, o.pnd[down.parts]
-                rl += [(g.op, tok("HP", j, g.op, i=0, extra=2 * g.a_off), self._w(g),
+                rl += [(g.op, tok(hp, j, g.op, i=0, extra=2 * g.a_off), self._w(g),
                         sl("F", (P * j + g.part) * fp, g.op, i=2)) for g in down.gemms for j in range(S)]
                 rl += [(pn, tok("PX", j, pn, i=0), sl("F", P * j * fp, pn, i=1), nxt, tok("PX", j, pn, i=3),
                         tok("PXN", j, pn, i=4)) for j in range(S)]
+            if paro and L != self.layers[-1]:  # (the next layer's copies)
+                rl += rot(self.layers[self.layers.index(L) + 1], "in", "PXN", "XR")
         for d in self.drafters:
             rl += d.end_items(T, tok, lambda b, off, op, i: sl(b, off, op, i=i))
         self._starts[T] = [*starts, len(rl)]
@@ -417,7 +546,7 @@ class QwenPrefill(ChunkPrefill):
         if "PP" in own:
             pp = dev.view("PP")
             for L, o in self.pp_off.items():
-                pp[o:o + self.n_p] = GP.scan_params(ov.gguf, cfg, L, self.img.region(L, "gdn_in").block("qkv").rows)
+                pp[o:o + self.n_p] = GP.scan_params(ov.gguf, cfg, L, gdn_in_rows(self.img, L))
             dev.flush("PP")
         if "PQN" in own:
             qn = dev.view("PQN")
@@ -432,6 +561,16 @@ class QwenPrefill(ChunkPrefill):
             dev.flush("PCS")
         for d in self.drafters:
             d.static(dev, ov)
+        if self.paro:  # (the rotations' objects, the norms' weights folded into their consumers')
+            ro, g = dev.view("RO"), ov.gguf
+            for (L, kind), off in self.ro_off.items():
+                objs = []
+                for name, norm in self._rot_tensors(L, kind):
+                    gamma = ov._f32(f"blk.{L}.{norm}.weight") if norm else None
+                    objs.append(g.tensor(name).rot().tan_form(gamma, unit=True).pair_objects(row_floats(kind == "down")))
+                obj = np.concatenate(objs).reshape(-1)
+                ro[off:off + obj.size] = obj
+            dev.flush("RO")
         if self.gdn:
             self._conv_index()
 
@@ -655,7 +794,10 @@ class QwenPrefill(ChunkPrefill):
         (``attention_seconds``); CFG_S per ConfigureOp)"""
         cfg = self.cfg
         gemms = [g for name in self._phases(L) for g in self.plans[(L, name)].gemms]
-        wbytes = sum(self.img.region(L, name).read_bytes for name in self._phases(L))
+        wbytes = sum(self.img.region(L, name).read_bytes for name in self._regions(L))
+        if self.paro:  # (the rotations: their rows read and written, like weight bytes, per sub-chunk; an item each)
+            wbytes += SUB * sum(self.rot_bytes(L))
+            gemms += [None] * 4
         acts = [p.act for name in self._phases(L) if (p := self.plans[(L, name)]).act is not None]
         if acts:  # (a split gate / up block: its rows through GU, written and read, like weight bytes; an item more)
             wbytes += 2 * SUB * self.rb["GU"]
@@ -679,4 +821,4 @@ class QwenPrefill(ChunkPrefill):
         """(its GEMM objects, the GDN or attention ops, the norms; an MoE layer's block: 7)"""
         gemms = {id(g.op) for name in self._phases(L) for g in self.plans[(L, name)].gemms}
         gemms |= {id(p.act) for name in self._phases(L) if (p := self.plans[(L, name)]).act is not None}
-        return len(gemms) + (2 if self.cfg.attention[L] else 3) + 2 + (7 if self.moe else 0)
+        return len(gemms) + (2 if self.cfg.attention[L] else 3) + 2 + (7 if self.moe else 0) + (4 if self.paro else 0)

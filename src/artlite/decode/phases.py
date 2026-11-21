@@ -104,16 +104,15 @@ def group_K(region: Region, k0: int, g: int) -> int:
 def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
            block_flags: dict[str, int] | None = None, slots: int = gemv.SLOTS) -> list[Group]:
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
-    header: input objects of POST_K). The "ab" block (alpha, beta; or "alpha" of BFP16 planes, B_PAIR, and "beta", of planes
-    too: a PARO checkpoint's)
-    goes out as fp32 with F_MSG (the GDN core's) or ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block
+    header: input objects of POST_K). The "ab" block (alpha, beta, of BFP16 planes in a PARO checkpoint's: B_PAIR; or
+    "alpha" of planes and "beta") goes out as fp32 with F_MSG (the GDN core's) or ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block
     of row groups (``Block.G``) gets B_G2 / B_G4; ``slots``: the design's (its input objects of ``protocol.n_inputs``)."""
     assert len(region.blocks) <= NBLK and 1 <= S <= slots
     blk, rt = [], 0
     for b, nv in zip(region.blocks, valid_rows(region)):
         rt += b.tiles
         f32 = B_F32 if (flags & F_MSG or f32_ab) and b.name in ("ab", "beta") else 0
-        f32 |= B_PAIR if b.name == "alpha" or (b.name == "beta" and b.pairs) else 0  # (planes of F32 rows: their sums)
+        f32 |= B_PAIR if b.name == "alpha" or (b.name == "ab" and b.pairs) else 0  # (planes of F32 rows: their sums)
         assert b.G in (1, 2, 4), b.G
         g = {1: 0, 2: B_G2, 4: B_G4}[b.G] | (B_PT if b.pt else 0)
         blk += [rt, format_word(b) | f32 | g | (block_flags or {}).get(b.name, 0), nv]

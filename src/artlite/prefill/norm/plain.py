@@ -27,7 +27,8 @@ def plain_design(op: "PrefillNormOperator") -> Module:
     chunk_ty = np.ndarray[(8 * CH,), bf]
     grp_ty = np.ndarray[(8 * EMB,), bf]
     nl = 2 if op.lo else 1  # (lo: the chunk's hi panels, then its lo panels)
-    pan_ty = np.ndarray[(nl * CH // 8 * 36,), bf]  # CH / 8 panels of 72 B
+    U = op.unit
+    pan_ty = np.ndarray[(nl * CH // 8 * U,), bf]  # CH / 8 panels of 72 B (bf16 blocks: 128 B)
     w_ty = np.ndarray[(EMB,), bf]
     st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
     E = EMB
@@ -103,6 +104,8 @@ def plain_design(op: "PrefillNormOperator") -> Module:
     o_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]
     p_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(pf)]
 
+    ps = 1 if E // 64 * U <= 2046 else 2  # (a group's row in pieces: a shim BD's inner dimension <= 1023 words)
+
     def seq(*a):
         if add:
             x, d, w, xo, xn, xh, ph, dh, oh = a
@@ -124,14 +127,15 @@ def plain_design(op: "PrefillNormOperator") -> Module:
                                                     [op.cols * (E // 4) * 36, E // 64 * 36, E // 8 * 36, 1]),
                             group=tg, wait=True)
                 continue
-            ph[c].drain(xn, TensorAccessPattern((T * P * 9 // 16,), (c * (P // 8) + col // 8) * 36,
-                                                [1, n_g, 8, E // 64 * 36], [0, op.cols * (P // 8) * 36, E // 64 * 36, 1]),
+            ph[c].drain(xn, TensorAccessPattern((T * P // 64 * U,), (c * (P // 8) + col // 8) * U,
+                                                [1, n_g, 8 * ps, E // 64 // ps * U],
+                                                [0, op.cols * (P // 8) * U, E // 64 // ps * U, 1]),
                         group=tg, wait=True)
         tg.finish()
 
     vt = np.ndarray[(n,), bf]
     types = [vt] + ([np.ndarray[(nd,), bf]] if add else []) + [np.ndarray[((2 if pre else 1) * E,), bf]]
     types += [vt] if add else []
-    types.append(np.ndarray[((2 if op.lo else 1) * T * P * 9 // 16,), bf])
+    types.append(np.ndarray[((2 if op.lo else 1) * T * P // 64 * U,), bf])
     rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
     return Program(NPU2(), rt, workers=workers).resolve_program()

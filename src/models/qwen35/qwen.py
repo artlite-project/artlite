@@ -139,10 +139,8 @@ class NpuQwen(OverlayModel):
         self.dflash = DFlashOverlay(self.overlay, GGUFFile(dflash)) if dflash else None
         self.mtp = MtpDrafting(self) if self.drafter is not None else None  # (the drafters' bookkeeping: ``drafting``)
         self.flash = DFlashDrafting(self) if self.dflash is not None else None
-        # (a PARO checkpoint's prompts: decode steps until the prefill takes rotated inputs)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
-                                   dflash=self.dflash, precise=readout, pack=readout) \
-            if prefill and not self.overlay.paro else None
+                                   dflash=self.dflash, precise=readout, pack=readout) if prefill else None
         self._open(threads=threads)
         gguf.release()
         self._w_out = self.overlay._f32("output_norm.weight")

@@ -50,18 +50,19 @@ def row_floats(gu: bool) -> int:
 
 class PrefillRotOperator(ArtcOperator):
     """A rotated copy of T tokens x K channels (module docstring; ``rounds``: of the tan form; ``gu``: of a split gate /
-    up block's GU, its activation on the way)."""
+    up block's GU, its activation on the way; ``bf16``: x as bf16 blocks, a norm's ``bf16`` output)."""
 
     STACK = 1024
     p = kernel_prefix("prot")
 
-    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1):
+    def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1, bf16: bool = False):
         G = K // GROUP
         self.tok = row_floats(gu)
         assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
         assert rounds % 2 == 0 and 512 * rounds + 4 * GROUP == OBJ, rounds
         assert copies == 1 or (not gu and T // self.tok <= COLS * ROWS), "copies: a round per group"
-        self.T, self.K, self.rounds, self.gu, self.copies = T, K, rounds, gu, copies
+        assert not (gu and bf16)
+        self.T, self.K, self.rounds, self.gu, self.copies, self.bf16 = T, K, rounds, gu, copies, bf16
         super().__init__()
 
     @property
@@ -71,11 +72,11 @@ class PrefillRotOperator(ArtcOperator):
 
     @property
     def unit(self) -> int:
-        """bf16 elements of an input panel ([gate 64 | up 64] bf16, or a bfp16 panel's 72 bytes)."""
-        return 128 if self.gu else 36
+        """bf16 elements of an input panel ([gate 64 | up 64] bf16, a bf16 block, or a bfp16 panel's 72 bytes)."""
+        return 128 if self.gu else 64 if self.bf16 else 36
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu)
+        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         n = self.T * self.K * 9 // 16  # (bf16 elements of the panels)
@@ -103,8 +104,9 @@ class PrefillRotOperator(ArtcOperator):
         xs = [x3[c].cons().split([x_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[x_ty] * ROWS,
                                  names=[f"pr_x{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
         rs = r3 * COLS if bc else [r3[c].cons().forward(tile=Tile(c, 1), depth=2, name=f"pr_rb{c}") for c in range(COLS)]
+        od = 1 if self.bf16 else 2  # (bf16 blocks: 16 KB of x objects; the output, written last, drains meanwhile)
         os_ = [o3[c].prod().join([o_item * m for m in range(ROWS)], tile=Tile(c, 1), obj_types=[o_ty] * ROWS,
-                                 names=[f"pr_o{c}_{m}" for m in range(ROWS)], depths=[2] * ROWS) for c in range(COLS)]
+                                 names=[f"pr_o{c}_{m}" for m in range(ROWS)], depths=[od] * ROWS) for c in range(COLS)]
 
         t = max(nb // (COLS * ROWS), 1)  # (consecutive rounds of one group)
 

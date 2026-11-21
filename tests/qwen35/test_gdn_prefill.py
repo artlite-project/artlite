@@ -33,10 +33,12 @@ def _bits(x: np.ndarray) -> np.ndarray:
     return torch.from_numpy(np.ascontiguousarray(x, np.float32)).bfloat16().view(torch.int16).numpy().view(np.uint16)
 
 
-@pytest.mark.parametrize("size", ["9B", "1B", "occamy"])
+@pytest.mark.parametrize("size", ["9B", "1B", "occamy", "9B-ab32"])
 @pytest.mark.parametrize("T", [64])
 def test_gdn_scan(T: int, size: str) -> None:
-    """(Occamy: its F32 alpha in the ab slot as fp32, ``gdn_prefill.ab_f32``)"""
+    """(Occamy: its F32 alpha in the ab slot as fp32, ``gdn_prefill.ab_f32``; ab32: alpha and beta both fp32 in the ab
+    slot, a PARO checkpoint's, ``GdnPrepOperator``'s ``ab32``)"""
+    size, ab32 = size.removesuffix("-ab32"), size.endswith("-ab32")
     path = size_gguf(size)
     require(path)
     g = GGUFFile(path)
@@ -52,10 +54,11 @@ def test_gdn_scan(T: int, size: str) -> None:
                     logits="none")
     qkv = bf16_round(np.asarray(G_["linear_attn_qkv_mixed", L], np.float32).reshape(len(tokens), -1))
     alpha = np.asarray(G_["alpha", L], np.float32).reshape(len(tokens), -1)
-    alpha = alpha if GP.ab_f32(lay) else bf16_round(alpha)  # (the ab slot's values: fp32 or bf16)
-    beta = bf16_round(np.asarray(G_["beta", L], np.float32).reshape(len(tokens), -1))
+    alpha = alpha if GP.ab_f32(lay) or ab32 else bf16_round(alpha)  # (the ab slot's values: fp32 or bf16)
+    beta = np.asarray(G_["beta", L], np.float32).reshape(len(tokens), -1)
+    beta = beta if ab32 else bf16_round(beta)
     op = GP.GdnScanOperator(T=T, cfg=cfg, layout=lay)
-    prep = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay)
+    prep = GP.GdnPrepOperator(T=T, cfg=cfg, layout=lay, ab32=ab32)
     fused = FusedOperator(name="gdn_scan", runlist=[(prep, "G", "CV", "P", "M", "PR"),
                                                     (op, "PR", "G", "CV", "P", "GS", "O")],
                           input_args=["G", "P", "M", "CV"], output_args=["O"]).compile()  # (GS: scratch, written and read)
@@ -83,6 +86,10 @@ def test_gdn_scan(T: int, size: str) -> None:
                 a32 = np.ascontiguousarray(alpha[t0:t0 + n][:, vh], np.float32).view(np.uint16)
                 Gb[:n, c * lay.pitch + lay.off["alpha"] + np.arange(a32.shape[1])] = a32
                 Gb[:n, c * lay.pitch + lay.off["beta"] + np.arange(len(vh))] = _bits(beta[t0:t0 + n][:, vh])
+            elif ab32:  # (alpha then beta, fp32)
+                ab = np.concatenate([alpha[t0:t0 + n][:, vh], beta[t0:t0 + n][:, vh]], 1)
+                ab = np.ascontiguousarray(ab, np.float32).view(np.uint16)
+                Gb[:n, c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = ab
             else:
                 ab = np.concatenate([alpha[t0:t0 + n][:, vh], beta[t0:t0 + n][:, vh]], 1)
                 Gb[:n, c * lay.pitch + lay.off["ab"] + np.arange(ab.shape[1])] = _bits(ab)

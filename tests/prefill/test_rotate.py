@@ -1,5 +1,6 @@
 """``prefill.rotate.PrefillRotOperator`` on the NPU against its host model bit for bit (Qwen3-0.6B-PARO's rotations, or
-random ones without the checkpoint): the panels of x (``gu``: gate and up's bf16 panels, x = bf16(silu(gate) up),
+random ones without the checkpoint): the panels of x (``bf16``: its bf16 blocks, a norm's; ``gu``: gate and up's bf16
+panels, x = bf16(silu(gate) up),
 kmath.silu_tanh's model) -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16 value times T on the fp32
 MAC), x' as hi + lo into bfp16 panels; and the model against the exact transform (fp64)."""
 
@@ -65,24 +66,31 @@ def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.
 
 # (tokens, channels, gu, copies): a norm's / o's input (a norm's q, k, v copies: the objects broadcast; gate, up of 256
 # tokens: a column's own; an 8B's q, k, v: the copies' panels a row apart), Qwen3-0.6B's down (16-token items: 2 rounds of a group; 128 tokens: 4 groups a round),
-# Qwen3.5-0.8B's ffn (28 groups, 256 tokens: 2 groups a round)
+# Qwen3.5-0.8B's ffn (28 groups, 256 tokens: 2 groups a round); bf16 blocks (a norm's copies: 0.6B's q, k, v, an 8B's
+# gate, up of 128 tokens)
 CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), (256, 1024, False, 2),
          (1024, 4096, False, 3),
-         (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1)]
+         (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1),
+         (256, 1024, "bf16", 3), (128, 4096, "bf16", 2)]
 
 
 @pytest.mark.parametrize(("T", "K", "gu", "copies"), CASES,
-                         ids=[f"{T}x{K}" + ("-gu" if gu else "") + (f"-c{c}" if c > 1 else "") for T, K, gu, c in CASES])
+                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16"}.get(gu, "")) + (f"-c{c}" if c > 1 else "")
+                              for T, K, gu, c in CASES])
 @pytest.mark.usefixtures("vtanh")
-def test_prefill_rotate(T: int, K: int, gu: bool, copies: int) -> None:
+def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     rng = np.random.default_rng(0)
+    xb, gu = gu == "bf16", gu is True
     tfs = [_rotation(K, rng, 1 + c).tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True) for c in range(copies)]
     if gu:
         xp, x = _gu_input(T, K, rng)
+    elif xb:  # (bf16 blocks [T / 8][K / 8][8 tokens][8 channels])
+        x = (rng.standard_normal((T, K)) * np.exp(rng.standard_normal((T, 1)))).astype(bfloat16).astype(np.float32)
+        xp = x.reshape(T // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1).astype(bfloat16)
     else:
         xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
-    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies)
+    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb)
     ro = np.concatenate([tf.pair_objects(row_floats(gu)).reshape(-1) for tf in tfs])
     out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16))).reshape(T // 8, copies, -1)  # ([token group][copy])
     for c, tf in enumerate(tfs):

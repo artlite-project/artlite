@@ -184,7 +184,7 @@ void {{ p }}_kblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
     {{ p }}_block<false>(b, ws, (uint8_t *)out + {{ 2 * PAN }} * tb{% if SEG %}, SW(float, {{ w.mask }}) + 16 * i + 8 * tb{% endif %});
 }
 
-// Token block tb of chunk i (q core): b = [ab slot 8 x 64 ({{ "alpha HC fp32 | beta HC bf16" if F32A else "alpha HC | beta HC bf16" }}) | q rows 8 x 128] -> the Q panels
+// Token block tb of chunk i (q core): b = [ab slot 8 x 64 ({{ "alpha HC fp32 | beta HC " + ("fp32" if F32B else "bf16") if F32A else "alpha HC | beta HC bf16" }}) | q rows 8 x 128] -> the Q panels
 // and the gates of the k head's v heads h = kh + 2 hh: d = expm1(ssm_a softplus(alpha + dt)), beta = sigmoid(beta),
 // times the mask, at the record's [hh][d 16 | beta 16] (fp32: the block's 8 tokens at 8 tb); two heads per call
 // (lanes [head 2][the 8 tokens]){% if PACK %}; packed: the mask's token valid, d = -2 at a segment's first token (the scan's
@@ -219,7 +219,12 @@ void {{ p }}_qblock(const bfloat16 *__restrict b, int32_t *__restrict ws, bfloat
         aie::vector<int32, 16> ai, bi;
         AIE_LOOP_UNROLL_FULL
         for (int t = 0; t < 8; t++) {
-{% if F32A %}
+{% if F32A and F32B %}
+            ai[t] = ((const int32_t *)ab)[32 * t + h0];
+            ai[8 + t] = ((const int32_t *)ab)[32 * t + h1];
+            bi[t] = ((const int32_t *)ab)[32 * t + {{ HC }} + h0];
+            bi[8 + t] = ((const int32_t *)ab)[32 * t + {{ HC }} + h1];
+{% elif F32A %}
             ai[t] = ((const int32_t *)ab)[32 * t + h0];
             ai[8 + t] = ((const int32_t *)ab)[32 * t + h1];
             bi[t] = (int32_t)ab[64 * t + {{ 2 * HC }} + h0] << 16;

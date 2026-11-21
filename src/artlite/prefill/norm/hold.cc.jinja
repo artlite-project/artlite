@@ -1,3 +1,7 @@
+{# (bf16: xn as bf16 blocks of 64 [8 tokens][8 columns], else bfp16 panels) #}
+{% macro out_decl() %}{% if bf16 %}bfloat16 *__restrict o = out;{% else %}aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);{% endif %}{% endmacro %}
+{% macro push(acc) %}{% if bf16 %}aie::store_v(o, {{ acc }}.template to_vector<bfloat16>());
+        o += 64;{% else %}o.push({{ acc }}.template to_vector<bfp16ebs8>());{% endif %}{% endmacro %}
 
 namespace {
 // st: ss[4][32] -> inv_hi[64] | inv_lo[64] at st + 128 (bf16, lane 32 h + 8 t + e = token t's 1 / rms)
@@ -72,7 +76,7 @@ void {{ p }}_b(const bfloat16 *__restrict v, const bfloat16 *__restrict w, float
         {{ p }}_inv(st);
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
-    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
+    {{ out_decl() }}
     const bfloat16 *__restrict pv = v + {{ C }} * kc;
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
@@ -81,7 +85,7 @@ void {{ p }}_b(const bfloat16 *__restrict v, const bfloat16 *__restrict w, float
         const aie::vector<bfloat16, 64> wr = aie::concat(aie::load_v<8>(pw).template grow_replicate<32>(),
                                                          aie::load_v<8>(pw + 8).template grow_replicate<32>());
         aie::vector<bfloat16, 64> xw = aie::mul(xp, wr).template to_vector<bfloat16>();
-        o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+        {{ push("aie::mac(aie::mul(xw, vh), xw, vl)") }}
         pv += 16;
         pw += 16;
     }

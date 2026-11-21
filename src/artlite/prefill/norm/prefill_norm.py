@@ -35,7 +35,7 @@ class PrefillNormOperator(ArtcOperator):
 
     def __init__(self, *, T: int, add: bool = True, E: int = 2048, eps: float = 1e-5, d_pitch: int = 0,
                  cols: int = COLS, deltas: int = 1, d_stride: int = 0, lo: bool = False, pre: bool = False,
-                 out_pitch: int = 0, out_col: int = 0, raw: bool = False):
+                 out_pitch: int = 0, out_col: int = 0, raw: bool = False, bf16: bool = False):
         """cols: cores (one per column) taking the token groups in turn: few for short prompts, where the
         op's reconfiguration costs more than its work. deltas = 2 (replay mode): x += d + d2 (a projection in two
         K parts: summed in fp32, rounded once), both at d_pitch, d2 ``d_stride`` elements after d
@@ -44,7 +44,10 @@ class PrefillNormOperator(ArtcOperator):
         (one delta, E <= 2048). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
         norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
         panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them; not
-        in the hold design). raw (no add): xn = x w, without the norm (a drafter's taps as panels: w of ones)."""
+        in the hold design). raw (no add): xn = x w, without the norm (a drafter's taps as panels: w of ones). bf16:
+        xn as bf16 blocks of 8 tokens x 8 columns in the panels' order (128 B each, ``unit``: a PARO checkpoint's
+        rotations read them, ``prefill.rotate``: rounded once per element, where a block's shared exponent loses the
+        small channels beside an outlier one, which the rotation would spread)."""
         assert T % (8 * cols) == 0 and T > 0 and E % CH == 0 and 1 <= cols <= COLS
         self.T, self.add, self.E, self.eps, self.cols, self.lo = T, add, E, eps, cols, lo
         self.d_pitch = d_pitch or E // COLS  # (pitch of delta's column blocks)
@@ -63,13 +66,19 @@ class PrefillNormOperator(ArtcOperator):
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
         assert E % 1024 == 0 or self.replay, "the plain design: E of whole 1024 columns"
         assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
-        self.pre, self.raw = pre, raw
+        self.pre, self.raw, self.bf16 = pre, raw, bf16
+        assert not (bf16 and lo), "bf16 blocks: no lo panels"
         assert not raw or not (add or pre or lo), "raw: x's own panels"
         self.out_pitch, self.out_col = out_pitch or E, out_col
         assert not pre or not add, "pre: a norm without a delta"
         assert (self.out_pitch, out_col) == (E, 0) or not (lo or self.hold) and (
             out_col % 8 == 0 and out_col + E <= self.out_pitch), (out_pitch, out_col)
         super().__init__()
+
+    @property
+    def unit(self) -> int:
+        """bf16 elements of an output block of 8 tokens x 8 columns (a bfp16 panel: 36)."""
+        return 64 if self.bf16 else 36
 
     @property
     def hold(self) -> bool:
@@ -89,15 +98,15 @@ class PrefillNormOperator(ArtcOperator):
         specs.append(ArgSpec("in", ((2 if self.pre else 1) * EMB,), bfloat16))
         if self.add:
             specs.append(ArgSpec("out", (n,), bfloat16))
-        specs.append(ArgSpec("out", ((2 if self.lo else 1) * self.T * self.out_pitch * 9 // 16,), bfloat16))
+        specs.append(ArgSpec("out", ((2 if self.lo else 1) * self.T * self.out_pitch // 64 * self.unit,), bfloat16))
         return specs
 
     def get_kernel_src(self) -> str:
         if self.hold:
-            return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas)
+            return _HOLD_SRC.render(p=self.p, E=self.E, C=HCH, G=HG, eps=repr(self.eps), nd=self.deltas, bf16=self.bf16)
         # (the same source for add and no add: one copy in a fused ELF)
         return _SRC.render(p=self.p, E=self.E, C=self.ch, eps=repr(self.eps), replay=self.replay, lo=self.lo, pre=self.pre,
-                           raw=self.raw)
+                           raw=self.raw, bf16=self.bf16)
 
     def get_mlir_artifact(self) -> Module:
         return DESIGNS[self.design](self)
