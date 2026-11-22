@@ -37,7 +37,8 @@ from models.server.process import listen
 from models.server.realtime import TRANSCRIPTION_EVENT as TRANSCRIPTION
 from models.server.router import Router, RouterOptions, create_router_app
 
-from ..model_files import require
+if __package__:  # (not when run as a script: the router's model servers, the manual check)
+    from ..model_files import require
 
 CHILD = [sys.executable, os.path.abspath(__file__), "--child"]
 
