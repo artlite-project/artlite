@@ -27,6 +27,9 @@ C++ and lets Peano, LLVM for AI Engine, optimize it, steered by hints chosen per
 device rather than for portability.
 
 - **GGUF files as they are.** No conversion step, no extra copy of the weights.
+- **ParoQuant checkpoints too.** PARO int4 / int5 checkpoint directories (Llama 3.1, Qwen3, Qwen3.5 / 3.6 / 3.8, Gemma 4)
+  run from their safetensors at their quantization's size, each linear's input rotated on the NPU
+  ([Models](docs/models/README.md)).
 - **Prompt and generation on the NPU.**
 - **Tools in llama.cpp's style.** `artlite-cli`, `artlite-server` (an OpenAI-compatible API and llama.cpp's web chat,
   for one model or with a model picker over all of yours) and `artlite-bench`, with llama.cpp's option names where
@@ -108,10 +111,10 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 
 | model | weights | on the NPU |
 |---|---|---|
-| [Llama 3.2 1B, 3B, Llama 3.1 8B Instruct](docs/models/llama3.md) | GGUF Q2_K to Q6_K, Q4_0, Q4_1, BF16 | prefill, decode |
-| [Qwen3 0.6B, Qwen3-Embedding 0.6B / 4B, Qwen3-Reranker 0.6B / 4B, Decision-2.0-Kai 0.6B](docs/models/qwen3.md) | GGUF Q4_1, Q8_0, Q4_K_M | prefill, decode; embeddings, rerank, decisions |
-| [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0 | prefill, decode with its MTP drafter |
-| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B; the decision models d3-lite, d3-nano, Kev-4B](docs/models/qwen35.md) | GGUF Q4_K_M, Q8_0; Occamy's IQ3_XXS / Q3_K mix | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's); decisions, also about images |
+| [Llama 3.2 1B, 3B, Llama 3.1 8B Instruct](docs/models/llama3.md) | GGUF Q2_K to Q6_K, Q4_0, Q4_1, BF16; PARO int4 | prefill, decode |
+| [Qwen3 0.6B, Qwen3-Embedding 0.6B / 4B, Qwen3-Reranker 0.6B / 4B, Decision-2.0-Kai 0.6B](docs/models/qwen3.md) | GGUF Q4_1, Q8_0, Q4_K_M; PARO int4 | prefill, decode; embeddings, rerank, decisions |
+| [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0; PARO int4 | prefill, decode with its MTP drafter |
+| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B; the decision models d3-lite, d3-nano, Kev-4B](docs/models/qwen35.md) | GGUF Q4_K_M, Q8_0; Occamy's IQ3_XXS / Q3_K mix; PARO int4, int5 | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's); decisions, also about images |
 | [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B; the decision models d1-2B, d1-Omni-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio, LFM3-Omni Q4_K_M, Q4_0; d1-Omni Q8_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images and videos through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription) and its generator (text to speech, spoken replies); all of them in one model (LFM3-Omni: videos with their sound, realtime conversations); decisions, also about images, videos and audio |
 | [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.7x on code and math); tool calls, thinking levels |
 | [Flint](docs/models/flint.md) | GGUF int4 (Recursive's official file) | prefill, decode (a 40B mixture of experts, ~2.5B active: 31 tokens/s at 1K); tool calls, thinking |

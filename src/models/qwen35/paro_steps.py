@@ -13,7 +13,9 @@ the last layer's down (an identity copy over the output norm, ``image``); a DFla
 residual), in a region of its own (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
 expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
 copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
-(the 4-lane rounds, ``kmath.rotate``) or a dense model's of 8 (the rounds per half of 4 slots), one sequence."""
+(the 4-lane rounds, ``kmath.rotate``) or a dense model's of 8 (the rounds per half of 4 slots; several sequences:
+rot_g's and rot_o's inputs staged, which the GDN chains and the attention's passes write, gin_q's and gin_z's rows per
+chain, ``gdn_steps``' "Several sequences")."""
 
 from typing import TYPE_CHECKING
 
@@ -207,6 +209,9 @@ class ParoSteps(RotatedOverlay):
         L, name = phase
         S, cfg = st.S, self.cfg
         ffn = cfg.intermediate_size // COLS
+        if name in ("gin_q", "gin_z") and self.sequences > 1:  # (per chain into its sequence's objects)
+            self.gdn_steps.chain_rows(seq, st, L, S, name)
+            return
         for c in range(COLS):
             if name in ("rot_in", "eh"):
                 self.emit_copies(seq, c, S, self.copies_of(L))

@@ -288,14 +288,20 @@ class Screened:
     def __init__(self, screen: Screen, screened: np.ndarray, x: np.ndarray, alive: Callable[[], bool]):
         assert screened.dtype == bfloat16 and len(x) == len(screened)
         self.shape = screened.shape
-        self._of = (screen, screened, x)
+        self._of = (screen, screened, x, alive)
         self._rows = [ScreenedRow(screen, s, xi, alive) for s, xi in zip(screened, x, strict=True)]
 
     def take(self, a: int, b: int) -> "Screened":
         """Slots a .. b - 1 over copies of the NPU's rows: valid past the overlay's next dispatch of logits (several
         sequences' step: each one's rows, read while the next step runs)."""
-        screen, screened, x = self._of
+        screen, screened, x, _ = self._of
         return Screened(screen, screened[a:b].copy(), x[a:b], lambda: True)
+
+    def rows(self, sel: slice | np.ndarray) -> "Screened":
+        """The slots ``sel`` (a step's caller's rows of its slots): a slice's over the NPU's rows (valid as this
+        step's), an index array's over copies."""
+        screen, screened, x, alive = self._of
+        return Screened(screen, screened[sel], x[sel], alive)
 
     def __len__(self) -> int:
         return self.shape[0]

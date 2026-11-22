@@ -37,11 +37,15 @@ from .protocol import (
     M_NX,
     M_RGN,
     META,
+    STAGED_X,
     XB,
     XPAY,
     region_bytes,
     rot_input_fill,
     rot_region_bytes,
+    staged_cell,
+    staged_fill,
+    staged_region_bytes,
 )
 from .protocol import rot_objects as pack_rot_objects
 from .step import StepPlan
@@ -81,9 +85,10 @@ class RotatedOverlay:
         once."""
         return self.rot_kind(name) == "rotx" and all(ng == 1 for _, ng in self.rot_subs(L, name, S))
 
-    def _add_rot_inputs(self, phase: tuple[int, str], extra: int = 0) -> None:
+    def _add_rot_inputs(self, phase: tuple[int, str], extra: int = 0, staged: bool = False) -> None:
         """The input region of a rotated phase (module docstring; ``extra``: a "rotx" input's bytes per element past its
-        x, ``model.ModelOverlay._add_inputs``')."""
+        x, ``model.ModelOverlay._add_inputs``'; ``staged``: a "rotx" input's x in cells, ``protocol.staged_region_bytes``:
+        the attention's passes and the GDN chains of a step of several sequences write it)."""
         L, name = phase
         kind = self.rot_kind(name)
         if kind == "in":
@@ -91,8 +96,11 @@ class RotatedOverlay:
         elif kind == "rotx":  # (a metadata object per sub-phase: ``rot_subs``, then x)
             n, mul = self.rot_slice(L, name)
             K, subs = n * COLS, len(self.rot_subs(L, name, self.SLOTS))
-            off = self._take("ACT", region_bytes(K, mul * self.SLOTS) + (subs - 1) * XB + extra * K)
-            regs = [InputRegion(off + i * XB, 0, K, x0=(subs - i) * XB) for i in range(subs)]
+            assert not staged or mul == 1, name
+            x = (subs - 1) * XB + (staged_region_bytes(K, self.SLOTS) if staged else region_bytes(K, mul * self.SLOTS))
+            off = self._take("ACT", x + extra * K)
+            pad = STAGED_X - XB if staged else 0
+            regs = [InputRegion(off + i * XB, 0, K, staged=staged, x0=(subs - i) * XB + pad) for i in range(subs)]
         elif name == "tap":  # (a block drafter's tap: a plain copy of the layer's input, an F_PSQ input's layout)
             regs = [InputRegion(self._take("ACT", rot_region_bytes(self.H, self.SLOTS)), 0, self.H, x0=XB + XPAY)]
         else:
@@ -142,14 +150,15 @@ class RotatedOverlay:
                 g.meta[M_NT] += nrot
         return groups
 
-    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], fills: list[list[int]],
+    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str],
+                         fills: list[list[int | tuple[int, tuple[int, ...]]]],
                          a_fills: dict[tuple[int, int], int] | None = None) -> None:
-        """A phase's X fills of XB bytes at ACT offsets (``fills``: per column, in order) and its outputs: the fills in
-        rounds of one a column (a column's tasks in a row put the last column's first ~2 us behind), up to the 4 a
-        column's queue holds (empty after the phase's sync), then the drains, then the rest (past 4 queued fills a
-        column's next fill waits for its oldest, whose room the cores make only while their outputs drain): the cores
-        start on their first objects before the drains are written. ``a_fills``: {(column, X fill index): W offset}: an
-        A object (one tile) filled before that X fill (``rot_single``)."""
+        """A phase's X fills of XB bytes at ACT offsets (``fills``: per column, in order; (offset, dims): a staged x's
+        strips) and its outputs: the fills in rounds of one a column (a column's tasks in a row put the last column's
+        first ~2 us behind), up to the 4 a column's queue holds (empty after the phase's sync), then the drains, then
+        the rest (past 4 queued fills a column's next fill waits for its oldest, whose room the cores make only while
+        their outputs drain): the cores start on their first objects before the drains are written. ``a_fills``:
+        {(column, X fill index): W offset}: an A object (one tile) filled before that X fill (``rot_single``)."""
         n = max(len(f) for f in fills)
         for r in range(n):
             if r == txn.QUEUE_DEPTH:
@@ -158,7 +167,8 @@ class RotatedOverlay:
                 if a_fills and (c, r) in a_fills:
                     seq.fill("A", c, self.dev.address("W", a_fills[(c, r)]), self.image.tile_bytes)
                 if r < len(fills[c]):
-                    seq.fill("X", c, self.dev.address("ACT", fills[c][r]), XB)
+                    off, dims = fills[c][r] if isinstance(fills[c][r], tuple) else (fills[c][r], None)
+                    seq.fill("X", c, self.dev.address("ACT", off), XB, dims)
         if n <= txn.QUEUE_DEPTH:
             self._outputs(seq, st, phase)
 
@@ -175,13 +185,18 @@ class RotatedOverlay:
                 # slice's part, ``rot_subs``)
                 mul = self.rot_slice(*phase)[1]
                 x = rg.off + rg.x0
-                fills: list[list[int]] = [[] for _ in range(COLS)]
+                fills: list[list[int | tuple[int, tuple[int, ...]]]] = [[] for _ in range(COLS)]
                 single = self.rot_single(*phase, st.S)
                 a_fills: dict[tuple[int, int], int] = {}
                 r = self.rot_data_region(*phase) if single else None
+                if rg.staged:  # (the X object's strips a cell apart, its header's from the cells before: ``staged_fill``)
+                    assert sp == self.SLOTS, (phase, sp)
+                    cell, dims = staged_cell(self.SLOTS), staged_fill(XPAY // (2 * sp), self.SLOTS)[1]
                 for i, (g0, _) in enumerate(self.rot_subs(*phase, st.S)):
                     for c in range(COLS):
-                        at = x + 2 * mul * sp * (self.rot_start(*phase, c) + ROT_GROUP * g0) - (XB - XPAY)
+                        e = self.rot_start(*phase, c) + ROT_GROUP * g0
+                        at = (x + cell * (e // 8) - 2 * (XB - XPAY), dims) if rg.staged else \
+                            x + 2 * mul * sp * e - (XB - XPAY)
                         if single:  # (its group's A object, the group first: ``rot_single``)
                             a_fills[(c, len(fills[c]))] = (r.offset + c * r.col_stride + g0 // 2 * r.tile_bytes
                                                            + g0 % 2 * ROT_OBJ)

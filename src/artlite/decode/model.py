@@ -104,7 +104,8 @@ class InputRegion:
     K: int
     post: bool = False
     staged: bool = False
-    x0: int = XB  # (x's offset in the region: after the metadata object; a rotated input's after its partial sums object)
+    x0: int = XB  # (x's offset in the region: after the metadata object; a rotated input's after its partial sums object;
+    # a staged x's first cell)
 
 
 def host_bytes(shape: tuple[int, ...]) -> np.ndarray:
@@ -333,7 +334,8 @@ class ModelOverlay:
         for k0, g in mp.group_chunks(r):
             K = mp.group_K(r, k0, g)
             n = staged_region_bytes(K, self.SLOTS) if staged else post_region_bytes(K) if post else region_bytes(K, self.SLOTS)
-            regs.append(InputRegion(self._take("ACT", n + extra * K), k0 * r.kc, K, post, staged))
+            regs.append(InputRegion(self._take("ACT", n + extra * K), k0 * r.kc, K, post, staged,
+                                    STAGED_X if staged else XB))
         self.inp[phase] = regs
 
     def staged(self, phase: tuple[int, str]) -> bool:
@@ -347,8 +349,7 @@ class ModelOverlay:
         sp = self._sp(S, phase)
         for rg in self.inp[phase]:
             if rg.k0 <= e < rg.k0 + rg.K:
-                at = rg.off + STAGED_X + staged_cell(self.SLOTS) * ((e - rg.k0) // 8) if rg.staged else \
-                    rg.off + rg.x0 + 2 * sp * (e - rg.k0)
+                at = rg.off + rg.x0 + (staged_cell(self.SLOTS) * ((e - rg.k0) // 8) if rg.staged else 2 * sp * (e - rg.k0))
                 return at, 2 * sp * (rg.k0 + rg.K - e), 2 * self.SLOTS * rg.K
         raise ValueError(e)
 

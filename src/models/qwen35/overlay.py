@@ -46,7 +46,8 @@ objects, states and conv states in buffers of its own (``SEQ``; ``ModelOverlay.s
 its ``rope``. A step's slots may be several sequences' (``decode.step.Part``), with no kernel of its own: each attention
 runs a pass per sequence (``decode.attn256_steps``' "Several sequences") and each GDN layer a chain per sequence
 (``gdn_steps``' "Several sequences": its words in its header object, its rows drained into its objects, its outputs
-into its slots of gdn_out's staged x), and every slot's numbers are those of a step of its sequence alone.
+into its slots of gdn_out's staged x; a PARO checkpoint's: rot_g's, and the attention's passes write rot_o's), and every
+slot's numbers are those of a step of its sequence alone.
 """
 
 import dataclasses
@@ -84,7 +85,7 @@ from artlite.decode.protocol import (
     XPAY,
     interleave,
 )
-from artlite.decode.screen import Screen
+from artlite.decode.screen import Screen, Screened
 from artlite.decode.step import Part
 from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile, tensor_f32
@@ -177,11 +178,11 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         layers whose input goes out as a plain copy too, ``paro_steps``; the image's ``taps``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
-        self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``; one sequence)
+        self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``)
         self.taps = tuple(L for L in taps if L in self.layers) if self.paro else ()
         assert set(self.taps) <= set(img.taps), (self.taps, img.taps)
-        if self.paro and (sequences > 1 or slots not in (None, 4, 8) or (slots == 8 and cfg.moe)):
-            raise ValueError("a PARO checkpoint: one sequence, a design of 4 slots (a dense model's: 8)")
+        if self.paro and (slots not in (None, 4, 8) or (slots == 8 and cfg.moe)):
+            raise ValueError("a PARO checkpoint: a design of 4 slots (a dense model's: 8)")
         fmts = img.formats() | set(formats)
         gu_rows = img.gu_rows() | gu  # (``decode.design``'s gate / up windows: tiles of gate / up phases of other rows; a
         # PARO checkpoint has none, its gate and up phases of their own)
@@ -193,7 +194,7 @@ class QwenOverlay(ParoSteps, ModelOverlay):
                           slots_of(cfg, fmts, self.paro or (bool(cfg.nextn_layers) if drafts is None else drafts)))
         if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
             raise ValueError(f"{sequences} sequences: a dense model whose formats run on the design of 8 slots "
-                             f"(``runs_eight``: its tile formats, an image whose LM head is not screened)")
+                             f"(``runs_eight``: its tile formats, a screened LM head's plane among them)")
         if sequences > 8:
             raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
@@ -311,10 +312,11 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         for L, name in self._phases():  # (the GDN step's outputs' x (gdn_out's, PARO's rot_g): the GDN pads' sink past
             # it; several sequences: the x that the attention's passes and the GDN chains write staged)
             sink = 2 * self.SLOTS if name == ("rot_g" if self.paro else "gdn_out") else 0
+            staged = self.sequences > 1 and name in (("rot_o", "rot_g") if self.paro else ("attn_out", "gdn_out"))
             if self.rot_kind(name) is not None:
-                self._add_rot_inputs((L, name), extra=sink)
+                self._add_rot_inputs((L, name), extra=sink, staged=staged)
                 continue
-            self._add_inputs((L, name), extra=sink, staged=self.sequences > 1 and name in ("attn_out", "gdn_out"))
+            self._add_inputs((L, name), extra=sink, staged=staged)
         for L in self.taps:  # (a DFlash2 drafter's taps: plain copies, no phase reads them)
             self._add_rot_inputs((L, "tap"))
         self.norm_off: dict[tuple[int, str], int] = {}
@@ -853,14 +855,16 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         self._kept_rows = keep
         self.gdn_steps.set_chain_words(parts)
         self._write_loadr(x)
-        first = self._input(self.layers[0])
-        self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
+        if not self.paro:  # (PARO: rot_in's copies of the residual)
+            first = self._input(self.layers[0])
+            self._write_input(self.inp[first][0], interleave(x, self._sp(S, first)).view(np.uint8).reshape(-1))
         out = self._run(S, parts, logits)
         for cur in curs:
             cur.accepted = False
         if out is None:
             return None
-        return out[:len(keep)] if keep[-1] == len(keep) - 1 else out[keep]  # (the caller's rows: a view, else a copy)
+        sel = slice(0, len(keep)) if keep[-1] == len(keep) - 1 else keep  # (the caller's rows: a view, else a copy)
+        return out.rows(sel) if isinstance(out, Screened) else out[sel]
 
     def _run(self, S: int, position: int | tuple[Part, ...], logits: bool) -> np.ndarray | None:
         """(a step that ``patch_ahead`` patched patches none ahead itself: ``STEPS_AHEAD``)"""

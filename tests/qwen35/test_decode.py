@@ -639,43 +639,50 @@ def test_gdn_steps_27b() -> None:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("size", ["1B", "9B", "3.8-27B"])
+@pytest.mark.parametrize("size", ["1B", "9B", "3.8-27B", "0.8B-paro", "27B-paro"])
 def test_overlay_sequences(size: str) -> None:
     """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; tokens of their own, at
     positions of their own) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay
     of one sequence: alternated (``select``: a round of 1 .. 8 slots of one, some of them kept, then of the next) and
     in joint steps (``step``'s parts: a GDN chain and an attention pass per sequence; slots dealt at random, drafts
     kept or not, one sequence joining later, chains across their blocks' ends); the first layers up to the first
-    full-attention layer."""
+    full-attention layer. PARO checkpoints (Qwen3.5-0.8B-PARO, Qwen3.8-27B-PARO-int5): their rotations' inputs from the
+    attention's passes and the GDN chains staged, gin_q's and gin_z's rows per chain, the screened LM head's plane rows."""
     from artlite.decode.step import Part
+    from artlite.hf_model import HfModel
+    from artlite.model_config import checkpoint
     from models.qwen35.overlay import QwenOverlay
 
-    path = size_gguf(size)
+    paro = {"0.8B-paro": "qwen3.5-0.8B-paro", "27B-paro": "qwen3.8-27B-paro-int5"}.get(size)
+    path = checkpoint(paro) if paro else size_gguf(size)
     require(path)
-    g = GGUFFile(path)
+    g = HfModel(path) if paro else GGUFFile(path)
     layers = list(range(QwenConfig.from_gguf(g).attention_layers[0] + 1))
     lengths = (90, 60, 44)
     nseq = len(lengths)
     rng = np.random.default_rng(7)
     toks = [[int(t) for t in rng.integers(0, 50000, n)] for n in lengths]
     emb = [g.rows("token_embd.weight", t) for t in toks]
-    def image() -> QwenImage:  # (the LM head's rows whole, as a model of several sequences lays them out)
-        return QwenImage(g, layers=layers, vocab=COLS * 64, screen=False)
+    def image() -> QwenImage:  # (the LM head's rows whole, as a model of several sequences lays them out; a PARO
+        # checkpoint's screened: the NPU's rows of its plane)
+        return QwenImage(g, layers=layers, vocab=COLS * 64, screen=bool(paro))
+
+    def bits(row: object) -> np.ndarray:
+        return np.asarray(getattr(row, "screened", row)).view(np.uint16)
 
     one = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, slots=8, image=image())
     one.load()
     want = []
     for s in range(nseq):  # (alone: an overlay of one sequence, in steps of one)
         one.reset()
-        want.append([np.asarray(one.step(emb[s][p:p + 1], p)[0]).view(np.uint16).copy() for p in range(lengths[s])])
+        want.append([bits(one.step(emb[s][p:p + 1], p)[0]).copy() for p in range(lengths[s])])
     one.dev = None
     ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, sequences=nseq, image=image())
     ov.load()
-    assert ov.SLOTS == 8
+    assert ov.SLOTS == 8 and bool(ov.screen) == bool(paro)
 
-    def check(got: np.ndarray, at: list[tuple[int, int]], what: str) -> None:
-        bad = [(s, p) for row, (s, p) in zip(got, at, strict=True)
-               if not np.array_equal(np.asarray(row).view(np.uint16), want[s][p])]
+    def check(got: object, at: list[tuple[int, int]], what: str, a: int = 0) -> None:
+        bad = [(s, p) for k, (s, p) in enumerate(at) if not np.array_equal(bits(got[a + k]), want[s][p])]
         assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
 
     def slots(s: int, p: int, n: int) -> tuple[np.ndarray, int]:
@@ -700,7 +707,7 @@ def test_overlay_sequences(size: str) -> None:
         if n:
             ov.select(s)
             x, m = slots(s, pos[s], n)
-            check(ov.step(x, pos[s], commit=False)[:m], [(s, pos[s] + k) for k in range(m)], "alternated")
+            check(ov.step(x, pos[s], commit=False), [(s, pos[s] + k) for k in range(m)], "alternated")
             ov.accept(m)
             pos[s] += m
 
@@ -720,7 +727,7 @@ def test_overlay_sequences(size: str) -> None:
         got = ov.step(np.concatenate([x for x, _ in rows]), parts)
         a = 0
         for (s, n), (_, m) in zip(take, rows, strict=True):
-            check(got[a:a + m], [(s, pos[s] + k) for k in range(m)], f"step {steps}")
+            check(got, [(s, pos[s] + k) for k in range(m)], f"step {steps}", a)
             ov.accept(m, s)
             pos[s] += m
             a += n

@@ -12,10 +12,11 @@ step of one sequence: one chain), each the core's step of that sequence's slots 
   sequence's header object, which has ``F_GIN`` beside ``F_GDN`` (``gdn.entry8``'s ``gbegin`` takes the step's words
   where it finds ``F_GIN``: after the gdn_in phase's own object, whose words the header's replace);
 - gdn_in's rows are drained per chain into its sequence's objects, the chain's first slot's as the objects' first (a
-  drain per group of the stream's objects - the q and k blocks' halves, the v heads' v and z halves, ab - and chain);
+  drain per group of the stream's objects - the q and k blocks' halves, the v heads' v and z halves, ab - and chain; a
+  PARO checkpoint's gin_q's and gin_z's: ``chain_rows``);
 - its objects, histories and states are its sequence's (GOBJ, GSTATE: every transfer's address patched per step,
   ``patch_chains``; the state panels from its block's half);
-- its outputs, whole heads of 8 slots, go into gdn_out's staged x from the chain's first slot on
+- its outputs, whole heads of 8 slots, go into gdn_out's staged x (a PARO checkpoint's rot_g's) from the chain's first slot on
   (``decode.protocol.staged_region_bytes``), the block's gates after them into the sink or, the last head's, into the
   sequence's header.
 
@@ -31,13 +32,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from artlite.decode.attn256 import M_BRANCH
-from artlite.decode.protocol import C_LEN, DIMS_OBJ, M_NS, STAGED_X, XB, XPAY, staged_cell
+from artlite.decode.protocol import C_LEN, DIMS_OBJ, M_NS, XB, XPAY, staged_cell
 from artlite.decode.step import Part
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence
 
 from . import gdn
-from .image import gdn_v_heads
 from .steps import ChainBD, PanelTable, StatePanel, Step
 from .words import M_COMMIT, M_CSHIFT, M_KSHIFT, M_NREP
 
@@ -232,16 +232,44 @@ class GdnTransfers:
             seq.drain("C", c, pay(c, gdn.H_SLOT) + gdn.H_AB, 2 * S * C_LEN)  # ab
         seq.sync()
 
+    def chain_rows(self, seq: Sequence, st: Step, L: int, S: int, part: str = "") -> None:
+        """(an overlay of several sequences) gdn_in's rows per chain into its sequence's objects, the chain's first slot's
+        as their first (module docstring "Several sequences"; ``part``: of a PARO checkpoint's gin_q, the q and k blocks
+        and the v heads' v halves, or gin_z's, their z halves and ab), every drain recorded (``patch_chains``)."""
+        ov = self.ov
+        sh, hc = ov.gsh, ov.gsh.hc
+        chains = [(a, n) for a, n, _ in st.subs] if len(st.subs) > 1 else [(0, S)]
+        gobj, row = ov.dev.address("GOBJ"), 2 * C_LEN  # (bytes of a slot's object of gdn_in's rows)
+
+        def dests(c: int) -> list[int]:  # (the stream's groups in its order: a block's objects (half, slot); then ab)
+            def pay(k: int) -> int:
+                return ov.gdn_payload(L, c, k)
+
+            out = [pay(sh.kh_slot(kh) + 1) + 3 * 2 * gdn.D + 8 * row * half for kh in range(2) for half in range(2)]
+            out += [pay(sh.kh_slot(kh) + 4) + 8 * row * half for kh in range(2) for half in range(2)]
+            out += [pay(sh.v_slot(h) + 2) + 2048 * z + 8 * row * half for z in range(2) for h in range(hc)
+                    for half in range(2)]
+            out.append(pay(gdn.H_SLOT) + gdn.H_AB)
+            nq = 8 + 2 * hc  # (gin_q's groups: q, k, the v halves)
+            return out[:nq] if part == "gin_q" else out[nq:] if part == "gin_z" else out
+
+        # (per group each chain's slots, in rounds over the columns: a column's drains in a row would hold the others'
+        # rows back, a channel queues 4)
+        for ds in zip(*(dests(c) for c in range(COLS)), strict=True):
+            for u, (_, n) in enumerate(chains):
+                for c, d in enumerate(ds):
+                    st.chains.append(ChainBD(seq.drain("C", c, gobj + d, n * row)[0], u, ChainBD.ROWS, d))
+
     def _chains(self, seq: Sequence, st: Step, L: int, S: int) -> None:
         """(an overlay of several sequences, 8 slots) gdn_in and a GDN chain per sequence of the step (module docstring
-        "Several sequences"): gdn_in's rows per chain into its objects' first slots (a sync), then per chain its units
-        as ``_chunkwise``'s, every transfer in a sequence's buffer recorded (``Step.chains``: ``patch_chains``)."""
+        "Several sequences"): gdn_in's rows per chain into its objects' first slots (``chain_rows``; a PARO checkpoint's
+        gin_q's and gin_z's, ``paro_steps``), a sync, then per chain its units as ``_chunkwise``'s, every transfer in a
+        sequence's buffer recorded (``Step.chains``: ``patch_chains``)."""
         ov = self.ov
         dev, sh, hc = ov.dev, ov.gsh, ov.gsh.hc
         chains = [(a, n) for a, n, _ in st.subs] if len(st.subs) > 1 else [(0, S)]
         assert ov.ends or len(chains) == 1, "a step of several sequences: every chain ends its block"
         gobj, gstate = dev.address("GOBJ"), dev.address("GSTATE")
-        row = 2 * C_LEN  # (bytes of a slot's object of gdn_in's rows)
 
         def pay(c: int, k: int) -> int:
             return ov.gdn_payload(L, c, k)
@@ -249,23 +277,10 @@ class GdnTransfers:
         def rec(at: int, u: int, kind: int, offset: int) -> None:
             st.chains.append(ChainBD(at, u, kind, offset))
 
-        self._gdn_in(seq, L, S)
-
-        def dests(c: int) -> list[int]:  # (the stream's groups in its order: a block's objects (half, slot); then ab)
-            out = [pay(c, sh.kh_slot(kh) + 1) + 3 * 2 * gdn.D + 8 * row * half for kh in range(2) for half in range(2)]
-            out += [pay(c, sh.kh_slot(kh) + 4) + 8 * row * half for kh in range(2) for half in range(2)]
-            out += [pay(c, sh.v_slot(h) + 2) + 2048 * z + 8 * row * half for z in range(2) for h in range(hc)
-                    for half in range(2)]
-            return [*out, pay(c, gdn.H_SLOT) + gdn.H_AB]
-
-        # (per group each chain's slots, in rounds over the columns: a column's drains in a row would hold the others'
-        # rows back, a channel queues 4)
-        for ds in zip(*(dests(c) for c in range(COLS)), strict=True):
-            for u, (_, n) in enumerate(chains):
-                for c, d in enumerate(ds):
-                    rec(seq.drain("C", c, gobj + d, n * row)[0], u, ChainBD.ROWS, d)
+        self._gdn_in(seq, L, S, st)
+        if not ov.paro:
+            self.chain_rows(seq, st, L, S)
         seq.sync()
-        vh = [gdn_v_heads(ov.cfg, c) for c in range(COLS)]
         last = hc - 1  # (the last v head the core runs: k head 1's last)
         cell = staged_cell(ov.SLOTS)
         for u, (a, n) in enumerate(chains):
@@ -294,12 +309,13 @@ class GdnTransfers:
                 rec(seq.drain("D", c, gobj + o, 2 * gdn.D_BYTES)[0], u, ChainBD.GOBJ, o)
 
             def v_do(h: int, c: int, u: int = u, a: int = a) -> None:
-                # (its gated outputs (2 KB: [k block 16][slot 8][8]) into the cells of its head in gdn_out's staged x from the
-                # chain's first slot on; the block's gates after them (2 KB): of the last head into the header, else into
-                # the sink past that K group's x)
-                e = gdn.D * vh[c][h]
-                rg = next(r for r in ov.inp[(L, "gdn_out")] if r.k0 <= e < r.k0 + r.K)
-                x = rg.off + STAGED_X + cell * ((e - rg.k0) // 8)
+                # (its gated outputs (2 KB: [k block 16][slot 8][8]) into the cells of its head in the staged x of gdn_out (a
+                # PARO checkpoint's rot_g: ``gdn_x``) from the chain's first slot on; the block's gates after them (2 KB): of
+                # the last head into the header, else into the sink past that K group's x)
+                phase, e = ov.gdn_x(L, c, h)
+                rg = next(r for r in ov.inp[phase] if r.k0 <= e < r.k0 + r.K)
+                assert rg.staged, phase
+                x = rg.off + rg.x0 + cell * ((e - rg.k0) // 8)
                 kb = cell // 8  # (words of a k block)
                 at = seq.drain("D", c, dev.address("ACT", x + 16 * a), gdn.D_BYTES // 2, (kb, gdn.D // 8, 2 * kb, 2 * kb * gdn.D // 8))[0]
                 rec(at, u, ChainBD.OUT, x)
@@ -307,7 +323,7 @@ class GdnTransfers:
                     o = pay(c, gdn.H_SLOT) + gdn.H_DN
                     rec(seq.drain("D", c, gobj + o, gdn.D_BYTES // 2)[0], u, ChainBD.GOBJ, o)
                 else:
-                    sink = rg.off + STAGED_X + cell * (rg.K // 8) + 2 * ov.SLOTS * (e - rg.k0)
+                    sink = rg.off + rg.x0 + cell * (rg.K // 8) + 2 * ov.SLOTS * (e - rg.k0)
                     seq.drain("D", c, dev.address("ACT", sink), gdn.D_BYTES // 2)
 
             units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_dh, v_do)))

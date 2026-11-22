@@ -500,10 +500,10 @@ class Qwen(Model):
                 else "none")
         if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
-        paro = bool(getattr(self.gguf, "paro_bits", 0))  # (a PARO checkpoint, no MTP tensors: a DFlash2 drafter)
+        self.paro = bool(getattr(self.gguf, "paro_bits", 0))  # (a PARO checkpoint, no MTP tensors: a DFlash2 drafter)
         self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
                        qwen_dflash_of(path) if kind == "auto" and mmproj is None
-                       and (paro or self.cfg.nextn_layers and self._eight()) else None)
+                       and (self.paro or self.cfg.nextn_layers and self._eight()) else None)
         if kind == "draft-dflash" and self.dflash is None:
             raise ValueError(f"{path}: no DFlash2 drafter (a <repository>-DFlash2-GGUF of Q4_K_M) in the models directory")
         # (the MTP drafter, ``NpuQwen``'s: "" the file's own block, else a qwen35moe model's MTP file; a file; None)
@@ -572,29 +572,29 @@ class Qwen(Model):
 
     @property
     def parallel(self) -> bool:  # type: ignore[override]
-        """(a dense chat model whose tile formats run on the design of 8 slots, its LM head's rows whole:
-        ``overlay.runs_eight``)"""
+        """(a dense chat model whose tile formats run on the design of 8 slots, its LM head's rows whole - a PARO
+        checkpoint's screened, its plane Q4_0: ``overlay.runs_eight``)"""
         if not (self.generates and self.cfg.causal):
             return False
-        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=False).formats())
+        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=self.paro).formats())
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
-        """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole, the file's MTP block as the drafter where
-        it has one and a drafter is asked for, a DFlash2 drafter's place too)"""
+        """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole (a PARO checkpoint's screened), the file's MTP
+        block as the drafter where it has one and a drafter is asked for, a DFlash2 drafter's place too)"""
         if sequences == 1:
             self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
                                 dflash=self.dflash, readout=not self.generates)
             return self._npu
         own = self._own()
         if self.dflash is not None:
-            log.warning("%s with %d sequences drafts with its MTP layer (the DFlash2 drafter's records follow one "
-                        "sequence)", self.name, sequences)
+            log.warning("%s with %d sequences %s (the DFlash2 drafter's records follow one sequence)", self.name,
+                        sequences, "drafts with its MTP layer" if own else "runs without a drafter")
         weights = self.weights
-        if weights.image.screen or (weights.image.mtp_layer >= 0) != own:  # (the image packed again: its LM head's
-            # rows whole, the MTP block where it drafts)
+        if (weights.image.screen and not self.paro) or (weights.image.mtp_layer >= 0) != own or weights.image.taps:
+            # (the image packed again: its LM head's rows whole, the MTP block where it drafts, no DFlash2 drafter's taps)
             weights.wait()
             self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=own, pairs=self.generates,
-                                                            screen=False))
+                                                            screen=self.paro))
         self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights,
                             drafter="" if own else None, readout=not self.generates, sequences=sequences)
         return self._npu

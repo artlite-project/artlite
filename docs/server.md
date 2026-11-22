@@ -470,7 +470,7 @@ saves the state where each prompt's last message begins, and a turn continues fr
 
 ### Several requests at a time
 
-With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.5-9B, Qwen3.6-27B, Qwen3.8-27B and MiniCPM-V 4.7 serve up to N requests at a time. The NPU holds N
+With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.5-9B, Qwen3.6-27B, Qwen3.8-27B (their PARO checkpoints too) and MiniCPM-V 4.7 serve up to N requests at a time. The NPU holds N
 sequences, each with KV caches of `-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the
 requests that generate share their decode steps. A step streams the weights once for 4 tokens: with one request those
 are its token and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a

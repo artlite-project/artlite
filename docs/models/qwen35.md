@@ -88,12 +88,13 @@ driver's hang detection. The prompt's last logits come from the LM head alone. T
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
 Several requests at a time (`artlite-server -np N`, up to 8; MiniCPM-V's language model, Qwen3.5-9B, Qwen3.6-27B,
-Qwen3.8-27B and Swift 1.5: the dense files, on the design of 8 tokens per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.1 GB a sequence on the 9B, 0.3 GB on the 27B), and a decode
+Qwen3.8-27B and Swift 1.5: the dense files and PARO checkpoints, on the design of 8 tokens per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.1 GB a sequence on the 9B, 0.3 GB on the 27B), and a decode
 step's 8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them,
 each attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per
 sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.05x / 1.12x / 1.39x a step of one,
 so 4 requests get 3.2x and 8 get 4.8x one request's tokens per second in all (the 27B; the 9B: 1.07x / 1.16x / 1.50x,
-3.3x and 4.8x). The LM head is then read whole, and the 9B, whose three formats' kernels do not fit a main core of
+3.3x and 4.8x). The LM head is then read whole (a PARO checkpoint's stays screened: its plane's Q4_0 runs on that
+design), and the 9B, whose three formats' kernels do not fit a main core of
 that design together, loads each as a code page: one request alone gets 10.7 tokens per second there instead of
 12.5 (MiniCPM-V, whose own design is of 4 tokens too: 98 instead of 115, and 135 / 164 / 172 for 2 / 4 / 8 requests).
 A file's MTP layer (Qwen3.8-27B's, Swift 1.5's) drafts for every request (a cache of its own per sequence, its guesses for a request ahead
