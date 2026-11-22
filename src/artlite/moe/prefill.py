@@ -12,9 +12,10 @@ layer, after the post-attention norm with lo panels (PXM: per token [x hi | x lo
    ``gather.CombineOperator``);
 
 then the model's residual norm adds DL. PARO (``paro``: rotated inputs, ``decode.rotated``): the norm's x / rms as bf16
-blocks, its rotated copy (the experts' gate / up rotation) as single panels (XR: the router's and the shared expert's A,
-their rows folded into it) and as bf16 rows (PXR: ``prefill.rotate``'s rows_out), which the gather takes plain; the
-experts' h rotated in place before their downs (``slot_rot``). The router and the shared expert's GEMMs run one item each over the chunk
+blocks, its rotated copy (the experts' gate / up rotation) as [hi | lo] panels (XR: the router's and the shared expert's
+A, their rows folded into it; ``prefill.rotate``'s hilo: one panel of x' flips the top 8 of 2-3% of the tokens a layer)
+and as bf16 rows (PXR: its rows_out), which the gather takes plain; the experts' h rotated in place before their downs
+(``slot_rot``). The router and the shared expert's GEMMs run one item each over the chunk
 (from ``sub`` tokens on: their token chunks a scratchpad parameter, ``params``; an item per sub-chunk would pay each
 item's pipeline fill and drain). The buffers are the chunk's, shared by the layers (one layer's block in flight). ``cap``: chunks per column at most (the worst case of a chunk of ``max_t`` tokens: ceil((256 + max_t k /
 CHUNK) / COLS))."""
@@ -41,8 +42,8 @@ class MoEPrefill:
 
     def __init__(self, image: object, *, layers: list[int], sizes: tuple[int, ...], sub: int, eps: float,
                  gating: str = "softmax", paro: int = 0):
-        """paro: a PARO checkpoint's (rotated inputs: module docstring's "PARO"), the bytes of a token's single panels
-        of the hidden size (the rotated copy's, XR)."""
+        """paro: a PARO checkpoint's (rotated inputs: module docstring's "PARO"), the bytes of a token's row of the
+        rotated copy's hi and lo panels (XR)."""
         cfg = image.cfg
         self.img, self.layers, self.sub, self.eps, self.gating, self.paro = image, layers, sub, eps, gating, paro
         self.H, self.E, self.K = cfg.hidden_size, cfg.n_experts, cfg.n_experts_used
@@ -80,10 +81,9 @@ class MoEPrefill:
         """Layer L's GEMMs of a chunk of T tokens: the router, the shared gate / up and down; from ``sub`` tokens on one
         item each over the whole chunk (their token chunks a scratchpad parameter: ``params``)."""
         mi = self.img.region(L, "moe_in")
-        whole, lo = T >= self.sub, not self.paro
-        return SimpleNamespace(router=MG.router(self.img, mi, T, ops=self._gemms, whole=whole, lo=lo),
-                               sgu=MG.shared_gate_up(self.img, mi, T, width=self.Fs, ops=self._gemms, whole=whole,
-                                                     lo=lo),
+        whole = T >= self.sub
+        return SimpleNamespace(router=MG.router(self.img, mi, T, ops=self._gemms, whole=whole),
+                               sgu=MG.shared_gate_up(self.img, mi, T, width=self.Fs, ops=self._gemms, whole=whole),
                                sdown=MG.row_group_gemm(self.img.region(L, "sdown"), T, pitch=self.pitch,
                                                        row=ds_row(self.H, self.pitch), ops=self._gemms, whole=whole))
 

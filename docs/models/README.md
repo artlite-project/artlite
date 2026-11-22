@@ -23,8 +23,8 @@ weight with their scales), each projection's input rotated on the NPU as the che
 and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
 against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s),
-z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.4 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
-bytes a token; prompts at the GGUF's speed: 1360 tokens per second at 1024 tokens).
+z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
+bytes a token; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357).
 
 ## Tested files and plans
 

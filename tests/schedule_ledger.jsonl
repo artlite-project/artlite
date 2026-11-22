@@ -321,7 +321,7 @@
 {"section": "dfc7e32bb3b8", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=1024, N=8704, tile_bytes=9280, col_bytes=157760, passes=1, kc=1024, kc_group=1, region_rt=17, c_pairs=True, pace=0"}
 {"section": "c99be5f7bff7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=1024, tile_bytes=9280, col_bytes=137625600, passes=2, kc=1024, kc_group=2, region_rt=17, k_rep=2, c_pairs=True, pace=0"}
 {"section": "d426d01c53be", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=1024, tile_bytes=9280, col_bytes=172228608, passes=2, kc=1024, kc_group=2, region_rt=19, k_rep=2, c_pairs=True, pace=0"}
-{"section": "b706734f702a", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=1, c_pairs=True, pace=0"}
+{"section": "ba4b7cfc33ab", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=2, c_pairs=True, pace=0"}
 {"section": "8a24680420c1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=12800, tile_bytes=9280, col_bytes=631040, passes=1, kc=1024, kc_group=2, region_rt=34, c_pairs=True, pace=0"}
 {"section": "c7463db056cf", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=13312, tile_bytes=9280, col_bytes=172228608, passes=1, kc=1024, kc_group=2, region_rt=115, c_pairs=True, pace=0"}
 {"section": "e1f82e4d5b6c", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=128, K=2048, N=512, tile_bytes=9216, col_bytes=120848384, passes=1, kc=1024, kc_group=2, region_rt=24, k_rep=2, c_pairs=True, pace=0"}
@@ -335,7 +335,7 @@
 {"section": "17649bb02c01", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=1024, N=8704, tile_bytes=9280, col_bytes=157760, passes=1, kc=1024, kc_group=1, region_rt=17, c_pairs=True, pace=0"}
 {"section": "e54128f541c0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=1024, tile_bytes=9280, col_bytes=137625600, passes=2, kc=1024, kc_group=2, region_rt=17, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "988cd86554d6", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=1024, tile_bytes=9280, col_bytes=172228608, passes=2, kc=1024, kc_group=2, region_rt=19, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
-{"section": "237114334c5d", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=1, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
+{"section": "a6c8ecb453ba", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "27d1dce6c1c2", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=12800, tile_bytes=9280, col_bytes=631040, passes=1, kc=1024, kc_group=2, region_rt=34, c_pairs=True, pace=0"}
 {"section": "4fc189db4f08", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=13312, tile_bytes=9280, col_bytes=172228608, passes=1, kc=1024, kc_group=2, region_rt=115, c_pairs=True, pace=0"}
 {"section": "7dff761ccc47", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=2048, N=512, tile_bytes=9216, col_bytes=120848384, passes=1, kc=1024, kc_group=2, region_rt=24, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
@@ -348,7 +348,7 @@
 {"section": "3aaa0a936376", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=256, K=5120, N=17920, tile_bytes=9280, col_bytes=2923200, passes=1, kc=1024, kc_group=5, region_rt=63, c_pairs=True, pace=0"}
 {"section": "7b4425192e9e", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=137625600, passes=2, kc=1024, kc_group=2, region_rt=17, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "4b4e31e5c8ec", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=172228608, passes=2, kc=1024, kc_group=2, region_rt=19, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
-{"section": "08b840c7359c", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=1, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
+{"section": "11fb01d7ad7f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "7b2676c3e9e0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=512, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, silu=True, act='silu', c_bfp16=True, region_rt=16, mc_param='moe_t', mc_unit=256, pace=4"}
 {"section": "85f37f0b275f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=8192, K=2048, N=512, tile_bytes=9216, col_bytes=120848384, passes=1, kc=1024, kc_group=2, region_rt=24, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "42d1f9f5e1e7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
@@ -1027,7 +1027,7 @@
 {"section": "071640839edf", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024, copies=3, bf16=True"}
 {"section": "a02730c9147c", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=17408, gu=True"}
 {"section": "f94bc29fc053", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048"}
-{"section": "61095bc01d4b", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, bf16=True"}
+{"section": "c9b88d520cef", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, bf16=True, hilo=True"}
 {"section": "d28c132e2327", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, bf16=True, rows_out=True"}
 {"section": "644019fa91b6", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, copies=2, bf16=True"}
 {"section": "704231f602fc", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, copies=3, bf16=True"}
@@ -1041,7 +1041,7 @@
 {"section": "f8ece7224362", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=1024, copies=3, bf16=True"}
 {"section": "987c7440239e", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=17408, gu=True"}
 {"section": "813938ace329", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048"}
-{"section": "f88fe349c916", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, bf16=True"}
+{"section": "2fcf4519e494", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, bf16=True, hilo=True"}
 {"section": "53a68ff8f902", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, bf16=True, rows_out=True"}
 {"section": "965fcd4718c9", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, copies=2, bf16=True"}
 {"section": "aa74d5b90032", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, copies=3, bf16=True"}
@@ -1675,11 +1675,11 @@
 {"fn": "gq_pairs", "in": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "cycles": 8555, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
 {"fn": "gq_zero", "in": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "cycles": 79, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 64, "spills": 0, "bytes": 16}]}
 {"fn": "gq_zerof", "in": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
-{"fn": "gq_dq", "in": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 311, "upper": false, "bytes": 592, "stack": 128, "calls": [], "loops": [{"at": "gq_dq+18", "parent": -1, "sched": "post-RA", "ii": 36, "ns": 2, "bound": 36, "iters": 7, "spills": 2, "bytes": 240}]}
-{"fn": "gq_mm", "in": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 284, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 7, "spills": 0, "bytes": 320}]}
-{"fn": "gq_mmf", "in": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 408, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 7, "spills": 8, "bytes": 400}]}
-{"fn": "gq_pairs", "in": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 8555, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
-{"fn": "gq_zerof", "in": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
+{"fn": "gq_dq", "in": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 311, "upper": false, "bytes": 592, "stack": 128, "calls": [], "loops": [{"at": "gq_dq+18", "parent": -1, "sched": "post-RA", "ii": 36, "ns": 2, "bound": 36, "iters": 7, "spills": 2, "bytes": 240}]}
+{"fn": "gq_mm", "in": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 284, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 7, "spills": 0, "bytes": 320}]}
+{"fn": "gq_mmf", "in": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 408, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 7, "spills": 8, "bytes": 400}]}
+{"fn": "gq_pairs", "in": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 8555, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
+{"fn": "gq_zerof", "in": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
 {"fn": "gq_dq", "in": "e1f82e4d5b6c", "apps": ["flint-int4"], "cycles": 311, "upper": false, "bytes": 592, "stack": 128, "calls": [], "loops": [{"at": "gq_dq+18", "parent": -1, "sched": "post-RA", "ii": 36, "ns": 2, "bound": 36, "iters": 7, "spills": 2, "bytes": 240}]}
 {"fn": "gq_mm", "in": "e1f82e4d5b6c", "apps": ["flint-int4"], "cycles": 284, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 7, "spills": 0, "bytes": 320}]}
 {"fn": "gq_mmf", "in": "e1f82e4d5b6c", "apps": ["flint-int4"], "cycles": 408, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 7, "spills": 8, "bytes": 400}]}
@@ -1728,10 +1728,10 @@
 {"fn": "gq_pairs", "in": "4b4e31e5c8ec", "apps": ["occamy-1.0-APEX"], "cycles": 17087, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
 {"fn": "gq_zero", "in": "4b4e31e5c8ec", "apps": ["occamy-1.0-APEX"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
 {"fn": "gq_zerof", "in": "4b4e31e5c8ec", "apps": ["occamy-1.0-APEX"], "cycles": 271, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 256, "spills": 0, "bytes": 16}]}
-{"fn": "gq_mm", "in": "08b840c7359c", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 540, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
-{"fn": "gq_mmf", "in": "08b840c7359c", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 784, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 15, "spills": 8, "bytes": 400}]}
-{"fn": "gq_pairs", "in": "08b840c7359c", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 17087, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
-{"fn": "gq_zerof", "in": "08b840c7359c", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 271, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 256, "spills": 0, "bytes": 16}]}
+{"fn": "gq_mm", "in": "11fb01d7ad7f", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 540, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
+{"fn": "gq_mmf", "in": "11fb01d7ad7f", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 784, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 15, "spills": 8, "bytes": 400}]}
+{"fn": "gq_pairs", "in": "11fb01d7ad7f", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 17087, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
+{"fn": "gq_zerof", "in": "11fb01d7ad7f", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 271, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 256, "spills": 0, "bytes": 16}]}
 {"fn": "gq_silu", "in": "7b2676c3e9e0", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 1442, "upper": false, "bytes": 1440, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 6, "bound": 8, "iters": 59, "spills": 0, "bytes": 96}, {"at": "gq_silu+13", "parent": -1, "sched": "post-RA", "ii": 4, "ns": 6, "bound": 4, "iters": 27, "spills": 0, "bytes": 48}]}
 {"fn": "gq_mm", "in": "85f37f0b275f", "apps": ["flint-int4"], "cycles": 540, "upper": false, "bytes": 768, "stack": 0, "calls": [], "loops": [{"at": "mac+17", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
 {"fn": "gq_mmf", "in": "85f37f0b275f", "apps": ["flint-int4"], "cycles": 784, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 15, "spills": 8, "bytes": 400}]}
@@ -3475,8 +3475,12 @@
 {"fn": "prot_u0", "in": "987c7440239e", "apps": ["qwen3.8-27B-PARO-int5"], "cycles": 2877, "upper": false, "bytes": 1632, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w4x256_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w4x256_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 60, "spills": 0, "bytes": 96}, {"at": "prot_u0+9", "parent": -1, "sched": "none", "ii": 95, "ns": 1, "bound": 39, "iters": 16, "spills": 0, "bytes": 512}]}
 {"fn": "prot_rot", "in": "813938ace329", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["813938ace329", "prot_u0", 1], ["f8ece7224362", "prot_out", 1], ["f8ece7224362", "prot_round", 8]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_u0", "in": "813938ace329", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+20", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
-{"fn": "prot_out", "in": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 1326, "upper": false, "bytes": 752, "stack": 0, "calls": [], "loops": [{"at": "prot_out+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 450}, {"at": "prot_out+11", "parent": 0, "sched": "pre-RA", "ii": 19, "ns": 3, "bound": 19, "iters": 14, "spills": 0, "bytes": 208}]}
-{"fn": "prot_rot", "in": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 7098, "upper": false, "bytes": 272, "stack": 64, "calls": [["53a68ff8f902", "prot_out", 1], ["aa74d5b90032", "prot_round", 8], ["aa74d5b90032", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_out", "in": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 1803, "upper": false, "bytes": 448, "stack": 256, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 94}, {"at": "prot_out+10", "parent": 0, "sched": "none", "ii": 55, "ns": 1, "bound": 15, "iters": 16, "spills": 8, "bytes": 240}]}
+{"fn": "prot_rot", "in": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 7269, "upper": false, "bytes": 272, "stack": 64, "calls": [["2fcf4519e494", "prot_out", 1], ["2fcf4519e494", "prot_round", 8], ["2fcf4519e494", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 614, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 37, "ns": 2, "bound": 23, "iters": 15, "spills": 0, "bytes": 272}]}
+{"fn": "prot_out", "in": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 701, "upper": false, "bytes": 784, "stack": 64, "calls": [], "loops": [{"at": "prot_out+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 454}, {"at": "prot_out+11", "parent": 0, "sched": "pre-RA", "ii": 20, "ns": 3, "bound": 20, "iters": 14, "spills": 0, "bytes": 208}]}
+{"fn": "prot_rot", "in": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 6167, "upper": false, "bytes": 272, "stack": 64, "calls": [["2fcf4519e494", "prot_round", 8], ["2fcf4519e494", "prot_u0", 1], ["53a68ff8f902", "prot_out", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_out", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
 {"fn": "prot_rot", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 6651, "upper": false, "bytes": 272, "stack": 64, "calls": [["aa74d5b90032", "prot_out", 1], ["aa74d5b90032", "prot_round", 8], ["aa74d5b90032", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_round", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO"], "cycles": 593, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 6, "iters": 62, "spills": 0, "bytes": 96}]}
@@ -7200,10 +7204,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "bytes": 3568}
 {"core": 4, "design": "qwen_prefill", "entry": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "bytes": 3568}
 {"core": 5, "design": "qwen_prefill", "entry": "d426d01c53be", "apps": ["occamy-1.0-APEX"], "bytes": 3568}
-{"core": 2, "design": "qwen_prefill", "entry": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 6192}
-{"core": 3, "design": "qwen_prefill", "entry": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5312}
-{"core": 4, "design": "qwen_prefill", "entry": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5312}
-{"core": 5, "design": "qwen_prefill", "entry": "b706734f702a", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5312}
+{"core": 2, "design": "qwen_prefill", "entry": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 4416}
+{"core": 3, "design": "qwen_prefill", "entry": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3568}
+{"core": 4, "design": "qwen_prefill", "entry": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3568}
+{"core": 5, "design": "qwen_prefill", "entry": "ba4b7cfc33ab", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3568}
 {"core": 2, "design": "qwen_prefill", "entry": "8a24680420c1", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 6048}
 {"core": 3, "design": "qwen_prefill", "entry": "8a24680420c1", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5296}
 {"core": 4, "design": "qwen_prefill", "entry": "8a24680420c1", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5296}
@@ -7240,10 +7244,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "988cd86554d6", "apps": ["occamy-1.0-APEX"], "bytes": 3696}
 {"core": 4, "design": "qwen_prefill", "entry": "988cd86554d6", "apps": ["occamy-1.0-APEX"], "bytes": 3696}
 {"core": 5, "design": "qwen_prefill", "entry": "988cd86554d6", "apps": ["occamy-1.0-APEX"], "bytes": 3696}
-{"core": 2, "design": "qwen_prefill", "entry": "237114334c5d", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 6272}
-{"core": 3, "design": "qwen_prefill", "entry": "237114334c5d", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5424}
-{"core": 4, "design": "qwen_prefill", "entry": "237114334c5d", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5424}
-{"core": 5, "design": "qwen_prefill", "entry": "237114334c5d", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5424}
+{"core": 2, "design": "qwen_prefill", "entry": "a6c8ecb453ba", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 4512}
+{"core": 3, "design": "qwen_prefill", "entry": "a6c8ecb453ba", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3696}
+{"core": 4, "design": "qwen_prefill", "entry": "a6c8ecb453ba", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3696}
+{"core": 5, "design": "qwen_prefill", "entry": "a6c8ecb453ba", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 3696}
 {"core": 2, "design": "qwen_prefill", "entry": "27d1dce6c1c2", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 6048}
 {"core": 3, "design": "qwen_prefill", "entry": "27d1dce6c1c2", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5296}
 {"core": 4, "design": "qwen_prefill", "entry": "27d1dce6c1c2", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 5296}
@@ -8218,14 +8222,14 @@
 {"core": 3, "design": "qwen_prefill", "entry": "f94bc29fc053", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2784}
 {"core": 4, "design": "qwen_prefill", "entry": "f94bc29fc053", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2784}
 {"core": 5, "design": "qwen_prefill", "entry": "f94bc29fc053", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2784}
-{"core": 2, "design": "qwen_prefill", "entry": "61095bc01d4b", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2640}
-{"core": 3, "design": "qwen_prefill", "entry": "61095bc01d4b", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2640}
-{"core": 4, "design": "qwen_prefill", "entry": "61095bc01d4b", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2640}
-{"core": 5, "design": "qwen_prefill", "entry": "61095bc01d4b", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2640}
-{"core": 2, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 3, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 4, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 5, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
+{"core": 2, "design": "qwen_prefill", "entry": "c9b88d520cef", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 3, "design": "qwen_prefill", "entry": "c9b88d520cef", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 4, "design": "qwen_prefill", "entry": "c9b88d520cef", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 5, "design": "qwen_prefill", "entry": "c9b88d520cef", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 2, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 3, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 4, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 5, "design": "qwen_prefill", "entry": "d28c132e2327", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
 {"core": 2, "design": "qwen_prefill", "entry": "644019fa91b6", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}
 {"core": 3, "design": "qwen_prefill", "entry": "644019fa91b6", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}
 {"core": 4, "design": "qwen_prefill", "entry": "644019fa91b6", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}
@@ -8270,14 +8274,14 @@
 {"core": 3, "design": "qwen_prefill", "entry": "813938ace329", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2800}
 {"core": 4, "design": "qwen_prefill", "entry": "813938ace329", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2800}
 {"core": 5, "design": "qwen_prefill", "entry": "813938ace329", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2800}
-{"core": 2, "design": "qwen_prefill", "entry": "f88fe349c916", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 3, "design": "qwen_prefill", "entry": "f88fe349c916", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 4, "design": "qwen_prefill", "entry": "f88fe349c916", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 5, "design": "qwen_prefill", "entry": "f88fe349c916", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 2, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 3, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 4, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
-{"core": 5, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2656}
+{"core": 2, "design": "qwen_prefill", "entry": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 3, "design": "qwen_prefill", "entry": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 4, "design": "qwen_prefill", "entry": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 5, "design": "qwen_prefill", "entry": "2fcf4519e494", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2048}
+{"core": 2, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 3, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 4, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
+{"core": 5, "design": "qwen_prefill", "entry": "53a68ff8f902", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2384}
 {"core": 2, "design": "qwen_prefill", "entry": "965fcd4718c9", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}
 {"core": 3, "design": "qwen_prefill", "entry": "965fcd4718c9", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}
 {"core": 4, "design": "qwen_prefill", "entry": "965fcd4718c9", "apps": ["qwen3.6-35B-A3B-PARO"], "bytes": 2672}

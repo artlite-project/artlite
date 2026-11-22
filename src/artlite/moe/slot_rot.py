@@ -71,7 +71,7 @@ class SlotRotOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         p = self.p
-        return _SRC.render(p=p, R=self.rounds, TOK=TOK, gu=False, xb=False, gurows=False, rows_out=False) + f"""
+        return _SRC.render(p=p, R=self.rounds, TOK=TOK, gu=False, xb=False, gurows=False, rows_out=False, hilo=False) + f"""
 extern "C" {{
 // a core's group of an item (its words: the design's FIFOs are int32)
 void {p}_rotw(const int32_t *__restrict x, const int32_t *__restrict ro, int32_t *__restrict o, float *__restrict ua,

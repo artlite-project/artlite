@@ -2,7 +2,8 @@
 GemmQd, ``prefill.gemm``), model-independent.
 
 - ``router``: the router's rows (BFP16 hi / lo planes per expert, a gated shared expert's gate planes after them)
-  against x as [hi | lo] panels (``PrefillNormOperator(lo=True)``: the weights' K chunks stream twice, ``k_rep``), fp32
+  against x as [hi | lo] panels (``PrefillNormOperator(lo=True)``, a PARO layer's ``PrefillRotOperator(hilo=True)``: the
+  weights' K chunks stream twice, ``k_rep``), fp32
   C, each expert's [hi, lo] row pair summed (``c_pairs``): per token and column c, row width ``router_pitch`` fp32, the
   column's E / 8 logits from c ``router_pitch`` on, then the shared gate's logit (the second pass's first pair; the
   rest of that pass: the zero rows of the gate's tile and the next region's tiles, never read).
@@ -45,11 +46,9 @@ CHUNK_PARAM, CHUNK_UNIT = "moe_t", 256  # a whole-chunk GEMM's token chunks (``G
 # tokens / CHUNK_UNIT, the cores' own chunks of fewer tokens scaled from it
 
 
-def router(image: object, region: object, T: int, *, ops: dict | None = None, whole: bool = False,
-           lo: bool = True) -> PG.Gemm:
+def router(image: object, region: object, T: int, *, ops: dict | None = None, whole: bool = False) -> PG.Gemm:
     """The router GEMM of T tokens (module docstring); C in bf16 units: per token COLS router_pitch fp32 values.
-    ``whole``: the token chunks' count a scratchpad parameter (``chunk_param``: one design for any T); ``lo``: x as [hi
-    | lo] panels (else as single panels: a PARO layer's rotated copy, as the decode reads it)."""
+    ``whole``: the token chunks' count a scratchpad parameter (``chunk_param``: one design for any T)."""
     b = region.block("router")
     assert not region.half and b.fmt == "BFP16" and (not gated(region) or region.block("sgate").fmt == "BFP16")
     passes, pitch = router_passes(region), 2 * router_pitch(region)  # (pitch: bf16 units)
@@ -57,8 +56,7 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None, wh
           "col_bytes": region.col_stride, "passes": passes,
           "out_cols": [[pitch * c + PASS * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
           "kc_group": region.kc_group, "blocks": ((region.rt0["router"], passes),),
-          "region_rt": min(region.n_rt, region.rt0["router"] + passes * PASS // b.R), "k_rep": 2 if lo else 1,
-          "c_pairs": True}
+          "region_rt": min(region.n_rt, region.rt0["router"] + passes * PASS // b.R), "k_rep": 2, "c_pairs": True}
     if whole:
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     op = PG.gemm_op(kw, T, "qkv", ops)
@@ -66,10 +64,10 @@ def router(image: object, region: object, T: int, *, ops: dict | None = None, wh
 
 
 def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: dict | None = None,
-                   whole: bool = False, lo: bool = True) -> PG.Gemm:
-    """The shared expert's gate / up GEMM of T tokens on x's hi panels (A of 2 hidden columns: [hi | lo]; ``lo``
-    False: A of the hidden's single panels): silu(gate) up as bfp16 panels of ``width`` (the shared expert's) columns,
-    column c's from width / COLS c on. ``whole``: as ``router``'s."""
+                   whole: bool = False) -> PG.Gemm:
+    """The shared expert's gate / up GEMM of T tokens on x's hi panels (A of 2 hidden columns: [hi | lo]):
+    silu(gate) up as bfp16 panels of ``width`` (the shared expert's) columns, column c's from width / COLS c on.
+    ``whole``: as ``router``'s."""
     b = region.block("sgu")
     assert not region.half, "an MoE layer's input of whole K chunks"
     per = width // COLS  # (outputs per column)
@@ -83,7 +81,7 @@ def shared_gate_up(image: object, region: object, T: int, *, width: int, ops: di
           "out_cols": [[per * c + w * p for p in range(passes)] for c in range(COLS)], "kc": region.kc,
           "kc_group": region.kc_group, "silu": True, "act": "silu", "c_bfp16": True,
           "blocks": ((region.rt0["sgu"], passes),), "region_rt": min(region.n_rt, region.rt0["sgu"] + b.tiles),
-          **({"a_cols": (0, 2 * region.K)} if lo else {})}
+          "a_cols": (0, 2 * region.K)}
     if pl:
         kw["tiles"] = tp
     if whole:

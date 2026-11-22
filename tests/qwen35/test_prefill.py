@@ -104,8 +104,9 @@ def test_prefill_paro(case: str) -> None:
     down's rotation in ``rows`` mode), against llama.cpp on its first layers (F16); Qwen3.6-35B-A3B-PARO: its MoE layers
     (``moe.prefill``'s PARO path: the experts' h rotated in their slots, ``moe.slot_rot``). (Measured: 0.8B prefill mean
     1.7%, max 12.3% (one token: its GDN gates' a / b rows, folded into gin_z's copy, through exp; 7.1% with the fold
-    against the exact transform, at the same KL), 27B 0.6% and 2.5%, 35B-A3B 0.6% and 2.3%: bfp16 GEMM inputs against the
-    decode's bf16 ones, whose error is 0.5%; the decode after the prefill as close as the decode alone.)"""
+    against the exact transform, at the same KL), 27B 0.6% and 2.5%, 35B-A3B 0.6% and 3.3% (its routing: near ties of the
+    router's logits from inputs 0.5% off flip a token's experts): bfp16 GEMM inputs against the decode's bf16 ones, whose
+    error is 0.5%; the decode after the prefill as close as the decode alone, over 16 tokens.)"""
     from artlite.hf_model import HfModel
     from artlite.model_config import checkpoint
     from models.qwen35.overlay import QwenOverlay
@@ -118,7 +119,7 @@ def test_prefill_paro(case: str) -> None:
     g = HfModel(path)
     La = QwenConfig.from_gguf(g).attention_layers[0]
     ref = pseudo_gguf(path) if "0.8B" in case else pseudo_gguf(path, f16=True, layers=La + 2)
-    n1, n2, K = 288, 100, 4
+    n1, n2, K = 288, 100, 16
     P = n1 + n2
     tokens = llama_tokenize(ref, essay("apple.txt"))[:P + K]
     want = np.asarray(golden(ref, tokens, layers=("g", La), names="l_out", logits="none")["l_out", La], np.float32)

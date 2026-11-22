@@ -2,7 +2,8 @@
 random ones without the checkpoint): the panels of x (``bf16``: its bf16 blocks, a norm's; ``gu``: gate and up's bf16
 panels, x = bf16(silu(gate) up),
 kmath.silu_tanh's model) -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16 value times T on the fp32
-MAC), x' as hi + lo into bfp16 panels; and the model against the exact transform (fp64)."""
+MAC), x' as hi + lo into bfp16 panels (``rowsout``: bf16 rows; ``hilo``: the panels of x' and of its remainder); and the
+model against the exact transform (fp64)."""
 
 import numpy as np
 import pytest
@@ -77,18 +78,21 @@ CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), 
          (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1),
          (256, 1024, "bf16", 3), (128, 4096, "bf16", 2),
          (256, 2048, "rows", 1), (128, 3072, "rows", 1),
-         (256, 2048, "rowsout", 1), (128, 2048, "rowsout", 1)]
+         (256, 2048, "rowsout", 1), (128, 2048, "rowsout", 1), (512, 2048, "rowsout", 1),
+         (1024, 2048, "hilo", 1), (512, 2048, "hilo", 1), (128, 2048, "hilo", 1)]
 
 
 @pytest.mark.parametrize(("T", "K", "gu", "copies"), CASES,
-                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows", "rowsout": "-rowsout"}.get(gu, "")) +
+                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows", "rowsout": "-rowsout",
+                                             "hilo": "-hilo"}.get(gu, "")) +
                               (f"-c{c}" if c > 1 else "")
                               for T, K, gu, c in CASES])
 @pytest.mark.usefixtures("vtanh")
 def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     rng = np.random.default_rng(0)
     rows_out = gu == "rowsout"  # (bf16 blocks in, x' as bf16 rows: an MoE layer's copy that its experts gather)
-    xb, rows, gu = gu in ("bf16", "rowsout"), gu == "rows", gu is True or gu == "rows"
+    hilo = gu == "hilo"  # (bf16 blocks in, x' as hi and lo panels: an MoE layer's copy that its router reads)
+    xb, rows, gu = gu in ("bf16", "rowsout", "hilo"), gu == "rows", gu is True or gu == "rows"
     tfs = [_rotation(K, rng, 1 + c).tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True) for c in range(copies)]
     if rows:  # (GU as rows [token][block 8][gate | up], a block's gate from its start, up 32 past its gate, padding)
         gp, x = _gu_input(T, K, rng)
@@ -108,13 +112,26 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     else:
         xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
-    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None, rows_out=rows_out)
-    ro = np.concatenate([tf.pair_objects(row_floats(gu)).reshape(-1) for tf in tfs])
+    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None, rows_out=rows_out,
+                            hilo=hilo)
+    ro = np.concatenate([tf.pair_objects(row_floats(gu or hilo or rows_out)).reshape(-1) for tf in tfs])
     out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16)))
     if rows_out:
         got, want = out.astype(np.float32).reshape(T, K), model(x, tfs[0], rows_out=True)
         bad = np.argwhere(got != want)
         assert not len(bad), f"{len(bad)} of {got.size} values differ, first {bad[:4].tolist()}"
+        return
+    if hilo:  # ([token group][hi | lo]: bfp16(x'), bfp16(x' - bfp16(x')); lo's remainder from the MMUL (``al::split_hilo``,
+        # the norm's lo panels' too): a few values one unit of their lo block off, 2^-15 of the block's maximum)
+        out = out.reshape(T // 8, 2, -1)
+        want = model(x, tfs[0])
+        hi = bfp16.from_panels(bfp16.to_panels(want), T, K)
+        got = [bfp16.from_panels(out[:, c].reshape(-1), T, K) for c in range(2)]
+        bad = np.argwhere(got[0] != hi)
+        assert not len(bad), f"hi: {len(bad)} values differ, first {bad[:4].tolist()}"
+        d = np.abs(got[1] - bfp16.from_panels(bfp16.to_panels(want - hi), T, K))
+        top = np.repeat(np.abs(want).reshape(T, K // 8, 8).max(-1), 8, axis=1)
+        assert np.mean(d > 0) < 1e-4 and (d <= top * 2.0 ** -14).all(), (np.mean(d > 0), (d / top).max())
         return
     out = out.reshape(T // 8, copies, -1)  # ([token group][copy])
     for c, tf in enumerate(tfs):
