@@ -17,7 +17,7 @@ import math
 import numpy as np
 import torch
 
-from artlite.gguf_model import GGUFFile
+from artlite.hf_model import open_mmproj
 from artlite.model_config import ClipConfig
 
 from ..goldens.media import VisionGolden, golden
@@ -48,7 +48,7 @@ class Encoder:
     """Qwen3-VL's vision encoder from its mmproj file (module docstring)."""
 
     def __init__(self, mmproj: str):
-        self.g = g = GGUFFile(mmproj)
+        self.g = g = open_mmproj(mmproj)
         self.cfg = cfg = ClipConfig.from_gguf(g)
         assert cfg.projector == "qwen3vl_merger", cfg.projector
         self.hidden, self.heads, self.hd = cfg.hidden, cfg.heads, cfg.head_dim

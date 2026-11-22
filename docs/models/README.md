@@ -17,10 +17,11 @@ lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGU
 
 ParoQuant (PARO) checkpoints, int4 or int5 (`int5-bitplane`) with groups of 128 (`quantization_config.quant_method`
 `paroquant`), run as checkpoint directories of `Qwen3ForCausalLM`, `LlamaForCausalLM`,
-`Qwen3_5ForConditionalGeneration` (its text; int5: Qwen3.5's) and `Qwen3_5MoeForConditionalGeneration` (its experts PARO,
-its router and shared expert F16): their linears as 4-bit (5-bit) tiles of the checkpoint's size (4.5, 5.5 bits per
+`Qwen3_5ForConditionalGeneration` (its text; int5: Qwen3.5's), `Qwen3_5MoeForConditionalGeneration` (its experts PARO,
+its router and shared expert F16) and `Gemma4ForConditionalGeneration` (its text; E4B): their linears as 4-bit (5-bit) tiles of the checkpoint's size (4.5, 5.5 bits per
 weight with their scales), each projection's input rotated on the NPU as the checkpoint prescribes (its channel scales
-and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
+and Givens rounds), the head and embeddings from the checkpoint's F16 tensors; a Qwen3.5 / 3.6 checkpoint's vision
+tower with `--mmproj` the directory ([images](qwen35.md#images-qwen35--36--38)). Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
 against the checkpoint computed exactly on the CPU), z-lab/Llama-3.1-8B-Instruct-PARO (its first layers as the
 checkpoint computes them; a step of one token 81.7 ms, bartowski's Q4_K_S GGUF 76.0), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s;
@@ -29,7 +30,9 @@ up to 4 tokens: 6.8 tokens per second after a 1K-token essay prompt, 4.8 after 3
 z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
 bytes a token; with its base model's MTP drafter, ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the
 GGUF files, 34.8 tokens per second after a 1K-token essay prompt and 29.8 after 32K, the GGUF's 35.8 and 30.5, the
-same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357).
+same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357), z-lab/gemma-4-E4B-it-PARO (teacher-forced
+KL 0.00029 against the checkpoint computed exactly; a step of one token 56.3 ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer
+bytes a token; a 1024-token prompt at 3150 tokens per second, the GGUF's 3040, 2048 tokens at 3390, the GGUF's 3170).
 
 ## Tested files and plans
 
@@ -41,7 +44,7 @@ same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357
 | | ✅ Llama 3.2 3B Instruct | unsloth Q4_K_M, BF16; bartowski Q4_0, Q5_K_M; MaziyarPanahi Q2_K, Q3_K_M | |
 | | ✅ Llama 3.1 8B Instruct | lmstudio-community Q4_K_M; bartowski Q4_K_S; z-lab's PARO checkpoint (int4) | EAGLE3 draft head (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`) |
 | | 🤔 Llama 3.3 70B's EAGLE3 draft head | | `yuhuili/EAGLE3-LLaMA3.3-Instruct-70B` `pytorch_model.bin` |
-| gemma4 | ✅ Gemma 4 E4B it | ggml-org Q4_0, with its MTP drafter | vision + audio; ggml-org Q8_0, BF16 (with MTP); lmstudio-community Q4_K_M; unsloth Q4_1; HauhauCS Uncensored Aggressive Q4_K_M, Q2_K_P |
+| gemma4 | ✅ Gemma 4 E4B it | ggml-org Q4_0, with its MTP drafter; z-lab's PARO checkpoint (int4) | vision + audio; ggml-org Q8_0, BF16 (with MTP); lmstudio-community Q4_K_M; unsloth Q4_1; HauhauCS Uncensored Aggressive Q4_K_M, Q2_K_P |
 | | 🤔 Gemma 4 12B it | | lmstudio-community Q4_K_M, QAT Q4_0; unsloth Q4_K_M (with MTP); vision + audio |
 | | 🤔 Gemma 4 26B-A4B it | | lmstudio-community QAT Q4_0; vision |
 | | 🤔 Gemma 4 31B it | | lmstudio-community QAT Q4_0; HauhauCS QAT Uncensored Balanced Q4_K_M (with MTP); vision |

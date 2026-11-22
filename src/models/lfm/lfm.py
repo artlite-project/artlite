@@ -32,7 +32,7 @@ import numpy as np
 
 from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
-from artlite.hf_model import open_weights
+from artlite.hf_model import open_mmproj, open_weights
 from artlite.model_config import AudioConfig, ClipConfig, LfmConfig
 from artlite.overlay import WeightBuffer
 from artlite.vision.shell import shared_device
@@ -204,7 +204,7 @@ class Lfm(Model):
         toks = self.gguf.strings("tokenizer.ggml.tokens")
         self.banned = tuple(toks.index(t) for t in a_host.TEXT_ONLY_BANNED if t in toks)
         if mmproj is not None:
-            mg = GGUFFile(mmproj)
+            mg = open_mmproj(mmproj)
             has_vision = bool(mg.meta.get("clip.has_vision_encoder", "clip.vision.projector_type" in mg.meta))
             if AudioConfig.has_audio(mg):
                 check_tower(mmproj, AudioConfig.from_gguf(mg), a_npu.PROJECTORS, what="audio projector",

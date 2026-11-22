@@ -167,6 +167,17 @@ def test_catalog_checkpoint(tmp_path: object) -> None:
     assert entries["Qwen/Qwen3-0.6B"].names == ["Qwen/Qwen3-0.6B"]
 
 
+def test_catalog_checkpoint_tower(tmp_path: object) -> None:
+    """A checkpoint directory with a Qwen3-VL vision tower (z-lab's Qwen3.5-0.8B-PARO): its own encoder."""
+    src = checkpoint("qwen3.5-0.8B-paro")
+    require(src)
+    d = tmp_path / "models"
+    (d / "z-lab").mkdir(parents=True)
+    os.symlink(src, d / "z-lab" / "Qwen3.5-0.8B-PARO")
+    e = catalog_of(str(d), tmp_path).scan()["z-lab/Qwen3.5-0.8B-PARO"]
+    assert e.mmproj == e.path and e.media == ["image"]
+
+
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,
                  caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level("INFO")

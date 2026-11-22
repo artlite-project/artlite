@@ -55,7 +55,7 @@ import numpy as np
 
 from artlite.decode.dflash.overlay import DFlashOverlay
 from artlite.gguf_model import GGUFFile
-from artlite.hf_model import open_weights
+from artlite.hf_model import open_mmproj, open_weights
 from artlite.model_config import ClipConfig, DFlashConfig, QwenConfig, qwen_dflash_of, qwen_mtp_of
 from artlite.overlay import WeightBuffer
 
@@ -523,7 +523,7 @@ class Qwen(Model):
             self.name = "MiniCPM-V 4.7"
         self._npu: NpuQwen | None = None
         if mmproj is not None:
-            clip = ClipConfig.from_gguf(GGUFFile(mmproj))
+            clip = ClipConfig.from_gguf(open_mmproj(mmproj))
             if clip.projection_dim != self.cfg.hidden_size:
                 raise ValueError(f"{mmproj}: embeddings of {clip.projection_dim}, the language model's "
                                  f"{self.cfg.hidden_size}")

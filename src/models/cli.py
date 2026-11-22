@@ -94,7 +94,7 @@ def arg_parser() -> argparse.ArgumentParser:
                         "and LFM3's default), or hi + lo blocks (Qwen3's and Gemma's default; +50%% cache bytes and read "
                         "time)")
     vis = p.add_argument_group("images in the prompt (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3-VL)")
-    vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf)")
+    vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf), or a checkpoint directory (its vision tower)")
     vis.add_argument("--image", action="append", default=[],
                      help=f"an image file (repeatable): where the prompt has {MEDIA_MARKER}, else before it")
     vis.add_argument("--video", action="append", default=[],

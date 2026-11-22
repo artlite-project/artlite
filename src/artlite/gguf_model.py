@@ -535,6 +535,10 @@ class GGUFFile:
         _, _, off, nbytes = self.tensor_info[name]
         return self.data, off, nbytes
 
+    def tensor_file(self, name: str) -> tuple[str, np.ndarray] | None:
+        """The (path, whole mapping) of the file a tensor's bytes are in (None: a tensor of memory)."""
+        return self.path, self.data
+
     def _sources(self, name: str) -> list[tuple[np.ndarray, int, int]]:
         """The (file mapping, file offset, bytes) ranges a tensor is read from (``hf_model``'s PARO linears: their codes,
         every expert's)."""

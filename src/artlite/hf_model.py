@@ -14,8 +14,11 @@ the converter interleaves them and the weight images undo it, ``gguf_model.unper
 
 Supported: ``Qwen3ForCausalLM`` (``qwen3``), ``LlamaForCausalLM`` (``llama``), ``Qwen3_5ForConditionalGeneration`` /
 ``Qwen3_5ForCausalLM`` (``qwen35``; its MTP block as the nextn layer), ``Qwen3_5MoeForConditionalGeneration``
-(``qwen35moe``), ``Gemma4ForConditionalGeneration`` / ``Gemma4ForCausalLM`` (``gemma4``). Vision and audio towers are not
-read here.
+(``qwen35moe``), ``Gemma4ForConditionalGeneration`` / ``Gemma4ForCausalLM`` (``gemma4``).
+
+A checkpoint's vision tower opens as the mmproj file the converter makes of it (``open_mmproj``, ``HfModel(mmproj=)``;
+``--mmproj`` the checkpoint directory): Qwen3.5's / 3.6's (``model.visual.*``, ``conversion/qwen3vl.py``'s
+``Qwen3VLVisionModel``: projector ``qwen3vl_merger``, the patch embedding's Conv3D as its two temporal kernels).
 """
 
 import dataclasses
@@ -48,6 +51,26 @@ def is_checkpoint(path: str) -> bool:
 def open_weights(path: str) -> GGUFFile:
     """A model file: a GGUF file, or a checkpoint directory as its virtual GGUF file (``HfModel``)."""
     return HfModel(path) if os.path.isdir(path) else GGUFFile(path)
+
+
+def open_mmproj(path: str) -> GGUFFile:
+    """An mmproj file: a GGUF file, or a checkpoint directory's vision tower as its virtual mmproj (``HfModel(mmproj=)``)."""
+    return HfModel(path, mmproj=True) if os.path.isdir(path) else GGUFFile(path)
+
+
+def has_vision_tower(path: str) -> bool:
+    """Whether a checkpoint directory has a vision tower ``open_mmproj`` reads (from its config.json alone)."""
+    try:
+        with open(os.path.join(path, "config.json")) as f:
+            cfg = json.load(f)
+    except OSError:
+        return False
+    return bool(cfg.get("vision_config")) and (cfg.get("architectures") or [""])[0] in _VISION
+
+
+def model_files(path: str) -> list[str]:
+    """The files of a model: a GGUF file, or a checkpoint directory's safetensors (a cache's key covers them)."""
+    return [os.path.join(path, n) for n in _shard_names(path)] if os.path.isdir(path) else [path]
 
 
 def _shard_names(path: str) -> list[str]:
@@ -86,7 +109,8 @@ class HfModel(GGUFFile):
 
     unpermuted = True  # (a Llama's Q / K rows in rotate-half order: module docstring)
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, mmproj: bool = False):
+        """``mmproj``: the checkpoint's vision tower as its mmproj (module docstring)."""
         self.path = path
         with open(os.path.join(path, "config.json")) as f:
             self.config = json.load(f)
@@ -99,14 +123,15 @@ class HfModel(GGUFFile):
                                           f"unquantized and ParoQuant checkpoints)")
             self.paro_bits, self.paro_group = paro.check_config(path, qc)
         hf_arch = (self.config.get("architectures") or [""])[0]
-        if hf_arch not in _ADAPTERS:
-            raise NotImplementedError(f"{path}: Hugging Face architecture {hf_arch!r} is not supported (supported: "
-                                      f"{', '.join(_ADAPTERS)})")
+        table = _VISION if mmproj else _ADAPTERS
+        if hf_arch not in table:
+            raise NotImplementedError(f"{path}: Hugging Face architecture {hf_arch!r} is not supported{' (a vision tower)' if mmproj else ''} "
+                                      f"(supported: {', '.join(table)})")
         self._shards: list[tuple[str, np.memmap]] = []
         self._hf: dict[str, _Entry] = {}
         for name in _shard_names(path):
             self._read_header(os.path.join(path, name))
-        self.adapter = _ADAPTERS[hf_arch](self)
+        self.adapter = table[hf_arch](self)
         self.arch = self.adapter.arch
         self._entries: dict[str, _Entry] = {}
         for name in self._hf:
@@ -168,6 +193,10 @@ class HfModel(GGUFFile):
     def _mapped(self, name: str) -> tuple[np.ndarray, int, int] | None:
         e = self._entries[name]
         return None if e.compute is not None else (self._shards[e.shard][1], e.offset, e.nbytes)
+
+    def tensor_file(self, name: str) -> tuple[str, np.ndarray] | None:
+        e = self._entries[name]
+        return None if e.compute is not None or e.paro else self._shards[e.shard]
 
     def _sources(self, name: str) -> list[tuple[np.ndarray, int, int]]:
         e = self._entries[name]
@@ -894,6 +923,90 @@ _ADAPTERS: dict[str, type[_Adapter]] = {
     "Qwen3_5MoeForCausalLM": _Qwen35Moe,
     "Gemma4ForConditionalGeneration": _Gemma4,
     "Gemma4ForCausalLM": _Gemma4,
+}
+
+
+class _Qwen3VLVision(_Adapter):
+    """Qwen3-VL's vision tower as its mmproj (``conversion/qwen3vl.py``'s ``Qwen3VLVisionModel`` and ``MmprojModel``:
+    the ``clip`` keys, the tensors by gguf-py's mmproj map, the merger's fc1 / fc2 as mm.0 / mm.2, its norm as
+    v.post_ln, the deepstack mergers per layer, the patch embedding's temporal kernels as v.patch_embd.weight and
+    .weight.1)."""
+
+    arch = "clip"
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def __init__(self, hf: HfModel):
+        self.hf, self.hp = hf, hf.hparams
+        v = dict(hf.config.get("vision_config") or {})
+        if not v:
+            raise ValueError(f"{hf.path}: no vision_config (no vision tower)")
+        v.setdefault("image_size", int(v.get("num_position_embeddings", 2304) ** 0.5 * v.get("patch_size", 16)))
+        self.v, self.block_count = v, int(v["depth"])
+        self.names = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self.deepstack = [i in v.get("deepstack_visual_indexes", []) for i in range(self.block_count)]
+        self.pre: dict = {}
+        for name, sub in (("preprocessor_config.json", "media_proc_cfg"), ("processor_config.json", "image_processor")):
+            if os.path.isfile(p := os.path.join(hf.path, name)):
+                with open(p) as f:
+                    cfg = json.load(f)
+                self.pre |= cfg | cfg.get(sub, {})
+
+    def write_metadata(self, w: gguf.GGUFWriter) -> None:
+        v = self.v
+        w.add_type(gguf.GGUFType.MMPROJ)
+        w.add_clip_has_vision_encoder(True)
+        w.add_vision_projection_dim(int(self.hp["hidden_size"]))  # (the language model's width)
+        w.add_vision_image_size(int(v["image_size"]))
+        w.add_vision_patch_size(int(v["patch_size"]))
+        w.add_vision_embedding_length(int(v["hidden_size"]))
+        w.add_vision_feed_forward_length(int(v["intermediate_size"]))
+        w.add_vision_block_count(self.block_count)
+        w.add_vision_head_count(int(v["num_heads"]))
+        w.add_vision_image_mean(self.pre["image_mean"])
+        w.add_vision_image_std(self.pre["image_std"])
+        w.add_clip_projector_type(gguf.VisionProjectorType.QWEN3VL)
+        w.add_vision_use_gelu(True)
+        if v.get("spatial_merge_size") is not None:
+            w.add_vision_spatial_merge_size(int(v["spatial_merge_size"]))
+        w.add_vision_attention_layernorm_eps(self.hf.config.get("text_config", {}).get("rms_norm_eps", 1e-6))
+        w.add_vision_is_deepstack_layers(self.deepstack)
+
+    def tensors(self, name: str) -> list[tuple[str, _Entry]]:
+        if not name.startswith(("model.visual.", "visual.")):
+            return []
+        n = name.replace("model.visual.", "visual.", 1)
+        e = self.hf._hf[name]
+        names = gguf.TENSOR_NAMES
+        if n == "visual.patch_embed.proj.weight":  # (Conv3D (C, 3, 2, P, P): its two temporal kernels)
+            if e.shape[2] != 2:
+                raise NotImplementedError(f"{self.hf.path}: {name}: a temporal patch of {e.shape[2]} (2 runs)")
+            g = names[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".weight"
+            return [(g + s, self.computed(name, lambda a, t=t: a[:, :, t])) for t, s in enumerate(("", ".1"))]
+        if n == "visual.patch_embed.proj.bias":
+            g = names[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH] + ".bias"
+        elif n.startswith("visual.merger."):
+            part, _, tail = n.split(".", 2)[2].partition(".")
+            if part.startswith("linear_fc"):
+                g = names[gguf.MODEL_TENSOR.V_MMPROJ].format(bid={"linear_fc1": 0, "linear_fc2": 2}[part]) + "." + tail
+            elif part == "norm":
+                g = names[gguf.MODEL_TENSOR.V_POST_NORM] + "." + tail
+            else:
+                raise NotImplementedError(f"{self.hf.path}: merger tensor {name}")
+        elif n.startswith("visual.deepstack_merger_list."):
+            i, part, tail = n.split(".", 4)[2:]
+            kind = {"norm": gguf.MODEL_TENSOR.V_DS_NORM, "linear_fc1": gguf.MODEL_TENSOR.V_DS_FC1,
+                    "linear_fc2": gguf.MODEL_TENSOR.V_DS_FC2}[part]
+            g = names[kind].format(bid=self.v["deepstack_visual_indexes"][int(i)]) + "." + tail
+        else:
+            g = self.gguf_name(n)
+            if g is None:
+                raise NotImplementedError(f"{self.hf.path}: no mmproj name for {name}")
+        return [(g, self.transform(name, n, e))]
+
+
+_VISION: dict[str, type[_Adapter]] = {
+    "Qwen3_5ForConditionalGeneration": _Qwen3VLVision,
+    "Qwen3_5MoeForConditionalGeneration": _Qwen3VLVision,
 }
 
 

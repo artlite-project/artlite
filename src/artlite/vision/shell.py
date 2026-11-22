@@ -23,7 +23,7 @@ from typing import ClassVar
 
 import numpy as np
 
-from ..gguf_model import GGUFFile
+from ..hf_model import model_files, open_mmproj
 from ..model_config import ClipConfig
 from .device import VisionDevice
 from .program import ProgramStore
@@ -132,7 +132,7 @@ class MediaEncoder(ABC):
 
     def __init__(self, path: str):
         self.path = path
-        self.gguf = GGUFFile(path)
+        self.gguf = open_mmproj(path)  # (a checkpoint directory: its vision tower)
         self.results = EmbeddingCache()
 
     @property
@@ -172,7 +172,7 @@ def shared_device(kind: str, mmproj: str, encoders: Mapping[str, MediaEncoder]) 
     without a switch). Their built state is cached together in ``kind``'s directory, keyed by the mmproj and the
     encoders' modules."""
     w = {n: e.weights() for n, e in encoders.items()}
-    cache = state_dir(kind, mmproj, tuple(sorted({m for e in encoders.values() for m in e.MODULES})), [mmproj])
+    cache = state_dir(kind, mmproj, tuple(sorted({m for e in encoders.values() for m in e.MODULES})), model_files(mmproj))
     store = ProgramStore(cache)
     return attach(cache, sources(w),
                   lambda npu, st: [net for n, e in encoders.items() for net in e.build(npu, w[n], st and st[n], store)],

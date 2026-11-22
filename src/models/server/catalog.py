@@ -13,7 +13,8 @@ of its matrices (``formats.has_tile_format``); a file Artlite cannot run is skip
 Drafters (``mtp-``, ``dspark-``, ``dflash-``, ``eagle3-``: their models find them themselves) and vision or speech
 encoders (architecture ``clip``) are not models of their own; split files are not read. An encoder goes with a model of
 its directory whose class takes its projector type (``Model.projectors``) and its width; of several, the one of the
-shortest name (``mmproj-model-f16.gguf``, not ``mmproj-model-f16-4x.gguf``). Reading a header takes ~0.1 s (its
+shortest name (``mmproj-model-f16.gguf``, not ``mmproj-model-f16-4x.gguf``); a checkpoint directory with a vision tower
+(``hf_model.has_vision_tower``) is its own. Reading a header takes ~0.1 s (its
 vocabulary's strings are skipped one by one): the headers are cached in ``<cache>/server/models.json`` by path, size
 and modification time, with each model's last load time (the web UI's loading bar).
 
@@ -40,7 +41,7 @@ from typing import Any
 
 from artlite import settings
 from artlite.formats import has_tile_format
-from artlite.hf_model import is_checkpoint, open_weights
+from artlite.hf_model import has_vision_tower, is_checkpoint, open_weights
 from artlite.operators.toolchain import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
@@ -368,6 +369,9 @@ class Catalog:
             opts = {**common, **entry.options, **self.options}
             if "mmproj" in opts:
                 entry.mmproj = opts.pop("mmproj")
+            elif os.path.isdir(entry.path) and has_vision_tower(entry.path) \
+                    and "qwen3vl_merger" in model_class(entry.header["arch"]).projectors:
+                entry.mmproj = entry.path  # (its own tower)
             else:
                 entry.mmproj = self._encoder(entry, encoders.get(os.path.dirname(entry.path), []))
             entry.media = self._media(entry.mmproj) if entry.mmproj else []
@@ -430,7 +434,9 @@ class Catalog:
 
     def _media(self, mmproj: str) -> list[str]:
         """What an encoder file takes and gives: ``image``, ``audio``, ``video`` (an LFM3-VL tower), ``speech`` (a speech
-        generator: audio out); ``image`` when its header cannot be read."""
+        generator: audio out); ``image`` when its header cannot be read (and a checkpoint directory's tower)."""
+        if os.path.isdir(mmproj):
+            return ["image"]
         try:
             h = self._header(mmproj)
         except (OSError, ValueError, AssertionError, KeyError):

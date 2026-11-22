@@ -248,7 +248,9 @@ artlite-cli -m lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gg
 The Qwen models' vision encoder is their `mmproj-*.gguf` (projector `qwen3vl_merger`; BF16, F16 or Q8_0, tested:
 lmstudio-community's BF16 files of Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B, IsValorum's Q8_0 for Occamy 1.0,
 ggml-org's Q8_0 for d3-lite and d3-nano: the one of the model's repository, whose width is the model's;
-[artlite-server](../server.md)'s router mode pairs it with the model by itself). An image is resized whole, as
+[artlite-server](../server.md)'s router mode pairs it with the model by itself), or a checkpoint directory's vision tower
+(`--mmproj` the directory, read as llama.cpp's converter makes its mmproj: z-lab's PARO checkpoints of Qwen3.5-0.8B and
+Qwen3.6-35B-A3B, their towers F16; the router pairs a directory with its own). An image is resized whole, as
 transformers' processor and llama.cpp resize it: its sides to multiples of 32 pixels at its aspect, between
 `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (default the mmproj's limits where it has them,
 d3's 64 and 1600, else llama.cpp's 8 and 4096; a 1024 x 768 photo is 768 tokens, a phone's 12-megapixel photo 4015). Its tokens take the

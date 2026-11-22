@@ -215,3 +215,36 @@ def test_tower(npu: VisionDevice, name: str) -> None:
     med, p90 = (np.median(e), np.median(es)), (np.percentile(e, 90), np.percentile(es, 90))
     print(f"{name} 512 x 512: per token median {med[0]:.4f} (the CPU's {med[1]:.4f}), p90 {p90[0]:.4f} ({p90[1]:.4f})")
     assert med[0] < 1.25 * med[1] and p90[0] < 1.3 * p90[1]
+
+
+def test_checkpoint_tower() -> None:
+    """A checkpoint directory's vision tower as its mmproj (``hf_model.open_mmproj``: z-lab's Qwen3.6-35B-A3B-PARO,
+    the tower F16 there): the metadata and tensors of the base model's BF16 mmproj (the same values but F16's
+    subnormals: within 2^-24; their float64 encoders agree to 1e-6), and the astronaut's embeddings on the NPU as close
+    to the float64 encoder as the mmproj's (per merged token: the median within 1.15x, p90 within 1.3x; the two NPU
+    runs differ by ~3% per token: the overlay's bf16 rounding points amplify the weights' last bits, as
+    ``test_encoder_model``'s perturbed patch weights)."""
+    from artlite.hf_model import open_mmproj
+    from artlite.model_config import checkpoint
+    from models.qwen3vl.npu import NpuVision, image_pixels
+
+    path = checkpoint("qwen3.6-35B-A3B-paro")
+    require(path, MMPROJ)
+    v, g = open_mmproj(path), GGUFFile(MMPROJ)
+    assert set(v.tensor_info) == set(g.tensor_info)
+    assert all(np.array_equal(np.asarray(v.meta.get(k)), np.asarray(x)) for k, x in g.meta.items() if k.startswith("clip."))
+    for n in g.tensor_info:
+        a, b = v.tensor(n).dequantize().reshape(-1), g.tensor(n).dequantize().reshape(-1)
+        assert np.abs(a - b).max() <= 2.0 ** -24, n
+    im = load_image(ASTRONAUT)
+    errs = {}
+    for name, p in (("mmproj", MMPROJ), ("checkpoint", path)):
+        nv = NpuVision(p, max_tokens=256)
+        px = image_pixels(im, min_tokens=nv.min_tokens, max_tokens=nv.max_tokens)
+        if name == "mmproj":
+            want = V.Encoder(MMPROJ).forward(normalized(px, nv.clip.mean, nv.clip.std)).numpy()
+        e = rel_rows(np.asarray(nv.encoder(px), np.float64), want)
+        errs[name] = (float(np.median(e)), float(np.percentile(e, 90)))
+    print({k: tuple(round(x, 4) for x in v) for k, v in errs.items()})
+    (m0, p0), (m1, p1) = errs["mmproj"], errs["checkpoint"]
+    assert m1 < 1.15 * m0 and p1 < 1.3 * p0, errs

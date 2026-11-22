@@ -80,8 +80,8 @@ def gguf_matrix(g: GGUFFile, name: str) -> Wt:
     if t.qtype not in _GGUF_KINDS:
         raise NotImplementedError(f"{g.path}: {name} is {t.qtype}: the NPU's media encoders take mmproj files of Q8_0, "
                                   f"BF16, F16 or F32 weights (use the model's Q8_0 mmproj)")
-    raw = t.raw if t.raw.dtype == np.uint8 else t.raw.view(np.uint8)
-    return Wt.of(Source(sname, t.qtype, t.rows, t.cols, raw.reshape(t.rows, -1), (g.path, g.data)))
+    raw = t.raw if t.raw.dtype == np.uint8 else np.ascontiguousarray(t.raw).view(np.uint8)
+    return Wt.of(Source(sname, t.qtype, t.rows, t.cols, raw.reshape(t.rows, -1), g.tensor_file(name)))
 
 
 def gguf_getter(g: GGUFFile) -> Callable[[str], Wt | np.ndarray]:

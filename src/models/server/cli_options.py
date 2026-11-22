@@ -130,7 +130,8 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                      help="llama-server's switch to Jinja chat templates: always on (accepted, no effect)")
     structured.add_arguments(gen)
     vis = p.add_argument_group("images and audio (Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, LFM3-VL, LFM3-Audio)")
-    vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf): images "
+    vis.add_argument("--mmproj", type=model_path, help="the vision or speech encoder's GGUF file (mmproj-*.gguf; a checkpoint "
+                     "directory: its vision tower): images "
                      "in chat messages (image_url parts of data URIs), audio (input_audio parts, "
                      "/v1/audio/transcriptions)")
     vis.add_argument("--max-slices", type=int,
