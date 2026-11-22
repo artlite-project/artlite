@@ -310,7 +310,7 @@ HF_CHECKPOINTS = {"qwen3-0.6B": "Qwen/Qwen3-0.6B", "qwen3.5-0.8B": "Qwen/Qwen3.5
                   "qwen3-0.6B-paro": "z-lab/Qwen3-0.6B-PARO", "qwen3-8B-paro": "z-lab/Qwen3-8B-PARO",
                   "qwen3.5-0.8B-paro": "z-lab/Qwen3.5-0.8B-PARO", "qwen3.8-27B-paro-int5": "Launch80/Qwen3.8-27B-PARO-int5",
                   "qwen3.6-35B-A3B-paro": "z-lab/Qwen3.6-35B-A3B-PARO", "gemma-4-E2B": "google/gemma-4-E2B-it",
-                  "gemma-4-E2B-paro": "z-lab/gemma-4-E2B-it-PARO"}
+                  "gemma-4-E2B-paro": "z-lab/gemma-4-E2B-it-PARO", "gemma-4-E4B-paro": "z-lab/gemma-4-E4B-it-PARO"}
 
 
 def checkpoint(name: str) -> str:
