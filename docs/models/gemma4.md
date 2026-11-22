@@ -67,7 +67,7 @@ Speed and accuracy (E4B Q4_0, Strix):
 | prompt | 2345 tokens/s at 1032 tokens, 2750 at 8000 (`--no-prefill`: decode steps of 4 tokens, 121) |
 | accuracy vs the fp32 evaluation of the same file | teacher-forced KL 0.00023 / 0.00026 at 1 / 4 tokens per dispatch (34 tokens, argmax agreement 100%) |
 | after a prompt through the prefill | KL 0.00020 (34 tokens); its KV caches within 1-3% of the decode path's at every position through layer 11 (deeper layers amplify the prefill's rounding at a few positions) |
-| the PARO checkpoint | a dispatch of one token 56.3 ms (the Q4_0 file's 55.6); prompts at 3150 tokens/s at 1024 tokens, 3390 at 2048 (the Q4_0 file's 3040, 3170; `artlite-bench -p 1024,2048`); teacher-forced KL 0.00029 at 1 and 4 tokens per dispatch against the checkpoint computed exactly (34 tokens after a prompt through the prefill, argmax agreement 100%) |
+| the PARO checkpoint | a dispatch of one token 53.9 ms (the Q4_0 file's 55.6); prompts at 3150 tokens/s at 1024 tokens, 3390 at 2048 (the Q4_0 file's 3040, 3170; `artlite-bench -p 1024,2048`); teacher-forced KL 0.00029 at 1 and 4 tokens per dispatch against the checkpoint computed exactly (34 tokens after a prompt through the prefill, argmax agreement 100%) |
 | determinism | a token's logits depend on the tokens up to it only: not on the other slots of its dispatch, nor on rejected drafts; steps of 1-4 tokens give the same logits bit for bit (greedy text with drafts is the text without) |
 
 Design: the module docstrings of `decode/protocol.py`, `decode/design.py`, `decode/attn_overlay.py` and `gemma4/`.

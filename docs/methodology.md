@@ -21,8 +21,8 @@ Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF'
 | machine | ASUS ROG Flow Z13 (2025, GZ302EA), BIOS 314 |
 | processor | AMD Ryzen AI Max+ 395: 16 Zen 5 cores, Radeon 8060S iGPU, XDNA 2 NPU |
 | memory | 128 GB LPDDR5X-8000, 256-bit (256 GB/s) |
-| OS | Gentoo Linux, kernel 7.2.9 (7.2.14 from 2026-11-10) |
-| NPU driver and firmware | `amdxdna` from AMD's xdna-driver (2.21.70-790-g49fe4e13), NPU firmware 1.1.2.65 (xdna-driver's build, `npu.dev.sbin`; linux-firmware's `npu_7.sbin` 1.1.2.65 measures the same) |
+| OS | Gentoo Linux, kernel 7.2.9 (7.2.14 from 2026-11-10, 7.3.5 for the runs of 2026-11-22) |
+| NPU driver and firmware | `amdxdna` from AMD's xdna-driver (2.21.70-790-g49fe4e13; 2.21.70-873-gca385d85 for the runs of 2026-11-22), NPU firmware 1.1.2.65 (xdna-driver's build, `npu.dev.sbin`; linux-firmware's `npu_7.sbin` 1.1.2.65 measures the same) |
 | power | ACPI platform profile `performance` in both of its handlers (amd-pmf and asus-wmi: `/sys/class/platform-profile/*/profile`; `/sys/firmware/acpi/platform_profile` reads `custom` when they differ); NPU power mode: the driver's default for Artlite (it sets none), `turbo` for FastFlowLM and OpenFlowLM |
 
 One NPU job at a time, with no other heavy CPU load.
@@ -73,16 +73,19 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | Llama 3.1 8B Instruct | Q4_K_M | [lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | `f2be3e1a239c` | 2026-10-15 |
 | | Q4_K_S | [bartowski/Meta-Llama-3.1-8B-Instruct-GGUF](https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/blob/main/Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf) `Meta-Llama-3.1-8B-Instruct-Q4_K_S.gguf` | `7b04439ae150` | 2026-10-15 |
 | Gemma 4 E4B it | Q4_0 | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q4_0.gguf) `gemma-4-E4B-it-Q4_0.gguf`, its drafter `mtp-gemma-4-E4B-it-Q4_0.gguf` | `a555b900214b`, `d19a11e4fd50` | 2026-10-15 |
+| | PARO int4 | [z-lab/gemma-4-E4B-it-PARO](https://huggingface.co/z-lab/gemma-4-E4B-it-PARO) (a checkpoint directory) | commit `9dc686c0da46` | 2026-11-22 |
 | Qwen3.8 27B | Q4_K_M | [lmstudio-community/Qwen3.8-27B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-Q4_K_M.gguf) `Qwen3.8-27B-Q4_K_M.gguf`, its drafter [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/main/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` | `e00082f779fa`, `1a25c56858e1` | 2026-10-21; DFlash2 2026-11-01 |
+| | PARO int5 | [Launch80/Qwen3.8-27B-PARO-int5](https://huggingface.co/Launch80/Qwen3.8-27B-PARO-int5) (a checkpoint directory), its drafter the DFlash2 file above | commit `668cb0d71371`, `1a25c56858e1` | 2026-11-22 |
 | Qwen3.6 35B-A3B | Q4_K_M | [lmstudio-community/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-Q4_K_M.gguf) `Qwen3.6-35B-A3B-Q4_K_M.gguf`, its drafter [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/blob/main/mtp-Qwen3.6-35B-A3B-Q4_0.gguf) `mtp-Qwen3.6-35B-A3B-Q4_0.gguf` | `4ac6a06bce55`, `606fca331adc` | 2026-10-24; MTP at 1K 2026-10-29 |
+| | PARO int4 | [z-lab/Qwen3.6-35B-A3B-PARO](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-PARO) (a checkpoint directory), its drafter the MTP file above | commit `0c62664e71c1`, `606fca331adc` | 2026-11-22 |
 | Occamy 1.0 (35B-A3B) | APEX-I-MiniPlus | [IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf) `Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf` (as re-uploaded on 2026-10-23), its drafter [`occamy-1.0-mtp-Q4_K_M.gguf`](https://huggingface.co/IsValorum/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated-GGUF/blob/main/occamy-1.0-mtp-Q4_K_M.gguf) | `ba40cdc039c6`, `f8b0e6174daa` | 2026-10-25 |
 | MiniCPM-V 4.7 1B | Q4_K_M | [openbmb/MiniCPM-V-4.7-1B-gguf](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/MiniCPM-V-4_7-1B-Q4_K_M.gguf) `MiniCPM-V-4_7-1B-Q4_K_M.gguf` (the language model), its vision encoders [`mmproj-model-f16.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16.gguf) (16x) and [`mmproj-model-f16-4x.gguf`](https://huggingface.co/openbmb/MiniCPM-V-4.7-1B-gguf/blob/main/mmproj-model-f16-4x.gguf) (4x) | `588c6c94c82f`, `fb9cc047a3cd`, `1e0ab439877e` | 2026-10-21 |
 | LFM3 1.7B | QAD-Q4_0 | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-QAD-Q4_0.gguf) `LFM3-1.7B-QAD-Q4_0.gguf` | `43a7d09a0e9c` | 2026-11-10 |
 | | Q4_K_M | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-Q4_K_M.gguf) `LFM3-1.7B-Q4_K_M.gguf` | `3793e1e6e226` | 2026-11-10 |
 | Flint | int4 | [RecursiveSI/flint-int4-gguf](https://huggingface.co/RecursiveSI/flint-int4-gguf/blob/main/flint-int4-q4_1.gguf) `flint-int4-q4_1.gguf`, its drafter [incoai/Flint-DFlash2-GGUF](https://huggingface.co/incoai/Flint-DFlash2-GGUF/blob/main/Flint-DFlash2-Q4_K_M.gguf) `Flint-DFlash2-Q4_K_M.gguf` | `43c07baccdba`, `c14e92d3f666` | 2026-11-18 |
 
-sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id. Recorded: the date of the
-runs, with the toolchain pinned then:
+sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id (a checkpoint directory: its
+repository's commit). Recorded: the date of the runs, with the toolchain pinned then:
 
 | recorded | mlir-aie | llvm-aie (Peano) |
 |---|---|---|
@@ -97,6 +100,7 @@ runs, with the toolchain pinned then:
 | 2026-11-16 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 | 2026-11-18 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 | 2026-11-17 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
+| 2026-11-22 | 1.4.6.dev63+g0f76700 | 22.0.0.2026112001+ec5614f1 |
 
 The decode speeds of the files whose LM head is screened (Qwen3 0.6B, the Llama files but the BF16 ones and 3B Q3_K_M,
 Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B) are runs of 2026-11-16; those of Qwen3.6 35B-A3B, Occamy 1.0 and MiniCPM-V 4.7 1B, and

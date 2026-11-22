@@ -656,11 +656,11 @@ def main() -> None:
     charts = {
         "decode": bar_chart(
             data, "decode_tps", "Decode speed, tokens/s",
-            ["Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file.", pairing],
+            ["Generation speed after a prompt of 1k and of 32k tokens, greedy: one bar per GGUF file or checkpoint.", pairing],
             (1024, 32768), lambda v: f"{v:.1f}"),
         "prefill": bar_chart(
             data, "prefill_tps", "Prefill speed, tokens/s",
-            ["Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file.",
+            ["Prompt tokens processed per second (prompt length / time to the first token), one bar per GGUF file or checkpoint.",
              pairing],
             (1024, 32768), lambda v: f"{v:.0f}"),
         "ttft": ttft_chart(data),

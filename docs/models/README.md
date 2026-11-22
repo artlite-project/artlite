@@ -24,16 +24,26 @@ and Givens rounds), the head and embeddings from the checkpoint's F16 tensors; a
 tower with `--mmproj` the directory ([images](qwen35.md#images-qwen35--36--38)). Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
 against the checkpoint computed exactly on the CPU), z-lab/Llama-3.1-8B-Instruct-PARO (its first layers as the
 checkpoint computes them; a step of one token 81.7 ms, bartowski's Q4_K_S GGUF 76.0), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
-(its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s;
-with its base model's DFlash2 drafter, z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of
-up to 8 tokens: 8.3 tokens per second after a 1K-token essay prompt (the Q4_K_M GGUF's 11.2 at 11% fewer bytes a token),
-6.8 after 32K, the same greedy text),
-z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
-bytes a token; with its base model's MTP drafter, ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the
-GGUF files, 34.8 tokens per second after a 1K-token essay prompt and 29.8 after 32K, the GGUF's 35.8 and 30.5, the
-same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357), z-lab/gemma-4-E4B-it-PARO (teacher-forced
-KL 0.00029 against the checkpoint computed exactly; a step of one token 53.9 ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer
-bytes a token; a 1024-token prompt at 3150 tokens per second, the GGUF's 3040, 2048 tokens at 3390, the GGUF's 3170).
+(its first layers within 0.6% of the checkpoint computed exactly; with its base model's DFlash2 drafter,
+z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of up to 8 tokens, the same greedy text
+with and without drafts), z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; with its base model's MTP drafter,
+ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the GGUF files, the same greedy text),
+z-lab/gemma-4-E4B-it-PARO (teacher-forced KL 0.00029 against the checkpoint computed exactly; a step of one token 53.9
+ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer bytes a token). Their speeds next to the GGUF files' (the
+[charts](../../README.md#performance)' runs, [methodology](../methodology.md)):
+
+| | TTFT 1K / 32K | decode 1K / 32K | with the drafter 1K / 32K (S: tokens a step) |
+|---|---|---|---|
+| Qwen3.8 27B, PARO int5 | 3.27 / 120 s | 3.0 / 2.8 tokens/s | 8.9 / 6.4 tokens/s (S 8) |
+| Qwen3.8 27B, Q4_K_M | 2.25 / 86.4 s | 3.3 / 3.0 | 8.6 / 6.5 (S 8) |
+| Qwen3.6 35B-A3B, PARO int4 | 0.825 / 21.4 s | 25.6 / 21.5 | 35.0 / 29.9 (S 4 / 2) |
+| Qwen3.6 35B-A3B, Q4_K_M | 0.811 / 21.8 s | 27.4 / 23.5 | 35.8 / 30.5 (S 3) |
+| Gemma 4 E4B, PARO int4 | 0.341 / 12.4 s | 17.8 / 14.3 | |
+| Gemma 4 E4B, Q4_0 | 0.38 / 12.9 s | 16.7 / 13.7 | 33.0 / 20.4 (S 4 / 2) |
+
+The 27B int5's prompts are slower than its GGUF's: its 5-bit tiles have Q5_K's planar layout, which the prefill
+multiplies on three of a column's four cores (the fourth dequantizes), where the GGUF's Q4_K tiles use all four, and a
+chunk is compute bound.
 
 ## Tested files and plans
 
