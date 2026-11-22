@@ -115,6 +115,9 @@ def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
     tw = op.tile_bytes // 4
     fmt = op.fmt
 
+    def addr(j: int) -> int:  # (the word address of tile j: ``run`` tiles of an object back to back)
+        return col + j // op.run * tw + j % op.run * op.nsb * op.slice // 4
+
     def units(p: int) -> list[list]:
         """Per memtile object of pass p: per tile the word address of each gathered unit row (``None``: the rows
         of a slice from its start; hg > 1: a header unit's rows of the group's chunks, ``GemmQOperator.hg``)."""
@@ -122,7 +125,7 @@ def _expected_b(op: GemmQOperator, c: int, half: int = 0) -> list[np.ndarray]:
         if op.hg == 1:
             for kc in range(op.n_kc):
                 for sl in _units(op, p, kc):
-                    out.append([col + _tile(op, c, p, kc, t) * tw + sl * op.slice // 4 for t in range(op.tiles)])
+                    out.append([addr(_tile(op, c, p, kc, t)) + sl * op.slice // 4 for t in range(op.tiles)])
             return out
         hw = op.slice // 4 // op.hg  # (a tile's header, words)
         for k0, r in op.hdr_groups:
@@ -233,6 +236,22 @@ def test_gemm_q_dataflow(tag: str, fmt: str, kw: dict) -> None:
     dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     dm.check_memtile_object(df.a_obj * 2, df.a_wdims, repeated=df.a_repeat > 1)
 
+    _check_weights(op, df)
+    _check_activations(op, df)
+    _check_outputs(op, df)
+    _check_l1_q(op)
+
+
+def test_gemm_q_runs() -> None:
+    """BFP16 row-group tiles (a PARO checkpoint's F16 shared down: 2 slots of 512 columns in a 9280-byte object) as
+    GemmQ tiles of 512 columns, two to an object (``run``)."""
+    passes, S = 4, 9280
+    out_cols = [[c * 256 + 64 * p for p in range(passes)] for c in range(COLS)]
+    op = GemmQOperator(fmt="BFP16", rows=8, M=256, K=512, N=COLS * 256, tile_bytes=S, col_bytes=passes * 4 * S,
+                       passes=passes, out_cols=out_cols, kc=512, kc_group=1, run=2)
+    df = op.flow
+    assert df.b_chain(0) is not None
+    dm.check_memtile_object(df.b_obj * 4, df.b_wdims)
     _check_weights(op, df)
     _check_activations(op, df)
     _check_outputs(op, df)

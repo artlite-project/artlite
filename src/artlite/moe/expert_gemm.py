@@ -73,7 +73,8 @@ from . import ctl
 
 MAC_ROWS, M = 3, 64
 CHUNK = MAC_ROWS * M  # tokens of a chunk
-N_PARAM = "eg_n"  # (+ the column: its chunks, from bit 8 its gathered row groups)
+N_PARAM = "eg_n"  # (+ the column: its chunks; bits 8 .. 19 its gathered row groups, from bit 20 PARO's slot items)
+N_GROUPS, N_ITEMS = 8, 20  # (the fields' first bits)
 BLOCK_BDS = (14, 15)  # the control blocks' shim BDs (the sequence's own, block 0's fill: the low ids)
 W_BDS = (9, 10, 11, 12, 13)  # the weight tasks' BDs
 A_BDS = (1, 2, 3)  # a chunk's A strips (MM2S0)

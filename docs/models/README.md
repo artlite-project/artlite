@@ -23,8 +23,8 @@ weight with their scales), each projection's input rotated on the NPU as the che
 and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
 against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s),
-z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.3 tokens per second, the Q4_K_M GGUF's 28.0 at 5% fewer
-bytes a token; its prompts run as decode steps).
+z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.4 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
+bytes a token; prompts at the GGUF's speed: 1360 tokens per second at 1024 tokens).
 
 ## Tested files and plans
 
@@ -41,14 +41,14 @@ bytes a token; its prompts run as decode steps).
 | | 🤔 Gemma 4 26B-A4B it | | lmstudio-community QAT Q4_0; vision |
 | | 🤔 Gemma 4 31B it | | lmstudio-community QAT Q4_0; HauhauCS QAT Uncensored Balanced Q4_K_M (with MTP); vision |
 | qwen35 | ✅ Qwen3.5 9B | lmstudio-community Q4_K_M | |
-| | ✅ Qwen3.5 0.8B | Qwen's checkpoint directory (BF16, with its MTP block) | |
+| | ✅ Qwen3.5 0.8B | Qwen's checkpoint directory (BF16, with its MTP block); z-lab's PARO checkpoint (int4) | |
 | | ✅ Qwen3.6 27B | lmstudio-community Q4_K_M, its mmproj BF16 (images) | |
-| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images); unsloth UD-IQ4_XS (gate / up in two formats, IQ2 tensors), UD-IQ3_XXS, UD-IQ1_M (IQ1_S, IQ1_M tensors) | |
+| | ✅ Qwen3.8 27B | lmstudio-community Q4_K_M, with its MTP layer as the drafter; its mmproj BF16 (images); unsloth UD-IQ4_XS (gate / up in two formats, IQ2 tensors), UD-IQ3_XXS, UD-IQ1_M (IQ1_S, IQ1_M tensors); Launch80's PARO checkpoint (int5) | |
 | | ✅ Swift 1.5 (Qwen3.8 27B fine-tune, uncensored) | IsValorum APEX-I-MiniPlus V3 (IQ4_XS / IQ3_S / IQ3_XXS FFN), with its MTP layer as the drafter | its mmproj Q8_0 |
 | | ✅ MiniCPM-V 4.7 1B | openbmb Q4_K_M, its mmproj f16 (16x, 4x) | openbmb's other quants |
 | | ✅ vllm-sr d3-lite, d3-nano (decision models: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q8_0, their mmproj Q8_0 (images) | |
 | | ✅ Kev-4B (decision model: [`/v1/systemone`](../server.md#decisions)) | ggml-org Q4_K_M | |
-| qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0); its mmproj BF16 (images) | |
+| qwen35moe | ✅ Qwen3.6 35B-A3B | lmstudio-community Q4_K_M, with ggml-org's MTP drafter (Q4_0); its mmproj BF16 (images); z-lab's PARO checkpoint (int4) | |
 | | ✅ Occamy 1.0 (Qwen3.6 35B-A3B fine-tune, abliterated) | IsValorum APEX-I-MiniPlus V2.1 (IQ3_XXS / Q3_K experts), with its MTP drafter (Q4_K_M); its mmproj Q8_0 (images) | |
 | | 🤔 Bonsai 27B (1-bit) | | lmstudio-community Q1_0; vision |
 | | 🤔 Ternary Bonsai 2 27B | | prism-ml PTQ1_0, PQ2_0; vision |

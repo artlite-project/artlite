@@ -139,7 +139,6 @@ class NpuQwen(OverlayModel):
         self.dflash = DFlashOverlay(self.overlay, GGUFFile(dflash)) if dflash else None
         self.mtp = MtpDrafting(self) if self.drafter is not None else None  # (the drafters' bookkeeping: ``drafting``)
         self.flash = DFlashDrafting(self) if self.dflash is not None else None
-        prefill = prefill and not (self.overlay.paro and cfg.moe)  # (a PARO MoE checkpoint: its prompts as decode steps)
         self.prefill = QwenPrefill(self.overlay, sizes=sizes, draft=None if self.dflash is not None else self.drafter,
                                    dflash=self.dflash, precise=readout, pack=readout) if prefill else None
         self._open(threads=threads)

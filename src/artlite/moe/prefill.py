@@ -11,7 +11,10 @@ layer, after the post-attention norm with lo panels (PXM: per token [x hi | x lo
    experts' gate / up (H) and down (Y, ``expert_gemm``), the combine (DL: the delta per token,
    ``gather.CombineOperator``);
 
-then the model's residual norm adds DL. The router and the shared expert's GEMMs run one item each over the chunk
+then the model's residual norm adds DL. PARO (``paro``: rotated inputs, ``decode.rotated``): the norm's x / rms as bf16
+blocks, its rotated copy (the experts' gate / up rotation) as single panels (XR: the router's and the shared expert's A,
+their rows folded into it) and as bf16 rows (PXR: ``prefill.rotate``'s rows_out), which the gather takes plain; the
+experts' h rotated in place before their downs (``slot_rot``). The router and the shared expert's GEMMs run one item each over the chunk
 (from ``sub`` tokens on: their token chunks a scratchpad parameter, ``params``; an item per sub-chunk would pay each
 item's pipeline fill and drain). The buffers are the chunk's, shared by the layers (one layer's block in flight). ``cap``: chunks per column at most (the worst case of a chunk of ``max_t`` tokens: ceil((256 + max_t k /
 CHUNK) / COLS))."""
@@ -26,8 +29,9 @@ from ..prefill import gemm as PG
 from ..prefill.norm import PrefillNormOperator
 from . import gemm as MG
 from . import plan as MP
-from .expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
+from .expert_gemm import CHUNK, N_GROUPS, N_ITEMS, N_PARAM, ExpertGemmOperator, M
 from .gather import CHAIN, SHARED_W, CombineOperator, GatherNormOperator, ds_row
+from .slot_rot import SlotRotOperator
 
 
 class MoEPrefill:
@@ -36,9 +40,11 @@ class MoEPrefill:
     a shared expert without a gate row (``gemm.gated``) weighs 1."""
 
     def __init__(self, image: object, *, layers: list[int], sizes: tuple[int, ...], sub: int, eps: float,
-                 gating: str = "softmax"):
+                 gating: str = "softmax", paro: int = 0):
+        """paro: a PARO checkpoint's (rotated inputs: module docstring's "PARO"), the bytes of a token's single panels
+        of the hidden size (the rotated copy's, XR)."""
         cfg = image.cfg
-        self.img, self.layers, self.sub, self.eps, self.gating = image, layers, sub, eps, gating
+        self.img, self.layers, self.sub, self.eps, self.gating, self.paro = image, layers, sub, eps, gating, paro
         self.H, self.E, self.K = cfg.hidden_size, cfg.n_experts, cfg.n_experts_used
         self.F, self.Fs = cfg.expert_ffn, cfg.shared_ffn
         self.gated = MG.gated(image.region(layers[0], "moe_in"))
@@ -47,7 +53,8 @@ class MoEPrefill:
         self.pitch = MG.shared_pitch(image, layers)
         self._gemms: dict = {}
         self._ops: dict = {}
-        self.gnorm = GatherNormOperator(E=self.H, eps=eps, cap=self.cap)
+        self.gnorm = GatherNormOperator(E=self.H, eps=eps, cap=self.cap, plain=bool(paro))
+        self.srot = SlotRotOperator(K=self.F, cap=self.cap) if paro else None
         self.gu = {L: self._op(ExpertGemmOperator.of("gu", image.region(L, "exp_gu"), cap=self.cap, out=self.F))
                    for L in layers}
         self.dn = {L: self._op(ExpertGemmOperator.of("down", image.region(L, "exp_down"), cap=self.cap, out=self.H))
@@ -73,9 +80,10 @@ class MoEPrefill:
         """Layer L's GEMMs of a chunk of T tokens: the router, the shared gate / up and down; from ``sub`` tokens on one
         item each over the whole chunk (their token chunks a scratchpad parameter: ``params``)."""
         mi = self.img.region(L, "moe_in")
-        whole = T >= self.sub
-        return SimpleNamespace(router=MG.router(self.img, mi, T, ops=self._gemms, whole=whole),
-                               sgu=MG.shared_gate_up(self.img, mi, T, width=self.Fs, ops=self._gemms, whole=whole),
+        whole, lo = T >= self.sub, not self.paro
+        return SimpleNamespace(router=MG.router(self.img, mi, T, ops=self._gemms, whole=whole, lo=lo),
+                               sgu=MG.shared_gate_up(self.img, mi, T, width=self.Fs, ops=self._gemms, whole=whole,
+                                                     lo=lo),
                                sdown=MG.row_group_gemm(self.img.region(L, "sdown"), T, pitch=self.pitch,
                                                        row=ds_row(self.H, self.pitch), ops=self._gemms, whole=whole))
 
@@ -87,8 +95,9 @@ class MoEPrefill:
     def rows(self) -> dict[str, int]:
         """Bytes per token of the per-token buffers."""
         g = self.gemms(self.layers[0], self.sub)
-        return {"PXM": 2 * self.H * 9 // 8, "LG": 2 * g.router.op.N, "HS": self.Fs * 9 // 8, "DS": 2 * ds_row(self.H, self.pitch),
-                "DL": 2 * self.H}
+        x = {"XR": self.paro, "PXR": 2 * self.H} if self.paro else {"PXM": 2 * self.H * 9 // 8}  # (the A, the rows)
+        return x | {"LG": 2 * g.router.op.N, "HS": self.Fs * 9 // 8, "DS": 2 * ds_row(self.H, self.pitch),
+                    "DL": 2 * self.H}
 
     def fixed(self) -> dict[str, int]:
         """Bytes of the chunk-independent buffers (the control streams, XP, H, Y)."""
@@ -96,23 +105,25 @@ class MoEPrefill:
         return {"CBG": 4 * COLS * self.gnorm.cb_words, "CBU": 4 * COLS * max(op.cb_words for op in gu),
                 "CBD": 4 * COLS * max(op.cb_words for op in dn),
                 "CBC": 4 * COLS * max(op.cb_words for op in self.comb.values()),
+                **({"CBR": 4 * COLS * self.srot.cb_words} if self.srot else {}),
                 "XP": 2 * COLS * self.cap * self.gnorm.slot, "H": 2 * COLS * self.cap * max(op.c_slot for op in gu),
                 "Y": 2 * COLS * self.cap * CHUNK * self.y_pitch}
 
-    def items(self, L: int, T: int, *, tok: object, sl: object, w: object, norm: str
+    def items(self, L: int, T: int, *, tok: object, sl: object, w: object, norm: str, ro: str = ""
               ) -> tuple[list[tuple], tuple[int, int, int]]:
         """Layer L's block for a chunk of T tokens (after its norm with lo panels, before the residual norm that adds
         DL): the runlist items and the three that start a piece (the shared expert's, the gathered norm's: after
         ``host_route``, the expert GEMMs': after ``host_streams``). ``tok(buf, j, op, i, row)`` / ``sl(buf, off, op,
         i)``: the prefill's slices; ``w(gemm)``: a GEMM's weight slice; ``norm``: the post-attention norm weight's
-        slice."""
+        slice; ``ro`` (``paro``): the slice of the downs' rotation objects (``SlotRotOperator``)."""
         g = self.gemms(L, T)
         rb = self.rows()
+        xa = "XR" if self.paro else "PXM"  # (the router's and the shared expert's A: a PARO layer's rotated copy)
         rl: list[tuple] = []
         r = g.router
-        rl.append((r.op, tok("PXM", 0, r.op, 0, rb["PXM"]), w(r), tok("LG", 0, r.op, 2, rb["LG"])))
+        rl.append((r.op, tok(xa, 0, r.op, 0, rb[xa]), w(r), tok("LG", 0, r.op, 2, rb["LG"])))
         i_shared = len(rl)
-        rl.append((g.sgu.op, tok("PXM", 0, g.sgu.op, 0, rb["PXM"]), w(g.sgu), tok("HS", 0, g.sgu.op, 2, rb["HS"])))
+        rl.append((g.sgu.op, tok(xa, 0, g.sgu.op, 0, rb[xa]), w(g.sgu), tok("HS", 0, g.sgu.op, 2, rb["HS"])))
         rl.append((g.sdown.op, tok("HS", 0, g.sdown.op, 0, rb["HS"]), w(g.sdown), tok("DS", 0, g.sdown.op, 2, rb["DS"])))
         i_experts = len(rl)
         gu, dn = self.gu[L], self.dn[L]
@@ -120,13 +131,16 @@ class MoEPrefill:
         rl.append((self.gnorm, sl("CBG", 0, self.gnorm, 0), norm, sl("XP", 0, self.gnorm, 2)))
         i_gemms = len(rl)
         rl.append((gu, sl("CBU", 0, gu, 0), sl("XP", 0, gu, 1), sl("H", 0, gu, 2)))
+        if self.srot is not None:  # (the experts' h rotated in place for their downs)
+            sr = self.srot
+            rl.append((sr, sl("CBR", 0, sr, 0), ro, sl("H", 0, sr, 2), sl("H", 0, sr, 3)))
         rl.append((dn, sl("CBD", 0, dn, 0), sl("H", 0, dn, 1), sl("Y", 0, dn, 2)))
         rl.append((cb, sl("CBC", 0, cb, 0), sl("DS", 0, cb, 1), sl("DL", 0, cb, 2)))
         return rl, (i_shared, i_experts, i_gemms)
 
     @property
     def operators(self) -> list[object]:
-        return [self.gnorm, *self._ops.values(), *self.comb.values()]
+        return [self.gnorm, *self._ops.values(), *self.comb.values(), *([self.srot] if self.srot else [])]
 
     # ------------------------------------------------------------------
     # The host step
@@ -143,7 +157,7 @@ class MoEPrefill:
         ids, wts = MP.route(lg[:n], self.K, E=self.E, per_col=self.E // COLS, pitch=pitch, gating=self.gating)
         sg = lg[:n, MG.PASS // 2].astype(np.float64) if self.gated else None
         plan = MP.Plan.of(ids, cap=self.cap, E=self.E)
-        px = self._addr(dev, lib, "PX") + 2 * self.H * np.arange(T, dtype=np.int64)
+        px = self._addr(dev, lib, "PXR" if self.paro else "PX") + 2 * self.H * np.arange(T, dtype=np.int64)
         w = self.gnorm.cb_words
         v = dev.view("CBG").view(np.uint32)
         self.gnorm.streams([px[r] for r in plan.rows], plan.sizes,
@@ -153,13 +167,15 @@ class MoEPrefill:
         dev.flush("CBG")
         counts = plan.counts
         groups = [int((-(-plan.sizes[c] // CHAIN)).sum()) for c in range(COLS)]  # (the gather norm's)
-        lib.set_params({f"{N_PARAM}{c}": counts[c] | groups[c] << 8 for c in range(COLS)})
+        items = self.srot.items(plan.sizes) if self.srot else [0] * COLS
+        lib.set_params({f"{N_PARAM}{c}": counts[c] | groups[c] << N_GROUPS | items[c] << N_ITEMS for c in range(COLS)})
         self._routed = (L, n, plan, wts, sg)
         return plan
 
     def host_streams(self, L: int, *, n: int, T: int, dev: object, lib: object) -> None:
         """The rest of layer L's routed work (after ``host_route``): the expert GEMMs' and the combine's control streams
-        (CBU, CBD, CBC), the weights (DS rows' last ``WT_ROW`` fp32: the shared down writes the rest of them)."""
+        (CBU, CBD, CBC; PARO: the slot rotation's CBR), the weights (DS rows' last ``WT_ROW`` fp32: the shared down
+        writes the rest of them)."""
         L_, n_, plan, wts, sg = self._routed
         assert (L_, n_) == (L, n), (L_, L)
 
@@ -190,7 +206,13 @@ class MoEPrefill:
         wt[:] = 0
         wt[:n, :self.K] = wts
         wt[:n, SHARED_W] = 1 / (1 + np.exp(-sg)) if sg is not None else 1.0
-        for name in ("CBU", "CBD", "CBC"):
+        if self.srot is not None:
+            sr = self.srot
+            v = dev.view("CBR").view(np.uint32)
+            sr.streams(plan.sizes, cb=[addr("CBR", 4 * c * sr.cb_words) for c in range(COLS)],
+                       h=[addr("H", 2 * c * self.cap * gu.c_slot) for c in range(COLS)],
+                       out=[v[c * sr.cb_words:(c + 1) * sr.cb_words] for c in range(COLS)])
+        for name in ("CBU", "CBD", "CBC", *(("CBR",) if self.srot else ())):
             dev.flush(name)
         dev.flush("DS", 0, T * rb["DS"])  # (the weights' lines: the host writes no other line of DS)
 

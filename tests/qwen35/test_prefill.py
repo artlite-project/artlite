@@ -93,17 +93,19 @@ def test_prefill_slice(size: str, La: int) -> None:
     assert np.mean(cont) < 1.5 * np.mean(dec) + 2e-3
 
 
-@pytest.mark.parametrize("case", ["qwen3.5-0.8B-paro", "qwen3.8-27B-paro-int5"], ids=["0.8B", "27B"])
+@pytest.mark.parametrize("case", ["qwen3.5-0.8B-paro", "qwen3.8-27B-paro-int5", "qwen3.6-35B-A3B-paro"],
+                         ids=["0.8B", "27B", "35B-A3B"])
 def test_prefill_paro(case: str) -> None:
     """Qwen3.5-0.8B-PARO (a checkpoint directory: each projection on its rotated copy of its input, ``prefill.rotate``)
     up to its first full-attention layer: a chunk of two sub-chunks (the second part padding), then a chunk of 128 (the
     last tokens padding), from the embeddings, against llama.cpp on its pseudo-quantized GGUF (``goldens.paro``); then
     decode steps continuing from the state the prefill left, against llama.cpp and against the overlay running every
     position as a decode step. Qwen3.8-27B-PARO-int5: its P5_128 gate and up as rows (``prefill.gemm.plan_gate_up_rows``,
-    down's rotation in ``rows`` mode), against llama.cpp on its first layers (F16). (Measured: 0.8B prefill mean 1.7%,
-    max 12.3% (one token: its GDN gates' a / b rows, folded into gin_z's copy, through exp; 7.1% with the fold against
-    the exact transform, at the same KL), 27B 0.6% and 2.5%: bfp16 GEMM inputs against the decode's bf16 ones, whose
-    error is 0.5%; the decode after the prefill as close as the decode alone.)"""
+    down's rotation in ``rows`` mode), against llama.cpp on its first layers (F16); Qwen3.6-35B-A3B-PARO: its MoE layers
+    (``moe.prefill``'s PARO path: the experts' h rotated in their slots, ``moe.slot_rot``). (Measured: 0.8B prefill mean
+    1.7%, max 12.3% (one token: its GDN gates' a / b rows, folded into gin_z's copy, through exp; 7.1% with the fold
+    against the exact transform, at the same KL), 27B 0.6% and 2.5%, 35B-A3B 0.6% and 2.3%: bfp16 GEMM inputs against the
+    decode's bf16 ones, whose error is 0.5%; the decode after the prefill as close as the decode alone.)"""
     from artlite.hf_model import HfModel
     from artlite.model_config import checkpoint
     from models.qwen35.overlay import QwenOverlay
@@ -115,7 +117,7 @@ def test_prefill_paro(case: str) -> None:
     require(path)
     g = HfModel(path)
     La = QwenConfig.from_gguf(g).attention_layers[0]
-    ref = pseudo_gguf(path, f16=True, layers=La + 2) if "27B" in case else pseudo_gguf(path)
+    ref = pseudo_gguf(path) if "0.8B" in case else pseudo_gguf(path, f16=True, layers=La + 2)
     n1, n2, K = 288, 100, 4
     P = n1 + n2
     tokens = llama_tokenize(ref, essay("apple.txt"))[:P + K]

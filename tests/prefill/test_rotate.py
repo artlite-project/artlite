@@ -22,9 +22,10 @@ def _f32(x: np.ndarray) -> np.ndarray:
     return np.asarray(x, np.float32)
 
 
-def model(x: np.ndarray, tf: object) -> np.ndarray:
+def model(x: np.ndarray, tf: object, rows_out: bool = False) -> np.ndarray:
     """The operator's arithmetic on x (T, K) (bfp16 values) with the unit tan form tf (``kmath_sim``'s accumulator
-    arithmetic): x' (T, K) as hi + lo (fp32, before the output panels' rounding)."""
+    arithmetic): x' (T, K) as hi + lo (fp32, before the output panels' rounding; ``rows_out``: x' rounded once to
+    bf16)."""
     T, K = x.shape
     g = tf.group
     w = ks.bf16(tf.w)
@@ -40,6 +41,8 @@ def model(x: np.ndarray, tf: object) -> np.ndarray:
         out[:, gi, q] = ks.mac(b, cb[None, :, r, :, 1], ks.bf16(a))
         u = out
     hi = ks.bf16(u)  # (out as hi + lo: the panels' rounding of their sum)
+    if rows_out:
+        return hi.astype(np.float32).reshape(T, K)
     return ks.add(hi, ks.bf16(ks.add(u, -hi))).astype(np.float32).reshape(T, K)
 
 
@@ -73,17 +76,19 @@ CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), 
          (1024, 4096, False, 3),
          (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1),
          (256, 1024, "bf16", 3), (128, 4096, "bf16", 2),
-         (256, 2048, "rows", 1), (128, 3072, "rows", 1)]
+         (256, 2048, "rows", 1), (128, 3072, "rows", 1),
+         (256, 2048, "rowsout", 1), (128, 2048, "rowsout", 1)]
 
 
 @pytest.mark.parametrize(("T", "K", "gu", "copies"), CASES,
-                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows"}.get(gu, "")) +
+                         ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows", "rowsout": "-rowsout"}.get(gu, "")) +
                               (f"-c{c}" if c > 1 else "")
                               for T, K, gu, c in CASES])
 @pytest.mark.usefixtures("vtanh")
 def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     rng = np.random.default_rng(0)
-    xb, rows, gu = gu == "bf16", gu == "rows", gu is True or gu == "rows"
+    rows_out = gu == "rowsout"  # (bf16 blocks in, x' as bf16 rows: an MoE layer's copy that its experts gather)
+    xb, rows, gu = gu in ("bf16", "rowsout"), gu == "rows", gu is True or gu == "rows"
     tfs = [_rotation(K, rng, 1 + c).tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True) for c in range(copies)]
     if rows:  # (GU as rows [token][block 8][gate | up], a block's gate from its start, up 32 past its gate, padding)
         gp, x = _gu_input(T, K, rng)
@@ -103,9 +108,15 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     else:
         xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
-    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None)
+    op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None, rows_out=rows_out)
     ro = np.concatenate([tf.pair_objects(row_floats(gu)).reshape(-1) for tf in tfs])
-    out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16))).reshape(T // 8, copies, -1)  # ([token group][copy])
+    out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16)))
+    if rows_out:
+        got, want = out.astype(np.float32).reshape(T, K), model(x, tfs[0], rows_out=True)
+        bad = np.argwhere(got != want)
+        assert not len(bad), f"{len(bad)} of {got.size} values differ, first {bad[:4].tolist()}"
+        return
+    out = out.reshape(T // 8, copies, -1)  # ([token group][copy])
     for c, tf in enumerate(tfs):
         want = model(x, tf)
         got = bfp16.from_panels(out[:, c].reshape(-1), T, K)

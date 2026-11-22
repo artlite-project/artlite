@@ -146,6 +146,7 @@ class GemmSpec:
     pass_step: int = 0
     ptail: bool = False
     c_panels: int = 0
+    run: int = 1
 
     def __post_init__(self) -> None:
         for name in ("out_cols", "blocks", "a_cols", "ablate"):
@@ -215,6 +216,7 @@ class Geometry:
     rt_stride: int
     tail: int  # super-blocks of the last K chunk (0: whole chunks; K = 2560 of tiles of 1024 columns: 2)
     ptail: bool  # the passes read row tiles in pairs sharing their tail tile (``tile``)
+    run: int  # tiles of an image object (tile_bytes): back to back from its start (``GemmSpec.run``)
     KA: int  # A's columns
     a_k0: int
     a_K: int
@@ -478,6 +480,11 @@ class Geometry:
         else:
             last = ((nk - 1) // g) * rt * rs + (rt_end - 1) * rs + (nk - 1) % g + 1 if nk > 1 or rs > 1 else rt_end
             region = (rt * rs * (nk // g) if nk > 1 or rs > 1 else rt) * spec.tile_bytes
+        if spec.run > 1:  # (objects of run tiles)
+            assert not dequant and not dq_core and groups == 1 and n_kc == 1 and rt_stride == 1 and k_rep == 1
+            assert all(rt0 % spec.run == 0 for rt0, _ in blocks) and tiles % spec.run == 0 and step % spec.run == 0
+            assert spec.run * nsb * slice_bytes <= spec.tile_bytes, (spec.run, spec.tile_bytes)
+            last, region = -(-last // spec.run), -(-rt // spec.run) * spec.tile_bytes
         overrun = max(0, last * spec.tile_bytes - region)
         w_bytes = COLS * spec.col_bytes + hdr_skip + overrun - max(0, spec.col_bytes - region)
         assert slice_bytes in (2048, 2304) or is_planar, "super-block slices: 16 x 128 B (Q4), 8 x 288 B (BFP16)"
@@ -488,7 +495,7 @@ class Geometry:
             planar=is_planar, nsb=nsb, units=units, slice=slice_bytes, hdr_units=hdr_units, hdr_skip=hdr_skip, hg=hg,
             us=us, dequant=dequant, ws_planes=FORMATS[fmt].ws_planes, pair=pair, tq=tq, tiles=tiles, TR=TR,
             blocks=blocks, pass_step=step, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
-            tail=tail, ptail=spec.ptail,
+            tail=tail, ptail=spec.ptail, run=spec.run,
             KA=KA, a_k0=a_k0, a_K=a_K, overrun=overrun, w_bytes=w_bytes, halves=halves, n_read=n_read, n=n, nm=nm,
             c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1,
             c_panels=spec.c_panels)

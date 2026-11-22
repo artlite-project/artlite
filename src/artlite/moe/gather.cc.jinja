@@ -57,31 +57,42 @@ void {{ p }}_row(const bfloat16 *__restrict x, bfloat16 *__restrict g, float *__
         px += 32;
         aie::store_v(pg, v);
         pg += 32;
+{% if not plain %}
         acc = aie::mac_square(acc, v);
+{% endif %}
     }
     aie::store_v(ss + 32 * t, acc.template to_vector<float>());
 }
 
-// pass B, chunk kc: 32 panels (8 tokens x 8 columns) of g * w * (1 / rms) as bfp16ebs8 -> out (``prefill.norm``'s)
+// pass B, chunk kc: 32 panels (8 tokens x 8 columns) of g * w * (1 / rms) as bfp16ebs8 -> out (``prefill.norm``'s;
+// plain: of g)
 void {{ p }}_b(const bfloat16 *__restrict g, const bfloat16 *__restrict w, float *__restrict st,
                  bfloat16 *__restrict out, int32_t kc)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if plain %}
+    const aie::vector<bfloat16, 64> one = aie::broadcast<bfloat16, 64>(1.0f);  // (plain: the rows as they are)
+{% else %}
     bfloat16 *__restrict ih = (bfloat16 *)(st + 256);
     bfloat16 *__restrict il = ih + 64;
     if (kc == 0)
         {{ p }}_inv(st);
     const aie::vector<bfloat16, 64> vh = aie::load_v<64>(ih);
     const aie::vector<bfloat16, 64> vl = aie::load_v<64>(il);
+{% endif %}
     aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::c> o((bfp16ebs8 *)out);
     const bfloat16 *__restrict pg = g + {{ C }} * kc;
     const bfloat16 *__restrict pw = w + {{ C }} * kc;
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ C // 8 }}; kb++) {
         aie::vector<bfloat16, 64> xp = al::gather<8, 8>(pg, {{ E }});
+{% if plain %}
+        o.push(aie::mul(xp, one).template to_vector<bfp16ebs8>());
+{% else %}
         aie::vector<bfloat16, 64> xw = aie::mul(xp, aie::load_v<8>(pw).template grow_replicate<64>())
                                            .template to_vector<bfloat16>();
         o.push(aie::mac(aie::mul(xw, vh), xw, vl).template to_vector<bfp16ebs8>());
+{% endif %}
         pg += 8;
         pw += 8;
     }

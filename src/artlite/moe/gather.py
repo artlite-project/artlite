@@ -52,7 +52,7 @@ from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS, range32, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from . import ctl
-from .expert_gemm import CHUNK, N_PARAM
+from .expert_gemm import CHUNK, N_GROUPS, N_PARAM
 
 CHAIN = 8  # rows per block (a token group)
 ROW_BDS = (6, 7, 9, 10, 11, 12, 13, 15)  # a chain's row BDs (the sequences' own: 0 .. 2)
@@ -70,13 +70,15 @@ class _Gathered(ArtcOperator):
 
     p = kernel_prefix("mg")
 
+    plain = False  # (GatherNormOperator's: the rows not normed)
+
     def __init__(self, *, E: int, eps: float = 1e-6, ds_pitch: int = 0):
         self.E, self.eps, self.ds_pitch = E, eps, ds_pitch
         super().__init__()
 
     def get_kernel_src(self) -> str:
         return _SRC.render(p=self.p, E=self.E, C=256, eps=repr(self.eps), WT=WT_ROW, COLS=COLS,
-                           DP=self.ds_pitch or self.E // COLS)
+                           DP=self.ds_pitch or self.E // COLS, plain=self.plain)
 
     @property
     def row_n(self) -> int:
@@ -140,11 +142,12 @@ class _Gathered(ArtcOperator):
 
 
 class GatherNormOperator(_Gathered):
-    """XP of an MoE layer: per column its chunks' gathered rows normed (module docstring). ``cap``: chunks per column
-    at most. Arguments: the control streams (per column ``cb_words``), the norm weight (E bf16), XP (out)."""
+    """XP of an MoE layer: per column its chunks' gathered rows normed (module docstring; ``plain``: as they are, a PARO
+    layer's rotated copy of its normed input, ``prefill.rotate``'s rows_out, the weight unused). ``cap``: chunks per
+    column at most. Arguments: the control streams (per column ``cb_words``), the norm weight (E bf16), XP (out)."""
 
-    def __init__(self, *, E: int, eps: float, cap: int):
-        self.cap = cap
+    def __init__(self, *, E: int, eps: float, cap: int, plain: bool = False):
+        self.cap, self.plain = cap, plain
         super().__init__(E=E, eps=eps)
 
     @property
@@ -246,7 +249,7 @@ class GatherNormOperator(_Gathered):
             w = w_f.acquire(1)
             kw(w, wb)
             w_f.release(1)
-            n = prm.read() // 256  # (the column's row groups: ``N_PARAM`` from bit 8)
+            n = (prm.read() // (1 << N_GROUPS)) & 0xFFF  # (the column's row groups: ``N_PARAM``'s)
             for _ in range32(n):
                 for t in range_(8):
                     x = x_f.acquire(1)

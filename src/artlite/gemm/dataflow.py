@@ -218,6 +218,10 @@ class Dataflow:
             if geo.hg > 1:  # (per pass: the header groups' units and the chunks' codes, ``_hg_bds``)
                 for p_ in range(p0, p0 + np_):
                     out += [(p_, t) for t in self._hg_bds(c, geo.pass_rt[p_], 1)]
+            elif geo.run > 1:  # (per pass: [unit][object][its tile][words], the tiles of an object back to back)
+                n = geo.run
+                out += [(p_, TensorAccessPattern(w_dims, base + geo.pass_rt[p_] // n * tw, [nsl, nt // n, n, sw],
+                                                 [sw, tw, nsl * sw, 1])) for p_ in range(p0, p0 + np_)]
             elif nk == 1:
                 out.append((p0, TensorAccessPattern(w_dims, base + rt0 * rs * tw, [np_, nsl, nt, sw],
                                                     [ps * rs * tw, sw, rs * tw, 1])))
@@ -265,6 +269,11 @@ class Dataflow:
         base = c * geo.col_bytes // 2
         n_rt = geo.region_rt
         w_dims = (1, geo.w_bytes // 2)
+        if geo.run > 1:  # (objects of run tiles: a BD per unit, [pass][object][its tile][words])
+            n = geo.run
+            return [[TensorAccessPattern(w_dims, base + rt0 // n * tw + u * sw, [np_, nt // n, n, sw],
+                                         [ps // n * tw, tw, nsl * sw, 1]) for u in range(nsl)]
+                    for rt0, np_ in geo.blocks]
         # chunk k: tile (j, k) at (k // g) n_rt rs + j rs + k % g; pass p's tiles j = rt0 + nt p ..
         return [[TensorAccessPattern(w_dims, base + ((k // g) * n_rt * rs + rt0 * rs + k % g) * tw, [np_, nsl, nt, sw],
                                      [ps * rs * tw, sw, rs * tw, 1]) for k in list(range(nk)) * geo.k_rep]

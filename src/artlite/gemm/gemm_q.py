@@ -148,6 +148,7 @@ class GemmQOperator(ArtcOperator):
         pass_step: int = 0,
         ptail: bool = False,
         c_panels: int = 0,
+        run: int = 1,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -180,7 +181,10 @@ class GemmQOperator(ArtcOperator):
         tiles of 1024 columns): the last chunk's first half of the super-blocks (``Geometry.tail``); ``ptail``: a block
         of row tiles in pairs sharing that chunk's tile (``decode.image.Block.pt``; ``blocks``: (its first tile, passes),
         ``region_rt``: a column's tiles), read in pass pairs, the even row tiles' pass and the odd ones' (from the tail
-        tile's second half), the two parts of a gate / up C object (``Geometry.tile``).
+        tile's second half), the two parts of a gate / up C object (``Geometry.tile``). ``run``: an image object
+        (``tile_bytes``) holds that many tiles back to back (BFP16 row-group tiles, ``groups``' layout, read as tiles of
+        kc / G columns: their panels are k8-major, a slot's columns one run of the object's bytes; tile i's slot j = row
+        tile run i + j: output rows in order).
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -192,7 +196,7 @@ class GemmQOperator(ArtcOperator):
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
             mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail,
-            c_panels=c_panels)
+            c_panels=c_panels, run=run)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()

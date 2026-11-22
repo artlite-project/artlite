@@ -21,7 +21,7 @@ all 32 cores instead (the columns' reads of them: 12% of the pass's bytes at 102
 OUT): RO the groups' objects [group][``OBJ``], OUT x' as panels. A norm's ``copies`` for several projections (q, k, v;
 gate, up): x read once, each item rotated per copy (RO [copy][group][OBJ], OUT [token group][copy][K / 8 panels]: a
 copy's panels one row apart, whatever the prompt's size: a GEMM reads its copy as K columns of panels ``copies`` K
-wide). ``rows`` (``gu`` of gate and up GEMMs that write rows, ``prefill.gemm.plan_gate_up_rows``: tiles whose passes
+wide). ``rows_out``: x' as bf16 rows [T][K] (an MoE layer's copy that its experts gather, ``moe.gather``). ``rows`` (``gu`` of gate and up GEMMs that write rows, ``prefill.gemm.plan_gate_up_rows``: tiles whose passes
 are not 64 rows, P5_128's 13): GU as bf16 rows [token][column block][gate | up] (a block's gate channels from its start,
 its up ones ``rows[1]`` later, ``rows[0]`` a block's width): an item's L1 object [token][gate 128 | up 128], each round's
 [the column's tokens][gate | up][128] a fill whose repeat is the round, a fill per column block (the groups of a block
@@ -60,7 +60,8 @@ class PrefillRotOperator(ArtcOperator):
     p = kernel_prefix("prot")
 
     def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1, bf16: bool = False,
-                 rows: tuple[int, int] | None = None):
+                 rows: tuple[int, int] | None = None, rows_out: bool = False):
+        """rows_out: x' as bf16 rows [T][K] instead of panels (an MoE layer's copy that its experts gather)."""
         G = K // GROUP
         self.tok = row_floats(gu)
         assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
@@ -68,7 +69,9 @@ class PrefillRotOperator(ArtcOperator):
         assert copies == 1 or (not gu and T // self.tok <= COLS * ROWS), "copies: a round per group"
         assert not (gu and bf16) and (rows is None or (gu and K % COLS == 0 and K // COLS % GROUP == 0
                                                       and rows[0] >= 2 * K // COLS and rows[1] >= K // COLS))
+        assert not rows_out or (copies == 1 and not gu), "rows_out: one copy of a norm's x"
         self.T, self.K, self.rounds, self.gu, self.copies, self.bf16, self.rows = T, K, rounds, gu, copies, bf16, rows
+        self.rows_out = rows_out
         super().__init__()
 
     @property
@@ -82,10 +85,11 @@ class PrefillRotOperator(ArtcOperator):
         return 128 if self.gu else 64 if self.bf16 else 36
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16, gurows=self.rows is not None)
+        return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16, gurows=self.rows is not None,
+                           rows_out=self.rows_out)
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        n = self.T * self.K * 9 // 16  # (bf16 elements of the panels)
+        n = self.T * self.K if self.rows_out else self.T * self.K * 9 // 16  # (bf16 elements of the rows or panels)
         nx = self.T * COLS * self.rows[0] if self.rows else self.T * self.K // 64 * self.unit
         return [ArgSpec("in", (nx,), bfloat16),
                 ArgSpec("in", (self.copies * self.K // GROUP * OBJ // 2,), bfloat16),
@@ -96,7 +100,7 @@ class PrefillRotOperator(ArtcOperator):
         G, nb = K // GROUP, T // tok  # (groups, items per group)
         u8, f32 = np.dtype[np.uint8], np.dtype[np.float32]
         ntg = tok // 8  # (token groups of an item)
-        x_item, o_item = ntg * 16 * self.unit * 2, ntg * 16 * 72  # (bytes)
+        x_item, o_item = ntg * 16 * self.unit * 2, tok * 2 * GROUP if self.rows_out else ntg * 16 * 72  # (bytes)
         x_ty, xc_ty = np.ndarray[(x_item,), u8], np.ndarray[(ROWS * x_item,), u8]
         o_ty, oc_ty = np.ndarray[(o_item,), u8], np.ndarray[(ROWS * o_item,), u8]
         r_ty = np.ndarray[(OBJ,), u8]
@@ -137,7 +141,8 @@ class PrefillRotOperator(ArtcOperator):
                         x_f.release(1)
                     r_f.release(1)
 
-        workers = [Worker(core, [xs[c][m].cons(), rs[c].cons(), os_[c][m].prod(), k_rot,
+        rd = {"depth": 1} if self.rows_out else {}  # (rows out: 8 KB items; the object single-buffered, one per group)
+        workers = [Worker(core, [xs[c][m].cons(), rs[c].cons(**rd), os_[c][m].prod(), k_rot,
                                  Buffer(u_ty, name=f"pr_ua{c}_{m}"), Buffer(u_ty, name=f"pr_ub{c}_{m}"),
                                  *([Buffer(y_ty, name=f"pr_y{c}_{m}")] if gu else [])],
                           tile=Tile(c, 2 + m), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
@@ -148,18 +153,21 @@ class PrefillRotOperator(ArtcOperator):
         if self.rows:
             nx = T * COLS * self.rows[0]
         no, orow, ow = T * K * 9 // 16, K // 8 * 36, 16 * 36
+        if self.rows_out:  # (rows: a token's K, a group's 128 of them)
+            no, orow, ow = T * K, K, GROUP
         nro = C * G * OBJ // 2
 
-        def walk(c: int, size: int, row: int, run: int, nc: int = 1, cstep: int = 0) -> TensorAccessPattern:
-            """Column c's walk over the rounds of an argument of ``size`` elements in token-group rows of ``row``, a
-            group's ``run`` of each (runs of 1024 elements: a shim BD's inner dimension holds at most 1023 words):
-            [group (or round)][the column's token groups][run]; ``nc`` copies: [round][copy, ``cstep`` apart][..][run]."""
+        def walk(c: int, size: int, row: int, run: int, nc: int = 1, cstep: int = 0, per: int = ntg) -> TensorAccessPattern:
+            """Column c's walk over the rounds of an argument of ``size`` elements in token-group rows of ``row`` (``per``
+            of them an item; rows_out's output: token rows, ``tok``), a group's ``run`` of each (runs of 1024 elements: a
+            shim BD's inner dimension holds at most 1023 words): [group (or round)][the column's token groups][run]; ``nc``
+            copies: [round][copy, ``cstep`` apart][..][run]."""
             cut = min(run, 1024)
             if nb >= COLS * ROWS:  # (a group's items over t = nb / 32 rounds: the column's 4 t of them)
-                base, dims, steps = 4 * t * ntg * c * row, [G, 4 * t * ntg], [run, row]
+                base, dims, steps = 4 * t * per * c * row, [G, 4 * t * per], [run, row]
             else:  # (a round's items over 32 / nb groups)
                 s = COLS * ROWS // nb
-                base, dims, steps = 4 * c % nb * ntg * row + 4 * c // nb * run, [n, 4 * ntg], [s * run, row]
+                base, dims, steps = 4 * c % nb * per * row + 4 * c // nb * run, [n, 4 * per], [s * run, row]
             if nc > 1:
                 assert cut == run
                 return TensorAccessPattern((size,), base, [dims[0], nc, dims[1], run], [steps[0], cstep, steps[1], 1])
@@ -199,7 +207,8 @@ class PrefillRotOperator(ArtcOperator):
                     xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
                 if c < len(rh):
                     rh[c].fill(RO, ro_tap(c), group=tg)
-                oh[c].drain(OUT, walk(c, C * no, C * orow, ow, C, orow), group=tg, wait=True)
+                oh[c].drain(OUT, walk(c, no, orow, ow, per=tok) if self.rows_out else walk(c, C * no, C * orow, ow, C, orow),
+                            group=tg, wait=True)
                 for tap in rows_taps(c) if self.rows else ():  # (after the column's drain: past 4 queued tasks a fill
                     # waits for its first to complete, which the cores reach only while their outputs drain)
                     xh[c].fill(X, tap, group=tg)

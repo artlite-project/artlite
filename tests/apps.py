@@ -1,10 +1,11 @@
 """The apps' designs as the apps build them (no NPU): per app its model file and its builder, which compiles the app's
 designs and returns what it built (``AppBuild``): the decode overlays and prefill libraries of the models present
-(Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's and Qwen3.5-0.8B-PARO's checkpoint directories: their rotated inputs; Qwen3.6-35B-A3B also with its MTP drafter file, the app's default:
-the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block and with its DFlash2
-drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision overlay (the Stable
-Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them, ``schedule_ledger.py`` reads
-their builds."""
+(Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's, Qwen3.5-0.8B-PARO's, Qwen3.6-35B-A3B-PARO's and
+Qwen3.8-27B-PARO-int5's checkpoint directories: their rotated inputs; Qwen3.6-35B-A3B also with its MTP drafter file,
+the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
+and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision
+overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them,
+``schedule_ledger.py`` reads their builds."""
 
 import os
 from collections.abc import Callable
@@ -168,6 +169,8 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "qwen3-embedding-4B-Q4_K_M": _llama(qwen3_gguf("embedding-4B"), "hilo"),
     "qwen3-0.6B-PARO": _llama(checkpoint("qwen3-0.6B-paro"), "hilo"),
     "qwen3.5-0.8B-PARO": (checkpoint("qwen3.5-0.8B-paro"), _qwen),
+    "qwen3.6-35B-A3B-PARO": (checkpoint("qwen3.6-35B-A3B-paro"), _qwen),
+    "qwen3.8-27B-PARO-int5": (checkpoint("qwen3.8-27B-paro-int5"), _qwen),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
