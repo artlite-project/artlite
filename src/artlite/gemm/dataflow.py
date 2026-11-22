@@ -180,8 +180,8 @@ class Dataflow:
         w_dims = (1, geo.w_bytes // 2)
         step = 2 if geo.ptail else 1  # (passes per iteration)
         out = []
-        for e in range(step):
-            p = p0 + e
+        for i, e in enumerate((0, 1) if geo.ptail else (max(geo.pt_part, 0),)):  # (parity e: ``pt_part``'s every pass)
+            p = p0 + i
             it = (geo.tile(p + step, 0, 0) - geo.tile(p, 0, 0)) * tw if np_ > step else tw  # (the next iteration's)
             for k in range(geo.n_kc):
                 ts = (geo.tile(p, 1, k) - geo.tile(p, 0, k)) * tw if geo.tiles > 1 else tw
@@ -330,7 +330,14 @@ class Dataflow:
             cols, no = [o - cr for o, (cr, _) in zip(cols, geo.carry, strict=True)], geo.win
         taps = []
         for p0, cnt, step in drain_runs(cols):
-            if geo.c_panels:  # bf16 panels [group][N / 8][c_panels]: [pass][the chunk's groups][no / 8 blocks][64]
+            if geo.c_panels and geo.pt_part >= 0:  # (one parity of row tile pairs: a pass's row tiles 2 R apart, each
+                # R = 16 outputs, panels of 64: [pass][the chunk's groups][tile][its two panels])
+                pp = geo.c_panels
+                assert pp == 64 and geo.R == 16, (pp, geo.R)
+                taps.append(TensorAccessPattern((self.c_elems,), (ch * rows * m // 8 * geo.N + cols[p0]) // 8 * pp,
+                                                [cnt, rows * m // 8, geo.tiles, 2 * pp],
+                                                [step // 8 * pp, geo.N // 8 * pp, 4 * pp, 1]))
+            elif geo.c_panels:  # bf16 panels [group][N / 8][c_panels]: [pass][the chunk's groups][no / 8 blocks][64]
                 pp = geo.c_panels
                 taps.append(TensorAccessPattern((self.c_elems,), (ch * rows * m // 8 * geo.N + cols[p0]) // 8 * pp,
                                                 [cnt, rows * m // 8, no // 8, 64], [step // 8 * pp, geo.N // 8 * pp, pp, 1]))

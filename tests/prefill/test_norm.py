@@ -267,3 +267,30 @@ def test_residual_norm(mode: str, E: int, deltas: int, d_pitch: int, scale: bool
     ex, en, eq = rel(got_x, want_x), rel(got_n, want_n), rel(want_q, want_n)
     print(f"x' {ex:.2e}, xn {en:.2e} (the model's values rounded to bfp16: {eq:.2e})")
     assert ex < 2e-5 and en < 1.1 * eq, (ex, en, eq)
+
+
+@pytest.mark.parametrize("mode", ["in", "post", "plain"])
+def test_residual_norm_bf16(mode: str) -> None:
+    """``bf16`` (a PARO Gemma's norms, w1 of ones: its weights in the rotations): xn as bf16 blocks of 8 tokens x 8
+    columns in the panels' order, within bf16's rounding of the fp64 model's values (``plain``: x' itself)."""
+    T, E, dp, eps = 256, 2560, 320, 1e-6
+    op = ResidualNormOperator(T=T, E=E, mode=mode, eps=eps, d_pitch=dp, bf16=True).compile()
+    dev = op.device
+    g = torch.Generator().manual_seed(11)
+    x = torch.randn(T, E, generator=g) * 4
+    d = (torch.randn(1, T, COLS, dp, generator=g) * 30).bfloat16()
+    wp = torch.rand(E, generator=g) + 0.5
+    w1 = torch.ones(E)
+    P = artlite.from_numpy(residual_params(wp.numpy(), w1.numpy(), 1.0, E).view(np.int16).view(bfloat16), dev)
+    X = artlite.from_numpy(to_numpy(x.contiguous().view(torch.bfloat16).reshape(-1)), dev)
+    XN = artlite.empty((T * E,), dtype=bfloat16, device=dev)
+    if mode == "in":
+        op.dispatch(P, X, XN)
+    else:
+        op.dispatch(P, X, artlite.from_numpy(to_numpy(d.reshape(-1).contiguous()), dev), X, XN)
+    XN.sync_from_device()
+    want_n = _residual_reference(x, d.float().reshape(T, E), wp, w1, 1.0, eps, mode)[1]
+    got_n = to_torch(XN.numpy()).double().view(T // 8, E // 8, 8, 8).transpose(1, 2).reshape(T, E)
+    err = rel(got_n, want_n)
+    print(f"{mode}: xn {err:.2e}")
+    assert err < 3e-3, err  # (bf16's rounding: ~1.6e-3)

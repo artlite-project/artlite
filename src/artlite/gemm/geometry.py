@@ -147,6 +147,7 @@ class GemmSpec:
     ptail: bool = False
     c_panels: int = 0
     run: int = 1
+    ptail_part: int = -1
 
     def __post_init__(self) -> None:
         for name in ("out_cols", "blocks", "a_cols", "ablate"):
@@ -216,6 +217,7 @@ class Geometry:
     rt_stride: int
     tail: int  # super-blocks of the last K chunk (0: whole chunks; K = 2560 of tiles of 1024 columns: 2)
     ptail: bool  # the passes read row tiles in pairs sharing their tail tile (``tile``)
+    pt_part: int  # (>= 0: ``ptail``'s row tiles of that parity alone: every pass a pair's even, or odd, row tiles)
     run: int  # tiles of an image object (tile_bytes): back to back from its start (``GemmSpec.run``)
     KA: int  # A's columns
     a_k0: int
@@ -297,8 +299,8 @@ class Geometry:
         (``decode.image.Region``'s pairs of 2 n_kc - 1 tiles, a block's (first tile, passes) in ``blocks``): pass pair q
         of a block reads pairs q tiles .. as even row tiles (pass 2 q) and odd ones (2 q + 1), the last chunk from the
         pair's tail tile."""
-        return _tile(self.blocks, self.pass_rt, self.ptail, self.tiles, self.n_kc, self.kc_group, self.region_rt,
-                     self.rt_stride, p, t, k)
+        return _tile(self.blocks, self.pass_rt, self.ptail or self.pt_part >= 0, self.tiles, self.n_kc, self.kc_group,
+                     self.region_rt, self.rt_stride, p, t, k, self.pt_part)
 
     @property
     def hdr_groups(self) -> list[tuple[int, int]]:
@@ -345,6 +347,8 @@ class Geometry:
         assert not tail or (2 * tail == nsb and K > kc and spec.k_rep == 1 and groups == 1
                             and spec.kc_group in (0, -(-K // kc))), (K, kc, spec.kc_group)
         assert not spec.ptail or (tail and spec.blocks and all(cnt % 2 == 0 for _, cnt in spec.blocks)), "ptail: pairs"
+        # (one parity of ``ptail``'s pairs: a GEMM of plain C, its passes the pairs' even or odd row tiles)
+        assert spec.ptail_part < 0 or (tail and spec.blocks and not spec.ptail and not silu and spec.ptail_part in (0, 1))
         # planar tiles of super-block units (``Slot.unit_bytes``): the weight objects are units of the pass's tiles
         units = slot(fmt).unit_bytes(fmt, rows, nsb) if is_planar else 0
         assert groups == 1 or (dq_core and k_rep == 1 and not silu and kc // 256 % groups == 0), groups
@@ -386,6 +390,11 @@ class Geometry:
             pass_rt = tuple(t0 + (2 * n_kc - 1) * tiles * (i // 2) + n_kc * (i % 2) for t0, cnt in blocks
                             for i in range(cnt))
             region_rt = spec.region_rt  # (ptail: the column's tiles)
+        elif spec.ptail_part >= 0:  # (pass q: pairs q tiles .., row tiles of parity ptail_part)
+            assert spec.region_rt and step == tiles, "ptail_part: the column's tiles (region_rt)"
+            pass_rt = tuple(t0 + (2 * n_kc - 1) * tiles * i + n_kc * spec.ptail_part for t0, cnt in blocks
+                            for i in range(cnt))
+            region_rt = spec.region_rt
         else:
             pass_rt = tuple(rt0 + step * i for rt0, cnt in blocks for i in range(cnt))
             rt_end = max(rt0 + step * (cnt - 1) + tiles for rt0, cnt in blocks)  # row tiles read
@@ -473,8 +482,8 @@ class Geometry:
         # last column's: a column stride longer than the region (a column-major image's) is not read past it there,
         # where the image may end
         nk, g, rt, rs = n_kc, kc_group, region_rt, rt_stride
-        if spec.ptail:  # (the last tile any pass reads; the region: the column's tiles)
-            last = 1 + max(_tile(blocks, pass_rt, True, tiles, nk, g, rt, rs, p, t, k)
+        if spec.ptail or spec.ptail_part >= 0:  # (the last tile any pass reads; the region: the column's tiles)
+            last = 1 + max(_tile(blocks, pass_rt, True, tiles, nk, g, rt, rs, p, t, k, spec.ptail_part)
                            for p in range(passes) for t in range(tiles) for k in range(nk))
             region = rt * spec.tile_bytes
         else:
@@ -495,7 +504,7 @@ class Geometry:
             planar=is_planar, nsb=nsb, units=units, slice=slice_bytes, hdr_units=hdr_units, hdr_skip=hdr_skip, hg=hg,
             us=us, dequant=dequant, ws_planes=FORMATS[fmt].ws_planes, pair=pair, tq=tq, tiles=tiles, TR=TR,
             blocks=blocks, pass_step=step, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
-            tail=tail, ptail=spec.ptail, run=spec.run,
+            tail=tail, ptail=spec.ptail, pt_part=spec.ptail_part, run=spec.run,
             KA=KA, a_k0=a_k0, a_K=a_K, overrun=overrun, w_bytes=w_bytes, halves=halves, n_read=n_read, n=n, nm=nm,
             c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1,
             c_panels=spec.c_panels)
@@ -508,8 +517,8 @@ class Geometry:
 
 
 def _tile(blocks: tuple[tuple[int, int], ...], pass_rt: tuple[int, ...], ptail: bool, tiles: int, n_kc: int, g: int,
-          n_rt: int, rs: int, p: int, t: int, k: int) -> int:
-    """``Geometry.tile`` (also for ``variants``, before the geometry exists)."""
+          n_rt: int, rs: int, p: int, t: int, k: int, part: int = -1) -> int:
+    """``Geometry.tile`` (also for ``variants``, before the geometry exists; ``part``: ``pt_part``)."""
     if not ptail:
         j = pass_rt[p] + t
         return (k // g) * n_rt * rs + j * rs + k % g
@@ -521,7 +530,7 @@ def _tile(blocks: tuple[tuple[int, int], ...], pass_rt: tuple[int, ...], ptail: 
     pair = 2 * n_kc - 1
     if k < n_kc - 1:
         return pass_rt[p] + pair * t + k
-    return pass_rt[p] - n_kc * (i % 2) + pair * t + n_kc - 1
+    return pass_rt[p] - n_kc * (i % 2 if part < 0 else part) + pair * t + n_kc - 1
 
 
 @dataclass(frozen=True)

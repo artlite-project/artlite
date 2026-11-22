@@ -148,7 +148,6 @@ class GemmaOverlay(GemmaParo, AttentionOverlay):
         """The step's phases in order, from layer ``start`` on (``lm`` False: up to the last attention that writes a
         cache)."""
         if self.paro:
-            assert self.start == self.layers[0], "a PARO checkpoint's steps: from the first layer"
             return self.paro_phases(lm)
         out = [(L, n) for L in self.layers if L >= self.start for n in PHASES
                if n not in ("gate", "proj") or self.cfg.per_layer_dim]
@@ -379,7 +378,7 @@ class GemmaOverlay(GemmaParo, AttentionOverlay):
             self._metas(S)
         act = dev.view("ACT")
         if start != self.layers[0]:  # (res: what the header scales back to x, with the scale's bf16 bits as M_SCALE)
-            x = x / bf16_value(self._scale(start, "qkv"))
+            x = x / bf16_value(self.r_scale(start, "rq") if self.paro else self._scale(start, "qkv"))
         xf = x
         self._write_loadr(xf)
         sp = packed_slots(S)

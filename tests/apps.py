@@ -1,7 +1,7 @@
 """The apps' designs as the apps build them (no NPU): per app its model file and its builder, which compiles the app's
 designs and returns what it built (``AppBuild``): the decode overlays and prefill libraries of the models present
 (Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's, Qwen3.5-0.8B-PARO's, Qwen3.6-35B-A3B-PARO's and
-Qwen3.8-27B-PARO-int5's checkpoint directories: their rotated inputs, the 27B's also with its base model's DFlash2
+Qwen3.8-27B-PARO-int5's and Gemma 4 E4B PARO's checkpoint directories: their rotated inputs, the 27B's also with its base model's DFlash2
 drafter; Qwen3.6-35B-A3B (and its PARO checkpoint) also with its MTP drafter file, the app's default: the design runs
 the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
 and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision
@@ -72,7 +72,7 @@ def _gemma(path: str) -> AppBuild:
     from models.gemma4.overlay import GemmaOverlay
     from models.gemma4.prefill import GemmaPrefill
 
-    ov = GemmaOverlay(GGUFFile(path), max_positions=4096 + BATCH)
+    ov = GemmaOverlay(open_weights(path), max_positions=4096 + BATCH)
     pf = GemmaPrefill(ov)
     return _built([ov.op, pf.lib], pf, ov)
 
@@ -193,6 +193,7 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "qwen3.8-27B-PARO-int5": (checkpoint("qwen3.8-27B-paro-int5"), _qwen),
     "qwen3.8-27B-PARO-int5-dflash": (checkpoint("qwen3.8-27B-paro-int5"), _qwen_paro_dflash),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
+    "gemma-E4B-PARO": (checkpoint("gemma-4-E4B-paro"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
     "qwen-3.8-27B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda path: _qwen_drafts(path, dflash=False)),

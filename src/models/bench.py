@@ -176,11 +176,14 @@ def file_info(path: str, *, gguf: GGUFFile | None = None) -> tuple[dict[str, obj
     """A GGUF file's fields (llama.cpp's model_type, size and parameters) and its vocabulary size; ``gguf``: the file
     already open."""
     f = gguf or open_weights(path)
+    params = sum(math.prod(dims) for dims, _, _, _ in f.tensor_info.values())
+    ftype = f.meta.get("general.file_type")
+    bits = getattr(f, "paro_bits", 0)  # (a checkpoint directory: no file type; a PARO checkpoint's bits)
+    quant = file_type_name(ftype) if ftype is not None else f"PARO int{bits}" if bits else "unknown"
     info = {"model_filename": path,
-            "model_type": f"{f.arch} {f.meta.get('general.size_label', '?B')} "
-                          f"{file_type_name(f.meta.get('general.file_type'))}",
+            "model_type": f"{f.arch} {f.meta.get('general.size_label', f'{params / 1e9:.1f}B')} {quant}",
             "model_size": sum(nbytes or 0 for _, _, _, nbytes in f.tensor_info.values()),
-            "model_n_params": sum(math.prod(dims) for dims, _, _, _ in f.tensor_info.values())}
+            "model_n_params": params}
     return info, f.string_count("tokenizer.ggml.tokens")
 
 

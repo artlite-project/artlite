@@ -18,8 +18,9 @@ partial sums into the gu region), rgate, rup -> gate, up (F_PSQ: into rot_down's
 of the column's 1280, rotated), down (F_VOUT -> the pg region), rpgate -> pgate (gelu(y) pli: F_PLI, its 32 rows a
 column into rot_proj's 64-slot input), rot_proj (column c rotates proj's group c % 2 of the slots' first 32 channels
 into element 128 c of proj's input: its 4 row groups' copies of the 256), proj (F_VOUT -> the next layer's qkv region);
-then rlm (the last layer's update, an identity copy over the output norm) -> lm. The first layer's qkv region holds the
-embeddings as r (v and its partial sums zero: n = r). Inputs that came with an earlier phase's (rk, rv, k, v, rup, up)
+then rlm (the last layer's update, an identity copy over the output norm) -> lm. The step's first layer's qkv region holds
+its input as r (the embeddings, or a prefill chunk's residual over the output scale before; v and its partial sums zero:
+n = r). Inputs that came with an earlier phase's (rk, rv, k, v, rup, up)
 take no sync."""
 
 from typing import TYPE_CHECKING
@@ -97,10 +98,11 @@ class GemmaParo(RotatedOverlay):
     # ------------------------------------------------------------------
 
     def paro_phases(self: "GemmaOverlay", lm: bool = True) -> list[tuple[int, str]]:
-        """The step's phases in order (``lm`` False: up to the last attention that writes a cache)."""
+        """The step's phases in order, from layer ``start`` on (``lm`` False: up to the last attention that writes a
+        cache)."""
         cfg = self.cfg
         out = [(-1, "ple")] if cfg.per_layer_dim and self.ple else []
-        for L in self.layers:
+        for L in self.layers[self.layers.index(self.start):]:
             own = cfg.kv_source(L) == L
             out += [(L, n) for n in LAYER if (own or n not in ("rk", "rv", "k", "v"))
                     and (cfg.per_layer_dim or n not in ("rpgate", "pgate", "rot_proj", "proj"))]
@@ -231,7 +233,7 @@ class GemmaParo(RotatedOverlay):
     def r_meta(self: "GemmaOverlay", L: int, name: str, S: int) -> list[tuple[int, np.ndarray]]:
         """An R phase's metadata objects of S slots: (ACT offset, bytes) per column and sub-phase (module docstring):
         the first sub-phase's F_RPS, F_RUPD (an update's first: its partial sums object follows, counted in M_NX), F_PZERO
-        (the first layer's: no update, pend zero); per sub-phase its groups and their rotation objects, the last one's
+        (the step's first layer's: no update, pend zero, ``overlay.GemmaOverlay.step``); per sub-phase its groups and their rotation objects, the last one's
         padding object (a column of fewer than the most groups) counted in M_NT."""
         sp = packed_slots(S)
         per = SLOTS // sp  # (strips of an X object)
@@ -243,7 +245,7 @@ class GemmaParo(RotatedOverlay):
                 m = np.zeros(META, np.int32)
                 f = F_MAIN | F_ROTX | F_RPOST
                 if i == 0:
-                    f |= F_RPS | (F_RUPD if name in UPD else 0) | (F_PZERO if L == self.layers[0] and name == "rq" else 0)
+                    f |= F_RPS | (F_RUPD if name in UPD else 0) | (F_PZERO if L == self.start and name == "rq" else 0)
                 nra = -(-(g0 + ng) // 2) - g0 // 2  # (its groups' objects: two a 9216-byte object, from group g0)
                 pad = nmax - self.image.r_objects(c) if i + 1 == len(subs) else 0
                 m[M_FLAGS], m[M_NS], m[M_NX], m[M_RGN] = f, S, per * (2 if f & F_RUPD else 1), ng

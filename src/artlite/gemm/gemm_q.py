@@ -147,6 +147,7 @@ class GemmQOperator(ArtcOperator):
         pace: int | None = None,
         pass_step: int = 0,
         ptail: bool = False,
+        ptail_part: int = -1,
         c_panels: int = 0,
         run: int = 1,
     ):
@@ -195,7 +196,7 @@ class GemmQOperator(ArtcOperator):
             out_cols=out_cols, silu=silu, act=act, nrows=nrows, c_bfp16=c_bfp16, ablate=ablate, kc=kc,
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
-            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail,
+            mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail, ptail_part=ptail_part,
             c_panels=c_panels, run=run)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
@@ -535,7 +536,7 @@ class GemmQOperator(ArtcOperator):
             for _ in range_(self.n_full):
                 chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(self.nsb), *extra)
             if self.tail:  # (its first super-blocks; ``ptail``: a pass pair's second part, the odd row tiles, the others)
-                s0 = self.tail * part if self.ptail else 0
+                s0 = self.tail * (part if self.ptail else max(self.pt_part, 0))
                 chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(s0, s0 + self.tail), *extra)
             if silu:  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
                 extra[0](acc, c, st, *(extra[2:4] if gelu else (0,)), *([part] if parts == 2 else []))

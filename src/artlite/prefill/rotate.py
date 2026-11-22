@@ -37,7 +37,7 @@ from aie.iron.controlflow import forever_, range_
 from aie.iron.device import NPU2, Tile
 from ml_dtypes import bfloat16
 
-from ..operators import templating
+from ..operators import kmath, templating
 from ..operators.base import ArgSpec, ArtcOperator
 from ..operators.design import COLS
 from ..operators.kernel_source import kernel_prefix
@@ -64,11 +64,15 @@ class PrefillRotOperator(ArtcOperator):
     p = kernel_prefix("prot")
 
     def __init__(self, *, T: int, K: int, rounds: int = 8, gu: bool = False, copies: int = 1, bf16: bool = False,
-                 rows: tuple[int, int] | None = None, rows_out: bool = False, hilo: bool = False):
+                 rows: tuple[int, int] | None = None, rows_out: bool = False, hilo: bool = False, act: str = "silu",
+                 narrow: bool = False, gu_split: bool = False):
         """rows_out: x' as bf16 rows [T][K] instead of panels (an MoE layer's copy that its experts gather); hilo: x' as
-        panels of bfp16(x') and of bfp16(x' - bfp16(x')), two copies' places (an MoE router's input, its logits exact)."""
+        panels of bfp16(x') and of bfp16(x' - bfp16(x')), two copies' places (an MoE router's input, its logits exact);
+        act: ``gu``'s activation, "silu" or a GELU form (Gemma's: ``kmath.act`` of its table, two copies in each core);
+        narrow: items of 16 tokens anyway (a K of few groups: a PARO Gemma's proj, 2 groups);
+        gu_split: GU as [T / 8][gate K / 8 | up K / 8][64] (``prefill.gemm.gate_up_split``: row tile pairs' GEMMs)."""
         G = K // GROUP
-        self.tok = row_floats(gu or hilo or rows_out)
+        self.tok = row_floats(gu or hilo or rows_out or narrow)
         assert K % GROUP == 0 and T % (self.tok * ROWS) == 0 and (G * T // self.tok) % (COLS * ROWS) == 0, (T, K)
         assert rounds % 2 == 0 and 512 * rounds + 4 * GROUP == OBJ, rounds
         assert copies == 1 or (not gu and T // self.tok <= COLS * ROWS), "copies: a round per group"
@@ -77,7 +81,16 @@ class PrefillRotOperator(ArtcOperator):
         assert not (rows_out or hilo) or (copies == 1 and not gu and not (rows_out and hilo)), "one copy of a norm's x"
         self.T, self.K, self.rounds, self.gu, self.copies, self.bf16, self.rows = T, K, rounds, gu, copies, bf16, rows
         self.rows_out, self.hilo = rows_out, hilo
+        assert act == "silu" or (gu and act in kmath.TABLES), act
+        assert not gu_split or (gu and rows is None), "gu_split: GU's panels"
+        self.act, self.gu_split = act, gu_split
         super().__init__()
+
+    @property
+    def kind_label(self) -> str:
+        """Its kind in ``artlite-probe --kinds``: K, the copies, the input's form."""
+        form = f"gu {self.act}" if self.gu else "bf16" if self.bf16 else "panels"
+        return f"K {self.K} x{self.out_copies} {form}"
 
     @property
     def n_rounds(self) -> int:
@@ -96,7 +109,7 @@ class PrefillRotOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         return _SRC.render(p=self.p, R=self.rounds, TOK=self.tok, gu=self.gu, xb=self.bf16, gurows=self.rows is not None,
-                           rows_out=self.rows_out, hilo=self.hilo)
+                           rows_out=self.rows_out, hilo=self.hilo, act=self.act, gusplit=self.gu_split)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         n = self.T * self.K if self.rows_out else self.T * self.K * 9 // 16  # (bf16 elements of the rows or panels)
@@ -116,8 +129,11 @@ class PrefillRotOperator(ArtcOperator):
         o_ty, oc_ty = np.ndarray[(o_item,), u8], np.ndarray[(ROWS * o_item,), u8]
         r_ty = np.ndarray[(OBJ,), u8]
         u_ty = np.ndarray[(GROUP * tok,), f32]
-        y_ty = np.ndarray[(ntg * 1024,), np.dtype[bfloat16]]  # (gu: the gates' silu)
-        k_rot = Kernel(f"{p}_rot", "kernel.o", [x_ty, r_ty, o_ty, u_ty, u_ty, *([y_ty, np.int32] if gu else [])])
+        y_ty = np.ndarray[(ntg * 1024,), np.dtype[bfloat16]]  # (gu: the gates' activation)
+        gelu = gu and self.act != "silu"  # (its table's two copies, ``kmath.TABLES``)
+        lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]] if gelu else None
+        act_ty = [lut_ty, lut_ty] if gelu else [np.int32]
+        k_rot = Kernel(f"{p}_rot", "kernel.o", [x_ty, r_ty, o_ty, u_ty, u_ty, *([y_ty, *act_ty] if gu else [])])
         n = self.n_rounds
         x3 = [ObjectFifo(xc_ty, name=f"pr_x{c}", depth=2) for c in range(COLS)]
         bc = nb >= COLS * ROWS  # (every core on one group at a time: the objects broadcast)
@@ -148,14 +164,17 @@ class PrefillRotOperator(ArtcOperator):
                     r = r_f.acquire(1)
                     for _ in range_(t):
                         x, o = x_f.acquire(1), o_f.acquire(1)
-                        rot(x, r, o, ua, ub, *([y[0], 0] if gu else []))  # (gu: silu's opaque runtime zero)
+                        rot(x, r, o, ua, ub, *([y[0], *(y[1:] if gelu else [0])] if gu else []))  # (gu: silu's
+                        # opaque runtime zero, a GELU's table copies)
                         o_f.release(1)
                         x_f.release(1)
                     r_f.release(1)
 
         workers = [Worker(core, [xs[c][m].cons(), rs[c].cons(), os_[c][m].prod(), k_rot,
                                  Buffer(u_ty, name=f"pr_ua{c}_{m}"), Buffer(u_ty, name=f"pr_ub{c}_{m}"),
-                                 *([Buffer(y_ty, name=f"pr_y{c}_{m}")] if gu else [])],
+                                 *([Buffer(y_ty, name=f"pr_y{c}_{m}")] if gu else []),
+                                 *[Buffer(lut_ty, name=f"pr_{t}{c}_{m}", initial_value=kmath.TABLES[self.act].table_words())
+                                   for t in (("ta", "tb") if gelu else ())]],
                           tile=Tile(c, 2 + m), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for m in range(ROWS)]
         # (bf16 elements: the input, its token group's row, a group's run of it in a token group; the output's; the
@@ -217,7 +236,9 @@ class PrefillRotOperator(ArtcOperator):
         def seq(X, RO, OUT, xh, rh, oh):
             tg = TaskGroup()
             for c in range(COLS):
-                if not self.rows:
+                if self.gu_split:  # (per token group the group's gate run, then its up run)
+                    xh[c].fill(X, walk(c, nx, xr, xw // 2, 2, K // 8 * 64, inner=True), group=tg)
+                elif not self.rows:
                     xh[c].fill(X, walk(c, nx, xr, xw), group=tg)
                 if c < len(rh):
                     rh[c].fill(RO, ro_tap(c), group=tg)

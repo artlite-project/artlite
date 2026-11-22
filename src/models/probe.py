@@ -406,6 +406,8 @@ def kinds(path: str, *, tokens: int, seconds: float) -> tuple[list[str], list[tu
         """An operator's kind: a GEMM by its pace class (role and tile kind), format and shape; one with a mode by it
         (an attention's kind and window); else its class."""
         mode = getattr(op, "mode", None)
+        if (label := getattr(op, "kind_label", None)) is not None:  # (its own: e.g. a rotation's K and copies)
+            return f"{type(op).__name__} {label}"
         if hasattr(op, "fmt") and hasattr(op, "K"):
             role = f"{PACE_CLASSES[op.pace]} " if getattr(op, "pace", None) is not None else ""
             return f"{type(op).__name__} {role}{op.fmt} {op.K}x{op.N}"

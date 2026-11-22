@@ -43,13 +43,14 @@ class ResidualNormOperator(ArtcOperator):
     """The residual update and norm of T tokens (module docstring). Runtime sequence: ``in``: (P, X, XN); ``post`` /
     ``plain`` / ``add``: (P, X, D, XO, XN), XO = X in place. P: the parameters (``params``), X / XO: (T, E) fp32 (as bf16
     pairs), D: the deltas (2 T 8 d_pitch per delta, ``d_stride`` apart), XN: panels in rows of ``out_pitch`` columns
-    (default E; more: the GEMM's K in whole chunks, the padding panels unwritten)."""
+    (default E; more: the GEMM's K in whole chunks, the padding panels unwritten); ``bf16``: bf16 blocks of 8 tokens x 8
+    columns in the panels' order instead (128 B each: a PARO checkpoint's rotations read them, ``prefill.rotate``)."""
 
     STACK = 1024
     p = kernel_prefix("gn")
 
     def __init__(self, *, T: int, E: int, mode: str, eps: float, d_pitch: int = 0, deltas: int = 1, d_stride: int = 0,
-                 scale: bool = False, cols: int = COLS, out_pitch: int = 0):
+                 scale: bool = False, cols: int = COLS, out_pitch: int = 0, bf16: bool = False):
         """``scale``: x' = (...) s with s from the parameters (the layer's output scale), else s = 1 (cheaper)."""
         assert mode in MODES and E % 128 == 0, (mode, E)
         self.out_pitch = out_pitch or E
@@ -57,6 +58,8 @@ class ResidualNormOperator(ArtcOperator):
         assert T % 8 == 0 and T >= 8 * cols and 1 <= cols <= COLS and deltas in (1, 2, 4)
         assert mode == "post" or not scale
         self.T, self.E, self.mode, self.eps, self.cols, self.scale = T, E, mode, eps, cols, scale
+        self.bf16 = bf16
+        self.unit = 64 if bf16 else 36  # (bf16 elements of an 8 x 8 output block: a bfp16 panel's 36)
         self.ch = E // RCH  # (columns per chunk)
         self.d_pitch = d_pitch or E // COLS
         assert self.d_pitch >= E // COLS
@@ -75,7 +78,7 @@ class ResidualNormOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         return _RSRC.render(p=self.p, E=self.E, CH=self.ch, eps=repr(self.eps), mode=self.mode, deltas=self.deltas,
-                           scale=self.scale, w=Attr(self.workspace()))
+                           scale=self.scale, w=Attr(self.workspace()), bf16=self.bf16)
 
     @property
     def n_delta(self) -> int:
@@ -86,7 +89,7 @@ class ResidualNormOperator(ArtcOperator):
         specs = [ArgSpec("in", (8 * E,), bfloat16), ArgSpec("in", (2 * T * E,), bfloat16)]
         if self.mode != "in":
             specs += [ArgSpec("in", (self.n_delta,), bfloat16), ArgSpec("out", (2 * T * E,), bfloat16)]
-        specs.append(ArgSpec("out", (T * self.out_pitch * 9 // 16,), bfloat16))
+        specs.append(ArgSpec("out", (T * self.out_pitch * self.unit // 64,), bfloat16))
         return specs
 
     def get_mlir_artifact(self) -> Module:
@@ -96,7 +99,7 @@ class ResidualNormOperator(ArtcOperator):
         bf = np.dtype[bfloat16]
         xc_ty = np.ndarray[(2 * 8 * ch,), bf]  # a chunk of x (8 tokens x ch fp32)
         dc_ty = np.ndarray[(nd * 8 * ch,), bf]  # a chunk of d ([delta][8 tokens][ch] bf16) or of the parameters
-        pan_ty = np.ndarray[(ch // 8 * 36,), bf]
+        pan_ty = np.ndarray[(ch // 8 * self.unit,), bf]
         ws_ty = np.ndarray[(self.workspace()["size"] // 2,), bf]
         k_prm = Kernel(f"{p}_prm", "kernel.o", [dc_ty, ws_ty, np.int32])
         k_ss = Kernel(f"{p}_ss", "kernel.o", [xc_ty if mode == "in" else dc_ty, ws_ty, np.int32])
@@ -184,7 +187,7 @@ class ResidualNormOperator(ArtcOperator):
         d_h = [f[0].prod(tile=Tile(c, 0)) for c, f in enumerate(df)]
         o_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]
         p_h = [f.cons(tile=Tile(c, 0)) for c, f in enumerate(pf)]
-        cols, op_ = self.cols, self.out_pitch
+        cols, op_, u = self.cols, self.out_pitch, self.unit
 
         def seq(*a):
             if mode == "in":
@@ -205,14 +208,14 @@ class ResidualNormOperator(ArtcOperator):
                                                       [8 * cols * ed, self.d_stride, dp, 1]), group=tg)
                     oh[c].drain(XO, TensorAccessPattern((n,), 16 * E * c, [n_g, n_kc, 8, 2 * ch],
                                                         [16 * cols * E, 2 * ch, 2 * E, 1]), group=tg, wait=True)
-                ph[c].drain(XN, TensorAccessPattern((T * op_ * 9 // 16,), c * (op_ // 8) * 36,
-                                                    [1, n_g, 8, E // 64 * 36], [0, cols * (op_ // 8) * 36, E // 64 * 36, 1]),
+                ph[c].drain(XN, TensorAccessPattern((T * op_ * u // 64,), c * (op_ // 8) * u,
+                                                    [1, n_g, 8, E // 64 * u], [0, cols * (op_ // 8) * u, E // 64 * u, 1]),
                             group=tg, wait=True)
             tg.finish()
 
         types = [np.ndarray[(8 * E,), bf], np.ndarray[(n,), bf]]
         if mode != "in":
             types += [np.ndarray[(self.n_delta,), bf], np.ndarray[(n,), bf]]
-        types.append(np.ndarray[(T * self.out_pitch * 9 // 16,), bf])
+        types.append(np.ndarray[(T * self.out_pitch * u // 64,), bf])
         rt = Runtime(seq, [*types, x_h, d_h, p_h, *([o_h] if mode != "in" else [])])
         return Program(NPU2(), rt, workers=workers).resolve_program()

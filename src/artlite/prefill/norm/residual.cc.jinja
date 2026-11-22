@@ -137,6 +137,8 @@ void {{ p }}_upd(const bfloat16 *__restrict x_, const bfloat16 *__restrict d, bf
     aie::accum<accfloat, 64> acc(aie::load_v<64>(ss));
     if (kc == 0)
         acc = aie::zeros<accfloat, 64>();
+{% elif bf16 %}
+    bfloat16 *__restrict o = pan;
 {% else %}
     al::BOut<> o((bfp16ebs8 *)pan);
 {% endif %}
@@ -160,6 +162,9 @@ void {{ p }}_upd(const bfloat16 *__restrict x_, const bfloat16 *__restrict d, bf
         {{ p }}_scatter8<{{ CH }}>(xo, xp);
 {% if mode != "plain" %}
         acc = aie::mac_square(acc, aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>());
+{% elif bf16 %}
+        aie::store_v(o, aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>());
+        o += 64;
 {% else %}
         o.push(aie::accum<accfloat, 64>(xp).template to_vector<bfp16ebs8>());
 {% endif %}
@@ -193,7 +198,11 @@ void {{ p }}_pan(const bfloat16 *__restrict x_, {{ "const bfloat16 *__restrict d
 {% endif %}
     const bfloat16 *__restrict p1 = NW(bfloat16, {{ w.w1 }}) + {{ CH }} * kc;
     const float *__restrict px = (const float *)x_;
+{% if bf16 %}
+    bfloat16 *__restrict o = pan;
+{% else %}
     al::BOut<> o((bfp16ebs8 *)pan);
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < {{ CH // 8 }}; kb++) {
 {% if mode == "add" %}
@@ -211,7 +220,12 @@ void {{ p }}_pan(const bfloat16 *__restrict x_, {{ "const bfloat16 *__restrict d
 {% endif %}
         const aie::vector<bfloat16, 64> xw = aie::mul(aie::accum<accfloat, 64>(xp).template to_vector<bfloat16>(),
                                                       aie::load_v<8>(p1).template grow_replicate<64>()).template to_vector<bfloat16>();
+{% if bf16 %}
+        aie::store_v(o, aie::mac(aie::mul(xw, ih), xw, il).template to_vector<bfloat16>());
+        o += 64;
+{% else %}
         o.push(aie::mac(aie::mul(xw, ih), xw, il).template to_vector<bfp16ebs8>());
+{% endif %}
         px += 8;
         p1 += 8;
     }

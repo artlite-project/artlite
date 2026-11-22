@@ -7,7 +7,8 @@ F_PLI epilogue forms them (``decode.protocol.F_PLI``).
 embeddings (the prefill's "ple" GEMM, bf16: per token column c's 32 values at c ``pitch``, the argument starting at the
 layer's); e the host's per-layer token rows of the layer (T x 256 bf16, ``GemmaHost.layer_rows``); w the projection
 norm's weights / sqrt 2 (bf16 hi [256] | lo [256]); h as proj's A: bfp16 panels [T / 8][512 / 8][72 B] in the same
-slots (column c's 32 values at 64 c, zeros after them: the image's proj tiles hold zero weights there, ``gemma4.image``).
+slots (column c's 32 values at 64 c, zeros after them: the image's proj tiles hold zero weights there, ``gemma4.image``);
+``dense``: h's 256 values contiguous ([T / 8][256 / 8][72 B]: a PARO checkpoint's proj rotation reads them).
 1 / rms(p) over a token's 256 values with eps = hidden_size rms_norm_eps (``prefill`` folds the projection's 1 / sqrt(hidden) into
 the norm), GELU through kmath's table pass (a worker buffer of the core: no static tables), bf16 like the decode's:
 bf16(bf16(gelu(bf16(y))) pli).
@@ -44,19 +45,20 @@ class PleOperator(ArtcOperator):
     STACK = 1024
     p = kernel_prefix("g4ple")
 
-    def __init__(self, *, T: int, pitch: int, eps: float, cols: int = COLS // 2):
+    def __init__(self, *, T: int, pitch: int, eps: float, cols: int = COLS // 2, dense: bool = False):
         assert T % 8 == 0 and T >= 8 * cols and 1 <= cols <= COLS // 2 and pitch % 32 == 0
-        self.T, self.pitch, self.eps, self.cols = T, pitch, eps, cols
+        self.T, self.pitch, self.eps, self.cols, self.dense = T, pitch, eps, cols, dense
+        self.ow = D if dense else COLS * SLOT  # (h's row: its values, or the slots)
         super().__init__()
 
     def get_kernel_src(self) -> str:
-        return _SRC.render(p=self.p, SLOT=SLOT, PER=PER, D=D, eps=repr(self.eps))
+        return _SRC.render(p=self.p, SLOT=SLOT, PER=PER, D=D, eps=repr(self.eps), dense=self.dense)
 
     def get_arg_spec(self) -> list[ArgSpec]:
         T = self.T
         return [ArgSpec("in", (T * COLS * SLOT,), bfloat16), ArgSpec("in", (T * COLS * self.pitch,), bfloat16),
                 ArgSpec("in", (T * D,), bfloat16), ArgSpec("in", (2 * D,), bfloat16),
-                ArgSpec("out", (T * COLS * SLOT * 9 // 16,), bfloat16)]
+                ArgSpec("out", (T * self.ow * 9 // 16,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
         T, p, cols, pitch = self.T, self.p, self.cols, self.pitch
@@ -67,7 +69,7 @@ class PleOperator(ArtcOperator):
         w_ty = np.ndarray[(2 * D,), bf]
         j_ty = np.ndarray[(18 * D,), bf]  # (p | e | w)
         s_ty = np.ndarray[(64,), np.dtype[np.float32]]
-        o_ty = np.ndarray[(8 * COLS * SLOT * 9 // 16,), bf]
+        o_ty = np.ndarray[(8 * self.ow * 9 // 16,), bf]
         tab = kmath.GELU.table_words()  # (its two copies in banks 2 and 3: kmath.table_pass)
         tab_ty = np.ndarray[(tab.size,), np.dtype[np.uint32]]
         k_ple = Kernel(f"{p}_ple", "kernel.o", [y_ty, j_ty, l_ty, l_ty, s_ty, tab_ty, tab_ty, o_ty])
@@ -95,8 +97,8 @@ class PleOperator(ArtcOperator):
                                  Buffer(tab_ty, name=f"pl_tabb{c}", initial_value=tab, mem_bank=3), n_gs[c]],
                           tile=Tile(c, 2), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(cols)]
-        ny, npp, ne, no = T * COLS * SLOT, T * COLS * pitch, T * D, T * COLS * SLOT * 9 // 16
-        g_y, g_e, g_o = 8 * COLS * SLOT, 8 * D, 8 * COLS * SLOT * 9 // 16
+        ny, npp, ne, no = T * COLS * SLOT, T * COLS * pitch, T * D, T * self.ow * 9 // 16
+        g_y, g_e, g_o = 8 * COLS * SLOT, 8 * D, 8 * self.ow * 9 // 16
         row = COLS * pitch  # (a token's row of P)
 
         def seq(Y, P, E, W, A, yh, ph, eh, wh, oh):  # (p, e, w: each group's object of the join)

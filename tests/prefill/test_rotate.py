@@ -1,7 +1,6 @@
 """``prefill.rotate.PrefillRotOperator`` on the NPU against its host model bit for bit (Qwen3-0.6B-PARO's rotations, or
 random ones without the checkpoint): the panels of x (``bf16``: its bf16 blocks, a norm's; ``gu``: gate and up's bf16
-panels, x = bf16(silu(gate) up),
-kmath.silu_tanh's model) -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16 value times T on the fp32
+panels, x = bf16(silu(gate) up), kmath.silu_tanh's model; Gemma's bf16(gelu(gate) up), its table's) -> u = x w' (exact), the rounds on Givens pairs (the partner's bf16 value times T on the fp32
 MAC), x' as hi + lo into bfp16 panels (``rowsout``: bf16 rows; ``hilo``: the panels of x' and of its remainder); and the
 model against the exact transform (fp64)."""
 
@@ -60,11 +59,12 @@ def _rotation(K: int, rng: np.random.Generator, layer: int = 1) -> Rotation:
         return Rotation(rng.uniform(-1.2, 1.2, (8, K // 2)), pairs, rng.uniform(-2, 2, K), 128)  # (|tan| <= 2.6: PARO's)
 
 
-def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-    """GU's panels [T / 8][K / 8][gate 64 | up 64] (bf16, [token][channel] each) and x = bf16(silu(gate) up) (T, K)."""
+def _gu_input(T: int, K: int, rng: np.random.Generator, act: str = "silu") -> tuple[np.ndarray, np.ndarray]:
+    """GU's panels [T / 8][K / 8][gate 64 | up 64] (bf16, [token][channel] each) and x = bf16(act(gate) up) (T, K)."""
     gu = (rng.standard_normal((T // 8, K // 8, 2, 8, 8)) * 2).astype(bfloat16)
     g = gu[:, :, 0].astype(np.float32)
-    y = np.asarray(ks.emulate(kmath.silu_tanh(walk=(2, 128)), g.reshape(-1)), np.float32).reshape(g.shape)
+    fn = kmath.silu_tanh(walk=(2, 128)) if act == "silu" else kmath.act(kmath.TABLES[act], table_arg=True, walk=(2, 128))
+    y = np.asarray(ks.emulate(fn, g.reshape(-1)), np.float32).reshape(g.shape)
     h = (torch.from_numpy(y).bfloat16().float() * torch.from_numpy(gu[:, :, 1].astype(np.float32))).bfloat16().float()
     return gu.reshape(-1), h.numpy().transpose(0, 2, 1, 3).reshape(T, K)
 
@@ -75,7 +75,7 @@ def _gu_input(T: int, K: int, rng: np.random.Generator) -> tuple[np.ndarray, np.
 # gate, up of 128 tokens)
 CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), (256, 1024, False, 2),
          (1024, 4096, False, 3),
-         (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1),
+         (1024, 3072, True, 1), (128, 3072, True, 1), (256, 3584, True, 1), (256, 2560, "gelu", 1), (256, 2560, "split", 1),
          (256, 1024, "bf16", 3), (128, 4096, "bf16", 2),
          (256, 2048, "rows", 1), (128, 3072, "rows", 1),
          (256, 2048, "rowsout", 1), (128, 2048, "rowsout", 1), (512, 2048, "rowsout", 1),
@@ -84,7 +84,7 @@ CASES = [(256, 1024, False, 1), (1024, 3072, False, 1), (1024, 1024, False, 3), 
 
 @pytest.mark.parametrize(("T", "K", "gu", "copies"), CASES,
                          ids=[f"{T}x{K}" + ({True: "-gu", "bf16": "-bf16", "rows": "-rows", "rowsout": "-rowsout",
-                                             "hilo": "-hilo"}.get(gu, "")) +
+                                             "hilo": "-hilo", "gelu": "-gu-gelu", "split": "-gu-split"}.get(gu, "")) +
                               (f"-c{c}" if c > 1 else "")
                               for T, K, gu, c in CASES])
 @pytest.mark.usefixtures("vtanh")
@@ -92,7 +92,9 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
     rng = np.random.default_rng(0)
     rows_out = gu == "rowsout"  # (bf16 blocks in, x' as bf16 rows: an MoE layer's copy that its experts gather)
     hilo = gu == "hilo"  # (bf16 blocks in, x' as hi and lo panels: an MoE layer's copy that its router reads)
-    xb, rows, gu = gu in ("bf16", "rowsout", "hilo"), gu == "rows", gu is True or gu == "rows"
+    act = "gelu" if gu in ("gelu", "split") else "silu"  # (Gemma's down: its gelu table)
+    split = gu == "split"  # (GU as [gate | up] halves: a PARO Gemma's gate / up of row tile pairs)
+    xb, rows, gu = gu in ("bf16", "rowsout", "hilo"), gu == "rows", gu in (True, "rows", "gelu", "split")
     tfs = [_rotation(K, rng, 1 + c).tan_form(None if gu else rng.uniform(0.5, 2.0, K), unit=True) for c in range(copies)]
     if rows:  # (GU as rows [token][block 8][gate | up], a block's gate from its start, up 32 past its gate, padding)
         gp, x = _gu_input(T, K, rng)
@@ -105,7 +107,9 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
         grid[:, :, geo[1]:geo[1] + kb] = up.reshape(T, COLS, kb)
         xp = grid.reshape(-1)
     elif gu:
-        xp, x = _gu_input(T, K, rng)
+        xp, x = _gu_input(T, K, rng, act)
+        if split:  # ([T / 8][K / 8][gate | up][64] -> [T / 8][gate | up][K / 8][64])
+            xp = np.ascontiguousarray(xp.reshape(T // 8, K // 8, 2, 64).transpose(0, 2, 1, 3)).reshape(-1)
     elif xb:  # (bf16 blocks [T / 8][K / 8][8 tokens][8 channels])
         x = (rng.standard_normal((T, K)) * np.exp(rng.standard_normal((T, 1)))).astype(bfloat16).astype(np.float32)
         xp = x.reshape(T // 8, 8, K // 8, 8).transpose(0, 2, 1, 3).reshape(-1).astype(bfloat16)
@@ -113,7 +117,7 @@ def test_prefill_rotate(T: int, K: int, gu: bool | str, copies: int) -> None:
         xp = bfp16.to_panels(rng.standard_normal((T, K)).astype(np.float32) * np.exp(rng.standard_normal((T, 1))))
         x = bfp16.from_panels(xp, T, K)  # (the panels' values)
     op = PrefillRotOperator(T=T, K=K, gu=gu, copies=copies, bf16=xb, rows=geo if rows else None, rows_out=rows_out,
-                            hilo=hilo)
+                            hilo=hilo, act=act, gu_split=split)
     ro = np.concatenate([tf.pair_objects(row_floats(gu or hilo or rows_out)).reshape(-1) for tf in tfs])
     out = np.asarray(op.compile().run(xp, ro.view(bfp16.bfloat16)))
     if rows_out:

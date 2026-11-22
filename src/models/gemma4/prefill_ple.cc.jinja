@@ -4,8 +4,8 @@
 
 extern "C" {
 
-// 8 tokens: y (8 x {{ 8 * SLOT }} bf16), pew: p and e (8 x {{ D }} bf16 each), w ({{ D }} hi | {{ D }} lo bf16) -> 64
-// panels (8 tokens x 8 columns) of h in the slots
+// 8 tokens: y (8 x {{ 8 * SLOT }} bf16), pew: p and e (8 x {{ D }} bf16 each), w ({{ D }} hi | {{ D }} lo bf16) -> {{ 32 if dense else 64 }}
+// panels (8 tokens x 8 columns) of h {{ "contiguous" if dense else "in the slots" }}
 void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pew, bfloat16 *__restrict t,
                  bfloat16 *__restrict pl, float *__restrict ss, const uint32_t *__restrict tab_ab,
                  const uint32_t *__restrict tab_cd, bfloat16 *__restrict out)
@@ -46,7 +46,7 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pew, b
             aie::store_v(pl + {{ D }} * k + i, r.template to_vector<bfloat16>());
         }
     }
-    {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values, 4 of zeros
+    {  // h = bf16(gelu) pli -> panels: per slot 4 panels of values{{ "" if dense else ", 4 of zeros" }}
         const bfloat16 *__restrict pg = t;
         al::BOut<> o((bfp16ebs8 *)out);
         for (int s = 0; s < 8; s++) {
@@ -55,8 +55,10 @@ void {{ p }}_ple(const bfloat16 *__restrict y, const bfloat16 *__restrict pew, b
                 const aie::vector<bfloat16, 64> l = al::gather<8, 8>(pl + {{ PER }} * s + 8 * q, {{ D }});
                 o.push(aie::mul(g, l).template to_vector<bfp16ebs8>());
             }
+{% if not dense %}
             for (int q = 0; q < 4; q++)
                 o.push(aie::zeros<accfloat, 64>().template to_vector<bfp16ebs8>());
+{% endif %}
         }
     }
 }

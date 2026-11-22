@@ -104,13 +104,13 @@ def shared_pitch(image: object, layers: list[int]) -> int:
 
 
 def row_group_gemm(region: object, T: int, *, pitch: int, row: int = 0, ops: dict | None = None, mac_rows: int = 0,
-                   m: int = 0, whole: bool = False) -> PG.Gemm:
-    """A dense GEMM of T tokens on a region of row-group tiles (one block: the shared down): GemmQd, ``groups`` G,
-    passes of ROW_GROUP_TILES tiles, column c's outputs from c pitch on, in rows of ``row`` bf16 (default COLS pitch:
-    the columns past them left alone); mac_rows / m: the MAC rows and tokens per MAC row (default: 2 x 64 from T 128 on,
-    else 1 x T); ``whole``: as ``router``'s."""
+                   m: int = 0, whole: bool = False, tiles: int = ROW_GROUP_TILES) -> PG.Gemm:
+    """A dense GEMM of T tokens on a region of row-group tiles (one block: the shared down; a PARO Gemma's proj): GemmQd,
+    ``groups`` G, passes of ``tiles`` tiles, column c's outputs from c pitch on, in rows of ``row`` bf16 (default COLS
+    pitch: the columns past them left alone); mac_rows / m: the MAC rows and tokens per MAC row (default: 2 x 64 from T
+    128 on, else 1 x T); ``whole``: as ``router``'s."""
     (b,) = region.blocks
-    G, R, tiles = b.G, b.R, ROW_GROUP_TILES
+    G, R = b.G, b.R
     passes = -(-b.tiles // tiles)
     assert tiles * passes * G * R <= pitch, (pitch, b.tiles)
     if not mac_rows:
@@ -125,6 +125,9 @@ def row_group_gemm(region: object, T: int, *, pitch: int, row: int = 0, ops: dic
         kw.update(mc_param=CHUNK_PARAM, mc_unit=CHUNK_UNIT)
     if planar(b.fmt, R, region.kc):
         kw.update(tiles=tiles, c_pack=True)
+    elif tiles != ROW_GROUP_TILES:  # (tile-major passes of other than 64 rows: a column's tiles in one pass)
+        assert b.fmt != "BFP16" and 64 // R == ROW_GROUP_TILES, (b.fmt, R)
+        kw["tiles"] = tiles
     if b.fmt == "BFP16":  # (a PARO checkpoint's F16 shared down: GemmQ on its slots as tiles of kc / G, ``run``)
         n = 64 // R  # (row tiles of a pass)
         kw.update(K=region.kc // G, kc=region.kc // G, kc_group=1, groups=1, run=G, region_rt=G * kw["region_rt"],

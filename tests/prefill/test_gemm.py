@@ -362,3 +362,44 @@ def test_unit_gemm(fmt: str, tiles: int) -> None:
         cols = np.concatenate([c * pitch + w * p + np.arange(tiles * R) for c in range(COLS) for p in range(op.passes)])
         rows = np.concatenate([c * n_rt * R + np.arange(op.passes * tiles * R) for c in range(COLS)])
         assert rel_native(C[:, cols], want[:, rows]) < _tol(K), (op.passes, rel_native(C[:, cols], want[:, rows]))
+
+
+def test_gate_up_pair_tails() -> None:
+    """A PARO Gemma's gate and up (K 2560 of tiles of 1024 columns, their row tiles in pairs sharing the tail tile,
+    ``Block.pt``): ``plan_gate_up_pair``'s GEMMs of the pairs' even and odd row tiles (``GemmSpec.ptail_part``) into GU
+    as [gate | up] halves of bf16 panels of 64: every row of both against the dequantized rows (the operand's
+    values)."""
+    path = checkpoint("gemma-4-E4B-paro")
+    require(path)
+    from models.gemma4.image import GemmaImage
+
+    g = open_weights(path)
+    img = GemmaImage(g, layers=[0], vocab=COLS * 64)
+    W = np.zeros(img.nbytes, np.uint8)
+    img.pack(W)
+    gate, up = img.region(0, "gate"), img.region(0, "up")
+    assert gate.blocks[0].pt and PG.gate_up_split(gate, up)
+    T, K, ffn = 256, gate.K_in, img.cfg.intermediate_size
+    pp = PG.plan_gate_up_pair(img, gate, up, T, {})
+    ops = list(dict.fromkeys(gm.op for gm in pp.gemms))
+    assert len(pp.gemms) == 4
+    lib = Library("t_gate_up_pairs", ops).compile().load()
+    A = (torch.randn(T, K, generator=torch.Generator().manual_seed(5)) * 0.5).bfloat16()
+    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), T, K))
+    GU = torch.zeros((T * 2 * ffn,), dtype=torch.bfloat16)
+    for gm in pp.gemms:
+        dev = artlite.Device()
+        w = np.zeros(gm.op.w_bytes, np.uint8)
+        a, b = max(gm.w_off, 0), min(gm.w_off + gm.op.w_bytes, W.size)
+        w[a - gm.w_off:b - gm.w_off] = W[a:b]
+        bufs = [artlite.from_numpy(bfp16.to_panels(to_numpy(A)), dev), artlite.from_numpy(w.view(bfloat16), dev),
+                artlite.from_numpy(to_numpy(GU), dev)]
+        lib.run(lib.items([(gm.op, "A", "W", "C")], dict(zip("AWC", (x._raw for x in bufs)))), bufs=[x._raw for x in bufs])
+        bufs[2].sync_from_device()
+        GU = to_torch(bufs[2].numpy().copy())
+    got = GU.view(T // 8, 2, ffn // 8, 8, 8).permute(1, 0, 3, 2, 4).reshape(2, T, ffn).float()  # ([gate | up][t][row])
+    for i, r in enumerate((gate, up)):
+        want = Aq @ _rows(img, r.blocks[0].tensors, np.arange(ffn), K).T
+        err = rel_native(got[i], want)
+        print(r.name, f"{err:.2e}")
+        assert err < _tol(K), (r.name, err)

@@ -157,7 +157,8 @@ class GemmaPrepOperator(ArtcOperator):
         """``kp``: the cache's K panels per record (2: hi + lo, 1: single)."""
         assert cfg.num_attention_heads == COLS and all(k == COLS // QH for k in cfg.kv_heads)
         self.kind = kind_of(cfg, hd, kp)
-        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER and {"q", "kv"} <= set(layout.off)
+        # (a PARO checkpoint's layout: k and v of their own, each column a quarter of its KV head's K and V)
+        assert T % 32 == 0 and T // 8 <= MAX_BD_ITER and ({"q", "kv"} <= set(layout.off) or {"q", "k", "v"} <= set(layout.off))
         self.T, self.cfg, self.layout, self.kv_bytes, self.cs_positions = T, cfg, layout, kv_bytes, cs_positions
         super().__init__()
 
@@ -265,9 +266,12 @@ class GemmaPrepOperator(ArtcOperator):
             tg = TaskGroup()
             for c in range(COLS):
                 taps = [TensorAccessPattern((T * N,), c * pitch + lay.off["q"], [n_tg, 1, 8, hd], [8 * N, 0, N, 1])]
-                if c in roles:  # (the KV head's halves: this column's and the next one's kv blocks)
+                if c in roles and "kv" in lay.off:  # (the KV head's halves: this column's and the next one's kv blocks)
                     taps.append(TensorAccessPattern((T * N,), c * pitch + lay.off["kv"], [n_tg, 8, 2, hd // 2],
                                                     [8 * N, N, pitch, 1]))
+                elif c in roles:  # (a PARO layout: its K or V quarters in the KV head's 4 columns)
+                    at = (c - c % 4) * pitch + lay.off["k" if roles[c] == "k" else "v"]
+                    taps.append(TensorAccessPattern((T * N,), at, [n_tg, 8, 4, hd // 4], [8 * N, N, pitch, 1]))
                 chained_fill(ah[c], G, taps, tg)
                 bh[c].fill(PRM, TensorAccessPattern((8 * 4 * k.rot,), 0, [1, 1, 1, 8 * 4 * k.rot], [0, 0, 0, 1]),
                            group=tg)

@@ -54,7 +54,7 @@ OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # project
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
          "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv", "gin_q": "qkv", "gin_z": "qkv", "attn_q": "qkv", "attn_k": "qkv",
-         "attn_v": "qkv", "up": "qkv"}
+         "attn_v": "qkv", "up": "qkv", "pgate": "qkv"}
 assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
@@ -343,9 +343,14 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
     from the caller's slices, panels ``a_width`` columns wide: ``plan_phase``'s): one GEMM design for both (a pass of
     tile-major 16-row tiles: 64 outputs), its C as bf16
     panels into GU, [T / 8][ffn / 8][gate 64 | up 64] (``c_panels``; up's C argument 64 elements in), which down's
-    rotation reads (``prefill.rotate``'s ``gu``: the activation on the way)."""
+    rotation reads (``prefill.rotate``'s ``gu``: the activation on the way). Blocks of row tile pairs (``Block.pt``: a K
+    half a chunk short, a PARO Gemma's): per region two GEMMs, the pairs' even row tiles and their odd ones
+    (``GemmSpec.ptail_part``: a pass 4 pairs, its row tiles 32 outputs apart), C as bf16 panels of 64 into GU of [T / 8]
+    [gate ffn / 8 | up ffn / 8][64] (``split``: ``prefill.rotate``'s ``gu_split``)."""
     (bg,), (bu,) = gate.blocks, up.blocks
     groups, KC = image.cfg.intermediate_size // COLS // 64, gate.kc
+    if bg.pt or bu.pt:
+        return _gate_up_pairs(image, gate, up, T, ops, a_width)
     gemms = []
     for part, (r, b) in enumerate(((gate, bg), (up, bu))):
         assert not planar(b.fmt, b.R, KC) and _tp(b) * b.R == ROWS and not b.pt, (b.fmt, b.R)
@@ -360,11 +365,40 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
     return PhasePlan(gemms, None)
 
 
+def _gate_up_pairs(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
+                   a_width: int) -> PhasePlan:
+    """``plan_gate_up_pair`` of blocks of row tile pairs: per region its pairs' even and odd row tiles."""
+    ffn, KC = image.cfg.intermediate_size // COLS, gate.kc
+    gemms = []
+    for half, r in enumerate((gate, up)):
+        (b,) = r.blocks
+        assert b.pt and b.R == 16 and _tp(b) == ROWS // 16 and b.tiles % (2 * _tp(b)) == 0, (b.fmt, b.R, b.tiles)
+        tp = _tp(b)
+        passes = b.tiles // 2 // tp  # (a pass: tp pairs' row tiles of one parity)
+        for e in range(2):
+            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": 2 * COLS * ffn, "tile_bytes": r.tile_bytes,
+                  "col_bytes": r.col_stride, "passes": passes,
+                  "out_cols": [[COLS * ffn * half + ffn * c + 2 * tp * b.R * q + b.R * e for q in range(passes)]
+                               for c in range(COLS)], "kc": KC, "kc_group": r.kc_group,
+                  "blocks": ((r.t0[b.name], passes),), "region_rt": r.n_t, "ptail_part": e, "c_panels": 64,
+                  **({"a_cols": (0, a_width)} if a_width else {})}
+            op = gemm_op(kw, T, "gu", ops)
+            assert type(op) is GemmQOperator, "bf16 C panels: GemmQ"
+            gemms.append(Gemm(op, r.offset - op.hdr_skip, c="GU"))
+    return PhasePlan(gemms, None)
+
+
+def gate_up_split(gate: Region, up: Region) -> bool:
+    """Whether ``plan_gate_up_pair`` writes GU as [gate | up] halves (blocks of row tile pairs), not [gate 64 | up 64]
+    slots."""
+    return gate.blocks[0].pt or up.blocks[0].pt
+
+
 def gate_up_paired(gate: Region, up: Region) -> bool:
     """Whether ``plan_gate_up_pair`` takes a PARO checkpoint's gate and up: tile-major tiles of 16 rows (passes of 64
     outputs); else ``plan_gate_up_rows``."""
     (bg,), (bu,) = gate.blocks, up.blocks
-    return all(not planar(b.fmt, b.R, gate.kc) and _tp(b) * b.R == ROWS and not b.pt for b in (bg, bu))
+    return all(not planar(b.fmt, b.R, gate.kc) and _tp(b) * b.R == ROWS for b in (bg, bu))
 
 
 def plan_gate_up_rows(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
