@@ -13,6 +13,9 @@ The model gives each phase's rotation objects (``rot_objects``: its data region'
 F_ROTE phase emits (``rot_copies``) and routes the outputs (``x_to``: values into a phase's x, ``emit_copies``: an F_ROTE
 emission)."""
 
+import itertools
+from typing import NamedTuple
+
 import numpy as np
 from ml_dtypes import bfloat16
 
@@ -51,6 +54,17 @@ from .protocol import rot_objects as pack_rot_objects
 from .step import StepPlan
 
 
+class Fill(NamedTuple):
+    """A fill task of ``fills_and_drains``: nbytes from an offset (ACT; an A fill's: W), ``Sequence.fill``'s dims,
+    repeat and iteration."""
+
+    off: int
+    nbytes: int = XB
+    dims: tuple[int, int, int, int] | None = None
+    repeat: int = 1
+    iteration: tuple[int, int] | None = None
+
+
 class RotatedOverlay:
     """The mixin of a ``model.ModelOverlay`` whose phases rotate their inputs (module docstring)."""
 
@@ -80,7 +94,7 @@ class RotatedOverlay:
 
     def rot_single(self, L: int, name: str, S: int) -> bool:
         """(rotx) Whether a rotation phase of S slots runs sub-phases of one group (an X object holds one: an F_RACT
-        phase of 8 slots): each takes its group's rotation A object, filled before its X objects (``_rot_inputs``),
+        phase of 8 slots): each takes its group's rotation A object, filled before its X objects (``_rotx_fills``),
         shifted so that the group comes first (a sub-phase's groups count from 0), not the phase's data region at
         once."""
         return self.rot_kind(name) == "rotx" and all(ng == 1 for _, ng in self.rot_subs(L, name, S))
@@ -93,14 +107,15 @@ class RotatedOverlay:
         kind = self.rot_kind(name)
         if kind == "in":
             regs = [InputRegion(self._take("ACT", XB), 0, 0)]
-        elif kind == "rotx":  # (a metadata object per sub-phase: ``rot_subs``, then x)
+        elif kind == "rotx":  # (a metadata object per sub-phase, XPAY apart: ``rot_subs``, ``_rotx_fills``; then x)
             n, mul = self.rot_slice(L, name)
             K, subs = n * COLS, len(self.rot_subs(L, name, self.SLOTS))
             assert not staged or mul == 1, name
-            x = (subs - 1) * XB + (staged_region_bytes(K, self.SLOTS) if staged else region_bytes(K, mul * self.SLOTS))
+            x = (subs - 1) * XPAY + (staged_region_bytes(K, self.SLOTS) if staged else region_bytes(K, mul * self.SLOTS))
             off = self._take("ACT", x + extra * K)
             pad = STAGED_X - XB if staged else 0
-            regs = [InputRegion(off + i * XB, 0, K, staged=staged, x0=(subs - i) * XB + pad) for i in range(subs)]
+            regs = [InputRegion(off + i * XPAY, 0, K, staged=staged, x0=(subs - 1 - i) * XPAY + XB + pad)
+                    for i in range(subs)]
         elif name == "tap":  # (a block drafter's tap: a plain copy of the layer's input, an F_PSQ input's layout)
             regs = [InputRegion(self._take("ACT", rot_region_bytes(self.H, self.SLOTS)), 0, self.H, x0=XB + XPAY)]
         else:
@@ -150,25 +165,27 @@ class RotatedOverlay:
                 g.meta[M_NT] += nrot
         return groups
 
-    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str],
-                         fills: list[list[int | tuple[int, tuple[int, ...]]]],
-                         a_fills: dict[tuple[int, int], int] | None = None) -> None:
-        """A phase's X fills of XB bytes at ACT offsets (``fills``: per column, in order; (offset, dims): a staged x's
-        strips) and its outputs: the fills in rounds of one a column (a column's tasks in a row put the last column's
-        first ~2 us behind), up to the 4 a column's queue holds (empty after the phase's sync), then the drains, then
-        the rest (past 4 queued fills a column's next fill waits for its oldest, whose room the cores make only while
-        their outputs drain): the cores start on their first objects before the drains are written. ``a_fills``:
-        {(column, X fill index): W offset}: an A object (one tile) filled before that X fill (``rot_single``)."""
+    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], fills: list[list[int | Fill]],
+                         a_fills: dict[tuple[int, int], int | list[Fill]] | None = None) -> None:
+        """A phase's X fills (``fills``: per column, in order; an ACT offset: XB bytes, a ``Fill``: a task of its own) and
+        its outputs: the fills in rounds of one a column (a column's tasks in a row put the last column's first ~2 us
+        behind), up to the 4 a column's queue holds (empty after the phase's sync), then the drains, then the rest (past
+        4 queued fills a column's next fill waits for its oldest, whose room the cores make only while their outputs
+        drain): the cores start on their first objects before the drains are written. ``a_fills``: {(column, X fill
+        index): W offset}: an A object (one tile) filled before that X fill (``Fill`` tasks: ``rot_single``)."""
         n = max(len(f) for f in fills)
         for r in range(n):
             if r == txn.QUEUE_DEPTH:
                 self._outputs(seq, st, phase)
             for c in range(COLS):
-                if a_fills and (c, r) in a_fills:
-                    seq.fill("A", c, self.dev.address("W", a_fills[(c, r)]), self.image.tile_bytes)
+                af = (a_fills or {}).get((c, r))
+                for f in af if isinstance(af, list) else [] if af is None else [af]:
+                    f = f if isinstance(f, Fill) else Fill(f, self.image.tile_bytes)
+                    seq.fill("A", c, self.dev.address("W", f.off), f.nbytes, f.dims, f.repeat, f.iteration)
                 if r < len(fills[c]):
-                    off, dims = fills[c][r] if isinstance(fills[c][r], tuple) else (fills[c][r], None)
-                    seq.fill("X", c, self.dev.address("ACT", off), XB, dims)
+                    f = fills[c][r]
+                    f = f if isinstance(f, Fill) else Fill(f)
+                    seq.fill("X", c, self.dev.address("ACT", f.off), f.nbytes, f.dims, f.repeat, f.iteration)
         if n <= txn.QUEUE_DEPTH:
             self._outputs(seq, st, phase)
 
@@ -183,25 +200,7 @@ class RotatedOverlay:
                     seq.fill("X", c, self.dev.address("ACT", rg.off), XB)
             elif kind == "rotx":  # (per sub-phase its metadata object, then its X object: the XB bytes ending with the
                 # slice's part, ``rot_subs``)
-                mul = self.rot_slice(*phase)[1]
-                x = rg.off + rg.x0
-                fills: list[list[int | tuple[int, tuple[int, ...]]]] = [[] for _ in range(COLS)]
-                single = self.rot_single(*phase, st.S)
-                a_fills: dict[tuple[int, int], int] = {}
-                r = self.rot_data_region(*phase) if single else None
-                if rg.staged:  # (the X object's strips a cell apart, its header's from the cells before: ``staged_fill``)
-                    assert sp == self.SLOTS, (phase, sp)
-                    cell, dims = staged_cell(self.SLOTS), staged_fill(XPAY // (2 * sp), self.SLOTS)[1]
-                for i, (g0, _) in enumerate(self.rot_subs(*phase, st.S)):
-                    for c in range(COLS):
-                        e = self.rot_start(*phase, c) + ROT_GROUP * g0
-                        at = (x + cell * (e // 8) - 2 * (XB - XPAY), dims) if rg.staged else \
-                            x + 2 * mul * sp * e - (XB - XPAY)
-                        if single:  # (its group's A object, the group first: ``rot_single``)
-                            a_fills[(c, len(fills[c]))] = (r.offset + c * r.col_stride + g0 // 2 * r.tile_bytes
-                                                           + g0 % 2 * ROT_OBJ)
-                        fills[c] += [self.inp[phase][i].off, at]
-                self.fills_and_drains(seq, st, phase, fills, a_fills)
+                self.fills_and_drains(seq, st, phase, *self._rotx_fills(phase, st.S))
                 return True
             elif rg.x0 != XB:  # (F_PSQ: the partial sums object after the metadata object)
                 for c in range(COLS):
@@ -209,6 +208,38 @@ class RotatedOverlay:
             else:
                 self._inputs(seq, rg, st.S, phase)
         return False
+
+    def _rotx_fills(self, phase: tuple[int, str], S: int) -> tuple[list[list[Fill]], dict[tuple[int, int], list[Fill]]]:
+        """A rotation phase's fills per column: one task of its sub-phases' [metadata object | X object] pairs (the
+        metadata objects XPAY apart as the X objects are: the X object of sub-phase i XPAY of x after sub-phase i - 1's,
+        a pair a repetition of the BD), and with single-group sub-phases (``rot_single``) their groups' A objects before
+        it (each the group's first: two a repetition, the A objects' tiles one after another). A staged x (several
+        sequences) per sub-phase its metadata object and its X object, strips a cell apart (``staged_fill``)."""
+        regs, subs = self.inp[phase], self.rot_subs(*phase, S)
+        rg, sp, mul = regs[0], self._sp(S, phase), self.rot_slice(*phase)[1]
+        x = rg.off + rg.x0
+        fills: list[list[Fill]] = [[] for _ in range(COLS)]
+        a_fills: dict[tuple[int, int], list[Fill]] = {}
+        if self.rot_single(*phase, S):  # (its group's A object, the group first)
+            r, G, T = self.rot_data_region(*phase), len(subs), self.image.tile_bytes
+            n0 = next(T // 4 // k for k in range(1, 64) if T // 4 % k == 0 and T // 4 // k < 1024)
+            for c in range(COLS):
+                a0 = r.offset + c * r.col_stride
+                pair = Fill(a0, 2 * T, (n0, T // 4 // n0, n0, ROT_OBJ // 4), G // 2, (T // 4, G // 2))
+                a_fills[(c, 0)] = [pair] * (G >= 2) + [Fill(a0 + G // 2 * T, T)] * (G % 2)
+        if rg.staged:  # (the X object's strips a cell apart, its header's from the cells before)
+            assert sp == self.SLOTS, (phase, sp)
+            cell, dims = staged_cell(self.SLOTS), staged_fill(XPAY // (2 * sp), self.SLOTS)[1]
+            for i, (g0, _) in enumerate(subs):
+                for c in range(COLS):
+                    e = self.rot_start(*phase, c) + ROT_GROUP * g0
+                    fills[c] += [Fill(regs[i].off), Fill(x + cell * (e // 8) - 2 * (XB - XPAY), XB, dims)]
+            return fills, a_fills
+        assert all(2 * mul * sp * ROT_GROUP * (g1 - g0) == XPAY for (g0, _), (g1, _) in itertools.pairwise(subs)), subs
+        for c in range(COLS):
+            d = x + 2 * mul * sp * (self.rot_start(*phase, c) + ROT_GROUP * subs[0][0]) - (XB - XPAY) - rg.off
+            fills[c].append(Fill(rg.off, 2 * XB, (XB // 8, 2, XB // 8, d // 4), len(subs), (XPAY // 4, len(subs))))
+        return fills, a_fills
 
     def x_to(self, seq: Sequence, c: int, phase: tuple[int, str], *, e0: int, n: int, S: int, mul: int = 1,
              so: int = 0) -> None:
