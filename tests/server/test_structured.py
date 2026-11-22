@@ -187,17 +187,35 @@ def test_choice_regex_grammar() -> None:
 
 def test_thought_free() -> None:
     """The thought is never constrained: a Qwen thought (the prompt opens it) and a Gemma one (the model opens it, its
-    opener allowed beside the grammar's tokens), then the answer held to the schema; thinking off: at once."""
+    opener allowed beside the grammar's tokens), then the answer held to the schema; with reasoning_format none the
+    content is the answer alone all the same (the thought in reasoning_content), whole and streamed, but beside tools
+    without a response format (a free answer: the thought in the content); thinking off: at once."""
+    on = {"chat_template_kwargs": {"enable_thinking": True}}
     for reasoning, reply in ((QWEN, ["Let", " me", " think", "```", "</think>", "\n\n", "{", '"', "a", '"', ":",
                                      " ", "7", "}"]),
                              (GEMMA, ["<|channel>thought", "Hmm", " ```", "<channel|>", "{", '"', "a", '"', ":",
                                       "7", "}"])):
         with client_of(reasoning=reasoning, chars=True) as (_model, npu, _engine, client):
+            for raw in ({}, {"reasoning_format": "none"}):
+                npu.replies = [reply]
+                r = chat(client, "Q", json_schema=SCHEMA, temperature=0, **on, **raw).json()
+                msg = r["choices"][0]["message"]
+                assert json.loads(msg["content"]) == {"a": 7} and "```" in msg["reasoning_content"], msg
+            rf = {"type": "json_schema", "json_schema": {"name": "x", "schema": SCHEMA}}
             npu.replies = [reply]
-            r = chat(client, "Q", json_schema=SCHEMA, temperature=0,
-                     chat_template_kwargs={"enable_thinking": True}).json()
-            msg = r["choices"][0]["message"]
-            assert json.loads(msg["content"]) == {"a": 7} and "```" in msg["reasoning_content"], msg
+            evs = events(chat(client, "Q", response_format=rf, temperature=0, stream=True, reasoning_format="none",
+                              **on))
+            assert json.loads(deltas(evs)) == {"a": 7} and "```" in deltas(evs, "reasoning_content")
+            thought = reply[:reply.index(reasoning[1]) + 1]
+            npu.replies = [[*thought, "y", "e", "s"]]
+            r = chat(client, "Q", structured_outputs={"choice": ["yes", "no"]}, temperature=0, reasoning_format="none",
+                     **on).json()
+            assert r["choices"][0]["message"]["content"] == "yes"
+            if reasoning == QWEN:  # (the fake's tool calls: Qwen's)
+                npu.replies = [[*thought, "\n\n", "Sunny"]]
+                r = chat(client, "Q", tools=[WEATHER], temperature=0, reasoning_format="none", **on).json()
+                msg = r["choices"][0]["message"]
+                assert msg["content"].endswith("</think>\n\nSunny") and "reasoning_content" not in msg, msg
             npu.replies = [["Thinking", " out", " loud"]]
             r = chat(client, "Q", json_schema=FLAGS, temperature=0, max_tokens=300,
                      chat_template_kwargs={"enable_thinking": False}).json()

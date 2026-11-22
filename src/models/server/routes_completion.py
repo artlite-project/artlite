@@ -79,7 +79,7 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
     async def completions(req: CompletionRequest, request: Request) -> Any:
         """OpenAI's completions: a raw prompt."""
         ctx.check(req)
-        grammar = await ctx.constrained(req, route="completion")
+        grammar = await ctx.compile(ctx.constraint(req, route="completion"))
         ids = await run_in_threadpool(prompt_ids, req.prompt)
         ctx.fits(ids)
         j, events = ctx.job(req, ids, think=False, grammar=grammar)
@@ -99,7 +99,7 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         """llama-server's own completion: a raw prompt; its responses as llama-server's (``content``, ``stop``,
         ``timings``, ``tokens_cached``, ...)."""
         ctx.check(req)
-        grammar = await ctx.constrained(req, route="completion")
+        grammar = await ctx.compile(ctx.constraint(req, route="completion"))
         ids = await run_in_threadpool(prompt_ids, req.prompt)
         ctx.fits(ids)
         j, events = ctx.job(req, ids, think=False, grammar=grammar)

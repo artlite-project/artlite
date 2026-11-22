@@ -94,6 +94,10 @@ Every route that generates holds its answer to a JSON schema, a grammar, a regul
 when the request asks for one: as the model writes, only the tokens that keep the answer valid can come
 ([llguidance](https://github.com/guidance-ai/llguidance) masks the others), so the answer parses; the schema does not
 go into the prompt. A model that thinks first thinks freely, and the constraint holds the answer after the thought.
+The content is the answer alone (a JSON one loads with `json.loads`): a JSON schema or object, a grammar, a regex or
+choices put the thought in `reasoning_content` even where `reasoning_format` (or `--reasoning-format`) `none` leaves
+it in the content otherwise (llama-server leaves Gemma 4's there, before the JSON; vLLM and Ollama always split it
+off).
 
 | field | API |
 |---|---|
@@ -681,7 +685,7 @@ Generation:
 | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`, `--presence-penalty`, `--frequency-penalty` | sampling defaults (default: the model's), as [artlite-cli](cli.md)'s |
 | `-s SEED`, `--seed` | sampling seed (default -1: random per request) |
 | `-rea on\|off\|auto`, `--reasoning` | let a model with a thinking mode think first (auto: when it has one; default off); a request's `chat_template_kwargs.enable_thinking` and the UI's toggle override it |
-| `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none) (default auto) |
+| `--reasoning-format auto\|deepseek\|none` | thoughts in `reasoning_content` (auto, deepseek) or in `content` (none: but beside a constrained answer, [Structured output](#structured-output)) (default auto); a request's `reasoning_format` overrides it |
 | `--reasoning-preserve`, `--no-reasoning-preserve` | earlier answers keep their thoughts in the prompt where the template can (the templates' `preserve_thinking`; default on); a request's `chat_template_kwargs.preserve_reasoning` (or `preserve_thinking`) overrides it |
 | `--reasoning-effort LEVEL` | the chat template's `reasoning_effort` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own); a request's `reasoning_effort` overrides it |
 | `--reasoning-budget N` | a thought's tokens at most, then its end is written for the model (-1: any, 0: at once; default -1); a request's `reasoning_budget_tokens` or `thinking_budget_tokens` overrides it ([API](#api)) |

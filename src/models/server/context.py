@@ -132,20 +132,25 @@ class ApiContext:
             if name in NEUTRAL and value not in (neutral, None, [], {}, ""):
                 self.warn_once((name, repr(value)), "%s = %r is not supported: ignored", name, value)
 
-    async def constrained(self, req: GenerationRequest, *, route: str = "chat", calls: Calls | None = None
-                          ) -> structured.Compiled | None:
-        """The request's structured output (``constraints.constraint_of``; none: the server's, ``--grammar``,
-        ``--json-schema``, which a request with tools takes only as JSON) and its tool calls (``calls``: their grammar,
-        ``call_grammar.answer``, with a JSON response format as the answer that is no call), compiled against the
-        model's tokens (in a thread: the first request may wait for them). A field that does not compile: a 400 that
-        names it."""
+    def constraint(self, req: GenerationRequest, *, route: str = "chat", tools: bool = False
+                   ) -> tuple[structured.Constraint, str] | None:
+        """The request's structured output and the field it came from (``constraints.constraint_of``; none: the
+        server's, ``--grammar``, ``--json-schema``, which a request with ``tools`` takes only as JSON), or None."""
         got = constraint_of(req.constraint_fields(), route=route)
         default = self.options.constraint
-        if got is None and default is not None and calls is not None and not default.json:
+        if got is None and default is not None and tools and not default.json:
             self.warn_once(("constraint", "tools"), "--grammar: requests with tools are answered without it (a call "
                            "or free text; a JSON schema would go with them)")
         elif got is None and default is not None:
             got = (default, "--grammar / --json-schema")
+        return got
+
+    async def compile(self, got: tuple[structured.Constraint, str] | None, *, calls: Calls | None = None
+                      ) -> structured.Compiled | None:
+        """A request's structured output (``constraint``) and its tool calls (``calls``: their grammar,
+        ``call_grammar.answer``, with a JSON response format as the answer that is no call), compiled against the
+        model's tokens (in a thread: the first request may wait for them). A field that does not compile: a 400 that
+        names it."""
         if got is None and calls is None:
             return None
         v = await self.vocab()
@@ -216,7 +221,7 @@ class ApiContext:
             opened: bool | None = None, budget: tuple[int, str, str, bool] = (-1, "", "", False), cid: str = "",
             continued: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
-        ``Job.answer_mark``; ``grammar``: the answer's structured output, ``constrained``; ``ban``: tokens it never
+        ``Job.answer_mark``; ``grammar``: the answer's structured output, ``compile``; ``ban``: tokens it never
         has; ``opened``: the prompt ends inside a thought, None: where it ends with the open marker; ``budget``: the
         thought's, ``thought_budget``; ``cid``: the chat completion's id; ``continued``: ``Job.continued``)."""
         options = self.options
@@ -287,7 +292,8 @@ class ApiContext:
         if "audio" in ((req.model_extra or {}).get("modalities") or []):
             raise not_supported("audio output is not supported by artlite-server")
         fns, calls = prompts.calls_of(req)
-        grammar = await self.constrained(req, calls=calls)
+        got = self.constraint(req, tools=calls is not None)
+        grammar = await self.compile(got, calls=calls)
         ban: tuple[int, ...] = ()
         if fns and calls is None and grammar is None and self.syntax is not None:  # (tool_choice none: no call text)
             opener = self.engine.model.tokenizer.encode(getattr(self.syntax.parser_class, "OPEN", ""))
@@ -307,7 +313,10 @@ class ApiContext:
             if token_ids(off) == token_ids(echo):
                 ids, think, budget = off, False, (-1, "", "", False)
         self.fits(ids, api)
-        reasoning = (req.reasoning_format or options.reasoning_format) != "none"
+        # a constraint of the whole answer (not a structural tag's free text; beside tools, the JSON that is no call):
+        # the content is that answer alone, the thought split off where reasoning_format none leaves it in the content
+        whole = got is not None and got[0].kind != "structural_tag" and (calls is None or calls.choice == "auto")
+        reasoning = whole or (req.reasoning_format or options.reasoning_format) != "none"
         # (a template that drops the earlier answers' thoughts renders this answer's opener otherwise next time)
         keeps = prompts.template_options(req.chat_template_kwargs)[1] and "preserve_thinking" in self.info.chat_template
         return self.job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens,
