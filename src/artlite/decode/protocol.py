@@ -129,6 +129,16 @@ F_HOUT = PHASE.flag("F_HOUT", 23)  # (an expert's gate / up sub-phase) the outpu
 F_ACCUM = PHASE.flag("F_ACCUM", 24)  # (a down sub-phase) the rows add into acc ([slot][hidden] bf16; F_ACC0: stored), F_EMITA: then out
 F_ACC0 = PHASE.flag("F_ACC0", 25)
 F_EMITA = PHASE.flag("F_EMITA", 26)
+# (``rot`` and ``post`` designs, a PARO Gemma's R phases, ``gemma4.paro_steps``: a kind of its own, whose bits other
+# designs' kinds take) an F_ROTX phase's slice is [v | r] per k block of a post-norm update's region: rotated is n = (r +
+# v w_post / rms(v)) scale (w_post of its groups in their rotation objects' spare bytes, ``gemma4.image``); F_RPS its
+# first sub-phase: before the first group the column's partial sums of res^2 go out; F_RUPD (with F_RPS: an update's
+# first R phase): the partial sums object of v follows the metadata object (1 / rms(v), kept for the update's other R
+# phases) and res's exact update goes out before the sums; F_RSLOT: the slice is a 64-slot input's first 32 channels of
+# each slot (proj's, ``gemma4.image``)
+RPOST = XMETA.kind("rpost", extends=(PHASE,))
+F_RPOST, F_RUPD, F_RPS, F_RSLOT = (RPOST.flag(n, b) for n, b in (("F_RPOST", 8), ("F_RUPD", 9), ("F_RPS", 10),
+                                                                 ("F_RSLOT", 11)))
 # a block's format word: the format at the low 8 bits (``formats``' fid), then
 B_F32 = PHASE.flag("B_F32", 8, of="format")  # its rows go out as fp32 (two bf16 slots each)
 B_GU = PHASE.flag("B_GU", 9, of="format")  # (moe) its rows are [8 gate | 8 up] groups (F_GU for this block)
@@ -199,10 +209,12 @@ S_SG = MOE_STATE.block("S_SG", SLOTS, at=48)
 S_NSUBC = MOE_STATE.word("S_NSUBC", at=S_WORDS + 8)
 # (rot) the partial sums object (a trip count), F_ROTE's rotation objects, the groups of the next rotation object, F_ROTX's
 # X objects, the rotation objects of the next one (trip counts); the copy (F_ROTX: the group in its X object), the group
-# and the groups of the phase's rotations
-ROT_STATE = STATE.kind("rot", exclusive_with=(POST_STATE,))
+# and the groups of the phase's rotations; (rot and post) an R phase's residual update before its first group (a trip
+# count: ``wpupd``)
+ROT_STATE = STATE.kind("rot")
 S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_NRA S_NGA S_NRX S_NRP S_RC S_RG S_RN",
                                                                       at=S_WORDS)
+S_NWP = ROT_STATE.word("S_NWP", at=S_WORDS + 9)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -238,10 +250,11 @@ PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}
 
 
-def consts() -> dict[str, int]:
-    """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``)."""
-    return XMETA.consts(PHASE, TOKEN, MOE) | STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE) | CMD.consts() | \
-        {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
+def consts(rpost: bool = False) -> dict[str, int]:
+    """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``; ``rpost``:
+    a rotated post design's, RPOST's flags too)."""
+    return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else [])) | \
+        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE) | CMD.consts() | {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
 
 
 # ----------------------------------------------------------------------

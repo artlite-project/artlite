@@ -202,7 +202,7 @@ class LlamaOverlay(RotatedOverlay, AttentionOverlay):
         r = ROT_DATA.get(name)
         return self.image.rot_groups(L, r) if r is not None and self.image.rot_region(L, r) else 0
 
-    def rot_slice(self, name: str) -> tuple[int, int]:
+    def rot_slice(self, L: int, name: str) -> tuple[int, int]:
         return (self.nh * self.hd, 1) if name == "rot_o" else (self.cfg.intermediate_size // COLS, 2)
 
     def rot_copies(self, L: int, name: str) -> int:
@@ -245,7 +245,7 @@ class LlamaOverlay(RotatedOverlay, AttentionOverlay):
             elif name in ("gate", "up"):
                 self.x_to(seq, c, (L, "rot_down"), e0=ffn * c, n=ffn, S=S, mul=2, so=packed_slots(S) if name == "up" else 0)
             elif name == "rot_down":
-                n = self.rot_slice(name)[0]
+                n = self.rot_slice(L, name)[0]
                 self.x_to(seq, c, (L, "down"), e0=n * c, n=n, S=S)
             elif name == "down" and nxt is not None:
                 self.emit_copies(seq, c, S, [(nxt, n) for n in "qkv"])

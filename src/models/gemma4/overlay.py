@@ -45,6 +45,9 @@ last one's positions, at most its own back, as the generation loop's rejected dr
 Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
 step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own in both cache kinds
 (``_join``). Every slot's logits and residual are those of a step of one of its sequence, bit for bit.
+
+A PARO checkpoint (``image``'s PARO layout): the phases of ``paro_steps`` (R phases instead of headers), the tied F16
+head screened (``decode.screen``).
 """
 
 from collections.abc import Callable
@@ -73,6 +76,7 @@ from artlite.decode.protocol import (
     packed_slots,
     post_region_bytes,
 )
+from artlite.decode.screen import Screen
 from artlite.decode.step import Part, StepPlan
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import GemmaConfig
@@ -83,6 +87,7 @@ from artlite.overlay import Sequence, WeightBuffer
 from . import attn as AT
 from .decode import GemmaDecodeOperator
 from .image import PLE, TILE_BYTES, GemmaImage
+from .paro_steps import GemmaParo
 
 PHASES = ("qkv", "att", "o", "gate_up", "down", "gate", "proj")
 PLE_PHASE = (-1, "ple")  # (E2B / E4B: the per-layer projection, the step's first phase)
@@ -91,7 +96,7 @@ GUARD = 16  # cache groups before a sliding-window cache's first one (the prefil
 KV_PAD = 2048  # positions past the caches (the last layer's): the prefill's sub-chunk slices of a cache
 
 
-class GemmaOverlay(AttentionOverlay):
+class GemmaOverlay(GemmaParo, AttentionOverlay):
     """A Gemma 4 GGUF model on its decode overlay. ``layers``: the layers to run (default: all; tests run slices; the
     first one reads x), ``vocab``: LM rows (default: the vocabulary), ``max_positions``: the full-attention caches'
     capacity, ``kv_k``: the caches' K precision ("hilo": bfp16 hi + lo blocks; "single": one block per 8 dims),
@@ -115,8 +120,12 @@ class GemmaOverlay(AttentionOverlay):
         if img.split:
             raise NotImplementedError("gate / up of two tile formats in a layer: Gemma's decode design (GELU) has no "
                                       "split gate / up blocks")
+        self.paro = img.paro
         self.op = GemmaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, eps=cfg.rms_norm_eps,
-                                      attn=at)
+                                      attn=at, **({"paro": True} if self.paro else {}))
+        if img.screen:  # (the LM head's input: the output norm's weights times x / rms, the soft cap after)
+            norm = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
+            self.screen = Screen(gguf, "token_embd.weight", norm, cfg.rms_norm_eps, min(self.vocab, cfg.vocab_size))
         pg_s, pg_f = at.pg[256], at.pg[512]
         assert GUARD * pg_s == cfg.sliding_window
         n_full = -(-max_positions // pg_f)
@@ -138,6 +147,9 @@ class GemmaOverlay(AttentionOverlay):
     def phases(self, lm: bool = True) -> list[tuple[int, str]]:
         """The step's phases in order, from layer ``start`` on (``lm`` False: up to the last attention that writes a
         cache)."""
+        if self.paro:
+            assert self.start == self.layers[0], "a PARO checkpoint's steps: from the first layer"
+            return self.paro_phases(lm)
         out = [(L, n) for L in self.layers if L >= self.start for n in PHASES
                if n not in ("gate", "proj") or self.cfg.per_layer_dim]
         out = [PLE_PHASE, *out] if self.cfg.per_layer_dim and self.ple else out
@@ -147,6 +159,8 @@ class GemmaOverlay(AttentionOverlay):
         return [*out, (-1, "lm")]
 
     def _flags(self, L: int, name: str) -> int:
+        if self.paro:
+            return self.paro_flags(L, name)
         # (a step from a later layer on: its qkv header zeroes pend, the update it adds: ``step(start=)``)
         return {"qkv": F_NORM | (F_POST if L != self.layers[0] else 0) | (F_PZERO if L == self.start != self.layers[0]
                                                                          else 0), "o": F_VOUT | F_PZERO | F_EMITR,
@@ -174,7 +188,9 @@ class GemmaOverlay(AttentionOverlay):
         take = self._take
         self.toks = (take("ACT", AT.TOKENS * XB),)
         self.loadr = take("ACT", COLS * SLOTS * XB)
-        if cfg.per_layer_dim:  # (the gate inputs gate_pitch apart: the per-layer projection's drains, ``_outputs``)
+        if self.paro:
+            self.paro_plan()
+        elif cfg.per_layer_dim:  # (the gate inputs gate_pitch apart: the per-layer projection's drains, ``_outputs``)
             for L in self.layers:
                 self._add_inputs((L, "gate"), post=True)
             offs = [self.inp[(L, "gate")][0].off for L in self.layers]
@@ -182,10 +198,11 @@ class GemmaOverlay(AttentionOverlay):
             assert offs == [offs[0] + i * self.gate_pitch for i in range(len(offs))]
             if len(offs) % 2:
                 take("ACT", self.gate_pitch)  # (the padding layer's rows: a sink)
-        for L, name in self.phases():
+        for L, name in self.phases() if not self.paro else ():
             if name not in ("att", "gate"):
                 self._add_inputs((L, name), post=bool(self._flags(L, name) & F_POST))
-        self.final = take("ACT", post_region_bytes(H))  # (the LM header's updated residual)
+        if not self.paro:
+            self.final = take("ACT", post_region_bytes(H))  # (the LM header's updated residual)
         # per layer and KV head [q objects SLOTS | raw K / V objects SLOTS]; q object a's metadata words: the F_ATT
         # object of the sub-step from slot a on (its token SLOTS kind + a)
         self.att_reg = {(L, h): take("ACT", 2 * SLOTS * XB) for L in self.layers for h in range(self.kv_heads)}
@@ -194,7 +211,8 @@ class GemmaOverlay(AttentionOverlay):
             assert cfg.kv_source(L) in own, f"layer {L} attends to the cache of layer {cfg.kv_source(L)}"
         self._plan_caches(own, pad=KV_PAD // min(self.at.pg.values()) * self.G * self.T)
         self._sizes()
-        self._plan_headers()
+        if not self.paro:
+            self._plan_headers()
 
     # ------------------------------------------------------------------
     # Load
@@ -222,9 +240,30 @@ class GemmaOverlay(AttentionOverlay):
             m[M_SCALE] = bf16_bits(self._scale(L, name))
         return m
 
+    def _groups(self, L: int, name: str, S: int) -> list:
+        return self.paro_groups(L, name, S) if self.paro else super()._groups(L, name, S)
+
+    def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
+        """(PARO: the R phases' per column, ``paro_steps.r_meta``)"""
+        out = super()._meta_writes(S)
+        if self.paro:
+            for L, name in self.rmeta:
+                out += self.r_meta(L, name, S)
+        return out
+
+    def _gemv(self, seq: Sequence, st: StepPlan, phase: tuple[int, str]) -> None:
+        if self.paro:
+            return self.paro_gemv(seq, st, phase)
+        return super()._gemv(seq, st, phase)
+
+    def _o_inputs(self, L: int) -> list[InputRegion]:
+        return self.inp[(L, "rot_o")] if self.paro else super()._o_inputs(L)
+
     def _outputs(self, seq: Sequence, st: StepPlan, phase: tuple[int, str]) -> None:
         """The C drains of a GEMV phase (after its last group): a header's updated residual slice (into the next
         header's r slots), then its outputs."""
+        if self.paro:
+            return self.paro_outputs(seq, st, phase)
         L, name = phase
         S, cfg, dev = st.S, self.cfg, self.dev
         flags = self._flags(L, name)
@@ -246,13 +285,23 @@ class GemmaOverlay(AttentionOverlay):
                 self._values_to(seq, c, (L, "down"), e0=ffn * c, n=ffn, S=S)
             elif name == "gate":
                 self._values_to(seq, c, (L, "proj"), e0=64 * c, n=C_LEN, S=S)
-            elif name == "ple":  # (C object j: the 32 rows of layers 2 j, 2 j + 1 -> their gate inputs' p [slot][256])
-                pairs, pw = -(-len(self.layers) // 2), self.gate_pitch // 4
-                g0 = self.inp[(self.layers[0], "gate")][0].off + 4 * META + 2 * PLE * c
-                seq.drain("C", c, dev.address("ACT", g0), S * 2 * C_LEN, (PLE // 2, 2, pw, 2 * PLE * COLS // 4), pairs,
-                          (2 * pw, pairs))
+            elif name == "ple":
+                self.ple_out(seq, c, S)
             elif name == "lm":
                 self._logits_out(seq, c, S)
+
+    @property
+    def gate_phase(self) -> str:
+        """The phase of the per-layer input gate (F_PLI: its input's metadata object holds p and e)."""
+        return "pgate" if self.paro else "gate"
+
+    def ple_out(self, seq: Sequence, c: int, S: int) -> None:
+        """The per-layer projection's outputs of column c: C object j, the 32 rows of layers 2 j, 2 j + 1 -> their gate
+        inputs' p [slot][256]."""
+        pairs, pw = -(-len(self.layers) // 2), self.gate_pitch // 4
+        g0 = self.inp[(self.layers[0], self.gate_phase)][0].off + 4 * META + 2 * PLE * c
+        seq.drain("C", c, self.dev.address("ACT", g0), S * 2 * C_LEN, (PLE // 2, 2, pw, 2 * PLE * COLS // 4), pairs,
+                  (2 * pw, pairs))
 
     def _weights_first(self, seq: Sequence, ph: list[tuple[int, str]], i: int,
                        run: Callable[[int], list[tuple[int, str]]]) -> None:
@@ -260,6 +309,15 @@ class GemmaOverlay(AttentionOverlay):
             self._weight_run(seq, [PLE_PHASE])
         elif i == 0 or ph[i - 1] == PLE_PHASE:
             self._weight_run(seq, run(i))
+
+    def _lm_x(self, S: int) -> np.ndarray:
+        """(PARO: the LM head's copy over the output norm's weights)"""
+        x = super()._lm_x(S)
+        if not self.paro:
+            return x
+        w = np.asarray(self.gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
+        w = w.astype(bfloat16).astype(np.float32)
+        return x / np.where(w != 0, w, 1)
 
     def logits_of(self, x: np.ndarray) -> np.ndarray:
         raise NotImplementedError("the LM head after a prefill chunk runs as a step from its last layer on: step(start=)")
@@ -326,14 +384,18 @@ class GemmaOverlay(AttentionOverlay):
         self._write_loadr(xf)
         sp = packed_slots(S)
         xi = interleave(xf, sp).view(np.uint8).reshape(-1)
-        if start == self.layers[0]:  # (its qkv: a plain input)
+        if self.paro:  # (the first update's region: r = x, v and the partial sums 0)
+            h0 = self.hdr[(start, "qkv")] + XB + XPAY
+            act[h0 - XPAY:h0] = 0
+        elif start == self.layers[0]:  # (its qkv: a plain input)
             self._write_input(self.inp[(start, "qkv")][0], xi)
         else:  # (its qkv: the first header, v and the partial sums 0)
             act[self.inp[(start, "qkv")][0].off + XB:][:XPAY] = 0
-        h0 = self.inp[self.first_header][0].off + XB + XPAY  # (the first header's r slots: x)
+        if not self.paro:
+            h0 = self.inp[self.first_header][0].off + XB + XPAY  # (the first header's r slots: x)
         hx = act[h0:h0 + 4 * sp * H].reshape(H // 8, 2, 16 * sp)
         hx[:, 1] = xi.reshape(H // 8, 16 * sp)
-        if start != self.layers[0]:
+        if start != self.layers[0] or self.paro:
             hx[:, 0] = 0
         dev.flush("ACT", h0 - XPAY, XPAY + 4 * sp * H)
         self.ple = p is None or not self.cfg.per_layer_dim or start != self.layers[0]
@@ -347,7 +409,7 @@ class GemmaOverlay(AttentionOverlay):
         """(layers, SLOTS, per_layer_dim) uint16 indices in ACT of the gate meta objects' p (e: SLOTS d after)."""
         if self._e_idx is None:
             d = self.cfg.per_layer_dim
-            offs = np.array([self.inp[(L, "gate")][0].off + 4 * META for L in self.layers])
+            offs = np.array([self.inp[(L, self.gate_phase)][0].off + 4 * META for L in self.layers])
             self._e_idx = offs[:, None, None] // 2 + d * np.arange(SLOTS)[None, :, None] + np.arange(d)[None, None, :]
         return self._e_idx
 
@@ -361,14 +423,14 @@ class GemmaOverlay(AttentionOverlay):
             act[idx] = np.asarray(p, np.uint16).transpose(1, 0, 2)
         lo = 0 if p is not None else 2 * SLOTS * d  # (p and e of the slots, or e)
         for L in self.layers:
-            self.dev.flush("ACT", self.inp[(L, "gate")][0].off + 4 * META + lo, 2 * SLOTS * d + 2 * S * d - lo)
+            self.dev.flush("ACT", self.inp[(L, self.gate_phase)][0].off + 4 * META + lo, 2 * SLOTS * d + 2 * S * d - lo)
 
     def read_p(self, S: int) -> np.ndarray:
         """The last step's per-layer projections (S, the overlay's layers, per_layer_dim) as bf16 bits (it ran the
         projection: ``ple``)."""
         d = self.cfg.per_layer_dim
         for L in self.layers:
-            self.dev.fetch("ACT", self.inp[(L, "gate")][0].off + 4 * META, 2 * S * d)
+            self.dev.fetch("ACT", self.inp[(L, self.gate_phase)][0].off + 4 * META, 2 * S * d)
         return self.dev.view("ACT").view(np.uint16)[self._pe_index()[:, :S]].transpose(1, 0, 2)
 
 

@@ -101,7 +101,7 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("flint", "int4", "", (0, 2), 0, "qkv", 256), ("flint", "int4", "", (0, 2), 0, "o", 256),
          ("flint", "int4", "", (0, 2), 0, "gate_up", 256), ("flint", "int4", "", (0, 2), 0, "down", 256),
          # P4_128 (a PARO checkpoint's linears: tile-major GemmQ, the K of each group in its rotation's storage order)
-         ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "qkv", 64), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "gate_up", 256),
+         ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "q", 64), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "gate", 256),
          ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "down", 256), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "o", 64),
          # P5_128 (int5: GemmQd, Q5_K's dequant; 13-row tiles of a qwen35 image): Qwen3.8-27B-PARO-int5's
          ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gin_q", 256), ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gdn_out", 256),

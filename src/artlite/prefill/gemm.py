@@ -97,9 +97,9 @@ class PhasePlan:
 def pair_tails(name: str, fmt: str, R: int) -> bool:
     """Whether ``plan_phase`` reads a ``decode.image.Block.pt`` block (row tiles in pairs sharing their tail tile) of
     this tile format in a region ``name``: gate / up's of 16-row tile-major tiles (GemmQ: pass pairs, a pair's even and
-    odd row tiles the two parts of a C object, ``geometry.GemmSpec.ptail``). The other regions of half a chunk short
-    read their tiles unpaired (the tail tile's first half only)."""
-    return name == "gate_up" and fmt in ("Q4_K", "Q4_0", "P4_128") and R == 16
+    odd row tiles the two parts of a C object, ``geometry.GemmSpec.ptail``; a PARO checkpoint's gate and up regions). The
+    other regions of half a chunk short read their tiles unpaired (the tail tile's first half only)."""
+    return name in ("gate_up", "gate", "up") and fmt in ("Q4_K", "Q4_0", "P4_128") and R == 16
 
 
 def input_k(image: TileImage, names: tuple[str, ...]) -> int:

@@ -27,7 +27,7 @@ _EXPLICIT = {"C_LEN", "B_G4", "V_NORM", "REC_K", "REC_V", "A_HI", "A_OBJ", "L_DO
 def _templates() -> dict[str, dict[str, int]]:
     """Template file -> the constants its renderers pass from the layouts."""
     out = {
-        "artlite/decode/design.cc.jinja": protocol.consts(),
+        "artlite/decode/design.cc.jinja": protocol.consts(rpost=True),
         "artlite/decode/attn.cc.jinja": decode_attn.consts(),
         "artlite/decode/gemv.cc.jinja": {},
         "models/lfm/conv.cc.jinja": lfm_conv.STATE.consts() | decode_attn.consts(),
@@ -60,6 +60,8 @@ def test_decode_design_words() -> None:
         protocol.XMETA.consts(protocol.PHASE, protocol.TOKEN, protocol.MOE, *kinds)
     protocol.XMETA.consts(protocol.PHASE, protocol.TOKEN, protocol.MOE, decode_attn.ATT, decode_attn.TOKEN_ATT,
                           lfm_conv.CONV, lfm_conv.CONV_TOKEN)
+    protocol.XMETA.consts(protocol.PHASE, protocol.TOKEN, protocol.MOE, decode_attn.ATT, decode_attn.TOKEN_ATT,
+                          protocol.RPOST)  # (a PARO Gemma's)
 
 
 def test_two_attention_flags_never_meet() -> None:

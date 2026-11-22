@@ -110,7 +110,7 @@ class ParoSteps(RotatedOverlay):
     def rot_kind(self, name: str) -> str | None:
         return KINDS.get(name) if self.paro else None
 
-    def rot_slice(self: "QwenOverlay", name: str) -> tuple[int, int]:
+    def rot_slice(self: "QwenOverlay", L: int, name: str) -> tuple[int, int]:
         cfg = self.cfg
         if name == "rot_g":  # (a column's v heads)
             return len(gdn_v_heads(cfg, 0)) * cfg.ssm_state, 1
@@ -145,7 +145,7 @@ class ParoSteps(RotatedOverlay):
         place), a PARO checkpoint's rot_g's (the column's heads in a row)."""
         d = self.cfg.ssm_state
         if self.paro:
-            return (L, "rot_g"), self.rot_slice("rot_g")[0] * c + d * h
+            return (L, "rot_g"), self.rot_slice(L, "rot_g")[0] * c + d * h
         return (L, "gdn_out"), d * gdn_v_heads(self.cfg, c)[h]
 
     # ------------------------------------------------------------------
@@ -210,7 +210,7 @@ class ParoSteps(RotatedOverlay):
                 for r in runs:
                     self.x_to(seq, c, (L, "gdn_out"), e0=cfg.ssm_state * int(r[0]), n=cfg.ssm_state * len(r), S=S)
             elif name == "rot_o":
-                n = self.rot_slice(name)[0]
+                n = self.rot_slice(L, name)[0]
                 self.x_to(seq, c, (L, "attn_out"), e0=n * c, n=n, S=S)
             elif name in ("gdn_out", "attn_out"):
                 self.emit_copies(seq, c, S, [(L, "moe_in")] if self.moe else [(L, "gate"), (L, "up")])
@@ -219,7 +219,7 @@ class ParoSteps(RotatedOverlay):
                           so=self._sp(S) if name == "up" else 0)
             elif name == "rot_down":  # (past down's K, the padding groups' outputs: into the sink)
                 last = self.inp[(L, "down")][-1]
-                n, K = self.rot_slice(name)[0], last.k0 + last.K  # (down's whole K: its K groups')
+                n, K = self.rot_slice(L, name)[0], last.k0 + last.K  # (down's whole K: its K groups')
                 real = max(0, min(n, K - n * c))
                 self.x_to(seq, c, (L, "down"), e0=n * c, n=real, S=S)
                 self.sink_out(seq, c, n - real, S)

@@ -38,7 +38,8 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
     CHAIN: ClassVar[int]
     ATTN_STACK = 3072
     ATTN_ROW = 5
-    A_DEPTH = 12  # (the memtile's BDs: 24 per channel parity)
+    A_DEPTH = 12  # (at least; ``attn_a_depth``)
+    A_DEPTH_MAX = 16  # (the A objects of a dense attention design's memtile FIFO at most: ``attn_a_depth``)
     ATTN_A_DEPTH = 1  # (the attention cores' cache objects in L1: 2: one arrives while the core works on the other)
     PAGES: ClassVar[bool] = False  # (the attention cores' program as code pages: module docstring)
 
@@ -51,6 +52,18 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
             attn.pages = paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(hdr,), bd0=(PG_BD,), ctl=(ctl,))
         super().__init__(tile_bytes=tile_bytes, **design)
         assert not self.moe or (attn is not None and attn.moe), "an MoE design: its attention cores pass the MoE layers"
+        if not self.moe:  # (an MoE design's: ``moe_a_depth``)
+            self.A_DEPTH = self.attn_a_depth()
+
+    def attn_a_depth(self) -> int:
+        """The objects of the A stream's memtile FIFO of a dense design: as many as the memtile's BDs leave it,
+        ``A_DEPTH_MAX`` at most (``moe_a_depth``'s BD halves; the paged formats' or the attention cores' pages take the
+        odd half's top). Between two GEMV phases (an attention, a PARO checkpoint's rotation phases) the main cores take
+        no weights while the shim streams the next phase's tiles into this FIFO: Gemma 4 E4B's 24 cache layers 24.13 ->
+        23.78 ms with 20 objects, a PARO checkpoint's 28.65 -> 27.73 (16 as 20)."""
+        pages = (len(self.paged) if self.pg_split else 48 - self.pg_store[0]) if self.paged else \
+            (48 - PG_BD if self.attn is not None and self.PAGES else 0)
+        return max(type(self).A_DEPTH, min(self.A_DEPTH_MAX, 24 - self.X_DEPTH - pages))
 
     def get_mlir_artifact(self) -> Module:
         self._aws = {}  # (made per program: ``_aws_of``)
