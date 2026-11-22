@@ -535,6 +535,12 @@ class GGUFFile:
         _, _, off, nbytes = self.tensor_info[name]
         return self.data, off, nbytes
 
+    def _sources(self, name: str) -> list[tuple[np.ndarray, int, int]]:
+        """The (file mapping, file offset, bytes) ranges a tensor is read from (``hf_model``'s PARO linears: their codes,
+        every expert's)."""
+        return [m] if (m := self._mapped(name)) is not None else []
+
+
     def _prefetch(self, name: str, stride: int, idx: np.ndarray, nbytes: int) -> None:
         """Ask for the pages of rows ``idx`` of a tensor (their first ``nbytes``; rows ``stride`` bytes apart) at once. A
         table outside the NPU image (Gemma's per-layer rows, an untied ``token_embd``) is in the page cache only once
@@ -543,13 +549,14 @@ class GGUFFile:
         if (m := self._mapped(name)) is not None:
             _hint(m[0], "willneed", m[1] + np.unique(idx).astype(np.int64) * stride, nbytes)
 
-    def release(self) -> None:
+    def release(self, name: str | None = None) -> None:
         """Give the mappings' resident pages back (after a loader read what it needs: the metadata, the tensors it
         converts on the host): they leave this process, stay in the system's file cache while it has room, and come
-        back on the next access. (A weight image's tensors never come through these mappings: the packers read the
-        files through views of their own, ``_native.pack_tiles``.)"""
-        for _, data in self.files:
-            _hint(data, "dontneed", 0, data.size)
+        back on the next access. (A weight image's tensors come through these mappings only where Python converts them,
+        ``decode.image``'s PARO linears: ``name``, that tensor's pages, once packed; the packers read the others through
+        views of their own, ``_native.pack_tiles``.)"""
+        for data, off, nbytes in self._sources(name) if name else ((d, 0, d.size) for _, d in self.files):
+            _hint(data, "dontneed", off, nbytes)
 
     def willneed(self, name: str) -> None:
         """Ask for a tensor's pages at once, read ahead into the file cache (a table read by scattered rows every

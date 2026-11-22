@@ -167,6 +167,14 @@ class HfModel(GGUFFile):
         e = self._entries[name]
         return None if e.compute is not None else (self._shards[e.shard][1], e.offset, e.nbytes)
 
+    def _sources(self, name: str) -> list[tuple[np.ndarray, int, int]]:
+        e = self._entries[name]
+        if not e.paro:
+            return super()._sources(name)
+        hf = [f"{p}.{c}" for p in ([e.paro.format(e=i) for i in range(e.experts)] if e.experts else [e.paro])
+              for c in _PARO_CODES]
+        return [(self._shards[x.shard][1], x.offset, x.nbytes) for x in (self._hf[n] for n in hf if n in self._hf)]
+
     def strings(self, key: str, first: int = 0) -> list[str]:
         return self._strings[key][first:]
 

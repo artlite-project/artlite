@@ -488,12 +488,14 @@ class TileImage:
                     files=self.gguf.files)
         if own:
             _pack_tiles(out, [x for r, b in own for x in self._native_blocks(r, b)], threads=threads)
-        for r, b in paro:  # (a block of PARO linears: transcoded into rows of blocks, packed, freed, block by block)
+        for r, b in paro:  # (a block of PARO linears: transcoded into rows of blocks, packed, freed, block by block; the
+            # file's pages they were read from given back)
             names = [t for t in b.tensors if t not in self._own]
             self._own.update({t: self.paro_rows(t) for t in names})
             _pack_tiles(out, self._native_blocks(r, b), threads=threads)
             for t in names:
                 del self._own[t]
+                self.gguf.release(t)
         self._fill_data(out)
         return any(r.data for r in self.regions)
 
