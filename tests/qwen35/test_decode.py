@@ -821,6 +821,40 @@ def test_overlay_paro(case: str, S: int) -> None:
     assert max(errs) < 2.5e-2 and np.mean(errs) < 8e-3, (max(errs), np.mean(errs))
 
 
+def test_overlay_paro_taps() -> None:
+    """A PARO checkpoint's overlay with a DFlash2 drafter (Qwen3.8-27B-PARO-int5 up to its first full-attention layer, a
+    tap at layer 2): the tap's plain copy of layer 2's input (an identity copy of the residual, ``paro_steps``) within
+    llama.cpp's residual after layer 1 on the pseudo-quantized model, over 12 positions by steps of one (bf16 rows:
+    0.3% at most); the drafter's head a view of the screened head's plane."""
+    from artlite.hf_model import HfModel
+    from artlite.model_config import checkpoint
+    from models.qwen35.image import QwenImage
+    from models.qwen35.overlay import QwenOverlay
+
+    from ..goldens.paro import pseudo_gguf
+
+    path = checkpoint("qwen3.8-27B-paro-int5")
+    require(path)
+    g = HfModel(path)
+    cfg = QwenConfig.from_gguf(g)
+    La, tap = cfg.attention_layers[0], 2
+    layers = list(range(La + 1))
+    ref = pseudo_gguf(path, f16=True, layers=La + 2)
+    tokens = llama_tokenize(ref, essay("apple.txt"))[:12]
+    want = np.asarray(golden(ref, tokens, layers=(tap - 1,), names="l_out", logits="none")["l_out", tap - 1], np.float32)
+    img = QwenImage(g, cfg, layers=layers, vocab=512, mtp=False, dflash=(tap,))
+    ov = QwenOverlay(g, layers=layers, vocab=512, max_positions=128, image=img, taps=(tap,))
+    assert ov.drafter_view() is not None
+    ov.load()
+    errs = []
+    for t in range(len(tokens)):
+        ov.step(g.rows("token_embd.weight", tokens[t:t + 1]), t, logits=False)
+        x = (ov.tap_rows((tap,), 1)[0, 0].astype(np.uint32) << 16).view(np.float32)
+        errs.append(rel_max(x, want[t]))
+        ov.accept(1)
+    assert max(errs) < 6e-3, errs
+
+
 @pytest.mark.parametrize("size", ["1B", "9B", "35B-A3B", "occamy", "3.8-27B"])
 def test_drafts_exact(size: str) -> None:
     """A step of S slots gives each kept slot the numbers of a step of one, bit for bit, so that drafts never change a

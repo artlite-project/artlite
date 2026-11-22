@@ -7,7 +7,8 @@ raw K / V objects), the attention (o into rot_o's input), rot_o, attn_out; then 
 input), rot_down (act(gate) up of each column's slice of down's input: the ffn in whole rotation groups a column, zero
 past it), down (the next layer's copies; the last layer's residual into the LM head's input). The first layer's copies
 come from rot_in (the residual slices the columns load), the LM head's from the last layer's down (an identity copy
-over the output norm, ``image``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
+over the output norm, ``image``); a DFlash2 drafter's taps (``taps``) an identity copy more each (no norm weight: the
+residual), in a region of its own (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
 expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
 copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
 (the 4-lane rounds, ``kmath.rotate``), one sequence."""
@@ -88,10 +89,14 @@ class ParoSteps(RotatedOverlay):
 
     def copies_of(self: "QwenOverlay", L: int) -> list[tuple[int, str]]:
         """The phases that take layer L's input: its rotated copies (L = -1: the LM head's, the output norm's weights
-        without a rotation)."""
+        without a rotation); a DFlash2 drafter's tap (``taps``): a plain copy after them, in a region of its own."""
         if L < 0:
             return [(-1, "lm")]
-        return [(L, n) for n in (("attn_q", "attn_k", "attn_v") if self.cfg.attention[L] else ("gin_q", "gin_z"))]
+        out = [(L, n) for n in (("attn_q", "attn_k", "attn_v") if self.cfg.attention[L] else ("gin_q", "gin_z"))]
+        return out + [(L, "tap")] if L in self.taps else out
+
+    def _tap(self: "QwenOverlay", L: int) -> tuple[int, str]:
+        return (L, "tap") if self.paro and L >= 0 else super()._tap(L)
 
     def next_layer(self: "QwenOverlay", L: int) -> int:
         """The layer after L (-1: the LM head)."""
@@ -119,6 +124,8 @@ class ParoSteps(RotatedOverlay):
         return len(self.copies_of(L if name == "rot_in" else self.next_layer(L)))
 
     def paro_groups(self: "QwenOverlay", L: int, name: str, S: int) -> list[mp.Group]:
+        if name == "tap":  # (a drafter's tap: no phase reads its metadata object)
+            return [mp.Group(0, 0, np.zeros(META, np.int32), 0, 0)]
         flags = self.paro_flags(L, name)
         plain = [] if self.rot_kind(name) in ("in", "rotx") else mp.groups(
             self.image.region(L, name), flags, S, slots=self.SLOTS, block_flags=MOE_BLOCKS if name == "moe_in" else None)

@@ -307,3 +307,34 @@ def test_pack_tails(size: str, pairs: bool) -> None:
     check_tails(img, pad, {"gdn_in", "attn_in", "gate_up", "lm"} if kev else {"down"})
     if not (pairs and kev):
         check_unpaired(img, pad)
+
+
+def test_paro_drafter_head() -> None:
+    """A PARO checkpoint's image with a DFlash2 drafter (Qwen3.5-0.8B-PARO's first layer, a tap there): its head's rows
+    on the screened head's Q4_0 plane (``draft_cols``: the drafter's fixed and table rows first in each column), the tap
+    layer's input copies one more (the identity: the residual itself); a head tile repacked with other rows
+    (``repack``: the drafter's table of a sequence's tokens; the plane's rows quantized again) as a fresh pack of
+    those rows packs it."""
+    from artlite.hf_model import HfModel
+    from artlite.model_config import checkpoint
+
+    path = checkpoint("qwen3.5-0.8B-paro")
+    require(path)
+    g = HfModel(path)
+    cfg = QwenConfig.from_gguf(g)
+    plain = QwenImage(g, cfg, layers=[0], vocab=512, mtp=False)
+    img = QwenImage(g, cfg, layers=[0], vocab=512, mtp=False, dflash=(0,))
+    assert img.screen and img.draft_cols and not plain.draft_cols and img.taps == (0,)
+    assert len(img._in_rot(0)) == len(plain._in_rot(0)) + 1 and img._in_rot(0)[-1][0] == ""
+    r = img.region(-1, "lm")
+    b = r.block("lm")
+    out = np.zeros(img.nbytes, np.uint8)
+    img.pack(out)
+    rows = b.rows[3, :b.R].copy()
+    b.rows[3, :b.R] = np.roll(rows, 5)  # (other tokens in column 3's first row tile)
+    spans = img.repack(out, r, b, 3, 0)
+    fresh = np.zeros(img.nbytes, np.uint8)
+    img.pack(fresh)
+    for off, n in spans:
+        assert np.array_equal(out[off:off + n], fresh[off:off + n]), off
+    b.rows[3, :b.R] = rows

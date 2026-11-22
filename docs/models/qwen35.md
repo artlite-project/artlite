@@ -46,8 +46,9 @@ IQ4_NL tensors, Q4_0 and Q4_1 ones and F32 ones (an MoE router's, a GDN alpha), 
 gate and up in two of them (unsloth's dynamic quantizations: below). A dense model with a KV head per 2 columns decodes
 up to 8 tokens per dispatch where its file holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than
 ten formats; else up to 4 (`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`:
-the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account) where the design runs 8 tokens and the file has its MTP
-layer (the DFlash2 drafter's head), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
+the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account; a PARO checkpoint's: its base model's) where the
+design runs 8 tokens and the file has its MTP layer (the DFlash2 drafter's head), or the model is a PARO checkpoint (its
+design of 4 slots), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
 model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in
 another account's repository of the same name (ggml-org publishes its drafters apart from the models); of several, Q4_0,
 then Q4_K_M, then Q8_0.

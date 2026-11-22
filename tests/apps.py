@@ -1,8 +1,8 @@
 """The apps' designs as the apps build them (no NPU): per app its model file and its builder, which compiles the app's
 designs and returns what it built (``AppBuild``): the decode overlays and prefill libraries of the models present
 (Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's, Qwen3.5-0.8B-PARO's, Qwen3.6-35B-A3B-PARO's and
-Qwen3.8-27B-PARO-int5's checkpoint directories: their rotated inputs; Qwen3.6-35B-A3B also with its MTP drafter file,
-the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
+Qwen3.8-27B-PARO-int5's checkpoint directories: their rotated inputs, the 27B's also with its base model's DFlash2
+drafter; Qwen3.6-35B-A3B also with its MTP drafter file, the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
 and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision
 overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them,
 ``schedule_ledger.py`` reads their builds."""
@@ -117,6 +117,24 @@ def _qwen_drafts(path: str, dflash: bool) -> AppBuild:
     return _built([ov.op, drafter.op, pf.lib], pf, ov)
 
 
+def _qwen_paro_dflash(path: str) -> AppBuild:
+    """A PARO checkpoint of a model with a DFlash2 drafter (Qwen3.8-27B-PARO-int5) as its app builds it: the drafter's
+    head on the screened head's plane, its taps as plain copies (``qwen35.image.QwenImage``'s ``dflash``)."""
+    from artlite.decode.dflash.overlay import DFlashOverlay
+    from models.qwen35.image import QwenImage
+    from models.qwen35.overlay import QwenOverlay
+    from models.qwen35.prefill import QwenPrefill
+    from models.qwen35.qwen import dflash_taps
+
+    if (file := qwen_dflash_of(path)) is None:
+        pytest.skip(f"no DFlash2 drafter of {path}")
+    g, taps = open_weights(path), dflash_taps(file)
+    ov = QwenOverlay(g, max_positions=4096, image=QwenImage(g, mtp=False, dflash=taps), drafts=True, taps=taps)
+    drafter = DFlashOverlay(ov, GGUFFile(file))
+    pf = QwenPrefill(ov, draft=None, dflash=drafter)
+    return _built([ov.op, drafter.op, pf.lib], pf, ov)
+
+
 def _lfm(path: str) -> AppBuild:
     from models.lfm.overlay import LfmOverlay
     from models.lfm.prefill import LfmPrefill
@@ -171,6 +189,7 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "qwen3.5-0.8B-PARO": (checkpoint("qwen3.5-0.8B-paro"), _qwen),
     "qwen3.6-35B-A3B-PARO": (checkpoint("qwen3.6-35B-A3B-paro"), _qwen),
     "qwen3.8-27B-PARO-int5": (checkpoint("qwen3.8-27B-paro-int5"), _qwen),
+    "qwen3.8-27B-PARO-int5-dflash": (checkpoint("qwen3.8-27B-paro-int5"), _qwen_paro_dflash),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),

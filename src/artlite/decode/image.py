@@ -31,7 +31,7 @@ so that expert e's two halves (blocks 2 e, 2 e + 1) are one contiguous run of th
 whole.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -514,15 +514,29 @@ class TileImage:
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
         """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer), with
-        the other row tile of its pair in a ``pt`` block (their shared tail tile): the (offset, bytes) of the tiles."""
+        the other row tile of its pair in a ``pt`` block (their shared tail tile): the (offset, bytes) of the tiles (a
+        half-precision head's Q4_0 plane: those rows quantized again)."""
         assert not b.fmt2, "a split block's row tiles are of two formats"
-        blk = list(self._native_blocks(r, b)[0])
         n = b.R * b.G
         lo = rt - rt % 2 if b.pt else rt
         hi = min(lo + 2, b.tiles) if b.pt else rt + 1
+        rows = np.ascontiguousarray(b.rows[col, lo * n:hi * n])
+        name = b.tensors[0]
+        plane = derived(b.fmt, self.qtype(name))
+        if plane:  # (the rows' plane alone, the rows renumbered into it)
+            t = self.tensor(name)
+            ids, rows = np.unique(rows[rows >= 0]), rows.copy()
+            rows[rows >= 0] = np.searchsorted(ids, rows[rows >= 0])
+            self._own[name] = QTensor(name=name, qtype="Q4_0", rows=len(ids), cols=t.cols,
+                                      raw=plane_rows(replace(t, rows=len(ids), raw=np.asarray(t.raw)[ids])))
+        try:
+            blk = list(self._native_blocks(r, b)[0])
+        finally:
+            if plane:
+                del self._own[name]
         blk[7] += lo
         blk[8] += col * r.col_stride
-        blk[11] = np.ascontiguousarray(b.rows[col, lo * n:hi * n]).reshape(1, -1)
+        blk[11] = rows.reshape(1, -1)
         if r.half:
             blk[14] = r.tile(r.rt0[b.name] + lo, 0)
         _pack_tiles(out, [tuple(blk)], threads=1)

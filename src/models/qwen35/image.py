@@ -43,7 +43,9 @@ GDN outputs of the column's v heads, ssm_out's rotation), "rot_o" (the column's 
 ``down_slice``, padding groups of zeros), "down_rot" (the next layer's copies; the last layer's: the LM head's, the output
 norm's weights without a rotation). An MoE layer's (``qwen35moe``): "<mixer out>_rot" moe_in's copy (the experts' gate
 / up rotation), moe_in's blocks folded into it (``moe_folded``), "exp_rot" between the expert slabs (``moe.image``). A
-PARO image is region-major.
+PARO image is region-major. With a DFlash2 drafter (``dflash``: its taps) its head's rows lead each column of the
+screened head's plane (``draft_cols``: the drafter's logits from the plane's rows), and a tap layer's input copies one
+more, the identity (``taps``: the residual itself, ``paro_steps``).
 
 An input half a chunk short of whole chunks in one K group (``decode.image.Region.half`` regions, ``tails``; a dense
 model's) is the hidden size where it is so (Kev-4B's 2560: gdn_in, attn_in, gate_up, the LM head) and down's ffn
@@ -121,12 +123,14 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True, tails: bool = True,
-                 pairs: bool = True, screen: bool = True):
+                 pairs: bool = True, screen: bool = True, dflash: tuple[int, ...] | None = None):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
         (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block); tails: a dense model's
         regions of the hidden's input half regions where it is half a chunk short, pairs: their pairs of row tiles
-        (module docstring); screen: the LM head may be screened (False: its rows whole, for a design of 8 slots)."""
+        (module docstring); screen: the LM head may be screened (False: its rows whole, for a design of 8 slots);
+        dflash: a PARO checkpoint's DFlash2 drafter's taps (its head's rows without an MTP block, on the screened head's
+        plane; the tap layers' inputs a plain copy more each: ``taps``)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
@@ -137,6 +141,7 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         L0 = self.layers[0]
         first = f"blk.{L0}.{'attn_q' if cfg.attention[L0] else 'attn_qkv'}.weight"  # (module docstring)
         self.paro = first in gguf.tensor_info and isinstance(gguf.tensor(first), ParoTensor)
+        self.taps = tuple(dflash) if self.paro and dflash else ()
         self._rot_init()
         if self.paro:
             mtp = False  # (the drafters of a PARO checkpoint: GGUF files of their own)
@@ -156,6 +161,9 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         lm = "output.weight" if "output.weight" in gguf else "token_embd.weight"
         if cfg.nextn_layers == 1 and not cfg.moe and not trunk and not self.paro:  # (its head: a view of a region-major image's rows)
             self.draft_cols = self._draft_cols(self.R[self.fmt(lm)], HEAD_ROWS if mtp else DFLASH_HEAD_ROWS)
+        elif self.paro and dflash is not None and not cfg.moe:  # (a PARO checkpoint's DFlash2 drafter: its head on the
+            # screened head's plane, the logits of its drafts only)
+            self.draft_cols = self._draft_cols(self.R[plane(self.qtype(lm))], DFLASH_HEAD_ROWS)
         if self.draft_cols:
             F = COLS * self.draft_cols - TABLE_ROWS
             self.fixed, self.table = (head_tokens(gguf, F) if self.n_ids == cfg.vocab_size else
@@ -166,8 +174,9 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         # model's with an MTP block, whatever rows of it the image holds: its drafters read the head's rows in place
         # (``draft_cols``), and its design of 8 slots has no L1 for tiles of more than 16 rows next to two X objects,
         # ``decode.design``'s "Designs of 8 slots")
-        self.screen = (screen and self.SCREEN and not (cfg.nextn_layers and not cfg.moe)
+        self.screen = (screen and self.SCREEN and not (cfg.nextn_layers and not cfg.moe and not self.paro)
                        and screened(self.qtype(lm), self.formats()))
+        assert not (self.paro and self.draft_cols) or self.screen, "a PARO checkpoint's drafter head: the screened plane"
         self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *((plane(self.qtype(lm)),) if self.screen else ()))], H)
         if self.draft_cols:
             self.order = self._order()
@@ -213,8 +222,9 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
                 if r.name in ("gate_up", "exp_gu") or (r.name, b.name) == ("moe_in", "sgu") for R in (b.R, b.R2) if R}
 
     def mtp_view(self, cfg: QwenConfig) -> "MtpView":
-        """The image of the MTP block's drafter (``cfg``: its config, the block as a layer): ``MtpView``."""
-        assert self.draft_cols, "a file with an MTP block of its own"
+        """The image of the MTP block's drafter (``cfg``: its config, the block as a layer): ``MtpView``; a DFlash2
+        drafter's head (its rows alone)."""
+        assert self.draft_cols, "an image with a drafter head's rows (``draft_cols``)"
         return MtpView(self, cfg)
 
     def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
@@ -299,11 +309,13 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
 
     def _in_rot(self, layer: int) -> list[tuple[str, np.ndarray, list[np.ndarray]]]:
         """(PARO) The copies of layer ``layer``'s input (the residual: its norm's weight folded into each rotation): a
-        GDN layer's for gin_q and gin_z, an attention layer's for attn_q, attn_k, attn_v."""
+        GDN layer's for gin_q and gin_z, an attention layer's for attn_q, attn_k, attn_v; a DFlash2 drafter's tap layer's
+        a plain one after them (``taps``)."""
         b = f"blk.{layer}."
         g, cg = self._vec(b + "attn_norm.weight"), column_groups(0, self.cfg.hidden_size // COLS)
         names = ("attn_q", "attn_k", "attn_v") if self.cfg.attention[layer] else ("attn_qkv", "attn_gate")
-        return [(f"{b}{n}.weight", g, cg) for n in names]
+        tap = [("", np.ones(self.cfg.hidden_size, np.float32), cg)] if layer in self.taps else []  # (the residual itself)
+        return [(f"{b}{n}.weight", g, cg) for n in names] + tap
 
     def _vec(self, name: str) -> np.ndarray:
         return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
@@ -414,7 +426,7 @@ class MtpView:
 
     order = None
     column_major = False
-    screen = False  # (the drafter reads its head's rows as they are)
+    screen = False  # (the drafter reads its head's rows as they are: a PARO checkpoint's DFlash2 drafter its plane's)
     paro = False  # (a PARO checkpoint's drafters: GGUF files of their own)
 
     def __init__(self, image: QwenImage, cfg: QwenConfig):

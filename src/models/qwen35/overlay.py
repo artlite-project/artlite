@@ -171,12 +171,15 @@ class QwenOverlay(ParoSteps, ModelOverlay):
     def __init__(self, gguf: GGUFFile, *, layers: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, weights: WeightBuffer | None = None, formats: tuple[str, ...] = (),
                  image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset(),
-                 drafts: bool | None = None, sequences: int = 1):
+                 drafts: bool | None = None, sequences: int = 1, taps: tuple[int, ...] = ()):
         """slots: a step's token slots at most (default ``slots_of``, ``drafts``: whether a drafter's steps of several
-        tokens run, default: the file has an MTP layer of its own)."""
+        tokens run, default: the file has an MTP layer of its own); taps: a DFlash2 drafter's (a PARO checkpoint's: the
+        layers whose input goes out as a plain copy too, ``paro_steps``; the image's ``taps``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
         self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``, a design of 4 slots, one sequence)
+        self.taps = tuple(L for L in taps if L in self.layers) if self.paro else ()
+        assert set(self.taps) <= set(img.taps), (self.taps, img.taps)
         if self.paro and (sequences > 1 or slots not in (None, 4)):
             raise ValueError("a PARO checkpoint: one sequence on the design of 4 slots")
         fmts = img.formats() | set(formats)
@@ -306,6 +309,8 @@ class QwenOverlay(ParoSteps, ModelOverlay):
                 self._add_rot_inputs((L, name), extra=sink)
                 continue
             self._add_inputs((L, name), extra=sink, staged=self.sequences > 1 and name in ("attn_out", "gdn_out"))
+        for L in self.taps:  # (a DFlash2 drafter's taps: plain copies, no phase reads them)
+            self._add_rot_inputs((L, "tap"))
         self.norm_off: dict[tuple[int, str], int] = {}
         self.n_norm = -(-self.H // (NX_PER_NORM * OBJ_K))  # norm-weight A objects of a phase
         nw = 2 * NX_PER_NORM * OBJ_K * (self.n_norm - 1) + self.T  # (the last object's extent)

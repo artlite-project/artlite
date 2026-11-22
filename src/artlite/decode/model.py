@@ -276,11 +276,15 @@ class ModelOverlay:
         """Token slots of a step at most (the design's)."""
         return self.op.slots
 
+    def _tap(self, L: int) -> tuple[int, str]:
+        """The input region whose x is layer L's tap (``tap_x``): its first phase's (a rotated overlay's: a plain copy of
+        its own, ``decode.rotated``)."""
+        return self._input(L)
+
     def tap_x(self, L: int) -> int:
-        """ACT offset of the x of layer L's first phase (L = -1: the LM head): the residual stream that layer read, as
-        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place; a rotated
-        input's: its copy, ``decode.rotated``)."""
-        rg = self.inp[self._input(L)][0]
+        """ACT offset of the x of layer L's tap (``_tap``; L = -1: the LM head): the residual stream that layer read, as
+        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place)."""
+        rg = self.inp[self._tap(L)][0]
         return rg.off + rg.x0
 
     def tap_rows(self, taps: tuple[int, ...], n: int) -> np.ndarray:
@@ -289,9 +293,9 @@ class ModelOverlay:
         several sequences, whose next step is another's too)."""
         out = []
         for L in taps:
-            rg = self.inp[self._input(L)][0]
+            rg = self.inp[self._tap(L)][0]
             sp = self._sp(self._last_s, self._input(L))
-            off = rg.off + XB
+            off = rg.off + rg.x0
             self.dev.fetch("ACT", off, 2 * sp * rg.K)
             v = self.dev.view("ACT")[off:off + 2 * sp * rg.K].view(np.uint16).reshape(-1, sp, 8)[:, :n]
             out.append(v.transpose(1, 0, 2).reshape(n, rg.K))

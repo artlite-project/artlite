@@ -104,7 +104,8 @@ from .image import DFlashImage
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}
 SCATTER = (18, ND, 36, 36 * ND)  # a record's drain into its pair (words): ND panels 144 B apart
-SLOTS_OF = 8  # the model's steps' slots at most (the drafter's injections read their x in place: packed, as its own)
+SLOTS_OF = 8  # the model's steps' slots at most (the drafter's injections read their x in place: packed as its own, or an
+# unpacked target's all slots, ``step``)
 
 
 class Run(NamedTuple):
@@ -141,7 +142,8 @@ class Step:
 class DFlashTarget(Protocol):
     """What the drafter needs of its model's overlay: its config, file, device and image (``kc``, ``payload``: the K groups
     of the drafter's own image; ``T``: the objects' size, its head's tiles being the model's), its steps' slots (``SLOTS``,
-    packed inputs: the drafter's injections read their x in place), the taps (``tap_x``: a layer's input x in its ACT) and
+    its inputs packed or not, ``_sp``: the drafter's injections read their x in place), the taps (``tap_x``: a layer's
+    input x in its ACT) and
     the drafter's head: the first rows of each column of its LM region (``drafter_view``: a ``decode.head`` view, its fixed
     tokens and its table; None: no such rows); ``KV_PAD``: the positions past its last layer's caches that its prefill's
     slices reach (the drafter's rings have as many past them); ``sequences``: the sequences it holds (several: the
@@ -178,8 +180,8 @@ class DFlashOverlay(ModelOverlay):
                 or max(cfg.taps) >= tc.num_hidden_layers):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         view = target.drafter_view()
-        if view is None or target.SLOTS > SLOTS_OF or not target.op.packed:
-            raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of packed steps of at most {SLOTS_OF} tokens and "
+        if view is None or target.SLOTS > SLOTS_OF:
+            raise ValueError(f"{gguf.path}: a DFlash2 drafter goes with a model of steps of at most {SLOTS_OF} tokens and "
                              f"a drafter head, not {target.gguf.path}")
         self.shape = DFlashShape(cfg, a_bytes=target.T, max_chunk=max_chunk, max_padding=max_padding)
         self.image = DFlashImage(gguf, cfg, kc=target.image.kc, payload=target.image.payload, tile_bytes=target.T)
@@ -646,6 +648,9 @@ class DFlashOverlay(ModelOverlay):
         model's steps, kept until its drafter's turn), written into ``stage``."""
         assert not S or q == self.next, (q, self.next)
         assert (rows is not None) == (S > 0 and bool(self.stage)), "a sequence's rows: given with the injection"
+        if S and not self.target.op.packed:  # (an unpacked target's taps, x of all its slots a k block: every slot
+            # injected, ``keep`` of them kept)
+            S = self.target.SLOTS
         st = self._transaction_of(S, x is not None, rows is not None)
         if rows is not None:
             act, sp = self.dev.view("ACT"), self._sp(S)

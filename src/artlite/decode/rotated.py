@@ -78,6 +78,8 @@ class RotatedOverlay:
             K, subs = n * COLS, len(self.rot_subs(name, SLOTS))
             off = self._take("ACT", region_bytes(K, mul * SLOTS) + (subs - 1) * XB + extra * K)
             regs = [InputRegion(off + i * XB, 0, K, x0=(subs - i) * XB) for i in range(subs)]
+        elif name == "tap":  # (a block drafter's tap: a plain copy of the layer's input, an F_PSQ input's layout)
+            regs = [InputRegion(self._take("ACT", rot_region_bytes(self.H)), 0, self.H, x0=XB + XPAY)]
         else:
             r = self.image.region(L, name)
             assert len(mp.group_chunks(r)) == 1, f"{name}: one K group"

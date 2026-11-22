@@ -14,6 +14,7 @@ it, so nothing else spells the location.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -231,9 +232,11 @@ def qwen_mtp_of(model: str, quant: str = "") -> str | None:
 
 def qwen_dflash_of(model: str) -> str | None:
     """The DFlash2 drafter (GGUF architecture ``dflash``) of a qwen35 model file: the Q4_K_M file of a repository
-    ``<model's repository>-DFlash2-GGUF`` of any organization (z-lab's for Qwen3.8-27B), or None."""
-    d = os.path.dirname(os.path.abspath(model))
+    ``<model's repository>-DFlash2-GGUF`` of any organization (z-lab's for Qwen3.8-27B), or None; a checkpoint directory's
+    (a PARO one, ``<base>-PARO[-<variant>]``): its base model's."""
+    d = os.path.abspath(model) if os.path.isdir(model) else os.path.dirname(os.path.abspath(model))
     root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d).removesuffix("-GGUF")
+    repo = re.sub(r"-PARO(-[\w.]+)?$", "", repo)
     for org in sorted(os.listdir(root)):
         x = os.path.join(root, org, f"{repo}-DFlash2-GGUF")
         files = sorted(f for f in os.listdir(x) if f.endswith("-Q4_K_M.gguf")) if os.path.isdir(x) else []
