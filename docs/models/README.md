@@ -32,7 +32,7 @@ z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second
 bytes a token; with its base model's MTP drafter, ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the
 GGUF files, 34.8 tokens per second after a 1K-token essay prompt and 29.8 after 32K, the GGUF's 35.8 and 30.5, the
 same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357), z-lab/gemma-4-E4B-it-PARO (teacher-forced
-KL 0.00029 against the checkpoint computed exactly; a step of one token 56.3 ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer
+KL 0.00029 against the checkpoint computed exactly; a step of one token 53.9 ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer
 bytes a token; a 1024-token prompt at 3150 tokens per second, the GGUF's 3040, 2048 tokens at 3390, the GGUF's 3170).
 
 ## Tested files and plans

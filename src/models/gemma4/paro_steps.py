@@ -23,6 +23,7 @@ its input as r (the embeddings, or a prefill chunk's residual over the output sc
 n = r). Inputs that came with an earlier phase's (rk, rv, k, v, rup, up)
 take no sync."""
 
+import itertools
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -60,7 +61,7 @@ from artlite.decode.protocol import (
     post_region_bytes,
     region_bytes,
 )
-from artlite.decode.rotated import RotatedOverlay
+from artlite.decode.rotated import Fill, RotatedOverlay
 from artlite.decode.step import StepPlan
 from artlite.operators.design import COLS
 from artlite.operators.util import bf16_bits, rup
@@ -85,6 +86,7 @@ NOSYNC = frozenset({"rk", "rv", "k", "v", "rup", "up"})
 LAYER = ("rq", "rk", "rv", "q", "k", "v", "att", "rot_o", "o", "rgate", "rup", "gate", "up", "rot_down", "down",
          "rpgate", "pgate", "rot_proj", "proj")
 SUBS = 2  # (an R phase's sub-phases at most: 3 groups, 2 an X object at SP 4)
+R_META = (SUBS - 1) * XPAY + XB  # (bytes of a column's metadata objects of an R phase: XPAY apart, ``r_fills``)
 
 
 class GemmaParo(RotatedOverlay):
@@ -198,16 +200,21 @@ class GemmaParo(RotatedOverlay):
             if len(offs) % 2:
                 take("ACT", self.gate_pitch)  # (the padding layer's rows: a sink)
         self.hdr = {}
-        for L in self.layers:
-            for h in ("qkv", "gu", "pg") if cfg.per_layer_dim else ("qkv", "gu"):
-                self.hdr[(L, h)] = take("ACT", post_region_bytes(H))
-        self.hdr[(-1, "lm")] = take("ACT", post_region_bytes(H))
-        self.final = take("ACT", post_region_bytes(H))  # (rlm's updated residual)
         self.rmeta: dict[tuple[int, str], int] = {}
+        reads: dict[tuple[int, str], list[tuple[int, str]]] = {}  # (an update region's R phases)
         for L, name in self.phases():
             if name in R_OF:
-                self.rmeta[(L, name)] = take("ACT", SUBS * COLS * XB)
-            elif name == "rot_proj":  # (the 64-slot input: C objects of a column's 32 rows and 32 zeros)
+                reads.setdefault((L, HDR[name]), []).append((L, name))
+        hdrs = [(L, h) for L in self.layers for h in (("qkv", "gu", "pg") if cfg.per_layer_dim else ("qkv", "gu"))]
+        for key in [*hdrs, (-1, "lm")]:  # (its R phases' metadata objects before it: ``r_fills``)
+            for phase in reads.get(key, ()):
+                self.rmeta[phase] = take("ACT", COLS * R_META)
+            self.hdr[key] = take("ACT", post_region_bytes(H))
+        self.final = take("ACT", post_region_bytes(H))  # (rlm's updated residual)
+        for L, name in self.phases():
+            if name in R_OF:
+                continue
+            if name == "rot_proj":  # (the 64-slot input: C objects of a column's 32 rows and 32 zeros)
                 self.inp[(L, name)] = [InputRegion(take("ACT", region_bytes(COLS * 64)), 0, COLS * 64, x0=XB)]
             elif self.rot_kind(name) is not None:
                 self._add_rot_inputs((L, name))
@@ -252,9 +259,9 @@ class GemmaParo(RotatedOverlay):
                 m[M_NRA], m[M_NT] = nra, nra + pad
                 hidden_meta(m, self.H)
                 m[M_SCALE] = bf16_bits(self.r_scale(L, name))
-                out.append((self.rmeta[(L, name)] + (i * COLS + c) * XB, m.view(np.uint8)))
+                out.append((self.r_meta_at((L, name), c, i), m.view(np.uint8)))
             for i in range(len(subs), SUBS):  # (unread, zeros: every S writes the same bytes, ``_metas``)
-                out.append((self.rmeta[(L, name)] + (i * COLS + c) * XB, np.zeros(4 * META, np.uint8)))
+                out.append((self.r_meta_at((L, name), c, i), np.zeros(4 * META, np.uint8)))
         return out
 
     # ------------------------------------------------------------------
@@ -282,19 +289,32 @@ class GemmaParo(RotatedOverlay):
                 self._inputs(seq, rg, st.S, phase)
             self._outputs(seq, st, phase)
 
-    def r_fills(self: "GemmaOverlay", phase: tuple[int, str], S: int) -> list[list[int]]:
-        """An R phase's fills per column (ACT offsets of XB bytes): per sub-phase its metadata object, an update's first
-        R phase's first then the partial sums object, then its X object (the XB bytes ending with its groups' [v | r])."""
+    def r_meta_at(self: "GemmaOverlay", phase: tuple[int, str], c: int, i: int) -> int:
+        """The ACT offset of column c's metadata object of an R phase's sub-phase i (a column's XPAY apart, as its X
+        objects are: ``r_fills``; the objects' tails, which nobody reads, under the next ones)."""
+        return self.rmeta[phase] + c * R_META + i * XPAY
+
+    def r_fills(self: "GemmaOverlay", phase: tuple[int, str], S: int) -> list[list[Fill]]:
+        """An R phase's fills per column: per sub-phase its metadata object, an update's first R phase's first then the
+        partial sums object, then its X object (the XB bytes ending with its groups' [v | r]). Two objects a task where
+        the second lies past the first (a BD of two strip groups that far apart: the metadata objects lie before their
+        update region), the sub-phases after the first a repetition of one (their objects XPAY apart)."""
         sp, h = packed_slots(S), self.hdr_of(phase)
         x = h + XB + XPAY
+
+        def pair(a: int, b: int, n: int = 1) -> Fill:
+            assert b > a, (a, b)
+            return Fill(a, 2 * XB, (XB // 8, 2, XB // 8, (b - a) // 4), n, (XPAY // 4, n))
+
         out = []
         for c in range(COLS):
-            f = []
-            for i, (g0, _) in enumerate(self.r_subs(c, S)):
-                f.append(self.rmeta[phase] + (i * COLS + c) * XB)
-                if i == 0 and phase[1] in UPD:
-                    f.append(h + XPAY)
-                f.append(x + 2 * 2 * sp * ROT_GROUP * (sum(R_GROUPS[:c]) + g0) - (XB - XPAY))
+            subs = self.r_subs(c, S)
+            X = [x + 2 * 2 * sp * ROT_GROUP * (sum(R_GROUPS[:c]) + g0) - (XB - XPAY) for g0, _ in subs]
+            assert all(b - a == XPAY for a, b in itertools.pairwise(X)), X
+            m0 = self.r_meta_at(phase, c, 0)
+            f = [Fill(m0), pair(h + XPAY, X[0])] if phase[1] in UPD else [pair(m0, X[0])]
+            if len(subs) > 1:
+                f.append(pair(self.r_meta_at(phase, c, 1), X[1], len(subs) - 1))
             out.append(f)
         return out
 

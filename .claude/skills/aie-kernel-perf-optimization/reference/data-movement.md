@@ -280,7 +280,9 @@ offsets): aie2p-coding section 8. For speed:
   channel and sync: the same 57 ms): count tasks as well as bytes, but measure before cutting them. Where the cores
   take a stream's objects as fast as they come (the 27B's GDN state panels at S 1, DMA-bound), each task of it is
   in the step time: its panel fills split into 8 / 32 tasks per pair and column cost +4 / +24 ms a step (~0.5-0.65 µs
-  a task, round-robin over the columns). Many units a layer: their tasks in rounds of one task over the columns, not a
+  a task, round-robin over the columns); so are a rotation phase's sub-phases (one X object each: the 27B PARO's
+  rot_down on 8 slots ran 17 a column, metadata, X and A objects a task each; one repeated BD a column, the metadata
+  objects XPAY apart as the X objects are: a step of 8 -2.5%, ``decode.rotated._rotx_fills``). Many units a layer: their tasks in rounds of one task over the columns, not a
   column's tasks in a row (a chunkwise GDN core with 4 v heads: 3.24 -> 2.82 ms a step at every S; the last column's first task
   ~10 µs behind the first's at every unit otherwise).
 - **Hold an output object only while writing it**: a core that acquires a D object early (a GDN conv block's history
