@@ -14,11 +14,14 @@ F_ROTE phase emits (``rot_copies``) and routes the outputs (``x_to``: values int
 emission)."""
 
 import numpy as np
+from ml_dtypes import bfloat16
 
 from ..operators.design import COLS
 from ..overlay import Sequence
+from ..paro import Rotation, TanForm
 from . import phases as mp
 from .design import ROT_GROUP
+from .image import Region
 from .model import InputRegion
 from .protocol import (
     C_LEN,
@@ -187,6 +190,34 @@ def column_groups(k0: int, n: int, g: int = ROT_GROUP) -> list[np.ndarray]:
     return [np.arange((k0 + n * c) // g, (k0 + n * (c + 1)) // g) for c in range(COLS)]
 
 
+def copy_inverse(rot: Rotation, gamma: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """The inverse of a rotated copy x' = R (w' x) (``rot``'s unit tan form, gamma folded in; the rounds R and w' as the
+    NPU runs them, T and w' in bf16) against gamma x, for ``folded``: (gamma / w' (K,), 0 where w' is; R^-1 per group
+    transposed (G, g, g)) in fp64."""
+    tf = rot.tan_form(gamma, unit=True)
+    g, K = rot.group, rot.K
+    T = np.asarray(tf.T, np.float32).astype(bfloat16).astype(np.float64)
+    ws = np.asarray(tf.w, np.float32).astype(bfloat16).astype(np.float64)
+    gm = np.ones(K) if gamma is None else np.asarray(gamma, np.float64).reshape(-1)
+    scale = np.where(ws != 0, gm / np.where(ws != 0, ws, 1), 0)
+    # (rows x' = x a per group, a's row i the image of e_i: the unit vectors of every group at once, the rounds being
+    # block-diagonal)
+    a = TanForm(tf.partner, T, np.ones(K), tf.chan, g).apply(np.tile(np.eye(g), (1, K // g)))
+    blocks = a.reshape(g, K // g, g).transpose(1, 0, 2)
+    return scale, np.linalg.inv(blocks).transpose(0, 2, 1)
+
+
+def folded(w: np.ndarray, inverse: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    """A matrix w (N, K) that reads a rotated copy x' of its input instead of gamma x (``copy_inverse``: the copy's): w
+    diag(gamma / w') R^-1 (fp64), its K in the copy's storage order. Exact against the NPU's copy (to its fp32
+    arithmetic), not only against the exact transform: logits that pick experts (a router's) agree with the file's fp32
+    ones."""
+    scale, inv_t = inverse
+    G, g, _ = inv_t.shape
+    m = (np.asarray(w, np.float64) * scale).reshape(-1, G, g)
+    return np.einsum("ngk,gkj->ngj", m, inv_t).reshape(m.shape[0], G * g)
+
+
 class RotatedImage:
     """The mixin of a ``image.TileImage`` whose linears take rotated inputs: data regions of rotation objects on the A
     runs (``rot_data``: per column the objects of each part, two groups per A object, ``protocol.rot_objects``)."""
@@ -208,12 +239,22 @@ class RotatedImage:
         self._add_data(L, name, per[0].size)
 
     def _rot_tan(self, tensor: str, gamma: np.ndarray | None) -> np.ndarray:
-        """(G, bytes) the groups' rotation objects of a tensor's tan form (``paro.TanForm.objects``), cached."""
+        """(G, bytes) the groups' rotation objects of a tensor's tan form (``paro.TanForm.objects``; tensor "": the
+        identity of gamma's channels, a plain linear's copy of a normed input), cached."""
         cache = self.__dict__.setdefault("_rot_tans", {})
         key = (tensor, None if gamma is None else gamma.tobytes())
         if key not in cache:
-            cache[key] = self.gguf.tensor(tensor).rot().tan_form(gamma, unit=True).objects()
+            rot = self.gguf.tensor(tensor).rot() if tensor else Rotation.identity(gamma.size)
+            cache[key] = rot.tan_form(gamma, unit=True).objects()
         return cache[key]
+
+    def rot_slab(self, L: int, name: str, tensor: str, halves: int) -> None:
+        """A data slab region (``image.TileImage.slabs``) of rotation objects: per expert half (``halves`` of them, half
+        h of an expert: its K's groups 2 h, 2 h + 1, one A object) the groups of the tensor's rotation (no norm weight)."""
+        o = self._rot_tan(tensor, None)
+        assert o.shape[0] == 4, f"{tensor}: an expert's K of 4 groups"
+        self._rot_objs[(L, name)] = np.stack([pack_rot_objects(o[2 * h:2 * h + 2], self.tile_bytes) for h in (0, 1)])
+        self.slabs.append(Region(L, name, [], 1, 1, self.tile_bytes, self.kc, data=self.tile_bytes, cols=halves))
 
     def rot_region(self, layer: int, name: str) -> bool:
         """Whether (layer, name) is a data region of rotation objects."""

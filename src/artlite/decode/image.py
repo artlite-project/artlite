@@ -263,6 +263,7 @@ class TileImage:
         self._own: dict[str, QTensor] = {}  # (tensors a model substitutes: re-laid-out copies in memory)
         self._views: dict[str, QTensor] = {}  # (the file's tensors as rows of another width: ``view``)
         self._chans: dict[str, np.ndarray] = {}  # (PARO linears: their K order, ``tensor``)
+        self._paro_views: dict[str, int] = {}  # (PARO linears read as rows of a view: rows of the view per row)
 
     def tensor(self, name: str) -> QTensor:
         """A tensor the blocks name (the file's, its ``view``, or the model's substitute: ``_own``; a PARO linear with
@@ -280,6 +281,9 @@ class TileImage:
         t = self.gguf.tensor(name)
         n = t.cols // (256 * row_sb)
         assert t.cols == n * 256 * row_sb, (name, t.cols, row_sb)
+        if isinstance(t, ParoTensor):  # (its rows of blocks as rows of the view: ``paro_rows``)
+            self._paro_views[name] = n
+            return
         self._views[name] = QTensor(name=name, qtype=t.qtype, rows=t.rows * n, cols=t.cols // n,
                                     raw=t.raw.reshape(t.rows * n, -1))
 
@@ -425,13 +429,13 @@ class TileImage:
         return self.norm_objects(layer, name.removesuffix("_norm"))
 
     def _fill_data(self, out: np.ndarray) -> None:
-        """Write the data regions: every column's copy of a region's ``data_objects`` (or its own)."""
-        for r in self.regions:
+        """Write the data regions and slabs: every column's copy of a region's ``data_objects`` (or its own)."""
+        for r in self.regions + self.slabs:
             if r.data:
                 objs = self.data_objects(r.layer, r.name)
-                per = objs.reshape(COLS, -1) if objs.ndim == 3 else np.broadcast_to(objs.reshape(1, -1), (COLS, objs.size))
-                for c in range(COLS):
-                    out[r.offset + c * r.col_stride:][:per.shape[1]] = per[c]
+                per = objs.reshape(objs.shape[0], -1) if objs.ndim == 3 else objs.reshape(1, -1)
+                for c in range(r.cols):  # (a slab's: objects of fewer columns than its halves repeat)
+                    out[r.offset + c * r.col_stride:][:per.shape[1]] = per[c % per.shape[0]]
 
     def region(self, layer: int, name: str) -> Region:
         return self._index[(layer, name)]
@@ -501,7 +505,10 @@ class TileImage:
         if not isinstance(t, ParoTensor):
             assert t.qtype in HALF, (name, t.qtype)
             return QTensor(name=name, qtype="Q4_0", rows=t.rows, cols=t.cols, raw=plane_rows(t))
-        return t.blocks()
+        b = t.blocks()
+        if n := self._paro_views.get(name):
+            return QTensor(name=name, qtype=b.qtype, rows=b.rows * n, cols=b.cols // n, raw=b.raw.reshape(b.rows * n, -1))
+        return b
 
     def repack(self, out: np.ndarray, r: Region, b: Block, col: int, rt: int) -> list[tuple[int, int]]:
         """Pack row tile rt of block b in column ``col`` again (its ``rows`` changed) into out (``pack``'s buffer), with

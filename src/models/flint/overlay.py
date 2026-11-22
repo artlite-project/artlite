@@ -50,9 +50,6 @@ from artlite.decode.attn_overlay import AttentionOverlay, CacheKind, CacheUse
 from artlite.decode.head import HeadView
 from artlite.decode.model import InputRegion
 from artlite.decode.protocol import (
-    B_F32,
-    B_GU,
-    B_PAIR,
     C_LEN,
     F_EMITR,
     F_GU,
@@ -71,7 +68,7 @@ from artlite.decode.vring import PAIR
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import FlintConfig
 from artlite.moe import route as MR
-from artlite.moe.steps import CP_BYTES, MoeTransfers
+from artlite.moe.steps import CP_BYTES, MOE_BLOCKS, MoeTransfers
 from artlite.operators import cdo
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, WeightBuffer
@@ -82,7 +79,6 @@ from .image import FlintImage
 PHASES = {"dense": ("qkv", "att", "o", "gate_up", "down"), "moe": ("qkv", "att", "o", "moe_in", "sdown", "moe")}
 FLAGS = {"qkv": F_NORM, "o": F_RESID | F_EMITR, "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM,
          "moe_in": F_NORM, "sdown": F_RESID}
-MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32}  # (moe_in's blocks: ``decode.design``)
 CHAIN = 2  # columns per KV head
 KV_PAD = 8192  # positions past the caches (the last layer's): the prefill's slices of a cache
 WRAP = 256  # groups of a sliding-window cache's ring (16384 positions: two of the prefill's largest chunks, so a prompt from

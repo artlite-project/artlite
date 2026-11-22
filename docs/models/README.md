@@ -16,13 +16,15 @@ weights run as BFP16 tiles, as a BF16 GGUF does. Tested: Qwen/Qwen3-0.6B, Qwen/Q
 lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGUFs).
 
 ParoQuant (PARO) checkpoints, int4 or int5 (`int5-bitplane`) with groups of 128 (`quantization_config.quant_method`
-`paroquant`), run as checkpoint directories of `Qwen3ForCausalLM`, `LlamaForCausalLM` and
-`Qwen3_5ForConditionalGeneration` (its text; int5: Qwen3.5's): their linears as 4-bit (5-bit) tiles of the checkpoint's
-size (4.5, 5.5 bits per weight with their scales), each projection's input rotated on the NPU as the checkpoint
-prescribes (its channel scales and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested:
-z-lab/Qwen3-0.6B-PARO (KL 0.0011 against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL
-0.0003), Launch80/Qwen3.8-27B-PARO-int5 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens
-per second, a 1024-token prompt in 3.2 s).
+`paroquant`), run as checkpoint directories of `Qwen3ForCausalLM`, `LlamaForCausalLM`,
+`Qwen3_5ForConditionalGeneration` (its text; int5: Qwen3.5's) and `Qwen3_5MoeForConditionalGeneration` (its experts PARO,
+its router and shared expert F16): their linears as 4-bit (5-bit) tiles of the checkpoint's size (4.5, 5.5 bits per
+weight with their scales), each projection's input rotated on the NPU as the checkpoint prescribes (its channel scales
+and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
+against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
+(its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s),
+z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.3 tokens per second, the Q4_K_M GGUF's 28.0 at 5% fewer
+bytes a token; its prompts run as decode steps).
 
 ## Tested files and plans
 

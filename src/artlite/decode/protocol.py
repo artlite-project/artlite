@@ -36,7 +36,9 @@ cores' objects in M_FLAGS are one space: a design's kinds (``XMETA.consts``) tak
 
 State words (``STATE``): those of the main core's workspace; the first ones are trip counts of the core program, and
 the words of the post-norm designs, the token objects and the MoE layers are features of one array (``POST_STATE``,
-``TOK_STATE``, ``MOE_STATE``: the MoE words reuse the others', ``STATE.together`` refuses both in one design). The
+``TOK_STATE``, ``MOE_STATE``: the MoE words reuse the others', ``STATE.together`` refuses both in one design); the rotated
+inputs' (``ROT_STATE``) and the last MoE word lie past the S_WORDS of the others, in a rotated or MoE design's longer state.
+The
 helper's command (``CMD``): its kind at ``C_KIND``, the input's slots per k block at ``C_SP``.
 
 Where the words are used: the main and helper cores' kernels (``design.cc.jinja``, ``gemv``), the attention cores
@@ -66,7 +68,8 @@ C_LEN = 64  # bf16 elements of a C object
 NBLK = 4  # blocks of row tiles a phase may have
 MAX_K = 5120  # k of a phase's K group: its x panels (46 KB) in the helper's memory
 CMD_WORDS = 16  # words of the helper's command
-S_WORDS = 64  # state words of the main core's workspace
+S_WORDS = 64  # state words of the main core's workspace (a ``rot`` or ``moe`` design's: ``S_WORDS_ROT``, words past them)
+S_WORDS_ROT = 80
 N_TOK = 8  # token objects (``tok`` designs: the cache objects per token object, TOK_STATE's S_NAS)
 POST_K = 256  # (post designs) k of a header phase's input object: [k block 32][v | r][slot 4][8] bf16
 ITEM_WORDS = 1 + SLOTS  # (MoE designs, of 4 slots) the expert object's item: e | h0 << 8 | h1 << 9, its weight in each slot
@@ -164,7 +167,7 @@ F_EXPERT = MOE.flag("F_EXPERT", 21)  # the expert object: the column's items, M_
 # State words of the main core
 # ----------------------------------------------------------------------
 
-STATE = WordMap("main core state", S_WORDS)
+STATE = WordMap("main core state", S_WORDS_ROT)
 _S = STATE.common
 (S_NNO, S_NXN, S_NXP, S_NIN, S_NT, S_NE, S_NSKIP, S_NASKIP, S_NM, S_NR, S_FLAGS, S_NS, S_K8, S_G, S_NRT, S_NB, S_KC,
  S_RT, S_XD, S_NX, S_STG, S_ESLOT, S_EJ, S_ESRC, S_FMT, S_TL) = _S.words(
@@ -187,16 +190,19 @@ S_NPS, S_SCALE = POST_STATE.words("S_NPS S_SCALE", at=44)
 S_COL, S_H8, S_IH = POST_STATE.words("S_COL S_H8 S_IH", at=48)
 TOK_STATE = STATE.kind("tok")
 S_NAS = TOK_STATE.block("S_NAS", N_TOK, at=52)  # (``tok``) the cache objects per token object (S_NAS + M_TOK_KIND)
-# (moe) the sub-phases of an expert object (a trip count), their local input strips (a trip count), the phase's first
-# panel chunk, the next sub-phase, the shared gate's logit per slot (fp32 bits)
+# (moe) the passes of an object (a trip count: a phase's 1, an expert object's sub-phases), a sub-phase's local input
+# strips (a trip count), the phase's first panel chunk, the next sub-phase, the shared gate's logit per slot (fp32 bits),
+# whether a pass sets up a sub-phase (a trip count: the helper's ``hsub``)
 MOE_STATE = STATE.kind("moe", exclusive_with=(POST_STATE,))
 S_NSUB, S_NLS, S_XC0, S_SUB = MOE_STATE.words("S_NSUB S_NLS S_XC0 S_SUB", at=44)
 S_SG = MOE_STATE.block("S_SG", SLOTS, at=48)
+S_NSUBC = MOE_STATE.word("S_NSUBC", at=S_WORDS + 8)
 # (rot) the partial sums object (a trip count), F_ROTE's rotation objects, the groups of the next rotation object, F_ROTX's
 # X objects, the rotation objects of the next one (trip counts); the copy (F_ROTX: the group in its X object), the group
 # and the groups of the phase's rotations
-ROT_STATE = STATE.kind("rot", exclusive_with=(POST_STATE, MOE_STATE))
-S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_NRA S_NGA S_NRX S_NRP S_RC S_RG S_RN", at=44)
+ROT_STATE = STATE.kind("rot", exclusive_with=(POST_STATE,))
+S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_NRA S_NGA S_NRX S_NRP S_RC S_RG S_RN",
+                                                                      at=S_WORDS)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -206,6 +212,10 @@ CMD = WordMap("helper command", CMD_WORDS)
 C_KIND = CMD.common.word("C_KIND", at=4)  # words 0 .. 3 by kind
 K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC, K_HELP = CMD.common.values(
     "K_TILE K_STRIP K_INPUT K_PSTRIP K_NOP K_BEGIN K_SUB K_ACC K_HELP", of="kind")  # (K_SUB, K_ACC: moe; K_HELP: ``help_flag``)
+# (``rot`` designs) the main core's rotations on the helper: the partial sums object (``psq``), the residual's copies
+# (``rote``), a slice's (``rotx``), an expert half's hold buffer (``hrot``); words 0 .. 2: the A object, the X object, the
+# main core's workspace (as the helper sees them)
+K_PSQ, K_ROTE, K_ROTX, K_HROT = CMD.common.values("K_PSQ K_ROTE K_ROTX K_HROT", of="kind", start=9)
 C_SP = CMD.common.word("C_SP")  # (K_STRIP, K_PSTRIP) the input's slots per k block
 C_MIRROR = CMD.common.flag("C_MIRROR", 3, of="sp")  # (K_PSTRIP: C_SP + C_MIRROR: strip 0 into slot 1, F_KPAIR)
 

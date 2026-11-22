@@ -278,8 +278,10 @@ class ModelOverlay:
 
     def tap_x(self, L: int) -> int:
         """ACT offset of the x of layer L's first phase (L = -1: the LM head): the residual stream that layer read, as
-        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place)."""
-        return self.inp[self._input(L)][0].off + XB
+        [hidden / 8][slot][8] bf16 for the slots ``_sp`` of its step (a DFlash2 drafter reads it in place; a rotated
+        input's: its copy, ``decode.rotated``)."""
+        rg = self.inp[self._input(L)][0]
+        return rg.off + rg.x0
 
     def tap_rows(self, taps: tuple[int, ...], n: int) -> np.ndarray:
         """The x of the layers ``taps``' first phase (``tap_x``) of the last step's first n slots: (n, taps, K) bf16
@@ -711,7 +713,7 @@ class ModelOverlay:
     def _lm_x(self, S: int) -> np.ndarray:
         """The residuals (S, hidden) the LM head read in the last dispatch of S slots (bf16 values, fp32; a copy)."""
         rg = self.inp[(-1, "lm")][0]
-        sp, off = self._sp(S, (-1, "lm")), rg.off + XB
+        sp, off = self._sp(S, (-1, "lm")), rg.off + rg.x0
         self.dev.fetch("ACT", off, 2 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, :S]
         return np.ascontiguousarray(v.transpose(1, 0, 2)).reshape(S, self.H).view(bfloat16).astype(np.float32)

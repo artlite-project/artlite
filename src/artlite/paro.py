@@ -17,7 +17,7 @@ NPU (module ``Rotation.tan_form``)."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -47,6 +47,11 @@ class Rotation:
     pairs: np.ndarray
     channel_scales: np.ndarray
     group: int
+
+    @classmethod
+    def identity(cls, K: int, group: int = 128, rounds: int = 8) -> Rotation:
+        """The transform x' = x of K channels (zero angles; a copy's rounds that only scale: ``tan_form``'s gamma)."""
+        return cls(np.zeros((rounds, K // 2)), np.tile(np.arange(K) % group, (rounds, 1)), np.ones(K), group)
 
     @property
     def K(self) -> int:
@@ -271,11 +276,16 @@ class ParoTensor(QTensor):
     def blocks(self, *, threads: int = 0) -> QTensor:
         """The linear as rows of P4_128 blocks (int5: P5_128; ``_native.awq_rows``: a QTensor the tile packer takes,
         (rows, K / 256 * 144, or 176) uint8 in memory: its rows, groups and channel order as this tensor's)."""
+        out = np.empty((self.rows, self.cols // 256 * (176 if self.bits == 5 else 144)), np.uint8)
+        self._rows_into(out, threads)
+        return QTensor(name=self.name, qtype=self.qtype, rows=self.rows, cols=self.cols, raw=out)
+
+    def _rows_into(self, out: np.ndarray, threads: int) -> None:
+        """``blocks``' rows into out (rows, K / 256 * 144 or 176)."""
         from . import _native
 
         assert self.group == 128, self.group
         five = self.bits == 5
-        out = np.empty((self.rows, self.cols // 256 * (176 if five else 144)), np.uint8)
         _native.awq_rows(out, np.ascontiguousarray(self.qweight), np.ascontiguousarray(self.qzeros),
                          np.ascontiguousarray(self.scales).view(np.uint16), self.group,
                          None if self.chan is None else np.ascontiguousarray(self.chan, np.int32),
@@ -283,7 +293,6 @@ class ParoTensor(QTensor):
                          None if self.groups_of is None else np.ascontiguousarray(self.groups_of, np.int64),
                          np.ascontiguousarray(self.qweight_hi) if five else None,
                          np.ascontiguousarray(self.qzeros_hi) if five else None, threads)
-        return QTensor(name=self.name, qtype=self.qtype, rows=self.rows, cols=self.cols, raw=out)
 
     def dequantize(self) -> np.ndarray:
         """W (rows, cols) fp32 = s (q - z): the quantized weight (its input transform not applied: ``effective``)."""
@@ -309,6 +318,31 @@ class ParoTensor(QTensor):
         R = r.rounds
         return Rotation(r.theta.reshape(R, -1, g // 2)[:, G].reshape(R, -1), r.pairs.reshape(R, -1, g)[:, G].reshape(R, -1),
                         r.channel_scales.reshape(-1, g)[G].reshape(-1), g)
+
+
+@dataclass
+class ParoExperts(ParoTensor):
+    """E PARO linears of one shape that share one rotation, stacked (an MoE layer's experts, ``ffn_*_exps``: rows E N,
+    expert e's outputs at rows e N ..): ``experts`` their ``ParoTensor``s (the stack's ``qweight`` .. are the first
+    one's); the stack's ``chan`` is every expert's."""
+
+    experts: list[ParoTensor] = field(default_factory=list)
+
+    def _each(self) -> list[ParoTensor]:
+        return [replace(t, chan=self.chan) for t in self.experts]
+
+    def fields(self) -> dict[str, np.ndarray]:
+        fs = [t.fields() for t in self._each()]
+        return {k: np.concatenate([f[k] for f in fs]) for k in fs[0]}
+
+    def _rows_into(self, out: np.ndarray, threads: int) -> None:
+        n = self.rows // len(self.experts)
+        for e, t in enumerate(self._each()):
+            t._rows_into(out[e * n:(e + 1) * n], threads)
+
+    def effective(self) -> np.ndarray:
+        """(float32, expert by expert: a stack's fp64 matrix would be 2 GB)"""
+        return np.concatenate([t.effective().astype(np.float32) for t in self._each()])
 
 
 def check_config(path: str, qc: dict) -> tuple[int, int]:

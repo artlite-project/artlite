@@ -130,7 +130,7 @@ class GdnTransfers:
         def pay(c: int, k: int) -> int:
             return dev.address("GOBJ", ov.gdn_payload(L, c, k))
 
-        self._gdn_in(seq, L, S)
+        self._gdn_in(seq, L, S, st)
         if wide:
             self._rows_wide(seq, L, S, pay)
         last = hc - 1  # (the last v head the core runs: k head 1's last)

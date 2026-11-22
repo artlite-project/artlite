@@ -91,7 +91,8 @@ class QwenDecodeOperator(Attn256DecodeOperator):
         self.msg = gdn is not None and slots == 4
         super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, moe=moe, max_k=max_k,
                          paged=paged, win=win, slots=slots, packed=slots == 8, bcast=bcast, gu_win=gu_win, pairs=pairs,
-                         split=split, tails=tails, tail_pairs=tail_pairs, **({"rot": True} if rot else {}))
+                         split=split, tails=tails, tail_pairs=tail_pairs,
+                         **({"rot": True, "norm_objs": False} if rot else {}))  # (``paro_steps``: the LM head's copy too)
 
     def _extra_src(self, p: str) -> str:
         return (self.gdn.render(p) if self.gdn is not None else "") + super()._extra_src(p)

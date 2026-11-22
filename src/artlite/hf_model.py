@@ -73,6 +73,8 @@ class _Entry:
     paro: str = ""  # (a PARO linear: its checkpoint name's prefix; ``ParoTensor``)
     rows_of: np.ndarray | None = None  # (PARO) its rows / groups in another order (``ParoTensor``)
     groups_of: np.ndarray | None = None
+    experts: int = 0  # (PARO experts stacked: ``paro`` a prefix with "{e}", ``rot`` their shared rotation's; ``ParoExperts``)
+    rot: str = ""
 
 
 class HfModel(GGUFFile):
@@ -184,11 +186,26 @@ class HfModel(GGUFFile):
         return QTensor(name=name, qtype=e.qtype, rows=a.shape[0], cols=a.shape[1], raw=a)
 
     def _paro(self, name: str, e: _Entry) -> paro.ParoTensor:
-        """A PARO linear's ``ParoTensor``."""
-        a = {p: self.hf_array(f"{e.paro}.{p}") for p in _PARO_PARTS if f"{e.paro}.{p}" in self._hf}
-        N, K = e.shape
-        rot = paro.Rotation(np.asarray(a["theta"], np.float64), np.asarray(a["pairs"], np.int64),
-                            np.asarray(a["channel_scales"], np.float64).reshape(-1), self.paro_group)
+        """A PARO linear's ``ParoTensor`` (stacked experts: ``ParoExperts``)."""
+        if e.experts:
+            r = {p: self.hf_array(f"{e.rot}_weight_{p}") for p in ("theta", "pairs", "channel_scales")}
+            rot = self._rotation(r)
+            ts = [self._linear(name, e.paro.format(e=i), e.shape[1:], rot, e) for i in range(e.experts)]
+            t0 = ts[0]
+            return paro.ParoExperts(name=name, qtype=e.qtype, rows=e.experts * t0.rows, cols=t0.cols, raw=t0.raw,
+                                    qweight=t0.qweight, qzeros=t0.qzeros, scales=t0.scales, group=self.paro_group,
+                                    rotation=rot, qweight_hi=t0.qweight_hi, qzeros_hi=t0.qzeros_hi, experts=ts)
+        r = {p: self.hf_array(f"{e.paro}.{p}") for p in ("theta", "pairs", "channel_scales")}
+        return self._linear(name, e.paro, e.shape, self._rotation(r), e)
+
+    def _rotation(self, r: dict[str, np.ndarray]) -> paro.Rotation:
+        return paro.Rotation(np.asarray(r["theta"], np.float64), np.asarray(r["pairs"], np.int64),
+                             np.asarray(r["channel_scales"], np.float64).reshape(-1), self.paro_group)
+
+    def _linear(self, name: str, prefix: str, shape: tuple[int, ...], rot: paro.Rotation, e: _Entry) -> paro.ParoTensor:
+        """The ``ParoTensor`` (N, K) = shape of the codes at ``<prefix>.qweight`` .."""
+        a = {p: self.hf_array(f"{prefix}.{p}") for p in _PARO_CODES if f"{prefix}.{p}" in self._hf}
+        N, K = shape
         return paro.ParoTensor(name=name, qtype=e.qtype, rows=N, cols=K, raw=a["qweight"], qweight=a["qweight"],
                                qzeros=a["qzeros"], scales=a["scales"], group=self.paro_group, rotation=rot,
                                qweight_hi=a.get("qweight_hi"), qzeros_hi=a.get("qzeros_hi"), rows_of=e.rows_of,
@@ -379,11 +396,17 @@ class _Adapter:
         if (part := name.rpartition(".")[2]) in _PARO_PARTS or name.endswith(_PARO_SHARED):
             if part != "qweight":
                 return []
-            if ".experts." in name:
-                raise NotImplementedError(f"{self.hf.path}: PARO experts ({name})")
             prefix = name.removesuffix(".qweight")
-            hf_name = hf_name.removesuffix(".qweight") + ".weight"
-            e = self.paro_entry(prefix)
+            if m := re.fullmatch(r"(.*\.experts)\.(\d+)\.(\w+)", prefix):  # (the stack, at expert 0's qweight)
+                if m[2] != "0":
+                    return []
+                e = self.experts_entry(m[1], m[3])
+                hf_name = re.sub(r"\.experts\.0\.(\w+)\.qweight$", r".experts.\1.weight", hf_name)
+            else:
+                e = self.paro_entry(prefix)
+                hf_name = hf_name.removesuffix(".qweight") + ".weight"
+        elif ".experts." in name:
+            raise NotImplementedError(f"{self.hf.path}: unquantized experts ({name}; PARO experts run)")
         else:
             e = self.hf._hf[name]
         g = self.gguf_name(hf_name)
@@ -402,6 +425,22 @@ class _Adapter:
         K, N = q.shape[0], q.shape[1] * 8
         return _Entry(f"P{hf.paro_bits}_{hf.paro_group}", (N, K), q.shard, q.offset,
                       sum(hf._hf[p].nbytes for p in parts), paro=prefix)
+
+    def experts_entry(self, prefix: str, proj: str) -> _Entry:
+        """The entry of an MoE layer's PARO experts ``<prefix>.<e>.<proj>`` stacked (E, N, K), their rotation the shared
+        ``<prefix>.gate_up_weight_*`` (gate_proj, up_proj) or ``<prefix>.down_weight_*``."""
+        hf = self.hf
+        E = int(self.hp["num_experts"])
+        rot = f"{prefix}.{'down' if proj == 'down_proj' else 'gate_up'}"
+        codes = ("qweight", "qzeros", "scales") + (("qweight_hi", "qzeros_hi") if hf.paro_bits == 5 else ())
+        parts = [f"{prefix}.{i}.{proj}.{p}" for i in range(E) for p in codes]
+        parts += [f"{rot}_weight_{p}" for p in ("theta", "pairs", "channel_scales")]
+        if missing := [p for p in parts if p not in hf._hf]:
+            raise ValueError(f"{hf.path}: PARO experts {prefix}.*.{proj} without {missing[0]}")
+        q = hf._hf[f"{prefix}.0.{proj}.qweight"]
+        K, N = q.shape[0], q.shape[1] * 8
+        return _Entry(f"P{hf.paro_bits}_{hf.paro_group}", (E, N, K), q.shard, q.offset,
+                      sum(hf._hf[p].nbytes for p in parts), paro=f"{prefix}.{{e}}.{proj}", experts=E, rot=rot)
 
     def filter(self, name: str) -> str | None:
         """A language-model tensor's name as the tensor map knows it (None: skip the tensor)."""
@@ -715,8 +754,22 @@ class _Qwen35(_Adapter):
                       compute=lambda: np.ascontiguousarray(np.take(hf._array(e), perm, axis=axis)))
 
 
+class _Qwen35Moe(_Qwen35):
+    """Qwen3_5MoeForConditionalGeneration (Qwen3_5MoeTextModel: Qwen2MoeModel's experts stacked per layer, E N rows; a
+    PARO checkpoint's at expert 0's ``qweight``, ``ParoExperts``): the shared expert's gate as a vector (F32, as the
+    converter writes 1-D tensors)."""
+
+    arch, model_arch = "qwen35moe", gguf.MODEL_ARCH.QWEN35MOE
+
+    def transform(self, name: str, hf_name: str, e: _Entry) -> _Entry:
+        if hf_name.endswith("shared_expert_gate.weight"):
+            return self.computed(name, lambda a: a.reshape(-1))
+        return super().transform(name, hf_name, e)
+
+
 # a PARO linear's checkpoint tensors (``artlite.paro``) and the suffixes of an MoE layer's shared rotations
 _PARO_PARTS = ("qweight", "qzeros", "scales", "theta", "pairs", "channel_scales", "qweight_hi", "qzeros_hi")
+_PARO_CODES = ("qweight", "qzeros", "scales", "qweight_hi", "qzeros_hi")
 _PARO_SHARED = ("_weight_theta", "_weight_pairs", "_weight_channel_scales")
 
 # the MTP block's tensors (the converter's names past the tensor map)
@@ -728,6 +781,8 @@ _ADAPTERS: dict[str, type[_Adapter]] = {
     "LlamaForCausalLM": _Llama,
     "Qwen3_5ForConditionalGeneration": _Qwen35,
     "Qwen3_5ForCausalLM": _Qwen35,
+    "Qwen3_5MoeForConditionalGeneration": _Qwen35Moe,
+    "Qwen3_5MoeForCausalLM": _Qwen35Moe,
 }
 
 

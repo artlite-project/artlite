@@ -486,13 +486,16 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 {{ lut.src }}
 {% set gwin = wide and (SLOTS == 8 or act == "silu") %}{# (the gate / up windows' rows of every act at 8 slots, SiLU's at 4) #}
 
-// A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
+// A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM{{ ", F_PSQ" if rot else "" }}: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
 // ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0 (kmath.act: the gather LUT, through gs){{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
 __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ ", int ng" if gwin else "" }}{{ ", int nf" if moe else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     float *__restrict yt = WS(float, {{ w_.yt }});
-{% if moe %}
+{% if moe and rot %}
+    if (flags & {{ F_NORM + F_PSQ + F_WS }}) {  // (F_WS: the slots' scales; F_PSQ: a rotated copy's 1 / rms)
+        const aie::vector<float, 32> iv = aie::load_v<32>(WS(float, (flags & {{ F_NORM + F_PSQ }}) ? {{ w_.inv }} : {{ w_.wsc }}));
+{% elif moe %}
     if (flags & {{ F_NORM + F_WS }}) {  // (F_WS: the slots' scales)
         const aie::vector<float, 32> iv = aie::load_v<32>(WS(float, (flags & {{ F_NORM }}) ? {{ w_.inv }} : {{ w_.wsc }}));
 {% else %}
@@ -1048,7 +1051,9 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
     for (int i = 0; i < {{ S_FLAGS }}; i++)
         st[i] = 0;
 {% if moe %}
-    st[{{ S_NSUB }}] = 0;
+    st[{{ S_NSUB }}] = 1;  // (one pass: the object's own; an expert object's are its sub-phases, ``hexpert``)
+    st[{{ S_NSUBC }}] = 0;
+    st[{{ S_NLS }}] = 0;
 {% endif %}
 {% if post %}
     st[{{ S_NPS }}] = 0;
@@ -1283,6 +1288,13 @@ __attribute__((minsize)) void {{ p }}_cmd(uint8_t *__restrict a, int32_t *__rest
     const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     const int kc = st[{{ S_KC }}];
     cmd[0] = (int32_t)(uintptr_t)a + ({{ SHM }});
+{% if moe and rot %}
+    if (!st[{{ S_TL }}]) {  // (past the tiles: a PARO gate / up's rotation object of its hold buffer, ``hrot``)
+        cmd[2] = (int32_t)(uintptr_t)ws + ({{ SHM }});
+        cmd[{{ C_KIND }}] = {{ K_HROT }};
+        return;
+    }
+{% endif %}
     cmd[1] = kc;
     cmd[2] = (int32_t)(uintptr_t)(xs + {{ gv.XS_CHUNK }} * kc) + ({{ SHM }});
     cmd[3] = st[{{ S_FMT }}];
@@ -1294,6 +1306,10 @@ void {{ p }}_tile(uint8_t *__restrict a, int32_t *__restrict ws, uint8_t *__rest
 {
     const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     const int kc = st[{{ S_KC }}];
+{% if moe and rot %}
+    if (!st[{{ S_TL }}])  // (the helper's ``hrot``)
+        return;
+{% endif %}
 {% if WIN in (5, 6, 7) %}
     if (st[{{ S_TEND }}]) {
         event1();
@@ -1357,6 +1373,13 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     float *__restrict yt = WS(float, {{ w_.yt }});
+{% if moe and rot %}
+    if (!st[{{ S_TL }}]) {  // (the helper's ``hrot``: no rows, no outputs)
+        st[{{ S_NE }}] = 0;
+        st[{{ S_NM }}] = 0;
+        return;
+    }
+{% endif %}
 {% if moe %}
     const int fm = st[{{ S_FMT }}];
     if (fm & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
@@ -1696,6 +1719,33 @@ __attribute__((minsize)) void {{ p }}_psq(const bfloat16 *__restrict x, int32_t 
     aie::store_v(WS(float, {{ w_.inv }}), al::rows4(al::inv_rms<{{ H }}, {{ SLOTS }}>(ss.template grow<16>(), {{ eps }}f)));
 }
 
+// (rot) The rotations run on the helper (the main core's commands: their objects and its workspace as the helper sees
+// them; the helper's ``htask`` runs psq, rote, rotx{{ "; hrot: a gate / up's last tile, ``cmd``" if moe else "" }}): the main
+// core's program memory
+__attribute__((minsize)) void {{ p }}_cpsq(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t *__restrict cmd)
+{
+    cmd[1] = (int32_t)(uintptr_t)x + ({{ SHM }});
+    cmd[2] = (int32_t)(uintptr_t)ws + ({{ SHM }});
+    cmd[{{ C_KIND }}] = {{ K_PSQ }};
+}
+
+__attribute__((minsize)) void {{ p }}_crote(const uint8_t *__restrict a, int32_t *__restrict ws, int32_t *__restrict cmd)
+{
+    cmd[0] = (int32_t)(uintptr_t)a + ({{ SHM }});
+    cmd[2] = (int32_t)(uintptr_t)ws + ({{ SHM }});
+    cmd[{{ C_KIND }}] = {{ K_ROTE }};
+}
+
+__attribute__((minsize)) void {{ p }}_crotx(const bfloat16 *__restrict x, const uint8_t *__restrict a, int32_t *__restrict ws,
+                                           int32_t *__restrict cmd)
+{
+    cmd[0] = (int32_t)(uintptr_t)a + ({{ SHM }});
+    cmd[1] = (int32_t)(uintptr_t)x + ({{ SHM }});
+    cmd[2] = (int32_t)(uintptr_t)ws + ({{ SHM }});
+    cmd[{{ C_KIND }}] = {{ K_ROTX }};
+}
+
+
 // the groups of the next rotation object after group g of n (pairs of the phase's groups; F_ROTX: of an X object)
 [[clang::always_inline]] inline int {{ p }}_nga(int left)
 {
@@ -1757,7 +1807,11 @@ __attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const 
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     const int S = st[{{ S_NS }}], g = st[{{ S_RG }}], i = st[{{ S_RC }}], sp = st[{{ S_SP }}];
+{% if moe %}
+    const int act = 0, ls = sp == 1 ? 0 : (sp == 2 ? 1 : 2);  // (no F_RACT: an MoE design's experts rotate in ``hrot``)
+{% else %}
     const int act = (st[{{ S_FLAGS }}] & {{ F_RACT }}) ? 1 : 0, ls = (sp == 1 ? 0 : (sp == 2 ? 1 : 2)) + act;
+{% endif %}
     const int per = 16 >> ls;  // (groups of an X object: XPAY / (2 128 SP'))
     const uint8_t *__restrict ro = a + {{ ROT_OBJ }} * (g & 1);
     const bfloat16 *__restrict src = x + {{ 2 * META }} + (128 * i << ls);
@@ -1796,6 +1850,36 @@ __attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const 
 
 {% endif %}
 {% if moe %}
+{% if rot %}
+// (rot) An expert half's h (the hold buffer's [h | h]: [k block][slot 4][8] bf16, 256 channels) rotated in place by its
+// rotation object a (groups 0, 1: the half's groups of the downs' rotation), in the GEMV scratch (idle: before the down)
+__attribute__((noinline)) void {{ p }}_hrot(const uint8_t *__restrict a, int32_t *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict u = WS(float, {{ w_.scr }});
+    bfloat16 *__restrict b0 = WS(bfloat16, {{ w_.scr + 2048 }}), *__restrict b1 = WS(bfloat16, {{ w_.scr + 4096 }});
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < 2; j++) {
+        const uint8_t *__restrict ro = a + {{ ROT_OBJ }} * j;
+        const bfloat16 *__restrict w = (const bfloat16 *)(ro + {{ ROT_W }});
+        bfloat16 *__restrict h = WS(bfloat16, {{ w_.hold }}) + 512 * j;  // (channels 128 j ..: k blocks 16 j ..)
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 16; k++)
+            {{ p }}_ru0(aie::load_v<32>(h + 32 * k), aie::zeros<bfloat16, 32>(), w + 8 * k, u + 32 * k, b0 + 64 * k);
+{% if "rot" not in ablate %}
+        {{ rotf }}(u, b0, b0, b1, b1, b0, b1, ro);
+{% endif %}
+        AIE_LOOP_NO_UNROLL
+        for (int q = 0; q < 16; q++) {
+            const aie::vector<bfloat16, 32> t =
+                aie::transpose(aie::accum<accfloat, 32>(aie::load_v<32>(u + 32 * q)).template to_vector<bfloat16>(), 8, 4);
+            aie::store_v(h + 32 * q, t);
+            aie::store_v(h + 32 * q + {{ 32 * (OBJ_K // 16) }}, t);
+        }
+    }
+}
+
+{% endif %}
 // The helper's command for the next sub-phase of an expert object (its state: ``hsub``)
 __attribute__((minsize)) void {{ p }}_sub(int32_t *__restrict ws, int32_t *__restrict cmd)
 {
@@ -1848,7 +1932,8 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
         }
     }
     pl[{{ PLAN_SUBS }} + ns - 1] |= 4;
-    st[{{ S_NSUB }}] = ns;
+    st[{{ S_NSUB }}] = ns;  // (its passes: each sets up its sub-phase first)
+    st[{{ S_NSUBC }}] = 1;
     st[{{ S_SUB }}] = 0;
     st[{{ S_NS }}] = m[{{ M_NS }}];
 }
@@ -1873,6 +1958,9 @@ __attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws)
     sm[{{ M_NX }}] = 0;
     sm[{{ M_XC0 }}] = down ? {{ SIDE }} : 0;
     {{ p }}_hbegin((const bfloat16 *)sm, ws, 0);
+{% if rot %}
+    st[{{ S_NT }}] += down ? 0 : sm[{{ M_NRA }}];  // (a PARO gate / up: its half's rotation object after its tiles: ``hrot``)
+{% endif %}
     st[{{ S_FLAGS }}] = sm[{{ M_FLAGS }}];
     st[{{ S_NIN }}] = down;
     st[{{ S_NLS }}] = down ? 2 : 0;
@@ -1921,7 +2009,18 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     }
 {% if moe %}
     if (flags & {{ F_ROUTE }}) {
+{% if route_page %}
+        // (the routing: a page of the helper, ``route_page``; the GEMV scratch of the main core, idle, takes the pager's
+        // data reads)
+        {{ mp }}_pg_need<1>({{ route_page }}, WS(uint8_t, {{ w_.scr }}));
+        // (the routing's tables' addresses taken here: their data stays resident, a page writes no data)
+        volatile uintptr_t *__restrict kt = (volatile uintptr_t *)WS(uint8_t, {{ w_.scr }});
+        kt[0] = (uintptr_t){{ p }}_ech;
+        kt[1] = (uintptr_t){{ p }}_ebd;
+        ((void (*)(const int32_t *, int32_t *, int))(intptr_t)((const volatile int32_t *){{ pg_state }})[1])(m, ws, col);
+{% else %}
         {{ p }}_route(m, ws, col);
+{% endif %}
         return;
     }
     if (flags & {{ F_EXPERT }}) {
@@ -1979,9 +2078,13 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     st[{{ S_KC }}] = xc0;
     st[{{ S_G }}] = m[{{ M_G }}] + xc0;
     st[{{ S_NIN }}] = nx > 0;
-    if (flags & {{ F_COMB }}) {  // (its objects add into the residual, which then goes out)
+    if (flags & {{ F_COMB }}) {  // (its objects add into the residual, which then goes out{{ "; F_ROTE: as its rotated copies" if rot else "" }})
         st[{{ S_NIN }}] = 0;
+{% if rot %}
+        st[{{ S_NE }}] = (flags & {{ F_ROTE }}) ? 0 : m[{{ M_NS }}] * {{ H8 // C_LEN }};
+{% else %}
         st[{{ S_NE }}] = m[{{ M_NS }}] * {{ H8 // C_LEN }};
+{% endif %}
         st[{{ S_ESRC }}] = 1;
 {% if packed %}
         st[{{ S_NXS }}] = 1;  // (whole objects, not strips: a slot's half's partials each)
@@ -2046,7 +2149,7 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     const int nrot = m[{{ M_NRA }}];  // (counted in M_NT: the other cores skip them as tiles)
     st[{{ S_NT }}] = m[{{ M_NT }}] - nrot;
     st[{{ S_TL }}] = m[{{ M_NT }}] - nrot;
-    st[{{ S_NIN }}] = nx > 0;
+    st[{{ S_NIN }}] = nx > 0{{ " && !(flags & %d)" % F_COMB if moe else "" }};
     st[{{ S_NPQ }}] = (flags & {{ F_PSQ }}) ? 1 : 0;
     st[{{ S_RG }}] = 0;
     st[{{ S_RC }}] = 0;
@@ -2105,6 +2208,24 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         {{ p }}_hbegin((const bfloat16 *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]{{ ", hres" if SLOTS == 8 else "" }});
         return;
     }
+{% if rot %}
+    if (kind >= {{ K_PSQ }}) {  // (the main core's rotations: ``cpsq`` ..)
+        const uint8_t *a = (const uint8_t *)(uintptr_t)cmd[0];
+        const bfloat16 *x = (const bfloat16 *)(uintptr_t)cmd[1];
+        int32_t *ws = (int32_t *)(uintptr_t)cmd[2];
+        if (kind == {{ K_PSQ }})
+            {{ p }}_psq(x, ws);
+        else if (kind == {{ K_ROTE }})
+            {{ p }}_rote(a, ws);
+{% if moe %}
+        else if (kind == {{ K_HROT }})
+            {{ p }}_hrot(a, ws);
+{% endif %}
+        else
+            {{ p }}_rotx(x, a, ws);
+        return;
+    }
+{% endif %}
 {% if moe %}
     if (kind == {{ K_SUB }}) {
         {{ p }}_hsub((int32_t *)(uintptr_t)cmd[1]);
@@ -2160,9 +2281,11 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
             {{ p }}_hstrip<false, false>(x, nullptr, sq, xpk, t, sp, 0, oh);
 {% else %}
         const int sp = {{ "cmd[%d]" % C_SP if packed else 4 }};
+{% if norm_objs %}
         if (cmd[1])
             {{ p }}_hstrip<true>(x, (const bfloat16 *)(uintptr_t)cmd[1], sq, xpk, t, sp);
         else
+{% endif %}
             {{ p }}_hstrip<false>(x, nullptr, sq, xpk, t, sp);
 {% endif %}
         return;
@@ -2204,5 +2327,14 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 {% endif %}
     {{ p }}_hinput((uint8_t *)(uintptr_t)cmd[0], (const float *)scr, sq, r, cmd[2] >> 5, cmd[1]{{ ", __builtin_bit_cast(float, cmd[3])" if post else "" }});
 }
+{% if moe and route_page %}
+
+// (a page of the helper: the routing, entered through the pager's state words only; external, so that it stays in the
+// object for ``paging.link``)
+void {{ p }}_pgr_route(const int32_t *__restrict m, int32_t *__restrict ws, int col)
+{
+    {{ p }}_route(m, ws, col);
+}
+{% endif %}
 
 }  // extern "C"

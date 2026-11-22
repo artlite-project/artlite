@@ -15,7 +15,9 @@ of the model's image class (``MoeImage``). Per MoE layer:
   ``ffn_up_exps``: expert e's rows e F ..), then "exp_down", the down's rows (all hidden of them) over the half's K
   (F / 2 columns, h F / 2 .., of ``ffn_down_exps``' rows e hidden ..) as row groups of kc / (F / 2) (4 for F 512).
   Expert e's two halves are one run of the image (``Region.col_stride`` apart: half 2 e + 1 right after half 2 e):
-  a decode column streams a whole expert, or one half of one.
+  a decode column streams a whole expert, or one half of one. PARO experts (``decode.rotated``): between them
+  "exp_rot", the half's rotation object (groups 2 h, 2 h + 1 of the downs' shared rotation: the half's h rotated in
+  the core before its down).
 """
 
 from typing import Any
@@ -57,6 +59,8 @@ class MoeImage:
                   Fs, G=KC // Fs)
         gu, down = (b + "ffn_gate_exps.weight", b + "ffn_up_exps.weight"), b + "ffn_down_exps.weight"
         self._add_slab(layer, "exp_gu", [("gu", gu, self._slab_rows("gu", self.R[self.fmt(gu[0])]))], H)
+        if self.__dict__.get("paro"):  # (PARO experts: a half's groups of the downs' rotation before its down tiles)
+            self.rot_slab(layer, "exp_rot", down, 2 * E)
         self.view(down, F // 512)  # (a row of the view: a half's K)
         self._add_slab(layer, "exp_down", [("down", (down,), self._slab_rows("down", self.R[self.fmt(down)]))], F // 2,
                        G=2 * KC // F)

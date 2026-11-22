@@ -308,7 +308,8 @@ def flint_gguf(quant: str = "int4") -> str:
 HF_CHECKPOINTS = {"qwen3-0.6B": "Qwen/Qwen3-0.6B", "qwen3.5-0.8B": "Qwen/Qwen3.5-0.8B",
                   "llama-1B": "lmstudio-community/Llama-3.2-1B-Instruct",
                   "qwen3-0.6B-paro": "z-lab/Qwen3-0.6B-PARO", "qwen3-8B-paro": "z-lab/Qwen3-8B-PARO",
-                  "qwen3.5-0.8B-paro": "z-lab/Qwen3.5-0.8B-PARO", "qwen3.8-27B-paro-int5": "Launch80/Qwen3.8-27B-PARO-int5"}
+                  "qwen3.5-0.8B-paro": "z-lab/Qwen3.5-0.8B-PARO", "qwen3.8-27B-paro-int5": "Launch80/Qwen3.8-27B-PARO-int5",
+                  "qwen3.6-35B-A3B-paro": "z-lab/Qwen3.6-35B-A3B-PARO"}
 
 
 def checkpoint(name: str) -> str:

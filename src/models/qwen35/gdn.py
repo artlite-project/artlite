@@ -103,7 +103,7 @@ from artlite.operators.util import Attr, bf16_hilo, bf16_hilo_bits, mask64, regi
 from artlite.operators.words import WordMap
 
 from .gdn_math import MATH, PANEL, D, GdnDims
-from .words import FLAGS, GDN_IN, MP_CONT, MP_MORE
+from .words import FLAGS, GDN_IN, MP_J0, MP_LAST
 
 D_BYTES = 4096  # bytes of a D object
 HIST = 3 + SLOTS  # history rows of a conv object
@@ -128,7 +128,7 @@ G_BN = _G.word("G_BN")  # (8 slots) a branching step's branch chunk: the block's
 
 def consts() -> dict[str, int]:
     """The words and flags the GDN core's kernels take: the metadata words of its objects and its state words."""
-    return XMETA.consts(PHASE, GDN_IN, FLAGS) | STATE.consts() | {"MP_MORE": MP_MORE, "MP_CONT": MP_CONT}
+    return XMETA.consts(PHASE, GDN_IN, FLAGS) | STATE.consts() | {"MP_LAST": MP_LAST, "MP_J0": MP_J0}
 
 
 # (8 slots) the GDN tile's locks of the k and v heads' constants, which the helper core computes (``hgdn``): asked, done;

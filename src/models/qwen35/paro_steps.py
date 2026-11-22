@@ -6,32 +6,49 @@ input), gdn_out (gate's and up's copies); per attention layer attn_q, attn_k, at
 raw K / V objects), the attention (o into rot_o's input), rot_o, attn_out; then gate, up (their rows into rot_down's
 input), rot_down (act(gate) up of each column's slice of down's input: the ffn in whole rotation groups a column, zero
 past it), down (the next layer's copies; the last layer's residual into the LM head's input). The first layer's copies
-come from rot_in (the residual slices the columns load). Phases whose inputs came with an earlier phase's (gin_z,
-attn_k, attn_v, up) take no sync. A design of 4 slots (the 4-lane rounds, ``kmath.rotate``), one sequence."""
+come from rot_in (the residual slices the columns load), the LM head's from the last layer's down (an identity copy
+over the output norm, ``image``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
+expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
+copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
+(the 4-lane rounds, ``kmath.rotate``), one sequence."""
 
 from typing import TYPE_CHECKING
 
 import numpy as np
+from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
 from artlite.decode.protocol import (
     C_LEN,
+    F_COMB,
     F_EMITR,
+    F_MAIN,
     F_MSG,
     F_PSQ,
     F_RACT,
     F_RESID,
     F_ROTE,
     F_ROTX,
+    F_WS,
+    M_FLAGS,
+    M_NRA,
+    M_NRC,
+    M_NS,
+    M_NT,
+    M_NX,
+    META,
     XB,
+    XPAY,
+    interleave,
 )
 from artlite.decode.rotated import RotatedOverlay
+from artlite.moe.steps import MOE_BLOCKS
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction
 
 from .image import QwenImage, gdn_v_heads
 from .steps import PanelTable, Step
-from .words import M_MPART, MP_CONT, MP_MORE
+from .words import M_MPART, MP_J0, MP_LAST
 
 if TYPE_CHECKING:
     from .overlay import QwenOverlay
@@ -39,14 +56,15 @@ if TYPE_CHECKING:
 FLAGS = {"rot_in": F_EMITR | F_ROTE, "gin_q": F_PSQ | F_MSG, "gin_z": F_PSQ | F_MSG, "attn_q": F_PSQ, "attn_k": F_PSQ,
          "attn_v": F_PSQ, "rot_g": F_ROTX, "rot_o": F_ROTX, "gdn_out": F_RESID | F_EMITR | F_ROTE,
          "attn_out": F_RESID | F_EMITR | F_ROTE, "gate": F_PSQ, "up": F_PSQ, "rot_down": F_ROTX | F_RACT,
-         "down": F_RESID | F_EMITR | F_ROTE}
+         "down": F_RESID | F_EMITR | F_ROTE, "moe_in": F_PSQ, "sdown": F_RESID | F_WS, "lm": F_PSQ}
 KINDS = {"rot_in": "in", "gin_q": "psq", "gin_z": "psq", "attn_q": "psq", "attn_k": "psq", "attn_v": "psq",
-         "gate": "psq", "up": "psq", "rot_g": "rotx", "rot_o": "rotx", "rot_down": "rotx"}
+         "gate": "psq", "up": "psq", "rot_g": "rotx", "rot_o": "rotx", "rot_down": "rotx", "moe_in": "psq", "lm": "psq"}
 DATA = {"rot_in": "rot_in", "rot_g": "rot_g", "rot_o": "rot_o", "gdn_out": "gdn_out_rot", "attn_out": "attn_out_rot",
         "rot_down": "rot_down", "down": "down_rot"}  # (each phase's rotation objects: ``image``'s data regions)
 NOSYNC = frozenset({"gin_z", "attn_k", "attn_v", "up"})
 MIXER = {True: ("attn_q", "attn_k", "attn_v", "rot_o", "attn_out"), False: ("gin_q", "gin_z", "rot_g", "gdn_out")}
 FFN = ("gate", "up", "rot_down", "down")
+MOE_FFN = ("moe_in", "sdown")  # (an MoE layer's phases: its route object, experts and combine, ``moe.steps``)
 
 
 class ParoSteps(RotatedOverlay):
@@ -62,16 +80,23 @@ class ParoSteps(RotatedOverlay):
     def paro_phases(self: "QwenOverlay") -> list[tuple[int, str]]:
         out = [(self.layers[0], "rot_in")]
         for L in self.layers:
-            out += [(L, n) for n in MIXER[bool(self.cfg.attention[L])] + FFN]
+            out += [(L, n) for n in MIXER[bool(self.cfg.attention[L])] + (MOE_FFN if self.moe else FFN)]
         return [*out, (-1, "lm")]
 
     def paro_flags(self: "QwenOverlay", L: int, name: str) -> int:
-        """(the last layer's down: its residual plain, into the LM head's normed input)"""
-        return FLAGS[name] & ~(F_ROTE if (L, name) == (self.layers[-1], "down") else 0)
+        return FLAGS[name]
 
     def copies_of(self: "QwenOverlay", L: int) -> list[tuple[int, str]]:
-        """The phases that take layer L's input: its rotated copies."""
+        """The phases that take layer L's input: its rotated copies (L = -1: the LM head's, the output norm's weights
+        without a rotation)."""
+        if L < 0:
+            return [(-1, "lm")]
         return [(L, n) for n in (("attn_q", "attn_k", "attn_v") if self.cfg.attention[L] else ("gin_q", "gin_z"))]
+
+    def next_layer(self: "QwenOverlay", L: int) -> int:
+        """The layer after L (-1: the LM head)."""
+        i = self.layers.index(L)
+        return self.layers[i + 1] if i + 1 < len(self.layers) else -1
 
     def rot_kind(self, name: str) -> str | None:
         return KINDS.get(name) if self.paro else None
@@ -89,20 +114,19 @@ class ParoSteps(RotatedOverlay):
         return self.image.rot_groups(L, d) if d is not None and self.image.rot_region(L, d) else 0
 
     def rot_copies(self: "QwenOverlay", L: int, name: str) -> int:
-        if name in ("gdn_out", "attn_out"):
-            return 2
-        i = self.layers.index(L)
-        return len(self.copies_of(L if name == "rot_in" else self.layers[i + 1]))
+        if name in ("gdn_out", "attn_out"):  # (gate's and up's; an MoE layer's moe_in's)
+            return 1 if self.moe else 2
+        return len(self.copies_of(L if name == "rot_in" else self.next_layer(L)))
 
     def paro_groups(self: "QwenOverlay", L: int, name: str, S: int) -> list[mp.Group]:
         flags = self.paro_flags(L, name)
-        plain = [] if self.rot_kind(name) in ("in", "rotx") else mp.groups(self.image.region(L, name), flags, S,
-                                                                           slots=self.SLOTS)
+        plain = [] if self.rot_kind(name) in ("in", "rotx") else mp.groups(
+            self.image.region(L, name), flags, S, slots=self.SLOTS, block_flags=MOE_BLOCKS if name == "moe_in" else None)
         out = self._rot_groups(L, name, S, flags, plain)
         if name in ("gin_q", "gin_z"):  # (the GDN core's message in two parts: gin_q's qkv rows, then gin_z's z and ab)
             # (the qkv rows the main core emits: the block's valid ones, not the padding of its last row tile)
             nq = -(-int((self.image.region(L, "gin_q").block("qkv").rows[0] >= 0).sum()) // C_LEN)
-            out[0].meta[M_MPART] = nq | MP_MORE if name == "gin_q" else (self.gsh.n_msg - nq) | MP_CONT
+            out[0].meta[M_MPART] = S * nq if name == "gin_q" else S * (self.gsh.n_msg - nq) | MP_LAST | nq << MP_J0
         return out
 
     def gdn_x(self: "QwenOverlay", L: int, c: int, h: int) -> tuple[tuple[int, str], int]:
@@ -158,9 +182,7 @@ class ParoSteps(RotatedOverlay):
         and the raw K / V objects; gin_q's and gin_z's go to the GDN cores (F_MSG)."""
         L, name = phase
         S, cfg = st.S, self.cfg
-        h8, ffn = self.H // COLS, cfg.intermediate_size // COLS
-        i = self.layers.index(L) if L >= 0 else -1
-        nxt = self.layers[i + 1] if 0 <= i < len(self.layers) - 1 else None
+        ffn = cfg.intermediate_size // COLS
         for c in range(COLS):
             if name == "rot_in":
                 self.emit_copies(seq, c, S, self.copies_of(L))
@@ -180,7 +202,7 @@ class ParoSteps(RotatedOverlay):
                 n = self.rot_slice(name)[0]
                 self.x_to(seq, c, (L, "attn_out"), e0=n * c, n=n, S=S)
             elif name in ("gdn_out", "attn_out"):
-                self.emit_copies(seq, c, S, [(L, "gate"), (L, "up")])
+                self.emit_copies(seq, c, S, [(L, "moe_in")] if self.moe else [(L, "gate"), (L, "up")])
             elif name in ("gate", "up"):
                 self.x_to(seq, c, (L, "rot_down"), e0=ffn * c, n=ffn, S=S, mul=2,
                           so=self._sp(S) if name == "up" else 0)
@@ -190,16 +212,18 @@ class ParoSteps(RotatedOverlay):
                 real = max(0, min(n, K - n * c))
                 self.x_to(seq, c, (L, "down"), e0=n * c, n=real, S=S)
                 self.sink_out(seq, c, n - real, S)
-            elif name == "down" and nxt is not None:
-                self.emit_copies(seq, c, S, self.copies_of(nxt))
             elif name == "down":
-                self._values_to(seq, c, (-1, "lm"), e0=h8 * c, n=h8, S=S)
+                self.emit_copies(seq, c, S, self.copies_of(self.next_layer(L)))
+            elif name == "lm":
+                self._logits_out(seq, c, S)
 
     def paro_build(self: "QwenOverlay", S: int, lm: bool, subs: tuple[tuple[int, int, int], ...], b: int) -> Step:
         """The transaction of a step of S slots (``QwenOverlay._build``'s)."""
         dev = self.dev
         seq = Sequence(self.op, inputs=("X",))
         st = Step(S, subs, b=b)
+        if self.moe:  # (the control packets' route; the routing's shim locks)
+            self.moe_steps.route(seq)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.loadr + c * self.SLOTS * XB), S * XB)
         self.paro_phase(seq, st, (self.layers[0], "rot_in"))
@@ -210,10 +234,12 @@ class ParoSteps(RotatedOverlay):
                 self.attn_steps.build(seq, st, L, S, phase=None, out="rot_o")
             else:
                 self.gdn_steps.build(seq, st, L, S)  # (gin_q, gin_z: ``gdn_in``)
-            for name in MIXER[bool(self.cfg.attention[L])][-2:] + FFN:
+            for name in MIXER[bool(self.cfg.attention[L])][-2:] + (() if self.moe else FFN):
                 self.paro_phase(seq, st, (L, name))
+            if self.moe:  # (its outputs: the combine's, ``comb_out``)
+                self.moe_steps.build(seq, L, S, (-1, "lm"), None, rot=self, st=st)
         if lm:
-            self._phase(seq, (-1, "lm"), S, "LOGITS")
+            self.paro_phase(seq, st, (-1, "lm"))
         seq.sync(fills=True)
         st.tr = Transaction(dev, seq.words())
         if self.ash is not None:
@@ -221,6 +247,49 @@ class ParoSteps(RotatedOverlay):
         if st.panels:
             st.table = PanelTable.of(st.panels)
         return st
+
+
+    # ------------------------------------------------------------------
+    # An MoE layer's rotations (``moe.steps.MoeTransfers.build``'s ``rot``)
+    # ------------------------------------------------------------------
+
+    def moe_in_fill(self: "QwenOverlay", seq: Sequence, st: Step, L: int) -> None:
+        """moe_in's input fills: its F_PSQ copy."""
+        self._rot_inputs(seq, st, (L, "moe_in"))
+
+    def comb_rotations(self: "QwenOverlay", seq: Sequence, L: int) -> None:
+        """The combine's A fills: its rotation objects (the next layer's copies of the residual), after the experts'."""
+        r = self.image.region(L, DATA["down"])
+        for c in range(COLS):
+            seq.fill("A", c, self.dev.address("W", r.offset + c * r.col_stride), r.data)
+
+    def comb_meta(self: "QwenOverlay", L: int, S: int) -> np.ndarray:
+        """The combine's metadata object of layer L: the next layer's copies (F_ROTE: M_NRC of them, M_NRA rotation
+        objects on A; the last layer's: the LM head's)."""
+        m = np.zeros(META, np.int32)
+        m[M_FLAGS], m[M_NS], m[M_NX] = F_MAIN | F_COMB | F_ROTE, S, 2 * S
+        m[M_NRA] = m[M_NT] = self.rot_objects(L, "down")
+        m[M_NRC] = len(self.copies_of(self.next_layer(L)))
+        return m
+
+    def comb_out(self: "QwenOverlay", seq: Sequence, c: int, L: int, S: int) -> None:
+        """Column c's outputs of the combine: the next layer's copies (the last layer's: the LM head's)."""
+        self.emit_copies(seq, c, S, self.copies_of(self.next_layer(L)))
+
+    def paro_logits_input(self: "QwenOverlay", x: np.ndarray) -> None:
+        """(``logits_of``) The LM head's F_PSQ input of a last layer's output x (hidden): the partial sums object (x's
+        sum of squares in column 0's first lane of slot 0) and x' = bf16(x bf16(w)), w the output norm's weights (the
+        copy the decode's rote makes)."""
+        rg = self.inp[(-1, "lm")][0]
+        x = np.asarray(x, np.float32).reshape(-1)
+        q = np.zeros(XPAY // 4, np.float32)
+        q[0] = np.sum(x.astype(np.float64) ** 2)
+        w = self._f32("output_norm.weight").astype(bfloat16).astype(np.float32)
+        xi = interleave((x * w).reshape(1, -1), self._sp(1)).view(np.uint8).reshape(-1)
+        act = self.dev.view("ACT")
+        act[rg.off + XB:rg.off + XB + XPAY] = q.view(np.uint8)
+        act[rg.off + rg.x0:rg.off + rg.x0 + xi.size] = xi
+        self.dev.flush("ACT", rg.off + XB, rg.x0 - XB + xi.size)
 
 
 def gdn_in_rows(image: QwenImage, L: int) -> np.ndarray:

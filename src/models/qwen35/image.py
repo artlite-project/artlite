@@ -40,7 +40,10 @@ BFP16 planes, ``_ab_folded``), the attention layers' attn_in in "attn_q", "attn_
 objects of each column in data regions (``decode.rotated.RotatedImage``): "rot_in" (the first layer's copies), "rot_g" (the
 GDN outputs of the column's v heads, ssm_out's rotation), "rot_o" (the column's attention heads, attn_output's),
 "<mixer out>_rot" (gate's and up's copies of the residual slice), "rot_down" (down's, the ffn in whole groups a column:
-``down_slice``, padding groups of zeros), "down_rot" (the next layer's copies). A PARO image is region-major.
+``down_slice``, padding groups of zeros), "down_rot" (the next layer's copies; the last layer's: the LM head's, the output
+norm's weights without a rotation). An MoE layer's (``qwen35moe``): "<mixer out>_rot" moe_in's copy (the experts' gate
+/ up rotation), moe_in's blocks folded into it (``moe_folded``), "exp_rot" between the expert slabs (``moe.image``). A
+PARO image is region-major.
 
 An input half a chunk short of whole chunks in one K group (``decode.image.Region.half`` regions, ``tails``; a dense
 model's) is the hidden size where it is so (Kev-4B's 2560: gdn_in, attn_in, gate_up, the LM head) and down's ffn
@@ -73,7 +76,7 @@ from artlite.decode.head import (
 from artlite.decode.image import Block, Region, TileImage, column_rows, gate_up_rows
 from artlite.decode.phases import group_chunks
 from artlite.decode.protocol import C_LEN, NX_PER_NORM, OBJ_K, norm_objects
-from artlite.decode.rotated import RotatedImage, column_groups
+from artlite.decode.rotated import RotatedImage, column_groups, copy_inverse, folded
 from artlite.decode.screen import plane, screened
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
@@ -131,11 +134,11 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         if vocab is None:
             vocab = -(-cfg.vocab_size // (COLS * C_LEN)) * COLS * C_LEN
         self.paired = pairs
-        first = f"blk.{self.layers[0]}.ffn_gate.weight"  # (module docstring; an MoE layer has none: S8)
+        L0 = self.layers[0]
+        first = f"blk.{L0}.{'attn_q' if cfg.attention[L0] else 'attn_qkv'}.weight"  # (module docstring)
         self.paro = first in gguf.tensor_info and isinstance(gguf.tensor(first), ParoTensor)
         self._rot_init()
         if self.paro:
-            assert not cfg.moe, "a PARO checkpoint: dense models"
             mtp = False  # (the drafters of a PARO checkpoint: GGUF files of their own)
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab,
@@ -220,7 +223,9 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         names = []
         for L in self.layers:
             b = f"blk.{L}."
-            if self.cfg.moe:
+            if self.cfg.moe and self.paro:
+                names += self.moe_folded(L)
+            elif self.cfg.moe:
                 names += self.scaled_planes(b + "post_attention_norm.weight", self.router_planes(L))
             if not self.cfg.attention[L] and not self.paro and any(blk.name == "alpha" for blk in self.region(L, "gdn_in").blocks):
                 names += self.scaled_planes(b + "attn_norm.weight", (b + "ssm_alpha.weight",))
@@ -269,17 +274,23 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
             self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
             out = "gdn_out"
         g = self._vec(b + "post_attention_norm.weight")
-        self.rot_data(layer, out + "_rot", [(b + "ffn_gate.weight", g, column_groups(0, h8)),
-                                            (b + "ffn_up.weight", g, column_groups(0, h8))])
-        self._add(layer, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
-        self._add(layer, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
-        n = self.down_slice(cfg)  # (a column's slice of down's input: whole groups, the last ones padding past the ffn)
-        self.rot_data(layer, "rot_down", [(b + "ffn_down.weight", None,
-                                           [np.where(gs < I // ROT, gs, -1) for gs in column_groups(0, n)])])
-        self._add(layer, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
+        if cfg.moe:  # (moe_in's copy: the experts' gate / up rotation; moe_in's other blocks read it, ``moe_folded``)
+            self.rot_data(layer, out + "_rot", [(b + "ffn_gate_exps.weight", g, column_groups(0, h8))])
+            self._moe(layer, gated=True)
+        else:
+            self.rot_data(layer, out + "_rot", [(b + "ffn_gate.weight", g, column_groups(0, h8)),
+                                                (b + "ffn_up.weight", g, column_groups(0, h8))])
+            self._add(layer, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
+            self._add(layer, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
+            n = self.down_slice(cfg)  # (a column's slice of down's input: whole groups, the last ones padding past the ffn)
+            self.rot_data(layer, "rot_down", [(b + "ffn_down.weight", None,
+                                               [np.where(gs < I // ROT, gs, -1) for gs in column_groups(0, n)])])
+            self._add(layer, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
         i = self.layers.index(layer)
         if i + 1 < len(self.layers):
             self.rot_data(layer, "down_rot", self._in_rot(self.layers[i + 1]))
+        else:  # (the LM head's copy: the output norm's weights, no rotation)
+            self.rot_data(layer, "down_rot", [("", self._vec("output_norm.weight"), column_groups(0, h8))])
 
     @staticmethod
     def down_slice(cfg: QwenConfig) -> int:
@@ -303,28 +314,40 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
                                   "gin_q": "attn_qkv", "gin_z": "attn_gate", "gdn_out": "ssm_out", "gate": "ffn_gate",
                                   "up": "ffn_up", "down": "ffn_down"}[name] + ".weight"
 
-    def _ab_folded(self, layer: int) -> list[str]:
-        """(PARO) ssm_alpha and ssm_beta (F16) as substitutes W A^-1 (``_own``, kept: 2 x 16 rows a layer) that read
-        gin_z's input: A the exact transform of attn_gate's rotation without the norm's weight (its copy x' = A (w x), so
-        W (w x) = W A^-1 x'), F32: BFP16 planes [hi, lo] (``decode.image.Block.pairs``, B_PAIR: their sums the rows,
-        exact to ~2^-16; one plane of bfp16 is 1-4% off on the folded rows, whose channels the rotation mixes: a slice of
-        34 tokens up to the first attention layer 2.5% off at most with a beta of one plane, 0.7% on average)."""
+    def moe_folded(self, layer: int) -> list[str]:
+        """(PARO) An MoE layer's blocks of moe_in that read its copy x' (the experts' gate / up rotation, the FFN norm's
+        weight folded in) as substitutes (``_own``, until the caller drops them): the router's and the shared expert's
+        gate rows W A^-1 (``decode.rotated.folded``: A the copy's transform as the NPU computes it; F32: their BFP16
+        planes, as the GGUF path's), the shared expert's gate and up (F16 as the file's: one BFP16 plane)."""
         b = f"blk.{layer}."
-        rot = self.gguf.tensor(b + "attn_gate.weight").rot()
-        tf = rot.tan_form(None, unit=True)
-        K, g = rot.K, rot.group
-        inv = np.zeros((K, K))
-        eye = np.eye(g)
-        for j in range(K // g):  # (A per group: the rows the group's unit vectors become)
-            x = np.zeros((g, K))
-            x[:, g * j:g * (j + 1)] = eye
-            a = tf.apply(x)[:, g * j:g * (j + 1)].T  # (A's block: column i the image of e_i)
-            inv[g * j:g * (j + 1), g * j:g * (j + 1)] = np.linalg.inv(a)
+        rot, g = self.gguf.tensor(b + "ffn_gate_exps.weight").rot(), self._vec(b + "post_attention_norm.weight")
+        inverse = copy_inverse(rot, g)
+        names = []
+        for n in ("ffn_gate_inp", "ffn_gate_inp_shexp", "ffn_gate_shexp", "ffn_up_shexp"):
+            name = f"{b}{n}.weight"
+            t = self.gguf.tensor(name)
+            raw = folded(np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols), inverse)
+            half = n.endswith("_shexp") and n != "ffn_gate_inp_shexp"
+            if half:
+                assert np.abs(raw).max() < 6e4, f"{name}: folded beyond F16"
+            self._own[name] = QTensor(name=name, qtype="F16" if half else "F32", rows=t.rows, cols=t.cols,
+                                      raw=raw.astype(np.float16 if half else np.float32))
+            names.append(name)
+        return names
+
+    def _ab_folded(self, layer: int) -> list[str]:
+        """(PARO) ssm_alpha and ssm_beta (F16) as substitutes that read gin_z's input, its rotated copy of the normed
+        residual (``decode.rotated.folded``: exact against the copy the NPU computes; ``_own``, kept: 2 x 16 rows a
+        layer), F32: BFP16 planes [hi, lo] (``decode.image.Block.pairs``, B_PAIR: their sums the rows, exact to ~2^-16; one
+        plane of bfp16 is 1-4% off on the folded rows, whose channels the rotation mixes: a slice of 34 tokens up to the
+        first attention layer 2.5% off at most with a beta of one plane, 0.7% on average)."""
+        b = f"blk.{layer}."
+        inverse = copy_inverse(self.gguf.tensor(b + "attn_gate.weight").rot(), self._vec(b + "attn_norm.weight"))
         names = []
         for n in ("ssm_alpha", "ssm_beta"):
             name = f"{b}{n}.weight"
             t = self.gguf.tensor(name)
-            raw = (np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols) @ inv).astype(np.float32)
+            raw = folded(np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols), inverse).astype(np.float32)
             self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
             names.append(name)
         return names

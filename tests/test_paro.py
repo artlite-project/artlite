@@ -11,7 +11,7 @@ from artlite.decode.image import pack_rows
 from artlite.formats import pack_tile, slice_fields
 from artlite.hf_model import HfModel
 from artlite.model_config import checkpoint
-from artlite.paro import ParoTensor, Rotation, awq_unpack, bitplane_unpack, check_config
+from artlite.paro import ParoExperts, ParoTensor, Rotation, awq_unpack, bitplane_unpack, check_config
 
 from .model_files import require
 
@@ -96,6 +96,26 @@ def test_checkpoint_linears(case: str) -> None:
             assert np.abs(got - want).max() <= 1e-12 * np.abs(want).max(), n
             assert tf.partner.dtype == np.uint8 and tf.partner.max() < 128
             assert np.array_equal(np.sort(tf.chan.reshape(-1, 128), 1), np.tile(np.arange(128), (t.cols // 128, 1)))
+
+
+def test_experts() -> None:
+    """An MoE layer's PARO experts stacked (``ParoExperts``: rows E N, the shared rotation): each expert's rows and
+    blocks those of its own linear, with the stack's channel order."""
+    require(checkpoint("qwen3.6-35B-A3B-paro"))
+    hf = HfModel(checkpoint("qwen3.6-35B-A3B-paro"))
+    for n, proj, rot in (("blk.3.ffn_up_exps.weight", "up_proj", "gate_up"), ("blk.3.ffn_down_exps.weight", "down_proj",
+                                                                                "down")):
+        t = hf.tensor(n)
+        assert isinstance(t, ParoExperts) and len(t.experts) == 256 and t.rows == 256 * t.experts[0].rows
+        assert np.array_equal(t.rot().theta, hf.hf_array(f"model.language_model.layers.3.mlp.experts.{rot}_weight_theta"))
+        t.chan = t.rot().tan_form().chan
+        b, n1 = t.blocks().raw, t.experts[0].rows
+        for e in (0, 255, 77):
+            one = hf._linear(n, f"model.language_model.layers.3.mlp.experts.{e}.{proj}", (n1, t.cols), t.rotation,
+                             hf._entries[n])
+            one.chan = t.chan
+            assert np.array_equal(b[e * n1:(e + 1) * n1], one.blocks().raw), (n, e)
+        assert np.array_equal(t.fields()["q"][77 * n1:78 * n1], one.fields()["q"])
 
 
 def test_tan_bounded() -> None:

@@ -53,12 +53,11 @@ void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
     if (!(flags & {{ F_MSG }}))
         return;
 {% if parts %}
-    const int S = m[{{ M_NS }}], part = m[{{ M_MPART }}];  // (a part of the message: words.M_MPART)
-    st[{{ G_NMSG }}] = S * (part & 0xFFFF);
-    st[{{ G_ON }}] = !(part & {{ MP_MORE }});
-    if (part & {{ MP_CONT }})
-        return;
+    // (a part of the message: words.M_MPART; every part carries the step's words, the last continues the first's objects)
+    const int S = m[{{ M_NS }}], part = m[{{ M_MPART }}];
     st[{{ G_NS }}] = S;
+    st[{{ G_NMSG }}] = part & 0xFFFF;
+    st[{{ G_ON }}] = (part & {{ MP_LAST }}) ? 1 : 0;
 {% else %}
     const int S = m[{{ M_NS }}];
     st[{{ G_NS }}] = S;
@@ -69,7 +68,11 @@ void {{ p }}_gbegin(const bfloat16 *__restrict x, int32_t *__restrict ws)
     st[{{ G_NREP }}] = m[{{ M_NREP }}];
     st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
     st[{{ G_COMMIT }}] = m[{{ M_COMMIT }}];
+{% if parts %}
+    st[{{ G_MJ }}] = part >> {{ MP_J0 }};
+{% else %}
     st[{{ G_MJ }}] = 0;
+{% endif %}
     st[{{ G_MS }}] = 0;
     st[{{ G_CB }}] = 0;
     st[{{ G_PAIR }}] = 0;

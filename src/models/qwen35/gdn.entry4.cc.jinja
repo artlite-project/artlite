@@ -63,12 +63,11 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
     if (!(flags & {{ F_MSG }}))
         return;
 {% if parts %}
-    const int S = m[{{ M_NS }}], part = m[{{ M_MPART }}];  // (a part of the message: words.M_MPART)
-    st[{{ G_NMSG }}] = S * (part & 0xFFFF);
-    st[{{ G_ON }}] = !(part & {{ MP_MORE }});
-    if (part & {{ MP_CONT }})
-        return;
+    // (a part of the message: words.M_MPART; every part carries the step's words, the last continues the first's objects)
+    const int S = m[{{ M_NS }}], part = m[{{ M_MPART }}];
     st[{{ G_NS }}] = S;
+    st[{{ G_NMSG }}] = part & 0xFFFF;
+    st[{{ G_ON }}] = (part & {{ MP_LAST }}) ? 1 : 0;
 {% else %}
     const int S = m[{{ M_NS }}];
     st[{{ G_NS }}] = S;
@@ -79,7 +78,11 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
     st[{{ G_NPD }}] = (m[{{ M_NREP }}] + S) >> 3;  // (1: the step ends its block, its state panels' update goes out)
     st[{{ G_CSHIFT }}] = m[{{ M_CSHIFT }}];
     st[{{ G_KSHIFT }}] = m[{{ M_KSHIFT }}];
+{% if parts %}
+    st[{{ G_MJ }}] = part >> {{ MP_J0 }};
+{% else %}
     st[{{ G_MJ }}] = 0;
+{% endif %}
     st[{{ G_MS }}] = 0;
     st[{{ G_KH }}] = 0;
     st[{{ G_PANEL }}] = 0;

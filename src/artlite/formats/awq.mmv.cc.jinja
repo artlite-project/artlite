@@ -1,4 +1,4 @@
-// ---- P4_128 (16 rows): Q4_K's tile with the AWQ header (formats.awq): [word 16][row 16][4 B], a row's words 0 .. 3 s,
+// ---- P4_128 (16 rows{{ "; rg: ys, the second super-block's rows at y + ys (row groups)" if rg else "" }}): Q4_K's tile with the AWQ header (formats.awq): [word 16][row 16][4 B], a row's words 0 .. 3 s,
 // 4 .. 7 B (the prefill's), 8 .. 11 V hi, 12 .. 15 V lo (V = s (8 - z)), each word the bf16 pair of groups 2 w', 2 w' +
 // 1 (128 k each); codes as Q4_K's (mmv/q4kmm). w = s (q - 8) + V. Scratch (from 1 KB on): tab [sb'][g][hl][i][r] (1 KB:
 // hi = s, lo = 0) | c [sb'][i][g][{{ L }}] ({{ L // 16 }} KB)
@@ -46,7 +46,7 @@ __attribute__((noinline)) void {{ p }}_p4_tab(const uint8_t *__restrict a, const
 {% else %}
 template <int HI>
 __attribute__((noinline)) void {{ p }}_p4_tab(const uint8_t *__restrict a, const uint8_t *__restrict xs,
-                                              bfloat16 *__restrict tab, float *__restrict y)
+                                              bfloat16 *__restrict tab, float *__restrict y{{ ", int ys" if rg else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const al::BV nI = al::neg_eye();
@@ -66,8 +66,14 @@ __attribute__((noinline)) void {{ p }}_p4_tab(const uint8_t *__restrict a, const
             al::split_hilo(aie::mac(aie::mul({{ p }}_p4x(hw + 512), one), {{ p }}_p4x(hw + 768), one), nI, hi, lo);
             const v64bfp16ebs8 X = u ? X1 : X0;
             Y = aie::accum<accfloat, 64>(mac_8x8_8x8T(X, 1, lo, 1, mac_8x8_8x8T(X, 1, hi, 1, Y)));
+{% if rg %}
+            {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (per super-block: its rows of their own with ys)
+            Y = aie::zeros<accfloat, 64>();
+{% endif %}
         }
+{% if not rg %}
         {{ p }}_yadd(y + 32 * g, Y);
+{% endif %}
     }
 }
 
@@ -75,12 +81,12 @@ __attribute__((noinline)) void {{ p }}_p4_tab(const uint8_t *__restrict a, const
 // super-blocks 2 HI, 2 HI + 1 of a P4_128 tile
 template <int HI>
 __attribute__((noinline)) void {{ p }}_p4(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                          const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                          const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *tab = (bfloat16 *)(scr + 1024);
     bfloat16 *c = (bfloat16 *)(scr + 2048);
-    {{ p }}_p4_tab<HI>(a, xs, tab, y);
+    {{ p }}_p4_tab<HI>(a, xs, tab, y{{ ", ys" if rg else "" }});
     {{ p }}_q4k_mm(xp, xs + {{ XS_SLOT }} * HI, a + 1024 + 4096 * HI, c);
     {{ p }}_sc(c, tab, y, 128, 8, {{ 2 * L }});
-    {{ p }}_sc(c + {{ 16 * L }}, tab + 256, y, 128, 8, {{ 2 * L }});
+    {{ p }}_sc(c + {{ 16 * L }}, tab + 256, y{{ " + ys" if rg else "" }}, 128, 8, {{ 2 * L }});
 }

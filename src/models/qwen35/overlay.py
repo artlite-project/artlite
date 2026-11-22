@@ -66,10 +66,6 @@ from artlite.decode.attn256_steps import AttentionSteps, pass_subs
 from artlite.decode.design import PG_ONE_CHANNEL
 from artlite.decode.model import CacheRows, ModelOverlay, Snapshot, StepKey, host_bytes, paged_formats
 from artlite.decode.protocol import (
-    B_F32,
-    B_GU,
-    B_KEEP,
-    B_PAIR,
     F_EMITR,
     F_GU,
     F_MSG,
@@ -94,7 +90,7 @@ from artlite.decode.vring import substeps
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import QwenConfig
 from artlite.moe import route as MR
-from artlite.moe.steps import CP_BYTES, MoeTransfers
+from artlite.moe.steps import CP_BYTES, MOE_BLOCKS, MoeTransfers
 from artlite.operators import cdo
 from artlite.operators.design import COLS
 from artlite.overlay import Sequence, Transaction, WeightBuffer
@@ -112,7 +108,6 @@ from .words import F_GDN, F_GIN, M_HPAN
 FLAGS = {"eh": F_RESID | F_EMITR,  # (a drafter's first phase: ``draft``)
          "gdn_in": F_NORM | F_MSG, "attn_in": F_NORM, "gdn_out": F_RESID | F_EMITR, "attn_out": F_RESID | F_EMITR,
          "gate_up": F_NORM | F_GU, "down": F_RESID | F_EMITR, "lm": F_NORM, "moe_in": F_NORM, "sdown": F_RESID | F_WS}
-MOE_BLOCKS = {"sgu": B_GU, "router": B_PAIR | B_F32, "sgate": B_PAIR | B_KEEP}  # (moe_in's blocks: ``decode.design``)
 MOE_MAX_K = 2048  # (an MoE model's K groups at most: ``image.payload``)
 KV_PAD = 4096 - 256  # positions past the caches (the last layer's): the prefill's sub-chunk slices
 
@@ -258,7 +253,7 @@ class QwenOverlay(ParoSteps, ModelOverlay):
     # ------------------------------------------------------------------
 
     def _groups(self, L: int, name: str, S: int) -> list[mp.Group]:
-        if self.paro and name != "lm":
+        if self.paro:
             return self.paro_groups(L, name, S)
         out = mp.groups(self.image.region(L, name), self.flags[name], S, block_flags=MOE_BLOCKS if name == "moe_in" else None,
                         f32_ab=name == "gdn_in" and self.g8, slots=self.SLOTS)
@@ -348,10 +343,14 @@ class QwenOverlay(ParoSteps, ModelOverlay):
                 self.xch[L] = take("ACT", XB)
                 self.cp[L] = take("ACT", COLS * (CP_BYTES + XB))
             self.part = take("ACT", COLS * self.part_col)
+            if self.paro:  # (per layer its combine's metadata objects: the next layer's copies, ``paro_steps.comb_meta``)
+                self.comb = {L: take("ACT", COLS * XB) for L in self.layers}
         # (the F_ATT objects' first words: [transaction buffer][layer][column][sub-step])
         self.fobj = np.array([[[[self.fatt_object(L, c, u, b) // 4 for u in range(self.ash.u)] for c in range(COLS)]
                                for L in self.fatt] for b in range(2 if self.AHEAD else 1)], np.int64)
-        self.gin = np.array([self.inp[(L, "gin_q" if self.paro else "gdn_in")][0].off // 4 for L in self.gobj], np.int64)
+        # (the gdn_in metadata objects' first words, whose step words the host writes: a PARO checkpoint's gin_q and gin_z)
+        self.gin = np.array([self.inp[(L, n)][0].off // 4 for L in self.gobj
+                             for n in (("gin_q", "gin_z") if self.paro else ("gdn_in",))], np.int64)
         self._branch: tuple | None = None  # (the step words as the metadata objects hold them: ``_set_branch``; None: unknown)
         r0 = self._layout["KV"]
         for L in self.kv_off:  # (per KV head two slots: ``ring``)
@@ -499,6 +498,8 @@ class QwenOverlay(ParoSteps, ModelOverlay):
     def _weights(self, seq: Sequence, phase: tuple[int, str], gi: int) -> None:
         """The A fills of a phase's K group gi: its norm-weight objects (the first group of a normed phase), its tiles
         (a column-major image: none, ``_runs``)."""
+        if self.paro:  # (``paro_steps``: an MoE layer's moe_in and sdown)
+            return self.paro_weights(seq, phase, gi, True)
         if self.image.column_major:
             return
         dev, (L, name) = self.dev, phase
@@ -877,9 +878,29 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         return (*self._ring_state()[:-1], self._rope_used[2])
 
     def _lm_phase(self, seq: Sequence) -> None:
+        if self.paro:  # (its F_PSQ input: ``paro_logits_input``)
+            self.paro_phase(seq, Step(1, ()), (-1, "lm"))
+            return
         if self.image.column_major:
             self._weight_run(seq, [(-1, "lm")])
         self._phase(seq, (-1, "lm"), 1, "LOGITS")
+
+    def logits_of(self, x: np.ndarray) -> np.ndarray:
+        """(PARO: the LM head's input as its F_PSQ copy, ``paro_logits_input``)"""
+        if not self.paro:
+            return super().logits_of(x)
+        if self._metas_s != (1, self.start):
+            self._metas(1)
+        if self._tr_lm is None:
+            seq = Sequence(self.op, inputs=("X",))
+            self._lm_phase(seq)
+            seq.sync(fills=True)
+            self._tr_lm = Transaction(self.dev, seq.words())
+        self._clear_pads(self._sp(1))
+        self.paro_logits_input(x)
+        self.ready()
+        self.dev.dispatch(self._tr_lm)
+        return self._logits(1)[0]
 
     def accept(self, n: int, seq: int | None = None) -> None:
         """The previous step's first n tokens (of sequence ``seq``; None: the selected one) are accepted (the next
@@ -947,12 +968,26 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         self.dev.fetch("ACT", off, 2 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)
         rows = np.arange(n) if self._kept_rows is None else self._kept_rows[:n]
-        return np.ascontiguousarray(v[:, rows].transpose(1, 0, 2)).reshape(n, self.H).view(bfloat16).astype(np.float32)
+        h = np.ascontiguousarray(v[:, rows].transpose(1, 0, 2)).reshape(n, self.H).view(bfloat16).astype(np.float32)
+        return h / self._lm_w() if self.paro else h
 
     def hidden(self, L: int = -1, slot: int = 0) -> np.ndarray:
-        """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32)."""
+        """The residual stream that layer L (-1: the LM head) read in the last step, of a slot (bf16 values, fp32; a PARO
+        checkpoint's, of the LM head only: its copy over the output norm's bf16 weights, ``paro_steps``)."""
+        assert not self.paro or L == -1, "a PARO checkpoint's layers read rotated copies"
         off, sp = self.tap_x(L), self._sp(self._last_s, self._input(L))
         self.dev.fetch("ACT", off, 2 * sp * self.H)
         v = self.dev.view("ACT")[off:off + 2 * sp * self.H].view(np.uint16).reshape(-1, sp, 8)[:, slot].reshape(-1)
-        return v.view(bfloat16).astype(np.float32)
+        h = v.view(bfloat16).astype(np.float32)
+        return h / self._lm_w() if self.paro else h
+
+    def _lm_x(self, S: int) -> np.ndarray:
+        """(PARO: the LM head's copy over the output norm's weights, ``hidden``)"""
+        x = super()._lm_x(S)
+        return x / self._lm_w() if self.paro else x
+
+    def _lm_w(self) -> np.ndarray:
+        """(PARO) The output norm's weights as the LM head's copy carries them (bf16; zeros as ones: a dead channel)."""
+        w = self._f32("output_norm.weight").astype(bfloat16).astype(np.float32)
+        return np.where(w != 0, w, 1)
 

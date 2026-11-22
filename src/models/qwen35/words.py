@@ -22,7 +22,7 @@ GDN_IN = XMETA.kind("qwen35 gdn_in", extends=(PHASE, BRANCH))
 M_NREP, M_CSHIFT, M_COMMIT, M_KSHIFT = GDN_IN.words("M_NREP M_CSHIFT M_COMMIT M_KSHIFT", at=M_MODEL)
 M_HPAN = GDN_IN.word("M_HPAN", at=35)
 # (a PARO checkpoint: gdn_in in two phases, each on its own rotated input) the phase's part of the step's message: its
-# objects per slot | MP_MORE (more parts follow: the step waits) | MP_CONT (a later part: the step's words came with the
-# first); 0: the whole message
+# objects (all slots') | MP_LAST (the last part: the step starts after it) | its first object per slot << MP_J0 (the
+# earlier parts' objects); 0: the whole message. Every part's metadata carries the step's words.
 M_MPART = GDN_IN.word("M_MPART")
-MP_MORE, MP_CONT = 1 << 16, 1 << 17
+MP_LAST, MP_J0 = 1 << 16, 17
