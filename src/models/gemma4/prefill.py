@@ -30,10 +30,12 @@ The control code is assembled on the host from one library ELF and runs in piece
 A PARO checkpoint (``image``'s PARO layout; the decode's ``paro_steps``): chunks of multiples of ``PARO_SUB`` (GemmQ's
 passes of 64 tokens a core row), the norms' x / rms (the pgate's input: x itself) as bf16 blocks (``bf16``), their
 weights folded into the consumers' rotations (``prefill.rotate``, objects in RO): after a norm its copies side by side
-in XR (q, k, v; gate, up; pgate), the attention's A into AR, gate and up of row tile pairs (``plan_gate_up_pair``) as GU's
-[gate | up] halves, which down's rotation reads with the GELU on the way (HR), the per-layer input h dense (HPL) and
-rotated in its 4 row groups' copies (HPR, proj's K 256 as row groups of 4). q, k and v write G in one layout
-(``prefill.gemm.joined_layout``: k and v a KV head's quarters a column, the prep's ``k`` / ``v`` taps).
+in XR (q, k, v; gate, up; pgate), the attention's A into AR, gate and up of row tile pairs in GEMMs of both
+(``plan_gate_up_pair``'s ``act``: h = gelu(gate) up in their epilogue) into GU, which down's rotation reads (HR), the
+per-layer input h dense (HPL) and rotated (HPR: proj's K 256 as row groups of 4, each a pass of the A strip). q, k and
+v write G in one layout (``prefill.gemm.joined_layout``: k and v a KV head's quarters a column, the prep's ``k`` / ``v``
+taps). The GEMMs but q / k / v, pgate and down and the rotations run in items of ``PARO_BIG`` tokens where a chunk is
+made of them.
 
 Precision: layer 23's caches end within 2-3% (K / V rms) of the decode path's, ~4% / 6% of the fp32 model's on long
 prompts (the decode path: ~1% / 1.6%). The GEMMs' single bfp16 inputs, their weights as bfp16 panels (the Q4_0 scale
@@ -56,7 +58,7 @@ from artlite.prefill import gemm as PG
 from artlite.prefill.chunks import CONFIG_S, ChunkPrefill
 from artlite.prefill.norm import ResidualNormOperator, residual_params
 from artlite.prefill.rotate import OBJ as ROT_OBJ
-from artlite.prefill.rotate import PrefillRotOperator, row_floats
+from artlite.prefill.rotate import PrefillRotOperator
 
 from . import attn_prefill as AP
 from .overlay import GUARD, KV_PAD, GemmaOverlay
@@ -78,7 +80,8 @@ PARO_SIZES = tuple(range(PARO_SUB, 2049, PARO_SUB))
 PARO_ROT = ("qkv", "o", "gu", "down", "pg", "proj")  # (a layer's rotations, ``_paro_init``)
 PARO_REGIONS = ("q", "k", "v", "o", "gate", "up", "down", "pgate", "proj")  # (a PARO checkpoint's GEMM regions)
 PARO_PLANS = ("qkv", "o", "gate_up", "down", "pgate", "proj")
-PARO_BIG = 1024  # (PARO: the GEMMs' but down's and the rotations' block where a chunk is made of them: fewer items)
+PARO_BIG = 1024  # (PARO: most operators' block where a chunk is made of them, ``_paro_init``: fewer items)
+PARO_MID = 512  # (PARO: down's, its norm's and the prep's)
 
 
 def plan_gemm(img: object, region: object, T: int, *, pitch: int = 0, ops: dict[str, object] | None = None
@@ -163,16 +166,22 @@ class GemmaPrefill(ChunkPrefill):
             hd = cfg.head_dim(L)
             lay = PG.joined_layout([img.region(L, n) for n in "qkv"], t)
             self.pitch[hd] = max(self.pitch.get(hd, 0), lay.pitch)
-        # (the GEMMs but down's and the rotations of a block of u tokens: PARO_BIG where a chunk is made of them)
+        # (blocks of u tokens: the GEMMs but down's, the rotations, the norms but the one after down, the PLE: PARO_BIG
+        # where a chunk is made of them; of v: down, its norm (its K parts' C a block apart: a shim step's reach), the
+        # prep: PARO_MID)
         self.big = PARO_BIG if any(T % PARO_BIG == 0 for T in self.sizes) else 0
-        self.gplans = {u: self._paro_plans(u, gemms) for u in (t, self.big) if u}
-        self.plans = self.gplans[t]
+        self.mid = PARO_MID if any(T % PARO_MID == 0 for T in self.sizes) else 0
+        us, vs = sorted({t, self.big} - {0}), sorted({t, self.mid} - {0})
+        self.gplans = {u: self._paro_plans(u, gemms) for u in us}
+        self.plans = dict(self.gplans[t])
+        self.dplans = {v: {L: plan_gemm(img, img.region(L, "down"), v, ops=gemms, pitch=dp) for L in own} for v in vs}
         for L in own:
-            self.plans[(L, "down")] = plan_gemm(img, img.region(L, "down"), t, ops=gemms, pitch=dp)
-        down = [self.plans[(L, "down")] for L in own]
+            self.plans[(L, "down")] = self.dplans[t][L]
+        down = [d for p in self.dplans.values() for d in p.values()]
         self.parts = down[0].parts
         assert all(d.parts == self.parts for d in down) and self.parts in (1, 2, 4)
-        self.f_part = max(arg_bytes(g.op, 2) for d in down for g in d.gemms)
+        self.f_parts = {v: max(arg_bytes(g.op, 2) for d in p.values() for g in d.gemms) for v, p in self.dplans.items()}
+        self.f_part = self.f_parts[t]
         gl = self.plans[(own[0], "pgate")].layout
         assert gl.pitch == 64 and gl.off["pgate"] == 0, gl
         self.ple_plans = {u: plan_gemm(img, img.region(-1, "ple"), u, ops=gemms) for u in self.gplans}
@@ -180,20 +189,25 @@ class GemmaPrefill(ChunkPrefill):
         assert all(p.layout == self.ple_plan.layout for p in self.ple_plans.values())
         self.rots = {u: self._paro_rots(u) for u in self.gplans}
         eps = cfg.rms_norm_eps
-        self.n_raw = ResidualNormOperator(T=t, E=H, mode="plain", eps=eps, d_pitch=dp)  # (x's panels for ple)
-        self.n_in = ResidualNormOperator(T=t, E=H, mode="in", eps=eps, bf16=True)
-        self.n_o = ResidualNormOperator(T=t, E=H, mode="post", eps=eps, d_pitch=dp, bf16=True)
-        self.n_d = ResidualNormOperator(T=t, E=H, mode="plain", eps=eps, d_pitch=dp, deltas=self.parts,
-                                        d_stride=self.f_part // 2 if self.parts > 1 else 0, bf16=True)
-        self.n_p = ResidualNormOperator(T=t, E=H, mode="post", eps=eps, d_pitch=dp, scale=True, bf16=True)
-        self.ple = PleOperator(T=t, pitch=self.ple_plan.layout.pitch, eps=eps * H, dense=True)
+        self.norms = {u: {"raw": ResidualNormOperator(T=u, E=H, mode="plain", eps=eps, d_pitch=dp),  # (x's panels)
+                          "in": ResidualNormOperator(T=u, E=H, mode="in", eps=eps, bf16=True),
+                          "o": ResidualNormOperator(T=u, E=H, mode="post", eps=eps, d_pitch=dp, bf16=True),
+                          "p": ResidualNormOperator(T=u, E=H, mode="post", eps=eps, d_pitch=dp, scale=True, bf16=True)}
+                      for u in us}
+        self.n_ds = {v: ResidualNormOperator(T=v, E=H, mode="plain", eps=eps, d_pitch=dp, deltas=self.parts,
+                                             d_stride=self.f_parts[v] // 2 if self.parts > 1 else 0, bf16=True)
+                     for v in vs}
+        self.n_raw, self.n_in = self.norms[t]["raw"], self.norms[t]["in"]
+        self.ples = {u: PleOperator(T=u, pitch=self.ple_plan.layout.pitch, eps=eps * H, dense=True) for u in us}
+        self.ple = self.ples[t]
         self.kind = {hd: AP.kind_of(cfg, hd, ov.at.kp) for hd in self.hds}
         self.cs_rows = ov.max_positions + self.MAX_T
         self.kv_bytes = {cfg.head_dim(L): ov.kv_bytes(L) for L in own}
         pad = KV_PAD // 16 * ov.G * AP.OBJ
-        self.prep = {hd: AP.GemmaPrepOperator(T=t, cfg=cfg, hd=hd, layout=self.plans[(next(
+        self.preps = {(hd, v): AP.GemmaPrepOperator(T=v, cfg=cfg, hd=hd, layout=self.plans[(next(
             L for L in own if cfg.head_dim(L) == hd), "qkv")].layout, kv_bytes=self.kv_bytes[hd],
-            cs_positions=self.cs_rows, kp=ov.at.kp) for hd in self.hds}
+            cs_positions=self.cs_rows, kp=ov.at.kp) for hd in self.hds for v in vs}
+        self.prep = {hd: self.preps[(hd, t)] for hd in self.hds}  # (``params``: every block size's)
         self.attn = {(hd, T): AP.GemmaAttnOperator(T=T, cfg=cfg, hd=hd, kv_bytes=self.kv_bytes[hd], kv_pad=pad,
                                                    kp=ov.at.kp) for hd in self.hds for T in self.sizes}
         self._starts: dict[int, list[int]] = {}
@@ -202,7 +216,8 @@ class GemmaPrefill(ChunkPrefill):
 
     def _paro_plans(self, u: int, gemms: dict[tuple, object]) -> dict[tuple[int, str], PG.PhasePlan]:
         """(PARO) The GEMM plans of blocks of u tokens but down's: q, k, v into one layout, each from its copy in XR;
-        gate and up of row tile pairs into GU; o; pgate from its copy; proj's row groups."""
+        gate and up of row tile pairs, h = gelu(gate) up into GU (``plan_gate_up_pair``'s ``act``); o; pgate from its
+        copy; proj's row groups."""
         img, H, cfg = self.img, self.H, self.cfg
         plans = {}
         for L in self.layers:
@@ -212,9 +227,9 @@ class GemmaPrefill(ChunkPrefill):
             gs = [dataclasses.replace(g, a=f"XR3{c}") for c, r in enumerate(regs)
                   for g in PG.plan_phase(img, r, u, ops=gemms, layout=lay, a_width=3 * H).gemms]
             plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
-            gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), u, gemms, 2 * H)
-            assert PG.gate_up_split(img.region(L, "gate"), img.region(L, "up")) and len(gu.gemms) == 4
-            gu.gemms = [dataclasses.replace(g, a=f"XR2{i // 2}") for i, g in enumerate(gu.gemms)]
+            gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), u, gemms, 2 * H, act="gelu")
+            assert len(gu.gemms) == 2  # (per parity of the row tile pairs: gate on copy 0, up on copy 1)
+            gu.gemms = [dataclasses.replace(g, a="XR20") for g in gu.gemms]
             plans[(L, "gate_up")] = gu
             plans[(L, "o")] = plan_gemm(img, img.region(L, "o"), u, ops=gemms, pitch=self.d_pitch)
             pg = PG.plan_phase(img, img.region(L, "pgate"), u, ops=gemms)
@@ -227,12 +242,12 @@ class GemmaPrefill(ChunkPrefill):
 
     def _paro_rots(self, u: int) -> dict[str, PrefillRotOperator]:
         """(PARO) The rotations of blocks of u tokens: a norm's copies (q, k, v; gate, up; pgate: x itself), the
-        attention's A per head_dim, down's of GU with the GELU on the way, proj's of h."""
+        attention's A per head_dim, down's of h (gate / up's bf16 blocks), proj's of the per-layer input h."""
         cfg, H, img = self.cfg, self.H, self.img
         I, D = cfg.intermediate_size, cfg.per_layer_dim
         rots = {"qkv": PrefillRotOperator(T=u, K=H, copies=3, bf16=True),
                 "gu": PrefillRotOperator(T=u, K=H, copies=2, bf16=True),
-                "down": PrefillRotOperator(T=u, K=I, gu=True, act="gelu", gu_split=True),
+                "down": PrefillRotOperator(T=u, K=I, bf16=True),
                 "pg": PrefillRotOperator(T=u, K=H, bf16=True),
                 "proj": PrefillRotOperator(T=u, K=D, narrow=True)}
         for hd in self.hds:
@@ -261,7 +276,7 @@ class GemmaPrefill(ChunkPrefill):
         self.pr = 9 * H // 8  # (a token's row of panels)
         self.rb = {"PX": 4 * H, "PXN": 2 * H, "XR": 3 * self.pr, "G": 2 * COLS * max(self.pitch.values()),
                    "A": 9 * COLS * hd // 8, "AR": 9 * COLS * hd // 8, "Y": 2 * COLS * self.d_pitch,
-                   "GU": 2 * 2 * cfg.intermediate_size, "HR": 9 * cfg.intermediate_size // 8, "GY": 2 * COLS * 64,
+                   "GU": 2 * cfg.intermediate_size, "HR": 9 * cfg.intermediate_size // 8, "GY": 2 * COLS * 64,
                    "HPL": 9 * cfg.per_layer_dim // 8, "HPR": 9 * cfg.per_layer_dim // 8, "P": 2 * COLS * self.d_pitch,
                    "E": 2 * cfg.per_layer_dim, "QS": COLS * max(k.qp for k in self.kind.values()) // 8,
                    "PXR": 9 * H // 8, "PP": 2 * self.ple_plan.layout.N}
@@ -283,13 +298,16 @@ class GemmaPrefill(ChunkPrefill):
 
     def _paro_runlist(self, S: int) -> list[tuple]:
         ov, cfg, rb = self.ov, self.cfg, self.rb
-        sl, tok, t = self._sl, self._tok, self.SUB
-        T, fp = S * t, self.f_part
-        u = self.big if self.big and T % self.big == 0 else t  # (the GEMMs' and rotations' blocks: nb of u tokens)
-        nb, gp, rots = T // u, self.gplans[u], self.rots[u]
+        sl, t = self._sl, self.SUB
+        T = S * t
+        u = self.big if self.big and T % self.big == 0 else t  # (``_paro_init``'s blocks: nb of u tokens, nv of v)
+        v = self.mid if self.mid and T % self.mid == 0 else t
+        nb, nv, gp, rots, nrm = T // u, T // v, self.gplans[u], self.rots[u], self.norms[u]
+        fp, n_d, ple = self.f_parts[v], self.n_ds[v], self.ples[u]
 
-        def blk(buf: str, j: int, op: object, *, i: int, row: int = 0, extra: int = 0) -> str:  # (block j's slice)
-            return sl(buf, j * u * (row or rb[buf]) + extra, op, i=i)
+        def blk(buf: str, j: int, op: object, *, i: int, row: int = 0, extra: int = 0, n: int = 0) -> str:  # (block
+            # j's slice of n tokens a block, default u)
+            return sl(buf, j * (n or u) * (row or rb[buf]) + extra, op, i=i)
 
         def rot(L: int, kind: str, src: str, dst: str, row: int = 0) -> list[tuple]:  # (a rotation's blocks; XR: the
             # copies side by side; row: of src and dst, default theirs)
@@ -299,17 +317,17 @@ class GemmaPrefill(ChunkPrefill):
                    for j in range(nb)]
             return [(op, blk(src, j, op, i=0, row=row), f"RO[{ro}:{ro + arg_bytes(op, 1)}]", out[j]) for j in range(nb)]
 
-        def a_in(g: PG.Gemm, j: int, n: int = 0) -> str:  # (copy c of C in XR, block j's of n tokens, default u)
+        def a_in(g: PG.Gemm, j: int) -> str:  # (copy c of C in XR, block j's)
             C, c = int(g.a[2]), int(g.a[3])
-            return sl("XR", (j * (n or u) * C + 8 * c) * self.pr, g.op, i=0)
+            return sl("XR", (j * u * C + 8 * c) * self.pr, g.op, i=0)
 
-        n = self.n_raw
-        rl: list[tuple] = [(n, self._np("raw", n), tok("PX", j, n, i=1), sl("Z", 0, n, i=2), tok("PX", j, n, i=3),
-                            tok("PXR", j, n, i=4)) for j in range(S)]
+        n = nrm["raw"]
+        rl: list[tuple] = [(n, self._np("raw", n), blk("PX", j, n, i=1), sl("Z", 0, n, i=2), blk("PX", j, n, i=3),
+                            blk("PXR", j, n, i=4)) for j in range(nb)]
         rl += [(g.op, blk("PXR", j, g.op, i=0), self._w(g), blk("PP", j, g.op, i=2)) for g in self.ple_plans[u].gemms
                for j in range(nb)]
-        rl += [(self.n_in, self._np("in", self.n_in), tok("PX", j, self.n_in, i=1), tok("PXN", j, self.n_in, i=2))
-               for j in range(S)]
+        n = nrm["in"]
+        rl += [(n, self._np("in", n), blk("PX", j, n, i=1), blk("PXN", j, n, i=2)) for j in range(nb)]
         rl += rot(self.layers[0], "qkv", "PXN", "XR")
         ple_off = self.ple_plan.layout.off["ple"]
         starts = []
@@ -318,48 +336,47 @@ class GemmaPrefill(ChunkPrefill):
             hd = cfg.head_dim(L)
             kd = self.kind[hd]
             rg, rq, ra = 2 * COLS * self.pitch[hd], COLS * kd.qp // 8, 9 * hd  # (the kind's G, QS, A rows)
-            rl += [(g.op, a_in(g, j, t), self._w(g), tok("G", j, g.op, i=2, row=rg))
-                   for g in self.plans[(L, "qkv")].gemms for j in range(S)]
-            prep, attn = self.prep[hd], self.attn[(hd, T)]
+            rl += [(g.op, a_in(g, j), self._w(g), blk("G", j, g.op, i=2, row=rg))
+                   for g in gp[(L, "qkv")].gemms for j in range(nb)]
+            prep, attn = self.preps[(hd, v)], self.attn[(hd, T)]
             kv0, kvb = ov.kv_off[L], arg_bytes(prep, 4)
-            grp = t // kd.pg * kd.group
+            grp = v // kd.pg * kd.group
             cs = "CSS" if kd.swa else "CSF"
             prm = f"PRM[{self.prm_off[L]}:{self.prm_off[L] + arg_bytes(prep, 2)}]"
-            rl += [(prep, tok("G", j, prep, i=0, row=rg), sl(cs, j * t * 8 * kd.rot, prep, i=1), prm,
-                    tok("QS", j, prep, i=3, row=rq), f"KV[{kv0 + j * grp}:{kv0 + j * grp + kvb}]") for j in range(S)]
+            rl += [(prep, blk("G", j, prep, i=0, row=rg, n=v), sl(cs, j * v * 8 * kd.rot, prep, i=1), prm,
+                    blk("QS", j, prep, i=3, row=rq, n=v), f"KV[{kv0 + j * grp}:{kv0 + j * grp + kvb}]")
+                   for j in range(nv)]
             if i == len(self.layers) - 1:
                 break
             rl.append((attn, sl("QS", 0, attn, i=0), f"KV[{kv0}:{kv0 + arg_bytes(attn, 1)}]", sl("A", 0, attn, i=2)))
             rl += rot(L, "o", "A", "AR", ra)
             (g,) = gp[(L, "o")].gemms
             rl += [(g.op, blk("AR", j, g.op, i=0, row=ra), self._w(g), blk("Y", j, g.op, i=2)) for j in range(nb)]
-            n = self.n_o
-            rl += [(n, self._np((L, "o"), n), tok("PX", j, n, i=1), tok("Y", j, n, i=2), tok("PX", j, n, i=3),
-                    tok("PXN", j, n, i=4)) for j in range(S)]
+            n = nrm["o"]
+            rl += [(n, self._np((L, "o"), n), blk("PX", j, n, i=1), blk("Y", j, n, i=2), blk("PX", j, n, i=3),
+                    blk("PXN", j, n, i=4)) for j in range(nb)]
             rl += rot(L, "gu", "PXN", "XR")
             rl += [(g.op, a_in(g, j), self._w(g), blk("GU", j, g.op, i=2)) for g in gp[(L, "gate_up")].gemms
                    for j in range(nb)]
             rl += rot(L, "down", "GU", "HR")
-            P = self.parts
-            rl += [(g.op, tok("HR", j, g.op, i=0, extra=2 * g.a_off), self._w(g), sl("F", (P * j + g.part) * fp, g.op, i=2))
-                   for g in self.plans[(L, "down")].gemms for j in range(S)]
-            n = self.n_d
-            rl += [(n, self._np((L, "d"), n), tok("PX", j, n, i=1), sl("F", P * j * fp, n, i=2), tok("PX", j, n, i=3),
-                    tok("PXN", j, n, i=4)) for j in range(S)]
+            P = self.parts  # (block j's down parts at (P j + part) fp)
+            rl += [(g.op, blk("HR", j, g.op, i=0, extra=2 * g.a_off, n=v), self._w(g),
+                    sl("F", (P * j + g.part) * fp, g.op, i=2)) for g in self.dplans[v][L].gemms for j in range(nv)]
+            rl += [(n_d, self._np((L, "d"), n_d), blk("PX", j, n_d, i=1, n=v), sl("F", P * j * fp, n_d, i=2),
+                    blk("PX", j, n_d, i=3, n=v), blk("PXN", j, n_d, i=4, n=v)) for j in range(nv)]
             rl += rot(L, "pg", "PXN", "XR")
-            (g,) = self.plans[(L, "pgate")].gemms
-            rl += [(g.op, a_in(g, j, t), self._w(g), tok("GY", j, g.op, i=2)) for j in range(S)]
+            (g,) = gp[(L, "pgate")].gemms
+            rl += [(g.op, a_in(g, j), self._w(g), blk("GY", j, g.op, i=2)) for j in range(nb)]
             li = self.layers.index(L)
             e = li * (self.MAX_T + PAD_ROWS) * rb["E"]
-            rl += [(self.ple, tok("GY", j, self.ple, i=0), tok("PP", j, self.ple, i=1, extra=2 * (ple_off + 32 * li)),
-                    tok("E", j, self.ple, i=2, extra=e), sl("PLW", 0, self.ple, i=3), tok("HPL", j, self.ple, i=4))
-                   for j in range(S)]
+            rl += [(ple, blk("GY", j, ple, i=0), blk("PP", j, ple, i=1, extra=2 * (ple_off + 32 * li)),
+                    blk("E", j, ple, i=2, extra=e), sl("PLW", 0, ple, i=3), blk("HPL", j, ple, i=4)) for j in range(nb)]
             rl += rot(L, "proj", "HPL", "HPR")
             (g,) = gp[(L, "proj")].gemms
             rl += [(g.op, blk("HPR", j, g.op, i=0), self._w(g), blk("P", j, g.op, i=2)) for j in range(nb)]
-            n = self.n_p
-            rl += [(n, self._np((L, "p"), n), tok("PX", j, n, i=1), tok("P", j, n, i=2), tok("PX", j, n, i=3),
-                    tok("PXN", j, n, i=4)) for j in range(S)]
+            n = nrm["p"]
+            rl += [(n, self._np((L, "p"), n), blk("PX", j, n, i=1), blk("P", j, n, i=2), blk("PX", j, n, i=3),
+                    blk("PXN", j, n, i=4)) for j in range(nb)]
             rl += rot(self.layers[i + 1], "qkv", "PXN", "XR")
         self._starts[T] = [*starts, len(rl)]
         return rl
@@ -457,8 +474,8 @@ class GemmaPrefill(ChunkPrefill):
         for name, r in self.rb.items():  # (the GEMMs' padding rows past the last sub-chunk)
             own[name] = max(own.get(name, 0), (self.MAX_T + PAD_ROWS) * r) + (
                 (len(self.layers) - 1) * (self.MAX_T + PAD_ROWS) * r if name == "E" else 0)
-        own["F"] = own["F"] + self.f_part
-        own["Z"] = arg_bytes(self.n_raw, 2)
+        own["F"] = own["F"] + (max(self.f_parts.values()) if self.paro else self.f_part)
+        own["Z"] = max(arg_bytes(n["raw"], 2) for n in self.norms.values()) if self.paro else arg_bytes(self.n_raw, 2)
         own["PLW"] = arg_bytes(self.ple, 3)
 
     def _bind(self) -> None:
@@ -504,9 +521,9 @@ class GemmaPrefill(ChunkPrefill):
         if self.paro:  # (the rotations' objects, the norms' weights folded into their consumers')
             ro = dev.view("RO")
             for (L, kind), off in self.ro_off.items():
+                tok = self.rots[self.SUB][f"o{cfg.head_dim(L)}" if kind == "o" else kind].tok  # (its items' tokens)
                 obj = np.concatenate([ov.gguf.tensor(t).rot().tan_form(None if w is None else img._vec(w), unit=True)
-                                      .pair_objects(row_floats(kind in ("down", "proj"))).reshape(-1)
-                                      for t, w in self._rot_tensors(L, kind)])
+                                      .pair_objects(tok).reshape(-1) for t, w in self._rot_tensors(L, kind)])
                 ro[off:off + obj.size] = obj
             dev.flush("RO")
 
@@ -550,7 +567,7 @@ class GemmaPrefill(ChunkPrefill):
         self._stage_px(x, T, np.float32)
         hooks = None
         if isinstance(e, Future):  # (a piece from the first PLE item on)
-            i = next(i for i, (op, *_) in enumerate(self.runlists[T]) if op is self.ple)
+            i = next(i for i, (op, *_) in enumerate(self.runlists[T]) if isinstance(op, PleOperator))
             hooks = {i: lambda: self._write_e(e.result(), n, T)}
         else:
             self._write_e(e, n, T)

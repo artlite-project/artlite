@@ -150,6 +150,7 @@ class GemmQOperator(ArtcOperator):
         ptail_part: int = -1,
         c_panels: int = 0,
         run: int = 1,
+        dual: int = 0,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -185,7 +186,10 @@ class GemmQOperator(ArtcOperator):
         tile's second half), the two parts of a gate / up C object (``Geometry.tile``). ``run``: an image object
         (``tile_bytes``) holds that many tiles back to back (BFP16 row-group tiles, ``groups``' layout, read as tiles of
         kc / G columns: their panels are k8-major, a slot's columns one run of the object's bytes; tile i's slot j = row
-        tile run i + j: output rows in order).
+        tile run i + j: output rows in order). ``dual``: passes in pairs (``ptail_part``'s tiles), the second part's
+        tiles ``dual`` tiles after the first's (a second region of the same shape: a PARO checkpoint's up after its
+        gate), each part on its half of A (K columns each: the two regions' inputs side by side, 2 K in all); C = bf16
+        act(first part's C tile) times the second's (``act``: the gate / up activation), one C object per pair.
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -197,7 +201,7 @@ class GemmQOperator(ArtcOperator):
             kc_group=kc_group, rt_stride=rt_stride, tiles=tiles, c_pack=c_pack, region_rt=region_rt, m=m,
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
             mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail, ptail_part=ptail_part,
-            c_panels=c_panels, run=run)
+            c_panels=c_panels, run=run, dual=dual)
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()
@@ -309,11 +313,11 @@ class GemmQOperator(ArtcOperator):
         A, B, C, ``acc`` and ``st``, the SiLU scratch; a GELU epilogue's table copies ``lut``, ``lutb`` (``kmath.act``'s
         two). get_mlir_artifact asserts its buffer types against this."""
         m = g.m
-        lut = (1 if g.silu and g.act != "silu" else 0, kmath.TABLES[g.act].table_words().nbytes)
+        lut = (1 if (g.silu and g.act != "silu") or g.dual else 0, kmath.TABLES[g.act].table_words().nbytes)
         if g.pair:
             return {"A": (2, m * 72), "B": (B_DEPTH, 4 * g.b_l1_words),
                     "C": (2, m * g.n_out * 9 // 8 * g.c_parts if g.c_bfp16 else m * g.n_c * 2),
-                    "acc": (1 if g.silu else 0, m * g.n * 2),
+                    "acc": (1 if g.silu or g.dual else 0, m * g.n * 2),
                     "ws": (1, 1024 * g.nsb * g.ws_planes * g.tq // TILES),
                     "st": (1, max(m * g.n * 2, 16 * g.b_l1_words if slot(g.fmt).gemm_q_collects else 0)),
                     "X": (2, g.n // 2 * KT * 9 // 8), "lut": lut, "lutb": lut}
@@ -338,12 +342,12 @@ class GemmQOperator(ArtcOperator):
         tiles) and the C tile(s) every cycle: each gets its own region. The stack is at 0.
         """
         sizes = self._buffers(g, plan)
-        target = "acc" if g.silu or g.c_pairs else "C"  # the MAC's C tile
+        target = "acc" if g.silu or g.c_pairs or g.dual else "C"  # the MAC's C tile
         # (buffer, allowed regions in order of preference)
         if g.pair:  # the MAC streams X (or the partner's), A and the two C tiles: one region each; the dequant
             # reads B and ws and writes X: three regions; the C objects of the epilogue (cold) next to X
             order = [("X", [0]), ("A", [1]), (target, [2]), ("st", [3]), ("ws", [2, 3, 0])]
-            order += [("C", [0, 3, 1])] if g.silu else []
+            order += [("C", [0, 3, 1])] if g.silu or g.dual else []
             order += [("B", [3, 1, 0, 2])]
         else:
             order = [("st", [0]), ("A", [1]), (target, [2])] + ([("C", [0, 3, 1])] if g.silu or g.c_pairs else [])
@@ -358,6 +362,16 @@ class GemmQOperator(ArtcOperator):
             need = n * align64(sz)
             r = next((r for r in regions if free[r] >= need and not (name == "lutb" and nxt[r] // REGION
                                                                       == layout["lut"][0] // REGION)), None)
+            if r is None and name == "C" and g.dual:  # (the epilogue's C objects, cold: one where each fits)
+                layout[name] = []
+                for _ in range(n):
+                    r = next((r for r in regions if free[r] >= align64(sz)), None)
+                    if r is None:
+                        return None
+                    layout[name].append(nxt[r])
+                    free[r] -= align64(sz)
+                    nxt[r] += align64(sz)
+                continue
             if r is None:
                 return None
             layout[name] = [nxt[r] + i * align64(sz) for i in range(n)]
@@ -388,7 +402,7 @@ class GemmQOperator(ArtcOperator):
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
                                   c_pack=False, carry=None, win=0, c_parts=self.c_parts, pingpong=False, planar=False,
                                   sxp=1, csplit=0, tq=self.tq, pair=self.pair,
-                                  c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1,
+                                  c_pairs=self.c_pairs, macf=f"{MACF}<{self.m}, {self.n}>", slots=1, dual=bool(self.dual),
                                   **self._pace_vars())
 
     def _sequence(self, a_prods: list, b_prods: list, c_conses: list, ROWS: int) -> object:
@@ -459,6 +473,11 @@ class GemmQOperator(ArtcOperator):
         lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]]
         k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, *([lut_ty] * 2 if gelu else [np.int32]),
                                                          *[np.int32] * (self.c_parts - 1)]) if self.silu else None
+        dual = bool(self.dual)
+        if dual:  # (part 0: C = act(acc), part 1: C *= acc; the activation's table copies, SiLU's too)
+            gelu = True  # (the table copies in the workers' arguments)
+            assert self.pair, "dual: GemmQ pairs"
+            k_silu = Kernel(f"{p}_dual", "kernel.o", [acc_ty, C_l1_ty, lut_ty, lut_ty, np.int32])
         pair = self.pair
         if pair:
             ws_ty = np.ndarray[(bufs["ws"][1] // 2,), np.dtype[bfloat16]]  # planes x nsb x 128 tq
@@ -497,7 +516,7 @@ class GemmQOperator(ArtcOperator):
 
         c_pairs = self.c_pairs
 
-        parts = self.c_parts  # (C objects of two passes: their outputs in turn)
+        parts = 2 if dual else self.c_parts  # (C objects of two passes: their outputs in turn; dual: a pass pair's one)
 
         def core_fn(pc, prm, bf, af, cf, zero, mm, st, *extra):  # BFP16: the k-tile objects are MMUL panels already
             run_paced(pc, self.pace, lambda b: core_item(prm, b, af, cf, zero, mm, st, *extra), bf)
@@ -531,7 +550,7 @@ class GemmQOperator(ArtcOperator):
                 cf.release(1)
 
         def pass_fn(bf, af, xo, xi, zero, hdr, dq, mm, ws, st, h, c, part, *extra):
-            acc = extra[1] if silu else c
+            acc = extra[1] if silu or dual else c
             zero(acc)
             for _ in range_(self.n_full):
                 chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(self.nsb), *extra)
@@ -540,6 +559,8 @@ class GemmQOperator(ArtcOperator):
                 chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, range_(s0, s0 + self.tail), *extra)
             if silu:  # (gelu: the table copies; silu: the kernel's opaque runtime zero)
                 extra[0](acc, c, st, *(extra[2:4] if gelu else (0,)), *([part] if parts == 2 else []))
+            elif dual:
+                extra[0](acc, c, extra[2], extra[3], part)
 
         def chunk_fn(bf, af, xo, xi, hdr, dq, mm, ws, st, h, acc, sbs, *extra):  # a K chunk's super-blocks sbs
             for pl in range(planes):  # header planes, one k-tile slot per L1 object (this half's tiles)
@@ -571,7 +592,7 @@ class GemmQOperator(ArtcOperator):
             for c in range(COLS):
                 pc = pcs.get((c, row + 2))
                 st = Buffer(st_ty, name=f"gq_st_{c}_{row}")
-                extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.silu else
+                extra = ([k_silu, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.silu or dual else
                          [k_pairs, Buffer(acc_ty, name=f"gq_acc_{c}_{row}")] if self.c_pairs else [])
                 if gelu:  # (extra[2:4]; Q4_K's header expansion stays last)
                     extra += [Buffer(lut_ty, name=f"gq_{key}_{c}_{row}", initial_value=kmath.TABLES[self.act].table_words())

@@ -151,6 +151,7 @@ def gemm_mac_rows(T: int, which: str, fmt: str, planar: bool = False) -> int:
     (2 or 3 MAC rows at T <= 128: no faster)."""
     if planar:
         return 1 if T <= 64 else 2 if T <= 128 else 3
-    if not FORMATS[fmt].dequant or T <= 256 or which == "down":  # (BFP16: no dequant)
+    if not FORMATS[fmt].dequant or T <= 256 or which == "down" or T % 288:  # (BFP16: no dequant; a T of no whole
+        # passes of 3 x 96 tokens: GemmQd's of 3 x 64 would pad it and stream the weights more often than GemmQ's 256)
         return 0
     return 0 if which in ("gu", "o") else 3

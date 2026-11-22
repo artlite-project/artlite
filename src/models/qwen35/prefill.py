@@ -51,9 +51,11 @@ outlier's exponent: Qwen3-0.6B-PARO's KL 4x). After the input norm the rotated c
 side by side (XR: gin_q's and gin_z's, or attn_q's, attn_k's and attn_v's), each GEMM reading its
 copy as K columns of panels C K wide into one layout of G (``prefill.gemm.joined_layout``: the GDN and attention
 operators' as ever; the GDN's alpha and beta, folded into gin_z's rotation as F32 planes, in fp32: GdnPrep's
-``ab32``); the mixer's output rotated for its projection (AR); gate's and up's copies (XR), gate and up as bf16
-panels into GU (one GEMM design, ``prefill.gemm.plan_gate_up_pair``; tiles whose passes are not 64 outputs, P5_128's:
-rows into GJ, ``plan_gate_up_rows``), down's rotation with the activation on the way (HR). An MoE layer (``moe.prefill``'s
+``ab32``); the mixer's output rotated for its projection (AR); gate's and up's copies (XR), gate and up in one GEMM
+whose epilogue forms h = silu(gate) up into GU (``prefill.gemm.plan_gate_up_pair``'s ``act``, where its A strip of
+both copies stays in the memtile; else gate and up as bf16 panels into GU, one GEMM design; tiles whose passes are not
+64 outputs, P5_128's: rows into GJ, ``plan_gate_up_rows``), down's rotation (HR; of GU or GJ: the activation on the
+way). An MoE layer (``moe.prefill``'s
 PARO path): after its post-attention norm the experts' gate / up rotation as hi and lo panels (XR: the router and the
 shared expert, their rows folded into it) and as rows (PXR: the experts' gathered rows), the experts' h rotated in their
 slots.
@@ -232,9 +234,11 @@ class QwenPrefill(ChunkPrefill):
             if self.paro and name == "gate_up":  # (one design, bf16 panels into GU, or rows into GJ: down's rotation
                 # takes them)
                 gate, up = img.region(L, "gate"), img.region(L, "up")
-                gu = (PG.plan_gate_up_rows, PG.plan_gate_up_pair)[self.gu_paired](img, gate, up, t, self._gemms,
-                                                                                    2 * self.kh)
-                n = len(gu.gemms) // 2  # (gate's GEMMs, then up's)
+                if self.gu_paired:  # (one GEMM of both where it fits: h = silu(gate) up, ``act``)
+                    gu = PG.plan_gate_up_pair(img, gate, up, t, self._gemms, 2 * self.kh, act="silu")
+                else:
+                    gu = PG.plan_gate_up_rows(img, gate, up, t, self._gemms, 2 * self.kh)
+                n = len(gu.gemms) // 2 if not gu.gemms[0].op.dual else 1  # (gate's GEMMs, then up's; a dual GEMM)
                 gu.gemms = [dataclasses.replace(g, a="XR20" if i < n else "XR21") for i, g in enumerate(gu.gemms)]
                 return gu
             region = img.region(L, name)
@@ -270,11 +274,15 @@ class QwenPrefill(ChunkPrefill):
                 # takes: two rotations, the same objects)
                 rots["moe"] = rot(K=self.kh, bf16=True, hilo=True)
                 rots["moe_rows"] = rot(K=self.kh, bf16=True, rows_out=True)
-            else:  # (down's rotation: of GU's panels, or of GJ's rows: the layout's pitch and up's offset)
+            else:  # (down's rotation: of the dual GEMM's h, of GU's panels, or of GJ's rows: the layout's pitch and
+                # up's offset)
                 lay = plans[(self.layers[0], "gate_up")].layout
                 assert self.gu_paired or all(plans[(L, "gate_up")].layout == lay for L in self.layers), "one GJ layout"
-                rots["down"] = rot(K=cfg.intermediate_size, gu=True,
-                                   rows=None if self.gu_paired else (lay.pitch, lay.off["up"]))
+                dual = {bool(plans[(L, "gate_up")].gemms[0].op.dual) for L in self.layers}
+                assert len(dual) == 1 and getattr(self, "gu_dual", dual) == dual, "one down rotation (its RO objects)"
+                self.gu_dual = dual
+                rots["down"] = rot(K=cfg.intermediate_size, bf16=True, narrow=True) if True in dual else \
+                    rot(K=cfg.intermediate_size, gu=True, rows=None if self.gu_paired else (lay.pitch, lay.off["up"]))
             if self.gdn:
                 rots["in_gdn"] = rots["gu"]
                 rots["o_gdn"] = rot(K=cfg.ssm_v_heads * GD.D)
@@ -374,7 +382,8 @@ class QwenPrefill(ChunkPrefill):
                 if not self.gu_paired else 0  # (GJ's rows: [column][gate | up] bf16)
             self.rb |= {"XR": 3 * self.pr, "AR": max(self.rb_a.values())}
             if not cfg.moe:
-                self.rb |= {"GU": 4 * cfg.intermediate_size, "GJ": gj, "HR": self.rb["HP"]}
+                self.rb |= {"GU": (2 if True in self.gu_dual else 4) * cfg.intermediate_size, "GJ": gj,
+                            "HR": self.rb["HP"]}
             self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO: ``_bind``)
             k = 0
             for L in self.layers:
@@ -607,7 +616,7 @@ class QwenPrefill(ChunkPrefill):
                 objs = []
                 for name, norm in self._rot_tensors(L, kind):
                     gamma = ov._f32(f"blk.{L}.{norm}.weight") if norm else None
-                    row = row_floats(kind in ("down", "moe"))  # (16-token items: down's gu, the MoE copy's)
+                    row = row_floats(kind in ("down", "moe"))  # (16-token items: down's (any chunk size's), the MoE copy's)
                     objs.append(g.tensor(name).rot().tan_form(gamma, unit=True).pair_objects(row))
                 obj = np.concatenate(objs).reshape(-1)
                 ro[off:off + obj.size] = obj

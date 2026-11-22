@@ -116,7 +116,8 @@ class Dataflow:
             b_wdims=None if noperm or wdims is None else stream_walk(obj_w // parts, wdims),
             b_rdims=None if noperm else stream_walk(obj_w // parts, rdims, rpad), b_parts=parts,
             a_res=a_res, a_obj=a_obj, a_l1=m * 36, a_wdims=stream_walk(a_obj, a_wdims),
-            a_repeat=geo.passes * geo.G if a_res and geo.passes * geo.G > 1 else 1,
+            # (``dual``: a pass pair takes the strip once, a part its half)
+            a_repeat=geo.passes * geo.G // (2 if geo.dual else 1) if a_res and geo.passes * geo.G > 1 else 1,
             c_l1=c_l1,
             # the join of the 4 cores' 8x8 sub-blocks is un-panelized to row-major on the way to the shim
             # (packed C objects: row-major already, the columns past n_out dropped: a partial read of each
@@ -178,9 +179,10 @@ class Dataflow:
         assert geo.us == 1 and geo.hg == 1 and geo.k_rep == 1, "a tail: plain units"
         base = c * geo.col_bytes // 2
         w_dims = (1, geo.w_bytes // 2)
-        step = 2 if geo.ptail else 1  # (passes per iteration)
+        step = 2 if geo.ptail or geo.dual else 1  # (passes per iteration)
+        pt = max(geo.pt_part, 0)  # (parity e: ``pt_part``'s every pass; ``dual``: both parts of a pair)
         out = []
-        for i, e in enumerate((0, 1) if geo.ptail else (max(geo.pt_part, 0),)):  # (parity e: ``pt_part``'s every pass)
+        for i, e in enumerate((0, 1) if geo.ptail else (pt, pt) if geo.dual else (pt,)):
             p = p0 + i
             it = (geo.tile(p + step, 0, 0) - geo.tile(p, 0, 0)) * tw if np_ > step else tw  # (the next iteration's)
             for k in range(geo.n_kc):
@@ -195,11 +197,13 @@ class Dataflow:
         block where one pattern covers them): per pass and K chunk the header units and the super-block
         slices of the pass's tiles."""
         geo = self.geo
-        if geo.tail:  # (per pass, ``ptail``: per pass pair, the pieces of ``_tail_bds``' iterations)
+        if geo.tail or geo.dual:  # (per pass, ``ptail`` / ``dual``: per pass pair, the pieces of the chained fill's
+            # iterations)
             out, p0 = [], 0
-            step = 2 if geo.ptail else 1
-            for _, np_ in geo.blocks:
-                bds = self._tail_bds(c, p0, np_)
+            step = 2 if geo.ptail or geo.dual else 1
+            chains = None if geo.tail else self.b_chain(c)
+            for b, (_, np_) in enumerate(geo.blocks):
+                bds = self._tail_bds(c, p0, np_) if geo.tail else chains[b]
                 for q in range(np_ // step):
                     out += [(p0 + q * step, TensorAccessPattern(t.tensor_dims, t.offset + q * t.strides[0],
                                                                  [1, *t.sizes[1:]], [0, *t.strides[1:]])) for t in bds]
@@ -251,7 +255,7 @@ class Dataflow:
         if geo.tail:
             chains, p0 = [], 0
             for _, np_ in geo.blocks:
-                assert np_ // (2 if geo.ptail else 1) <= MAX_BD_ITER, "a BD iterates at most MAX_BD_ITER times"
+                assert np_ // (2 if geo.ptail or geo.dual else 1) <= MAX_BD_ITER, "a BD iterates at most MAX_BD_ITER times"
                 chains.append(self._tail_bds(c, p0, np_))
                 p0 += np_
             assert sum(map(len, chains)) <= MAX_CHAIN_BDS, "chained weight fills of more than MAX_CHAIN_BDS shim BDs"
@@ -261,14 +265,19 @@ class Dataflow:
             chains = [self._hg_bds(c, rt0, np_) for rt0, np_ in geo.blocks]
             assert sum(map(len, chains)) <= MAX_CHAIN_BDS, "chained weight fills of more than MAX_CHAIN_BDS shim BDs"
             return chains
-        taps = self.b_taps(c)
-        if (len(taps) == len(geo.blocks) and geo.k_rep == 1) or max(n for _, n in geo.blocks) > MAX_BD_ITER:
-            return None  # (one fill per block already; a BD iterates at most MAX_BD_ITER times)
         tw, (nsl, sw) = geo.tile_bytes // 2, geo.fill_units
         nt, nk, g, rs, ps = geo.tiles, geo.n_kc, geo.kc_group, geo.rt_stride, geo.pass_step
         base = c * geo.col_bytes // 2
         n_rt = geo.region_rt
         w_dims = (1, geo.w_bytes // 2)
+        if geo.dual:  # (per pass pair, each part's chunks: a BD each, its row tiles ``dual`` on for the second)
+            assert g == nk and geo.run == 1 and geo.k_rep == 1 and max(n for _, n in geo.blocks) // 2 <= MAX_BD_ITER
+            return [[TensorAccessPattern(w_dims, base + ((rt0 + part * geo.dual) * rs + k) * tw, [np_ // 2, nsl, nt, sw],
+                                         [ps * rs * tw, sw, rs * tw, 1]) for part in range(2) for k in range(nk)]
+                    for rt0, np_ in geo.blocks]
+        taps = self.b_taps(c)
+        if (len(taps) == len(geo.blocks) and geo.k_rep == 1) or max(n for _, n in geo.blocks) > MAX_BD_ITER:
+            return None  # (one fill per block already; a BD iterates at most MAX_BD_ITER times)
         if geo.run > 1:  # (objects of run tiles: a BD per unit, [pass][object][its tile][words])
             n = geo.run
             return [[TensorAccessPattern(w_dims, base + rt0 // n * tw + u * sw, [np_, nt // n, n, sw],
@@ -284,6 +293,7 @@ class Dataflow:
         the memtile) or once per pass."""
         geo = self.geo
         m, K, aK, df = geo.m, geo.KA, geo.a_K, self
+        assert df.a_res or not geo.dual, "dual: A resident"
         n = 1 if df.a_res else geo.passes
         # panels [group][k8][36]: read [kt][group][8 k-steps x panel]
         return TensorAccessPattern((geo.M * aK * 9 // 16,),
@@ -316,6 +326,8 @@ class Dataflow:
         """The first output column of each C object of column c (``out_cols``; two per pass in halves; of two parts:
         one per pass, or per pair of passes)."""
         geo = self.geo
+        if geo.dual:  # (a pass pair's one C object)
+            return list(geo.out_cols[c][0::2])
         if geo.c_parts == 2:
             return list(geo.out_cols[c]) if geo.halves == 2 else list(geo.out_cols[c][0::2])
         return [o + geo.n_out * h for o in geo.out_cols[c] for h in range(geo.halves)]

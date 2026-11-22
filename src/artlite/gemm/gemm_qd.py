@@ -335,7 +335,7 @@ class GemmQdOperator(GemmQOperator):
                                   n_out=self.n_out, n_c=self.n_c, R=self.R, tiles=self.tiles,
                                   TR=self.TR, pingpong=self.pingpong, planar=self.planar, hu=self.hdr_units,
                                   hp0=self.hdr_plane0, hs=self.hdr_slot_words, sxp=self.sxp, tq=self.tq, pair=False,
-                                  us=self.us, c_pairs=False, macf="", slots=self.slots,
+                                  us=self.us, c_pairs=False, macf="", slots=self.slots, dual=False,
                                   pack_plan=pack_plan(self.nm, self.n_out, self.n_c, self.tiles, self.R)
                                   if self.c_pack and self.slots == 2 else None,
                                   **self._pace_vars(), **slot(self.fmt).qd_template_vars(self))

@@ -59,9 +59,10 @@ def _ref_prefill(path: str, ids: list[int]) -> dict[str, torch.Tensor]:
     return cached_ref(ref.path, "paro_prefill", (ids, VOCAB), run, sources=gemma_cpu.SOURCES)
 
 
-@pytest.mark.parametrize(("n", "p0"), [(300, 0), (300, 64)], ids=["two-chunks", "after-decode"])
+@pytest.mark.parametrize(("n", "p0"), [(200, 0), (300, 64), (1000, 0)], ids=["256", "512-after-decode", "1024"])
 def test_paro_prefill(n: int, p0: int) -> None:
-    """The prefill (``GemmaPrefill``) of the slice, p0 tokens as decode steps first, then n in chunks: the caches within
+    """The prefill (``GemmaPrefill``) of the slice, p0 tokens as decode steps first, then n in a chunk (of 256, 512 and
+    1024 tokens: its operators' blocks of each size, ``_paro_init``): the caches within
     5% of the decode path's (rel; its GEMMs' bfp16 inputs against the decode's bf16), the residual into the last layer
     within 3% of the fp32 model's (measured ~1.5%), the last token's logits after a step from the last layer within 2%."""
     from models.gemma4.prefill import GemmaPrefill
@@ -115,7 +116,7 @@ class _ParoCpu(gemma_cpu.GemmaCpu):
 def test_paro_model() -> None:
     """NpuGemma on the checkpoint, a chat prompt through the prefill then its continuation teacher-forced at 1 and 4
     tokens per dispatch: KL of the next-token distributions against the fp32 model (``_ParoCpu``) and argmax
-    agreement."""
+    agreement (measured: 0.00029 both, 100% of 34 tokens)."""
     from models.gemma4.gemma import NpuGemma
     from models.gemma4.tokenizer import chat_prompt
 

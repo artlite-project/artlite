@@ -351,15 +351,19 @@
 {"section": "11fb01d7ad7f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=1024, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, region_rt=25, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
 {"section": "7b2676c3e9e0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=4096, K=2048, N=512, tile_bytes=9280, col_bytes=464000, passes=2, kc=1024, kc_group=2, silu=True, act='silu', c_bfp16=True, region_rt=16, mc_param='moe_t', mc_unit=256, pace=4"}
 {"section": "85f37f0b275f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='BFP16', rows=8, M=8192, K=2048, N=512, tile_bytes=9216, col_bytes=120848384, passes=1, kc=1024, kc_group=2, region_rt=24, k_rep=2, c_pairs=True, mc_param='moe_t', mc_unit=256, pace=0"}
-{"section": "42d1f9f5e1e7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
+{"section": "f579a9599520", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=12, kc=1024, kc_group=1, region_rt=24, c_panels=64, dual=24, act='silu', pace=4"}
 {"section": "90a618bf50c1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2048, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=2, region_rt=8, pace=2"}
 {"section": "e8c2d642767f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2048, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=2, region_rt=20, pace=2"}
-{"section": "c376b7beadd3", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=20480, tile_bytes=9216, col_bytes=341049344, passes=10, kc=1024, kc_group=3, region_rt=200, ptail_part=0, c_panels=64, pace=4"}
-{"section": "8a3413645cf4", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=20480, tile_bytes=9216, col_bytes=341049344, passes=10, kc=1024, kc_group=3, region_rt=200, ptail_part=1, c_panels=64, pace=4"}
+{"section": "74ee7ec513e2", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=10240, tile_bytes=9216, col_bytes=341049344, passes=20, kc=1024, kc_group=3, region_rt=200, ptail_part=0, c_panels=64, dual=200, act='gelu', pace=4"}
+{"section": "f151d6e2314f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=10240, tile_bytes=9216, col_bytes=341049344, passes=20, kc=1024, kc_group=3, region_rt=200, ptail_part=1, c_panels=64, dual=200, act='gelu', pace=4"}
+{"section": "6744d01267dc", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=3072, tile_bytes=9216, col_bytes=341049344, passes=1, kc=1024, kc_group=3, region_rt=4, pace=0"}
+{"section": "4d7108731426", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=3072, tile_bytes=9216, col_bytes=341049344, passes=4, kc=1024, kc_group=3, region_rt=16, pace=0"}
+{"section": "3ac541f94299", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=6144, tile_bytes=9216, col_bytes=341049344, passes=2, kc=1024, kc_group=3, region_rt=8, pace=0"}
+{"section": "a865543f4ef7", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=2560, N=6144, tile_bytes=9216, col_bytes=341049344, passes=8, kc=1024, kc_group=3, region_rt=32, pace=0"}
 {"section": "f79127e69a17", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=3072, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=3, region_rt=8, pace=6"}
 {"section": "616969a2d69c", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=1024, K=4096, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=4, region_rt=20, pace=2"}
-{"section": "993a209fd3c9", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
-{"section": "9060d638cf19", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=3584, tile_bytes=9280, col_bytes=259840, passes=7, kc=1024, kc_group=1, region_rt=28, c_panels=128, pace=4"}
+{"section": "19f87596bd5e", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=12, kc=1024, kc_group=1, region_rt=24, c_panels=64, dual=24, act='silu', pace=4"}
+{"section": "ad145d5984d1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=3584, tile_bytes=9280, col_bytes=259840, passes=14, kc=1024, kc_group=1, region_rt=28, c_panels=64, dual=224, act='silu', pace=4"}
 {"section": "dc4500f95b66", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=1, region_rt=8, pace=0"}
 {"section": "aaf4bf13391a", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=4, kc=1024, kc_group=1, region_rt=16, pace=0"}
 {"section": "1b9f1887e8fc", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=1024, N=5120, tile_bytes=9280, col_bytes=296960, passes=8, kc=1024, kc_group=1, region_rt=32, pace=0"}
@@ -374,8 +378,8 @@
 {"section": "72562e77cd61", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=3072, N=1024, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=3, region_rt=8, pace=6"}
 {"section": "23793c095fc1", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=3584, N=1024, tile_bytes=9280, col_bytes=296960, passes=2, kc=1024, kc_group=4, region_rt=8, pace=6"}
 {"section": "c3978f4530b0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=128, K=4096, N=2048, tile_bytes=9280, col_bytes=593920, passes=4, kc=1024, kc_group=2, region_rt=16, pace=2"}
-{"section": "a9830f40f9ba", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=6, kc=1024, kc_group=1, region_rt=24, c_panels=128, pace=4"}
-{"section": "2d7a0904bdeb", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=3584, tile_bytes=9280, col_bytes=259840, passes=7, kc=1024, kc_group=1, region_rt=28, c_panels=128, pace=4"}
+{"section": "575adff63169", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=3072, tile_bytes=9216, col_bytes=43778048, passes=12, kc=1024, kc_group=1, region_rt=24, c_panels=64, dual=24, act='silu', pace=4"}
+{"section": "e978194b8df6", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=3584, tile_bytes=9280, col_bytes=259840, passes=14, kc=1024, kc_group=1, region_rt=28, c_panels=64, dual=224, act='silu', pace=4"}
 {"section": "68e330e385d0", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=2, kc=1024, kc_group=1, region_rt=8, pace=0"}
 {"section": "ac731b12b3c6", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=4096, tile_bytes=9216, col_bytes=43778048, passes=4, kc=1024, kc_group=1, region_rt=16, pace=0"}
 {"section": "ee1e218c50dd", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=1024, N=5120, tile_bytes=9280, col_bytes=296960, passes=8, kc=1024, kc_group=1, region_rt=32, pace=0"}
@@ -388,8 +392,8 @@
 {"section": "7d6430e6cc28", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2048, N=12800, tile_bytes=9280, col_bytes=631040, passes=8, kc=1024, kc_group=2, region_rt=32, pace=0"}
 {"section": "8b4fd2da14a4", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2048, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=2, region_rt=20, pace=2"}
 {"section": "1eb6e4c0d581", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2048, N=9216, tile_bytes=9280, col_bytes=74240, passes=1, kc=1024, kc_group=2, region_rt=4, pace=0"}
-{"section": "103a80607d94", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=20480, tile_bytes=9216, col_bytes=341049344, passes=10, kc=1024, kc_group=3, region_rt=200, ptail_part=0, c_panels=64, pace=4"}
-{"section": "797819b23889", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=20480, tile_bytes=9216, col_bytes=341049344, passes=10, kc=1024, kc_group=3, region_rt=200, ptail_part=1, c_panels=64, pace=4"}
+{"section": "499b70eb7438", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=10240, tile_bytes=9216, col_bytes=341049344, passes=20, kc=1024, kc_group=3, region_rt=200, ptail_part=0, c_panels=64, dual=200, act='gelu', pace=4"}
+{"section": "ea29ce4deb5f", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=10240, tile_bytes=9216, col_bytes=341049344, passes=20, kc=1024, kc_group=3, region_rt=200, ptail_part=1, c_panels=64, dual=200, act='gelu', pace=4"}
 {"section": "908012ea20c9", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=3072, tile_bytes=9216, col_bytes=341049344, passes=1, kc=1024, kc_group=3, region_rt=4, pace=0"}
 {"section": "c8e4dbd38c2b", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=3072, tile_bytes=9216, col_bytes=341049344, passes=4, kc=1024, kc_group=3, region_rt=16, pace=0"}
 {"section": "d532cf518659", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=2560, N=6144, tile_bytes=9216, col_bytes=341049344, passes=2, kc=1024, kc_group=3, region_rt=8, pace=0"}
@@ -399,6 +403,7 @@
 {"section": "8d15373037be", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=4096, N=2048, tile_bytes=9280, col_bytes=593920, passes=4, kc=1024, kc_group=2, region_rt=16, pace=2"}
 {"section": "d625799f17fc", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=4096, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=4, region_rt=20, pace=2"}
 {"section": "4fa9fb1287ee", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=256, K=5120, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=5, region_rt=20, rt_stride=5, pace=6"}
+{"section": "fbc1aa54f47e", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='P4_128', rows=16, M=512, K=5120, N=2560, tile_bytes=9216, col_bytes=341049344, passes=5, kc=1024, kc_group=5, region_rt=20, rt_stride=5, pace=6"}
 {"section": "7e579d0fca3d", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='Q4_0', rows=16, M=1024, K=2048, N=2048, tile_bytes=9280, col_bytes=133431296, passes=4, kc=1024, kc_group=2, region_rt=16, pace=2"}
 {"section": "001fa4d4ac74", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='Q4_0', rows=16, M=1024, K=2048, N=8192, tile_bytes=9280, col_bytes=133431296, passes=30, kc=1024, kc_group=2, silu=True, act='silu', c_bfp16=True, lines=True, pace=4"}
 {"section": "0814defbacc4", "label": "GemmQOperator (artlite/gemm/gemm_q.py)", "detail": "nrows=4, fmt='Q4_0', rows=16, M=1024, K=4096, N=2048, tile_bytes=9280, col_bytes=133431296, passes=4, kc=1024, kc_group=4, region_rt=16, rt_stride=4, pace=6"}
@@ -838,6 +843,8 @@
 {"section": "8fefc52e7259", "label": "GemmaPrepOperator (models/gemma4/attn_prefill.py)", "detail": "T=256, hd=512, kv_bytes=7105536, cs_positions=6160, kp=2"}
 {"section": "36364361e2f2", "label": "GemmaPrepOperator (models/gemma4/attn_prefill.py)", "detail": "T=288, hd=256, kv_bytes=4008960, cs_positions=6128, kp=2"}
 {"section": "c967bfd20ed3", "label": "GemmaPrepOperator (models/gemma4/attn_prefill.py)", "detail": "T=288, hd=512, kv_bytes=7105536, cs_positions=6128, kp=2"}
+{"section": "6062bbd7d282", "label": "GemmaPrepOperator (models/gemma4/attn_prefill.py)", "detail": "T=512, hd=256, kv_bytes=4008960, cs_positions=6160, kp=2"}
+{"section": "f6ab6646e1ca", "label": "GemmaPrepOperator (models/gemma4/attn_prefill.py)", "detail": "T=512, hd=512, kv_bytes=7105536, cs_positions=6160, kp=2"}
 {"section": "1d1ef07f3633", "label": "LfmDecodeOperator (models/lfm/decode.py)", "detail": "hidden=2048, tile_bytes=9280, eps=1e-05, gu_win=False, split=False"}
 {"section": "21f3fadbb307", "label": "LlamaDecodeOperator (models/llama/decode.py)", "detail": "hidden=1024, tile_bytes=10240, eps=1e-06, gu_win=False, split=False, tails=False, tail_pairs=False"}
 {"section": "c60c6d31af62", "label": "LlamaDecodeOperator (models/llama/decode.py)", "detail": "hidden=1024, tile_bytes=9216, eps=1e-06, gu_win=False, split=False, tails=False, tail_pairs=False, rot=True"}
@@ -846,6 +853,7 @@
 {"section": "9d61474a4cb1", "label": "LlamaDecodeOperator (models/llama/decode.py)", "detail": "hidden=2560, tile_bytes=9280, eps=1e-06, gu_win=False, split=False, tails=True, tail_pairs=True"}
 {"section": "2d0852bc679e", "label": "LlamaDecodeOperator (models/llama/decode.py)", "detail": "hidden=3072, tile_bytes=9280, eps=1e-05, gu_win=False, split=False, tails=False, tail_pairs=False"}
 {"section": "2fc0feb39916", "label": "LlamaDecodeOperator (models/llama/decode.py)", "detail": "hidden=4096, tile_bytes=9280, eps=1e-05, gu_win=False, split=False, tails=False, tail_pairs=False"}
+{"section": "af017575a1cf", "label": "PleOperator (models/gemma4/prefill_ple.py)", "detail": "T=1024, pitch=1344, eps=0.00256, dense=True"}
 {"section": "60549bb91218", "label": "PleOperator (models/gemma4/prefill_ple.py)", "detail": "T=256, pitch=1344, eps=0.00256, dense=True"}
 {"section": "7ddcd036ef05", "label": "PleOperator (models/gemma4/prefill_ple.py)", "detail": "T=288, pitch=1344, eps=0.00256"}
 {"section": "436305e00259", "label": "PrefillAttnOperator (artlite/prefill/attn256.py)", "detail": "T=1024, head_bytes=2375680, causal=True, pp=1"}
@@ -1065,13 +1073,13 @@
 {"section": "a4003c6985cf", "label": "PrefillNormOperator (artlite/prefill/norm/prefill_norm.py)", "detail": "T=64, add=False, E=5120, eps=1e-06, raw=True, out_pitch=25600, out_col=0"}
 {"section": "ea2097cd7555", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024, copies=2, bf16=True"}
 {"section": "09531197f3cb", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=1024, copies=3, bf16=True"}
-{"section": "bb03ef37c32d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=10240, gu=True, act='gelu', gu_split=True"}
+{"section": "6a9aaaf21848", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=10240, bf16=True"}
 {"section": "c07661d60d4d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2048"}
 {"section": "57ff9acb746e", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=256, narrow=True"}
 {"section": "5cca5e252b9f", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2560, bf16=True"}
 {"section": "9afb062ae278", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2560, copies=2, bf16=True"}
 {"section": "3edf6b834fbd", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=2560, copies=3, bf16=True"}
-{"section": "e7d0b5e980d0", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=3072, gu=True"}
+{"section": "3498f4391df9", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=3072, bf16=True, narrow=True"}
 {"section": "0d65112c21bf", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=1024, K=4096"}
 {"section": "f5efea7b4b97", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024, copies=2, bf16=True"}
 {"section": "071640839edf", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=1024, copies=3, bf16=True"}
@@ -1081,15 +1089,15 @@
 {"section": "d28c132e2327", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, bf16=True, rows_out=True"}
 {"section": "644019fa91b6", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, copies=2, bf16=True"}
 {"section": "704231f602fc", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=2048, copies=3, bf16=True"}
-{"section": "36d58b8e6116", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3072, gu=True"}
-{"section": "ac9141bd68df", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3584, gu=True, rows=None"}
+{"section": "2496996dca4a", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3072, bf16=True, narrow=True"}
+{"section": "98577a6bba85", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=3584, bf16=True, narrow=True"}
 {"section": "1279240accb2", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=4096"}
 {"section": "db8e5953b4f7", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=5120, copies=2, bf16=True"}
 {"section": "75bed4acf62d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=5120, copies=3, bf16=True"}
 {"section": "4be0e07296f4", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=128, K=6144"}
 {"section": "ec7fc0e6d8bd", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=1024, copies=2, bf16=True"}
 {"section": "f8ece7224362", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=1024, copies=3, bf16=True"}
-{"section": "b1bbabec31c0", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=10240, gu=True, act='gelu', gu_split=True"}
+{"section": "f4a8ac4caa5c", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=10240, bf16=True"}
 {"section": "987c7440239e", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=17408, gu=True"}
 {"section": "813938ace329", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048"}
 {"section": "2fcf4519e494", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2048, bf16=True, hilo=True"}
@@ -1100,8 +1108,8 @@
 {"section": "08f132cc6c4d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2560, bf16=True"}
 {"section": "0d448e31736e", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2560, copies=2, bf16=True"}
 {"section": "547fa192c09f", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=2560, copies=3, bf16=True"}
-{"section": "6becf8da681d", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3072, gu=True"}
-{"section": "bd6a7985dafd", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3584, gu=True, rows=None"}
+{"section": "7bffd2ecdeb7", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3072, bf16=True, narrow=True"}
+{"section": "3ba77b475029", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=3584, bf16=True, narrow=True"}
 {"section": "11fcf5cbfd26", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=4096"}
 {"section": "d708726c954a", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=5120, copies=2, bf16=True"}
 {"section": "555be30292a5", "label": "PrefillRotOperator (artlite/prefill/rotate.py)", "detail": "T=256, K=5120, copies=3, bf16=True"}
@@ -1162,6 +1170,10 @@
 {"section": "9069b6c8f61f", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2048, mode='in', eps=1e-05"}
 {"section": "252ed1100b84", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=1, d_stride=0"}
 {"section": "fd7577a3ec5a", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=2, d_stride=2097152"}
+{"section": "dbb6d5bc6d35", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2560, mode='in', eps=1e-06, bf16=True"}
+{"section": "6d0b18ebbcf4", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2560, mode='plain', eps=1e-06, d_pitch=320"}
+{"section": "9bf7cd9cd202", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2560, mode='post', eps=1e-06, d_pitch=320, bf16=True"}
+{"section": "352e5f5c393c", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=1024, E=2560, mode='post', eps=1e-06, d_pitch=320, scale=True, bf16=True"}
 {"section": "8a337a7d4b99", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=128, E=2048, mode='in', eps=1e-05"}
 {"section": "6d12947f64d8", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=128, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=1, d_stride=0"}
 {"section": "c7ae46262922", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=128, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=2, d_stride=262144"}
@@ -1196,6 +1208,7 @@
 {"section": "4af1bec68671", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=512, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=2, d_stride=1048576"}
 {"section": "af847d1a156c", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=512, E=2048, mode='post', eps=1e-05, d_pitch=288, deltas=1, d_stride=0"}
 {"section": "a9e50d37952c", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=512, E=2048, mode='post', eps=1e-05, d_pitch=288, deltas=2, d_stride=1179648"}
+{"section": "390f21cb71c3", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=512, E=2560, mode='plain', eps=1e-06, d_pitch=320, deltas=2, d_stride=1310720, bf16=True"}
 {"section": "938a7b7a331d", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=64, E=2048, mode='in', eps=1e-05"}
 {"section": "39dbb60589bb", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=64, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=1, d_stride=0"}
 {"section": "9c3c56e43fc1", "label": "ResidualNormOperator (artlite/prefill/norm/residual.py)", "detail": "T=64, E=2048, mode='post', eps=1e-05, d_pitch=256, deltas=2, d_stride=131072"}
@@ -1807,6 +1820,10 @@
 {"fn": "gq_mmf", "in": "85f37f0b275f", "apps": ["flint-int4"], "cycles": 784, "upper": false, "bytes": 944, "stack": 256, "calls": [], "loops": [{"at": "macf+17", "parent": -1, "sched": "post-RA", "ii": 47, "ns": 2, "bound": 38, "iters": 15, "spills": 8, "bytes": 400}]}
 {"fn": "gq_pairs", "in": "85f37f0b275f", "apps": ["flint-int4"], "cycles": 17087, "upper": false, "bytes": 1888, "stack": 832, "calls": [], "loops": [{"at": "gq_pairs+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 78}, {"at": "gq_pairs+5", "parent": 0, "sched": "none", "ii": 265, "ns": 1, "bound": 256, "iters": 8, "spills": 71, "bytes": 1680}]}
 {"fn": "gq_zerof", "in": "85f37f0b275f", "apps": ["flint-int4"], "cycles": 271, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 256, "spills": 0, "bytes": 16}]}
+{"fn": "gq_dual", "in": "f579a9599520", "apps": ["qwen3-0.6B-PARO"], "cycles": 3148, "upper": true, "bytes": 240, "stack": 0, "calls": [["19f87596bd5e", "km_silu_lut_t<4096>", 1]], "loops": [{"at": "gq_dual+14", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 2, "bound": 3, "iters": 63, "spills": 0, "bytes": 112}]}
+{"fn": "gq_dual", "in": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "cycles": 3148, "upper": true, "bytes": 240, "stack": 0, "calls": [["f151d6e2314f", "km_gelu_lut_t<4096>", 1]], "loops": [{"at": "gq_dual+14", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 2, "bound": 3, "iters": 63, "spills": 0, "bytes": 112}]}
+{"fn": "km_gelu_lut_t<4096>", "in": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "cycles": 2105, "upper": false, "bytes": 256, "stack": 0, "calls": [["f151d6e2314f", "km_gelu_tab_t<4096>", 1]], "loops": [{"at": "km_gelu_lut_t+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 123, "spills": 0, "bytes": 32}]}
+{"fn": "km_gelu_tab_t<4096>", "in": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "cycles": 1834, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_gelu_tab_t+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 125, "spills": 0, "bytes": 128}]}
 {"fn": "gq_mm", "in": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "cycles": 548, "upper": false, "bytes": 880, "stack": 0, "calls": [], "loops": [{"at": "mac+26", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
 {"fn": "gq_zero", "in": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
 {"fn": "gq_dq", "in": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "cycles": 198, "upper": false, "bytes": 704, "stack": 128, "calls": [], "loops": [{"at": "gq_dq+19", "parent": -1, "sched": "post-RA", "ii": 40, "ns": 2, "bound": 40, "iters": 3, "spills": 2, "bytes": 272}]}
@@ -1816,6 +1833,16 @@
 {"fn": "gq_pace0", "in": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "cycles": 7, "upper": false, "bytes": 32, "stack": 0, "calls": [], "loops": []}
 {"fn": "gq_pace1", "in": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "cycles": null, "upper": null, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "gq_pace1+10", "parent": -1, "sched": "none", "ii": 8, "ns": 1, "bound": 3, "iters": null, "spills": 0, "bytes": 32}]}
 {"fn": "gq_zero", "in": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
+{"fn": "gq_dual", "in": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "cycles": 1612, "upper": true, "bytes": 240, "stack": 0, "calls": [["19f87596bd5e", "km_silu_lut_t<2048>", 1]], "loops": [{"at": "gq_dual+14", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 2, "bound": 3, "iters": 31, "spills": 0, "bytes": 112}]}
+{"fn": "km_silu_lut_t<2048>", "in": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "cycles": 1081, "upper": false, "bytes": 256, "stack": 0, "calls": [["19f87596bd5e", "km_silu_tab_t<2048>", 1]], "loops": [{"at": "km_silu_lut_t+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}]}
+{"fn": "km_silu_lut_t<4096>", "in": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "cycles": 2105, "upper": false, "bytes": 256, "stack": 0, "calls": [["19f87596bd5e", "km_silu_tab_t<4096>", 1]], "loops": [{"at": "km_silu_lut_t+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 123, "spills": 0, "bytes": 32}]}
+{"fn": "km_silu_tab_t<2048>", "in": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "cycles": 938, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_silu_tab_t+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
+{"fn": "km_silu_tab_t<4096>", "in": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "cycles": 1834, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_silu_tab_t+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 125, "spills": 0, "bytes": 128}]}
+{"fn": "gq_dual", "in": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 1612, "upper": true, "bytes": 240, "stack": 0, "calls": [["ad145d5984d1", "km_silu_lut_t<2048>", 1]], "loops": [{"at": "gq_dual+14", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 2, "bound": 3, "iters": 31, "spills": 0, "bytes": 112}]}
+{"fn": "km_silu_lut_t<2048>", "in": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 1081, "upper": false, "bytes": 256, "stack": 0, "calls": [["ad145d5984d1", "km_silu_tab_t<2048>", 1]], "loops": [{"at": "km_silu_lut_t+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}]}
+{"fn": "km_silu_lut_t<4096>", "in": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 2105, "upper": false, "bytes": 256, "stack": 0, "calls": [["ad145d5984d1", "km_silu_tab_t<4096>", 1]], "loops": [{"at": "km_silu_lut_t+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 123, "spills": 0, "bytes": 32}]}
+{"fn": "km_silu_tab_t<2048>", "in": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 938, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_silu_tab_t+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
+{"fn": "km_silu_tab_t<4096>", "in": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 1834, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_silu_tab_t+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 125, "spills": 0, "bytes": 128}]}
 {"fn": "gq_dq", "in": "64d8cc8f8c74", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 198, "upper": false, "bytes": 704, "stack": 128, "calls": [], "loops": [{"at": "gq_dq+19", "parent": -1, "sched": "post-RA", "ii": 40, "ns": 2, "bound": 40, "iters": 3, "spills": 2, "bytes": 272}]}
 {"fn": "gq_hcp", "in": "64d8cc8f8c74", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 40, "upper": true, "bytes": 224, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:49", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 9, "spills": 0, "bytes": 16}]}
 {"fn": "gq_hdr_p4", "in": "64d8cc8f8c74", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 133, "upper": false, "bytes": 496, "stack": 64, "calls": [], "loops": [{"at": "gq_hdr_p4+4", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 278}, {"at": "gq_hdr_p4+6", "parent": 0, "sched": "pre-RA", "ii": 12, "ns": 3, "bound": 12, "iters": 2, "spills": 0, "bytes": 112}]}
@@ -1837,6 +1864,7 @@
 {"fn": "gq_pace0", "in": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "cycles": 7, "upper": false, "bytes": 32, "stack": 0, "calls": [], "loops": []}
 {"fn": "gq_pace1", "in": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "cycles": null, "upper": null, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "gq_pace1+10", "parent": -1, "sched": "none", "ii": 8, "ns": 1, "bound": 3, "iters": null, "spills": 0, "bytes": 32}]}
 {"fn": "gq_zero", "in": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "cycles": 79, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 64, "spills": 0, "bytes": 16}]}
+{"fn": "gq_dual", "in": "e978194b8df6", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 3148, "upper": true, "bytes": 240, "stack": 0, "calls": [["ad145d5984d1", "km_silu_lut_t<4096>", 1]], "loops": [{"at": "gq_dual+14", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 2, "bound": 3, "iters": 63, "spills": 0, "bytes": 112}]}
 {"fn": "gq_mm", "in": "2df0935d49b2", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 548, "upper": false, "bytes": 880, "stack": 0, "calls": [], "loops": [{"at": "mac+26", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
 {"fn": "gq_zero", "in": "2df0935d49b2", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 143, "upper": false, "bytes": 160, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:61", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 1, "bound": 1, "iters": 128, "spills": 0, "bytes": 16}]}
 {"fn": "gq_mm", "in": "1eb6e4c0d581", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 548, "upper": false, "bytes": 880, "stack": 0, "calls": [], "loops": [{"at": "mac+26", "parent": -1, "sched": "post-RA", "ii": 32, "ns": 2, "bound": 32, "iters": 15, "spills": 0, "bytes": 320}]}
@@ -2674,19 +2702,6 @@
 {"fn": "km_gelu_tab<32>", "in": "0de3321d675f", "apps": ["gemma-E4B-PARO"], "cycles": 52, "upper": false, "bytes": 272, "stack": 0, "calls": [], "loops": []}
 {"fn": "km_rot_r8_g1_f32_c3072", "in": "0de3321d675f", "apps": ["gemma-E4B-PARO"], "cycles": 1541, "upper": false, "bytes": 288, "stack": 64, "calls": [["0de3321d675f", "km_rot_r8_g1_f32_c3072_round", 8]], "loops": [{"at": "km_rot_r8_g1_f32_c3072+7", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 9, "iters": 4, "spills": 0, "bytes": 130}]}
 {"fn": "km_rot_r8_g1_f32_c3072_round", "in": "0de3321d675f", "apps": ["gemma-E4B-PARO"], "cycles": 179, "upper": false, "bytes": 688, "stack": 0, "calls": [], "loops": [{"at": "km_rot_r8_g1_f32_c3072_round+12", "parent": -1, "sched": "post-RA", "ii": 17, "ns": 4, "bound": 16, "iters": 5, "spills": 0, "bytes": 144}]}
-{"fn": "g4ap_k", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 3936, "upper": false, "bytes": 1120, "stack": 320, "calls": [["9e46c541a1fd", "g4ap_nr", 8], ["9e46c541a1fd", "g4ap_scatter", 8]], "loops": [{"at": "kernel_lib.h:584", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 30, "spills": 8, "bytes": 112}]}
-{"fn": "g4ap_nr", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 382, "upper": false, "bytes": 368, "stack": 64, "calls": [["9e46c541a1fd", "km_rms_256_l32_e1em06", 1]], "loops": [{"at": "km_rope_128_i+4", "parent": -1, "sched": "none", "ii": 47, "ns": 1, "bound": 16, "iters": 4, "spills": 0, "bytes": 224}]}
-{"fn": "g4ap_prm", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 14, "upper": false, "bytes": 48, "stack": 0, "calls": [], "loops": []}
-{"fn": "g4ap_q", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 5097, "upper": false, "bytes": 912, "stack": 576, "calls": [["9e46c541a1fd", "g4ap_nr", 8], ["9e46c541a1fd", "g4ap_scatter", 8]], "loops": [{"at": "g4ap_q+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 10, "bytes": 312}, {"at": "g4ap_q+12", "parent": 0, "sched": "post-RA", "ii": 31, "ns": 2, "bound": 12, "iters": 3, "spills": 0, "bytes": 160}, {"at": "kernel_lib.h:575", "parent": -1, "sched": "pre-RA", "ii": 12, "ns": 2, "bound": 5, "iters": 31, "spills": 0, "bytes": 112}]}
-{"fn": "g4ap_scatter", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 43, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 25, "spills": 0, "bytes": 16}]}
-{"fn": "g4ap_v", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 2456, "upper": false, "bytes": 752, "stack": 64, "calls": [["9e46c541a1fd", "km_rms_256_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 180}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 7, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 30, "spills": 0, "bytes": 96}]}
-{"fn": "km_rms_256_l32_e1em06", "in": "9e46c541a1fd", "apps": ["gemma-E4B-PARO"], "cycles": 168, "upper": false, "bytes": 624, "stack": 0, "calls": [], "loops": [{"at": "km_rms_256_l32_e1em06+12", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 6, "spills": 0, "bytes": 96}]}
-{"fn": "g4ap_k", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 4384, "upper": false, "bytes": 1120, "stack": 320, "calls": [["8fefc52e7259", "g4ap_nr", 8], ["8fefc52e7259", "g4ap_scatter", 8]], "loops": [{"at": "kernel_lib.h:584", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 62, "spills": 8, "bytes": 112}]}
-{"fn": "g4ap_nr", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 354, "upper": false, "bytes": 368, "stack": 64, "calls": [["8fefc52e7259", "km_rms_512_l32_e1em06", 1]], "loops": [{"at": "km_rope_64_d256_i+4", "parent": -1, "sched": "none", "ii": 46, "ns": 1, "bound": 16, "iters": 2, "spills": 0, "bytes": 224}]}
-{"fn": "g4ap_q", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 6624, "upper": false, "bytes": 1136, "stack": 832, "calls": [["8fefc52e7259", "g4ap_nr", 8], ["8fefc52e7259", "g4ap_scatter", 8]], "loops": [{"at": "g4ap_q+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 14, "bytes": 320}, {"at": "g4ap_q+12", "parent": 0, "sched": "post-RA", "ii": 31, "ns": 2, "bound": 12, "iters": 7, "spills": 0, "bytes": 160}, {"at": "g4ap_q+17", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 16, "bytes": 274}, {"at": "g4ap_q+20", "parent": 2, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 9, "iters": 30, "spills": 8, "bytes": 96}]}
-{"fn": "g4ap_scatter", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 75, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 57, "spills": 0, "bytes": 16}]}
-{"fn": "g4ap_v", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 3927, "upper": false, "bytes": 752, "stack": 64, "calls": [["8fefc52e7259", "km_rms_512_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 15, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 62, "spills": 0, "bytes": 96}]}
-{"fn": "km_rms_512_l32_e1em06", "in": "8fefc52e7259", "apps": ["gemma-E4B-PARO"], "cycles": 236, "upper": false, "bytes": 672, "stack": 0, "calls": [], "loops": [{"at": "km_rms_512_l32_e1em06+16", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 14, "spills": 0, "bytes": 96}]}
 {"fn": "g4ap_k", "in": "36364361e2f2", "apps": ["gemma-E4B-Q4_0"], "cycles": 3936, "upper": false, "bytes": 1120, "stack": 320, "calls": [["36364361e2f2", "g4ap_nr", 8], ["36364361e2f2", "g4ap_scatter", 8]], "loops": [{"at": "kernel_lib.h:584", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 30, "spills": 8, "bytes": 112}]}
 {"fn": "g4ap_nr", "in": "36364361e2f2", "apps": ["gemma-E4B-Q4_0"], "cycles": 382, "upper": false, "bytes": 368, "stack": 64, "calls": [["36364361e2f2", "km_rms_256_l32_e1em06", 1]], "loops": [{"at": "km_rope_128_i+4", "parent": -1, "sched": "none", "ii": 47, "ns": 1, "bound": 16, "iters": 4, "spills": 0, "bytes": 224}]}
 {"fn": "g4ap_prm", "in": "36364361e2f2", "apps": ["gemma-E4B-Q4_0"], "cycles": 14, "upper": false, "bytes": 48, "stack": 0, "calls": [], "loops": []}
@@ -2700,6 +2715,19 @@
 {"fn": "g4ap_scatter", "in": "c967bfd20ed3", "apps": ["gemma-E4B-Q4_0"], "cycles": 75, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 57, "spills": 0, "bytes": 16}]}
 {"fn": "g4ap_v", "in": "c967bfd20ed3", "apps": ["gemma-E4B-Q4_0"], "cycles": 3927, "upper": false, "bytes": 752, "stack": 64, "calls": [["c967bfd20ed3", "km_rms_512_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 15, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "km_rms_512_l32_e1em06", "in": "c967bfd20ed3", "apps": ["gemma-E4B-Q4_0"], "cycles": 236, "upper": false, "bytes": 672, "stack": 0, "calls": [], "loops": [{"at": "km_rms_512_l32_e1em06+16", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 14, "spills": 0, "bytes": 96}]}
+{"fn": "g4ap_k", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 3936, "upper": false, "bytes": 1120, "stack": 320, "calls": [["6062bbd7d282", "g4ap_nr", 8], ["6062bbd7d282", "g4ap_scatter", 8]], "loops": [{"at": "kernel_lib.h:584", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 30, "spills": 8, "bytes": 112}]}
+{"fn": "g4ap_nr", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 382, "upper": false, "bytes": 368, "stack": 64, "calls": [["6062bbd7d282", "km_rms_256_l32_e1em06", 1]], "loops": [{"at": "km_rope_128_i+4", "parent": -1, "sched": "none", "ii": 47, "ns": 1, "bound": 16, "iters": 4, "spills": 0, "bytes": 224}]}
+{"fn": "g4ap_prm", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 14, "upper": false, "bytes": 48, "stack": 0, "calls": [], "loops": []}
+{"fn": "g4ap_q", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 5097, "upper": false, "bytes": 912, "stack": 576, "calls": [["6062bbd7d282", "g4ap_nr", 8], ["6062bbd7d282", "g4ap_scatter", 8]], "loops": [{"at": "g4ap_q+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 10, "bytes": 312}, {"at": "g4ap_q+12", "parent": 0, "sched": "post-RA", "ii": 31, "ns": 2, "bound": 12, "iters": 3, "spills": 0, "bytes": 160}, {"at": "kernel_lib.h:575", "parent": -1, "sched": "pre-RA", "ii": 12, "ns": 2, "bound": 5, "iters": 31, "spills": 0, "bytes": 112}]}
+{"fn": "g4ap_scatter", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 43, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 25, "spills": 0, "bytes": 16}]}
+{"fn": "g4ap_v", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 2456, "upper": false, "bytes": 752, "stack": 64, "calls": [["6062bbd7d282", "km_rms_256_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 180}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 7, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 30, "spills": 0, "bytes": 96}]}
+{"fn": "km_rms_256_l32_e1em06", "in": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "cycles": 168, "upper": false, "bytes": 624, "stack": 0, "calls": [], "loops": [{"at": "km_rms_256_l32_e1em06+12", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 6, "spills": 0, "bytes": 96}]}
+{"fn": "g4ap_k", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 4384, "upper": false, "bytes": 1120, "stack": 320, "calls": [["f6ab6646e1ca", "g4ap_nr", 8], ["f6ab6646e1ca", "g4ap_scatter", 8]], "loops": [{"at": "kernel_lib.h:584", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 62, "spills": 8, "bytes": 112}]}
+{"fn": "g4ap_nr", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 354, "upper": false, "bytes": 368, "stack": 64, "calls": [["f6ab6646e1ca", "km_rms_512_l32_e1em06", 1]], "loops": [{"at": "km_rope_64_d256_i+4", "parent": -1, "sched": "none", "ii": 46, "ns": 1, "bound": 16, "iters": 2, "spills": 0, "bytes": 224}]}
+{"fn": "g4ap_q", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 6624, "upper": false, "bytes": 1136, "stack": 832, "calls": [["f6ab6646e1ca", "g4ap_nr", 8], ["f6ab6646e1ca", "g4ap_scatter", 8]], "loops": [{"at": "g4ap_q+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 14, "bytes": 320}, {"at": "g4ap_q+12", "parent": 0, "sched": "post-RA", "ii": 31, "ns": 2, "bound": 12, "iters": 7, "spills": 0, "bytes": 160}, {"at": "g4ap_q+17", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 16, "bytes": 274}, {"at": "g4ap_q+20", "parent": 2, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 9, "iters": 30, "spills": 8, "bytes": 96}]}
+{"fn": "g4ap_scatter", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 75, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 57, "spills": 0, "bytes": 16}]}
+{"fn": "g4ap_v", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 3927, "upper": false, "bytes": 752, "stack": 64, "calls": [["f6ab6646e1ca", "km_rms_512_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 15, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "km_rms_512_l32_e1em06", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 236, "upper": false, "bytes": 672, "stack": 0, "calls": [], "loops": [{"at": "km_rms_512_l32_e1em06+16", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 14, "spills": 0, "bytes": 96}]}
 {"fn": "km_exp2_v64_zero", "in": "1d1ef07f3633", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "cycles": 88, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": []}
 {"fn": "km_silu_lut<32>", "in": "1d1ef07f3633", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "cycles": 64, "upper": false, "bytes": 64, "stack": 0, "calls": [["1d1ef07f3633", "km_silu_tab<32>", 1]], "loops": []}
 {"fn": "km_silu_tab<32>", "in": "1d1ef07f3633", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "cycles": 52, "upper": false, "bytes": 272, "stack": 0, "calls": [], "loops": []}
@@ -3392,8 +3420,8 @@
 {"fn": "l3dm_q6h_tab", "in": "2fc0feb39916", "apps": ["llama-8B-Q4_K_S"], "cycles": 87, "upper": false, "bytes": 608, "stack": 0, "calls": [], "loops": [{"at": "l3dm_q6h_tab+26", "parent": -1, "sched": "post-RA", "ii": 12, "ns": 4, "bound": 12, "iters": 1, "spills": 0, "bytes": 112}]}
 {"fn": "l3dm_sc", "in": "2fc0feb39916", "apps": ["llama-8B-Q4_K_S"], "cycles": 68, "upper": false, "bytes": 288, "stack": 0, "calls": [], "loops": [{"at": "l3dm_sc+12", "parent": -1, "sched": "post-RA", "ii": 6, "ns": 3, "bound": 4, "iters": 6, "spills": 0, "bytes": 64}]}
 {"fn": "l3dm_trq", "in": "2fc0feb39916", "apps": ["llama-8B-Q4_K_S"], "cycles": 215, "upper": false, "bytes": 880, "stack": 0, "calls": [], "loops": [{"at": "l3dm_trq+10", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 466}, {"at": "l3dm_trq+12", "parent": 0, "sched": "post-RA", "ii": 18, "ns": 2, "bound": 18, "iters": 1, "spills": 0, "bytes": 192}]}
-{"fn": "g4ple_ple", "in": "60549bb91218", "apps": ["gemma-E4B-PARO"], "cycles": 4960, "upper": false, "bytes": 1664, "stack": 384, "calls": [["60549bb91218", "km_gelu_tab_t_w1x64<2048>", 1]], "loops": [{"at": "km_gelu_lut_t_w1x64_i+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+13", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 236}, {"at": "g4ple_ple+17", "parent": 1, "sched": "post-RA", "ii": 3, "ns": 4, "bound": 3, "iters": 4, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+29", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 76}, {"at": "g4ple_ple+32", "parent": 3, "sched": "none", "ii": 38, "ns": 1, "bound": 7, "iters": 8, "spills": 0, "bytes": 144}, {"at": "g4ple_ple+46", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 226}, {"at": "g4ple_ple+47", "parent": 5, "sched": "pre-RA", "ii": 19, "ns": 2, "bound": 15, "iters": 3, "spills": 0, "bytes": 160}]}
-{"fn": "km_gelu_tab_t_w1x64<2048>", "in": "60549bb91218", "apps": ["gemma-E4B-PARO"], "cycles": 938, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_gelu_tab_t_w1x64+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
+{"fn": "g4ple_ple", "in": "af017575a1cf", "apps": ["gemma-E4B-PARO"], "cycles": 4960, "upper": false, "bytes": 1664, "stack": 384, "calls": [["af017575a1cf", "km_gelu_tab_t_w1x64<2048>", 1]], "loops": [{"at": "km_gelu_lut_t_w1x64_i+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+13", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 236}, {"at": "g4ple_ple+17", "parent": 1, "sched": "post-RA", "ii": 3, "ns": 4, "bound": 3, "iters": 4, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+29", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 76}, {"at": "g4ple_ple+32", "parent": 3, "sched": "none", "ii": 38, "ns": 1, "bound": 7, "iters": 8, "spills": 0, "bytes": 144}, {"at": "g4ple_ple+46", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 226}, {"at": "g4ple_ple+47", "parent": 5, "sched": "pre-RA", "ii": 19, "ns": 2, "bound": 15, "iters": 3, "spills": 0, "bytes": 160}]}
+{"fn": "km_gelu_tab_t_w1x64<2048>", "in": "af017575a1cf", "apps": ["gemma-E4B-PARO"], "cycles": 938, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_gelu_tab_t_w1x64+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
 {"fn": "g4ple_ple", "in": "7ddcd036ef05", "apps": ["gemma-E4B-Q4_0"], "cycles": 5099, "upper": false, "bytes": 1872, "stack": 640, "calls": [["7ddcd036ef05", "km_gelu_tab_t_w1x64<2048>", 1]], "loops": [{"at": "km_gelu_lut_t_w1x64_i+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+13", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 236}, {"at": "g4ple_ple+17", "parent": 1, "sched": "post-RA", "ii": 3, "ns": 4, "bound": 3, "iters": 4, "spills": 0, "bytes": 32}, {"at": "g4ple_ple+29", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 82}, {"at": "g4ple_ple+32", "parent": 3, "sched": "none", "ii": 38, "ns": 1, "bound": 7, "iters": 8, "spills": 0, "bytes": 144}, {"at": "g4ple_ple+46", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 338}, {"at": "g4ple_ple+47", "parent": 5, "sched": "pre-RA", "ii": 20, "ns": 2, "bound": 15, "iters": 3, "spills": 0, "bytes": 144}, {"at": "g4ple_ple+52", "parent": 5, "sched": "post-RA", "ii": 2, "ns": 1, "bound": 2, "iters": 4, "spills": 0, "bytes": 32}]}
 {"fn": "km_gelu_tab_t_w1x64<2048>", "in": "7ddcd036ef05", "apps": ["gemma-E4B-Q4_0"], "cycles": 938, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "km_gelu_tab_t_w1x64+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
 {"fn": "km_pp1_split_t__exp2_a32_bounded<16>", "in": "ba81be165e2f", "apps": ["qwen-1B-Q4_K_M", "qwen3.5-0.8B-PARO"], "cycles": 91, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": [{"at": "km_pp1_split_t__exp2_a32_bounded+8", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 4, "bound": 8, "iters": 5, "spills": 0, "bytes": 96}]}
@@ -3671,24 +3699,20 @@
 {"fn": "prot_rot", "in": "ea2097cd7555", "apps": ["qwen3-0.6B-PARO"], "cycles": 6651, "upper": false, "bytes": 272, "stack": 64, "calls": [["ea2097cd7555", "prot_out", 1], ["ea2097cd7555", "prot_round", 8], ["ea2097cd7555", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_round", "in": "ea2097cd7555", "apps": ["qwen3-0.6B-PARO"], "cycles": 593, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 6, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "prot_u0", "in": "ea2097cd7555", "apps": ["qwen3-0.6B-PARO"], "cycles": 920, "upper": false, "bytes": 992, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 56, "ns": 2, "bound": 39, "iters": 15, "spills": 0, "bytes": 432}]}
-{"fn": "km_gelu_lut_t_w32x2048<2048>", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 1082, "upper": false, "bytes": 272, "stack": 0, "calls": [["bb03ef37c32d", "km_gelu_tab_t_w32x2048<2048>", 1]], "loops": [{"at": "km_gelu_lut_t_w32x2048+13", "parent": -1, "sched": "post-RA", "ii": 2, "ns": 6, "bound": 2, "iters": 59, "spills": 0, "bytes": 32}]}
-{"fn": "km_gelu_tab_t_w32x2048<2048>", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 937, "upper": false, "bytes": 656, "stack": 0, "calls": [], "loops": [{"at": "km_gelu_tab_t_w32x2048+17", "parent": -1, "sched": "post-RA", "ii": 14, "ns": 4, "bound": 10, "iters": 61, "spills": 0, "bytes": 128}]}
-{"fn": "prot_out", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_rot", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 7476, "upper": false, "bytes": 320, "stack": 64, "calls": [["bb03ef37c32d", "prot_out", 1], ["bb03ef37c32d", "prot_round", 8], ["bb03ef37c32d", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_round", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
-{"fn": "prot_u0", "in": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "cycles": 2164, "upper": false, "bytes": 624, "stack": 64, "calls": [["bb03ef37c32d", "km_gelu_lut_t_w32x2048<2048>", 1]], "loops": [{"at": "prot_u0+10", "parent": -1, "sched": "none", "ii": 65, "ns": 1, "bound": 26, "iters": 16, "spills": 0, "bytes": 368}]}
 {"fn": "prot_rot", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["c07661d60d4d", "prot_u0", 1], ["ea2097cd7555", "prot_out", 1], ["ea2097cd7555", "prot_round", 8]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_u0", "in": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+20", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
-{"fn": "prot_rot", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 6040, "upper": false, "bytes": 272, "stack": 64, "calls": [["57ff9acb746e", "prot_u0", 1], ["bb03ef37c32d", "prot_out", 1], ["bb03ef37c32d", "prot_round", 8]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_u0", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 743, "upper": false, "bytes": 736, "stack": 0, "calls": [], "loops": [{"at": "prot_u0+20", "parent": -1, "sched": "post-RA", "ii": 45, "ns": 2, "bound": 26, "iters": 15, "spills": 0, "bytes": 320}]}
+{"fn": "prot_out", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 6040, "upper": false, "bytes": 272, "stack": 64, "calls": [["57ff9acb746e", "prot_out", 1], ["57ff9acb746e", "prot_round", 8], ["57ff9acb746e", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "57ff9acb746e", "apps": ["gemma-E4B-PARO"], "cycles": 743, "upper": false, "bytes": 736, "stack": 0, "calls": [], "loops": [{"at": "prot_u0+19", "parent": -1, "sched": "post-RA", "ii": 45, "ns": 2, "bound": 26, "iters": 15, "spills": 0, "bytes": 320}]}
 {"fn": "prot_out", "in": "5cca5e252b9f", "apps": ["gemma-E4B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
 {"fn": "prot_rot", "in": "5cca5e252b9f", "apps": ["gemma-E4B-PARO"], "cycles": 6651, "upper": false, "bytes": 272, "stack": 64, "calls": [["5cca5e252b9f", "prot_out", 1], ["5cca5e252b9f", "prot_round", 8], ["5cca5e252b9f", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_round", "in": "5cca5e252b9f", "apps": ["gemma-E4B-PARO"], "cycles": 593, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 6, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "prot_u0", "in": "5cca5e252b9f", "apps": ["gemma-E4B-PARO"], "cycles": 920, "upper": false, "bytes": 992, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 56, "ns": 2, "bound": 39, "iters": 15, "spills": 0, "bytes": 432}]}
-{"fn": "prot_out", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_rot", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 7677, "upper": false, "bytes": 272, "stack": 64, "calls": [["e7d0b5e980d0", "prot_out", 1], ["e7d0b5e980d0", "prot_round", 8], ["e7d0b5e980d0", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_round", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
-{"fn": "prot_u0", "in": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "cycles": 2379, "upper": false, "bytes": 1504, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 60, "spills": 0, "bytes": 96}, {"at": "prot_u0+10", "parent": -1, "sched": "none", "ii": 64, "ns": 1, "bound": 27, "iters": 16, "spills": 0, "bytes": 368}]}
+{"fn": "prot_out", "in": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "cycles": 5911, "upper": false, "bytes": 272, "stack": 64, "calls": [["3498f4391df9", "prot_out", 1], ["3498f4391df9", "prot_round", 8], ["3498f4391df9", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "cycles": 614, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 37, "ns": 2, "bound": 23, "iters": 15, "spills": 0, "bytes": 272}]}
 {"fn": "prot_rot", "in": "0d65112c21bf", "apps": ["gemma-E4B-PARO"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["0d65112c21bf", "prot_u0", 1], ["5cca5e252b9f", "prot_out", 1], ["5cca5e252b9f", "prot_round", 8]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_u0", "in": "0d65112c21bf", "apps": ["gemma-E4B-PARO"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+20", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
 {"fn": "prot_out", "in": "f8ece7224362", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
@@ -3711,10 +3735,10 @@
 {"fn": "prot_rot", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 6651, "upper": false, "bytes": 272, "stack": 64, "calls": [["aa74d5b90032", "prot_out", 1], ["aa74d5b90032", "prot_round", 8], ["aa74d5b90032", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_round", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 593, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 6, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "prot_u0", "in": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 920, "upper": false, "bytes": 992, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 56, "ns": 2, "bound": 39, "iters": 15, "spills": 0, "bytes": 432}]}
-{"fn": "prot_out", "in": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
-{"fn": "prot_rot", "in": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 7677, "upper": false, "bytes": 272, "stack": 64, "calls": [["bd6a7985dafd", "prot_out", 1], ["bd6a7985dafd", "prot_round", 8], ["bd6a7985dafd", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
-{"fn": "prot_round", "in": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
-{"fn": "prot_u0", "in": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 2379, "upper": false, "bytes": 1504, "stack": 192, "calls": [], "loops": [{"at": "km_silu_tanh_w2x128_i+17", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 4, "bound": 7, "iters": 61, "spills": 0, "bytes": 96}, {"at": "km_silu_tanh_w2x128_i+36", "parent": -1, "sched": "post-RA", "ii": 10, "ns": 5, "bound": 8, "iters": 60, "spills": 0, "bytes": 96}, {"at": "prot_u0+10", "parent": -1, "sched": "none", "ii": 64, "ns": 1, "bound": 27, "iters": 16, "spills": 0, "bytes": 368}]}
+{"fn": "prot_out", "in": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 445, "upper": false, "bytes": 720, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 2, "spills": 0, "bytes": 530}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
+{"fn": "prot_rot", "in": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 5911, "upper": false, "bytes": 272, "stack": 64, "calls": [["3ba77b475029", "prot_out", 1], ["3ba77b475029", "prot_round", 8], ["3ba77b475029", "prot_u0", 1]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
+{"fn": "prot_round", "in": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 593, "upper": false, "bytes": 320, "stack": 0, "calls": [], "loops": [{"at": "prot_round+8", "parent": -1, "sched": "post-RA", "ii": 9, "ns": 3, "bound": 5, "iters": 62, "spills": 0, "bytes": 96}]}
+{"fn": "prot_u0", "in": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "cycles": 614, "upper": false, "bytes": 640, "stack": 0, "calls": [], "loops": [{"at": "prot_u0+18", "parent": -1, "sched": "post-RA", "ii": 37, "ns": 2, "bound": 23, "iters": 15, "spills": 0, "bytes": 272}]}
 {"fn": "prot_rot", "in": "11fcf5cbfd26", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["11fcf5cbfd26", "prot_u0", 1], ["aa74d5b90032", "prot_out", 1], ["aa74d5b90032", "prot_round", 8]], "loops": [{"at": "prot_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
 {"fn": "prot_u0", "in": "11fcf5cbfd26", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 986, "upper": false, "bytes": 1120, "stack": 64, "calls": [], "loops": [{"at": "prot_u0+20", "parent": -1, "sched": "post-RA", "ii": 60, "ns": 2, "bound": 43, "iters": 15, "spills": 0, "bytes": 480}]}
 {"fn": "prot_out", "in": "555be30292a5", "apps": ["qwen3.8-27B-PARO-int5", "qwen3.8-27B-PARO-int5-dflash"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "prot_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "prot_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
@@ -5030,6 +5054,15 @@
 {"fn": "gn_pan", "in": "fd7577a3ec5a", "apps": ["lfm3-QAD-Q4_0"], "cycles": 1502, "upper": true, "bytes": 1104, "stack": 384, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 85, "ns": 1, "bound": 26, "iters": 16, "spills": 6, "bytes": 384}]}
 {"fn": "gn_ss", "in": "fd7577a3ec5a", "apps": ["lfm3-QAD-Q4_0"], "cycles": 386, "upper": false, "bytes": 448, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 22, "ns": 2, "bound": 16, "iters": 15, "spills": 0, "bytes": 144}]}
 {"fn": "gn_upd", "in": "fd7577a3ec5a", "apps": ["lfm3-QAD-Q4_0"], "cycles": 1213, "upper": true, "bytes": 1120, "stack": 256, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 66, "ns": 1, "bound": 25, "iters": 16, "spills": 4, "bytes": 336}]}
+{"fn": "gn_pan", "in": "dbb6d5bc6d35", "apps": ["gemma-E4B-PARO"], "cycles": 328, "upper": true, "bytes": 1152, "stack": 0, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 6, "bound": 9, "iters": 15, "spills": 0, "bytes": 96}]}
+{"fn": "gn_ss", "in": "dbb6d5bc6d35", "apps": ["gemma-E4B-PARO"], "cycles": 192, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
+{"fn": "gn_prm", "in": "6d0b18ebbcf4", "apps": ["gemma-E4B-PARO"], "cycles": 38, "upper": true, "bytes": 192, "stack": 0, "calls": [], "loops": []}
+{"fn": "gn_ss", "in": "6d0b18ebbcf4", "apps": ["gemma-E4B-PARO"], "cycles": 193, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
+{"fn": "gn_upd", "in": "6d0b18ebbcf4", "apps": ["gemma-E4B-PARO"], "cycles": 938, "upper": true, "bytes": 1184, "stack": 64, "calls": [], "loops": [{"at": "gn_upd+16", "parent": -1, "sched": "post-RA", "ii": 39, "ns": 2, "bound": 22, "iters": 19, "spills": 0, "bytes": 256}]}
+{"fn": "gn_pan", "in": "9bf7cd9cd202", "apps": ["gemma-E4B-PARO"], "cycles": 1523, "upper": true, "bytes": 1008, "stack": 128, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 69, "ns": 1, "bound": 20, "iters": 20, "spills": 2, "bytes": 288}]}
+{"fn": "gn_upd", "in": "9bf7cd9cd202", "apps": ["gemma-E4B-PARO"], "cycles": 1258, "upper": true, "bytes": 1040, "stack": 0, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 55, "ns": 1, "bound": 19, "iters": 20, "spills": 0, "bytes": 256}]}
+{"fn": "gn_pan", "in": "352e5f5c393c", "apps": ["gemma-E4B-PARO"], "cycles": 1647, "upper": true, "bytes": 1088, "stack": 512, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 75, "ns": 1, "bound": 27, "iters": 20, "spills": 8, "bytes": 336}]}
+{"fn": "gn_upd", "in": "352e5f5c393c", "apps": ["gemma-E4B-PARO"], "cycles": 1418, "upper": true, "bytes": 1088, "stack": 256, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 63, "ns": 1, "bound": 25, "iters": 20, "spills": 4, "bytes": 304}]}
 {"fn": "gn_pan", "in": "a5851e51049c", "apps": ["spark-4B-Q4_K_M"], "cycles": 774, "upper": true, "bytes": 1056, "stack": 0, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 31, "ns": 2, "bound": 18, "iters": 19, "spills": 0, "bytes": 192}]}
 {"fn": "gn_ss", "in": "a5851e51049c", "apps": ["spark-4B-Q4_K_M"], "cycles": 193, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
 {"fn": "gn_upd", "in": "a5851e51049c", "apps": ["spark-4B-Q4_K_M"], "cycles": 490, "upper": false, "bytes": 528, "stack": 0, "calls": [], "loops": [{"at": "gn_upd+13", "parent": -1, "sched": "post-RA", "ii": 23, "ns": 2, "bound": 16, "iters": 19, "spills": 0, "bytes": 176}]}
@@ -5039,20 +5072,9 @@
 {"fn": "gn_pan", "in": "2071b17553b6", "apps": ["spark-4B-Q4_K_M"], "cycles": 1365, "upper": true, "bytes": 1552, "stack": 128, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 59, "ns": 2, "bound": 42, "iters": 19, "spills": 2, "bytes": 400}]}
 {"fn": "gn_ss", "in": "2071b17553b6", "apps": ["spark-4B-Q4_K_M"], "cycles": 851, "upper": false, "bytes": 672, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 41, "ns": 2, "bound": 32, "iters": 19, "spills": 0, "bytes": 256}]}
 {"fn": "gn_upd", "in": "2071b17553b6", "apps": ["spark-4B-Q4_K_M"], "cycles": 1130, "upper": false, "bytes": 960, "stack": 0, "calls": [], "loops": [{"at": "gn_upd+13", "parent": -1, "sched": "post-RA", "ii": 55, "ns": 2, "bound": 40, "iters": 19, "spills": 0, "bytes": 384}]}
-{"fn": "gn_pan", "in": "f99e2d552248", "apps": ["gemma-E4B-PARO"], "cycles": 328, "upper": true, "bytes": 1152, "stack": 0, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 6, "bound": 9, "iters": 15, "spills": 0, "bytes": 96}]}
-{"fn": "gn_ss", "in": "f99e2d552248", "apps": ["gemma-E4B-PARO"], "cycles": 192, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
 {"fn": "gn_pan", "in": "8edbbb2e93bb", "apps": ["spark-4B-Q4_K_M"], "cycles": 412, "upper": true, "bytes": 1184, "stack": 0, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 12, "ns": 5, "bound": 10, "iters": 16, "spills": 0, "bytes": 112}]}
 {"fn": "gn_prm", "in": "8edbbb2e93bb", "apps": ["spark-4B-Q4_K_M"], "cycles": 38, "upper": true, "bytes": 192, "stack": 0, "calls": [], "loops": []}
 {"fn": "gn_ss", "in": "8edbbb2e93bb", "apps": ["spark-4B-Q4_K_M"], "cycles": 192, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
-{"fn": "gn_prm", "in": "9d38033dfaf4", "apps": ["gemma-E4B-PARO"], "cycles": 38, "upper": true, "bytes": 192, "stack": 0, "calls": [], "loops": []}
-{"fn": "gn_ss", "in": "9d38033dfaf4", "apps": ["gemma-E4B-PARO"], "cycles": 193, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
-{"fn": "gn_upd", "in": "9d38033dfaf4", "apps": ["gemma-E4B-PARO"], "cycles": 938, "upper": true, "bytes": 1184, "stack": 64, "calls": [], "loops": [{"at": "gn_upd+16", "parent": -1, "sched": "post-RA", "ii": 39, "ns": 2, "bound": 22, "iters": 19, "spills": 0, "bytes": 256}]}
-{"fn": "gn_ss", "in": "38f855cffa1f", "apps": ["gemma-E4B-PARO"], "cycles": 474, "upper": false, "bytes": 448, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 22, "ns": 2, "bound": 16, "iters": 19, "spills": 0, "bytes": 144}]}
-{"fn": "gn_upd", "in": "38f855cffa1f", "apps": ["gemma-E4B-PARO"], "cycles": 1521, "upper": true, "bytes": 1040, "stack": 320, "calls": [], "loops": [{"at": "gn_upd+16", "parent": -1, "sched": "none", "ii": 69, "ns": 1, "bound": 24, "iters": 20, "spills": 4, "bytes": 336}]}
-{"fn": "gn_pan", "in": "f0e7d7acdbf2", "apps": ["gemma-E4B-PARO"], "cycles": 1523, "upper": true, "bytes": 1008, "stack": 128, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 69, "ns": 1, "bound": 20, "iters": 20, "spills": 2, "bytes": 288}]}
-{"fn": "gn_upd", "in": "f0e7d7acdbf2", "apps": ["gemma-E4B-PARO"], "cycles": 1258, "upper": true, "bytes": 1040, "stack": 0, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 55, "ns": 1, "bound": 19, "iters": 20, "spills": 0, "bytes": 256}]}
-{"fn": "gn_pan", "in": "0d6937701bbc", "apps": ["gemma-E4B-PARO"], "cycles": 1647, "upper": true, "bytes": 1088, "stack": 512, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 75, "ns": 1, "bound": 27, "iters": 20, "spills": 8, "bytes": 336}]}
-{"fn": "gn_upd", "in": "0d6937701bbc", "apps": ["gemma-E4B-PARO"], "cycles": 1418, "upper": true, "bytes": 1088, "stack": 256, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 63, "ns": 1, "bound": 25, "iters": 20, "spills": 4, "bytes": 304}]}
 {"fn": "gn_pan", "in": "b0b4e7bcd9d1", "apps": ["gemma-E4B-Q4_0"], "cycles": 412, "upper": true, "bytes": 1184, "stack": 0, "calls": [], "loops": [{"at": "gn_pan+15", "parent": -1, "sched": "post-RA", "ii": 12, "ns": 5, "bound": 10, "iters": 16, "spills": 0, "bytes": 112}]}
 {"fn": "gn_ss", "in": "b0b4e7bcd9d1", "apps": ["gemma-E4B-Q4_0"], "cycles": 192, "upper": false, "bytes": 336, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 8, "ns": 3, "bound": 6, "iters": 18, "spills": 0, "bytes": 64}]}
 {"fn": "gn_prm", "in": "8bdca950fa97", "apps": ["gemma-E4B-Q4_0"], "cycles": 38, "upper": true, "bytes": 192, "stack": 0, "calls": [], "loops": []}
@@ -5073,6 +5095,8 @@
 {"fn": "gn_pan", "in": "a9e50d37952c", "apps": ["lfm3-Q4_K_M"], "cycles": 1502, "upper": true, "bytes": 1104, "stack": 384, "calls": [], "loops": [{"at": "gn_pan+18", "parent": -1, "sched": "none", "ii": 85, "ns": 1, "bound": 26, "iters": 16, "spills": 6, "bytes": 384}]}
 {"fn": "gn_ss", "in": "a9e50d37952c", "apps": ["lfm3-Q4_K_M"], "cycles": 386, "upper": false, "bytes": 448, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 22, "ns": 2, "bound": 16, "iters": 15, "spills": 0, "bytes": 144}]}
 {"fn": "gn_upd", "in": "a9e50d37952c", "apps": ["lfm3-Q4_K_M"], "cycles": 1213, "upper": true, "bytes": 1120, "stack": 256, "calls": [], "loops": [{"at": "gn_upd+18", "parent": -1, "sched": "none", "ii": 66, "ns": 1, "bound": 25, "iters": 16, "spills": 4, "bytes": 336}]}
+{"fn": "gn_ss", "in": "390f21cb71c3", "apps": ["gemma-E4B-PARO"], "cycles": 474, "upper": false, "bytes": 448, "stack": 0, "calls": [], "loops": [{"at": "gn_ss+11", "parent": -1, "sched": "post-RA", "ii": 22, "ns": 2, "bound": 16, "iters": 19, "spills": 0, "bytes": 144}]}
+{"fn": "gn_upd", "in": "390f21cb71c3", "apps": ["gemma-E4B-PARO"], "cycles": 1521, "upper": true, "bytes": 1040, "stack": 320, "calls": [], "loops": [{"at": "gn_upd+16", "parent": -1, "sched": "none", "ii": 69, "ns": 1, "bound": 24, "iters": 20, "spills": 4, "bytes": 336}]}
 {"fn": "msr_out", "in": "79d0315a5e08", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 879, "upper": false, "bytes": 704, "stack": 0, "calls": [], "loops": [{"at": "msr_out+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 4, "spills": 0, "bytes": 514}, {"at": "msr_out+9", "parent": 0, "sched": "post-RA", "ii": 11, "ns": 5, "bound": 10, "iters": 12, "spills": 0, "bytes": 112}]}
 {"fn": "msr_ro", "in": "79d0315a5e08", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 82, "upper": false, "bytes": 176, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:49", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 65, "spills": 0, "bytes": 16}]}
 {"fn": "msr_rot", "in": "79d0315a5e08", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "cycles": 6717, "upper": false, "bytes": 272, "stack": 64, "calls": [["79d0315a5e08", "msr_out", 1], ["79d0315a5e08", "msr_round", 8], ["79d0315a5e08", "msr_u0", 1]], "loops": [{"at": "msr_rot+9", "parent": -1, "sched": "none", "ii": 20, "ns": 1, "bound": 7, "iters": 4, "spills": 0, "bytes": 98}]}
@@ -5621,14 +5645,30 @@
 {"core": 3, "design": "gemma_prefill", "entry": "e8c2d642767f", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
 {"core": 4, "design": "gemma_prefill", "entry": "e8c2d642767f", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
 {"core": 5, "design": "gemma_prefill", "entry": "e8c2d642767f", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
-{"core": 2, "design": "gemma_prefill", "entry": "c376b7beadd3", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
-{"core": 3, "design": "gemma_prefill", "entry": "c376b7beadd3", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 4, "design": "gemma_prefill", "entry": "c376b7beadd3", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 5, "design": "gemma_prefill", "entry": "c376b7beadd3", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 2, "design": "gemma_prefill", "entry": "8a3413645cf4", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
-{"core": 3, "design": "gemma_prefill", "entry": "8a3413645cf4", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 4, "design": "gemma_prefill", "entry": "8a3413645cf4", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 5, "design": "gemma_prefill", "entry": "8a3413645cf4", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 2, "design": "gemma_prefill", "entry": "74ee7ec513e2", "apps": ["gemma-E4B-PARO"], "bytes": 15360}
+{"core": 3, "design": "gemma_prefill", "entry": "74ee7ec513e2", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 4, "design": "gemma_prefill", "entry": "74ee7ec513e2", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 5, "design": "gemma_prefill", "entry": "74ee7ec513e2", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 2, "design": "gemma_prefill", "entry": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "bytes": 15360}
+{"core": 3, "design": "gemma_prefill", "entry": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 4, "design": "gemma_prefill", "entry": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 5, "design": "gemma_prefill", "entry": "f151d6e2314f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 2, "design": "gemma_prefill", "entry": "6744d01267dc", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
+{"core": 3, "design": "gemma_prefill", "entry": "6744d01267dc", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 4, "design": "gemma_prefill", "entry": "6744d01267dc", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 5, "design": "gemma_prefill", "entry": "6744d01267dc", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 2, "design": "gemma_prefill", "entry": "4d7108731426", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
+{"core": 3, "design": "gemma_prefill", "entry": "4d7108731426", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 4, "design": "gemma_prefill", "entry": "4d7108731426", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 5, "design": "gemma_prefill", "entry": "4d7108731426", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 2, "design": "gemma_prefill", "entry": "3ac541f94299", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
+{"core": 3, "design": "gemma_prefill", "entry": "3ac541f94299", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 4, "design": "gemma_prefill", "entry": "3ac541f94299", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 5, "design": "gemma_prefill", "entry": "3ac541f94299", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 2, "design": "gemma_prefill", "entry": "a865543f4ef7", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
+{"core": 3, "design": "gemma_prefill", "entry": "a865543f4ef7", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 4, "design": "gemma_prefill", "entry": "a865543f4ef7", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 5, "design": "gemma_prefill", "entry": "a865543f4ef7", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
 {"core": 2, "design": "gemma_prefill", "entry": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "bytes": 5232}
 {"core": 3, "design": "gemma_prefill", "entry": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
 {"core": 4, "design": "gemma_prefill", "entry": "616969a2d69c", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
@@ -5637,14 +5677,14 @@
 {"core": 3, "design": "gemma_prefill", "entry": "8b4fd2da14a4", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
 {"core": 4, "design": "gemma_prefill", "entry": "8b4fd2da14a4", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
 {"core": 5, "design": "gemma_prefill", "entry": "8b4fd2da14a4", "apps": ["gemma-E4B-PARO"], "bytes": 3600}
-{"core": 2, "design": "gemma_prefill", "entry": "103a80607d94", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
-{"core": 3, "design": "gemma_prefill", "entry": "103a80607d94", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 4, "design": "gemma_prefill", "entry": "103a80607d94", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 5, "design": "gemma_prefill", "entry": "103a80607d94", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 2, "design": "gemma_prefill", "entry": "797819b23889", "apps": ["gemma-E4B-PARO"], "bytes": 8576}
-{"core": 3, "design": "gemma_prefill", "entry": "797819b23889", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 4, "design": "gemma_prefill", "entry": "797819b23889", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
-{"core": 5, "design": "gemma_prefill", "entry": "797819b23889", "apps": ["gemma-E4B-PARO"], "bytes": 4960}
+{"core": 2, "design": "gemma_prefill", "entry": "499b70eb7438", "apps": ["gemma-E4B-PARO"], "bytes": 15360}
+{"core": 3, "design": "gemma_prefill", "entry": "499b70eb7438", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 4, "design": "gemma_prefill", "entry": "499b70eb7438", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 5, "design": "gemma_prefill", "entry": "499b70eb7438", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 2, "design": "gemma_prefill", "entry": "ea29ce4deb5f", "apps": ["gemma-E4B-PARO"], "bytes": 15360}
+{"core": 3, "design": "gemma_prefill", "entry": "ea29ce4deb5f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 4, "design": "gemma_prefill", "entry": "ea29ce4deb5f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
+{"core": 5, "design": "gemma_prefill", "entry": "ea29ce4deb5f", "apps": ["gemma-E4B-PARO"], "bytes": 8416}
 {"core": 2, "design": "gemma_prefill", "entry": "908012ea20c9", "apps": ["gemma-E4B-PARO"], "bytes": 8480}
 {"core": 3, "design": "gemma_prefill", "entry": "908012ea20c9", "apps": ["gemma-E4B-PARO"], "bytes": 4944}
 {"core": 4, "design": "gemma_prefill", "entry": "908012ea20c9", "apps": ["gemma-E4B-PARO"], "bytes": 4944}
@@ -5669,6 +5709,10 @@
 {"core": 3, "design": "gemma_prefill", "entry": "4fa9fb1287ee", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
 {"core": 4, "design": "gemma_prefill", "entry": "4fa9fb1287ee", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
 {"core": 5, "design": "gemma_prefill", "entry": "4fa9fb1287ee", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
+{"core": 2, "design": "gemma_prefill", "entry": "fbc1aa54f47e", "apps": ["gemma-E4B-PARO"], "bytes": 5232}
+{"core": 3, "design": "gemma_prefill", "entry": "fbc1aa54f47e", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
+{"core": 4, "design": "gemma_prefill", "entry": "fbc1aa54f47e", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
+{"core": 5, "design": "gemma_prefill", "entry": "fbc1aa54f47e", "apps": ["gemma-E4B-PARO"], "bytes": 3584}
 {"core": 2, "design": "gemma_prefill", "entry": "c0ec32155a51", "apps": ["gemma-E4B-PARO"], "bytes": 2880}
 {"core": 3, "design": "gemma_prefill", "entry": "c0ec32155a51", "apps": ["gemma-E4B-PARO"], "bytes": 2288}
 {"core": 4, "design": "gemma_prefill", "entry": "c0ec32155a51", "apps": ["gemma-E4B-PARO"], "bytes": 2288}
@@ -5847,12 +5891,17 @@
 {"core": 3, "design": "gemma_prefill", "entry": "36364361e2f2", "apps": ["gemma-E4B-Q4_0"], "bytes": 2928}
 {"core": 2, "design": "gemma_prefill", "entry": "c967bfd20ed3", "apps": ["gemma-E4B-Q4_0"], "bytes": 2992}
 {"core": 3, "design": "gemma_prefill", "entry": "c967bfd20ed3", "apps": ["gemma-E4B-Q4_0"], "bytes": 2976}
+{"core": 2, "design": "gemma_prefill", "entry": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "bytes": 2720}
+{"core": 3, "design": "gemma_prefill", "entry": "6062bbd7d282", "apps": ["gemma-E4B-PARO"], "bytes": 2928}
+{"core": 2, "design": "gemma_prefill", "entry": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "bytes": 2992}
+{"core": 3, "design": "gemma_prefill", "entry": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "bytes": 2976}
+{"core": 2, "design": "gemma_prefill", "entry": "af017575a1cf", "apps": ["gemma-E4B-PARO"], "bytes": 2704}
 {"core": 2, "design": "gemma_prefill", "entry": "60549bb91218", "apps": ["gemma-E4B-PARO"], "bytes": 2704}
 {"core": 2, "design": "gemma_prefill", "entry": "7ddcd036ef05", "apps": ["gemma-E4B-Q4_0"], "bytes": 2912}
-{"core": 2, "design": "gemma_prefill", "entry": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "bytes": 3360}
-{"core": 3, "design": "gemma_prefill", "entry": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "bytes": 3360}
-{"core": 4, "design": "gemma_prefill", "entry": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "bytes": 3360}
-{"core": 5, "design": "gemma_prefill", "entry": "bb03ef37c32d", "apps": ["gemma-E4B-PARO"], "bytes": 3360}
+{"core": 2, "design": "gemma_prefill", "entry": "6a9aaaf21848", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 3, "design": "gemma_prefill", "entry": "6a9aaaf21848", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 4, "design": "gemma_prefill", "entry": "6a9aaaf21848", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 5, "design": "gemma_prefill", "entry": "6a9aaaf21848", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
 {"core": 2, "design": "gemma_prefill", "entry": "c07661d60d4d", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 3, "design": "gemma_prefill", "entry": "c07661d60d4d", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 4, "design": "gemma_prefill", "entry": "c07661d60d4d", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
@@ -5877,10 +5926,10 @@
 {"core": 3, "design": "gemma_prefill", "entry": "0d65112c21bf", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 4, "design": "gemma_prefill", "entry": "0d65112c21bf", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 5, "design": "gemma_prefill", "entry": "0d65112c21bf", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
-{"core": 2, "design": "gemma_prefill", "entry": "b1bbabec31c0", "apps": ["gemma-E4B-PARO"], "bytes": 3312}
-{"core": 3, "design": "gemma_prefill", "entry": "b1bbabec31c0", "apps": ["gemma-E4B-PARO"], "bytes": 3312}
-{"core": 4, "design": "gemma_prefill", "entry": "b1bbabec31c0", "apps": ["gemma-E4B-PARO"], "bytes": 3312}
-{"core": 5, "design": "gemma_prefill", "entry": "b1bbabec31c0", "apps": ["gemma-E4B-PARO"], "bytes": 3312}
+{"core": 2, "design": "gemma_prefill", "entry": "f4a8ac4caa5c", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 3, "design": "gemma_prefill", "entry": "f4a8ac4caa5c", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 4, "design": "gemma_prefill", "entry": "f4a8ac4caa5c", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
+{"core": 5, "design": "gemma_prefill", "entry": "f4a8ac4caa5c", "apps": ["gemma-E4B-PARO"], "bytes": 2656}
 {"core": 2, "design": "gemma_prefill", "entry": "813938ace329", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 3, "design": "gemma_prefill", "entry": "813938ace329", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 4, "design": "gemma_prefill", "entry": "813938ace329", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
@@ -5905,6 +5954,10 @@
 {"core": 3, "design": "gemma_prefill", "entry": "11fcf5cbfd26", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 4, "design": "gemma_prefill", "entry": "11fcf5cbfd26", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
 {"core": 5, "design": "gemma_prefill", "entry": "11fcf5cbfd26", "apps": ["gemma-E4B-PARO"], "bytes": 2800}
+{"core": 2, "design": "gemma_prefill", "entry": "dbb6d5bc6d35", "apps": ["gemma-E4B-PARO"], "bytes": 3792}
+{"core": 2, "design": "gemma_prefill", "entry": "6d0b18ebbcf4", "apps": ["gemma-E4B-PARO"], "bytes": 5536}
+{"core": 2, "design": "gemma_prefill", "entry": "9bf7cd9cd202", "apps": ["gemma-E4B-PARO"], "bytes": 8000}
+{"core": 2, "design": "gemma_prefill", "entry": "352e5f5c393c", "apps": ["gemma-E4B-PARO"], "bytes": 8128}
 {"core": 2, "design": "gemma_prefill", "entry": "f99e2d552248", "apps": ["gemma-E4B-PARO"], "bytes": 3792}
 {"core": 2, "design": "gemma_prefill", "entry": "9d38033dfaf4", "apps": ["gemma-E4B-PARO"], "bytes": 5536}
 {"core": 2, "design": "gemma_prefill", "entry": "38f855cffa1f", "apps": ["gemma-E4B-PARO"], "bytes": 5504}
@@ -5915,6 +5968,7 @@
 {"core": 2, "design": "gemma_prefill", "entry": "2e75c16b6fe3", "apps": ["gemma-E4B-Q4_0"], "bytes": 5904}
 {"core": 2, "design": "gemma_prefill", "entry": "009eb71783bf", "apps": ["gemma-E4B-Q4_0"], "bytes": 8016}
 {"core": 2, "design": "gemma_prefill", "entry": "7538b74fccde", "apps": ["gemma-E4B-Q4_0"], "bytes": 8144}
+{"core": 2, "design": "gemma_prefill", "entry": "390f21cb71c3", "apps": ["gemma-E4B-PARO"], "bytes": 5504}
 {"core": 2, "design": "lfm_prefill", "entry": "aa2c75de4401", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "bytes": 9072}
 {"core": 3, "design": "lfm_prefill", "entry": "aa2c75de4401", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "bytes": 9072}
 {"core": 4, "design": "lfm_prefill", "entry": "aa2c75de4401", "apps": ["lfm3-Q4_K_M", "lfm3-QAD-Q4_0"], "bytes": 9072}
@@ -6580,10 +6634,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "c3f55e6b0664", "apps": ["llama-8B-Q4_K_S"], "bytes": 4160}
 {"core": 2, "design": "llama_prefill", "entry": "f6e91b8163ae", "apps": ["llama-8B-Q4_K_S"], "bytes": 5808}
 {"core": 3, "design": "llama_prefill", "entry": "f6e91b8163ae", "apps": ["llama-8B-Q4_K_S"], "bytes": 4160}
-{"core": 2, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "42d1f9f5e1e7", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 2, "design": "llama_prefill", "entry": "f579a9599520", "apps": ["qwen3-0.6B-PARO"], "bytes": 8544}
+{"core": 3, "design": "llama_prefill", "entry": "f579a9599520", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 4, "design": "llama_prefill", "entry": "f579a9599520", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 5, "design": "llama_prefill", "entry": "f579a9599520", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
 {"core": 2, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 5232}
 {"core": 3, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
 {"core": 4, "design": "llama_prefill", "entry": "90a618bf50c1", "apps": ["qwen3-0.6B-PARO"], "bytes": 3600}
@@ -6592,10 +6646,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 4, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 5, "design": "llama_prefill", "entry": "f79127e69a17", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
-{"core": 2, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "993a209fd3c9", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 2, "design": "llama_prefill", "entry": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "bytes": 8544}
+{"core": 3, "design": "llama_prefill", "entry": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 4, "design": "llama_prefill", "entry": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 5, "design": "llama_prefill", "entry": "19f87596bd5e", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
 {"core": 2, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
 {"core": 3, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
 {"core": 4, "design": "llama_prefill", "entry": "dc4500f95b66", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
@@ -6612,10 +6666,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 4, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
 {"core": 5, "design": "llama_prefill", "entry": "72562e77cd61", "apps": ["qwen3-0.6B-PARO"], "bytes": 3584}
-{"core": 2, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
-{"core": 3, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 4, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
-{"core": 5, "design": "llama_prefill", "entry": "a9830f40f9ba", "apps": ["qwen3-0.6B-PARO"], "bytes": 3552}
+{"core": 2, "design": "llama_prefill", "entry": "575adff63169", "apps": ["qwen3-0.6B-PARO"], "bytes": 8544}
+{"core": 3, "design": "llama_prefill", "entry": "575adff63169", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 4, "design": "llama_prefill", "entry": "575adff63169", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
+{"core": 5, "design": "llama_prefill", "entry": "575adff63169", "apps": ["qwen3-0.6B-PARO"], "bytes": 5600}
 {"core": 2, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 5168}
 {"core": 3, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
 {"core": 4, "design": "llama_prefill", "entry": "68e330e385d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3536}
@@ -7151,10 +7205,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 4, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 5, "design": "llama_prefill", "entry": "c07661d60d4d", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
-{"core": 2, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 3, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 4, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 5, "design": "llama_prefill", "entry": "e7d0b5e980d0", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 2, "design": "llama_prefill", "entry": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 3, "design": "llama_prefill", "entry": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 4, "design": "llama_prefill", "entry": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 5, "design": "llama_prefill", "entry": "3498f4391df9", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
 {"core": 2, "design": "llama_prefill", "entry": "f5efea7b4b97", "apps": ["qwen3-0.6B-PARO"], "bytes": 2656}
 {"core": 3, "design": "llama_prefill", "entry": "f5efea7b4b97", "apps": ["qwen3-0.6B-PARO"], "bytes": 2656}
 {"core": 4, "design": "llama_prefill", "entry": "f5efea7b4b97", "apps": ["qwen3-0.6B-PARO"], "bytes": 2656}
@@ -7167,10 +7221,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
 {"core": 4, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
 {"core": 5, "design": "llama_prefill", "entry": "f94bc29fc053", "apps": ["qwen3-0.6B-PARO"], "bytes": 2784}
-{"core": 2, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 3, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 4, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 5, "design": "llama_prefill", "entry": "36d58b8e6116", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 2, "design": "llama_prefill", "entry": "2496996dca4a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 3, "design": "llama_prefill", "entry": "2496996dca4a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 4, "design": "llama_prefill", "entry": "2496996dca4a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 5, "design": "llama_prefill", "entry": "2496996dca4a", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
 {"core": 2, "design": "llama_prefill", "entry": "ec7fc0e6d8bd", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
 {"core": 3, "design": "llama_prefill", "entry": "ec7fc0e6d8bd", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
 {"core": 4, "design": "llama_prefill", "entry": "ec7fc0e6d8bd", "apps": ["qwen3-0.6B-PARO"], "bytes": 2672}
@@ -7183,10 +7237,10 @@
 {"core": 3, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 4, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
 {"core": 5, "design": "llama_prefill", "entry": "813938ace329", "apps": ["qwen3-0.6B-PARO"], "bytes": 2800}
-{"core": 2, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 3, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 4, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
-{"core": 5, "design": "llama_prefill", "entry": "6becf8da681d", "apps": ["qwen3-0.6B-PARO"], "bytes": 3200}
+{"core": 2, "design": "llama_prefill", "entry": "7bffd2ecdeb7", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 3, "design": "llama_prefill", "entry": "7bffd2ecdeb7", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 4, "design": "llama_prefill", "entry": "7bffd2ecdeb7", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
+{"core": 5, "design": "llama_prefill", "entry": "7bffd2ecdeb7", "apps": ["qwen3-0.6B-PARO"], "bytes": 2320}
 {"core": 2, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-3B-Q4_K_M", "llama-8B-Q4_K_S"], "bytes": 1856}
 {"core": 3, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-3B-Q4_K_M"], "bytes": 1808}
 {"core": 3, "design": "llama_prefill", "entry": "691c1721af6c", "apps": ["llama-8B-Q4_K_S"], "bytes": 1856}
@@ -7710,10 +7764,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "3aaa0a936376", "apps": ["qwen3.8-27B-PARO-int5", "qwen3.8-27B-PARO-int5-dflash"], "bytes": 3552}
 {"core": 4, "design": "qwen_prefill", "entry": "3aaa0a936376", "apps": ["qwen3.8-27B-PARO-int5", "qwen3.8-27B-PARO-int5-dflash"], "bytes": 3552}
 {"core": 5, "design": "qwen_prefill", "entry": "3aaa0a936376", "apps": ["qwen3.8-27B-PARO-int5", "qwen3.8-27B-PARO-int5-dflash"], "bytes": 3552}
-{"core": 2, "design": "qwen_prefill", "entry": "9060d638cf19", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5168}
-{"core": 3, "design": "qwen_prefill", "entry": "9060d638cf19", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
-{"core": 4, "design": "qwen_prefill", "entry": "9060d638cf19", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
-{"core": 5, "design": "qwen_prefill", "entry": "9060d638cf19", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
+{"core": 2, "design": "qwen_prefill", "entry": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 8544}
+{"core": 3, "design": "qwen_prefill", "entry": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
+{"core": 4, "design": "qwen_prefill", "entry": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
+{"core": 5, "design": "qwen_prefill", "entry": "ad145d5984d1", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
 {"core": 2, "design": "qwen_prefill", "entry": "1b9f1887e8fc", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5168}
 {"core": 3, "design": "qwen_prefill", "entry": "1b9f1887e8fc", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
 {"core": 4, "design": "qwen_prefill", "entry": "1b9f1887e8fc", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
@@ -7754,10 +7808,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "c3978f4530b0", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 3584}
 {"core": 4, "design": "qwen_prefill", "entry": "c3978f4530b0", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 3584}
 {"core": 5, "design": "qwen_prefill", "entry": "c3978f4530b0", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 3584}
-{"core": 2, "design": "qwen_prefill", "entry": "2d7a0904bdeb", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5168}
-{"core": 3, "design": "qwen_prefill", "entry": "2d7a0904bdeb", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
-{"core": 4, "design": "qwen_prefill", "entry": "2d7a0904bdeb", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
-{"core": 5, "design": "qwen_prefill", "entry": "2d7a0904bdeb", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
+{"core": 2, "design": "qwen_prefill", "entry": "e978194b8df6", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 8544}
+{"core": 3, "design": "qwen_prefill", "entry": "e978194b8df6", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
+{"core": 4, "design": "qwen_prefill", "entry": "e978194b8df6", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
+{"core": 5, "design": "qwen_prefill", "entry": "e978194b8df6", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5600}
 {"core": 2, "design": "qwen_prefill", "entry": "ee1e218c50dd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 5168}
 {"core": 3, "design": "qwen_prefill", "entry": "ee1e218c50dd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
 {"core": 4, "design": "qwen_prefill", "entry": "ee1e218c50dd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3552}
@@ -8716,10 +8770,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "704231f602fc", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2768}
 {"core": 4, "design": "qwen_prefill", "entry": "704231f602fc", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2768}
 {"core": 5, "design": "qwen_prefill", "entry": "704231f602fc", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2768}
-{"core": 2, "design": "qwen_prefill", "entry": "ac9141bd68df", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 3, "design": "qwen_prefill", "entry": "ac9141bd68df", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 4, "design": "qwen_prefill", "entry": "ac9141bd68df", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 5, "design": "qwen_prefill", "entry": "ac9141bd68df", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
+{"core": 2, "design": "qwen_prefill", "entry": "98577a6bba85", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 3, "design": "qwen_prefill", "entry": "98577a6bba85", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 4, "design": "qwen_prefill", "entry": "98577a6bba85", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 5, "design": "qwen_prefill", "entry": "98577a6bba85", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
 {"core": 2, "design": "qwen_prefill", "entry": "1279240accb2", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}
 {"core": 3, "design": "qwen_prefill", "entry": "1279240accb2", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}
 {"core": 4, "design": "qwen_prefill", "entry": "1279240accb2", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}
@@ -8768,10 +8822,10 @@
 {"core": 3, "design": "qwen_prefill", "entry": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2784}
 {"core": 4, "design": "qwen_prefill", "entry": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2784}
 {"core": 5, "design": "qwen_prefill", "entry": "aa74d5b90032", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2784}
-{"core": 2, "design": "qwen_prefill", "entry": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 3, "design": "qwen_prefill", "entry": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 4, "design": "qwen_prefill", "entry": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
-{"core": 5, "design": "qwen_prefill", "entry": "bd6a7985dafd", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 3200}
+{"core": 2, "design": "qwen_prefill", "entry": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 3, "design": "qwen_prefill", "entry": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 4, "design": "qwen_prefill", "entry": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
+{"core": 5, "design": "qwen_prefill", "entry": "3ba77b475029", "apps": ["qwen3.5-0.8B-PARO"], "bytes": 2320}
 {"core": 2, "design": "qwen_prefill", "entry": "11fcf5cbfd26", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}
 {"core": 3, "design": "qwen_prefill", "entry": "11fcf5cbfd26", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}
 {"core": 4, "design": "qwen_prefill", "entry": "11fcf5cbfd26", "apps": ["qwen3.6-35B-A3B-PARO", "qwen3.6-35B-A3B-PARO-mtp"], "bytes": 2800}

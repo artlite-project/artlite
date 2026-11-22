@@ -7,6 +7,10 @@ namespace {
 {% set gact = km.act(km.TABLES[act], table_arg=True, walk=(2, 128)) %}
 {{ gact.src }}
 {% endif %}
+{% if dual %}
+{% set dact = km.act(km.TABLES[act], table_arg=True) %}
+{{ dact.src }}
+{% endif %}
 {% from "artlite/gemm/gemm_q.epilogue.cc.jinja" import times_up %}
 
 }  // namespace
@@ -205,6 +209,31 @@ void {{ p }}_{{ name }}(const bfloat16 *__restrict cacc_, bfloat16 *__restrict h
 // panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
 // table, in two 16 KB regions), then times up.
 {{ gate_up(act, "const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd", gact, "tab_ab, tab_cd") }}
+
+{% endif %}
+{% if dual %}
+// a dual pass pair's epilogue (``GemmQOperator``'s ``dual``), elementwise in the C tile's layout: part 0 (the gates) C =
+// act(acc) through kmath.act's table (the core's two copies); part 1 (the ups) C = bf16(C acc): h = act(bf16(gate)) up
+void {{ p }}_dual(const bfloat16 *__restrict acc, bfloat16 *__restrict c, const uint32_t *__restrict tab_ab,
+                  const uint32_t *__restrict tab_cd, int32_t part)
+{
+{% if "act" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    if (part == 0) {
+        {{ dact }}<{{ m * n }}>(acc, c, tab_ab, tab_cd);
+        return;
+    }
+    const bfloat16 __aie_dm_resource_a *__restrict pa = (const bfloat16 __aie_dm_resource_a *)acc;
+    bfloat16 __aie_dm_resource_b *__restrict pc = (bfloat16 __aie_dm_resource_b *)c;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < {{ m * n // 64 }}; i++) {
+        aie::store_v(pc, aie::mul(aie::load_v<64>(pc), aie::load_v<64>(pa)).template to_vector<bfloat16>());
+        pc += 64;
+        pa += 64;
+    }
+}
 
 {% endif %}
 {% if pair %}

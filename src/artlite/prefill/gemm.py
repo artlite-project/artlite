@@ -338,7 +338,7 @@ def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
 
 
 def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
-                      a_width: int = 0) -> PhasePlan:
+                      a_width: int = 0, *, act: str = "") -> PhasePlan:
     """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
     from the caller's slices, panels ``a_width`` columns wide: ``plan_phase``'s): one GEMM design for both (a pass of
     tile-major 16-row tiles: 64 outputs), its C as bf16
@@ -346,12 +346,31 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
     rotation reads (``prefill.rotate``'s ``gu``: the activation on the way). Blocks of row tile pairs (``Block.pt``: a K
     half a chunk short, a PARO Gemma's): per region two GEMMs, the pairs' even row tiles and their odd ones
     (``GemmSpec.ptail_part``: a pass 4 pairs, its row tiles 32 outputs apart), C as bf16 panels of 64 into GU of [T / 8]
-    [gate ffn / 8 | up ffn / 8][64] (``split``: ``prefill.rotate``'s ``gu_split``)."""
+    [gate ffn / 8 | up ffn / 8][64] (``split``: ``prefill.rotate``'s ``gu_split``). With ``act``: one GEMM of both
+    (per parity of row tile pairs), ``GemmSpec.dual``: a pass pair, gate's tiles on the first half of A (the copies
+    [gate | up] side by side), then up's on the second, its epilogue forming h = act(gate) up, bf16 panels [T / 8]
+    [ffn / 8][64] into GU (down's rotation reads them as bf16 blocks), where its A strip of 2 K columns stays in the
+    memtile (else the plan without ``act``: ``Gemm.op.dual`` tells them apart)."""
     (bg,), (bu,) = gate.blocks, up.blocks
     groups, KC = image.cfg.intermediate_size // COLS // 64, gate.kc
     if bg.pt or bu.pt:
-        return _gate_up_pairs(image, gate, up, T, ops, a_width)
+        return _gate_up_pairs(image, gate, up, T, ops, a_width, act)
     gemms = []
+    if act:
+        assert (bg.fmt, bg.R, bg.tiles) == (bu.fmt, bu.R, bu.tiles) and _tp(bg) * bg.R == ROWS, (bg, bu)
+        rs = gate.kc_group  # (a row tile's tiles: its chunks together)
+        assert gate.col_stride == up.col_stride and gate.n_rt == up.n_rt and rs == gate.n_kc
+        assert (up.offset - gate.offset) % (gate.tile_bytes * rs) == 0, (up.offset, gate.offset)
+        kw = {"fmt": bg.fmt, "rows": bg.R, "M": T, "K": gate.K_in, "N": COLS * groups * 64, "tile_bytes": gate.tile_bytes,
+              "col_bytes": gate.col_stride, "passes": 2 * groups,
+              "out_cols": [[64 * (groups * c + j) for j in range(groups) for _ in range(2)] for c in range(COLS)],
+              "kc": KC, "kc_group": rs, "blocks": ((0, 2 * groups),), "region_rt": gate.n_rt, "c_panels": 64,
+              "dual": (up.offset - gate.offset) // (gate.tile_bytes * rs), "act": act,
+              **({"a_cols": (0, a_width)} if a_width else {})}
+        if gemm_op(kw, T, "gu").flow.a_res:  # (else A refetched per pass: the separate GEMMs)
+            op = gemm_op(kw, T, "gu", ops)
+            assert type(op) is GemmQOperator, "the dual epilogue: GemmQ"
+            return PhasePlan([Gemm(op, gate.offset - op.hdr_skip, c="GU")], None)
     for part, (r, b) in enumerate(((gate, bg), (up, bu))):
         assert not planar(b.fmt, b.R, KC) and _tp(b) * b.R == ROWS and not b.pt, (b.fmt, b.R)
         kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * groups * 64, "tile_bytes": r.tile_bytes,
@@ -366,10 +385,29 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
 
 
 def _gate_up_pairs(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
-                   a_width: int) -> PhasePlan:
-    """``plan_gate_up_pair`` of blocks of row tile pairs: per region its pairs' even and odd row tiles."""
+                   a_width: int, act: str) -> PhasePlan:
+    """``plan_gate_up_pair`` of blocks of row tile pairs: per region its pairs' even and odd row tiles (``act``: per
+    parity a dual GEMM of both regions)."""
     ffn, KC = image.cfg.intermediate_size // COLS, gate.kc
     gemms = []
+    if act:
+        (b,), (bu,) = gate.blocks, up.blocks
+        tp = _tp(b)
+        assert b.pt and bu.pt and b.R == 16 and tp == ROWS // 16 and (b.fmt, b.tiles) == (bu.fmt, bu.tiles), (b, bu)
+        assert gate.col_stride == up.col_stride and gate.n_t == up.n_t and (up.offset - gate.offset) % gate.tile_bytes == 0
+        dual = (up.offset - gate.offset) // gate.tile_bytes
+        pairs = b.tiles // 2 // tp  # (a pass pair: tp row tile pairs' tiles of one parity, gate's then up's)
+        for e in range(2):
+            kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": gate.K_in, "N": COLS * ffn, "tile_bytes": gate.tile_bytes,
+                  "col_bytes": gate.col_stride, "passes": 2 * pairs,
+                  "out_cols": [[ffn * c + 2 * tp * b.R * q + b.R * e for q in range(pairs) for _ in range(2)]
+                               for c in range(COLS)], "kc": KC, "kc_group": gate.kc_group,
+                  "blocks": ((gate.t0[b.name], 2 * pairs),), "region_rt": gate.n_t, "ptail_part": e, "c_panels": 64,
+                  "dual": dual, "act": act, **({"a_cols": (0, a_width)} if a_width else {})}
+            op = gemm_op(kw, T, "gu", ops)
+            assert type(op) is GemmQOperator, "the dual epilogue: GemmQ"
+            gemms.append(Gemm(op, gate.offset - op.hdr_skip, c="GU"))
+        return PhasePlan(gemms, None)
     for half, r in enumerate((gate, up)):
         (b,) = r.blocks
         assert b.pt and b.R == 16 and _tp(b) == ROWS // 16 and b.tiles % (2 * _tp(b)) == 0, (b.fmt, b.R, b.tiles)

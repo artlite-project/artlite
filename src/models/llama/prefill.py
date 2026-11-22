@@ -31,8 +31,9 @@ x / rms as bf16 blocks (``PrefillNormOperator``'s ``bf16``: bfp16 panels before 
 channels to its outlier's exponent) into XR's panels, three copies (q, k, v; after o: gate and up, two) in one pass that reads them once (side by side:
 [token group][copy][hidden / 8 panels], each GEMM reading its copy's columns), the attention's A into AR; q, k and v
 write G in one
-layout (``prefill.gemm.joined_layout``), gate and up GU as bf16 panels (``plan_gate_up_pair``: one design), which down's
-rotation reads, the activation on the way (``prefill.rotate``'s ``gu``), into HR. The rotation objects
+layout (``prefill.gemm.joined_layout``), gate and up in one GEMM whose epilogue forms h = silu(gate) up as bf16 panels
+in GU (``plan_gate_up_pair``'s ``act``, where its A strip of both copies stays in the memtile; else gate and up as GU's
+bf16 panels, the activation on the way: ``prefill.rotate``'s ``gu``), which down's rotation reads into HR. The rotation objects
 (``paro.TanForm.pair_objects``) are in RO, compiled at bind.
 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
@@ -206,16 +207,23 @@ class LlamaPrefill(ChunkPrefill):
                 gs = [dataclasses.replace(g, a=f"XR3{PARO_COPY[r.name]}")
                       for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay, a_width=3 * self.kh).gemms]
                 plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
-                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms, 2 * self.kh)
+                gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms, 2 * self.kh,
+                                          act="silu")
                 gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
                 plans[(L, "gate_up")] = gu
                 for name in ("o", "down"):
                     plans[(L, name)] = plan_gemm(img, img.region(L, name), t, ops=gemms, pitch=dp, k_parts=self._k_parts)
-            # (a norm's copies: q, k, v and gate, up; o's; down's: of GU, the activation on the way)
+            # (a norm's copies: q, k, v and gate, up; o's; down's: of h, the dual GEMM's (``plan_gate_up_pair``'s
+            # ``act``), or of GU, the activation on the way)
             (ko,) = {img.region(L, "o").K_in for L in self.layers}
+            dual = {bool(plans[(L, "gate_up")].gemms[0].op.dual) for L in self.layers}
+            assert len(dual) == 1 and getattr(self, "gu_dual", dual) == dual, "one down rotation (its RO objects)"
+            self.gu_dual = dual
+            down = {"K": cfg.intermediate_size, "gu": True}  # (16-token items: a short chunk's groups over the cores)
+            down = {"K": cfg.intermediate_size, "bf16": True, "narrow": True} if True in dual else down
             for name, kw in (("qkv", {"K": self.kh, "copies": 3, "bf16": True}),
                              ("gate_up", {"K": self.kh, "copies": 2, "bf16": True}),
-                             ("o", {"K": ko}), ("down", {"K": cfg.intermediate_size, "gu": True})):
+                             ("o", {"K": ko}), ("down", down)):
                 rots[name] = gemms.setdefault(("rot", t, *kw.items()), PrefillRotOperator(T=t, **kw))
         else:
             pitch = PG.phase_pitch(img, "qkv", qt)
@@ -286,7 +294,7 @@ class LlamaPrefill(ChunkPrefill):
         if split:  # (split gate / up blocks: their GEMMs' rows, ``prefill.gemm``)
             self.rb["GU"] = max(2 * PG.gu_columns(self.img, r) for r in split)
         if self.paro:  # (GU: gate and up's rows; the rotated inputs as the panels they replace)
-            self.rb |= {"GU": 2 * 2 * cfg.intermediate_size, "XR": 3 * self.pr, "AR": self.rb["A"],
+            self.rb |= {"GU": (2 if True in self.gu_dual else 4) * cfg.intermediate_size, "XR": 3 * self.pr, "AR": self.rb["A"],
                         "HR": self.rb["HP"]}
             self.ro_off: dict[tuple[int, str], int] = {}  # (the rotations' objects in RO)
             k = 0

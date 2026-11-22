@@ -403,3 +403,42 @@ def test_gate_up_pair_tails() -> None:
         err = rel_native(got[i], want)
         print(r.name, f"{err:.2e}")
         assert err < _tol(K), (r.name, err)
+
+
+def test_gate_up_dual() -> None:
+    """The same gate and up in GEMMs of both (``plan_gate_up_pair``'s ``act``, ``GemmSpec.dual``: per parity a pass
+    pair, gate's tiles on A's first K columns, up's on the next K) whose epilogue forms h = gelu(bf16(gate)) up, bf16
+    panels of 64: against the dequantized rows on the two inputs (the operands' values)."""
+    path = checkpoint("gemma-4-E4B-paro")
+    require(path)
+    from models.gemma4.image import GemmaImage
+
+    g = open_weights(path)
+    img = GemmaImage(g, layers=[0], vocab=COLS * 64)
+    W = np.zeros(img.nbytes, np.uint8)
+    img.pack(W)
+    gate, up = img.region(0, "gate"), img.region(0, "up")
+    T, K, ffn = 256, gate.K_in, img.cfg.intermediate_size
+    pp = PG.plan_gate_up_pair(img, gate, up, T, {}, 2 * K, act="gelu")
+    assert len(pp.gemms) == 2
+    lib = Library("t_gate_up_dual", [gm.op for gm in pp.gemms]).compile().load()
+    A = (torch.randn(T, 2 * K, generator=torch.Generator().manual_seed(6)) * 0.5).bfloat16()
+    Aq = to_torch(bfp16.from_panels(bfp16.to_panels(to_numpy(A)), T, 2 * K))
+    H = torch.zeros((T * ffn,), dtype=torch.bfloat16)
+    for gm in pp.gemms:
+        dev = artlite.Device()
+        w = np.zeros(gm.op.w_bytes, np.uint8)
+        a, b = max(gm.w_off, 0), min(gm.w_off + gm.op.w_bytes, W.size)
+        w[a - gm.w_off:b - gm.w_off] = W[a:b]
+        bufs = [artlite.from_numpy(bfp16.to_panels(to_numpy(A)), dev), artlite.from_numpy(w.view(bfloat16), dev),
+                artlite.from_numpy(to_numpy(H), dev)]
+        lib.run(lib.items([(gm.op, "A", "W", "C")], dict(zip("AWC", (x._raw for x in bufs)))), bufs=[x._raw for x in bufs])
+        bufs[2].sync_from_device()
+        H = to_torch(bufs[2].numpy().copy())
+    got = H.view(T // 8, ffn // 8, 8, 8).permute(0, 2, 1, 3).reshape(T, ffn).float()
+    yg = (Aq[:, :K] @ _rows(img, gate.blocks[0].tensors, np.arange(ffn), K).T).bfloat16().float()
+    yu = Aq[:, K:] @ _rows(img, up.blocks[0].tensors, np.arange(ffn), K).T
+    want = torch.nn.functional.gelu(yg, approximate="tanh") * yu
+    err = rel_native(got, want)
+    print(f"h {err:.2e}")
+    assert err < 2 * _tol(K), err

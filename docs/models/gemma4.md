@@ -1,7 +1,8 @@
 # Gemma 4 on the NPU
 
-Gemma 4 E4B from a GGUF file. The architecture is read from the file's metadata (no
-`config.json`), the tokenizer and the chat template from the file itself. Running it: [artlite-cli](../cli.md);
+Gemma 4 E4B from a GGUF file, or z-lab's PARO checkpoint directory. The architecture is read from the file's metadata
+(no `config.json`; a checkpoint's from its `config.json`, as llama.cpp's converter reads it), the tokenizer and the chat
+template from the file itself. Running it: [artlite-cli](../cli.md);
 default sampling: the model's (temperature 1.0, top-k 64, top-p 0.95).
 
 ## Model files
@@ -11,6 +12,7 @@ $ARTLITE_MODELS_DIR/ggml-org/gemma-4-E4B-it-GGUF/     ggml-org/gemma-4-E4B-it-GG
     gemma-4-E4B-it-Q4_0.gguf                          (the NPU path: Q4_0 layers, Q8_0 embedding)
     mtp-gemma-4-E4B-it-Q4_0.gguf                      (the model's drafter, gemma4-assistant: multi-token prediction)
     gemma-4-E4B-it-Q8_0.gguf, gemma-4-E4B-it-BF16.gguf   (the fp32 reference only, for now: tests/gemma4/cpu.py)
+$ARTLITE_MODELS_DIR/z-lab/gemma-4-E4B-it-PARO/        z-lab/gemma-4-E4B-it-PARO (ParoQuant int4: -m z-lab/gemma-4-E4B-it-PARO)
 ```
 
 The models directory: [Installation](../install.md#models-directory).
@@ -33,6 +35,11 @@ tokens writes them instead; a prefill chunk's projection is a GEMM at its start)
   same weights (`prefill/gemm.py`), norms, attention and per-layer-input operators,
   writing the caches the decode continues from. A dispatch from layer 23 on (the layers after the
   prefill's, the LM head) finishes the prompt's last token.
+- A PARO checkpoint: its linears as 4-bit tiles of the checkpoint's size, each projection's input rotated as the
+  checkpoint prescribes (its channel scales and Givens rounds, the norms' weights folded in): in a dispatch by rotation
+  phases after each residual update (`gemma4/paro_steps.py`), in the prefill by rotation passes between the norms and
+  the GEMMs, gate and up in one GEMM with the GELU in its epilogue; the tied F16 embedding as the LM head through its
+  Q4_0 plane and the host's exact rows of the best candidates.
 - Generation with the model's drafter (`mtp-<model file>` next to it; `gemma4/draft.py`): a draft step
   (~1.2 ms, a dispatch of the same design on the drafter's weights and the model's caches) guesses the
   next three tokens; one dispatch of four slots verifies them, and a draft is kept only where the
@@ -45,8 +52,9 @@ tokens writes them instead; a prefill chunk's projection is a GEMM at its start)
   ([artlite-server](../server.md#several-requests-at-a-time)).
 
 Memory:
-- The weights the NPU streams (3.04 GB of the 4.59 GB file, the per-layer projection as a Q8_0 copy among them) are
-  re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing is written to disk.
+- The weights the NPU streams (3.04 GB of the 4.59 GB file, the per-layer projection as a Q8_0 copy among them; the PARO
+  checkpoint's: 2.73 GB) are re-laid-out into a device buffer at load, in memory, at their quantization's size. Nothing
+  is written to disk.
 - The per-layer token embedding (1.6 GB) stays in the mapped file: one row per token is read.
 - The KV cache: 222 MB at 4096 positions (every cache linear in the positions, the sliding-window
   ones too: the prefill writes and reads them as the decode does).
@@ -59,6 +67,7 @@ Speed and accuracy (E4B Q4_0, Strix):
 | prompt | 2345 tokens/s at 1032 tokens, 2750 at 8000 (`--no-prefill`: decode steps of 4 tokens, 121) |
 | accuracy vs the fp32 evaluation of the same file | teacher-forced KL 0.00023 / 0.00026 at 1 / 4 tokens per dispatch (34 tokens, argmax agreement 100%) |
 | after a prompt through the prefill | KL 0.00020 (34 tokens); its KV caches within 1-3% of the decode path's at every position through layer 11 (deeper layers amplify the prefill's rounding at a few positions) |
+| the PARO checkpoint | a dispatch of one token 56.3 ms (the Q4_0 file's 55.6); prompts at 3150 tokens/s at 1024 tokens, 3390 at 2048 (the Q4_0 file's 3040, 3170; `artlite-bench -p 1024,2048`); teacher-forced KL 0.00029 at 1 and 4 tokens per dispatch against the checkpoint computed exactly (34 tokens after a prompt through the prefill, argmax agreement 100%) |
 | determinism | a token's logits depend on the tokens up to it only: not on the other slots of its dispatch, nor on rejected drafts; steps of 1-4 tokens give the same logits bit for bit (greedy text with drafts is the text without) |
 
 Design: the module docstrings of `decode/protocol.py`, `decode/design.py`, `decode/attn_overlay.py` and `gemma4/`.
