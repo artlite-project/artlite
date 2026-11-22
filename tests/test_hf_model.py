@@ -3,8 +3,8 @@
 architecture and the sampling defaults kept) and the decode option llama.cpp alone reads (``tokenizer.ggml.clean_spaces``),
 every tensor equal as float32 (a Llama's Q / K rows in the checkpoint's rotate-half order: ``HfModel.unpermuted``;
 Qwen3.5's A = -exp(A_log) within an ulp: another exp); the virtual GGUF's tokenizer against the checkpoint's
-tokenizer.json (gigatoken) on the essay corpus and the TEXTS of test_tokenizer.py, its chat prompt against the converted
-file's (no NPU). On the NPU (slow) a checkpoint gives the same teacher-forced logits as its converted file."""
+tokenizer.json (gigatoken; Gemma 4: its tokenizer on the converted file) on the essay corpus and the TEXTS of
+test_tokenizer.py, its chat prompt against the converted file's (no NPU). On the NPU (slow) a checkpoint gives the same teacher-forced logits as its converted file."""
 
 import gigatoken
 import numpy as np
@@ -23,7 +23,7 @@ from .goldens.hf import converted
 from .model_files import require
 from .test_tokenizer import MESSAGES, TEXTS
 
-CASES = ["qwen3-0.6B", "qwen3.5-0.8B", "llama-1B"]
+CASES = ["qwen3-0.6B", "qwen3.5-0.8B", "llama-1B", "gemma-4-E2B"]
 SKIP_KEYS = ("general.", "tokenizer.ggml.clean_spaces")
 KEEP_KEYS = ("general.architecture", "general.sampling.")
 _FILES: dict[str, tuple[HfModel, GGUFFile]] = {}
@@ -81,6 +81,14 @@ def test_tokenizer(case: str) -> None:
     if hf.arch == "llama":
         mine = gigatoken.Tokenizer.from_json(bpe_tokenizer_json(hf, LLAMA3_PATTERN, ignore_merges=True))
         encode = lambda s: mine.encode(s).tolist()
+    elif hf.arch == "gemma4":  # (its own tokenizer on the metadata: against the converted file's)
+        from models.gemma4.tokenizer import GemmaTokenizer
+
+        encode, theirs = GemmaTokenizer(hf).encode, GemmaTokenizer(gg).encode
+        for text in [*TEXTS, essays()[:400_000]]:
+            assert encode(text) == theirs(text), text[:80]
+        assert render_chat(hf, MESSAGES) == render_chat(gg, MESSAGES)
+        return
     else:
         encode = BpeTokenizer(hf).encode
     for text in [*TEXTS, essays()[:400_000]]:
@@ -89,7 +97,7 @@ def test_tokenizer(case: str) -> None:
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("case", [c for c in CASES if c != "gemma-4-E2B"])  # (E2B's double-wide MLP: not run)
 def test_npu_logits(case: str) -> None:
     """A checkpoint and its converted file: the same weight image and logits (Qwen3.5: its A within an ulp, the logits
     within 1e-3 of their range)."""

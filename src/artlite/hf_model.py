@@ -13,7 +13,9 @@ names and are read in place from the memory-mapped safetensors; the converter's 
 the converter interleaves them and the weight images undo it, ``gguf_model.unpermute_rows``).
 
 Supported: ``Qwen3ForCausalLM`` (``qwen3``), ``LlamaForCausalLM`` (``llama``), ``Qwen3_5ForConditionalGeneration`` /
-``Qwen3_5ForCausalLM`` (``qwen35``; its MTP block as the nextn layer). Vision towers are not read here.
+``Qwen3_5ForCausalLM`` (``qwen35``; its MTP block as the nextn layer), ``Qwen3_5MoeForConditionalGeneration``
+(``qwen35moe``), ``Gemma4ForConditionalGeneration`` / ``Gemma4ForCausalLM`` (``gemma4``). Vision and audio towers are not
+read here.
 """
 
 import dataclasses
@@ -318,6 +320,8 @@ class _Adapter:
             w.add_rope_dimension_sections([*rp["mrope_section"], 0, 0, 0, 0][:4])
         if (theta := full.get("rope_theta")) is not None:
             w.add_rope_freq_base(theta)
+        if (theta := rp.get("sliding_attention", {}).get("rope_theta")) is not None:
+            w.add_rope_freq_base_swa(theta)
         if (eps := hp.get("rms_norm_eps")) is not None:
             w.add_layer_norm_rms_eps(eps)
         if (n := hp.get("num_experts", hp.get("num_local_experts"))) is not None:
@@ -775,6 +779,103 @@ class _Qwen35Moe(_Qwen35):
         return super().transform(name, hf_name, e)
 
 
+class _Gemma4(_Adapter):
+    """Gemma4ForConditionalGeneration (Gemma3Model, Gemma4Model; its text model: the towers are not read here): the
+    per-layer inputs, KV-shared layers (a PARO checkpoint has no K / V projections there), sliding-window layers of
+    their own head dim and RoPE base, the double-wide MLP of the KV-shared layers, the full layers' proportional RoPE as
+    ``rope_freqs`` (1e30 past the rotated pairs); norms as stored (no offset); the vocabulary of gguf-py's LlamaHfVocab
+    (byte-fallback BPE: tokenizer.json's tokens, scored -1000, special ones CONTROL but those the chat parser reads,
+    byte tokens BYTE)."""
+
+    arch, model_arch = "gemma4", gguf.MODEL_ARCH.GEMMA4
+    VISIBLE = frozenset({"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>",
+                         "<tool_response|>", "<|\"|>"})
+
+    def params(self, w: gguf.GGUFWriter) -> None:
+        hp = self.hp
+        super().params(w)
+        for k in ("feed_forward_length", "attention.key_length", "attention.value_length"):  # (written again below)
+            w.kv_data[0].pop(f"{self.arch}.{k}", None)
+        swa = [t == "sliding_attention" for t in hp["layer_types"]]
+        shared = int(hp["num_kv_shared_layers"])
+        ff = int(hp["intermediate_size"])
+        if hp.get("use_double_wide_mlp"):  # (the KV-shared layers' MLP twice as wide)
+            w.add_feed_forward_length([ff if il < self.block_count - shared else 2 * ff for il in range(self.block_count)])
+        else:
+            w.add_feed_forward_length(ff)
+        full_hd = hp.get("global_head_dim")
+        full_kv = hp.get("num_global_key_value_heads")
+        for il, lc in (hp.get("per_layer_config") or {}).items():  # (the first full layer's own head dim / KV heads)
+            if int(il) < len(swa) and not swa[int(il)]:
+                full_hd = full_hd if full_hd is not None else lc.get("head_dim")
+                full_kv = full_kv if full_kv is not None else lc.get("num_key_value_heads")
+        assert full_hd is not None, f"{self.hf.path}: no full-attention head dim"
+        if full_kv is not None and hp.get("num_key_value_heads") is not None:
+            w.add_head_count_kv([int(hp["num_key_value_heads"]) if s else int(full_kv) for s in swa])
+        w.add_key_length(int(full_hd))
+        w.add_value_length(int(full_hd))
+        w.add_key_length_swa(int(hp["head_dim"]))
+        w.add_value_length_swa(int(hp["head_dim"]))
+        if (cap := hp.get("final_logit_softcapping")) is not None:
+            w.add_final_logit_softcapping(cap)
+        if hp.get("sliding_window_pattern") != 1:
+            w.add_sliding_window(int(hp["sliding_window"]))
+        w.add_shared_kv_layers(shared)
+        w.add_embedding_length_per_layer_input(int(hp.get("hidden_size_per_layer_input") or 0))
+        w.add_sliding_window_pattern(swa)
+        if (eff := hp.get("expert_intermediate_size", hp.get("moe_intermediate_size"))) is not None:
+            w.add_expert_feed_forward_length(int(eff))
+        w.add_rope_dimension_count(int(full_hd))
+        w.add_rope_dimension_count_swa(int(hp["head_dim"] * self.rope.get("sliding_attention", {}).get(
+            "partial_rotary_factor", 1.0)))
+
+    def vocab(self, w: gguf.GGUFWriter) -> None:
+        path = os.path.join(self.hf.path, "tokenizer.json")
+        with open(path, encoding="utf-8") as f:
+            tj = json.load(f)
+        model = tj["model"]
+        if model["type"] != "BPE" or not model.get("byte_fallback") or tj["decoder"]["type"] != "Sequence":
+            raise NotImplementedError(f"{path}: not a byte-fallback BPE tokenizer (LlamaHfVocab's)")
+        rev = {i: t for t, i in model["vocab"].items()}
+        base = len(model["vocab"])  # (transformers' vocab_size: the model's vocabulary)
+        added = sorted(tj.get("added_tokens", []), key=lambda a: a["id"])
+        special = {a["id"] for a in added if a.get("special")}
+        rev.update({a["id"]: a["content"] for a in added if a["id"] < base})
+        extra = [a for a in added if a["id"] >= base]  # (added tokens past the vocabulary: appended in id order)
+        tokens, types = [], []
+        for i in range(base):
+            t = rev[i]
+            tokens.append(t)
+            types.append(T_BYTE if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", t) else T_CONTROL if i in special else T_NORMAL)
+        for a in extra:
+            tokens.append(a["content"])
+            types.append(T_CONTROL if a["id"] in special else T_USER)
+        types = [T_USER if t in self.VISIBLE else k for t, k in zip(tokens, types, strict=True)]
+        w.add_tokenizer_model("gemma4")
+        w.add_token_list(tokens)
+        w.add_token_scores([-1000.0] * len(tokens))
+        w.add_token_types(types)
+        _special_vocab(self.hf.path, tj, w)
+        w.add_add_space_prefix(False)
+        w.add_add_bos_token(True)
+
+    def filter(self, name: str) -> str | None:
+        if not name.startswith("model.language_model."):  # (the vision and audio towers, their embedders)
+            return None
+        name = name.replace("model.language_model.", "model.")
+        return f"{name}.weight" if name.endswith(("per_dim_scale", "layer_scalar")) else name
+
+    def extra(self) -> list[tuple[str, _Entry]]:
+        full = self.rope["full_attention"]
+        assert full["rope_type"] == "proportional", full
+        hd = int(self.hp.get("global_head_dim") or 0)
+        for il, lc in (self.hp.get("per_layer_config") or {}).items():
+            if not hd and self.hp["layer_types"][int(il)] == "full_attention":
+                hd = int(lc["head_dim"])
+        n_rot = int(hd * full["partial_rotary_factor"] / 2)
+        return [("rope_freqs.weight", _const(np.asarray([1.0] * n_rot + [1e30] * (hd // 2 - n_rot), np.float32)))]
+
+
 # a PARO linear's checkpoint tensors (``artlite.paro``) and the suffixes of an MoE layer's shared rotations
 _PARO_PARTS = ("qweight", "qzeros", "scales", "theta", "pairs", "channel_scales", "qweight_hi", "qzeros_hi")
 _PARO_CODES = ("qweight", "qzeros", "scales", "qweight_hi", "qzeros_hi")
@@ -791,6 +892,8 @@ _ADAPTERS: dict[str, type[_Adapter]] = {
     "Qwen3_5ForCausalLM": _Qwen35,
     "Qwen3_5MoeForConditionalGeneration": _Qwen35Moe,
     "Qwen3_5MoeForCausalLM": _Qwen35Moe,
+    "Gemma4ForConditionalGeneration": _Gemma4,
+    "Gemma4ForCausalLM": _Gemma4,
 }
 
 
