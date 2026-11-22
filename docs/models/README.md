@@ -21,7 +21,8 @@ ParoQuant (PARO) checkpoints, int4 or int5 (`int5-bitplane`) with groups of 128 
 its router and shared expert F16): their linears as 4-bit (5-bit) tiles of the checkpoint's size (4.5, 5.5 bits per
 weight with their scales), each projection's input rotated on the NPU as the checkpoint prescribes (its channel scales
 and Givens rounds), the head and embeddings from the checkpoint's F16 tensors. Tested: z-lab/Qwen3-0.6B-PARO (KL 0.0011
-against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
+against the checkpoint computed exactly on the CPU), z-lab/Llama-3.1-8B-Instruct-PARO (its first layers as the
+checkpoint computes them; a step of one token 81.7 ms, bartowski's Q4_K_S GGUF 76.0), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s;
 with its base model's DFlash2 drafter, z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of
 up to 4 tokens: 6.8 tokens per second after a 1K-token essay prompt, 4.8 after 32K, the same greedy text),
@@ -38,7 +39,7 @@ same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357
 |---|---|---|---|
 | llama | ✅ Llama 3.2 1B Instruct | unsloth Q4_0, Q4_1, Q4_K_M, BF16; lmstudio-community Q3_K_L, its checkpoint directory (BF16); bartowski Q6_K; MaziyarPanahi Q5_K_M | |
 | | ✅ Llama 3.2 3B Instruct | unsloth Q4_K_M, BF16; bartowski Q4_0, Q5_K_M; MaziyarPanahi Q2_K, Q3_K_M | |
-| | ✅ Llama 3.1 8B Instruct | lmstudio-community Q4_K_M; bartowski Q4_K_S | EAGLE3 draft head (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`) |
+| | ✅ Llama 3.1 8B Instruct | lmstudio-community Q4_K_M; bartowski Q4_K_S; z-lab's PARO checkpoint (int4) | EAGLE3 draft head (`yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`) |
 | | 🤔 Llama 3.3 70B's EAGLE3 draft head | | `yuhuili/EAGLE3-LLaMA3.3-Instruct-70B` `pytorch_model.bin` |
 | gemma4 | ✅ Gemma 4 E4B it | ggml-org Q4_0, with its MTP drafter | vision + audio; ggml-org Q8_0, BF16 (with MTP); lmstudio-community Q4_K_M; unsloth Q4_1; HauhauCS Uncensored Aggressive Q4_K_M, Q2_K_P |
 | | 🤔 Gemma 4 12B it | | lmstudio-community Q4_K_M, QAT Q4_0; unsloth Q4_K_M (with MTP); vision + audio |
