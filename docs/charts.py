@@ -6,7 +6,8 @@ artlite.json holds Artlite's measurements. Every other file in docs/data is a ru
 the same schema; its rows are drawn next to the Artlite row of the same model whose quant comes first in their
 comparable_quants (default: the row's own quant), and left out when no Artlite row matches. same_shapes_as charts a
 model under another model's group (same architecture and sizes, other weights); a row's own version (one measured
-with another release than its file's) is in its label, and its notes are footnotes as Artlite's. The image-ttft chart
+with another release than its file's) is a superscript after its runtime's name, spelled out in the legend, and its
+notes are footnotes as Artlite's. The image-ttft chart
 draws the rows with image_ttft_s (per vision encoder and image) under artlite.json's image_prompts: a group per image,
 its glyph the image's outline cut into its slices, all glyphs to one scale. Standard library only: the SVGs use the
 platform's sans-serif font, and text widths are estimated from Helvetica's metrics.
@@ -33,6 +34,7 @@ FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, A
 # color order: a runtime keeps its color whoever else is drawn
 RUNTIMES = ("Artlite", "FastFlowLM", "llama.cpp", "OpenFlowLM")
 NOTE_MARKS = "*†‡§¶‖"
+VERSION_MARKS = "¹²³⁴⁵⁶⁷⁸⁹"
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ THEMES = {
 # Helvetica advance widths (1/1000 em), for layout only
 _WIDTHS = {c: w for chars, w in (
     ("ijl", 222), (" .,:;!ft/'|I[]·", 278), ("r-()", 333), ('*"', 389), ("cksvxyzJ?", 500),
-    ("0123456789abdeghnopqu_L$†‡", 556), ("+=×<>~≈", 584), ("FTZ", 611), ("ABEKPSVXY&", 667), ("CDHNRUw", 722),
+    ("0123456789abdeghnopqu_L$†‡", 556), ("+=×<>~≈", 584), (VERSION_MARKS, 333), ("FTZ", 611), ("ABEKPSVXY&", 667), ("CDHNRUw", 722),
     ("GOQ", 778), ("mM", 833), ("%", 889), ("W", 944), ("—→…", 1000)) for c in chars}
 
 
@@ -114,15 +116,6 @@ class Row:
     @property
     def quant(self) -> str:
         return self.raw["quant"]
-
-    @property
-    def version_quant(self) -> str:
-        """The quant, after the row's own version if it has one."""
-        return f"{self.raw['version'].split()[0]} {self.quant}" if "version" in self.raw else self.quant
-
-    @property
-    def label(self) -> str:
-        return self.quant if self.runtime == "Artlite" else f"{self.runtime} {self.version_quant}"
 
     def get(self, key: str, n: int) -> float | None:
         return self.raw.get(key, {}).get(str(n))
@@ -175,6 +168,22 @@ def load() -> Data:
     return Data(rows, comparisons, groups, legend, art.get("image_prompts", {}))
 
 
+@dataclass
+class Versions:
+    """The comparison rows' own versions: a superscript per version in order of first use, after the runtime's version
+    in the legend."""
+    data: Data
+    marks: dict[tuple[str, str], str] = field(default_factory=dict)  # (runtime, version) -> mark
+
+    def mark(self, row: Row) -> str:
+        if "version" not in row.raw:
+            return ""
+        return self.marks.setdefault((row.runtime, row.raw["version"].split()[0]), VERSION_MARKS[len(self.marks)])
+
+    def legend(self, runtime: str) -> str:
+        return ", ".join([self.data.legend[runtime], *(f"{m} {v}" for (r, v), m in self.marks.items() if r == runtime)])
+
+
 # ---- SVG
 
 
@@ -216,6 +225,9 @@ class Svg:
         """items: (swatch kind: box, line or band; its class; label)."""
         x, y = PAD, self.y + 30
         for kind, cls, label in items:
+            w = (18 if kind == "box" else 26) + text_width(label, 12)
+            if x > PAD and x + w > WIDTH - PAD:  # the rest on the next line
+                x, y = PAD, y + 20
             if kind == "box":
                 self.add(f'<rect x="{x}" y="{y - 9}" width="12" height="12" rx="3" class="{cls}"/>')
                 x += 18
@@ -391,6 +403,7 @@ def draw_bars(svg: Svg, items: list[Heading | BarRow], panels: list[tuple[int | 
 def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: tuple[int, ...],
               fmt: Callable[[float], str]) -> Svg:
     notes = Notes()
+    versions = Versions(data)
     items: list[Heading | BarRow] = []
     shown = {"Artlite"}
     mtp = False
@@ -407,7 +420,8 @@ def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: t
                 if any(c.get(key, n) is not None for n in contexts):
                     shown.add(c.runtime)
                     marks = {int(n): notes.mark(t) for n, t in c.raw.get("notes", {}).get(key, {}).items()}
-                    items.append(BarRow(c.label + notes.mark(c.shapes_note()), f"f{data.color(c.runtime)}",
+                    label = f"{c.runtime}{versions.mark(c)} {c.quant}{notes.mark(c.shapes_note())}"
+                    items.append(BarRow(label, f"f{data.color(c.runtime)}",
                                         {n: c.get(key, n) for n in contexts},
                                         f"{c.runtime}, {c.raw['model']} {c.quant}", marks, partner=main))
             if any(r.mtp(key, n) is not None for n in contexts):
@@ -418,7 +432,7 @@ def bar_chart(data: Data, key: str, title: str, subtitle: list[str], contexts: t
                                     suffix={n: f"S={steps[str(n)]}" for n in contexts if str(n) in steps}))
 
     svg = Svg(title, subtitle)
-    legend = [("box", f"f{data.color(k)}", v) for k, v in data.legend.items() if k in shown]
+    legend = [("box", f"f{data.color(k)}", versions.legend(k)) for k in data.legend if k in shown]
     if mtp:
         legend.insert(1, ("box", "ft", "Artlite with its drafter, S tokens per step"))
     svg.legend(legend)
@@ -436,8 +450,9 @@ def image_chart(data: Data) -> Svg:
     encoders = list(prompts["encoders"].items())
     rows = [r for r in data.rows if r.raw.get(key)]
     notes = Notes()
+    versions = Versions(data)
     items: list[Heading | BarRow] = []
-    legend = {"Artlite": "Artlite"}  # (a comparison's own version: the release its images were measured with)
+    shown = {"Artlite"}
 
     def values(row: Row, image: str) -> dict[int | str, float | None]:
         return {e: row.raw[key].get(e, {}).get(image) for e, _ in encoders}
@@ -455,9 +470,9 @@ def image_chart(data: Data) -> Svg:
             items.append(main)
             for c in data.paired(r):
                 if c.raw.get(key):
-                    legend[c.runtime] = (f"{c.runtime} {c.raw['version'].split()[0]}" if "version" in c.raw
-                                         else data.legend[c.runtime])
-                    label = " ".join([c.runtime, *[c.quant] * (c.quant != r.quant), *[c.raw.get("backend", "")]])
+                    shown.add(c.runtime)
+                    label = " ".join([c.runtime + versions.mark(c), *[c.quant] * (c.quant != r.quant),
+                                      *[c.raw.get("backend", "")]])
                     items.append(BarRow(label.strip(), f"f{data.color(c.runtime)}", values(c, name),
                                         f"{label.strip()}, {c.raw['model']} {c.quant}, {name}", marks(c),
                                         partner=main))
@@ -469,7 +484,7 @@ def image_chart(data: Data) -> Svg:
         ("(an overview and its slices), then the prefill. From the request to the first streamed token, through each "
          "runtime's server."),
     ])
-    svg.legend([("box", f"f{data.color(k)}", v) for k, v in legend.items()])
+    svg.legend([("box", f"f{data.color(k)}", versions.legend(k)) for k in data.legend if k in shown])
     draw_bars(svg, items, [(e, heading) for e, heading in encoders], sig3, lower_better=True, ticks=6)
     svg.footer(notes)
     return svg
@@ -534,10 +549,14 @@ def ttft_chart(data: Data) -> Svg:
         ("its time grows with the prompt (1: linear, 2: quadratic), and the vertical gap between two curves is a "
          "speed ratio."),
     ])
-    shown = {c.runtime: c for _, _, _, cmps in panels for c in cmps}
+    versions = Versions(data)
+    for _, _, _, cmps in panels:
+        for c in cmps:
+            versions.mark(c)
+    shown = {c.runtime for _, _, _, cmps in panels for c in cmps}
     a = data.color("Artlite")
     svg.legend([("line", str(a), "Artlite"), ("band", f"b{a}", "Artlite, the range of its quants")]
-               + [("line", str(data.color(k)), data.legend[k]) for k in shown])
+               + [("line", str(data.color(k)), versions.legend(k)) for k in data.legend if k in shown])
     top = svg.y + 22
 
     for i, (g, main, arts, cmps) in enumerate(panels):
@@ -554,7 +573,7 @@ def ttft_chart(data: Data) -> Svg:
         svg.text(px, py - 26, g, "h")
         x = px  # each curve's quant, after a dot of its color
         for r in [main, *cmps]:
-            s = r.version_quant + notes.mark(r.shapes_note())
+            s = r.quant + versions.mark(r) + notes.mark(r.shapes_note())
             svg.add(f'<circle cx="{x + 3.5:.1f}" cy="{py - 14:.1f}" r="3.5" class="d{data.color(r.runtime)}"/>')
             svg.text(x + 10, py - 10, s)
             x += 10 + text_width(s, 11) + 12
