@@ -164,3 +164,15 @@ def test_tan_dead_channel() -> None:
     assert np.isfinite(tf.T).all() and np.isfinite(tf.w).all()
     want = r.apply(x * gamma)[:, tf.chan_index()]
     assert np.abs(tf.apply(x) - want).max() < 1e-12 * np.abs(want).max()
+
+
+def test_rounds_native() -> None:
+    """The tan form's rounds in C++ (``_native.paro_rounds``) give numpy's bits: partners, coefficients, scales, the
+    storage order and the scales' origins, with and without a gamma folded in."""
+    t, _ = random_paro(1024, 64, seed=5)
+    r = t.rot()
+    G, g = r.K // r.group, r.group
+    for d0 in (np.ones((G, g)), np.random.default_rng(3).uniform(0.25, 4.0, (G, g))):
+        (a, oa), (b, ob) = r._rounds(d0), r._rounds(d0, native=False)
+        for x, y in ((a.partner, b.partner), (a.T, b.T), (a.D, b.D), (a.chan, b.chan), (oa, ob)):
+            assert np.array_equal(x, y)

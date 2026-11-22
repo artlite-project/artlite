@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from . import _native
 from .gguf_model import QTensor
 
 _AWQ_ORDER = np.array([0, 4, 1, 5, 2, 6, 3, 7], np.uint32)  # nibble of logical column j
@@ -109,15 +110,24 @@ class Rotation:
         out.w = np.where(dead, 0.0, d0 / d1).reshape(-1) if dead is not None else (d0 / d1).reshape(-1)
         return out
 
-    def _rounds(self, d0: np.ndarray) -> tuple[TanForm, np.ndarray]:
+    def _rounds(self, d0: np.ndarray, *, native: bool = True) -> tuple[TanForm, np.ndarray]:
         """The tan form from the initial scales d0 (G, g): and per final storage position the channel whose initial scale
-        flows into its final one (G, g)."""
+        flows into its final one (G, g). ``native``: the rounds in C++ (``_native.paro_rounds``: the numpy expressions
+        below term by term, the angles' cosines and sines numpy's: the same bits; 9 ms -> 0.1 ms a linear of K 5120)."""
         G, g, R = self.K // self.group, self.group, self.rounds
-        d = d0.copy()
+        d = np.ascontiguousarray(d0, np.float64).copy()
+        th = np.asarray(self.theta, np.float64).reshape(R, G, g // 2)
+        if native:
+            partner8 = np.empty((R, G, g), np.uint8)
+            coef = np.empty((R, G, g), np.float64)
+            pos, origin = np.empty((G, g), np.int64), np.empty((G, g), np.int64)
+            _native.paro_rounds(np.ascontiguousarray(np.asarray(self.pairs, np.int64).reshape(R, G, g)),
+                                np.ascontiguousarray(np.cos(th)), np.ascontiguousarray(np.sin(th)), d, partner8, coef,
+                                pos, origin)
+            return self._form(partner8, coef, d, pos, origin)
         origin = np.tile(np.arange(g), (G, 1))  # (per channel: whose initial scale its scale carries)
         pos = np.tile(np.arange(g), (G, 1))  # pos[G, c]: the storage position of channel c
         p = np.asarray(self.pairs, np.int64).reshape(R, G, g // 2, 2)
-        th = np.asarray(self.theta, np.float64).reshape(R, G, g // 2)
         gi = np.arange(G)[:, None]
         partner = np.empty((R, G, g), np.int64)
         coef = np.empty((R, G, g), np.float64)
@@ -135,10 +145,17 @@ class Rotation:
             d[gi, i], d[gi, j] = np.where(cf, c * di, s * dj), np.where(cf, c * dj, -s * di)
             origin[gi, i], origin[gi, j] = np.where(cf, oi, oj), np.where(cf, oj, oi)
             pos[gi, i], pos[gi, j] = np.where(cf, P, Q), np.where(cf, Q, P)
+        return self._form(partner.astype(np.uint8), coef, d, pos, origin)
+
+    def _form(self, partner: np.ndarray, coef: np.ndarray, d: np.ndarray, pos: np.ndarray, origin: np.ndarray
+              ) -> tuple[TanForm, np.ndarray]:
+        """``_rounds``' result from the rounds' (partner, coef per storage position; d, pos, origin per channel)."""
+        G, g, R = self.K // self.group, self.group, self.rounds
+        gi = np.arange(G)[:, None]
         chan = np.empty_like(pos)  # chan[G, s]: the channel at storage position s
         chan[gi, pos] = np.arange(g)[None, :]
-        tf = TanForm(partner.reshape(R, -1).astype(np.uint8), coef.reshape(R, -1),
-                     np.take_along_axis(d, chan, 1).reshape(-1), chan.reshape(-1), g)
+        tf = TanForm(partner.reshape(R, -1), coef.reshape(R, -1), np.take_along_axis(d, chan, 1).reshape(-1),
+                     chan.reshape(-1), g)
         return tf, np.take_along_axis(origin, chan, 1)
 
 

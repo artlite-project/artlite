@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "artlite/awq_rows.h"
+#include "artlite/paro_rounds.h"
 #include "artlite/error.h"
 #include "artlite/slot_pack.h"
 #include "artlite/tile_pack.h"
@@ -155,6 +156,36 @@ void bind_pack(nb::module_& m) {
       "rows of P4_128 blocks (int5: P5_128; artlite::awq_rows) into out (rows, K / 256 * 144, or 176): its rows "
       "(rows_of: the columns of these rows), groups (groups_of) and each group's channels (chan: K group-local "
       "indices, the storage order of the rows' codes) in another order; threads: 0 = one per physical core.");
+
+  m.def(
+      "paro_rounds",
+      [](nb::ndarray<const int64_t, nb::ndim<3>, nb::c_contig, nb::device::cpu> pairs,
+         nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> cs,
+         nb::ndarray<const double, nb::ndim<3>, nb::c_contig, nb::device::cpu> sn,
+         nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> d,
+         nb::ndarray<uint8_t, nb::ndim<3>, nb::c_contig, nb::device::cpu> partner,
+         nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cpu> coef,
+         nb::ndarray<int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> pos,
+         nb::ndarray<int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> origin) {
+        const size_t R = pairs.shape(0), G = pairs.shape(1), g = pairs.shape(2);
+        if (g % 2 || g > 256 || cs.shape(0) != R || cs.shape(1) != G || cs.shape(2) != g / 2 || sn.shape(0) != R ||
+            sn.shape(1) != G || sn.shape(2) != g / 2 || d.shape(0) != G || d.shape(1) != g || partner.shape(0) != R ||
+            partner.shape(1) != G || partner.shape(2) != g || coef.shape(0) != R || coef.shape(1) != G ||
+            coef.shape(2) != g || pos.shape(0) != G || pos.shape(1) != g || origin.shape(0) != G || origin.shape(1) != g)
+          throw artlite::Error("paro_rounds: inconsistent shapes");
+        const int64_t* p = pairs.data();
+        for (size_t i = 0; i < R * G * g; i++)
+          if (p[i] < 0 || p[i] >= int64_t(g)) throw artlite::Error("paro_rounds: a channel outside its group");
+        nb::gil_scoped_release release_gil;
+        artlite::paro_rounds(int(R), int(G), int(g), p, cs.data(), sn.data(), d.data(), partner.data(), coef.data(),
+                             pos.data(), origin.data());
+      },
+      "pairs"_a, "cs"_a, "sn"_a, "d"_a, "partner"_a, "coef"_a, "pos"_a, "origin"_a,
+      "A rotation's tan form (artlite.paro.Rotation._rounds; artlite::paro_rounds): pairs (rounds, groups, group) int64 "
+      "group-local, cs / sn (rounds, groups, group / 2) the angles' cosines and sines, d (groups, group) the initial "
+      "scales (the final ones per channel on return); out: partner (rounds, groups, group) uint8, coef (rounds, groups, "
+      "group) fp64 per storage position, pos (groups, group) each channel's final storage position, origin (groups, "
+      "group) the channel whose initial scale each channel's carries.");
 
   m.def(
       "pack_slots",

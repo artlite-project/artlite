@@ -9,6 +9,7 @@ add_library(artlite_core OBJECT
   artlite/memory.cpp
   artlite/moe_host.cpp
   artlite/pack_run.cpp
+  artlite/paro_rounds.cpp
   artlite/sampling.cpp
   artlite/scratchpad.cpp
   artlite/slot_pack.cpp
@@ -19,12 +20,12 @@ if(MSVC)
   set_source_files_properties(artlite/tile_pack.cpp artlite/slot_pack.cpp artlite/pack_run.cpp artlite/moe_host.cpp
                               artlite/sampling.cpp PROPERTIES COMPILE_OPTIONS /arch:AVX512)
   # (the embedding rows' fp32 operations as gguf_model's QTensor.dequantize orders them: no fused multiply-adds)
-  set_source_files_properties(artlite/dequant.cpp PROPERTIES COMPILE_OPTIONS /fp:precise)
+  set_source_files_properties(artlite/dequant.cpp artlite/paro_rounds.cpp PROPERTIES COMPILE_OPTIONS /fp:precise)
 else()
   # the weight packers' AVX-512 VBMI / GFNI code, the MoE routing's, sampling's (Artlite runs on Zen 5 only)
   set_source_files_properties(artlite/tile_pack.cpp artlite/slot_pack.cpp artlite/pack_run.cpp artlite/moe_host.cpp
                               artlite/sampling.cpp PROPERTIES COMPILE_OPTIONS -march=znver5)
-  set_source_files_properties(artlite/dequant.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+  set_source_files_properties(artlite/dequant.cpp artlite/paro_rounds.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 # A backend: its shim, the Kernel on it and the code over its buffers and contexts (file reads, the profiler, the NPU's
