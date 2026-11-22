@@ -2,7 +2,8 @@
 designs and returns what it built (``AppBuild``): the decode overlays and prefill libraries of the models present
 (Qwen3 on Llama's path with its q / k norm weights, and Qwen3-0.6B-PARO's, Qwen3.5-0.8B-PARO's, Qwen3.6-35B-A3B-PARO's and
 Qwen3.8-27B-PARO-int5's checkpoint directories: their rotated inputs, the 27B's also with its base model's DFlash2
-drafter; Qwen3.6-35B-A3B also with its MTP drafter file, the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
+drafter; Qwen3.6-35B-A3B (and its PARO checkpoint) also with its MTP drafter file, the app's default: the design runs
+the drafter's formats too; Qwen3.8 27B on its design of 8 slots with its MTP block
 and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter), the vision
 overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them,
 ``schedule_ledger.py`` reads their builds."""
@@ -188,6 +189,7 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "qwen3-0.6B-PARO": _llama(checkpoint("qwen3-0.6B-paro"), "hilo"),
     "qwen3.5-0.8B-PARO": (checkpoint("qwen3.5-0.8B-paro"), _qwen),
     "qwen3.6-35B-A3B-PARO": (checkpoint("qwen3.6-35B-A3B-paro"), _qwen),
+    "qwen3.6-35B-A3B-PARO-mtp": (checkpoint("qwen3.6-35B-A3B-paro"), lambda path: _qwen(path, mtp=True)),
     "qwen3.8-27B-PARO-int5": (checkpoint("qwen3.8-27B-paro-int5"), _qwen),
     "qwen3.8-27B-PARO-int5-dflash": (checkpoint("qwen3.8-27B-paro-int5"), _qwen_paro_dflash),
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),

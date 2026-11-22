@@ -213,10 +213,14 @@ MTP_QUANTS = ("Q4_0", "Q4_K_M", "Q8_0")  # (a qwen35 drafter file by preference:
 def qwen_mtp_of(model: str, quant: str = "") -> str | None:
     """The multi-token-prediction drafter (``mtp-*.gguf``, or an uploader's ``<name>-mtp-*.gguf``) of a qwen35 /
     qwen35moe model file without a block of its own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
-    the drafters apart from other uploaders' models); of several, the first of ``MTP_QUANTS`` (``quant``: that
-    quantization's only). None: there is none."""
+    the drafters apart from other uploaders' models; a PARO checkpoint directory's: its base model's ``<base>-GGUF``
+    repositories); of several, the first of ``MTP_QUANTS`` (``quant``: that quantization's only). None: there is none."""
     d = os.path.dirname(os.path.abspath(model))
-    root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d)
+    if os.path.isdir(model):  # (a checkpoint directory, a PARO one <base>-PARO[-variant]: its base model's GGUF repositories)
+        d = os.path.abspath(model)
+        root, repo = os.path.dirname(os.path.dirname(d)), re.sub(r"-PARO(-[\w.]+)?$", "", os.path.basename(d)) + "-GGUF"
+    else:
+        root, repo = os.path.dirname(os.path.dirname(d)), os.path.basename(d)
     others = sorted(os.path.join(root, org, repo) for org in os.listdir(root) if os.path.isdir(os.path.join(root, org, repo)))
 
     def rank(f: str) -> int:

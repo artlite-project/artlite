@@ -13,7 +13,8 @@ writes the records (``AttnPrepOperator``) into the drafter's KV cache at the chu
   one row later: row q of the second region holds the projection of h_{q - 1} (its row
   0 the previous chunk's last valid row: ``carry``, zeros at position 0, after decode steps the host's: ``carry_of``);
   the residual norm adds both parts to a zero x (DZ) in fp32 and writes attn_norm(x0)'s panels (DPN);
-- the drafter's attn_in GEMMs (DG), then the attention prep into the drafter's cache (its q / k norms in the prefill's
+- the drafter's attn_in GEMMs (DG; a PARO checkpoint's drafter: its q, k, v regions into one layout,
+  ``prefill.gemm.joined_layout``), then the attention prep into the drafter's cache (its q / k norms in the prefill's
   PQN; its Q slots into QS, unused).
 
 Buffers of the drafter's device by "D" + their name (``buffers``): its weight image DW (a model's own block: the
@@ -43,7 +44,10 @@ class DraftPrefill(DrafterPrefill):
         cfg, img, H = draft.cfg, draft.image, draft.H
         self.L, self.H, self.eps = draft.L, H, cfg.rms_norm_eps
         self.R0 = max(prefill.sizes) + 64  # (rows of each of DY's regions: a chunk, its GEMMs' padding, the carry)
-        self.pitch = PG.phase_pitch(img, "attn_in", prefill.SUB)
+        # (a PARO checkpoint's drafter, ``QwenDraft``'s rotated image: q, k, v regions of their own into one layout)
+        self.qkv = [img.region(self.L, n) for n in ("attn_q", "attn_k", "attn_v")] if img.paro else None
+        self.pitch = (PG.joined_layout(self.qkv, prefill.SUB).pitch if self.qkv else
+                      PG.phase_pitch(img, "attn_in", prefill.SUB))
         eh = SimpleNamespace(regions=[img.region(self.L, "eh")])  # (eh's own pitch: its widest of the sub-chunk sizes')
         self.d_pitch = max(PG.d_pitch(eh, prefill._t(T)) for T in prefill.sizes)
         self.row = 2 * COLS * self.d_pitch  # (bytes of a row of DY)
@@ -58,8 +62,14 @@ class DraftPrefill(DrafterPrefill):
         assert not r.half and H % r.kc == 0, "eh_proj's [enorm half | hnorm half]: whole K chunks each"
         eh = PG.plan_phase(img, r, t, pitch=self.d_pitch, ops=self.pf._gemms, k_part=r.n_kc // 2)
         assert eh.parts == 2, "eh_proj as [enorm half | hnorm half]"
+        if self.qkv:  # (each region's GEMMs on the one input, DPN)
+            lay = PG.joined_layout(self.qkv, self.pf.SUB, self.pitch)
+            attn = PG.PhasePlan([g for r in self.qkv for g in PG.plan_phase(img, r, t, ops=self.pf._gemms, layout=lay).gemms],
+                                lay)
+        else:
+            attn = PG.plan_phase(img, img.region(self.L, "attn_in"), t, pitch=self.pitch, ops=self.pf._gemms)
         return SimpleNamespace(
-            eh=eh, attn=PG.plan_phase(img, img.region(self.L, "attn_in"), t, pitch=self.pitch, ops=self.pf._gemms),
+            eh=eh, attn=attn,
             ne=PrefillNormOperator(T=t, add=False, E=H, eps=eps, out_pitch=2 * H, out_col=0),
             nh=PrefillNormOperator(T=t, add=False, E=H, eps=eps, pre=True, out_pitch=2 * H, out_col=H),
             nx=PrefillNormOperator(T=t, E=H, eps=eps, deltas=2, d_stride=self.R0 * self.row // 2,
@@ -120,7 +130,7 @@ class DraftPrefill(DrafterPrefill):
     def seconds(self, Ss: float, *, weight_s: float, gemm_s: float, norm_s: float, prep_s: float, cfg_s: float) -> float:
         """Estimated time of a chunk's records (``QwenPrefill.layer_seconds``' constants; Ss sub-chunks)."""
         img = self.d.image
-        wbytes = sum(img.region(self.L, name).read_bytes for name in ("eh", "attn_in"))
+        wbytes = img.region(self.L, "eh").read_bytes + sum(r.read_bytes for r in self.qkv or [img.region(self.L, "attn_in")])
         heads = self.d.cfg.num_attention_heads
         return Ss * (weight_s * wbytes + 3 * gemm_s + 4 * norm_s * self.H + prep_s * heads) + 6 * cfg_s
 

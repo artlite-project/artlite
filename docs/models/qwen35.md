@@ -50,8 +50,8 @@ the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account; a PARO checkpoi
 design runs 8 tokens and the file has its MTP layer (the DFlash2 drafter's head), or the model is a PARO checkpoint (its
 design of 4 slots), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
 model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in
-another account's repository of the same name (ggml-org publishes its drafters apart from the models); of several, Q4_0,
-then Q4_K_M, then Q8_0.
+another account's repository of the same name (ggml-org publishes its drafters apart from the models; a PARO
+checkpoint's: in its base model's `<base>-GGUF` repositories); of several, Q4_0, then Q4_K_M, then Q8_0.
 `--spec-draft-model FILE` takes another file, `--spec-type none` none ([artlite-cli](../cli.md)).
 
 ## How the NPU path works

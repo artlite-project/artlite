@@ -58,10 +58,15 @@ class DraftImage(QwenImage):
     then of the table's; tiles of the model image's 9280 bytes (16 rows of Q4_0)."""
 
     SCREEN = False  # (a draft's logits: its head's rows as they are)
+    ROT_IN = False  # (rotated: its layer's copies come from its eh phase)
 
-    def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None):
+    def __init__(self, gguf: GGUFFile, cfg: QwenConfig, *, layers: list[int], vocab: int | None = None,
+                 rotated: bool = False):
+        """rotated: the drafter of a PARO checkpoint (its design's phases: ``QwenImage``'s ``rotated``, the eh phase's
+        copies of the residual for the layer's q, k, v, "eh_rot")."""
         self.fixed, self.table = head_tokens(gguf, (vocab or HEAD_ROWS + TABLE_ROWS) - TABLE_ROWS)
-        super().__init__(gguf, cfg, layers=layers, vocab=len(self.fixed) + len(self.table), tile_bytes=OBJ_BYTES)
+        super().__init__(gguf, cfg, layers=layers, vocab=len(self.fixed) + len(self.table), tile_bytes=OBJ_BYTES,
+                         rotated=rotated)
 
     def head_rows(self) -> np.ndarray:
         """(per column: its fixed tokens, then its table's)"""
@@ -71,6 +76,16 @@ class DraftImage(QwenImage):
         H = self.cfg.hidden_size
         self._add(layer, "eh", [("eh", (f"blk.{layer}.nextn.eh_proj.weight",), column_rows(H))], 2 * H)
         super()._layer(layer)
+
+    def _paro_layer(self, layer: int) -> None:
+        H = self.cfg.hidden_size
+        self._add(layer, "eh", [("eh", (f"blk.{layer}.nextn.eh_proj.weight",), column_rows(H))], 2 * H)
+        self.rot_data(layer, "eh_rot", self._in_rot(layer))
+        super()._paro_layer(layer)
+
+    def _vec(self, name: str) -> np.ndarray:
+        """(the head's norm: the block's shared_head_norm)"""
+        return super()._vec(f"blk.{self.layers[0]}.nextn.shared_head_norm.weight" if name == "output_norm.weight" else name)
 
     def norm_objects(self, layer: int, name: str) -> np.ndarray:
         if layer >= 0:
@@ -100,13 +115,15 @@ class _DraftConfig:
 
 class QwenDraft(QwenOverlay):
     """The drafter ``gguf`` (an MTP file; None: the block of the model's own file, ``QwenImage.mtp_view``) of the model
-    on ``target`` (whose design runs the drafter's formats: ``QwenOverlay(formats=)``). ``load`` after the target's
-    (its program and context; the model's own block: its weight buffer). ``table``: its head's tokens. A target of
+    on ``target`` (whose design runs the drafter's formats: ``QwenOverlay(formats=)``; a PARO checkpoint's: its block
+    laid out as a PARO layer of identity rotations, ``DraftImage``'s ``rotated``, its steps ``paro_steps``'). ``load``
+    after the target's (its program and context; the model's own block: its weight buffer). ``table``: its head's tokens. A target of
     several sequences: a cache of each, the selected one the target's (``ModelOverlay.followers``); the table is
     one, of every sequence's tokens."""
 
     CONFIG, IMAGE = _DraftConfig, DraftImage
     STEPS_AHEAD = False  # (its steps follow the model's rounds, not each other)
+    ROT_IN = False  # (a PARO checkpoint's drafter: its layer's copies from its eh phase, ``paro_steps``)
 
     def __init__(self, target: QwenOverlay, gguf: GGUFFile | None = None):
         own = gguf is None
@@ -119,8 +136,9 @@ class QwenDraft(QwenOverlay):
                 tc.n_experts_used, tc.expert_ffn, tc.shared_ffn):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         self.L = cfg.num_hidden_layers - 1
-        super().__init__(gguf, layers=[self.L], max_positions=target.max_positions,
-                         image=target.image.mtp_view(cfg) if own else None, slots=target.SLOTS,
+        image = target.image.mtp_view(cfg) if own else (DraftImage(gguf, cfg, layers=[self.L], rotated=True)
+                                                         if target.paro else None)
+        super().__init__(gguf, layers=[self.L], max_positions=target.max_positions, image=image, slots=target.SLOTS,
                          sequences=target.sequences)
         target.followers.append(self)  # (its cache of each of the model's sequences: selected with the model's)
         self.w_of = target if own else None

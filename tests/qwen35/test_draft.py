@@ -273,3 +273,55 @@ def test_draft_prefill(size: str) -> None:
     for u, v in ((ha, hb), (a, b)):
         assert np.sqrt(((u - v) ** 2).mean() / (v ** 2).mean()) < rec
     assert a.argmax() == b.argmax()
+
+
+def test_draft_paro() -> None:
+    """The MTP drafter (ggml-org's Q4_0 file) of Qwen3.6-35B-A3B-PARO (a checkpoint directory): its block laid out as a
+    PARO layer of identity rotations on the PARO design of 4 slots (``DraftImage``'s ``rotated``: each normed input an
+    identity copy over its norm's weights, its eh phase's copies of the residual for q, k, v), on a 2-layer slice of the
+    PARO model, against ``ref.mtp_block`` on llama.cpp's hidden states of the GGUF model's essay rows (the drafter's
+    inputs: the oracle does not depend on the model), in steps of 1 and 4 rows from position 0: within the GGUF design's
+    tolerances but h's median (0.76%: the copies' bf16(x bf16(gamma)) against the norm objects' x gamma)."""
+    from artlite.hf_model import HfModel
+    from artlite.model_config import checkpoint
+
+    path, model = checkpoint("qwen3.6-35B-A3B-paro"), size_gguf("35B-A3B")
+    require(path)
+    require(model)
+    mtp = qwen_mtp_of(path)
+    if mtp is None:
+        pytest.skip(f"no MTP drafter of {path}")
+    gm = GGUFFile(mtp)
+    cfg = QwenConfig.from_gguf(gm)
+    L = cfg.num_hidden_layers
+    tokens = llama_tokenize(model, essay("apple.txt"))[:N]
+    G = golden(model, tokens, layers=(L, "g"), names="mtp_tok_embd|result_norm", logits="none", mtp=mtp)
+    emb = np.asarray(G.mtp("mtp_tok_embd", L), np.float32).reshape(N, -1)
+    hr = np.asarray(G["result_norm"], np.float32).reshape(N, -1)
+    h = np.concatenate([np.zeros_like(hr[:1]), hr[:-1]])
+    target = QwenOverlay(HfModel(path), layers=[0, 3], vocab=4096, max_positions=1024, formats=draft_formats(gm),
+                         gu=draft_gate_up(gm))
+    draft = QwenDraft(target, gm)
+    assert draft.paro and draft.image.identity
+    target.load()
+    draft.load()
+    r = ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids)
+    tie, _, top = TOL["35B-A3B"]
+    med = 8.5e-3  # (h 0.76% median: the GGUF design's 0.72-0.74% and the copies' rounding)
+    t = gm.tensor(f"blk.{L}.ffn_gate_inp.weight")
+    p = np.sort(np_ops.softmax(r["mtp_attn_post_norm"] @ t.dequantize().reshape(t.rows, -1).T), -1)[:, ::-1]
+    refs = [r, ref.mtp_block(gm, cfg, emb, h, np.arange(N), head=draft.table.ids, swap=(p[:, 7] - p[:, 8]) / p[:, 7] < tie)]
+    for S in (1, 4):
+        draft.reset()
+        lg, hs = [], []
+        for q in range(0, N, S):
+            k = min(S, N - q)
+            lg.append(draft.step(emb[q:q + k], h[q:q + k], q).astype(np.float32))
+            hs += [draft.hidden_state(s) for s in range(k)]
+        lg, hs = np.concatenate(lg), np.stack(hs)
+        e, which = _nearest(hs, [x["h_nextn"].astype(np.float64) for x in refs])
+        assert np.median(e) < med and e.max() < top, (S, np.median(e), e.max(), int(e.argmax()))
+        want = np.choose(which[:, None], [x["logits"] for x in refs])
+        top2 = np.sort(want, -1)[:, -2:]
+        clear = top2[:, 1] - top2[:, 0] > 0.1
+        assert (lg.argmax(-1) == want.argmax(-1))[clear].all(), S

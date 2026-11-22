@@ -150,7 +150,7 @@ class QwenPrefill(ChunkPrefill):
         self.gu_paired = not self.paro or overlay.cfg.moe or all(PG.gate_up_paired(
             overlay.image.region(L, "gate"), overlay.image.region(L, "up")) for L in overlay.layers)
         if self.paro:  # (``prefill.rotate``: a sub-chunk's items over 32 cores from 128 tokens on)
-            assert draft is None and not pack, "a chat model's (its drafter: a DFlash2 one)"
+            assert not pack, "a chat model's"
             default = tuple(t for t in default if t >= 128)
         super().__init__(overlay, tuple(t for t in sizes or default if t >= 128 or not self.paro))
         self.max_t = default[-1]  # (the model's largest chunk: GdnOut's conv-state rows of G)

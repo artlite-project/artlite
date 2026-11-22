@@ -59,8 +59,9 @@ class MoeImage:
                   Fs, G=KC // Fs)
         gu, down = (b + "ffn_gate_exps.weight", b + "ffn_up_exps.weight"), b + "ffn_down_exps.weight"
         self._add_slab(layer, "exp_gu", [("gu", gu, self._slab_rows("gu", self.R[self.fmt(gu[0])]))], H)
-        if self.__dict__.get("paro"):  # (PARO experts: a half's groups of the downs' rotation before its down tiles)
-            self.rot_slab(layer, "exp_rot", down, 2 * E)
+        if self.__dict__.get("paro"):  # (PARO experts: a half's groups of the downs' rotation before its down tiles; a
+            # rotated image's plain experts: the identity, ``qwen35.image``'s ``rotated``)
+            self.rot_slab(layer, "exp_rot", "" if self.__dict__.get("identity") else down, 2 * E)
         self.view(down, F // 512)  # (a row of the view: a half's K)
         self._add_slab(layer, "exp_down", [("down", (down,), self._slab_rows("down", self.R[self.fmt(down)]))], F // 2,
                        G=2 * KC // F)

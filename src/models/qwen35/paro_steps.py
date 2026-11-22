@@ -6,8 +6,9 @@ input), gdn_out (gate's and up's copies); per attention layer attn_q, attn_k, at
 raw K / V objects), the attention (o into rot_o's input), rot_o, attn_out; then gate, up (their rows into rot_down's
 input), rot_down (act(gate) up of each column's slice of down's input: the ffn in whole rotation groups a column, zero
 past it), down (the next layer's copies; the last layer's residual into the LM head's input). The first layer's copies
-come from rot_in (the residual slices the columns load), the LM head's from the last layer's down (an identity copy
-over the output norm, ``image``); a DFlash2 drafter's taps (``taps``) an identity copy more each (no norm weight: the
+come from rot_in (the residual slices the columns load; an MTP drafter's, ``draft.QwenDraft``: from its eh phase,
+eh_proj over the host's [enorm(emb) | hnorm(h)], its layer's linears plain with identity rotations), the LM head's from
+the last layer's down (an identity copy over the output norm, ``image``); a DFlash2 drafter's taps (``taps``) an identity copy more each (no norm weight: the
 residual), in a region of its own (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
 expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
 copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
@@ -57,11 +58,12 @@ if TYPE_CHECKING:
 FLAGS = {"rot_in": F_EMITR | F_ROTE, "gin_q": F_PSQ | F_MSG, "gin_z": F_PSQ | F_MSG, "attn_q": F_PSQ, "attn_k": F_PSQ,
          "attn_v": F_PSQ, "rot_g": F_ROTX, "rot_o": F_ROTX, "gdn_out": F_RESID | F_EMITR | F_ROTE,
          "attn_out": F_RESID | F_EMITR | F_ROTE, "gate": F_PSQ, "up": F_PSQ, "rot_down": F_ROTX | F_RACT,
-         "down": F_RESID | F_EMITR | F_ROTE, "moe_in": F_PSQ, "sdown": F_RESID | F_WS, "lm": F_PSQ}
+         "down": F_RESID | F_EMITR | F_ROTE, "moe_in": F_PSQ, "sdown": F_RESID | F_WS, "lm": F_PSQ,
+         "eh": F_RESID | F_EMITR | F_ROTE}
 KINDS = {"rot_in": "in", "gin_q": "psq", "gin_z": "psq", "attn_q": "psq", "attn_k": "psq", "attn_v": "psq",
          "gate": "psq", "up": "psq", "rot_g": "rotx", "rot_o": "rotx", "rot_down": "rotx", "moe_in": "psq", "lm": "psq"}
 DATA = {"rot_in": "rot_in", "rot_g": "rot_g", "rot_o": "rot_o", "gdn_out": "gdn_out_rot", "attn_out": "attn_out_rot",
-        "rot_down": "rot_down", "down": "down_rot"}  # (each phase's rotation objects: ``image``'s data regions)
+        "rot_down": "rot_down", "down": "down_rot", "eh": "eh_rot"}  # (each phase's rotation objects: ``image``'s data regions)
 NOSYNC = frozenset({"gin_z", "attn_k", "attn_v", "up"})
 MIXER = {True: ("attn_q", "attn_k", "attn_v", "rot_o", "attn_out"), False: ("gin_q", "gin_z", "rot_g", "gdn_out")}
 FFN = ("gate", "up", "rot_down", "down")
@@ -78,8 +80,10 @@ class ParoSteps(RotatedOverlay):
     # The phases
     # ------------------------------------------------------------------
 
+    ROT_IN = True  # (the first layer's copies from the loaded residual; an MTP drafter's from its eh phase)
+
     def paro_phases(self: "QwenOverlay") -> list[tuple[int, str]]:
-        out = [(self.layers[0], "rot_in")]
+        out = [(self.layers[0], "rot_in")] if self.ROT_IN else []
         for L in self.layers:
             out += [(L, n) for n in MIXER[bool(self.cfg.attention[L])] + (MOE_FFN if self.moe else FFN)]
         return [*out, (-1, "lm")]
@@ -121,7 +125,7 @@ class ParoSteps(RotatedOverlay):
     def rot_copies(self: "QwenOverlay", L: int, name: str) -> int:
         if name in ("gdn_out", "attn_out"):  # (gate's and up's; an MoE layer's moe_in's)
             return 1 if self.moe else 2
-        return len(self.copies_of(L if name == "rot_in" else self.next_layer(L)))
+        return len(self.copies_of(L if name in ("rot_in", "eh") else self.next_layer(L)))
 
     def paro_groups(self: "QwenOverlay", L: int, name: str, S: int) -> list[mp.Group]:
         if name == "tap":  # (a drafter's tap: no phase reads its metadata object)
@@ -191,7 +195,7 @@ class ParoSteps(RotatedOverlay):
         S, cfg = st.S, self.cfg
         ffn = cfg.intermediate_size // COLS
         for c in range(COLS):
-            if name == "rot_in":
+            if name in ("rot_in", "eh"):
                 self.emit_copies(seq, c, S, self.copies_of(L))
             elif name == "attn_q":
                 self.attn_steps.q_drain(seq, L, S, c)
@@ -233,7 +237,7 @@ class ParoSteps(RotatedOverlay):
             self.moe_steps.route(seq)
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.loadr + c * self.SLOTS * XB), S * XB)
-        self.paro_phase(seq, st, (self.layers[0], "rot_in"))
+        self.paro_phase(seq, st, (self.layers[0], "rot_in" if self.ROT_IN else "eh"))
         for L in self.layers:
             if self.cfg.attention[L]:
                 for name in ("attn_q", "attn_k", "attn_v"):

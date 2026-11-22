@@ -26,7 +26,9 @@ against the checkpoint computed exactly on the CPU), z-lab/Qwen3.5-0.8B-PARO (KL
 with its base model's DFlash2 drafter, z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of
 up to 4 tokens: 6.8 tokens per second after a 1K-token essay prompt, 4.8 after 32K, the same greedy text),
 z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
-bytes a token; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357).
+bytes a token; with its base model's MTP drafter, ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the
+GGUF files, 34.8 tokens per second after a 1K-token essay prompt and 29.8 after 32K, the GGUF's 35.8 and 30.5, the
+same greedy text; a 1024-token prompt at 1340 tokens per second, the GGUF's 1357).
 
 ## Tested files and plans
 

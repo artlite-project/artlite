@@ -84,7 +84,7 @@ from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import QwenConfig
 from artlite.moe.image import MoeImage
 from artlite.operators.design import COLS
-from artlite.paro import ParoTensor
+from artlite.paro import ParoTensor, Rotation
 from artlite.prefill.gemm import pair_tails
 
 KC = 1024  # K chunk of a tile (5120 = 5 chunks, 4096 = 4)
@@ -120,17 +120,21 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
     draft_cols = 0
     mtp_layer = -1
     SCREEN = True  # (the model's own LM head may be screened: ``screen``)
+    ROT_IN = True  # (PARO: the first layer's copies from the loaded residual, "rot_in"; a drafter's from its eh phase)
+    identity = False
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True, tails: bool = True,
-                 pairs: bool = True, screen: bool = True, dflash: tuple[int, ...] | None = None):
+                 pairs: bool = True, screen: bool = True, dflash: tuple[int, ...] | None = None, rotated: bool = False):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
         (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block); tails: a dense model's
         regions of the hidden's input half regions where it is half a chunk short, pairs: their pairs of row tiles
         (module docstring); screen: the LM head may be screened (False: its rows whole, for a design of 8 slots);
         dflash: a PARO checkpoint's DFlash2 drafter's taps (its head's rows without an MTP block, on the screened head's
-        plane; the tap layers' inputs a plain copy more each: ``taps``)."""
+        plane; the tap layers' inputs a plain copy more each: ``taps``); rotated: plain linears laid out as a PARO
+        checkpoint's, every rotation the identity (the norms' weights in the copies: a PARO checkpoint's MTP drafter,
+        ``draft.DraftImage``)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
@@ -141,6 +145,8 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         L0 = self.layers[0]
         first = f"blk.{L0}.{'attn_q' if cfg.attention[L0] else 'attn_qkv'}.weight"  # (module docstring)
         self.paro = first in gguf.tensor_info and isinstance(gguf.tensor(first), ParoTensor)
+        self.identity = rotated and not self.paro  # (every rotation the identity: ``_rn``)
+        self.paro = self.paro or rotated
         self.taps = tuple(dflash) if self.paro and dflash else ()
         self._rot_init()
         if self.paro:
@@ -259,7 +265,7 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         """A PARO checkpoint's layer (module docstring's "PARO")."""
         cfg, b = self.cfg, f"blk.{layer}."
         H, I, h8 = cfg.hidden_size, cfg.intermediate_size, cfg.hidden_size // COLS
-        if layer == self.layers[0]:
+        if layer == self.layers[0] and self.ROT_IN:
             self.rot_data(layer, "rot_in", self._in_rot(layer))
         if cfg.attention[layer]:
             qh, hd = cfg.num_attention_heads // COLS, cfg.head_dim
@@ -267,7 +273,7 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
             self._add(layer, "attn_q", [("q", (b + "attn_q.weight",), q)], H)
             self._add(layer, "attn_k", [("k", (b + "attn_k.weight",), kv)], H)
             self._add(layer, "attn_v", [("v", (b + "attn_v.weight",), kv)], H)
-            self.rot_data(layer, "rot_o", [(b + "attn_output.weight", None, column_groups(0, qh * hd))])
+            self.rot_data(layer, "rot_o", [(self._rn(b + "attn_output.weight"), None, column_groups(0, qh * hd))])
             self._add(layer, "attn_out", [("out", (b + "attn_output.weight",), column_rows(H))],
                       cfg.num_attention_heads * hd)
             out = "attn_out"
@@ -280,20 +286,20 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
                                        ("ab", (alpha, beta), np.stack([2 * ab, 2 * ab + 1], -1).reshape(COLS, -1))], H)
             groups = [np.concatenate([d * j // ROT + np.arange(d // ROT) for j in gdn_v_heads(cfg, c)])
                       for c in range(COLS)]
-            self.rot_data(layer, "rot_g", [(b + "ssm_out.weight", None, groups)])
+            self.rot_data(layer, "rot_g", [(self._rn(b + "ssm_out.weight"), None, groups)])
             self._add(layer, "gdn_out", [("out", (b + "ssm_out.weight",), column_rows(H))], cfg.ssm_v_heads * d)
             out = "gdn_out"
         g = self._vec(b + "post_attention_norm.weight")
         if cfg.moe:  # (moe_in's copy: the experts' gate / up rotation; moe_in's other blocks read it, ``moe_folded``)
-            self.rot_data(layer, out + "_rot", [(b + "ffn_gate_exps.weight", g, column_groups(0, h8))])
+            self.rot_data(layer, out + "_rot", [(self._rn(b + "ffn_gate_exps.weight"), g, column_groups(0, h8))])
             self._moe(layer, gated=True)
         else:
-            self.rot_data(layer, out + "_rot", [(b + "ffn_gate.weight", g, column_groups(0, h8)),
-                                                (b + "ffn_up.weight", g, column_groups(0, h8))])
+            self.rot_data(layer, out + "_rot", [(self._rn(b + "ffn_gate.weight"), g, column_groups(0, h8)),
+                                                (self._rn(b + "ffn_up.weight"), g, column_groups(0, h8))])
             self._add(layer, "gate", [("gate", (b + "ffn_gate.weight",), column_rows(I))], H)
             self._add(layer, "up", [("up", (b + "ffn_up.weight",), column_rows(I))], H)
             n = self.down_slice(cfg)  # (a column's slice of down's input: whole groups, the last ones padding past the ffn)
-            self.rot_data(layer, "rot_down", [(b + "ffn_down.weight", None,
+            self.rot_data(layer, "rot_down", [(self._rn(b + "ffn_down.weight"), None,
                                                [np.where(gs < I // ROT, gs, -1) for gs in column_groups(0, n)])])
             self._add(layer, "down", [("down", (b + "ffn_down.weight",), column_rows(H))], I)
         i = self.layers.index(layer)
@@ -315,7 +321,12 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         g, cg = self._vec(b + "attn_norm.weight"), column_groups(0, self.cfg.hidden_size // COLS)
         names = ("attn_q", "attn_k", "attn_v") if self.cfg.attention[layer] else ("attn_qkv", "attn_gate")
         tap = [("", np.ones(self.cfg.hidden_size, np.float32), cg)] if layer in self.taps else []  # (the residual itself)
-        return [(f"{b}{n}.weight", g, cg) for n in names] + tap
+        return [(self._rn(f"{b}{n}.weight"), g, cg) for n in names] + tap
+
+    def _rn(self, name: str) -> str:
+        """(PARO) The tensor whose rotation a copy takes: ``name``, or "" (the identity: a ``rotated`` image's plain
+        linears)."""
+        return "" if self.identity else name
 
     def _vec(self, name: str) -> np.ndarray:
         return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(-1)
@@ -330,14 +341,19 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         """(PARO) An MoE layer's blocks of moe_in that read its copy x' (the experts' gate / up rotation, the FFN norm's
         weight folded in) as substitutes (``_own``, until the caller drops them): the router's and the shared expert's
         gate rows W A^-1 (``decode.rotated.folded``: A the copy's transform as the NPU computes it; F32: their BFP16
-        planes, as the GGUF path's), the shared expert's gate and up (F16 as the file's: one BFP16 plane)."""
+        planes, as the GGUF path's), the shared expert's gate and up (F16 as the file's: one BFP16 plane). A ``rotated``
+        image's (the identity: W diag(gamma / bf16(gamma))): the router's and gate's alone, the shared expert's tiles as
+        the file holds them (quantized: the fold is within bf16's rounding of the norm's weights)."""
         b = f"blk.{layer}."
-        rot, g = self.gguf.tensor(b + "ffn_gate_exps.weight").rot(), self._vec(b + "post_attention_norm.weight")
+        g = self._vec(b + "post_attention_norm.weight")
+        rot = Rotation.identity(g.size) if self.identity else self.gguf.tensor(b + "ffn_gate_exps.weight").rot()
         inverse = copy_inverse(rot, g)
         names = []
         for n in ("ffn_gate_inp", "ffn_gate_inp_shexp", "ffn_gate_shexp", "ffn_up_shexp"):
             name = f"{b}{n}.weight"
             t = self.gguf.tensor(name)
+            if self.identity and t.qtype not in ("F32", "F16", "BF16"):
+                continue
             raw = folded(np.asarray(t.dequantize(), np.float64).reshape(t.rows, t.cols), inverse)
             half = n.endswith("_shexp") and n != "ffn_gate_inp_shexp"
             if half:
@@ -428,6 +444,7 @@ class MtpView:
     column_major = False
     screen = False  # (the drafter reads its head's rows as they are: a PARO checkpoint's DFlash2 drafter its plane's)
     paro = False  # (a PARO checkpoint's drafters: GGUF files of their own)
+    taps: tuple[int, ...] = ()
 
     def __init__(self, image: QwenImage, cfg: QwenConfig):
         self.model, self.cfg, self.gguf = image, cfg, image.gguf

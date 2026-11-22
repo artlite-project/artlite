@@ -234,26 +234,28 @@ class RotatedImage:
         for c in range(COLS):
             objs = []
             for t, gamma, groups in parts:
-                o = self._rot_tan(t, gamma)
+                o = self._rot_tan(t, gamma, 1 + max(int(g.max()) for g in groups if g.size))
                 objs += [o[i] if i >= 0 else np.zeros_like(o[0]) for i in groups[c]]
             per.append(pack_rot_objects(np.stack(objs), self.tile_bytes))
         self._rot_objs[(L, name)] = np.stack(per)
         self._add_data(L, name, per[0].size)
 
-    def _rot_tan(self, tensor: str, gamma: np.ndarray | None) -> np.ndarray:
+    def _rot_tan(self, tensor: str, gamma: np.ndarray | None, groups: int = 0) -> np.ndarray:
         """(G, bytes) the groups' rotation objects of a tensor's tan form (``paro.TanForm.objects``; tensor "": the
-        identity of gamma's channels, a plain linear's copy of a normed input), cached."""
+        identity of gamma's channels, or of ``groups`` groups: a plain linear's copy of a normed input, or of its input),
+        cached."""
         cache = self.__dict__.setdefault("_rot_tans", {})
-        key = (tensor, None if gamma is None else gamma.tobytes())
+        key = (tensor, None if gamma is None else gamma.tobytes(), 0 if tensor or gamma is not None else groups)
         if key not in cache:
-            rot = self.gguf.tensor(tensor).rot() if tensor else Rotation.identity(gamma.size)
+            rot = self.gguf.tensor(tensor).rot() if tensor else Rotation.identity(
+                gamma.size if gamma is not None else groups * ROT_GROUP)
             cache[key] = rot.tan_form(gamma, unit=True).objects()
         return cache[key]
 
     def rot_slab(self, L: int, name: str, tensor: str, halves: int) -> None:
         """A data slab region (``image.TileImage.slabs``) of rotation objects: per expert half (``halves`` of them, half
         h of an expert: its K's groups 2 h, 2 h + 1, one A object) the groups of the tensor's rotation (no norm weight)."""
-        o = self._rot_tan(tensor, None)
+        o = self._rot_tan(tensor, None, 4)
         assert o.shape[0] == 4, f"{tensor}: an expert's K of 4 groups"
         self._rot_objs[(L, name)] = np.stack([pack_rot_objects(o[2 * h:2 * h + 2], self.tile_bytes) for h in (0, 1)])
         self.slabs.append(Region(L, name, [], 1, 1, self.tile_bytes, self.kc, data=self.tile_bytes, cols=halves))
