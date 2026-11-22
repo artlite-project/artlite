@@ -47,8 +47,8 @@ gate and up in two of them (unsloth's dynamic quantizations: below). A dense mod
 up to 8 tokens per dispatch where its file holds Q4_K and Q6_K tensors only, a drafter runs or the file has more than
 ten formats; else up to 4 (`overlay.slots_of`). Qwen3.8's drafter is its DFlash2 file (`model_config.qwen_dflash_of`:
 the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account; a PARO checkpoint's: its base model's) where the
-design runs 8 tokens and the file has its MTP layer (the DFlash2 drafter's head), or the model is a PARO checkpoint (its
-design of 4 slots), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
+design runs 8 tokens and the file has its MTP layer (the DFlash2 drafter's head), or the model is a PARO checkpoint (no MTP
+tensors), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
 model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in
 another account's repository of the same name (ggml-org publishes its drafters apart from the models; a PARO
 checkpoint's: in its base model's `<base>-GGUF` repositories); of several, Q4_0, then Q4_K_M, then Q8_0.
@@ -58,7 +58,7 @@ checkpoint's: in its base model's `<base>-GGUF` repositories); of several, Q4_0,
 
 Paths below are under `src/models/` (the model's own code: `qwen35/`, `minicpmv/`) and `src/artlite/` (what the models
 share). One design (`qwen35/decode.py`) runs up to 4 tokens per dispatch through every layer and the LM head (the 27B
-models' up to 8 when their gate / up is Q4_K, for a drafter's long chains: a step of 8 costs 1.01x a step of one at 1K and at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
+models' up to 8 when their gate / up is Q4_K or they are a PARO checkpoint, for a drafter's long chains: a step of 8 costs 1.01x a step of one at 1K and at 32K); the host builds the dispatch's transaction (`qwen35/overlay.py`), and the
 cores read what to do from their input streams. Per column:
 - the main core runs the projections (the GEMV phases on the weight tiles, RMSNorm, the residual stream
   in fp32, SiLU(gate) up);

@@ -131,7 +131,9 @@ class GdnTransfers:
             return dev.address("GOBJ", ov.gdn_payload(L, c, k))
 
         self._gdn_in(seq, L, S, st)
-        if wide:
+        if wide and ov.paro:  # (gin_q's and gin_z's rows drained by their phases: ``rows_wide``)
+            seq.sync()
+        elif wide:
             self._rows_wide(seq, L, S, pay)
         last = hc - 1  # (the last v head the core runs: k head 1's last)
         kh_span, v_span = (gdn.KH_SPAN, gdn.V_SPAN) if wide else (gdn.KH_SPAN4, gdn.V_SPAN4)
@@ -191,6 +193,26 @@ class GdnTransfers:
             units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_dh, v_do)))
         else:
             units(hc, ((kh_x,), (kh_d,)), ((v_xa, v_xp), (v_dp,) * ov.ends + (v_do, v_dh)))
+
+    def rows_wide(self, seq: Sequence, L: int, S: int, c: int, name: str) -> None:
+        """(a PARO checkpoint's, 8 slots) Column c's rows of gin_q (q and k into the q blocks' and K objects, v into the R
+        objects' first halves) or gin_z (z into their second halves, ab into the header): ``_rows_wide``'s drains split."""
+        ov, sh, hc = self.ov, self.ov.gsh, self.ov.gsh.hc
+        dev = ov.dev
+        X, hb = XPAY // 4, 2 * 64 * 8 // 4
+
+        def pay(k: int) -> int:
+            return dev.address("GOBJ", ov.gdn_payload(L, c, k))
+
+        v0 = pay(sh.v_slot(0) + 2)
+        if name == "gin_q":
+            q0 = pay(sh.kh_slot(0) + 1) + 3 * 2 * gdn.D
+            seq.drain("C", c, q0, 2 * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.KH_SPAN * X), 2,
+                      ((pay(sh.kh_slot(0) + 4) - q0) // 4, 2))
+            seq.drain("C", c, v0, hc * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.V_SPAN * X))
+        else:
+            seq.drain("C", c, v0 + 2048, hc * 2 * S * 2 * C_LEN, (S * C_LEN // 2, 2, hb, gdn.V_SPAN * X))
+            seq.drain("C", c, pay(gdn.H_SLOT) + gdn.H_AB, 2 * S * C_LEN)
 
     def _rows_wide(self, seq: Sequence, L: int, S: int, pay: Callable[[int, int], int]) -> None:
         """An 8-slot core's rows of gdn_in: per slot into the q blocks' second objects, the k heads' K objects and the v

@@ -500,7 +500,7 @@ class Qwen(Model):
                 else "none")
         if kind == "draft-dflash" and mmproj is not None:
             raise ValueError(f"{mmproj}: images in prompts go without a DFlash2 drafter (its taps have no M-RoPE positions)")
-        paro = bool(getattr(self.gguf, "paro_bits", 0))  # (a PARO checkpoint: a DFlash2 drafter on its design of 4 slots)
+        paro = bool(getattr(self.gguf, "paro_bits", 0))  # (a PARO checkpoint, no MTP tensors: a DFlash2 drafter)
         self.dflash = (draft_model or qwen_dflash_of(path) if kind == "draft-dflash" else
                        qwen_dflash_of(path) if kind == "auto" and mmproj is None
                        and (paro or self.cfg.nextn_layers and self._eight()) else None)

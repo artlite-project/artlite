@@ -177,25 +177,28 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         layers whose input goes out as a plain copy too, ``paro_steps``; the image's ``taps``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
-        self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``, a design of 4 slots, one sequence)
+        self.paro = img.paro  # (a PARO checkpoint's rotated inputs: ``paro_steps``; one sequence)
         self.taps = tuple(L for L in taps if L in self.layers) if self.paro else ()
         assert set(self.taps) <= set(img.taps), (self.taps, img.taps)
-        if self.paro and (sequences > 1 or slots not in (None, 4)):
-            raise ValueError("a PARO checkpoint: one sequence on the design of 4 slots")
+        if self.paro and (sequences > 1 or slots not in (None, 4, 8) or (slots == 8 and cfg.moe)):
+            raise ValueError("a PARO checkpoint: one sequence, a design of 4 slots (a dense model's: 8)")
         fmts = img.formats() | set(formats)
         gu_rows = img.gu_rows() | gu  # (``decode.design``'s gate / up windows: tiles of gate / up phases of other rows; a
         # PARO checkpoint has none, its gate and up phases of their own)
         gu_win = bool(gu_rows) and gu_rows != {16} or img.split
         # (several sequences: the design of 8 slots where the file's formats run on one)
-        slots = 4 if self.paro else slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
-                                              slots_of(cfg, fmts, bool(cfg.nextn_layers) if drafts is None else drafts))
+        # (a PARO checkpoint: as a model with drafts, its design of 8 slots no slower at S 1: the 27B int5's 3.52 tok/s
+        # against 3.47 on 4)
+        slots = slots or (8 if sequences > 1 and runs_eight(cfg, fmts) else
+                          slots_of(cfg, fmts, self.paro or (bool(cfg.nextn_layers) if drafts is None else drafts)))
         if sequences > 1 and (slots != 8 or cfg.moe):  # (a GDN chain per sequence: the core whose rows come through DDR)
             raise ValueError(f"{sequences} sequences: a dense model whose formats run on the design of 8 slots "
                              f"(``runs_eight``: its tile formats, an image whose LM head is not screened)")
         if sequences > 8:
             raise ValueError(f"{sequences} sequences: a step has 8 slots, a sequence each at most")
         att = [cfg.attention[L] for L in self.layers]
-        self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg), parts=self.paro) if not all(att) else None
+        self.gsh = gdn.GdnShape(cfg, slots=slots, chunk=chunk_of(cfg), parts=self.paro and slots == 4) \
+            if not all(att) else None
         # (a PARO checkpoint's: the gates in the attention core, the main core's program memory for the rotations and a
         # page of the formats: the 27B's int5)
         self.ash = attn.AttnShape(cfg, max_positions, a_bytes=img.tile_bytes, slots=slots, passes=sequences,
@@ -268,7 +271,10 @@ class QwenOverlay(ParoSteps, ModelOverlay):
     def _sp(self, S: int, phase: tuple[int, str] | None = None) -> int:
         """(a design of 8 slots: gdn_out's input of 8, the GDN cores' outputs whole heads of 8 slots; attn_out's, one pass:
         an octet's rows)"""
-        whole = phase is not None and (phase[1] == "gdn_out" or (phase[1] == "attn_out" and self.ash.one))
+        # (a PARO checkpoint's: rot_g's, rot_o's, which the cores' outputs feed)
+        name = phase[1] if phase is not None else ""
+        whole = name == ("rot_g" if self.paro else "gdn_out") or (
+            name == ("rot_o" if self.paro else "attn_out") and self.ash is not None and self.ash.one)
         return self.SLOTS if whole else super()._sp(S, phase)
 
     def _meta(self, L: int, name: str, rg: object, m: np.ndarray) -> np.ndarray:

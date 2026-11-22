@@ -781,20 +781,24 @@ def test_overlay_slice(mode: str, size: str) -> None:
     assert errs.max() < top and errs.mean(0).max() < mean, (errs.max(), errs.mean(0))
 
 
-_PARO_CASES = [("qwen3.5-0.8B-paro", 1), ("qwen3.5-0.8B-paro", 4), ("qwen3.8-27B-paro-int5", 1), ("qwen3.8-27B-paro-int5", 4),
-               ("qwen3.6-35B-A3B-paro", 1), ("qwen3.6-35B-A3B-paro", 4)]
+_PARO_CASES = [("qwen3.5-0.8B-paro", 1, 4), ("qwen3.5-0.8B-paro", 4, 4), ("qwen3.5-0.8B-paro", 8, 8),
+               ("qwen3.8-27B-paro-int5", 1, 8), ("qwen3.8-27B-paro-int5", 8, 8), ("qwen3.8-27B-paro-int5", 4, 4),
+               ("qwen3.6-35B-A3B-paro", 1, 4), ("qwen3.6-35B-A3B-paro", 4, 4)]
 
 
-@pytest.mark.parametrize(("case", "S"), _PARO_CASES, ids=["0.8B-s1", "0.8B-s4", "27B-s1", "27B-s4", "35B-A3B-s1", "35B-A3B-s4"])
-def test_overlay_paro(case: str, S: int) -> None:
+@pytest.mark.parametrize(("case", "S", "slots"), _PARO_CASES, ids=["0.8B-s1", "0.8B-s4", "0.8B-s8-d8", "27B-s1-d8", "27B-s8-d8",
+                                                                   "27B-s4-d4", "35B-A3B-s1", "35B-A3B-s4"])
+def test_overlay_paro(case: str, S: int, slots: int) -> None:
     """Qwen3.5-0.8B-PARO, Qwen3.8-27B-PARO-int5 and Qwen3.6-35B-A3B-PARO (checkpoint directories: their inputs rotated,
     ``paro_steps``; their GDN layers' a / b rows folded into gin_z's rotation, F32 planes; the 27B's P5_128 tiles of 13
     rows, several K groups an input, 6 v heads and 17 rotation groups of down's input a column; the 35B-A3B's MoE layers:
     the router, the shared expert and its gate folded into the experts' gate / up copy, the experts' h rotated in the
     helper before their downs, the combine's rotated copies) up to the first full-attention layer over 34 positions, by
-    steps of S tokens: the residual into the LM head after each token within llama.cpp's on the pseudo-quantized model
-    (``goldens.paro``: the checkpoint's linears computed exactly; the large models' first layers, F16) as close as the
-    GGUF files' slices are (1.2% at most, 0.5% on average; the 27B: 0.6%, 0.2%; the 35B-A3B: 0.6%, 0.2%)."""
+    steps of S tokens on a design of ``slots`` (8: the dense models' with drafts, the rounds on two halves of the slots,
+    their inputs single bfp16 rows): the residual into the LM head after each token within llama.cpp's on the
+    pseudo-quantized model (``goldens.paro``: the checkpoint's linears computed exactly; the large models' first layers,
+    F16) as close as the GGUF files' slices are (1.2% at most, 0.5% on average; the 27B: 0.6%, 0.2%; the 35B-A3B: 0.6%,
+    0.2%; on 8 slots the 0.8B 2.8%, 0.9%, the 27B 0.8%, 0.3%)."""
     from artlite.hf_model import HfModel
     from artlite.model_config import checkpoint
     from models.qwen35.overlay import QwenOverlay
@@ -810,7 +814,7 @@ def test_overlay_paro(case: str, S: int) -> None:
     n, layers = 34, list(range(La + 1))
     tokens = llama_tokenize(ref, essay("apple.txt"))[:n]
     G_ = golden(ref, tokens, ubatch=1, layers=("g", La), names="l_out|model.input_embed", logits="none")
-    ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128)
+    ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, slots=slots)
     ov.load()
     errs = []
     for t in range(0, n, S):
@@ -818,7 +822,8 @@ def test_overlay_paro(case: str, S: int) -> None:
         ov.step(g.rows("token_embd.weight", tokens[t:t + m]), t, logits=False)
         errs += [rel_max(ov.hidden(-1, s), np.asarray(G_["l_out", La][t + s], np.float32)) for s in range(m)]
         ov.accept(m)
-    assert max(errs) < 2.5e-2 and np.mean(errs) < 8e-3, (max(errs), np.mean(errs))
+    top, mean = (2.5e-2, 8e-3) if slots == 4 else (4e-2, 1.2e-2)
+    assert max(errs) < top and np.mean(errs) < mean, (max(errs), np.mean(errs))
 
 
 def test_overlay_paro_taps() -> None:

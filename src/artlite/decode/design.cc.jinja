@@ -995,7 +995,7 @@ __attribute__((noinline)) int {{ p }}_gusplit(int32_t *__restrict ws, int S, int
 // (rot: "Rotated inputs") A group's rotation in the main core's GEMV scratch (idle between tiles): u (fp32 [128][4]), its
 // bf16 copies b0, b1 (the gathers' layout, kmath.rotate), 2 KB each. 8 channels' input: v [slot 4][8] as bf16 hi, lo;
 // w: their 8 bf16 of the rotation object's w' -> u0 = v w ([8][4] fp32) and its copy
-[[clang::always_inline]] inline void {{ p }}_ru0(aie::vector<bfloat16, 32> vh, aie::vector<bfloat16, 32> vl,
+{% if SLOTS == 8 %}__attribute__((noinline, minsize)) void{% else %}[[clang::always_inline]] inline void{% endif %} {{ p }}_ru0(aie::vector<bfloat16, 32> vh, aie::vector<bfloat16, 32> vl,
                                                  const bfloat16 *__restrict w, float *__restrict u, bfloat16 *__restrict b)
 {
     const aie::vector<bfloat16, 32> wt = aie::transpose(aie::load_v<8>(w).template grow_replicate<32>(), 4, 8);
@@ -1006,8 +1006,9 @@ __attribute__((noinline)) int {{ p }}_gusplit(int32_t *__restrict ws, int S, int
 
 // The rounds on u (the rotation object at ro), then u -> the staged C objects at o: object j S + s (j = 0, 1; slot s < S)
 // holds channels 64 j .. 64 j + 63 of slot s in bf16 (each 8 channels' 4 slots stored: the stores past S land where a
-// later j's go, or past the objects)
-__attribute__((noinline)) void {{ p }}_rrun(const uint8_t *__restrict ro, uint8_t *__restrict scr, bfloat16 *__restrict o, int S)
+// later j's go, or past the objects{{ "; 8 slots: u holds half h's slots 4 h .. 4 h + 3, half 1 first: half 0's stores
+// overwrite the ones half 1's past S left" if SLOTS == 8 else "" }})
+__attribute__((noinline{{ ", minsize" if SLOTS == 8 else "" }})) void {{ p }}_rrun(const uint8_t *__restrict ro, uint8_t *__restrict scr, bfloat16 *__restrict o, int S{{ ", int h" if SLOTS == 8 else "" }})
 {
     float *u = (float *)scr;
     bfloat16 *b0 = (bfloat16 *)(scr + 2048), *b1 = (bfloat16 *)(scr + 4096);
@@ -1019,7 +1020,7 @@ __attribute__((noinline)) void {{ p }}_rrun(const uint8_t *__restrict ro, uint8_
     for (int q = 0; q < 16; q++) {
         const aie::vector<bfloat16, 32> t =
             aie::transpose(aie::accum<accfloat, 32>(aie::load_v<32>(u + 32 * q)).template to_vector<bfloat16>(), 8, 4);
-        bfloat16 *d = o + {{ C_LEN }} * S * (q >> 3) + 8 * (q & 7);
+        bfloat16 *d = o + {{ C_LEN }} * S * (q >> 3) + 8 * (q & 7){{ " + %d * h" % (4 * C_LEN) if SLOTS == 8 else "" }};
         aie::store_v(d, t.template extract<8>(0));
         aie::store_v(d + {{ C_LEN }}, t.template extract<8>(1));
         aie::store_v(d + {{ 2 * C_LEN }}, t.template extract<8>(2));
@@ -1266,11 +1267,14 @@ __attribute__((minsize)) void {{ p }}_inv(const float *__restrict r, int32_t *__
     if (WS(int32_t, {{ w_.st }})[{{ S_FLAGS }}] & {{ F_NORM }})  // (moe: the expert's gate / up reuses a phase's 1 / rms)
 {% endif %}
 {% if rot %}
-    if (!(WS(int32_t, {{ w_.st }})[{{ S_FLAGS }}] & {{ F_PSQ }}))  // (F_PSQ: the partial sums object's, ``psq``)
+    if (!(WS(int32_t, {{ w_.st }})[{{ S_FLAGS }}] & {{ F_PSQ }})) {  // (F_PSQ: the partial sums object's, ``psq``)
 {% endif %}
     aie::store_v(WS(float, {{ w_.inv }}), aie::load_v<32>(r));
 {% if SLOTS == 8 %}
     aie::store_v(WS(float, {{ w_.inv }}) + 32, aie::load_v<32>(r + 32));
+{% endif %}
+{% if rot %}
+    }
 {% endif %}
 {% if post %}
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
@@ -1735,11 +1739,24 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
 
 {% if rot %}
 // (rot) F_PSQ: the partial sums object (the 8 columns' C objects at 128 c: [slot 4][8 lanes] fp32 squares of their
-// residual slices) -> the slots' 1 / rms (8 lanes per slot)
+// residual slices{{ "; 8 slots: two a column, of slots 0 .. 3 and 4 .. 7, at 256 c" if SLOTS == 8 else "" }}) -> the slots' 1 / rms
+// (8 lanes per slot)
 __attribute__((minsize)) void {{ p }}_psq(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const float *__restrict q = (const float *)(x + {{ 2 * META }});
+{% if SLOTS == 8 %}
+    aie::vector<float, 32> sq = aie::load_v<32>(q), sq1 = aie::load_v<32>(q + 32);
+    AIE_LOOP_NO_UNROLL
+    for (int c = 1; c < {{ COLS }}; c++) {
+        sq = aie::add(sq, aie::load_v<32>(q + 64 * c));
+        sq1 = aie::add(sq1, aie::load_v<32>(q + 64 * c + 32));
+    }
+    const aie::vector<float, 16> iv = al::inv_rms<{{ H }}, 8>(al::group8<false>(aie::concat(sq, sq1)).template grow<16>(), {{ eps }}f);
+    aie::store_v(WS(float, {{ w_.inv }}), al::rows4(iv));
+    aie::store_v(WS(float, {{ w_.inv }}) + 32, al::rows4(aie::shuffle_down(iv, 4)));
+}
+{% else %}
     aie::vector<float, 32> sq = aie::load_v<32>(q);
     AIE_LOOP_NO_UNROLL
     for (int c = 1; c < {{ COLS }}; c++)
@@ -1747,6 +1764,7 @@ __attribute__((minsize)) void {{ p }}_psq(const bfloat16 *__restrict x, int32_t 
     const aie::vector<float, 8> ss = al::group8<false>(aie::concat(sq, aie::zeros<float, 32>()));
     aie::store_v(WS(float, {{ w_.inv }}), al::rows4(al::inv_rms<{{ H }}, {{ SLOTS }}>(ss.template grow<16>(), {{ eps }}f)));
 }
+{% endif %}
 
 // (rot) The rotations run on the helper (the main core's commands: their objects and its workspace as the helper sees
 // them; the helper's ``htask`` runs psq, rote, rotx{{ "; hrot: a gate / up's last tile, ``cmd``" if moe else "" }}): the main
@@ -1805,7 +1823,62 @@ __attribute__((minsize)) void {{ p }}_wpupd(const uint8_t *__restrict a, int32_t
 
 // (rot) F_ROTE: the next group of the residual's rotated copies (st[S_RG]: copy S_RC, its group q of the column's slice),
 // its rotation object group S_RG & 1 of the A object a: the copy's partial sums object first (the slots' squares of the
-// slice, fp32 exact: [slot 4][8 lanes]), then the group's C objects (staged: S_ESRC 6)
+// slice, fp32 exact: [slot 4][8 lanes]{{ "; 8 slots: slots 0 .. 3's, then 4 .. 7's (hres)" if SLOTS == 8 else "" }}), then the group's C objects (staged: S_ESRC 6)
+{% if SLOTS == 8 %}
+// (the squares of 4 slots' rows of the slice: [slot 4][8 lanes]; 8 slots' designs: program memory over speed, the rounds
+// run while A streams)
+__attribute__((noinline, minsize)) aie::vector<float, 32> {{ p }}_rsq(const float *__restrict r)
+{
+    aie::accum<accfloat, 32> sq = aie::zeros<accfloat, 32>();
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < {{ H8 }}; k += 8) {
+        const aie::vector<float, 32> v = aie::concat(aie::load_v<8>(r + k), aie::load_v<8>(r + {{ RES_PITCH }} + k),
+                                                     aie::load_v<8>(r + {{ 2 * RES_PITCH }} + k), aie::load_v<8>(r + {{ 3 * RES_PITCH }} + k));
+        aie::vector<bfloat16, 32> vh, vl;
+        al::split2<32>(v, vh, vl);
+        sq = aie::mac(aie::mac(aie::mac_square(sq, vh), vh, vl), vl, vh);
+    }
+    return sq.template to_vector<float>();
+}
+
+__attribute__((noinline, minsize)) void {{ p }}_rote(const uint8_t *__restrict a, int32_t *__restrict ws, const float *__restrict hres)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    const int S = st[{{ S_NS }}], g = st[{{ S_RG }}], c = st[{{ S_RC }}], q = g - c * {{ H8 // 128 }};
+    const uint8_t *__restrict ro = a + {{ ROT_OBJ }} * (g & 1);
+    bfloat16 *__restrict stg = WS(bfloat16, {{ w_.stg }});
+    int n = 0;
+    if (q == 0) {
+        aie::store_v((float *)stg, {{ p }}_rsq(WS(float, {{ w_.res }})));
+        aie::store_v((float *)stg + 32, {{ p }}_rsq(hres));
+        n = 2;
+    }
+    float *__restrict u = WS(float, {{ w_.scr }});
+    bfloat16 *__restrict b0 = WS(bfloat16, {{ w_.scr + 2048 }});
+    const bfloat16 *__restrict w = (const bfloat16 *)(ro + {{ ROT_W }});
+    AIE_LOOP_NO_UNROLL
+    for (int h = S > 4 ? 1 : 0; h >= 0; h--) {  // (half 1 first: ``rrun``)
+        const float *__restrict r = (h ? hres : WS(float, {{ w_.res }})) + 128 * q;
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 128; k += 8) {
+            const aie::vector<float, 32> v = aie::concat(aie::load_v<8>(r + k), aie::load_v<8>(r + {{ RES_PITCH }} + k),
+                                                         aie::load_v<8>(r + {{ 2 * RES_PITCH }} + k), aie::load_v<8>(r + {{ 3 * RES_PITCH }} + k));
+            aie::vector<bfloat16, 32> vh, vl;
+            al::split2<32>(v, vh, vl);
+            {{ p }}_ru0(vh, vl, w + k, u + 4 * k, b0 + 8 * k);
+        }
+        {{ p }}_rrun(ro, WS(uint8_t, {{ w_.scr }}), stg + {{ C_LEN }} * n, S, h);
+    }
+    st[{{ S_NE }}] = n + 2 * S;
+    st[{{ S_EJ }}] = 0;
+    st[{{ S_ESRC }}] = 6;
+    st[{{ S_RG }}] = g + 1;
+    if (q + 1 == {{ H8 // 128 }})
+        st[{{ S_RC }}] = c + 1;
+    st[{{ S_NGA }}] = {{ p }}_nga(st[{{ S_RN }}] - g - 1);
+}
+{% else %}
 __attribute__((noinline)) void {{ p }}_rote(const uint8_t *__restrict a, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -1849,11 +1922,12 @@ __attribute__((noinline)) void {{ p }}_rote(const uint8_t *__restrict a, int32_t
         st[{{ S_RC }}] = c + 1;
     st[{{ S_NGA }}] = {{ p }}_nga(st[{{ S_RN }}] - g - 1);
 }
+{% endif %}
 
 // (rot) F_ROTX: the next group (S_RC of the X object x, S_RG of the column's slice) of the slice ([k block][slot SP][8]
 // bf16 payload; F_RACT: [gate SP | up SP] per k block, rotated: act(bf16(gate)) up), its rotation object group S_RG & 1 of
 // the A object a -> its C objects (staged: S_ESRC 6)
-__attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const uint8_t *__restrict a, int32_t *__restrict ws)
+__attribute__((noinline{{ ", minsize" if SLOTS == 8 else "" }})) void {{ p }}_rotx(const bfloat16 *__restrict x, const uint8_t *__restrict a, int32_t *__restrict ws)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
@@ -1870,7 +1944,7 @@ __attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const 
     const aie::vector<bfloat16, 32> sc = aie::broadcast<bfloat16, 32>(__builtin_bit_cast(bfloat16, (uint16_t)st[{{ S_SCALE }}]));
     const bfloat16 *__restrict wpg = (const bfloat16 *)(a + {{ RWP_AT }}) + 128 * (g & 1);
 {% else %}
-    const int act = (st[{{ S_FLAGS }}] & {{ F_RACT }}) ? 1 : 0, ls = (sp == 1 ? 0 : (sp == 2 ? 1 : 2)) + act;
+    const int act = (st[{{ S_FLAGS }}] & {{ F_RACT }}) ? 1 : 0, ls = (sp == 1 ? 0 : (sp == 2 ? 1 : {{ "(sp == 4 ? 2 : 3)" if SLOTS == 8 else "2" }})) + act;
 {% endif %}
     const int per = 16 >> ls;  // (groups of an X object: XPAY / (2 128 SP'))
     const uint8_t *__restrict ro = a + {{ ROT_OBJ }} * (g & 1);
@@ -1879,6 +1953,29 @@ __attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const 
     bfloat16 *__restrict b0 = WS(bfloat16, {{ w_.scr + 2048 }});
     const bfloat16 *__restrict w = (const bfloat16 *)(ro + {{ ROT_W }});
     bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
+{% if SLOTS == 8 %}
+    // (8 slots: per half h of the slots, half 1 first (``rrun``), its 4 slots of each k block's [slot SP][8]; the
+    // activation table's copies in the helper's own memory: the gathers' operands need pointers)
+    volatile int32_t ta[2] = {{ "{%d, %d}" % (ACT8[0] + 0x30000, ACT8[1] + 0x30000) }};
+    AIE_LOOP_NO_UNROLL
+    for (int h = S > 4 ? 1 : 0; h >= 0; h--) {
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < 16; k++) {  // k block k: 8 channels
+        const bfloat16 *__restrict pk = src + (8 * k << ls) + 32 * h;
+        aie::vector<bfloat16, 32> vh, vl;
+        if (act) {  // h = act(bf16(gate)) up: exact in fp32 (a product of two bf16)
+            aie::store_v(gs, {{ p }}_kbr(pk));
+            {{ lut }}<32>(gs, gs + 32, (const uint32_t *)(intptr_t)ta[0], (const uint32_t *)(intptr_t)ta[1]);
+            al::split2<32>(aie::mul({{ p }}_kbr(pk + 8 * sp), aie::load_v<32>(gs + 32)), vh, vl);
+        } else {
+            vh = {{ p }}_kbr(pk);
+            vl = aie::zeros<bfloat16, 32>();
+        }
+        {{ p }}_ru0(vh, vl, w + 8 * k, u + 32 * k, b0 + 64 * k);
+    }
+    {{ p }}_rrun(ro, WS(uint8_t, {{ w_.scr }}), WS(bfloat16, {{ w_.stg }}), S, h);
+    }
+{% else %}
     AIE_LOOP_NO_UNROLL
     for (int k = 0; k < 16; k++) {  // k block k: 8 channels
 {% if post %}
@@ -1905,6 +2002,7 @@ __attribute__((noinline)) void {{ p }}_rotx(const bfloat16 *__restrict x, const 
         {{ p }}_ru0(vh, vl, w + 8 * k, u + 32 * k, b0 + 64 * k);
     }
     {{ p }}_rrun(ro, WS(uint8_t, {{ w_.scr }}), WS(bfloat16, {{ w_.stg }}), S);
+{% endif %}
     st[{{ S_NE }}] = 2 * S;
     st[{{ S_EJ }}] = 0;
     st[{{ S_ESRC }}] = 6;
@@ -2100,8 +2198,8 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     }
 {% endif %}
 {% if rot and packed %}
-    const int nx = m[{{ M_NX }}] - ((flags & {{ F_PSQ }}) ? (m[{{ M_NS }}] == 1 ? 4 : (m[{{ M_NS }}] == 2 ? 2 : 1)) : 0);  // (F_PSQ: the
-    // partial sums object counted in, for the other cores)
+    const int nx = m[{{ M_NX }}] - ((flags & {{ F_PSQ }}) ? (m[{{ M_NS }}] == 1 ? {{ SLOTS }} : (m[{{ M_NS }}] == 2 ? {{ SLOTS // 2 }} : (m[{{ M_NS }}] <= 4 ? {{ SLOTS // 4 }} : 1))) : 0);
+    // (F_PSQ: the partial sums object counted in as an object's strips, for the other cores)
 {% elif rot %}
     const int nx = m[{{ M_NX }}] - ((flags & {{ F_PSQ }}) ? 1 : 0);  // (F_PSQ: the partial sums object counted in)
 {% else %}
@@ -2323,7 +2421,7 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         if (kind == {{ K_PSQ }})
             {{ p }}_psq(x, ws);
         else if (kind == {{ K_ROTE }})
-            {{ p }}_rote(a, ws);
+            {{ p }}_rote(a, ws{{ ", hres" if SLOTS == 8 else "" }});
 {% if moe %}
         else if (kind == {{ K_HROT }})
             {{ p }}_hrot(a, ws);

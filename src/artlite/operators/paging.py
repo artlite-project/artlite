@@ -517,7 +517,7 @@ def _link_page(prj: str, obj: ObjectFile, own: set[int], script: str, slot: int,
                         "-Wl,--gc-sections", "-Wl,--orphan-handling=error", f"-Wl,-T,{tmp}.ld", "-o", tmp],
                        check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        raise PagingError(f"page {name}: link failed: {e.stderr.strip()}") from None
+        raise PagingError(f"page {name} of core {core}: link failed: {e.stderr.strip()}") from None
     finally:
         for x in (tmp + ".o", tmp + ".ld"):
             if os.path.exists(x):

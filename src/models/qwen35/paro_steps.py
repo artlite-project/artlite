@@ -1,6 +1,7 @@
 """A PARO checkpoint's steps on the qwen35 decode overlay (``image``'s PARO layout; the decode design's "Rotated
 inputs", ``decode.rotated``): the phases, their flags and kinds, and the step's build. Per GDN layer gin_q, gin_z (each
-F_PSQ on its rotated copy of the residual, F_MSG: the GDN core's message in two parts, ``words.M_MPART``), the GDN step
+F_PSQ on its rotated copy of the residual, F_MSG: the GDN core's message in two parts, ``words.M_MPART``; a design of 8
+slots: F_GIN, their rows to the GDN core through DDR, ``gdn_steps.rows_wide``), the GDN step
 (its outputs into rot_g's input, a column's v heads in a row), rot_g (each column's v heads rotated into gdn_out's
 input), gdn_out (gate's and up's copies); per attention layer attn_q, attn_k, attn_v (F_PSQ: into the q objects and the
 raw K / V objects), the attention (o into rot_o's input), rot_o, attn_out; then gate, up (their rows into rot_down's
@@ -12,7 +13,7 @@ the last layer's down (an identity copy over the output norm, ``image``); a DFla
 residual), in a region of its own (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
 expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
 copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
-(the 4-lane rounds, ``kmath.rotate``), one sequence."""
+(the 4-lane rounds, ``kmath.rotate``) or a dense model's of 8 (the rounds per half of 4 slots), one sequence."""
 
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,7 @@ from artlite.decode.protocol import (
     M_NS,
     M_NT,
     M_NX,
+    M_SP,
     META,
     XB,
     XPAY,
@@ -50,7 +52,7 @@ from artlite.overlay import Sequence, Transaction
 
 from .image import QwenImage, gdn_v_heads
 from .steps import PanelTable, Step
-from .words import M_MPART, MP_J0, MP_LAST
+from .words import F_GIN, M_MPART, MP_J0, MP_LAST
 
 if TYPE_CHECKING:
     from .overlay import QwenOverlay
@@ -89,6 +91,10 @@ class ParoSteps(RotatedOverlay):
         return [*out, (-1, "lm")]
 
     def paro_flags(self: "QwenOverlay", L: int, name: str) -> int:
+        """(a design of 8 slots: gin_q's and gin_z's rows into the GDN cores' objects through DDR, no F_MSG; their
+        metadata objects F_GIN: the step's words for the GDN cores, ``gdn.entry8``)"""
+        if self.SLOTS == 8 and name in ("gin_q", "gin_z"):
+            return FLAGS[name] & ~F_MSG | F_GIN
         return FLAGS[name]
 
     def copies_of(self: "QwenOverlay", L: int) -> list[tuple[int, str]]:
@@ -122,6 +128,9 @@ class ParoSteps(RotatedOverlay):
         d = DATA.get(name)
         return self.image.rot_groups(L, d) if d is not None and self.image.rot_region(L, d) else 0
 
+    def rot_data_region(self: "QwenOverlay", L: int, name: str) -> object:
+        return self.image.region(L, DATA[name])
+
     def rot_copies(self: "QwenOverlay", L: int, name: str) -> int:
         if name in ("gdn_out", "attn_out"):  # (gate's and up's; an MoE layer's moe_in's)
             return 1 if self.moe else 2
@@ -134,7 +143,11 @@ class ParoSteps(RotatedOverlay):
         plain = [] if self.rot_kind(name) in ("in", "rotx") else mp.groups(
             self.image.region(L, name), flags, S, slots=self.SLOTS, block_flags=MOE_BLOCKS if name == "moe_in" else None)
         out = self._rot_groups(L, name, S, flags, plain)
-        if name in ("gin_q", "gin_z"):  # (the GDN core's message in two parts: gin_q's qkv rows, then gin_z's z and ab)
+        if self.op.packed and self.SLOTS == 8:  # (the input's slots per k block, the host's per phase)
+            for g in out:
+                g.meta[M_SP] = self._sp(S, (L, name))
+        if name in ("gin_q", "gin_z") and self.SLOTS == 4:  # (the GDN core's message in two parts: gin_q's qkv rows,
+            # then gin_z's z and ab)
             # (the qkv rows the main core emits: the block's valid ones, not the padding of its last row tile)
             nq = -(-int((self.image.region(L, "gin_q").block("qkv").rows[0] >= 0).sum()) // C_LEN)
             out[0].meta[M_MPART] = S * nq if name == "gin_q" else S * (self.gsh.n_msg - nq) | MP_LAST | nq << MP_J0
@@ -152,9 +165,9 @@ class ParoSteps(RotatedOverlay):
     # The step
     # ------------------------------------------------------------------
 
-    def paro_weights(self: "QwenOverlay", seq: Sequence, phase: tuple[int, str], gi: int, last: bool) -> None:
+    def paro_weights(self: "QwenOverlay", seq: Sequence, phase: tuple[int, str], gi: int, last: bool, S: int = 1) -> None:
         """The A fills of a phase's K group gi: its tiles (a rotated phase of tiles), then after the last group's its
-        rotation objects (``DATA``)."""
+        rotation objects (``DATA``; a rotation phase of single-group sub-phases' come with them: ``rot_single``)."""
         L, name = phase
         dev = self.dev
         if self.rot_kind(name) not in ("in", "rotx"):
@@ -164,7 +177,7 @@ class ParoSteps(RotatedOverlay):
                 for o, n, dims, rep, it in mp.a_reads(region, c, gr):
                     seq.fill("A", c, dev.address("W", o), n, dims, rep, it)
         d = DATA.get(name)
-        if last and d is not None and self.image.rot_region(L, d):
+        if last and d is not None and self.image.rot_region(L, d) and not self.rot_single(L, name, S):
             r = self.image.region(L, d)
             for c in range(COLS):
                 seq.fill("A", c, dev.address("W", r.offset + c * r.col_stride), r.data)
@@ -174,7 +187,7 @@ class ParoSteps(RotatedOverlay):
         DDR; not ``NOSYNC``'s), then its outputs (``_outputs``)."""
         name = phase[1]
         if self.rot_kind(name) is not None:  # (one K group, or none)
-            self.paro_weights(seq, phase, 0, True)
+            self.paro_weights(seq, phase, 0, True, st.S)
             if name not in NOSYNC:
                 seq.sync()
             if not self._rot_inputs(seq, st, phase):
@@ -197,6 +210,8 @@ class ParoSteps(RotatedOverlay):
         for c in range(COLS):
             if name in ("rot_in", "eh"):
                 self.emit_copies(seq, c, S, self.copies_of(L))
+            elif name in ("gin_q", "gin_z") and self.SLOTS == 8:  # (into the GDN cores' objects, ``gdn_steps``)
+                self.gdn_steps.rows_wide(seq, L, S, c, name)
             elif name == "attn_q":
                 self.attn_steps.q_drain(seq, L, S, c)
             elif name in ("attn_k", "attn_v"):

@@ -21,7 +21,7 @@ from ..operators.design import COLS
 from ..overlay import Sequence
 from ..paro import Rotation, TanForm
 from . import phases as mp
-from .design import ROT_GROUP
+from .design import ROT_GROUP, ROT_OBJ
 from .image import Region
 from .model import InputRegion
 from .protocol import (
@@ -37,7 +37,6 @@ from .protocol import (
     M_NX,
     M_RGN,
     META,
-    SLOTS,
     XB,
     XPAY,
     region_bytes,
@@ -71,6 +70,17 @@ class RotatedOverlay:
         """The copies an F_ROTE phase emits."""
         raise NotImplementedError
 
+    def rot_data_region(self, L: int, name: str) -> Region:
+        """(rotx) The image's data region of a phase's rotation objects."""
+        raise NotImplementedError
+
+    def rot_single(self, L: int, name: str, S: int) -> bool:
+        """(rotx) Whether a rotation phase of S slots runs sub-phases of one group (an X object holds one: an F_RACT
+        phase of 8 slots): each takes its group's rotation A object, filled before its X objects (``_rot_inputs``),
+        shifted so that the group comes first (a sub-phase's groups count from 0), not the phase's data region at
+        once."""
+        return self.rot_kind(name) == "rotx" and all(ng == 1 for _, ng in self.rot_subs(L, name, S))
+
     def _add_rot_inputs(self, phase: tuple[int, str], extra: int = 0) -> None:
         """The input region of a rotated phase (module docstring; ``extra``: a "rotx" input's bytes per element past its
         x, ``model.ModelOverlay._add_inputs``')."""
@@ -80,15 +90,15 @@ class RotatedOverlay:
             regs = [InputRegion(self._take("ACT", XB), 0, 0)]
         elif kind == "rotx":  # (a metadata object per sub-phase: ``rot_subs``, then x)
             n, mul = self.rot_slice(L, name)
-            K, subs = n * COLS, len(self.rot_subs(L, name, SLOTS))
-            off = self._take("ACT", region_bytes(K, mul * SLOTS) + (subs - 1) * XB + extra * K)
+            K, subs = n * COLS, len(self.rot_subs(L, name, self.SLOTS))
+            off = self._take("ACT", region_bytes(K, mul * self.SLOTS) + (subs - 1) * XB + extra * K)
             regs = [InputRegion(off + i * XB, 0, K, x0=(subs - i) * XB) for i in range(subs)]
         elif name == "tap":  # (a block drafter's tap: a plain copy of the layer's input, an F_PSQ input's layout)
-            regs = [InputRegion(self._take("ACT", rot_region_bytes(self.H)), 0, self.H, x0=XB + XPAY)]
+            regs = [InputRegion(self._take("ACT", rot_region_bytes(self.H, self.SLOTS)), 0, self.H, x0=XB + XPAY)]
         else:
             r = self.image.region(L, name)
             assert len(mp.group_chunks(r)) == 1, f"{name}: one K group"
-            regs = [InputRegion(self._take("ACT", rot_region_bytes(r.K_in)), 0, r.K_in, x0=XB + XPAY)]
+            regs = [InputRegion(self._take("ACT", rot_region_bytes(r.K_in, self.SLOTS)), 0, r.K_in, x0=XB + XPAY)]
         self.inp[phase] = regs
 
     def rot_subs(self, L: int, name: str, S: int) -> list[tuple[int, int]]:
@@ -97,14 +107,14 @@ class RotatedOverlay:
         the next X object, the attention cores (on the same broadcast streams) skip a phase's X objects before its A
         objects, and each stream stalls on the consumer whose L1 objects are full."""
         n, mul = self.rot_slice(L, name)
-        per = XPAY // (2 * mul * self._sp(S) * ROT_GROUP)  # (groups of an X object)
+        per = XPAY // (2 * mul * self._sp(S, (L, name)) * ROT_GROUP)  # (groups of an X object)
         G = n // ROT_GROUP
         return [(g, min(per, G - g)) for g in range(0, G, per)]
 
     def _rot_groups(self, L: int, name: str, S: int, flags: int, groups: list[mp.Group]) -> list[mp.Group]:
         """A rotated phase's groups: "in" and "rotx" phases' own; an F_PSQ / F_ROTE phase's from the plain ones
         (``groups``: the phase's as any other's)."""
-        per = SLOTS // self._sp(S)  # (strips of an input object)
+        per = self.SLOTS // self._sp(S, (L, name))  # (strips of an input object)
         nrot = self.rot_objects(L, name)
         kind = self.rot_kind(name)
         if kind == "in":  # (no tiles: the rotation objects only)
@@ -119,7 +129,7 @@ class RotatedOverlay:
                 m[M_FLAGS], m[M_NS], m[M_NX], m[M_RGN] = F_MAIN | flags, S, per, ng
                 m[M_NT] = m[M_NRA] = -(-ng // 2)
                 out.append(mp.Group(0, 0, m, 0, 0))
-            assert sum(int(g.meta[M_NT]) for g in out) == nrot, (name, nrot)
+            assert sum(int(g.meta[M_NT]) for g in out) == (len(out) if self.rot_single(L, name, S) else nrot), (name, nrot)
             # (the regions' metadata objects past S's sub-phases: unread, written as zeros: every S writes the same bytes)
             return out + [mp.Group(0, 0, np.zeros(META, np.int32), 0, 0) for _ in self.inp[(L, name)][len(out):]]
         for i, g in enumerate(groups):
@@ -132,17 +142,21 @@ class RotatedOverlay:
                 g.meta[M_NT] += nrot
         return groups
 
-    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], fills: list[list[int]]) -> None:
+    def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], fills: list[list[int]],
+                         a_fills: dict[tuple[int, int], int] | None = None) -> None:
         """A phase's X fills of XB bytes at ACT offsets (``fills``: per column, in order) and its outputs: the fills in
         rounds of one a column (a column's tasks in a row put the last column's first ~2 us behind), up to the 4 a
         column's queue holds (empty after the phase's sync), then the drains, then the rest (past 4 queued fills a
         column's next fill waits for its oldest, whose room the cores make only while their outputs drain): the cores
-        start on their first objects before the drains are written."""
+        start on their first objects before the drains are written. ``a_fills``: {(column, X fill index): W offset}: an
+        A object (one tile) filled before that X fill (``rot_single``)."""
         n = max(len(f) for f in fills)
         for r in range(n):
             if r == txn.QUEUE_DEPTH:
                 self._outputs(seq, st, phase)
             for c in range(COLS):
+                if a_fills and (c, r) in a_fills:
+                    seq.fill("A", c, self.dev.address("W", a_fills[(c, r)]), self.image.tile_bytes)
                 if r < len(fills[c]):
                     seq.fill("X", c, self.dev.address("ACT", fills[c][r]), XB)
         if n <= txn.QUEUE_DEPTH:
@@ -152,7 +166,7 @@ class RotatedOverlay:
         """A rotated phase's input fills (its weights out before); True: its outputs drained too (a "rotx" phase's:
         ``fills_and_drains``)."""
         name = phase[1]
-        kind, sp = self.rot_kind(name), self._sp(st.S)
+        kind, sp = self.rot_kind(name), self._sp(st.S, phase)
         for rg in self.inp[phase]:
             if kind == "in":  # (the metadata object: the copies come from the residual)
                 for c in range(COLS):
@@ -162,11 +176,17 @@ class RotatedOverlay:
                 mul = self.rot_slice(*phase)[1]
                 x = rg.off + rg.x0
                 fills: list[list[int]] = [[] for _ in range(COLS)]
+                single = self.rot_single(*phase, st.S)
+                a_fills: dict[tuple[int, int], int] = {}
+                r = self.rot_data_region(*phase) if single else None
                 for i, (g0, _) in enumerate(self.rot_subs(*phase, st.S)):
                     for c in range(COLS):
                         at = x + 2 * mul * sp * (self.rot_start(*phase, c) + ROT_GROUP * g0) - (XB - XPAY)
+                        if single:  # (its group's A object, the group first: ``rot_single``)
+                            a_fills[(c, len(fills[c]))] = (r.offset + c * r.col_stride + g0 // 2 * r.tile_bytes
+                                                           + g0 % 2 * ROT_OBJ)
                         fills[c] += [self.inp[phase][i].off, at]
-                self.fills_and_drains(seq, st, phase, fills)
+                self.fills_and_drains(seq, st, phase, fills, a_fills)
                 return True
             elif rg.x0 != XB:  # (F_PSQ: the partial sums object after the metadata object)
                 for c in range(COLS):
@@ -179,7 +199,7 @@ class RotatedOverlay:
              so: int = 0) -> None:
         """n output values per slot of column c (objects (j, slot) of C_LEN values) -> the elements e0 .. e0 + n of a
         phase's x ([k block][slot mul sp][8]: an F_RACT phase's [gate | up]; ``so``: from slot so on), per K group."""
-        sp = self._sp(S)
+        sp = self._sp(S, phase)
         regions = self.inp[phase]
         for rg in regions[:1] if self.rot_kind(phase[1]) == "rotx" else regions:  # (sub-phases: one x)
             a, b = max(e0, rg.k0), min(e0 + n, rg.k0 + rg.K)
@@ -200,10 +220,11 @@ class RotatedOverlay:
             seq.drain("C", c, self.dev.address("ACT", self.rot_sink), S * 2 * n)
 
     def emit_copies(self, seq: Sequence, c: int, S: int, to: list[tuple[int, str]]) -> None:
-        """An F_ROTE emission of column c: per copy its partial sums object, then its x (the consumer's)."""
-        h8 = self.H // COLS
+        """An F_ROTE emission of column c: per copy its partial sums object (a design of 8 slots: two, of slots 0 .. 3
+        and 4 .. 7), then its x (the consumer's)."""
+        h8, nq = self.H // COLS, self.SLOTS // 4
         for ph in to:
-            seq.drain("C", c, self.dev.address("ACT", self.inp[ph][0].off + XB + 2 * C_LEN * c), 2 * C_LEN)
+            seq.drain("C", c, self.dev.address("ACT", self.inp[ph][0].off + XB + 2 * nq * C_LEN * c), 2 * nq * C_LEN)
             self.x_to(seq, c, ph, e0=h8 * c, n=h8, S=S)
 
 

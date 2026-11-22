@@ -26,7 +26,8 @@ against the checkpoint computed exactly on the CPU), z-lab/Llama-3.1-8B-Instruct
 checkpoint computes them; a step of one token 81.7 ms, bartowski's Q4_K_S GGUF 76.0), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; 2.96 tokens per second, a 1024-token prompt in 3.2 s;
 with its base model's DFlash2 drafter, z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of
-up to 4 tokens: 6.8 tokens per second after a 1K-token essay prompt, 4.8 after 32K, the same greedy text),
+up to 8 tokens: 8.0 tokens per second after a 1K-token essay prompt (the Q4_K_M GGUF's 11.2 at 11% fewer bytes a token),
+6.8 after 32K, the same greedy text),
 z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; 26.5 tokens per second, the Q4_K_M GGUF's 27.9 at 5% fewer
 bytes a token; with its base model's MTP drafter, ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the
 GGUF files, 34.8 tokens per second after a 1K-token essay prompt and 29.8 after 32K, the GGUF's 35.8 and 30.5, the

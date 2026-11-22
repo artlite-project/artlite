@@ -81,16 +81,18 @@ switchboxes): they never overlap here, each broadcast comes after a sync on the 
 phase comes after local objects with no drains in between: its inputs stay per column (``ModelOverlay._inputs``).
 
 Rotated inputs (``rot``: a PARO checkpoint's linears, ``artlite.paro``): a linear's input x is rotated per group of 128
-channels (``paro.TanForm``: its storage order is the tiles' K order) before the GEMV, and each column rotates only what it
-owns, once: no column rotates a whole input. The rotations run on the helper, the main core's commands (K_PSQ, K_ROTE,
-K_ROTX, K_HROT: the main core's program memory), in the main core's GEMV scratch, idle then (``kmath.rotate``: u fp32
-[128][slot 4] and its two bf16 copies, 6 KB; ``rrun``), their objects (``paro.TanForm.objects``, a norm's weight folded
-in: two groups per A object, ``protocol.rot_objects``) on the column's A stream after the phase's tiles, counted in M_NT
-(the other cores skip them as tiles; M_NRA of them). A design whose normed inputs are all rotated copies (qwen35's: the
-LM head's an identity copy over the output norm) has no norm-object input path (``norm_objs``):
+channels (``paro.TanForm``: its storage order is the tiles' K order) before the GEMV, and each column rotates only what
+it owns, once: no column rotates a whole input. The rotations run on the helper, the main core's commands (K_PSQ,
+K_ROTE, K_ROTX, K_HROT: the main core's program memory), in the main core's GEMV scratch, idle then (``kmath.rotate``: u
+fp32 [128][slot 4] and its two bf16 copies, 6 KB; ``rrun``; a design of 8 slots: per half of 4 slots, half 1 first),
+their objects (``paro.TanForm.objects``, a norm's weight folded in: two groups per A object, ``protocol.rot_objects``)
+on the column's A stream after the phase's tiles, counted in M_NT (the other cores skip them as tiles; M_NRA of them). A
+design whose normed inputs are all rotated copies (qwen35's: the LM head's an identity copy over the output norm) has no
+norm-object input path (``norm_objs``):
 
 - F_ROTE: the residual goes out (F_EMITR) as M_NRC rotated copies of the column's slice (H / 8 values: whole groups),
-  each after the copy's partial sums object (the slice's squares, fp32 exact, [slot 4][8 lanes]); the consumers' inputs
+  each after the copy's partial sums object (the slice's squares, fp32 exact, [slot 4][8 lanes]; 8 slots: two, slots
+  0 .. 3's and 4 .. 7's, the helper's residual rows ``hres``); the consumers' inputs
   (F_PSQ) start with the 8 columns' partial sums (an X object: their 1 / rms, ``psq``), their x is rotated, normed but
   for 1 / rms, which scales their rows (as F_NORM's), no norm-weight objects;
 - F_ROTX: a rotation phase (no tiles): each column's slice of an input (its X objects: o of its heads, its rows of [gate
@@ -311,8 +313,8 @@ class DecodeOverlayOperator(ArtcOperator):
         memory); rg: a dense design's row-group tiles (``decode.image.Block.G``: a PARO Gemma's proj of K 256; an MoE design
         has them)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
-        assert not rot or (slots == 4 and (post or hidden // COLS % ROT_GROUP == 0)), \
-            "rotated inputs: designs of 4 slots, residual slices of whole rotation groups (a post design's: R phases)"
+        assert not rot or (post or hidden // COLS % ROT_GROUP == 0), \
+            "rotated inputs: residual slices of whole rotation groups (a post design's: R phases)"
         # (a ``post`` design has TOK_STATE's words too: S_NAS is always declared)
         STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
                        *([MOE_STATE] if moe else []), *(self.GATE_STATE if self.gate else ()), *([ROT_STATE] if rot else []))
@@ -472,7 +474,9 @@ class DecodeOverlayOperator(ArtcOperator):
         """Byte offsets of the main core's workspace regions (and "size")."""
         S = self.slots
         sizes = [("st", 4 * (S_WORDS_ROT if self.rot or self.moe else S_WORDS)), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
-                 ("yt", 4 * self.yt), ("stg", 2 * S * 2 * C_LEN), ("gs", 2 * 16 * (max(S, 8) if self.split else S)),
+                 ("yt", 4 * self.yt), ("stg", 2 * (2 * S + (2 if self.rot and S == 8 else 0)) * C_LEN),  # (rot, 8 slots:
+                 # a rotated copy's group after its two partial sums objects, ``rote``)
+                 ("gs", 2 * 16 * (max(S, 8) if self.split else S)),
                  ("scr", gemv.scr_bytes(S))]  # (gs: a split design's gate tiles go through 64 floats of it, ``gusplit``)
         if self.post:
             sizes += [("pend", 4 * S * self.res_pitch), ("ivv", 4 * 32)]
