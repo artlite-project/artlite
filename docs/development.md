@@ -1,8 +1,8 @@
 # Development
 
-The rules every change follows, the commands and the map of the code are in [AGENTS.md](../AGENTS.md); contributions
-are accepted under the agreement in [CONTRIBUTING.md](../CONTRIBUTING.md). Building: [Installation](install.md), the
-development venv: [Installation: Development](install.md#development).
+The rules every change follows and the commands are in [AGENTS.md](../AGENTS.md), the map of the code in [Code
+map](code-map.md); contributions are accepted under the agreement in [CONTRIBUTING.md](../CONTRIBUTING.md). Building:
+[Installation](install.md), the development venv: [Installation: Development](install.md#development).
 
 ## Tests
 
@@ -36,12 +36,72 @@ ctest --test-dir build-tests --output-on-failure
 
 ## Operators
 
-An operator is one file: an `ArtcOperator` subclass that renders its kernel's C++ (`get_kernel_src()`), its array
-design in IRON (`get_mlir_artifact()`) and its buffer arguments (`get_arg_spec()`). It lives with what it serves: a
-subsystem the models share (`src/artlite/`: `gemm/`, `decode/`, `prefill/`, `moe/`, `vision/`) or one model's package
-(`src/models/<model>/`), and is tested in `tests/<package>/test_<module>.py`. How they compile and load:
-[Design](design.md#kernel-compilation-pipeline); the framework and the shared pieces to reuse: AGENTS.md's map and
-"How an operator works".
+How they compile and load: [Design](design.md#kernel-compilation-pipeline); where the framework's modules are:
+[Code map](code-map.md).
+
+- One module per operator: an `ArtcOperator` subclass implementing
+  - `get_kernel_src()`: C++ from a Jinja2 template (`JINJA_ENV`: undefined variables are errors) with shapes, trip
+    counts and strides as compile-time constants, its names under `kernel_prefix` (AGENTS.md's Rules). Kernel
+    templates are files next to their module, `<module>.cc.jinja` (several: `<module>.<part>.cc.jinja`), named by
+    their path from `src/` in Python (`templating.load`, `templating.source`) and in `{% include %}` (on a line of its
+    own: whole lines), never C++ in Python strings;
+  - `get_mlir_artifact()`: the array design in `aie.iron` (ObjectFifos, Workers, runtime sequence);
+  - `get_arg_spec()`: buffer directions, shapes, dtypes.
+- Reuse the shared pieces instead of copying (`artlite/operators/`, the headers in `artlite/include/`): `kmath/`
+  (exp2, recip, sigmoid, SiLU, GELU, ...: `km.exp2(...)` in a template; arrays through the gather LUT:
+  `km.act(km.SILU)`, `km.table_pass`; a head's norm and rope: `km.rms_norm`, `km.rope`; a softmax's P:
+  `km.p_pass1`, `km.p_pass2`), `kernel_lib.h` (`inv_rms`, bfp16 panels, lane shuffles, vectors from 128-bit
+  pieces: `al::concat`, `al::gather`; an fp32 value's bf16 hi / lo parts: `al::split2`; the attention preps' stage
+  rows and panels: `al::stage_row`, `al::encode_hilo`, `al::vpan`), `design.py` (`COLS`, `ROWS`, `range32`: Worker
+  loops with an i32 induction variable, `linear_tap`), `bfp16.py` (host bfp16ebs8 conversions and panels),
+  `l1_layout.py` (`pin_l1_buffers`), `util.py` (template `Attr`, workspace `regions`, bf16 constants, `arg_bytes`).
+  Words a kernel and the host share (metadata, state, command words, flags) are declared in `words.py` layouts and
+  reach a template as that layout's `consts()`, never by a name prefix of a module's globals.
+- A new operator lives with what it serves (an `artlite` subsystem, or its model's package: AGENTS.md's Layers) and is
+  tested in `tests/<package>/test_<module>.py`. Tests need no compile plumbing: pytest plans the selected tests in a
+  subprocess and builds their designs in the background.
+- `compile()` = render (`build_spec()`, in the calling thread) + build (Peano: `kernel.cc` -> `kernel.o`; `aiecc`:
+  `design.mlir` -> `main.pdi` + `insts.bin`). `kernel.cc` has a section per operator (a fused ELF's: each definition
+  in the first section that uses it, a later one lists what it shares). `compile_all(ops)` builds many in
+  parallel: use it wherever several designs are compiled before anything runs (`parallel_map` for other compile
+  work). `ARTLITE_COMPILE_JOBS` bounds the builds; `python -m artlite.parallel_compile CMD ...` fills the cache for
+  any command.
+- Every compile runs `operators/checks.py`: each core's deepest kernel call against its Worker `stack_size`, kernel
+  signatures against the design, rounding kernels that do not set the rounding mode, runtime-library arithmetic
+  (`ARTLITE_SKIP_CHECKS=1` skips them).
+- Builds are cached per content hash in `~/.cache/artlite/rtc_<hash>/` (inspect the artifacts there;
+  `ARTLITE_CACHE_DIR` moves it, `ARTLITE_IGNORE_CACHE=1` rebuilds). A render manifest (`render_cache.py`, keyed by
+  class, constructor arguments and the sources' hash) skips rendering cached designs; a module global changed at
+  runtime is not in that key, so a monkeypatched test needs its own operator names.
+- First use (`op.device` or the first dispatch) opens a HW context and uploads the program. `dispatch(*buffers)`
+  submits in sequence order and waits, without host <-> device syncs; `run(*tensors)` is the one-shot wrapper;
+  `artlite.from_numpy` / `artlite.empty(..., device=)` give device buffers (`Tensor.numpy()`: a zero-copy view); `compile(device=)` chains operators
+  on one device.
+- NPU2: 8 columns of compute rows 2-5, a memtile (row 1, 512 KB) and a shim (row 0). A core has 64 KB of data
+  memory in four 16 KB regions (budget ~63 KB with the stack) and 16 KB of program memory.
+
+## NPU pitfalls
+
+- A runtime-sequence argument stays below 4 GB (ELF relocation addends are 32-bit).
+- An ELF's control code goes into the process's device heap (64 MB heap BOs up to 512 MB; one before Linux 7.2, where
+  `Library`'s pieces shrink to fit, the least recently used step transactions are given up for room
+  (`overlay.Transactions`) and a heap that is still full raises `HeapFullError`); every ConfigureOp inlines its design's
+  configuration. Long programs: `fused.Library` + `Library.run`.
+  Thousands of entries in one aiecc ELF make aiecc's time explode.
+- `FusedOperator` refuses to run while a buffer read before it is written was never written by the host (declare
+  intentionally empty ones `uninitialized`). The host writes only input and scratch buffers: output BOs are never
+  flushed, so cached host writes land over the NPU's (garbage in 64-byte runs).
+- No kernel statics in fused or overlay designs (rewritten on every reconfiguration; they also collide with pinned
+  L1 buffers): scratch and tables are worker `Buffer`s. Every kernel entry that rounds sets
+  `aie::set_rounding(conv_even)` (the default is floor).
+- 128-byte vector loads need 64-byte alignment: an unaligned `load_v<64>` of bf16 silently rounds the address down.
+- Shim BDs: innermost dimension <= 1023 words (a longer one can make aiecc run for very long instead of failing);
+  at most 4 queued tasks per shim channel.
+- Host-built transactions (overlays): issue a phase's input fills and drains before the bulk of its weight fills, or
+  the queues deadlock; clflush host writes before a dispatch and fetch NPU writes before reading them. A dispatch ends
+  with every task it queued complete: the next one rewrites the BDs from its start, and a task still queued runs with
+  its words.
+
 
 ## Kernel tools
 
@@ -70,9 +130,28 @@ python -m artlite.parallel_compile python script.py
 `tests/test_app_designs.py` checks each app's ledger: a change to kernel code or a toolchain update refreshes the
 baseline in the same commit, whose diff of `tests/schedule_ledger.jsonl` shows what it did to the kernels' loops
 (pipelined or not, II, spills), cycles, code bytes, stack and the cores' program memory.
+`record` alone prints the differences worst first (lost pipelining, II / spills up, cores below 256 B free): a
+toolchain bump's survey. `rank APP` (`-p 1024`: the chunk's length): a prefill chunk's kinds of items by their busiest
+cores' static cycles and its loops by weight and by slack (II above the resource bound): which kernel work a
+session can win back.
 
 On-NPU profiling (hardware counters between a kernel's `event0()` / `event1()` markers, or event traces, as
 Chromium JSON for Perfetto) is switched on by `ARTLITE_PROFILE` (below).
+
+## Checking a change
+
+- Refactoring check: `pytest tests --dump-designs DIR` before and after, then
+  `python tests/design_diff.py BEFORE AFTER --asm` (identical MLIR; changed kernel sources compile to the same
+  asm). The apps' full designs are dumped too (`test_app_designs.py`); the slow tests are not. A change of shared
+  kernel code (`kmath/`, `include/kernel_lib.h`) re-renders only the tests it touches: `--affected REGEX --compile` on
+  BEFORE before the change, `--partial --asm` after (`design_diff.py`'s docstring); on the NPU then only the tests of
+  the designs whose code changed.
+- Host-side refactoring check (the overlays' step building and patching, metadata and command writes, weight
+  packing): `python tests/txn_dump.py DIR` before and after, then `python tests/txn_dump.py --diff BEFORE AFTER` (every
+  app's decode overlay and media encoder on a fake device, no NPU: per dispatch the transaction's words and the host
+  buffers' digests must be identical).
+- Data layouts (shim taps, memtile walks, joins) are tested on the host with `tests/dma_model.py`
+  (`tests/gemm/test_dma.py` is the pattern).
 
 ## Environment variables
 
@@ -136,3 +215,15 @@ Markdown that people can read too:
 | [iron-porting](../.claude/skills/iron-porting/SKILL.md) | porting an IRON operator to an Artlite operator |
 | [artlite-bench](../.claude/skills/artlite-bench/SKILL.md) | measuring a model for the README's charts |
 | [update-deps](../.claude/skills/update-deps/SKILL.md) | upgrading the pinned mlir-aie and Peano wheels |
+
+## References
+
+- AIE API headers: mlir-aie's `third_party/aie_api/`.
+- MLIR-AIE usage: mlir-aie's `{programming_guide,programming_examples,mlir_exercises}` (large; grep).
+- Peano backend (scheduler, pipeliners): llvm-aie's `llvm/lib/Target/AIE/`; the `__builtin_aie2p_*`
+  intrinsics: its `clang/include/clang/Basic/BuiltinsAIE2P.def`.
+- AMD manuals, cited by number: AM027 / AM029 (AIE-ML v2 = AIE2P architecture manual / register reference), AM020 /
+  AM025 (AIE-ML v1 = AIE2), UG1079 / UG1076 (AI Engine kernel and graph programming, tools and flows; chess /
+  Vitis, AIE1-oriented). AM029 is Versal's register layout: its memory-module and memtile offsets are the NPU's, its
+  shim (NOC / PL module) and core register-file, debug and counter offsets are not (Core_Status: 0x38004 there,
+  0x32004 here). The NPU's map: mlir-aie's `third_party/aie-codegen/aie-regdb/globalparams/xaie2pgbl_params.h`.

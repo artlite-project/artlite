@@ -6,7 +6,7 @@ description: AIE2P (NPU2 / XDNA2) facts and constraints for writing Artlite kern
 # AIE2P coding reference
 
 What the AIE2P array is and what breaks on it. Each point names its source: AMD manuals by number (AM027: AIE-ML v2
-architecture, AM029: its register reference), mlir-aie / llvm-aie paths relative to their checkouts (AGENTS.md
+architecture, AM029: its register reference), mlir-aie / llvm-aie paths relative to their checkouts (docs/development.md
 "References"), papers by title, or "measured" (on this machine).
 
 Related skills: **aie-kernel-perf-optimization** (speed; its section 2 holds the source rules every kernel follows:
@@ -217,7 +217,7 @@ BDs:
   depth 16 failed elsewhere. A link's two directions on one channel number draw on one parity (the decode overlay's
   A FIFO tops out at depth 12); pinning the channels (`cons(port=Port.dma(n))`: the memtile S2MM, `forward(port=)`:
   its MM2S) puts the directions on different parities (depth 20-22 compiled).
-- Shim BDs: 3 dims plus the outer repeat; the innermost dimension at most 1023 words (AGENTS.md): write long rows as
+- Shim BDs: 3 dims plus the outer repeat; the innermost dimension at most 1023 words (docs/development.md, NPU pitfalls): write long rows as
   `[n][512 words]`. An inner run of 1280 words fails lowering ("Do not include the highest dimension size in transfer
   length"); a longer one can make aiecc run for 25+ minutes instead. A gathered unit longer than 1023 words (32-row
   slices of 128 B per row = 1024 words) goes as sub-units of 16 rows: the memtile then receives [sub-unit][tile][row
@@ -326,8 +326,8 @@ Silent wrong results:
   or garbage, and `sizeof(bfp16ebs8)` is 9, `sizeof(uint4)` 1. Offset a `uint8_t *` and cast at the load or the stream
   constructor (`uint8_t[N*9]` for blocks). `aie::load_v<N>(uint4*)` + `.unpack()` yields linear nibble order (lane
   `2i` = low nibble of byte `i`); 1024-bit `load_v<256>(uint4*)` + unpack + `to_float<bfloat16>` is bit-exact.
-- `alignas()` does not work for `bfloat16` on AIE: use `__attribute__((aligned(64)))` (AGENTS.md: 64-byte alignment of
-  128-byte loads).
+- `alignas()` does not work for `bfloat16` on AIE: use `__attribute__((aligned(64)))` (NPU pitfalls in docs/development.md: 64-byte
+  alignment of 128-byte loads).
 - `AIE_LOOP_IGNORE_MEM_DEPS` also drops the compiler's spill / reload ordering: a spilling loop computes garbage.
 - **A lock acquire before a call can land in the call's delay slots** (`jl p0` with `acq` in slot 4): the core
   fetches the callee before the acquire completes, fatal when the wait is for that very code (pages written by
@@ -391,7 +391,7 @@ Address spaces and layout:
 
 ## 14. Build and debugging checklist
 
-- The compile cache key (AGENTS.md) covers the rendered sources, flags, design MLIR, `operators.h` and the toolchain
+- The compile cache key (docs/development.md, Operators) covers the rendered sources, flags, design MLIR, `operators.h` and the toolchain
   versions; in-place edits of installed toolchain headers are not detected: `ARTLITE_IGNORE_CACHE=1`.
 - `ARTLITE_LOG_COMMANDS=1` with `ARTLITE_IGNORE_CACHE=1` shows the exact `clang++` / `aiecc` invocations.
 - `dmesg` shows `amdxdna ... IO_PAGE_FAULT` when DMA addresses or buffer layouts are wrong.

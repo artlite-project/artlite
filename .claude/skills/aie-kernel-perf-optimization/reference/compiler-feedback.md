@@ -44,7 +44,7 @@ runs one).
 
 - `-Wpass-failed`: an `AIE_*` pragma was dropped.
 - `No memory bank assigned to load in function ...`: add a `__aie_dm_resource_*` qualifier and keep it through casts.
-- `checks.py` (every compile, AGENTS.md): stack, kernel signatures, rounding, runtime-library arithmetic.
+- `checks.py` (every compile, docs/development.md "Operators"): stack, kernel signatures, rounding, runtime-library arithmetic.
 
 ## Assembly checks (`kernel.cc.s`, `ARTLITE_GENERATE_ASM=1`)
 

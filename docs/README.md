@@ -13,7 +13,8 @@
 | [Page-local bricks](page-local-bricks.md) | memory lines and 4 KB pages on Krackan Point and Windows: what the NPU's DMA pays, what Artlite does, the planned prefill layout |
 | [Design](design.md) | runtime layers, C++ and Python API, kernel compilation, error handling, driver behaviour |
 | [Universal programs](paging.md) | code pages: cores that load their own code, compared with classic designs |
-| [Development](development.md) | tests, operators, kernel tools, environment variables, skills |
+| [Development](development.md) | tests, operators, NPU pitfalls, kernel tools, checking a change, environment variables, skills, references |
+| [Code map](code-map.md) | where the code lives, module by module; how the models run on the NPU |
 
 `data/` and `charts.py` hold the performance charts' numbers and draw them into `images/`; `diagram.py` draws the
 README's how-it-works diagram, `paging_diagrams.py` the figures of [Universal programs](paging.md).

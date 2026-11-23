@@ -242,8 +242,8 @@ model supplies its runlist, static buffers and time model). Kernel and data-move
 
 ## Pitfalls
 
-Besides AGENTS.md's (kernel names, statics, host writes and flushes, the 2 s and 4 GB limits) and aie2p-coding
-section 8's (join offsets, memtile channels, chained fills within 14 shim BDs, zeroed strides of size-1 dimensions):
+Besides AGENTS.md's (kernel names, the 2 s limit), docs/development.md's NPU pitfalls (statics, host writes and
+flushes, the 4 GB limit) and aie2p-coding section 8's (join offsets, memtile channels, chained fills within 14 shim BDs, zeroed strides of size-1 dimensions):
 - A GemmQd stays within 64 passes per block.
 - A bigger Worker `stack_size` costs L1 the operator's budget must still fit.
 - Test fixtures: the overlay's capacity must hold a chunk plus its padding (`max_positions`).

@@ -14,7 +14,7 @@ description: Port an IRON operator (XRT / xclbin, several files - op.py, design.
 | build | `XclbinArtifact`, `KernelObjectArtifact`, `SourceArtifact` | `compile()`: Peano `kernel.cc` -> `kernel.o`, aiecc -> PDI + insts (a single operator) or one ELF (fused operators, libraries) |
 | runtime | XRT via `aie.utils.NPUKernel` | artlite (`Device`, `Program`, buffers) |
 
-AGENTS.md "How an operator works" is the contract (render and build, the shared helpers, tests without compile
+docs/development.md "Operators" is the contract (render and build, the shared helpers, tests without compile
 plumbing, exports). Never import IRON components: only the `aie.iron` Python API, the `aie_api` C++ headers and the
 artlite runtime.
 

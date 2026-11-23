@@ -1,8 +1,8 @@
 # Contributing to Artlite
 
 Artlite is licensed under the GNU Lesser General Public License version 2.1 or later ([LICENSE](LICENSE));
-[csrc/shim_xdna/](csrc/shim_xdna/) keeps its own licenses ([its LICENSE](csrc/shim_xdna/LICENSE)). The code's rules,
-commands and map are in [AGENTS.md](AGENTS.md).
+[csrc/shim_xdna/](csrc/shim_xdna/) keeps its own licenses ([its LICENSE](csrc/shim_xdna/LICENSE)). The code's rules and
+commands are in [AGENTS.md](AGENTS.md), its map in [docs/code-map.md](docs/code-map.md).
 
 ## Accepting the agreement
 

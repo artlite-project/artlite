@@ -259,7 +259,7 @@ The first run of a model compiles its designs, from seconds to a few minutes per
 program: about 2 minutes); later runs load them from the cache (`ARTLITE_CACHE_DIR` moves it). Uncached designs
 build in parallel, `ARTLITE_COMPILE_JOBS` at a time (default: the CPU count).
 
-The map of the code: [AGENTS.md](../AGENTS.md#map).
+The map of the code: [Code map](code-map.md).
 
 ---
 
