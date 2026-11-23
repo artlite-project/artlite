@@ -77,7 +77,8 @@ class Block:
     ``tensors`` (their rows one after the other; -1: a zero padding row), n a multiple of R G: tile row v holds rows
     v G .. v G + G - 1 of them one after the other along K (G > 1: row groups, ``group_rows``). F32 tensors (an MoE
     router's) are BFP16 tiles of two planes per row: index 2 i + p is plane p of row i (0: hi = bfp16(w), 1: lo =
-    bfp16(w - hi); ``formats.bf16``): ``pairs``, the sum of a pair's outputs is the row's.
+    bfp16(w - hi); ``formats.bf16``): ``pairs``, the sum of a pair's outputs is the row's; a block of F32 tensors whose
+    indices are planes 0 only (``f32_planes``: one plane, tensors of bf16 values) is a BF16 tensor's tiles, not pairs.
 
     A split gate / up block (``fmt2``: gate and up in two tile formats, ``split_rows``): per SiLU group of 64 outputs its
     gate rows in ``na`` tiles of ``fmt`` (R rows), then its up rows in ``nb`` tiles of ``fmt2`` (R2 rows), each part's
@@ -296,6 +297,13 @@ class TileImage:
         qtype = self.qtype(name)
         return "BFP16" if qtype == "F32" else tile_format(qtype)
 
+    def gu_rows(self) -> set[int]:
+        """The rows per tile of the gate / up phases' tiles: the dense layers' gate_up (a split block's both), an MoE
+        layer's shared expert (moe_in's "sgu") and experts (exp_gu); other than {16}: the decode design's gate / up
+        windows (``decode.design``'s ``gu_win``: an 8-row tile holds only gate or only up rows)."""
+        return {R for r in self.regions + self.slabs for b in r.blocks
+                if r.name in ("gate_up", "exp_gu") or (r.name, b.name) == ("moe_in", "sgu") for R in (b.R, b.R2) if R}
+
     def _choose_tile_bytes(self) -> int:
         """The object size of the formats in the file (``formats.choose_tile_bytes``: rows streamed per format and K
         chunk, ffn_gate / ffn_up as the gate/up phase's SiLU groups, ``gate_up_rows``; token_embd only as the tied LM
@@ -347,7 +355,7 @@ class TileImage:
             fmt = fmts[0]
             R = self.R[fmt]
             assert G == 1 or rows.shape[1] % (R * G) == 0, (name, bname)
-            pairs = all(self.qtype(t) == "F32" for t in tensors)
+            pairs = all(self.qtype(t) == "F32" for t in tensors) and bool((rows[rows >= 0] % 2).any())
             # (a tail tile's halves: the super-block split's)
             pt = half and not pairs and not slot(fmt).mmv_split(fmt, self.nsb) and self.pairs(name, bname, fmt, R)
             blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs, pt=pt))
@@ -626,6 +634,18 @@ def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int
                               t.cols // 256, G)],
                        threads=1)
     return out.reshape(n, nch, S)
+
+
+def f32_planes(rows: np.ndarray, planes: int) -> np.ndarray:
+    """F32 tensors' rows (-1: a padding row) as indices of their BFP16 planes (``Block``): 2 planes, [2 i, 2 i + 1] per
+    row (hi and lo: the pairs' sums the rows to ~2^-16, B_PAIR; an MoE router's: fp32 logits); 1 plane, 2 i (hi: bfp16 of
+    the values, as a BF16 tensor's tiles; a tensor of bf16 values, ``gguf_model.bf16_exact``: half the bytes)."""
+    rows = np.asarray(rows, np.int64)
+    if planes == 1:
+        return np.where(rows >= 0, 2 * rows, -1)
+    assert planes == 2, planes
+    out = np.stack([2 * rows, 2 * rows + 1], -1)
+    return np.where(rows[..., None] >= 0, out, -1).reshape(*rows.shape[:-1], -1)
 
 
 def column_rows(n: int) -> np.ndarray:

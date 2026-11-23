@@ -34,6 +34,7 @@ const Format kFormats[] = {
     {"IQ2_XS", TileFormat::IQ2_XS, 74},       {"IQ2_S", TileFormat::IQ2_S, 82},
     {"IQ3_S", TileFormat::IQ3_S, 110},
     {"IQ4_NL", TileFormat::IQ4_NL, 144},      {"IQ4_XS", TileFormat::IQ4_XS, 136},
+    {"NVFP4", TileFormat::NVFP4, 144},        {"Q8_0H", TileFormat::Q8_0H, 272},
     {"BFP16/BF16", TileFormat::BFP16_BF16, 512}, {"BFP16/F16", TileFormat::BFP16_F16, 512},
     {"BFP16/F32", TileFormat::BFP16_F32, 1024},
 };
@@ -86,6 +87,8 @@ TEST(TilePack, UsedBytes) {
   EXPECT_EQ(artlite::used_bytes(TileFormat::Q4_K, 8, 4), 144u * 4 * 8);
   EXPECT_EQ(artlite::used_bytes(TileFormat::Q6_K, 8, 4), (2u * 4 * 8 + 31) / 32 * 32 + 208u * 4 * 8);
   EXPECT_EQ(artlite::used_bytes(TileFormat::BFP16_F32, 8, 2), 288u * 2 * 8);
+  EXPECT_EQ(artlite::used_bytes(TileFormat::NVFP4, 16, 4), 144u * 4 * 16);  // (IQ4_NL's tile)
+  EXPECT_EQ(artlite::used_bytes(TileFormat::Q8_0H, 16, 4), 144u * 4 * 16);  // (Q4_0's tile of Q8_0 rows)
   EXPECT_EQ(artlite::used_bytes(TileFormat::IQ4_NL, 8, 2), 144u * 2 * 8);
   EXPECT_EQ(artlite::used_bytes(TileFormat::IQ4_NL, 12, 2), ~size_t(0));  // (R a multiple of 8 only)
   EXPECT_EQ(artlite::used_bytes(TileFormat::IQ3_S, 8, 2), ~size_t(0));    // (R 17 .. 20 only)

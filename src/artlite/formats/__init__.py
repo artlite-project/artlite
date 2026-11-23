@@ -1,13 +1,15 @@
 """Weight tile formats of the GGUF weight images (the decode overlays, the prefill GEMMs): the registry of the format
 slots.
 
-A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1 / Q4_1_64, ``q4k``, ``q5k``, ``q6k``, ``bf16`` BFP16
-(of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0), ``iq1`` (IQ1_S, IQ1_M), ``iq2`` (IQ2_XXS, IQ2_XS, IQ2_S), ``iq3``
-(IQ3_XXS), ``iq3s`` (IQ3_S), ``iq4`` (IQ4_NL, IQ4_XS), ``awq`` (P4_128, P5_128: a ParoQuant checkpoint's linears); ``k23``: their
-shared parts, a slot without formats) holds for its formats the ``TileFormat`` records (tile geometry), the host-side packing (a lossless re-layout of the
-GGUF fields; only fp16 -> bf16 scales change, BFP16 rounds bf16 weights once), the kernel-source fragments of the
-prefill GEMMs (``gemm/<fmt>``: ``gemm_q``, ``gemm_qd``) and of the decode GEMV (``mmv/<fmt>``: ``decode.gemv``, which
-dispatches on ``TileFormat.fid``), and the hooks of both.
+A slot (``common.Slot``, one module per format family: ``q4`` Q4_0 / Q4_1 / Q4_1_64, ``q4k``, ``q5k``, ``q6k``, ``bf16``
+BFP16 (of a BF16 tensor), ``q2k``, ``q3k``, ``q8`` (Q8_0), ``q6h``, ``q8h`` (Q6_K's and Q8_0's high planes: a screened LM
+head's), ``iq1`` (IQ1_S, IQ1_M), ``iq2`` (IQ2_XXS, IQ2_XS, IQ2_S), ``iq3`` (IQ3_XXS), ``iq3s`` (IQ3_S), ``iq4`` (IQ4_NL,
+IQ4_XS), ``nvfp4`` (NVFP4: IQ4_NL's tiles and kernels with 16-k UE4M3 scales), ``awq`` (P4_128, P5_128: a ParoQuant
+checkpoint's linears); ``k23``: their shared parts, a slot without formats) holds for its formats the ``TileFormat``
+records (tile geometry), the host-side packing (a lossless re-layout of the GGUF fields; only fp16 -> bf16 scales change
+(NVFP4's UE4M3 scales: recoded, ``nvfp4``), BFP16 rounds bf16 weights once), the kernel-source fragments of the prefill
+GEMMs (``gemm/<fmt>``: ``gemm_q``, ``gemm_qd``) and of the decode GEMV (``mmv/<fmt>``: ``decode.gemv``, which dispatches
+on ``TileFormat.fid``), and the hooks of both.
 
 Tile: R rows x one K chunk of ``nsb`` super-blocks (256 columns each; the image's chunk: 1024 columns = 4
 super-blocks for Llama and Qwen, 512 for Gemma). Every format stores its integer codes as 32-bit words of 8
@@ -30,7 +32,7 @@ import math
 import numpy as np
 from jinja2 import ChoiceLoader, FunctionLoader, Template
 
-from . import awq, bf16, common, iq1, iq2, iq3, iq3s, iq4, k23, q2k, q3k, q4, q4k, q5k, q6h, q6k, q8
+from . import awq, bf16, common, iq1, iq2, iq3, iq3s, iq4, k23, nvfp4, q2k, q3k, q4, q4k, q5k, q6h, q6k, q8, q8h
 from .common import KC, KT, SB, TAB, TAB_BYTES, DqKernels, Slot, TileFormat
 
 __all__ = ["DERIVED", "FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", "DqKernels", "Slot", "TileFormat", "choose_tile_bytes", "gu_tiles",
@@ -38,7 +40,7 @@ __all__ = ["DERIVED", "FORMATS", "KC", "KT", "SB", "SLOTS", "TAB", "TAB_BYTES", 
 
 # the slots
 SLOTS: tuple[Slot, ...] = (q4.SLOT, bf16.SLOT, q4k.SLOT, q5k.SLOT, q6k.SLOT, k23.SLOT, q2k.SLOT, q3k.SLOT, q8.SLOT,
-                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT, q6h.SLOT, awq.SLOT, awq.SLOT5)
+                           iq1.SLOT, iq2.SLOT, iq3.SLOT, iq3s.SLOT, iq4.SLOT, q6h.SLOT, awq.SLOT, awq.SLOT5, nvfp4.SLOT, q8h.SLOT)
 
 FORMATS: dict[str, TileFormat] = {f.name: f for f in sorted((f for s in SLOTS for f in s.formats), key=lambda f: f.fid)}
 _SLOT_OF = {f.name: s for s in SLOTS for f in s.formats}
@@ -56,7 +58,7 @@ def slot(fmt: str) -> Slot:
 
 
 # the tile formats packed from tensors of another GGUF type (a plane or a compact layout of theirs): their source type
-DERIVED: dict[str, str] = {"Q6_KH": q6h.SOURCE, "Q4_1_64": q4.SOURCE_64}
+DERIVED: dict[str, str] = {"Q6_KH": q6h.SOURCE, "Q8_0H": q8h.SOURCE, "Q4_1_64": q4.SOURCE_64}
 
 
 def tile_format(qtype: str) -> str:
@@ -69,7 +71,7 @@ def tile_format(qtype: str) -> str:
 
 def packs_from(fmt: str, qtype: str) -> bool:
     """Whether tiles of ``fmt`` are packed from tensors of the GGUF type ``qtype``: its own format (``tile_format``), or
-    one derived from it (``DERIVED``: Q6_KH of Q6_K tensors, ``q6h``; Q4_1_64 of Q4_1 tensors in group-64 pairs, ``q4``)."""
+    one derived from it (``DERIVED``: Q6_KH of Q6_K tensors, ``q6h``; Q8_0H of Q8_0 tensors, ``q8h``; Q4_1_64 of Q4_1 tensors in group-64 pairs, ``q4``)."""
     if fmt in DERIVED:
         return qtype == DERIVED[fmt]
     return fmt == "BFP16" if qtype == "F32" else has_tile_format(qtype) and tile_format(qtype) == fmt

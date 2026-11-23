@@ -8,7 +8,8 @@
   summed on the slots' grid whatever the union of the step's experts), also where a step continues from fewer slots than
   the last one ran (rejected drafts);
 - several sequences on one device, alternated and in joint steps: every slot the logits of its sequence alone, bit for
-  bit, with linear caches and with the sliding-window caches as rings, one sequence across the wrap.
+  bit, with linear caches and with the sliding-window caches as rings, one sequence across the wrap;
+- a dense layer's gate / up as Q8_0 tiles of 8 rows (the design's gate / up windows).
 """
 
 import numpy as np
@@ -179,3 +180,51 @@ def test_flint_overlay_sequences(flint: tuple[GGUFFile, FlintConfig], layers: li
             pos[s] += n
         steps += 1
     assert max(len(u) for u in patterns) >= 3, "a step of three sequences"
+
+
+def test_flint_overlay_q8_gate_up(flint: tuple[GGUFFile, FlintConfig], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dense layer whose gate / up are Q8_0 tiles of 8 rows (another file's formats: unsloth's UD-Q4_K_XL; here the
+    official weights requantized in memory, the overlay's format check lifted): the design's gate / up windows
+    (``gu_win``: an 8-row tile holds only gate or only up rows; without them a step never ended) give the reference's
+    logits on the same weights, in steps of 1 .. 4 over 200 positions."""
+    from gguf.quants import Q8_0
+
+    import models.flint.overlay as FO
+    from artlite.gguf_model import QTensor
+    from models.flint.image import FlintImage
+
+    g, cfg = flint
+    names = ("blk.0.ffn_gate.weight", "blk.0.ffn_up.weight")
+    own = {}
+    for n in names:
+        t = g.tensor(n)
+        w = np.asarray(t.dequantize(), np.float32).reshape(t.rows, t.cols)
+        own[n] = QTensor(name=n, qtype="Q8_0", rows=t.rows, cols=t.cols, raw=Q8_0.quantize(w).reshape(t.rows, -1))
+
+    class Image(FlintImage):
+        def _layer(self, L: int) -> None:
+            self._own.update({n: t for n, t in own.items() if n.startswith(f"blk.{L}.")})
+            super()._layer(L)
+
+    class G8:  # (the file with the requantized tensors: the reference's)
+        def __getattr__(self, k: str) -> object:
+            return getattr(g, k)
+
+        def tensor(self, n: str) -> QTensor:
+            return own.get(n) or g.tensor(n)
+
+        def rows(self, n: str, idx: object, cols: int = 0, **kw: object) -> np.ndarray:
+            return np.asarray(own[n].dequantize(), np.float32)[np.asarray(idx)] if n in own else g.rows(n, idx, cols, **kw)
+
+    monkeypatch.setattr(FO, "FORMATS", FO.FORMATS | {"Q8_0"})
+    monkeypatch.setattr(FO.FlintOverlay, "IMAGE", Image)
+    ov = FO.FlintOverlay(g, layers=[0], vocab=VOCAB, max_positions=512)
+    assert ov.image.gu_rows() == {8} and ov.op.gu_win
+    ov.load()
+    n = 200
+    x = g.rows("token_embd.weight", np.asarray(_ids(g, n))).astype(np.float32)
+    h = ref.layer(G8(), cfg, 0, x, np.arange(n), q8=False)["l_out"]
+    _, want = ref.head_logits(G8(), cfg, h, np.arange(VOCAB), q8=False)
+    got = _run(ov, x, STEPS)
+    errs = np.array([rel(got[p], want[p]) for p in range(n)])
+    assert np.median(errs) < TOL / 2 and np.percentile(errs, 95) < TOL, errs

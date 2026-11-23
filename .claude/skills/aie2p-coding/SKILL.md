@@ -314,6 +314,8 @@ Silent wrong results:
 - **A rolled `extract<8>(h)` loop stored wrong lanes** (besides compiling to a switch): unroll lane loops.
 - **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
   (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
+  Of any width, `aie::shuffle_up(v, n)`'s lowest n lanes are not zeros (the shift's other register): `shuffle_up_fill`
+  with a zero vector, or `shuffle_up_rotate` (Q8_0H's centering panels, `formats/q4.mm.cc.jinja`).
 - **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B
   aligned** is accessed 32 B lower (the low address bits dropped): its stores overwrite the 32 B before the buffer
   (sd15's d-80 attention scores 1440 B into the Q object clobbered the queries' last rows). Start such buffers at 64-B

@@ -44,12 +44,12 @@ def codes(q: np.ndarray, R: int, nsb: int) -> np.ndarray:
     return np.ascontiguousarray(b.reshape(G, 8, nsb, 8, 4, 4).transpose(2, 3, 4, 0, 1, 5)).reshape(nsb, -1)
 
 
-def pair_words() -> np.ndarray:
-    """The decode's table (256 uint32 = 1 KB): entry b = [v[b & 15], v[b >> 4]] (int8 pair) at byte 4 b, i.e. per group of
-    16 entries their 32 bytes twice."""
+def pair_words(values: np.ndarray | None = None) -> np.ndarray:
+    """The decode's table (256 uint32 = 1 KB) of 16 int8 values v (default ``IQ4_VALUES``; NVFP4: MXFP4's): entry b =
+    [v[b & 15], v[b >> 4]] (int8 pair) at byte 4 b, i.e. per group of 16 entries their 32 bytes twice."""
     from ..gguf_model import IQ4_VALUES
 
-    v = IQ4_VALUES.view(np.uint8).astype(np.uint16)
+    v = (IQ4_VALUES if values is None else values).view(np.uint8).astype(np.uint16)
     e = v[np.arange(256) & 15] | v[np.arange(256) >> 4] << 8
     return np.concatenate([e.reshape(16, 16)] * 2, 1).reshape(-1).view(np.uint32)
 
@@ -57,21 +57,23 @@ def pair_words() -> np.ndarray:
 TAB_PREFILL = 2048  # (the prefill's table copies)
 
 
-def bf16_pair_words() -> np.ndarray:
-    """The prefill's table (512 uint32 = 2 KB): entry b = [bf16(v[b & 15]), bf16(v[b >> 4])] at byte 8 b, i.e. per group
-    of 8 entries their 32 bytes twice (4x32 gathers)."""
+def bf16_pair_words(values: np.ndarray | None = None) -> np.ndarray:
+    """The prefill's table (512 uint32 = 2 KB) of 16 int8 values v (``pair_words``): entry b = [bf16(v[b & 15]),
+    bf16(v[b >> 4])] at byte 8 b, i.e. per group of 8 entries their 32 bytes twice (4x32 gathers)."""
     from ..gguf_model import IQ4_VALUES
 
-    v = (IQ4_VALUES.astype(np.float32).view(np.uint32) >> 16).astype(np.uint32)
+    v = ((IQ4_VALUES if values is None else values).astype(np.float32).view(np.uint32) >> 16).astype(np.uint32)
     e = v[np.arange(256) & 15] | v[np.arange(256) >> 4] << 16
     return np.concatenate([e.reshape(32, 8)] * 2, 1).reshape(-1)
 
 
-# GemmQd (prefill) on super-block units of whole 16-row tiles
-_GEMM = templating.source("artlite/formats/iq4.gemm.cc.jinja")
+# GemmQd (prefill) on super-block units of whole 16-row tiles (also NVFP4's: ``formats.nvfp4``)
+GEMM = templating.source("artlite/formats/iq4.gemm.cc.jinja")
 
-# the decode GEMV (``decode.gemv``; the 4x16 gathers: ``mmv/g16``, the scaling by d: ``mmv/k23``)
+# the decode GEMV (``decode.gemv``; the 4x16 gathers: ``mmv/g16``, a super-block's weight panels: ``mmv/iq4w``, also
+# NVFP4's; the scaling by d: ``mmv/k23``)
 _MMV = templating.source("artlite/formats/iq4.mmv.cc.jinja")
+_W = templating.source("artlite/formats/iq4.w.cc.jinja")
 
 _NL = templating.source("artlite/formats/iq4.nl.cc.jinja")
 
@@ -101,8 +103,8 @@ class Iq4Slot(Slot):
     def unit_bytes(self, fmt: str, rows: int, nsb: int) -> int:
         return self.format(fmt).unit_bytes(rows)
 
-    sources: ClassVar[dict[str, str]] = {"mmv/iq4": _MMV, "mmv/IQ4_NL": _NL, "mmv/IQ4_XS": _XS, "gemm/IQ4_NL": _GEMM,
-                                         "gemm/IQ4_XS": _GEMM}
+    sources: ClassVar[dict[str, str]] = {"mmv/iq4w": _W, "mmv/iq4": _MMV, "mmv/IQ4_NL": _NL, "mmv/IQ4_XS": _XS,
+                                         "gemm/IQ4_NL": GEMM, "gemm/IQ4_XS": GEMM}
 
     # GemmQd (prefill): super-block units of whole 16-row tiles
 
@@ -136,7 +138,7 @@ class Iq4Slot(Slot):
         return nsb == 4  # (two super-blocks per core)
 
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
-        return ("mmv/k23", "mmv/g16", "mmv/iq4", f"mmv/{fmt}")
+        return ("mmv/k23", "mmv/g16", "mmv/iq4w", "mmv/iq4", f"mmv/{fmt}")
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, object]:
         R = self.format(fmt).rows(tile_bytes, nsb)

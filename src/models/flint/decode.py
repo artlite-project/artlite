@@ -25,7 +25,8 @@ MAX_K = 2048  # (the MoE design's K groups: the hidden size's, ``flint.image``)
 class FlintDecodeOperator(AttentionDecodeOperator):
     """The Flint decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of 1024
     columns (``tile_bytes``); ``attn``: the attention cores' shapes; ``experts``, ``used``: the MoE layers' experts and
-    experts per token; ``paged``: formats whose kernels are code pages."""
+    experts per token; ``paged``: formats whose kernels are code pages; ``gu_win``: gate / up tiles of other than 16 rows
+    (``decode.design``'s windows)."""
 
     PREFIX = "fld"
     CHAIN = 2
@@ -33,8 +34,8 @@ class FlintDecodeOperator(AttentionDecodeOperator):
     PAGES = True  # (the attention cores' ~18.6 KB of kernels: two kinds, 32 rows, the sinks, the chain's merge)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float, attn: Attn, experts: int,
-                 used: int, paged: tuple[str, ...] = (), win: str = ""):
+                 used: int, paged: tuple[str, ...] = (), win: str = "", gu_win: bool = False):
         assert all(gemv.supported(f, 4) for f in rows), rows
         super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4, act="silu",
                          packed=True, tok=True, moe=(experts, used), max_k=MAX_K, gating="sigmoid", shared_gate=False,
-                         paged=paged, win=win)
+                         paged=paged, win=win, gu_win=gu_win)

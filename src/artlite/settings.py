@@ -226,8 +226,9 @@ PACE = _declare(
     "PACE", "string", "auto", "the prefill GEMMs' pace levels: ``auto`` (calibrated per machine and cached), ``off``, "
     "``recalibrate``, or levels (``gu=3,qkv=2``, or one level for every class)", _text("auto"))
 LM_SCREEN = _declare(
-    "LM_SCREEN", "flag", ON, "a Q6_K LM head is screened: the NPU reads its high plane (39% of its bytes), the host "
-    "computes the logits that matter exactly (``decode.screen``; off: the NPU reads the whole head)", _off_when_zero)
+    "LM_SCREEN", "flag", ON, "a Q6_K LM head is screened: the NPU reads its high plane (39% of its bytes; F16 / BF16 "
+    "heads: a Q4_0 plane, 28%; a Q8_0 head where a model asks: its high plane, 53%), the host computes the logits that "
+    "matter exactly (``decode.screen``; off: the NPU reads the whole head)", _off_when_zero)
 LARGE_PAGES = _declare(
     "LARGE_PAGES", "flag", OFF, "Windows: host buffers of 2 MB and more on 2 MB pages (``MEM_LARGE_PAGES``) where the "
     "account holds the \"Lock pages in memory\" right, else 4 KB pages (``artlite-probe --pages`` reports which)",

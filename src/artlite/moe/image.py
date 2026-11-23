@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 from ml_dtypes import bfloat16
 
-from ..decode.image import column_rows, gate_up_rows, group_rows
+from ..decode.image import column_rows, f32_planes, gate_up_rows, group_rows
 from ..gguf_model import QTensor
 from ..operators.design import COLS
 
@@ -52,8 +52,8 @@ class MoeImage:
         R = self.R[self.fmt(b + "ffn_gate_shexp.weight")]
         self._add(layer, "moe_in", [("sgu", (b + "ffn_gate_shexp.weight", b + "ffn_up_shexp.weight"),
                                      gate_up_rows(Fs, R)),
-                                    ("router", planes, np.stack([2 * mine, 2 * mine + 1], -1).reshape(COLS, -1)),
-                                    *([("sgate", planes, np.tile([2 * E, 2 * E + 1], (COLS, 1)))] if gated else [])], H)
+                                    ("router", planes, f32_planes(mine, 2)),
+                                    *([("sgate", planes, f32_planes(np.full((COLS, 1), E), 2))] if gated else [])], H)
         R = self.R[self.fmt(b + "ffn_down_shexp.weight")]
         self._add(layer, "sdown", [("sdown", (b + "ffn_down_shexp.weight",), group_rows(column_rows(H), R, KC // Fs))],
                   Fs, G=KC // Fs)

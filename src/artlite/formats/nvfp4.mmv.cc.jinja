@@ -1,0 +1,119 @@
+{% from "artlite/formats/common.macros.cc.jinja" import table_bases with context %}
+// ---- NVFP4 (formats/nvfp4.py: {{ R4 }} rows, 2 row groups): per super-block a unit [codes [i][s][g][r][4 B] | scale codes
+// [j 16][row] u8]. Core H: super-blocks 2 H, 2 H + 1; per super-block u: its scales (_nv_ss), the weight panels (_iq4_w:
+// mmv/iq4w, MXFP4's value pairs), each x panel against them (_nv_x: the 16-k groups' sums c in place of panels), y +=
+// sum_j c_j d_j (_nv_sc).
+// Scratch: w / c [i 8][s 4][g 2][64 B] (0 .. 4096) | sct [j][row 16] bf16 (4096 .. 4608) | the table's addresses (8000 ..
+// 8008)
+
+// sct [j 16][row 16] = the scale codes' values d (sc: [j][row 16] u8): bf16 of the bits b << 4, times 2^116 (exact)
+__attribute__((noinline)) void {{ p }}_nv_ss(const uint8_t *__restrict sc, bfloat16 *__restrict sct)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> k = aie::broadcast<bfloat16, 32>({{ SCALE_MUL }});
+    AIE_LOOP_UNROLL_FULL
+    for (int u = 0; u < 4; u++) {
+        const aie::vector<uint8, 64> b = aie::load_v<64>(sc + 64 * u);
+        AIE_LOOP_UNROLL_FULL
+        for (int h = 0; h < 2; h++) {
+            const aie::vector<bfloat16, 32> v =
+                aie::upshift(aie::unpack(b.template extract<32>(h)), 4).template cast_to<bfloat16>();
+            aie::store_v(sct + 64 * u + 32 * h, aie::mul(v, k).template to_vector<bfloat16>());
+        }
+    }
+}
+
+// The 2 row groups' 16-k groups of a super-block against xp (its 32 x panels, each popped once): per 32-k group i the
+// chains (h, g) of k-steps 2 h, 2 h + 1 (16-k group j = 2 i + h) and row group g, c (j, g) in place of the chain's
+// panels: bf16(C[hi rows] + C[lo rows]) at panel (i, 2 h, g) (64 B at 512 i + 256 h + 64 g); 8 slots: c = bf16(C), its
+// two halves at panels (i, 2 h, g) and (i, 2 h + 1, g) (a chain's c overwrites only its own panels)
+__attribute__((noinline)) void {{ p }}_nv_x(const uint8_t *__restrict xp, const uint8_t *__restrict w,
+                                            bfloat16 *__restrict c)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BInR<aie_dm_resource::a> xs((const bfp16ebs8 *)xp);
+    const int8_t __aie_dm_resource_b *__restrict pw = (const int8_t __aie_dm_resource_b *)w;
+    bfloat16 *__restrict pc = c;
+    v64bfp16ebs8 W;
+    W.exponent = al::e8(0x85);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 8; i++) {
+        v64accfloat C0, C1, C2, C3;  // (h 0: g 0, 1; h 1: g 0, 1)
+        const v64bfp16ebs8 X0 = xs.pop();
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw);
+        C0 = mul_8x8_8x8T(X0, 1, W, 1);
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 64);
+        C1 = mul_8x8_8x8T(X0, 1, W, 1);
+        const v64bfp16ebs8 X1 = xs.pop();
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 128);
+        C0 = mac_8x8_8x8T(X1, 1, W, 1, C0);
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 192);
+        C1 = mac_8x8_8x8T(X1, 1, W, 1, C1);
+        const v64bfp16ebs8 X2 = xs.pop();
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 256);
+        C2 = mul_8x8_8x8T(X2, 1, W, 1);
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 320);
+        C3 = mul_8x8_8x8T(X2, 1, W, 1);
+        const v64bfp16ebs8 X3 = xs.pop();
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 384);
+        C2 = mac_8x8_8x8T(X3, 1, W, 1, C2);
+        W.mantissa = *(const v64int8 __aie_dm_resource_b *)(pw + 448);
+        C3 = mac_8x8_8x8T(X3, 1, W, 1, C3);
+{% if slots == 8 %}
+{% for k in range(4) %}
+        const aie::vector<bfloat16, 64> c{{ k }} = {{ p }}_c8(C{{ k }});
+        aie::store_v(pc + {{ 128 * (k // 2) + 32 * (k % 2) }}, c{{ k }}.template extract<32>(0));
+        aie::store_v(pc + {{ 128 * (k // 2) + 32 * (k % 2) + 64 }}, c{{ k }}.template extract<32>(1));
+{% endfor %}
+{% else %}
+{% for k in range(4) %}
+        aie::store_v(pc + {{ 128 * (k // 2) + 32 * (k % 2) }}, {{ p }}_sum2(C{{ k }}));
+{% endfor %}
+{% endif %}
+        pw += 512;
+        pc += 256;
+    }
+}
+
+// y[g] += sum over the 16 groups j of c (j, g) sct[j][g][r] for the 2 row groups (c (j, g): bf16 at c + 128 j + 32 g, 8
+// slots: slots 4 .. 7 at + 64; y [g][slot][r]; fp32 sums, the products exact)
+__attribute__((noinline)) void {{ p }}_nv_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
+                                             float *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
+    const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
+    const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
+    AIE_LOOP_UNROLL_FULL
+    for (int j = 0; j < 16; j++) {
+{% if slots == 8 %}
+        const aie::vector<bfloat16, 64> c0 = aie::concat(aie::load_v<32>(pc + 128 * j), aie::load_v<32>(pc + 128 * j + 64));
+        const aie::vector<bfloat16, 64> c1 = aie::concat(aie::load_v<32>(pc + 128 * j + 32), aie::load_v<32>(pc + 128 * j + 96));
+{% else %}
+        const aie::vector<bfloat16, 32> c0 = aie::load_v<32>(pc + 128 * j), c1 = aie::load_v<32>(pc + 128 * j + 32);
+{% endif %}
+        Y0 = aie::mac(Y0, c0, aie::load_v<8>(ps + 16 * j).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(Y1, c1, aie::load_v<8>(ps + 16 * j + 8).template grow_replicate<{{ L }}>());
+    }
+    aie::store_v(y, Y0.template to_vector<float>());
+    aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
+}
+
+// super-blocks 2 H, 2 H + 1 of an NVFP4 tile: y[g][{{ L }}] (rows 8 g ..) += their rows against xp (their 64 panels)
+template <int H>
+__attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
+                                             float *__restrict y, uint8_t *__restrict scr)
+{
+    bfloat16 *sct = (bfloat16 *)(scr + 4096);
+    // (the table copies' addresses through a volatile word: constants at the call would specialize _iq4_w, and the
+    // gathers' memory operands need pointers)
+    {{ table_bases() | indent(4) }}
+    AIE_LOOP_NO_UNROLL
+    for (int u = 0; u < 2; u++) {
+        uint8_t *un = a + {{ 144 * R4 }} * (2 * H + u);
+        {{ p }}_nv_ss(un + {{ 128 * R4 }}, sct);
+        {{ p }}_iq4_w(un, tab_ab, tab_cd, scr);
+        {{ p }}_nv_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
+        {{ p }}_nv_sc((const bfloat16 *)scr, sct, y);
+    }
+}

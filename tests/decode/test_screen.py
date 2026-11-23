@@ -1,8 +1,9 @@
-"""A screened LM head's host side (``artlite.decode.screen``) on a random Q6_K matrix and random F16 / BF16 ones, no NPU:
-the exact rows (``_native.screen_exact``, ``screen_exact_half``) against the dequantized matrix, and from screened
-logits computed as the cores compute them (the high plane's weights, ``formats.q6h``; a half-precision head's Q4_0 plane,
-quantized at load: ``screen.plane_rows``; rounded to bf16) the exact largest logits, the dense row, and
-``models.sampling``'s choices (penalties, a mask) against those of the exact logits."""
+"""A screened LM head's host side (``artlite.decode.screen``) on random Q6_K and Q8_0 matrices and random F16 / BF16
+ones, no NPU: the exact rows (``_native.screen_exact``, ``screen_exact_q8``, ``screen_exact_half``) against the
+dequantized matrix, and from screened logits computed as the cores compute them (the high plane's weights,
+``formats.q6h``, ``formats.q8h``; a half-precision head's Q4_0 plane, quantized at load: ``screen.plane_rows``; rounded
+to bf16) the exact largest logits, the dense row, and ``models.sampling``'s choices (penalties, a mask) against those of
+the exact logits; Inkling's Q8_0 head on llama.cpp's head inputs of an essay."""
 
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.decode import screen as SC
-from artlite.formats import q6h
+from artlite.formats import q6h, q8h
 from artlite.gguf_model import QTensor
 from models.sampling import Penalties, Sampling, argmax, pack_mask, top_logits
 
@@ -47,12 +48,20 @@ def _half_head(qtype: str) -> tuple[SC.Screen, np.ndarray, np.ndarray, dict[str,
     return SC.Screen(_File(t), "output.weight", norm, 1e-6, V), w.astype(np.float64), plane, {}
 
 
-@pytest.fixture(scope="module", params=["Q6_K", "F16", "BF16"])
+@pytest.fixture(scope="module", params=["Q6_K", "Q8_0", "F16", "BF16"])
 def head(request: pytest.FixtureRequest) -> tuple[SC.Screen, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """A screen of a random Q6_K head, its exact weights (V, H) and its high plane's (float64), its fields; of a random
-    F16 / BF16 head, with its Q4_0 plane (``_half_head``)."""
-    if request.param != "Q6_K":
+    """A screen of a random Q6_K or Q8_0 head, its exact weights (V, H) and its high plane's (float64, ``formats.q6h``,
+    ``formats.q8h``), its fields; of a random F16 / BF16 head, with its Q4_0 plane (``_half_head``)."""
+    if request.param in SC.HALF:
         return _half_head(request.param)
+    if request.param == "Q8_0":
+        t = random_tensor("Q8_0", V, H, 7)
+        f = t.fields()
+        hf = q8h.fields(f)
+        w = np.repeat(f["d"].astype(np.float64), 32, 1) * f["q"]
+        plane = np.repeat(hf["d"].astype(np.float64), 32, 1) * (hf["q"] - 7.5)
+        norm = np.random.default_rng(1).uniform(0.5, 2.0, H).astype(np.float32)
+        return SC.Screen(_File(t), "output.weight", norm, 1e-6, V), w, plane, f
     t = random_tensor("Q6_K", V, H, 7)
     f = t.fields()
     a = np.repeat((f["d"][..., None] * f["sc"].astype(np.float64)).reshape(V, -1), 16, 1)
@@ -230,6 +239,15 @@ def test_stats(head: tuple) -> None:
         assert np.allclose(sc.scale, 1 / (1 - rho), rtol=1e-5)
         assert np.allclose(sc.bound, SC.Z * np.sqrt(nv) / (1 - rho), rtol=1e-3)
         return
+    if "sc" not in f:  # (Q8_0: a = d, the largest block's deviation)
+        a2 = np.repeat(f["d"].astype(np.float64) ** 2, 32, 1)
+        wq = f["q"].astype(np.float64)
+        r = (f["q"] & 15) - 7.5
+        rho = (a2 * r * wq).sum(1) / (a2 * wq * wq).sum(1)
+        nv = (a2 * (r - rho[:, None] * wq) ** 2).reshape(V, -1, 32).mean(-1).max(1)
+        assert np.allclose(sc.scale, 1 / (1 - rho), rtol=1e-5)
+        assert np.allclose(sc.bound, SC.Z * np.sqrt(nv) / (1 - rho), rtol=1e-4)
+        return
     a2 = np.repeat((f["d"][..., None] * f["sc"].astype(np.float64)).reshape(V, -1) ** 2, 16, 1)
     wq, r = f["q"].astype(np.float64) - 32, (f["q"] & 15).astype(np.float64) - 8
     rho = (a2 * r * wq).sum(1) / (a2 * wq * wq).sum(1)
@@ -244,3 +262,47 @@ def test_screened_counts_file_formats() -> None:
     assert SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q6_K"})
     assert not SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q8_0"})
     assert SC.screened("F16", {"P4_128"}) and not SC.screened("Q8_0", {"Q4_K"})
+    assert SC.screened("Q8_0", {"NVFP4", "BFP16"}, opt_in=True)  # (a Q8_0 head: where the model asks, Inkling's)
+
+
+def test_inkling_head() -> None:
+    """Inkling's Q8_0 head (its vocabulary's 200058 rows; the Q8_0H plane 53% of the bytes) on llama.cpp's head inputs
+    (``result_norm``) of 512 essay tokens: the estimates of the 1000 largest logits of every token within their bounds (over 5120 tokens:
+    4.0 of the 6 sigma), each token's 20 largest logits the exact ones, the argmax llama.cpp's where its own (fp16)
+    logits' best two are apart."""
+    import torch
+
+    from artlite.gguf_model import GGUFFile
+    from artlite.model_config import inkling_gguf
+
+    from ..common import essays
+    from ..goldens.text import golden
+    from ..llama_cpp import llama_tokenize
+    from ..model_files import require
+
+    path = inkling_gguf()
+    require(path)
+    g = GGUFFile(path)
+    t = g.tensor("output.weight")
+    G = golden(path, llama_tokenize(path, essays())[:512], layers=("g",), names="result_norm", logits="f16")
+    xs, ll = np.array(G["result_norm"], np.float32), np.asarray(G.logits, np.float32)
+    V = ll.shape[1]  # (the vocabulary's rows: 200058 of the head's 201024)
+    sc = SC.Screen(g, "output.weight", np.ones(t.cols, np.float32), 1e-6, V)
+    f = t.fields()
+    hf = q8h.fields(f)
+    W = torch.from_numpy(np.repeat(f["d"], 32, 1) * f["q"].astype(np.float32))[:V]
+    P = torch.from_numpy(np.repeat(hf["d"], 32, 1) * (hf["q"].astype(np.float32) - 7.5))[:V]
+    for c0 in range(0, len(xs), 128):
+        x = torch.from_numpy(xs[c0:c0 + 128])
+        exact, screened = (x @ W.T).numpy(), (x @ P.T).bfloat16().view(torch.int16).numpy().view(bfloat16)
+        for j in range(len(x)):
+            gv, e = xs[c0 + j], exact[j]
+            z = np.abs(screened[j].astype(np.float32) * sc.scale - e) / (sc.bound * np.float32(np.linalg.norm(gv)))
+            largest = np.argpartition(e, -1000)[-1000:]
+            assert z[largest].max() < 1, (c0 + j, float(z[largest].max()) * SC.Z)
+            v, i = sc.top(screened[j], gv, 20)
+            order = np.lexsort((np.arange(V), -e))[:20]
+            m = int((e[order] >= e[order[0]] - SC.WINDOW).sum())
+            assert np.array_equal(i[:m], order[:m]) and np.allclose(v[:m], e[order[:m]], rtol=1e-5), c0 + j
+            best = np.sort(ll[c0 + j])[-2:]
+            assert best[1] - best[0] < 0.05 or i[0] == int(ll[c0 + j].argmax()), c0 + j

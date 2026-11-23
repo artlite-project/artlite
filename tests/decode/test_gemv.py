@@ -9,14 +9,15 @@ import dataclasses
 import numpy as np
 import pytest
 import torch
+from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.decode import gemv
-from artlite.decode.image import pack_rows
-from artlite.formats import DERIVED, FORMATS, pack_tile, q4, q6h, slice_fields, tile_format
-from artlite.gguf_model import IQ4_VALUES, QTensor
+from artlite.decode.image import f32_planes, pack_rows
+from artlite.formats import DERIVED, FORMATS, pack_tile, q4, q6h, q8h, slice_fields, tile_format
+from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES, QTensor
 from artlite.hf_model import open_weights
-from artlite.model_config import checkpoint, flint_gguf, gemma_gguf, llama_gguf, occamy_gguf, swift_gguf
+from artlite.model_config import checkpoint, flint_gguf, gemma_gguf, inkling_gguf, llama_gguf, occamy_gguf, swift_gguf
 from artlite.operators import bfp16
 from artlite.paro import ParoTensor
 
@@ -32,7 +33,8 @@ PACK = [("Q4_0", 9216, 2), ("Q8_0", 9216, 2), ("Q4_K", 9280, 4), ("Q5_K", 9280, 
         ("F16", 9216, 4), ("Q3_K", 9280, 4), ("IQ3_XXS", 9280, 4), ("Q8_0", 9280, 4), ("IQ3_S", 9280, 4),
         ("IQ4_NL", 9280, 4), ("IQ4_XS", 9280, 4), ("IQ4_XS", 4352, 4), ("IQ2_XXS", 9280, 4),
         ("IQ2_XS", 9280, 4), ("IQ2_S", 9280, 4), ("IQ2_S", 9216, 4), ("IQ1_S", 9280, 4), ("IQ1_M", 9280, 4),
-        ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4), ("Q4_1_64", 9216, 4)]
+        ("IQ1_S", 9216, 4), ("Q6_KH", 9280, 4), ("Q4_1_64", 9216, 4), ("NVFP4", 9216, 4), ("NVFP4", 9280, 4),
+        ("Q8_0H", 9216, 4)]
 
 
 @pytest.mark.parametrize(("qtype", "S_BYTES", "NSB"), PACK, ids=[f"{f}-{s}-nsb{n}" for f, s, n in PACK])
@@ -127,6 +129,18 @@ def test_pack_native_planes() -> None:
     assert err.max() < 3e-5, err
 
 
+def test_pack_native_one_plane() -> None:
+    """An F32 tensor of bf16 values as one plane (``f32_planes(rows, 1)``: plane 0 of each row, padding rows): the tiles
+    of the same values as a BF16 tensor."""
+    rng = np.random.default_rng(8)
+    w = (rng.standard_normal((9, 2048)) * np.exp2(rng.integers(-12, 4, (9, 1)))).astype(bfloat16)
+    t = QTensor(name="r", qtype="F32", rows=9, cols=2048, raw=w.astype(np.float32))
+    tb = QTensor(name="r", qtype="BF16", rows=9, cols=2048, raw=w.view(np.uint16))
+    rows = np.concatenate([np.random.default_rng(9).permutation(9), [-1] * 7])
+    assert np.array_equal(pack_rows([t], f32_planes(rows[None], 1)[0], "BFP16", 8, 9216, 2),
+                          pack_rows([tb], rows, "BFP16", 8, 9216, 2))
+
+
 def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
     """(R, K) the tile's weights as the kernels take them: GGUF's formulas with the scales in bf16 (the tiles')."""
     q = f["q"].astype(np.float64) if "q" in f else None
@@ -158,8 +172,13 @@ def _weights(fmt: str, f: dict[str, np.ndarray]) -> np.ndarray:
         v = IQ4_VALUES[f["q"]].astype(np.float64)
         return per(f["d"], 32) * v if fmt == "IQ4_NL" else \
             per(f["d"], 256) * np.repeat(f["ls"].astype(np.float64) - 32, 32, 1) * v
+    if fmt == "NVFP4":  # (d: exact in bf16)
+        return np.repeat(f["d"].astype(np.float64), 16, 1) * MXFP4_VALUES[f["q"]]
     if fmt in ("P4_128", "P5_128"):
         return per(f["s"], 128) * (q - np.repeat(f["z"].astype(np.float64), 128, 1))
+    if fmt == "Q8_0H":  # (Q8_0's fields: its high plane's weights, ``formats.q8h``)
+        h = q8h.fields(f)
+        return per(h["d"], 32) * (h["q"].astype(np.float64) - 7.5)
     if fmt == "Q6_KH":  # (Q6_K's fields: its high plane's weights, ``formats.q6h``)
         h = q6h.fields(f)
         return per(h["d"], 256) * np.repeat(h["sc"].astype(np.float64).reshape(q.shape[0], -1), 16, 1) * ((f["q"] >> 4) - 1.5)
@@ -201,6 +220,10 @@ GEMV = [
     ("Q4_1_64", 9216, 4, ("flint",), "blk.0.attn_q.weight"),
     ("P4_128", 9216, 4, ("paro",), "blk.0.ffn_down.weight"),  # (Qwen3-0.6B-PARO: AWQ codes, integer zeros)
     ("P5_128", 9280, 4, ("paro5",), "blk.0.ffn_down.weight"),  # (Qwen3.8-27B-PARO-int5: 13 rows)
+    ("NVFP4", 9216, 4, ("inkling",), "blk.0.ffn_gate_up_exps.weight"),  # (16 rows: expert 0's gate rows)
+    ("NVFP4", 9280, 4, ("random",), "NVFP4"),  # (every scale byte: subnormals, 0x7F, the sign bit)
+    ("Q8_0H", 9216, 4, ("inkling",), "output.weight"),  # (16 rows: the high plane of a Q8_0 head)
+    ("Q8_0H", 9280, 4, ("random",), "Q8_0"),
 ]
 
 
@@ -209,6 +232,8 @@ def _path(key: tuple[str, ...]) -> str:
         return checkpoint("qwen3-0.6B-paro" if key[0] == "paro" else "qwen3.8-27B-paro-int5")
     if key[0] == "flint":
         return flint_gguf()
+    if key[0] == "inkling":
+        return inkling_gguf()
     if key[0] in ("occamy", "swift"):
         return occamy_gguf() if key[0] == "occamy" else swift_gguf()
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])

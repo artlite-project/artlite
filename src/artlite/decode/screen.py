@@ -42,7 +42,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from .. import _native, settings
-from ..formats import q6h, tile_format
+from ..formats import q6h, q8h, tile_format
 from ..gguf_model import GGUFFile
 
 Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
@@ -54,8 +54,10 @@ IDS = 16384  # the rows a native pass collects (past them: numpy's)
 FILE_FORMATS = 3  # a screened head: in files of this many tile formats at most (``screened``)
 
 
-PLANES = {q6h.SOURCE: "Q6_KH", "F16": "Q4_0", "BF16": "Q4_0"}  # an LM head's GGUF type -> its plane's tile format
+# an LM head's GGUF type -> its plane's tile format
+PLANES = {q6h.SOURCE: "Q6_KH", q8h.SOURCE: "Q8_0H", "F16": "Q4_0", "BF16": "Q4_0"}
 HALF = ("F16", "BF16")  # (heads whose plane the image quantizes at load: ``derived``)
+OPT_IN = (q8h.SOURCE,)  # (heads screened only where a model's image asks: ``screened(opt_in=)``, Inkling's)
 
 
 def screens(qtype: str) -> bool:
@@ -74,12 +76,13 @@ def derived(fmt: str, qtype: str) -> bool:
     return qtype in HALF and fmt == PLANES[qtype]
 
 
-def screened(qtype: str, formats: set[str]) -> bool:
+def screened(qtype: str, formats: set[str], *, opt_in: bool = False) -> bool:
     """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a plane, in
     a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices; the head's own counts, not
     its plane's). Each paged format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its
-    largest page that short with an eighth."""
-    return settings.LM_SCREEN.get() and screens(qtype) and len(formats | {tile_format(qtype)}) <= FILE_FORMATS
+    largest page that short with an eighth. ``OPT_IN`` types (a Q8_0 head) only with ``opt_in``."""
+    return (settings.LM_SCREEN.get() and screens(qtype) and (opt_in or qtype not in OPT_IN)
+            and len(formats | {tile_format(qtype)}) <= FILE_FORMATS)
 
 
 def half_rows(t: object) -> np.ndarray:
@@ -103,6 +106,7 @@ class Screen:
         assert screens(t.qtype) and n <= t.rows, (name, t.qtype, n)
         self.half = t.qtype in HALF  # (a half-precision head: rows of words, bf16 or fp16)
         self.bf16 = t.qtype == "BF16"
+        self.q8 = t.qtype == q8h.SOURCE  # (a Q8_0 head)
         self.raw = half_rows(t) if self.half else t.raw  # (the file's rows: its mapping)
         self.eps, self.n = eps, n
         self._populate: Callable[[], None] | None = lambda: gguf.populate(name)  # (before the first rows: ``exact``)
@@ -111,6 +115,8 @@ class Screen:
         self.scale, self.bound = np.empty(n, np.float32), np.empty(n, np.float32)
         if self.half:
             _native.screen_stats_plane(self.raw, self.bf16, plane_rows(t)[:n], t.cols, self.scale, self.bound)
+        elif self.q8:
+            _native.screen_stats_q8(t.raw, t.cols, self.scale, self.bound)
         else:
             _native.screen_stats(t.raw, t.cols, self.scale, self.bound)
         self.bound *= np.float32(Z)
@@ -131,6 +137,8 @@ class Screen:
         self.rows += len(ids)
         if self.half:
             return _native.screen_exact_half(self.raw, self.bf16, np.ascontiguousarray(ids, np.int32), g)
+        if self.q8:
+            return _native.screen_exact_q8(self.raw, np.ascontiguousarray(ids, np.int32), g)
         return _native.screen_exact(self.raw, np.ascontiguousarray(ids, np.int32), g)
 
     def _above(self, bits: np.ndarray, gnorm: float, thr: float, mask: np.ndarray | None = None) -> np.ndarray:

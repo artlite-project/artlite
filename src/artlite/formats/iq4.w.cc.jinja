@@ -1,0 +1,20 @@
+// ---- A super-block's weight panels of the 4-bit table formats (IQ4_NL, IQ4_XS, NVFP4: formats/iq4.py, nvfp4.py), the
+// codes [i][s][g][r][4 B] by the gather unit through the format's table of the byte values' value pairs
+
+// The 64 weight panels of a super-block (codes [i][s][g][32 B], two panels per 64-byte load) -> wp [i][s][g][64 B]: per
+// panel its 32 bytes' entries (4 b + the copies' bases), 8 gathers
+__attribute__((noinline)) void {{ p }}_iq4_w(const uint8_t *__restrict codes, const uint32_t *__restrict tab_ab,
+                                             const uint32_t *__restrict tab_cd, uint8_t *__restrict wp)
+{
+    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
+    const v64int8 four = broadcast_to_v64int8(4);
+    const v64uint8 __aie_dm_resource_a *__restrict pi = (const v64uint8 __aie_dm_resource_a *)codes;
+    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int t = 0; t < 32; t++) {  // (II 20: the gathers' DM_ADA 17)
+        const v64acc32 q = mul_elem_64_2(*pi++, four);
+        pw[0] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 0), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 1), b16)));
+        pw[1] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 2), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 3), b16)));
+        pw += 2;
+    }
+}

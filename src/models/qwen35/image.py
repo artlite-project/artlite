@@ -221,12 +221,6 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         """The LM row of each token id (``n_ids``,): its fixed or other row (the table's repeat them)."""
         return lm_order(self.head_rows(), self.draft_cols)
 
-    def gu_rows(self) -> set[int]:
-        """The rows per tile of the gate / up phases' tiles: the dense layers' gate_up (a split block's both), an MoE
-        layer's shared expert (moe_in's "sgu") and experts (exp_gu)."""
-        return {R for r in self.regions + self.slabs for b in r.blocks
-                if r.name in ("gate_up", "exp_gu") or (r.name, b.name) == ("moe_in", "sgu") for R in (b.R, b.R2) if R}
-
     def mtp_view(self, cfg: QwenConfig) -> "MtpView":
         """The image of the MTP block's drafter (``cfg``: its config, the block as a layer): ``MtpView``; a DFlash2
         drafter's head (its rows alone)."""
@@ -461,7 +455,7 @@ class MtpView:
     def region(self, layer: int, name: str) -> Region:
         return self._index[(layer, name)]
 
-    gu_rows = QwenImage.gu_rows
+    gu_rows = TileImage.gu_rows
     formats = TileImage.formats
     split = TileImage.split
 

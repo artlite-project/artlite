@@ -208,6 +208,37 @@ void bind_sampling(nb::module_& m) {
       "The exact logits of rows ids of a Q6_K matrix (raw: (rows, row bytes) of its GGUF blocks) against g (cols,) "
       "fp32: artlite::screen_exact.");
   m.def(
+      "screen_stats_q8",
+      [](nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> raw, size_t cols, FloatsOut scale,
+         FloatsOut bound) {
+        const size_t n = scale.shape(0);
+        if (cols % 32 || cols / 32 * 34 > raw.shape(1) || n > raw.shape(0) || bound.shape(0) != n)
+          throw artlite::Error("screen_stats_q8: Q8_0 rows of cols columns, a scale and a bound per row");
+        nb::gil_scoped_release release;
+        artlite::screen_stats_q8(raw.data(), n, raw.shape(1), cols, scale.data(), bound.data());
+      },
+      "raw"_a, "cols"_a, "scale"_a, "bound"_a,
+      nb::sig("def screen_stats_q8(raw: numpy.ndarray[numpy.uint8], cols: int, scale: numpy.ndarray[numpy.float32], "
+              "bound: numpy.ndarray[numpy.float32]) -> None"),
+      "Per row of a Q8_0 matrix (raw: (rows, row bytes) of its GGUF blocks; the first len(scale) rows) what its high "
+      "plane says of its logits (screen_stats'): artlite::screen_stats_q8.");
+  m.def(
+      "screen_exact_q8",
+      [](nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> raw, Ints ids, Floats g) {
+        const size_t rows = raw.shape(0), cols = g.shape(0), m = ids.shape(0);
+        if (cols % 32 || cols / 32 * 34 > raw.shape(1)) throw artlite::Error("screen_exact_q8: g's columns in Q8_0 rows");
+        for (size_t j = 0; j < m; j++)
+          if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact_q8: a row past the matrix");
+        auto out = std::make_unique<float[]>(m);
+        artlite::screen_exact_q8(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        return owned(std::move(out), m);
+      },
+      "raw"_a, "ids"_a, "g"_a,
+      nb::sig("def screen_exact_q8(raw: numpy.ndarray[numpy.uint8], ids: numpy.ndarray[numpy.int32], "
+              "g: numpy.ndarray[numpy.float32]) -> numpy.ndarray[numpy.float32]"),
+      "The exact logits of rows ids of a Q8_0 matrix (raw: (rows, row bytes) of its GGUF blocks) against g (cols,) "
+      "fp32: artlite::screen_exact_q8.");
+  m.def(
       "q4_0_rows",
       [](nb::ndarray<const uint16_t, nb::ndim<2>, nb::device::cpu> raw, bool bf16, size_t cols,
          nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> out, unsigned threads) {

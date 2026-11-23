@@ -419,6 +419,67 @@ void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size
   }
 }
 
+void screen_stats_q8(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* scale, float* bound) {
+  // (a Q8_0 block: fp16 d, 32 int8 codes q = 16 h + l; the plane's part p = 16 h + 7.5, the rest r = l - 7.5)
+  const size_t nb = cols / 32;
+  std::vector<double> d(nb);
+  for (size_t i = 0; i < n; i++) {
+    const uint8_t* row = raw + i * row_bytes;
+    double rw = 0.0, ww = 0.0;
+    for (size_t k = 0; k < nb; k++) {
+      const uint8_t* b = row + 34 * k;
+      uint16_t d16;
+      std::memcpy(&d16, b, 2);
+      d[k] = double(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+      int32_t s_rw = 0, s_ww = 0;  // (twice r: integers)
+      for (int j = 0; j < 32; j++) {
+        const int q = int8_t(b[2 + j]), r2 = 2 * (q & 15) - 15;
+        s_rw += r2 * q;
+        s_ww += q * q;
+      }
+      rw += d[k] * d[k] * 0.5 * s_rw;
+      ww += d[k] * d[k] * s_ww;
+    }
+    const double rho = ww > 0 ? rw / ww : 0.0;
+    double nv = 0.0;  // (the largest block's mean a^2 (r - rho w)^2)
+    for (size_t k = 0; k < nb; k++) {
+      const uint8_t* b = row + 34 * k + 2;
+      double e = 0.0;
+      for (int j = 0; j < 32; j++) {
+        const int q = int8_t(b[j]);
+        const double x = ((q & 15) - 7.5) - rho * q;
+        e += x * x;
+      }
+      nv = std::max(nv, d[k] * d[k] * e / 32.0);
+    }
+    scale[i] = float(1.0 / (1.0 - rho));
+    bound[i] = float(std::sqrt(nv) / (1.0 - rho));
+  }
+}
+
+void screen_exact_q8(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
+                     float* out) {
+  // (a Q8_0 block: fp16 d, 32 int8 codes)
+  for (size_t r = 0; r < m; r++) {
+    const uint8_t* b = raw + size_t(ids[r]) * row_bytes;
+    double total = 0.0;
+    for (size_t k = 0; k < cols; k += 256) {  // (fp32 sums of 256 products, the row's in fp64)
+      __m512 acc = _mm512_setzero_ps();
+      for (size_t j = k; j < std::min(cols, k + 256); j += 32, b += 34) {
+        uint16_t d16;
+        std::memcpy(&d16, b, 2);
+        const __m512 d = _mm512_set1_ps(_mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(d16))));
+        const __m512 q0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 2))));
+        const __m512 q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 18))));
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(q0, d), _mm512_loadu_ps(g + j), acc);
+        acc = _mm512_fmadd_ps(_mm512_mul_ps(q1, d), _mm512_loadu_ps(g + j + 16), acc);
+      }
+      total += double(_mm512_reduce_add_ps(acc));
+    }
+    out[r] = float(total);
+  }
+}
+
 namespace {
 
 // 16 half-precision values as fp32

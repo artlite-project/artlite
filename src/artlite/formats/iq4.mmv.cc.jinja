@@ -1,27 +1,9 @@
 {% from "artlite/formats/common.macros.cc.jinja" import store_chain, table_bases with context %}
 // ---- IQ4_NL / IQ4_XS (formats/iq4.py: {{ R4 }} rows, 2 row groups): per super-block a unit, [codes [i][s][g][r][4 B] |
 // IQ4_NL: d [i][row] bf16 | IQ4_XS: ls low nibbles [i][row], high crumbs [i' 4][row], d [row] bf16]. Core H: super-blocks
-// 2 H, 2 H + 1; per super-block u: the weight panels (_iq4_w), each x panel against them (_iq4_x: the groups' sums c in
-// place of panels (i, 0, g)), y += sum_i c_i S_i (IQ4_XS: S = ls - 32 then hilo times d, _iq4xs_ss / _iq4_sc).
+// 2 H, 2 H + 1; per super-block u: the weight panels (_iq4_w: mmv/iq4w), each x panel against them (_iq4_x: the groups'
+// sums c in place of panels (i, 0, g)), y += sum_i c_i S_i (IQ4_XS: S = ls - 32 then hilo times d, _iq4xs_ss / _iq4_sc).
 // Scratch: w / c [i 8][s 4][g 2][64 B] (0 .. 4096) | sct [i][row 16] bf16 (4096) | the table's addresses (8000 .. 8008)
-
-// The 64 weight panels of a super-block (codes [i][s][g][32 B], two panels per 64-byte load) -> wp [i][s][g][64 B]: per
-// panel its 32 bytes' entries (4 b + the copies' bases), 8 gathers
-__attribute__((noinline)) void {{ p }}_iq4_w(const uint8_t *__restrict codes, const uint32_t *__restrict tab_ab,
-                                             const uint32_t *__restrict tab_cd, uint8_t *__restrict wp)
-{
-    const v16int32 b16 = al::table_b16(tab_ab, tab_cd);
-    const v64int8 four = broadcast_to_v64int8(4);
-    const v64uint8 __aie_dm_resource_a *__restrict pi = (const v64uint8 __aie_dm_resource_a *)codes;
-    v64int8 __aie_dm_resource_c *__restrict pw = (v64int8 __aie_dm_resource_c *)wp;
-    AIE_PREPARE_FOR_POSTPIPELINING
-    for (int t = 0; t < 32; t++) {  // (II 20: the gathers' DM_ADA 17)
-        const v64acc32 q = mul_elem_64_2(*pi++, four);
-        pw[0] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 0), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 1), b16)));
-        pw[1] = (v64int8)concat({{ p }}_g16(add((v16int32)extract_v16acc32(q, 2), b16)), {{ p }}_g16(add((v16int32)extract_v16acc32(q, 3), b16)));
-        pw += 2;
-    }
-}
 
 // The 2 row groups' 32-k groups of a super-block against xp (its 32 x panels, each popped once): c (i, g) = bf16(C[hi
 // rows] + C[lo rows]) of the group's 4 panels, in place of its panel (i, 0, g) (w: [i][s][g][64 B], c: 64 B per (i, g)

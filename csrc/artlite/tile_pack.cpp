@@ -1,5 +1,5 @@
 // The tile packers of ``artlite.formats`` (q4k.py, q5k.py, q6k.py, q6h.py, q4.py, q8.py, q2k.py, q3k.py, iq1.py, iq2.py,
-// iq3.py, iq3s.py, iq4.py, bf16.py:
+// iq3.py, iq3s.py, iq4.py, nvfp4.py, q8h.py, bf16.py:
 // ``pack``) on GGUF blocks (and F32 rows: BFP16 planes), with AVX-512 VBMI / GFNI for the K-quants' code planes. A
 // super-block's 256 codes go out as words of 8 consecutive k (``formats.common._word_order``: [sb][s][i][j] = k 256 sb +
 // 32 i + 8 s + j, two codes per byte, the lower k in the low nibble), so byte 32 s + 4 i + jj of a super-block's
@@ -406,6 +406,42 @@ void tile_q8_0(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
     }
 }
 
+/// Q8_0H (q8h.py: Q8_0's high plane in Q4_0's tile) from Q8_0 blocks: per row [sb][group 8] bf16 16 d, then [sb][row] 128
+/// code bytes in Q4_0's word order (byte 32 s + 4 i + jj: codes 8 s + 2 jj (low nibble), + 1 of group i), code c = (q >>
+/// 4) + 8 of the int8 q (its high nibble, (q as a byte >> 4) ^ 8).
+void tile_q8_0h(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  alignas(64) int32_t lo[16], hi[16];  // (the word transposition [i][s] -> [s][i] of a super-block's 32 code words)
+  for (int j = 0; j < 16; j++) {
+    const int i = j % 8;
+    lo[j] = i < 4 ? 4 * i + j / 8 : 16 + 4 * (i - 4) + j / 8;
+    hi[j] = lo[j] + 2;
+  }
+  const __m512i plo = _mm512_load_si512(lo), phi = _mm512_load_si512(hi);
+  const __m512i m4 = _mm512_set1_epi8(15), x8 = _mm512_set1_epi8(8), w16 = _mm512_set1_epi16(0x1001);
+  uint8_t* codes = t + 16 * nsb * R;
+  for (int r = 0; r < R; r++) {
+    uint8_t* h = t + 16 * nsb * r;
+    for (int sb = 0; sb < nsb; sb++) {
+      const uint8_t* b = src[r] + 272 * sb;
+      __m256i y[4];  // (groups 2 u, 2 u + 1: their code bytes m = 16 i + 4 s + jj)
+      for (int u = 0; u < 4; u++) {
+        const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 68 * u + 2));
+        const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 68 * u + 36));
+        const __m512i x = _mm512_inserti64x4(_mm512_castsi256_si512(a), c, 1);
+        const __m512i n = _mm512_xor_si512(_mm512_and_si512(_mm512_srli_epi16(x, 4), m4), x8);
+        y[u] = _mm512_cvtepi16_epi8(_mm512_maddubs_epi16(n, w16));  // (n0 + 16 n1 per pair)
+        put16(h + 16 * sb + 4 * u, bf16_of(b + 68 * u, false, 16.0f));
+        put16(h + 16 * sb + 4 * u + 2, bf16_of(b + 68 * u + 34, false, 16.0f));
+      }
+      const __m512i z0 = _mm512_inserti64x4(_mm512_castsi256_si512(y[0]), y[1], 1);
+      const __m512i z1 = _mm512_inserti64x4(_mm512_castsi256_si512(y[2]), y[3], 1);
+      uint8_t* c = codes + (size_t(sb) * R + r) * 128;
+      _mm512_storeu_si512(c, _mm512_permutex2var_epi32(z0, plo, z1));
+      _mm512_storeu_si512(c + 64, _mm512_permutex2var_epi32(z0, phi, z1));
+    }
+  }
+}
+
 /// Q4_1 (q4.py): per row [sb][group 8] bf16 d, then m (16 nsb bytes each), then the codes as Q4_0's.
 void tile_q4_1(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   uint8_t* m = t + 16 * nsb * R;
@@ -792,6 +828,74 @@ void tile_iq4(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
   }
 }
 
+/// vpermi2b indices of an NVFP4 super-block's low-nibble planes (bytes 64 half .. 64 half + 63, the word order of
+/// ``low_planes``) from the nibble pairs of its 4 blocks' 128 code bytes side by side: code 32 i + l is nibble (l / 8) % 2
+/// of byte 16 i + 8 (l / 16) + l % 8 (per 16-k group 8 bytes: Q4_0's order), so codes 8 s + 2 jj, + 1 of group i are
+/// nibble s % 2 of bytes 2 m, 2 m + 1, m = 8 i + 4 (s / 2) + jj.
+constexpr Idx nvfp4_planes(int half) {
+  Idx idx{};
+  for (int o = 0; o < 64; o++) {
+    int b = 64 * half + o, s = b >> 5, i = (b >> 2) & 7, jj = b & 3;
+    idx[o] = static_cast<uint8_t>(2 * (8 * i + 4 * (s >> 1) + jj) + (s & 1));
+  }
+  return idx;
+}
+
+constexpr Idx kNvLo = nvfp4_planes(0), kNvHi = nvfp4_planes(1);
+
+/// The scale code of each UE4M3 byte (nvfp4.py ``scale_codes``): 0 for a zero value (0x00, 0x7F: ggml's NaN, 0x80),
+/// else (E + 11) 8 + f for the value d = 2^E (1 + f / 8) of ggml's ``ggml_ue4m3_to_fp32`` (half the UE4M3 value, bit 7
+/// ignored).
+constexpr std::array<uint8_t, 256> nvfp4_scale_codes() {
+  std::array<uint8_t, 256> out{};
+  for (int x = 0; x < 256; x++) {
+    const int e = (x >> 3) & 15, m = x & 7;
+    if (x == 0x7F || (e == 0 && m == 0)) continue;
+    // (d = m 2^-10 for e 0: m = 1 -> 2^-10, m 2, 3 -> 2^-9 (1 + (m - 2) / 2), m 4 .. 7 -> 2^-8 (1 + (m - 4) / 4); else
+    // d = 2^(e - 8) (1 + m / 8))
+    int E, f;
+    if (e > 0) {
+      E = e - 8, f = m;
+    } else if (m == 1) {
+      E = -10, f = 0;
+    } else if (m < 4) {
+      E = -9, f = 4 * (m - 2);
+    } else {
+      E = -8, f = 2 * (m - 4);
+    }
+    out[x] = static_cast<uint8_t>((E + 11) * 8 + f);
+  }
+  return out;
+}
+
+constexpr std::array<uint8_t, 256> kNvScale = nvfp4_scale_codes();
+
+/// NVFP4 (nvfp4.py: IQ4_NL's tile): per super-block a unit: the codes [32-k group i][step s 4][row R] words (byte b of
+/// word (i, s) = codes 8 s + 2 b and 8 s + 2 b + 1 of group i, the lower k in the low nibble), then the scale codes
+/// [16-k group j 16][row] (``kNvScale``). A GGUF block (64 k, 36 B): 4 UE4M3 scales, then per 16-k group 8 code bytes.
+void tile_nvfp4(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
+  const __m512i lo = load_idx(kNvLo), hi = load_idx(kNvHi);
+  const __m512i at0 = word_major_index(0, R), at1 = word_major_index(1, R);
+  const size_t U = 144 * size_t(R);
+  auto codes2 = [](const uint8_t* b) {  // (two blocks' 32 code bytes side by side, as nibble pairs)
+    const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 4));
+    const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 40));
+    return nibble_pairs(_mm512_inserti64x4(_mm512_castsi256_si512(a), c, 1));
+  };
+  for (int sb = 0; sb < nsb; sb++) {
+    uint8_t* u = t + U * sb;
+    uint32_t* c = reinterpret_cast<uint32_t*>(u);
+    uint8_t* hd = u + 128 * size_t(R);
+    for (int r = 0; r < R; r++) {
+      const uint8_t* b = src[r] + 144 * sb;
+      const __m512i x0 = codes2(b), x1 = codes2(b + 72);
+      _mm512_i32scatter_epi32(c + r, at0, _mm512_permutex2var_epi8(x0, lo, x1), 4);
+      _mm512_i32scatter_epi32(c + r, at1, _mm512_permutex2var_epi8(x0, hi, x1), 4);
+      for (int j = 0; j < 16; j++) hd[size_t(j) * R + r] = kNvScale[b[36 * (j / 4) + j % 4]];
+    }
+  }
+}
+
 /// BFP16 (bf16.py) of BF16 or F16 rows: 8 rows of [k8][row][exp, 8 int8] blocks.
 template <bool F16>
 void tile_bfp16(uint8_t* t, const uint8_t* const* src, int R, int nsb) {
@@ -891,6 +995,9 @@ constexpr FormatInfo kFormats[] = {
     {TileFormat::P4_128, "P4_128", 144, true, false, [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; },
      plain<tile_p4>},
     {TileFormat::P5_128, "P5_128", 176, true, false, [](int R, int nsb) { return 176 * size_t(nsb) * R; }, plain<tile_p5>},
+    {TileFormat::NVFP4, "NVFP4", 144, false, false,
+     [](int R, int nsb) { return R % 8 ? ~size_t(0) : 144 * size_t(nsb) * R; }, plain<tile_nvfp4>},
+    {TileFormat::Q8_0H, "Q8_0H", 272, false, false, [](int R, int nsb) { return 144 * size_t(nsb) * R; }, plain<tile_q8_0h>},
     {TileFormat::BFP16_BF16, "BFP16/BF16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },
      plain<tile_bfp16<false>>},
     {TileFormat::BFP16_F16, "BFP16/F16", 512, false, true, [](int R, int nsb) { return 288 * size_t(nsb) * R; },

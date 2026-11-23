@@ -74,6 +74,17 @@ void screen_dense(const uint16_t* x, const float* scale, size_t n, float floor, 
 void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
                   float* out);
 
+/// What the high plane of row i of a Q8_0 matrix (``formats.q8h``; raw: n GGUF rows, row_bytes apart, of cols columns)
+/// says of its logits: with w = q = p + r (p = 16 (q >> 4) + 7.5, r = (q & 15) - 7.5) and a = d, rho = sum a^2 r w / sum
+/// a^2 w^2 and nv the largest of the blocks' mean a^2 (r - rho w)^2 (a row's mean lets Inkling's head inputs put
+/// logits 7.3 sigma off, its largest block 4.0): scale[i] = 1 / (1 - rho), bound[i] = sqrt(nv) / (1 - rho).
+void screen_stats_q8(const uint8_t* raw, size_t n, size_t row_bytes, size_t cols, float* scale, float* bound);
+
+/// The exact logits out[j] = w[ids[j]] . g of m rows of a Q8_0 matrix (raw: its GGUF rows, row_bytes apart; cols a
+/// multiple of 32): w = d q, fp32 sums of 256 products, the row's in fp64.
+void screen_exact_q8(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
+                     float* out);
+
 /// A screened F16 / BF16 head (``artlite.decode.screen``): its plane as Q4_0 rows (out: n rows of cols / 32 GGUF blocks
 /// of 18 B, llama.cpp's quantizer: d = the block's extreme / -8, q = min(15, int(x / d + 8.5))) of n rows of cols
 /// values (x: half-precision words, ``bf16`` or fp16, rows ``stride`` words apart), on ``threads`` threads (0: half the

@@ -614,6 +614,15 @@ def tensor_f32(gguf: GGUFFile, name: str) -> np.ndarray:
     return np.asarray(gguf.tensor(name).raw, np.float32).reshape(-1).copy()
 
 
+def bf16_exact(t: QTensor) -> bool:
+    """Whether every value of a tensor is a bf16 value (BF16; an F32 tensor whose words' low halves are all zero:
+    Inkling's controllers, routers, conv taps, bias tables, F32 in the file and BF16 in the checkpoint), so that its
+    tiles are a BF16 tensor's (one BFP16 plane: ``decode.image.f32_planes``)."""
+    if t.qtype == "BF16":
+        return True
+    return t.qtype == "F32" and not (np.ascontiguousarray(t.raw).view(np.uint32) & 0xFFFF).any()
+
+
 def bpe_tokenizer_json(gguf: GGUFFile, pattern: str | None, *, ignore_merges: bool = False,
                        special: bool = True) -> bytes:
     """A Hugging Face tokenizer.json of a GGUF byte-level BPE vocabulary (``tokenizer.ggml.model == "gpt2"``), for

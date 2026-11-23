@@ -31,9 +31,9 @@ from artlite.decode.gemv import (
 from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
 from artlite.decode.protocol import C_LEN, F_EMITR, F_GU, F_MSG
-from artlite.formats import FORMATS, TAB, q6h, slice_fields, slot
+from artlite.formats import FORMATS, TAB, q6h, q8h, slice_fields, slot
 from artlite.formats.common import table_copies
-from artlite.gguf_model import IQ4_VALUES
+from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES
 from artlite.operators import bfp16
 from artlite.operators.base import ArgSpec, ArtcOperator
 from artlite.operators.bfp16 import blocks
@@ -211,6 +211,16 @@ def _q4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     Mhl = Mh.astype(np.float64) + bfp16.values((M - Mh).astype(np.float32))
     o = x.xs32 @ Mhl.T  # (8, R)
     return y + x.fold(o)
+
+
+def _q8h(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (Q8_0's high plane, ``formats.q8h``: Q4_0's arithmetic on the codes c = (q >> 4) + 8 with d' = 16 d, centered at 7.5
+    # by the 32-k sum panels' rows: sum c X_a - 7.5 XS_a)
+    f = q8h.fields(f)
+    q = f["q"].astype(np.float64)
+    R, K = q.shape
+    C = np.einsum("ask,rsk->asr", x.X.reshape(8, K // 32, 32), q.reshape(R, K // 32, 32)) - 7.5 * x.xs32[..., None]
+    return (x.csum(C) * _bf64(f["d"]).reshape(R, K // 32).T[None]).sum(1)
 
 
 def _p4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
@@ -396,6 +406,15 @@ def _iq4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     return (_hilo(Y) * _bf64(f["d"]).reshape(R, nsb).T[None]).sum(1)
 
 
+def _nvfp4(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
+    # (w = d v[q], d per 16-k group (exact in bf16: ``formats.nvfp4``): per 16-k group c = bf16(sum v X_a), y += sum c d
+    # (the products exact); sums in fp32)
+    v = MXFP4_VALUES[f["q"]].astype(np.float64)
+    R, K = v.shape
+    c = x.csum(np.einsum("ask,rsk->asr", x.X.reshape(8, K // 16, 16), v.reshape(R, K // 16, 16)))  # (slots, K / 16, R)
+    return (c * f["d"].astype(np.float64).reshape(R, K // 16).T[None]).sum(1)
+
+
 def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
     w = f["w"]  # (a BF16 tensor's bit patterns or an F16 tensor's values)
     w = w.astype(np.float32) if w.dtype == np.float16 else \
@@ -406,12 +425,13 @@ def _bfp16(fmt: str, f: dict[str, np.ndarray], x: MmvX) -> np.ndarray:
 
 _REFS = {"Q4_0": _q4, "Q4_1": _q4, "Q4_1_64": _q4, "Q8_0": _q8, "Q4_K": _q4k, "Q5_K": _q5k, "Q6_K": _q6k, "Q2_K": _q2k, "Q3_K": _q3k,
          "IQ1_S": _iq1, "IQ1_M": _iq1, "IQ2_XXS": _iq2, "IQ2_XS": _iq2, "IQ2_S": _iq2, "IQ3_XXS": _iq3, "IQ3_S": _iq3s, "IQ4_NL": _iq4, "IQ4_XS": _iq4,
-         "BFP16": _bfp16, "Q6_KH": _q6h, "P4_128": _p4, "P5_128": _p4}
+         "NVFP4": _nvfp4, "BFP16": _bfp16, "Q6_KH": _q6h, "Q8_0H": _q8h, "P4_128": _p4, "P5_128": _p4}
 
 
 # (the formats with kernels of 8 slots)
 GEMV8_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS",
-                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BFP16", "Q6_KH", "P4_128", "P5_128")
+                 "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "NVFP4", "BFP16", "Q6_KH", "Q8_0H", "P4_128",
+                 "P5_128")
 
 
 def ref_tile(fmt: str, f: dict[str, np.ndarray], x: np.ndarray, slots: int = SLOTS) -> np.ndarray:

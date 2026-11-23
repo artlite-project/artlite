@@ -7,12 +7,14 @@ import gguf
 import numpy as np
 import pytest
 from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4
+from ml_dtypes import bfloat16
 
 from artlite import _native
 from artlite.formats import FORMATS
-from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES, UE4M3_HALF, GGUFFile
-from artlite.model_config import qwen_mtp_of
+from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES, UE4M3_HALF, GGUFFile, QTensor, bf16_exact
+from artlite.model_config import inkling_gguf, qwen_mtp_of
 
+from .model_files import require
 from .tensors import random_tensor
 
 
@@ -124,6 +126,28 @@ def test_nvfp4_dequantize() -> None:
     assert f["q"].max() <= 15 and len(np.unique(f["sc"])) == 256
     assert np.array_equal(f["d"], UE4M3_HALF[f["sc"]]) and UE4M3_HALF[0x7F] == 0 and UE4M3_HALF[0xFF] == 240
     assert np.array_equal(w, (f["d"][..., None] * MXFP4_VALUES[f["q"]].reshape(t.rows, -1, 16)).reshape(w.shape))
+
+
+# Inkling's F32 tensors of values that are not bf16 (fp32 in the checkpoint too): the depth-mix and message queries, the
+# router's correction bias, NVFP4's expert scales
+INKLING_FP32 = ("res_query.weight", "loop_msg_query.weight", "exp_probs_b.bias", "_exps.scale")
+
+
+def test_bf16_exact() -> None:
+    """``bf16_exact``: an F32 tensor of bf16 values (random ones rounded), not one with a bit below them; on Inkling's
+    file every F32 tensor but the fp32 ones (the controllers, routers, conv taps, bias tables, clip scales, norms: as BF16
+    tensors in the checkpoint)."""
+    w = np.random.default_rng(0).standard_normal((8, 256)).astype(np.float32)
+    b = w.astype(bfloat16).astype(np.float32)
+    assert bf16_exact(QTensor(name="b", qtype="F32", rows=8, cols=256, raw=b))
+    b[3, 7] = np.nextafter(b[3, 7], np.float32(np.inf))
+    assert not bf16_exact(QTensor(name="w", qtype="F32", rows=8, cols=256, raw=b))
+    path = inkling_gguf()
+    require(path)
+    g = GGUFFile(path)
+    names = [n for n, (_, qtype, _, _) in g.tensor_info.items() if qtype == "F32"]
+    got = {n for n in names if bf16_exact(g.tensor(n))}
+    assert got == {n for n in names if not n.endswith(INKLING_FP32)}, sorted(set(names) - got)[:8]
 
 
 @pytest.mark.parametrize("qtype", ["BF16", "F16", "Q4_0", "Q4_1", "Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ4_NL",

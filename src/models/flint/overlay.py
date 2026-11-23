@@ -114,8 +114,8 @@ class FlintOverlay(AttentionOverlay):
         if missing:
             raise NotImplementedError(f"{', '.join(missing)} tiles: the decode GEMV has no kernels for them")
         other = sorted(fmts - FORMATS)
-        if other:  # (unsloth's UD-Q4_K_XL: a layer step on its Q8_0 tiles of 8 rows does not end; its 6 formats need the
-            # main cores' kernels as pages beside the attention cores' own)
+        if other:  # (unsloth's UD-Q4_K_XL: its 6 formats need the main cores' kernels as pages beside the attention
+            # cores' own)
             raise NotImplementedError(f"{gguf.path}: {', '.join(other)} tiles: Flint runs the official int4 file "
                                       f"(model_config.flint_gguf(); its Q4_1 pairs as Q4_1_64), not yet other files")
         self.hd, self.nh = cfg.head_dim, cfg.q_per_kv
@@ -124,7 +124,8 @@ class FlintOverlay(AttentionOverlay):
                             kp=self.kp, qk_norm=True, qk_weights=True, eps=cfg.rms_norm_eps, a_bytes=self.T, sinks=True,
                             moe=True)
         self.op = FlintDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
-                                      eps=cfg.rms_norm_eps, attn=at, experts=cfg.n_experts, used=cfg.n_experts_used)
+                                      eps=cfg.rms_norm_eps, attn=at, experts=cfg.n_experts, used=cfg.n_experts_used,
+                                      gu_win=bool(img.gu_rows() - {16}))
         self.pg = at.pg[self.hd]  # positions per cache group
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)  # (groups before a sliding-window cache's first one)
         full = -(-max_positions // self.pg)

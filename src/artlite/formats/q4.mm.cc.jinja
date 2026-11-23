@@ -1,8 +1,9 @@
 {% from "artlite/formats/common.macros.cc.jinja" import store_chain with context %}
 // ---- Q4_0 / Q4_1: c_g,sb,i = bf16(C[hi rows] + C[lo rows]) -> c [sb][i][g][32]; C = -8 XS_i + sum_s X(sb, i, s)
 // W_g(sb, s, i) (the codes centered) of NS super-blocks, w [sb][g][i][s][32 B] (each super-block ADV + 1024 B after the
-// last)
-template <int NS, int ADV>
+// last). ZM, ZE: the centering panels' mantissa and exponent (-8: the -8 e_i panels of _nz; Q8_0H's -7.5 = -15 2^(0x84 -
+// 133): built in registers, no table a page would need resident, formats/q8h.py)
+template <int NS, int ADV, int ZM = -8, int ZE = 0x85>
 __attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, const uint8_t *__restrict xsum,
                                               const uint8_t *__restrict w, bfloat16 *__restrict c)
 {
@@ -24,11 +25,21 @@ __attribute__((noinline)) void {{ p }}_q40_mm(const uint8_t *__restrict xp, cons
         if (sb & 1)
             Z = xz.pop();
 {% endif %}
-        const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
+        [[maybe_unused]] const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
+        // (else: ZM at column 0 of every row, moved a column on per group)
+        [[maybe_unused]] aie::vector<int8, 64> nm = aie::select(aie::zeros<int8, 64>(), aie::broadcast<int8, 64>(ZM),
+                                                                aie::mask<64>::from_uint64(0x0101010101010101ull));
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int i = 0; i < 8; i++) {
-            const v64bfp16ebs8 N = {{ p }}_np(pn);
-            pn += 64;
+            v64bfp16ebs8 N;
+            if constexpr (ZM == -8 && ZE == 0x85) {
+                N = {{ p }}_np(pn);
+                pn += 64;
+            } else {
+                N.mantissa = nm;
+                N.exponent = al::e8(ZE);
+                nm = aie::shuffle_up_rotate(nm, 1);  // (shuffle_up's lowest lanes are not zeros)
+            }
             const v64bfp16ebs8 x0 = xs.pop(), x1 = xs.pop(), x2 = xs.pop(), x3 = xs.pop();
 {% if slots == 8 %}
             v64accfloat C0 = mac_8x8_8x8T(ZL, 1, N, 1, mul_8x8_8x8T(Z, 1, N, 1));
