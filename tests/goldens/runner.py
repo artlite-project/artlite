@@ -29,10 +29,9 @@ def build_tool(name: str, src: str, *, mtmd: bool = False) -> str:
         os.makedirs(CACHE_DIR, exist_ok=True)
         bindir = os.path.dirname(llama_cpp_bin("libllama.so"))
         tmp = f"{path}.{os.getpid()}.tmp"
-        cmd = ["g++", "-O2", "-std=c++17"]
+        cmd = ["g++", "-O2", "-std=c++17", "-Wno-deprecated-declarations"]
         if mtmd:
-            cmd += ["-Wno-deprecated-declarations", f"-I{LLAMA_CPP_DIR}/include", f"-I{LLAMA_CPP_DIR}/ggml/include",
-                    f"-I{LLAMA_CPP_DIR}/tools/mtmd"]
+            cmd += [f"-I{LLAMA_CPP_DIR}/include", f"-I{LLAMA_CPP_DIR}/ggml/include", f"-I{LLAMA_CPP_DIR}/tools/mtmd"]
         else:
             cmd += [f"-I{LLAMA_CPP_DIR}/include", f"-I{LLAMA_CPP_DIR}/src", f"-I{LLAMA_CPP_DIR}/ggml/include"]
         cmd += [src, "-o", tmp, f"-L{bindir}", *(["-lmtmd"] if mtmd else []), "-lllama", "-lggml", "-lggml-base",

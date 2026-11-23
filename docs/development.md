@@ -18,10 +18,11 @@ GitHub runs `ruff check` on each push to `main` and each pull request; the tests
 machine. The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The
 tests need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the
 background while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay
-corpus (`python tests/datasets/fetch_datasets.py`); the Qwen reference tests need a llama.cpp CPU build
-(`ARTLITE_LLAMA_CPP_DIR`) and skip without one. Their references (llama.cpp's runs, the CPU models' logits) are cached
-in `tests/refs/` (gitignored), keyed by their inputs; a new llama.cpp build or reference source replaces an entry's
-older version. An entry no test reads any more stays until deleted; a read marks it used, so
+corpus (`python tests/datasets/fetch_datasets.py`); the reference tests need a llama.cpp CPU build
+(`ARTLITE_LLAMA_CPP_DIR`; Inkling 2's: one with `inkling2_loop`, master of 2026-11-22 on) and skip without one. Their
+references (llama.cpp's runs, the CPU models' logits) are cached in `tests/refs/` (gitignored), keyed by their inputs;
+a new llama.cpp build or reference source replaces an entry's older version. An entry no test reads any more stays
+until deleted; a read marks it used, so
 `find tests/refs -mindepth 2 -maxdepth 2 -mtime +30 -exec rm -rf {} +` removes those unused for 30 days.
 
 The C++ runtime's tests (gtest: `tests/csrc/npu_test.cpp` on the NPU, the other files host-only) build in their own tree, with the venv active (`build/` belongs
@@ -83,7 +84,7 @@ table is the registry's (`tests/test_settings.py` compares it).
 | variable | effect | default |
 |---|---|---|
 | `ARTLITE_MODELS_DIR` | the models directory. Read at import. | ~/.artlite/models |
-| `ARTLITE_LLAMA_CPP_DIR` | the llama.cpp build the Qwen reference tests load. Read at import. | /src/llama.cpp |
+| `ARTLITE_LLAMA_CPP_DIR` | the llama.cpp CPU build the reference tests load. Read at import. | /src/llama.cpp |
 | `ARTLITE_CACHE_DIR` | the build cache. Read at import. | ~/.cache/artlite |
 | `ARTLITE_BACKEND` | the NPU backend: `xdna` (the amdxdna driver) or `xrt` (XRT). Read at import. | the platform's own (xdna on Linux, xrt on Windows) |
 | `ARTLITE_COMPILE_JOBS` | concurrent design builds (1: serial). | the CPU count |

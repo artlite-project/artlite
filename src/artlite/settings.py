@@ -175,7 +175,7 @@ MODELS_DIR = _declare(
     _home_path(".artlite", "models"), read="import",
     why="``model_config.MODELS_DIR`` is a constant of the models' paths")
 LLAMA_CPP_DIR = _declare(
-    "LLAMA_CPP_DIR", "path", "/src/llama.cpp", "the llama.cpp build the Qwen reference tests load",
+    "LLAMA_CPP_DIR", "path", "/src/llama.cpp", "the llama.cpp CPU build the reference tests load",
     _text("/src/llama.cpp"), read="import", why="``model_config.LLAMA_CPP_DIR`` is a constant")
 CACHE_DIR = _declare(
     "CACHE_DIR", "path", "~/.cache/artlite", "the build cache",
