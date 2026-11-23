@@ -1,0 +1,413 @@
+{
+ "transformers": "5.24.0",
+ "cases": {
+  "basic": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {},
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "no_system": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {},
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_none": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "none"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_minimal": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "minimal"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_low": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "low"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_medium": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "medium"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_high": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "high"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_xhigh": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "xhigh"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_max": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "max"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_ low ": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": " low "
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_float": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": 0.5
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "effort_zero": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": 0.0
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|>"
+  },
+  "thought_kept": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Factorize x^2 + x - 6 = 0"
+    },
+    {
+     "role": "assistant",
+     "content": "(x + 3)(x - 2)",
+     "reasoning_content": "Roots -3 and 2."
+    },
+    {
+     "role": "user",
+     "content": "And x^2 - 1?"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "high"
+   },
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Factorize x^2 + x - 6 = 0<|end_message|><|message_model|><|content_thinking|>Roots -3 and 2.<|end_message|><|message_model|><|content_text|>(x + 3)(x - 2)<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And x^2 - 1?<|end_message|>"
+  },
+  "tools": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Zürich?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "The user wants the weather.",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "units": "C",
+         "city": "Zürich",
+         "Days": [
+          1,
+          2
+         ],
+         "opts": {
+          "b": true,
+          "a": null
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "sunny, 21 C"
+    },
+    {
+     "role": "assistant",
+     "content": "Sunny, 21 C."
+    },
+    {
+     "role": "user",
+     "content": "Search for umbrellas"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": {
+         "q": "umbrellas"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "name": "search",
+     "content": "[]"
+    },
+    {
+     "role": "tool",
+     "name": "get_weather",
+     "content": "rain"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "units": {
+         "enum": [
+          "C",
+          "F"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "variables": {
+    "reasoning_effort": "low"
+   },
+   "text": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather in a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"units\":{\"enum\":[\"C\",\"F\"]}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>The user wants the weather.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"Days\":[1,2],\"city\":\"Zürich\",\"opts\":{\"b\":true,\"a\":null},\"units\":\"C\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny, 21 C<|end_message|><|message_model|><|content_text|>Sunny, 21 C.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Search for umbrellas<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"q\":\"umbrellas\"}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>search<|content_text|>[]<|end_message|><|message_tool|>get_weather<|content_text|>rain<|end_message|>"
+  },
+  "images": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "What is this?"
+      },
+      {
+       "type": "image"
+      },
+      {
+       "type": "text",
+       "text": "And this one?"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "x.png"
+       }
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "variables": {},
+   "text": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is this?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>And this one?<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>"
+  },
+  "parts": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "a"
+      },
+      "b",
+      {
+       "type": "input_text",
+       "text": "c"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "d"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "e"
+    }
+   ],
+   "tools": null,
+   "variables": {
+    "reasoning_effort": "none"
+   },
+   "text": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|><|message_user|><|content_text|>c<|end_message|><|message_model|><|content_text|>d<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>e<|end_message|>"
+  }
+ }
+}

@@ -1,16 +1,16 @@
-"""GGUF files on the host (``artlite.gguf_model``, ``artlite.model_config``): the IQ formats' fields and weights against
-gguf-py, the native row dequantization against ``QTensor.dequantize``, the drafter files' names."""
+"""GGUF files on the host (``artlite.gguf_model``, ``artlite.model_config``): the IQ formats' and NVFP4's fields and
+weights against gguf-py, the native row dequantization against ``QTensor.dequantize``, the drafter files' names."""
 
 from pathlib import Path
 
 import gguf
 import numpy as np
 import pytest
-from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS
+from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, NVFP4
 
 from artlite import _native
 from artlite.formats import FORMATS
-from artlite.gguf_model import IQ4_VALUES, GGUFFile
+from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES, UE4M3_HALF, GGUFFile
 from artlite.model_config import qwen_mtp_of
 
 from .tensors import random_tensor
@@ -113,8 +113,21 @@ def test_iq_dequantize(qtype: str) -> None:
         assert np.array_equal(w, (s[..., None] * IQ4_VALUES[f["q"]].reshape(t.rows, -1, 32)).reshape(w.shape))
 
 
+def test_nvfp4_dequantize() -> None:
+    """NVFP4 weights bit-identical to gguf-py's on random blocks (every UE4M3 scale byte: subnormals, 0x7F as 0, the
+    sign bit ignored; every code), their fields consistent: the codes' values times the scales."""
+    t = random_tensor("NVFP4", 64, 2048, 0)
+    w = t.dequantize()
+    ref = NVFP4.dequantize_rows(np.ascontiguousarray(t.raw)).reshape(t.rows, t.cols).astype(np.float32)
+    assert np.array_equal(w.view(np.uint32), ref.view(np.uint32))
+    f = t.fields()
+    assert f["q"].max() <= 15 and len(np.unique(f["sc"])) == 256
+    assert np.array_equal(f["d"], UE4M3_HALF[f["sc"]]) and UE4M3_HALF[0x7F] == 0 and UE4M3_HALF[0xFF] == 240
+    assert np.array_equal(w, (f["d"][..., None] * MXFP4_VALUES[f["q"]].reshape(t.rows, -1, 16)).reshape(w.shape))
+
+
 @pytest.mark.parametrize("qtype", ["BF16", "F16", "Q4_0", "Q4_1", "Q8_0", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ4_NL",
-                                   "IQ4_XS"])
+                                   "IQ4_XS", "NVFP4"])
 def test_dequant_rows(qtype: str) -> None:
     """The native rows (``_native.dequant_rows``: an embedding lookup) bit-identical to ``QTensor.dequantize``."""
     assert _native.dequant_supported(qtype)

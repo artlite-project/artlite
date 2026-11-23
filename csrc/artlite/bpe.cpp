@@ -141,6 +141,65 @@ std::vector<uint32_t> pretokenize_flint(const uint32_t* cp, const uint8_t* cls, 
   return lengths(p);
 }
 
+std::vector<uint32_t> pretokenize_gpt4o(const uint32_t* cp, const uint8_t* cls, size_t n) {
+  if (!n) return {};
+  auto num = [&](size_t i) { return cls[i] == PC_N; };
+  auto ws = [&](size_t i) { return cls[i] == PC_WS; };
+  auto nl = [&](size_t i) { return cp[i] == '\r' || cp[i] == '\n'; };
+  auto lm = [&](size_t i) { return cls[i] == PC_L || cls[i] == PC_M; };
+  // (?=[\p{L}\p{M}])([^a-z]) and (?=[\p{L}\p{M}])([^A-Z]): a letter or mark that is not ASCII lowercase / uppercase
+  auto up = [&](size_t i) { return lm(i) && !(cp[i] >= 'a' && cp[i] <= 'z'); };
+  auto lo = [&](size_t i) { return lm(i) && !(cp[i] >= 'A' && cp[i] <= 'Z'); };
+  // [^\r\n\p{L}\p{N}] (a mark too: \p{M} is no \p{L}) and [^\s\p{L}\p{N}]
+  auto pre = [&](size_t i) { return !nl(i) && cls[i] != PC_L && !num(i); };
+  auto other = [&](size_t i) { return !ws(i) && cls[i] != PC_L && !num(i); };
+  auto contraction = [&](size_t i, size_t e) -> size_t {  // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+    if (i + 1 >= e || cp[i] != '\'') return 0;
+    auto lower = [&](size_t k) { return k < e && cp[k] < 0x80 ? char(cp[k] | 0x20) : '\0'; };
+    const char a = lower(i + 1), b = lower(i + 2);
+    if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+    if ((a == 'r' || a == 'v') && b == 'e') return 3;
+    if (a == 'l' && b == 'l') return 3;
+    return 0;
+  };
+  // up* lo+ from j, std::regex's backtracking: the longest run of up whose next character starts a run of lo, else
+  // shorter; the end of that lo run, 0 if none
+  auto upper_lower = [&](size_t j, size_t e) -> size_t {
+    const size_t m = run(j, e, up);
+    for (size_t u = m;; u--) {
+      if (u < e && lo(u)) return run(u, e, lo);
+      if (u == j) return 0;
+    }
+  };
+  Pieces p{{0, n}};
+  p = split(p, [&](size_t i, size_t e) -> size_t {
+    for (const size_t j : {i + 1, i}) {  // up* lo+, with the optional character, then without it
+      if (j == i + 1 && !(pre(i) && j < e)) continue;
+      if (const size_t k = upper_lower(j, e)) return k - i + contraction(k, e);
+    }
+    for (const size_t j : {i + 1, i}) {  // up+ lo*
+      if (j == i + 1 && !(pre(i) && j < e)) continue;
+      if (j < e && up(j)) {
+        const size_t k = run(run(j, e, up), e, lo);
+        return k - i + contraction(k, e);
+      }
+    }
+    if (num(i)) return std::min<size_t>(run(i, e, num) - i, 3);
+    if (other(i) || (cp[i] == ' ' && i + 1 < e && other(i + 1))) {
+      const size_t j = run(i + (cp[i] == ' ' ? 1 : 0), e, other);
+      return run(j, e, [&](size_t k) { return nl(k) || cp[k] == '/'; }) - i;
+    }
+    if (ws(i)) {
+      const size_t j = run(i, e, ws);
+      for (size_t k = j; k > i; k--)  // \s*[\r\n]+: to the run's last line break
+        if (nl(k - 1)) return k - i;
+      return j == e || j - i == 1 ? j - i : j - i - 1;  // \s+(?!\S), else \s+
+    }
+    return 0;
+  });
+  return lengths(p);
+}
+
 namespace {
 
 // GPT-2's bytes_to_unicode: a byte's character in the vocabulary's strings, as UTF-8
@@ -182,12 +241,14 @@ void utf8(uint32_t c, std::vector<uint8_t>& out) {
 
 }  // namespace
 
-BpeEncoder::BpeEncoder(const std::vector<std::string>& tokens, const std::vector<std::string>& merges) {
+BpeEncoder::BpeEncoder(const std::vector<std::string>& tokens, const std::vector<std::string>& merges,
+                       bool ignore_merges) {
   std::unordered_map<std::string, int32_t> id;
   id.reserve(tokens.size());
   for (size_t i = 0; i < tokens.size(); i++) id.emplace(tokens[i], int32_t(i));
   for (int b = 0; b < 256; b++) {
-    auto it = id.find(byte_char(b));  // (bytes no UTF-8 text holds, 0xC0, 0xC1, 0xF5 ..: maybe none)
+    byte_char_[b] = byte_char(b);
+    auto it = id.find(byte_char_[b]);  // (bytes no UTF-8 text holds, 0xC0, 0xC1, 0xF5 ..: maybe none)
     byte_id_[b] = it == id.end() ? -1 : it->second;
   }
   merges_.reserve(merges.size());
@@ -199,6 +260,7 @@ BpeEncoder::BpeEncoder(const std::vector<std::string>& tokens, const std::vector
     if (a == id.end() || b == id.end() || ab == id.end()) throw Error("BpeEncoder: merge '" + m + "' of non-tokens");
     merges_.emplace(uint64_t(uint32_t(a->second)) << 32 | uint32_t(b->second), uint64_t(r) << 32 | uint32_t(ab->second));
   }
+  if (ignore_merges) words_ = std::move(id);
 }
 
 std::vector<int32_t> BpeEncoder::encode(const uint32_t* cp, size_t n, const uint32_t* lens, size_t n_pieces) const {
@@ -222,6 +284,14 @@ std::vector<int32_t> BpeEncoder::encode(const uint32_t* cp, size_t n, const uint
     bytes.clear();
     for (size_t i = at; i < at + lens[k]; i++) utf8(cp[i], bytes);
     at += lens[k];
+    if (!words_.empty() && bytes.size() > 1) {  // (a piece that is a token: that token)
+      std::string word;
+      for (const uint8_t b : bytes) word += byte_char_[b];
+      if (auto it = words_.find(word); it != words_.end()) {
+        out.push_back(it->second);
+        continue;
+      }
+    }
     sym.resize(bytes.size());
     for (size_t i = 0; i < bytes.size(); i++) {
       if (byte_id_[bytes[i]] < 0) throw Error("BpeEncoder.encode: byte " + std::to_string(bytes[i]) + " is not a token");

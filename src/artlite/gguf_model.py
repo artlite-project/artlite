@@ -9,8 +9,8 @@ losslessly (only fp16 scales become bf16, NPU side). ``dequantize`` gives
 the fp32 weights the ggml reference would compute.
 
 Supported: F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
-IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS (their tables: gguf-py's, ``iq1_grid``, ``iq2_grid``, ``iq3xxs_grid``, ``iq3s_grid``,
-``IQ4_VALUES``). A tensor of another type is listed
+IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, NVFP4 (their tables: gguf-py's, ``iq1_grid``, ``iq2_grid``, ``iq3xxs_grid``,
+``iq3s_grid``, ``IQ4_VALUES``, ``MXFP4_VALUES``, ``UE4M3_HALF``). A tensor of another type is listed
 (``tensor_info``: its size unknown, None) and raises NotImplementedError when read.
 
 llama.cpp's converter permutes the rows of a Llama's attn_q / attn_k per head (interleaved rotary pairs):
@@ -87,6 +87,9 @@ class QTensor:
                                                          w = d IQ4_VALUES[q]
         IQ4_XS: d (rows, cols/256), ls (rows, cols/32) u8 in [0, 63], q (rows, cols) u8 in [0, 15] (a 32-group's as
                Q4_0's);                                  w = d (ls_j - 32) IQ4_VALUES[q] (j = 32-group)
+        NVFP4: sc (rows, cols/16) u8 UE4M3 scales, d (rows, cols/16) their values halved (``UE4M3_HALF``: ggml's, 0x7F
+               as 0, the sign bit ignored), q (rows, cols) u8 in [0, 15] E2M1 codes (a 16-group's as Q4_0's);
+                                                         w = d MXFP4_VALUES[q] (j = 16-group; exact in fp32)
         BF16:  w (rows, cols) u16 bf16 bit patterns
         F16:   w (rows, cols) float16
         F32:   w (rows, cols) float32
@@ -210,6 +213,13 @@ class QTensor:
             q = np.concatenate([qs & 0xF, qs >> 4], -1)  # (rows, nb, 8, 32)
             return {"d": _f16(b[..., 0:2]), "ls": (lo | hi << 4).reshape(self.rows, nb * 8),
                     "q": q.reshape(self.rows, self.cols)}
+        if t == "NVFP4":  # (36 B per 64: 4 UE4M3 scales, then per 16-group 8 bytes of Q4_0's order)
+            b = self.blocks(36)
+            nb = b.shape[1]
+            sc = np.ascontiguousarray(b[..., :4]).reshape(self.rows, nb * 4)
+            qs = b[..., 4:].reshape(self.rows, nb, 4, 8)
+            q = np.concatenate([qs & 0xF, qs >> 4], -1)  # (rows, nb, 4, 16)
+            return {"sc": sc, "d": UE4M3_HALF[sc], "q": q.reshape(self.rows, self.cols)}
         raise ValueError(f"{self.name}: no quantization fields for {t}")
 
     def _iq2_fields(self, t: str) -> dict[str, np.ndarray]:
@@ -319,6 +329,8 @@ class QTensor:
             w = dl[..., None] * (f["q"].reshape(r, -1, n).astype(np.float32) * np.float32(0.125))
         elif t == "IQ4_NL":
             w = f["d"][..., None] * IQ4_VALUES[f["q"]].reshape(r, -1, 32).astype(np.float32)
+        elif t == "NVFP4":
+            w = f["d"][..., None] * MXFP4_VALUES[f["q"]].reshape(r, -1, 16).astype(np.float32)
         elif t == "IQ4_XS":  # (dl = d (ls - 32), then dl v: ggml's order, exact in fp32)
             dl = np.repeat(f["d"], 8, axis=-1) * (f["ls"].astype(np.float32) - 32)
             w = dl[..., None] * IQ4_VALUES[f["q"]].reshape(r, -1, 32).astype(np.float32)
@@ -369,6 +381,20 @@ def iq1_grid() -> np.ndarray:
 
 # IQ4_NL / IQ4_XS's 16 values (ggml's kvalues_iq4nl)
 IQ4_VALUES = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.int8)
+# ggml's kvalues_mxfp4: twice the E2M1 values of the 4-bit codes (NVFP4's, MXFP4's)
+MXFP4_VALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], np.int8)
+
+
+def _ue4m3_half() -> np.ndarray:
+    """(256,) float32: ggml's ggml_ue4m3_to_fp32 of each byte, half the UE4M3 value (bits 6-3 the exponent, bias 7;
+    2-0 the mantissa; subnormals at exponent 0; 0x7F, its NaN, as 0; bit 7 ignored)."""
+    x = np.arange(256)
+    e, m = (x >> 3) & 0xF, (x & 7).astype(np.float64)
+    v = np.where(e == 0, np.ldexp(m, -9), np.ldexp(1 + m / 8, e - 7)) * 0.5
+    return np.where((x == 0) | (x == 0x7F), 0.0, v).astype(np.float32)
+
+
+UE4M3_HALF = _ue4m3_half()
 
 
 def unpermute_rows(n_heads: int, rows: int) -> np.ndarray:
@@ -386,11 +412,11 @@ _GGML_TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_
                10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
                14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
                19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82),
-               23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2)}
+               23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2), 40: ("NVFP4", 64, 36)}
 _BLOCKS = {name: (per, nb) for name, per, nb in _GGML_TYPES.values()}
 # the names of ggml's other tensor types (unsupported: their tensors raise, ``tensor``; their files' errors name them)
 _GGML_NAMES = {6: "Q5_0", 7: "Q5_1", 9: "Q8_1", 15: "Q8_K", 24: "I8", 25: "I16", 26: "I32", 27: "I64", 28: "F64",
-               34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 40: "NVFP4", 41: "Q1_0"}
+               34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4", 41: "Q1_0"}
 
 
 class GGUFFile:
@@ -509,8 +535,9 @@ class GGUFFile:
         """Rows ``idx`` of a tensor dequantized (len(idx), cols) fp32, of its first ``cols`` columns (default all; a
         multiple of the format's block): an embedding lookup in the mapped file. In C++ (``_native.dequant_rows``: a
         decode step's lookup in a few us) the types of ``_native.dequant_supported`` (the plain ones, Q4_0, Q4_1, Q8_0,
-        Q3_K .. Q6_K, IQ4_NL, IQ4_XS), the others through ``QTensor.dequantize``. ``prefetch``: ask for the rows' pages at once first
-        (``_prefetch``: a syscall per row, ~1 us each; False for a table read every round, whose pages stay mapped)."""
+        Q3_K .. Q6_K, IQ4_NL, IQ4_XS, NVFP4), the others through ``QTensor.dequantize``. ``prefetch``: ask for the
+        rows' pages at once first (``_prefetch``: a syscall per row, ~1 us each; False for a table read every round,
+        whose pages stay mapped)."""
         t = self.tensor(name)
         cols, idx = cols or t.cols, np.asarray(idx)
         per, nb = _BLOCKS[t.qtype]

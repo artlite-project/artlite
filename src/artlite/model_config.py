@@ -1,5 +1,6 @@
 """Model architectures from the metadata of a GGUF file (:class:`LlamaConfig`, :class:`GemmaConfig`,
-:class:`QwenConfig`, :class:`LfmConfig`, :class:`SparkConfig`, :class:`FlintConfig`), and where model files live.
+:class:`QwenConfig`, :class:`LfmConfig`, :class:`SparkConfig`, :class:`FlintConfig`, :class:`InklingConfig`), and where
+model files live.
 
 Model directories live under :data:`MODELS_DIR` (``ARTLITE_MODELS_DIR``) as ``<org>/<repository>/`` (the Hugging Face
 repository a file comes from):
@@ -23,7 +24,7 @@ import numpy as np
 from . import settings
 
 MODELS_DIR = settings.MODELS_DIR.get()
-# a llama.cpp source tree with a CPU build (build/bin/libllama.so): the golden tensors of the qwen35 models
+# a llama.cpp source tree with a CPU build (build/bin/libllama.so): the tests' golden tensors and token ids
 LLAMA_CPP_DIR = settings.LLAMA_CPP_DIR.get()
 # uploaders of Llama GGUF files, in order of preference (file names: <repo name>-<quant>.gguf, MaziyarPanahi's
 # <repo name>.<quant>.gguf)
@@ -308,6 +309,56 @@ def flint_gguf(quant: str = "int4") -> str:
     """A Flint file: ``quant`` "int4" (Recursive's official file: the model's trained INT4 codes, MLX's groups of 64
     stored as Q4_1 block pairs), or a community quantization ("UD-Q4_K_XL": unsloth's, "Q4_K_M": lmstudio's)."""
     return os.path.join(MODELS_DIR, FLINT_FILES[quant])
+
+
+# (unsloth's repository: its root files the ``inkling2`` layout, ``Mainline_Support/``'s ``inkling2_loop``)
+INKLING_REPO = "unsloth/Inkling-2-Mini-GGUF"
+
+
+def inkling_gguf(quant: str = "UD-Q4_K_XL") -> str:
+    """An Inkling 2 Mini file of unsloth's repository (``quant``: "UD-Q4_K_XL", "UD-IQ1_S", ...), in its root: either
+    layout (``InklingConfig``; the ``Mainline_Support/`` files, renamed to .gguf, too)."""
+    return os.path.join(MODELS_DIR, INKLING_REPO, f"Inkling-2-Mini-{quant}.gguf")
+
+
+def _inkling_dirs(model: str) -> list[str]:
+    """(where an Inkling file's companions are: its directory, and the repository's root above ``Mainline_Support``)"""
+    d = os.path.dirname(os.path.abspath(model))
+    return [d] + ([os.path.dirname(d)] if os.path.basename(d) == "Mainline_Support" else [])
+
+
+def inkling_dspark_of(model: str) -> str | None:
+    """The DSpark drafter of an Inkling 2 file (GGUF architecture ``dflash`` with a Markov head, ``markov_w1``; its taps
+    count the model's visits, ``InklingConfig.visits``): ``dspark-*.gguf`` beside it or in the repository's root, Q8_0
+    first, then its ``dspark/`` directory (BF16), whose vocabulary and hidden size fit the model's; or None."""
+    from .gguf_model import GGUFFile
+
+    m = GGUFFile(model)
+    for d in [x for r in _inkling_dirs(model) for x in (r, os.path.join(r, "dspark"))]:
+        files = sorted((f for f in os.listdir(d) if f.startswith("dspark-") and f.endswith(".gguf")),
+                       key=lambda f: (not f.endswith("-Q8_0.gguf"), f)) if os.path.isdir(d) else []
+        for f in files:
+            g = GGUFFile(os.path.join(d, f))
+            if (g.arch == "dflash" and "markov_w1.weight" in g and g.meta.get("tokenizer.ggml.pre") == "inkling2"
+                    and g.arch_meta("embedding_length") == m.arch_meta("embedding_length")
+                    and g.string_count("tokenizer.ggml.tokens") == m.string_count("tokenizer.ggml.tokens")):
+                return os.path.join(d, f)
+    return None
+
+
+def inkling_mmproj_of(model: str) -> str | None:
+    """The vision tower of an Inkling 2 file (an mmproj of projector ``inkling2v``): ``mmproj-*.gguf`` beside it or in
+    the repository's root, F16 first; or None."""
+    from .gguf_model import GGUFFile
+
+    for d in _inkling_dirs(model):
+        files = sorted((f for f in os.listdir(d) if f.startswith("mmproj") and f.endswith(".gguf")),
+                       key=lambda f: (not f.endswith("-F16.gguf"), f)) if os.path.isdir(d) else []
+        for f in files:
+            meta = GGUFFile(os.path.join(d, f)).meta
+            if meta.get("clip.projector_type", meta.get("clip.vision.projector_type")) == "inkling2v":
+                return os.path.join(d, f)
+    return None
 
 
 # Hugging Face checkpoint directories (``artlite.hf_model``: a directory opens as a model file): bf16 / fp16 originals,
@@ -822,6 +873,207 @@ class FlintConfig:
             out[:, i] = th
             th = (th * scale).astype(np.float32)
         return out
+
+
+@dataclass(frozen=True)
+class Visit:
+    """One of a token's visits of a physical layer of Inkling 2 (``InklingConfig.visits``, in the order a token runs
+    them): its own KV cache and convolution histories, the layer's weights."""
+
+    index: int  # v, 0 .. visits - 1 (a DSpark drafter's ``target_layers`` count these: the residual entering visit v;
+    # ``visits``: the final state, after the output's depth mix and norm)
+    layer: int  # the physical layer
+    loop: int  # the loop core's pass (0 ..); -1: the prelude or the coda
+    slot: int  # llama.cpp's cache slot (its tensors' layer index): the physical layer in the first pass, then
+    # layers + (pass - 1) x core + (layer - core_start)
+    kind: str  # "swa" or "full"
+    block: bool  # the layer begins a block (layer % block_size == 0): its input becomes a block state, the residual
+    # restarts from its attention's output
+    queries: int  # its attention input's depth-mix queries: 0 (layer 0: the normed embedding itself), 1 (sliding
+    # window: Q, K and V from one input), 3 (full: one each)
+
+    @property
+    def messages(self) -> bool:
+        """The cross-pass messages and their controllers (the loop's passes after the first)."""
+        return self.loop > 0
+
+
+@dataclass(frozen=True)
+class InklingConfig:
+    """Architecture of Thinking Machines' Inkling 2 (GGUF ``inkling2_loop``: ggml-org's and unsloth's
+    ``Mainline_Support`` files; unsloth's root files, ``inkling2`` with ``num_loops``, map onto it: ``layout``), from
+    the metadata of its GGUF file (llama.cpp's ``src/models/inkling2.cpp``, ``inkling2-loop.cpp``).
+
+    ``num_hidden_layers`` physical layers in blocks of ``block_size``; the loop core (layers ``core_start`` ..
+    ``core_end`` - 1) runs ``passes`` times: a token visits the prelude, the core ``passes`` times, the coda
+    (``visits``). Each visit's inputs are depth mixes ("block attention residuals"): the completed block states and the
+    partial residual RMS-normed without weight, softmax over them of q . x / sqrt(hidden) for learned fp32 queries;
+    the passes after the first mix in a message per stream (q, k, v, ffn: ``CTRL_STREAMS``) from the previous pass's
+    bank (its block states after the core's first, its output) through a controller each (D: 2 hidden -> ``gate_rank``,
+    gain and forget: back; out = (1 - tanh(forget g)) x + tanh(gain g) message). Attention: ``num_attention_heads`` over
+    ``num_key_value_heads`` of ``head_dim``, no RoPE: K and V a causal conv of ``conv_taps`` taps (full layers: plus the
+    taps' per-token deltas), K L2-clipped to ``qk_clip``, V RMS-normed per head, Q scaled per dim and clipped, a
+    relative-position bias R . E[:, distance] (R: ``rel_length`` per head, clipped to ``rel_clip``; ``rel_extent``
+    distances; ``sliding_window`` on the "swa" layers), Q and R times ``tau`` on full layers, a per-query sink logit,
+    the output gated by sigmoid(gate). A conv after the attention's and the FFN's output projections. FFN: ``n_experts``
+    experts of ``expert_ffn``, the ``n_experts_used`` largest of sigmoid(router) + bias, weighted by their sigmoids over
+    their sum times ``expert_weights_scale``; "situ" activation beta tanh(g / beta) sigmoid(g) lbeta tanh(u / lbeta)
+    (``situ_beta``, ``situ_linear_beta``). The LM head's logits softcapped at ``softcap``; the embedding and head have
+    ``vocab_padded`` rows, of which the first ``vocab_size`` are tokens."""
+
+    vocab_size: int
+    vocab_padded: int
+    hidden_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    kinds: tuple[str, ...]
+    sliding_window: int
+    rms_norm_eps: float
+    max_position_embeddings: int
+    eos_token_ids: tuple[int, ...]
+    sampling: dict[str, float]
+    n_experts: int
+    n_experts_used: int
+    expert_ffn: int
+    expert_weights_scale: float
+    situ_beta: float
+    situ_linear_beta: float
+    block_size: int
+    conv_taps: int
+    rel_length: int
+    rel_extent: int
+    qk_clip: float
+    rel_clip: float
+    log_scale_floor: int
+    log_scale_alpha: float
+    softcap: float
+    core_start: int
+    core_end: int
+    passes: int
+    gate_rank: int
+    layout: str  # "loop" (``inkling2_loop``) or "root" (unsloth's ``inkling2`` with ``num_loops``)
+
+    ARCHS: ClassVar[tuple[str, ...]] = ("inkling2_loop", "inkling2")
+    CTRL_STREAMS: ClassVar[tuple[str, ...]] = ("q", "k", "v", "ffn")  # (llama.cpp's LOOP_CTRL_* order)
+    _ROOT_CTRL: ClassVar[dict[str, str]] = {"q": "attn", "k": "k", "v": "v", "ffn": "mlp"}
+    EOG: ClassVar[tuple[str, ...]] = ("<|endoftext|>",)  # (llama.cpp's end-of-generation tokens beside the EOS)
+    MIX_EPS: ClassVar[float] = 1e-6  # (the depth mixes' and controllers' unweighted RMS norms)
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> InklingConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch in cls.ARCHS, f"{gguf.path}: architecture {gguf.arch!r}, expected one of {cls.ARCHS}"
+        m = gguf.arch_meta
+        if gguf.arch == "inkling2_loop":
+            layout, n = "loop", int(m("block_count"))
+            start, end, passes = int(m("loop.start")), int(m("loop.end")), int(m("loop.count"))
+            if bool(m("loop.varying", False)):
+                raise NotImplementedError(f"{gguf.path}: a varying loop (the varloop research checkpoint)")
+        else:
+            if m("num_loops") is None:
+                raise NotImplementedError(f"{gguf.path}: an inkling2 file without a loop")
+            layout = "root"
+            start, end, passes = int(m("loop.core_start")), int(m("loop.core_end")), int(m("num_loops"))
+            n = int(m("block_count")) - (passes - 1) * (end - start)  # (its blocks count the cache slots)
+        block = int(m("attn_res.block_size"))
+        assert 0 < start < end <= n and start % block == 0 and end % block == 0 and passes >= 2, \
+            f"{gguf.path}: loop core {start} .. {end} of {n} layers, {passes} passes, blocks of {block}"
+        swa = [bool(x) for x in m("attention.sliding_window_pattern")][:n]
+        heads = {int(x) for x in np.atleast_1d(m("attention.head_count"))}
+        kv = {int(x) for x in np.atleast_1d(m("attention.head_count_kv"))}
+        hd = int(m("attention.key_length"))
+        assert len(heads) == len(kv) == 1 and int(m("attention.value_length")) == hd and \
+            int(m("attention.key_length_swa", hd)) == hd and int(m("rope.dimension_count", 0)) == 0, \
+            f"{gguf.path}: attention shapes"
+        vocab = gguf.string_count("tokenizer.ggml.tokens")
+        assert vocab == int(m("vocab_size_unpadded", vocab)), f"{gguf.path}: vocabulary"
+        tail = max(0, vocab - 512)
+        eos = [int(gguf.meta["tokenizer.ggml.eos_token_id"])]
+        eos += [i for i, t in enumerate(gguf.strings("tokenizer.ggml.tokens", tail), tail) if t in cls.EOG]
+        return cls(
+            vocab_size=vocab,
+            vocab_padded=int(m("vocab_size", vocab)),
+            hidden_size=int(m("embedding_length")),
+            num_hidden_layers=n,
+            num_attention_heads=heads.pop(),
+            num_key_value_heads=kv.pop(),
+            head_dim=hd,
+            kinds=tuple("swa" if x else "full" for x in swa),
+            sliding_window=int(m("attention.sliding_window")),
+            rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")),
+            max_position_embeddings=int(m("context_length")),
+            eos_token_ids=tuple(dict.fromkeys(eos)),
+            sampling={k: float(gguf.meta[f"general.sampling.{k}"]) for k in ("top_k", "top_p", "min_p", "temp")
+                      if f"general.sampling.{k}" in gguf.meta},
+            n_experts=int(m("expert_count")),
+            n_experts_used=int(m("expert_used_count")),
+            expert_ffn=int(m("expert_feed_forward_length")),
+            expert_weights_scale=float(m("expert_weights_scale", 1.0)),
+            situ_beta=float(m("activation.situ_beta")),
+            situ_linear_beta=float(m("activation.situ_linear_beta")),
+            block_size=block,
+            conv_taps=int(m("shortconv.l_cache")),
+            rel_length=int(m("attention.relative_length")),
+            rel_extent=int(m("attention.relative_extent")),
+            qk_clip=float(m("attention.qk_clip")),
+            rel_clip=float(m("attention.relative_clip")),
+            log_scale_floor=int(m("attention.log_scale_floor")),
+            log_scale_alpha=float(m("attention.log_scale_alpha")),
+            softcap=float(m("final_logit_softcapping", 0.0)),
+            core_start=start,
+            core_end=end,
+            passes=passes,
+            gate_rank=int(m("loop.gate_rank")),
+            layout=layout,
+        )
+
+    @property
+    def q_per_kv(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
+
+    def layers(self, kind: str) -> list[int]:
+        """The physical layers of a kind ("swa", "full"; "core": the loop's)."""
+        if kind == "core":
+            return list(range(self.core_start, self.core_end))
+        return [i for i, k in enumerate(self.kinds) if k == kind]
+
+    @property
+    def visits(self) -> tuple[Visit, ...]:
+        """A token's visits in order: the prelude, the core's passes, the coda."""
+        n, core = self.num_hidden_layers, self.core_end - self.core_start
+        path = [(layer, -1) for layer in range(self.core_start)]
+        path += [(layer, p) for p in range(self.passes) for layer in range(self.core_start, self.core_end)]
+        path += [(layer, -1) for layer in range(self.core_end, n)]
+        return tuple(Visit(index=v, layer=layer, loop=p, kind=self.kinds[layer], block=layer % self.block_size == 0,
+                           slot=layer if p <= 0 else n + (p - 1) * core + layer - self.core_start,
+                           queries=0 if layer == 0 else 1 if self.kinds[layer] == "swa" else 3)
+                     for v, (layer, p) in enumerate(path))
+
+    def tau(self, positions: np.ndarray | range | list) -> np.ndarray:
+        """(n,) float32: the full layers' factor of Q and R at positions, 1 + alpha ln(max(1, (p + 1) / floor)) in
+        llama.cpp's fp32 operations."""
+        p = np.asarray(positions, np.float32).reshape(-1) + np.float32(1)
+        x = np.maximum(p * np.float32(1.0 / self.log_scale_floor), np.float32(1))
+        return (np.log(x) * np.float32(self.log_scale_alpha) + np.float32(1)).astype(np.float32)
+
+    def ctrl_tensor(self, layer: int, stream: str, part: str) -> str:
+        """The name of a loop layer's controller weight for a stream of ``CTRL_STREAMS``: ``part`` "down" (2 hidden ->
+        gate_rank), "gain" or "forget" (gate_rank -> hidden)."""
+        if self.layout == "loop":
+            return f"blk.{layer}.loop_{stream}_ctrl_{part}.weight"
+        return f"blk.{layer}.loop_{self._ROOT_CTRL[stream]}_{part}.weight"
+
+    def msg_queries(self, gguf: Any, layer: int) -> np.ndarray:
+        """(4, hidden) fp32: a loop layer's message queries, one per stream of ``CTRL_STREAMS`` (the root layout's two
+        tables of the core's queries: per layer i of the core rows 2 i, 2 i + 1 of the q and kv tables, as llama.cpp's
+        converter stacks them: q[2 i], kv[2 i], kv[2 i + 1], q[2 i + 1])."""
+        if self.layout == "loop":
+            return gguf.tensor(f"blk.{layer}.loop_msg_query.weight").dequantize()
+        i = layer - self.core_start
+        q, kv = (gguf.tensor(f"{t}.weight").dequantize() for t in ("loop_res_query", "loop_kv_res_query"))
+        return np.stack([q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]])
 
 
 @dataclass(frozen=True)

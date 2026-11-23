@@ -50,10 +50,13 @@ void bind_text(nb::module_& m) {
   };
   pre("pretokenize_spark2_5", artlite::pretokenize_spark2_5);
   pre("pretokenize_flint", artlite::pretokenize_flint);
+  pre("pretokenize_gpt4o", artlite::pretokenize_gpt4o);
   nb::class_<artlite::BpeEncoder>(m, "BpeEncoder",
                                   "A byte-level BPE vocabulary's merges (the lowest rank first, as llama.cpp).")
-      .def(nb::init<const std::vector<std::string>&, const std::vector<std::string>&>(), "tokens"_a, "merges"_a,
-           "tokens: the vocabulary's strings (GPT-2's byte-level form), merges: 'a b' in rank order.")
+      .def(nb::init<const std::vector<std::string>&, const std::vector<std::string>&, bool>(), "tokens"_a, "merges"_a,
+           "ignore_merges"_a = false,
+           "tokens: the vocabulary's strings (GPT-2's byte-level form), merges: 'a b' in rank order; ignore_merges: a "
+           "piece that is a token is that token (llama.cpp's ignore_merges).")
       .def(
           "encode",
           [](const artlite::BpeEncoder& e, U32 cp, U32 lens) {

@@ -137,6 +137,26 @@ void iq4_xs(const uint8_t* b, float* o) {
   }
 }
 
+// UE4M3 -> fp32 as ggml_ue4m3_to_fp32: half the value (bits 6-3 the exponent, bias 7; subnormals at 0), 0x7F (its NaN)
+// as 0, bit 7 ignored
+float ue4m3_half(uint8_t x) {
+  if (x == 0 || x == 0x7F) return 0.0f;
+  const int e = (x >> 3) & 15, m = x & 7;
+  return (e ? std::ldexp(1.0f + float(m) / 8.0f, e - 7) : std::ldexp(float(m), -9)) * 0.5f;
+}
+
+// ggml's kvalues_mxfp4: twice the E2M1 values of the codes
+constexpr int8_t MXFP4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// NVFP4 (36 B per 64): 4 UE4M3 scales, then per 16-group 8 bytes of codes (Q4_0's order); w = MXFP4[q] d
+void nvfp4(const uint8_t* b, float* o) {
+  for (int s = 0; s < 4; s++) {
+    const float d = ue4m3_half(b[s]);
+    const uint8_t* q = b + 4 + 8 * s;
+    for (int j = 0; j < 16; j++) o[16 * s + j] = float(MXFP4[j < 8 ? q[j] & 15 : q[j - 8] >> 4]) * d;
+  }
+}
+
 // The plain types, a value per "block": F32, F16, BF16 (its bits, the high half of the fp32 value)
 void f32(const uint8_t* b, float* o) { std::memcpy(o, b, 4); }
 void f16_1(const uint8_t* b, float* o) { *o = f16(b); }
@@ -154,7 +174,8 @@ struct Type {
 constexpr Type TYPES[] = {{"F32", 1, 4, f32},       {"F16", 1, 2, f16_1},          {"BF16", 1, 2, bf16},
                           {"Q4_0", 32, 18, q4_0},   {"Q4_1", 32, 20, q4_1},        {"Q8_0", 32, 34, q8_0},
                           {"Q3_K", 256, 110, q3_k}, {"Q4_K", 256, 144, q45_k<false>}, {"Q5_K", 256, 176, q45_k<true>},
-                          {"Q6_K", 256, 210, q6_k},   {"IQ4_NL", 32, 18, iq4_nl},    {"IQ4_XS", 256, 136, iq4_xs}};
+                          {"Q6_K", 256, 210, q6_k},   {"IQ4_NL", 32, 18, iq4_nl},    {"IQ4_XS", 256, 136, iq4_xs},
+                          {"NVFP4", 64, 36, nvfp4}};
 
 const Type* type_of(std::string_view qtype) {
   for (const Type& t : TYPES)

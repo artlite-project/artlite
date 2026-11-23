@@ -1,5 +1,6 @@
 """The GGUF files' BPE tokenizer (models.tokenizer) against llama.cpp's llama-tokenize, on a file of each pre-tokenizer
-(qwen35: Qwen3.5-9B, qwen2: Qwen3 0.6B, lfm2: LFM3-1.7B, spark2_5: Spark-X2.6-1.7B, split natively): essays, code,
+(qwen35: Qwen3.5-9B, qwen2: Qwen3 0.6B, lfm2: LFM3-1.7B; split natively: spark2_5: Spark-X2.6-1.7B, flint: Flint,
+inkling2: Inkling 2 Mini, its GPT-4o split's letter cases in ``TEXTS``' last lines): essays, code,
 Unicode (CJK runs between digits and Latin, full-width digits), special tokens, the chat template's
 prompts; a template in place of the file's and the template's variables; LFM3's template (its ``generation`` block,
 thinking, tool calls) as llama-server renders it (no NPU)."""
@@ -11,7 +12,7 @@ import jinja2
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import flint_gguf, lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
+from artlite.model_config import flint_gguf, inkling_gguf, lfm3_gguf, qwen3_gguf, qwen_gguf, spark_gguf
 from models.templating import chat_template, effort_levels, template_option, thought_end
 from models.tokenizer import BpeTokenizer, chat_prompt
 
@@ -40,19 +41,21 @@ TEXTS = [
      "<｜start▁of▁sentence｜><|Bot|><think>x</think><tool_call>f<arg_key>k</arg_key><arg_value>1</arg_value></tool_call>"),
     "<|system|>sys<|user|>hi\n<|assistant|><think>t</think>a<|observation|><tool_response>{}</tool_response><|end_of_text|>",
     "camelCaseWord HTTPServer getHTTPResponse iPhone McDonald's ÀÉÎ ǅ x'S y'Ll z'VE \t\tq ;\n\n  \r\n x",
+    "ÉCOLE École HELLOworld HELLOé x\u0301abc \u0301abc ABCdéf 'S'T a/b\n/c .\n/ ./\n\n/x ΣΊΣΥΦΟΣ МИР мир \x00\x7f\u0085y",
 ]
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Factorize x^2 + x - 6 = 0"}]
 
 
-ESSAYS = {"qwen35": 2, "qwen2": 1, "lfm2": 1, "spark2_5": 1, "flint": 1}  # (essays per pre-tokenizer: prose is plain
-# English, the pre-tokenizers differ in what TEXTS holds; qwen35's regex is the long-text sensitive one)
+# (essays per pre-tokenizer: prose is plain English, the pre-tokenizers differ in what TEXTS holds; qwen35's regex is
+# the long-text sensitive one)
+ESSAYS = {"qwen35": 2, "qwen2": 1, "lfm2": 1, "spark2_5": 1, "flint": 1, "inkling2": 1}
 _TOKENIZERS: dict[str, tuple[str, BpeTokenizer]] = {}
 
 
 def _tok(pre: str) -> tuple[str, BpeTokenizer]:
     if pre not in _TOKENIZERS:
         path = {"qwen35": qwen_gguf("Q4_K_M", "9B"), "qwen2": qwen3_gguf("0.6B"), "lfm2": lfm3_gguf(),
-                "spark2_5": spark_gguf("1.7B"), "flint": flint_gguf()}[pre]
+                "spark2_5": spark_gguf("1.7B"), "flint": flint_gguf(), "inkling2": inkling_gguf()}[pre]
         require(path)
         _TOKENIZERS[pre] = path, BpeTokenizer(GGUFFile(path))
     return _TOKENIZERS[pre]
