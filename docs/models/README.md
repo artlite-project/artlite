@@ -26,7 +26,8 @@ against the checkpoint computed exactly on the CPU), z-lab/Llama-3.1-8B-Instruct
 checkpoint computes them; a step of one token 81.7 ms, bartowski's Q4_K_S GGUF 76.0), z-lab/Qwen3.5-0.8B-PARO (KL 0.0003), Launch80/Qwen3.8-27B-PARO-int5
 (its first layers within 0.6% of the checkpoint computed exactly; with its base model's DFlash2 drafter,
 z-lab/Qwen3.8-27B-DFlash2-GGUF, found and used as for the GGUF files, on steps of up to 8 tokens, the same greedy text
-with and without drafts), z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; with its base model's MTP drafter,
+with and without drafts), z-lab/Qwen3.8-27B-PARO (int4: its first layers within 0.5%; the same drafter),
+z-lab/Qwen3.6-35B-A3B-PARO (its first layers within 0.6%; with its base model's MTP drafter,
 ggml-org's mtp-Qwen3.6-35B-A3B-Q4_0.gguf, found and used as for the GGUF files, the same greedy text),
 z-lab/gemma-4-E4B-it-PARO (teacher-forced KL 0.00029 against the checkpoint computed exactly; a step of one token 53.9
 ms, ggml-org's Q4_0 GGUF 55.6, at 10% fewer bytes a token). Their speeds next to the GGUF files' (the

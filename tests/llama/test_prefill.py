@@ -5,8 +5,8 @@ prefill/test_norm.py):
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
   logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-4B: q / k norms, a hidden size of 2560 in padded K chunks;
-  Qwen3-0.6B-PARO: rotated inputs), and
-  packed chunks on Qwen3-Embedding-0.6B Q8_0 (all-Q8_0 GEMMs).
+  Qwen3-0.6B-PARO: rotated inputs; Llama-3.1-8B-PARO: gate and up in GEMMs of their own at every sub-chunk size),
+  and packed chunks on Qwen3-Embedding-0.6B Q8_0 (all-Q8_0 GEMMs).
 """
 
 import numpy as np
@@ -281,7 +281,8 @@ def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win
 # (GGUF quantization, model size, K format, tokens, decode steps first; "qwen3:<name>": model_config.qwen3_gguf's file)
 CACHES = [("Q4_K_M", "1B", "single", 300, 0), ("Q4_K_M", "1B", "hilo", 300, 128), ("Q4_K_M", "3B", "single", 600, 64),
           ("Q4_K_S", "8B", "hilo", 300, 0), ("Q4_1", "qwen3:0.6B", "hilo", 300, 64),
-          ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64), ("PARO", "qwen3-0.6B-paro", "hilo", 300, 64)]
+          ("Q4_K_M", "qwen3:embedding-4B", "hilo", 300, 64), ("PARO", "qwen3-0.6B-paro", "hilo", 300, 64),
+          ("PARO", "llama-8B-paro", "single", 300, 64)]
 
 
 @pytest.mark.slow
@@ -307,7 +308,7 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
 
         path = checkpoint(size)
         require(path)
-        g, qwen3 = HfModel(path), True
+        g, qwen3 = HfModel(path), size.startswith("qwen3")
     else:
         path = llama_path(quant, size)
         g = GGUFFile(path)

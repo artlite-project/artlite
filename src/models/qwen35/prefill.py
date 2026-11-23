@@ -53,9 +53,9 @@ copy as K columns of panels C K wide into one layout of G (``prefill.gemm.joined
 operators' as ever; the GDN's alpha and beta, folded into gin_z's rotation as F32 planes, in fp32: GdnPrep's
 ``ab32``); the mixer's output rotated for its projection (AR); gate's and up's copies (XR), gate and up in one GEMM
 whose epilogue forms h = silu(gate) up into GU (``prefill.gemm.plan_gate_up_pair``'s ``act``, where its A strip of
-both copies stays in the memtile; else gate and up as bf16 panels into GU, one GEMM design; tiles whose passes are not
-64 outputs, P5_128's: rows into GJ, ``plan_gate_up_rows``), down's rotation (HR; of GU or GJ: the activation on the
-way). An MoE layer (``moe.prefill``'s
+both copies stays in the memtile at every sub-chunk size; else gate and up as bf16 panels into GU, one GEMM design;
+tiles whose passes are not 64 outputs, P5_128's: rows into GJ, ``plan_gate_up_rows``), down's rotation (HR; of GU or
+GJ: the activation on the way). An MoE layer (``moe.prefill``'s
 PARO path): after its post-attention norm the experts' gate / up rotation as hi and lo panels (XR: the router and the
 shared expert, their rows folded into it) and as rows (PXR: the experts' gathered rows), the experts' h rotated in their
 slots.
@@ -234,8 +234,9 @@ class QwenPrefill(ChunkPrefill):
             if self.paro and name == "gate_up":  # (one design, bf16 panels into GU, or rows into GJ: down's rotation
                 # takes them)
                 gate, up = img.region(L, "gate"), img.region(L, "up")
-                if self.gu_paired:  # (one GEMM of both where it fits: h = silu(gate) up, ``act``)
-                    gu = PG.plan_gate_up_pair(img, gate, up, t, self._gemms, 2 * self.kh, act="silu")
+                if self.gu_paired:  # (one GEMM of both where it fits at every size: h = silu(gate) up, ``act``)
+                    gu = PG.plan_gate_up_pair(img, gate, up, t, self._gemms, 2 * self.kh, act="silu",
+                                              dual_T=self._t(self.sizes[-1]))
                 else:
                     gu = PG.plan_gate_up_rows(img, gate, up, t, self._gemms, 2 * self.kh)
                 n = len(gu.gemms) // 2 if not gu.gemms[0].op.dual else 1  # (gate's GEMMs, then up's; a dual GEMM)

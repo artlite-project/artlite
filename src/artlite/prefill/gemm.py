@@ -28,7 +28,8 @@ transfers': ``MAX_CHAIN_BDS``), so runs take at most MAX_CHAIN_BDS / n_kc blocks
 chunks of a group; parts of one width one design, their A arguments shifted: ``Gemm.a_off``), each writing its own C
 (``Gemm.part``: the residual add sums them). Parts also keep a long-K projection's A strip resident in the memtile
 (``resident_k_part``). A GEMM runs at most 64 passes (the memtile resends a resident A strip once per pass, BDs iterate
-at most 64 times: the 27B's gate_up in 68 passes hung the array): the 27B's gate_up runs as two GEMMs.
+at most 64 times: the 27B's gate_up in 68 passes hung the array): the 27B's gate_up runs as two GEMMs. A ``dual`` GEMM's
+BDs iterate per pass pair: at most 64 pairs.
 
 Every path dequantizes the weights into bfp16 panels (GemmQ: pairs of cores split each k-tile's dequant): a projection
 is within ~1.35 2^-9 sqrt(K / 64) of the exact product (relative rms; ``tests/prefill/test_gemm.py``).
@@ -121,7 +122,7 @@ def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOpe
         return ops[key]
     is_planar = planar(kw["fmt"], kw["rows"], kw["kc"])
     kw = {**kw, "pace": pace_class(which, is_planar)}
-    assert kw["passes"] <= MAX_BD_ITER, kw["passes"]
+    assert kw["passes"] // (2 if kw.get("dual") else 1) <= MAX_BD_ITER, kw["passes"]  # (dual: per pass pair)
     mac_rows = gemm_mac_rows(T, which, kw["fmt"], is_planar)
     if is_planar and mac_rows == 3 and T >= 256:
         op = planar_gemm(kw, T)
@@ -338,7 +339,7 @@ def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
 
 
 def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
-                      a_width: int = 0, *, act: str = "") -> PhasePlan:
+                      a_width: int = 0, *, act: str = "", dual_T: int = 0) -> PhasePlan:
     """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
     from the caller's slices, panels ``a_width`` columns wide: ``plan_phase``'s): one GEMM design for both (a pass of
     tile-major 16-row tiles: 64 outputs), its C as bf16
@@ -350,7 +351,9 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
     (per parity of row tile pairs), ``GemmSpec.dual``: a pass pair, gate's tiles on the first half of A (the copies
     [gate | up] side by side), then up's on the second, its epilogue forming h = act(gate) up, bf16 panels [T / 8]
     [ffn / 8][64] into GU (down's rotation reads them as bf16 blocks), where its A strip of 2 K columns stays in the
-    memtile (else the plan without ``act``: ``Gemm.op.dual`` tells them apart)."""
+    memtile, at ``dual_T`` tokens too (a prefill's largest sub-chunk: its sizes' GEMMs of one kind, down's rotation one;
+    the strip grows with the tokens: K 4096's stays at 128 tokens, not at 256) (else the plan without ``act``:
+    ``Gemm.op.dual`` tells them apart)."""
     (bg,), (bu,) = gate.blocks, up.blocks
     groups, KC = image.cfg.intermediate_size // COLS // 64, gate.kc
     if bg.pt or bu.pt:
@@ -367,7 +370,8 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
               "kc": KC, "kc_group": rs, "blocks": ((0, 2 * groups),), "region_rt": gate.n_rt, "c_panels": 64,
               "dual": (up.offset - gate.offset) // (gate.tile_bytes * rs), "act": act,
               **({"a_cols": (0, a_width)} if a_width else {})}
-        if gemm_op(kw, T, "gu").flow.a_res:  # (else A refetched per pass: the separate GEMMs)
+        Tr = max(T, dual_T)
+        if gemm_op({**kw, "M": Tr}, Tr, "gu").flow.a_res:  # (else A refetched per pass: the separate GEMMs)
             op = gemm_op(kw, T, "gu", ops)
             assert type(op) is GemmQOperator, "the dual epilogue: GemmQ"
             return PhasePlan([Gemm(op, gate.offset - op.hdr_skip, c="GU")], None)

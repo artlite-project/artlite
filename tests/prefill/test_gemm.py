@@ -443,3 +443,32 @@ def test_gate_up_dual() -> None:
     err = rel_native(got, want)
     print(f"h {err:.2e}")
     assert err < 2 * _tol(K), err
+
+
+# (a PARO checkpoint's hidden size, ffn: Qwen3-0.6B's, Llama-3.1-8B's, Qwen3.8-27B's; the dual GEMM at every size)
+PAIRS = [(1024, 3072, True), (4096, 14336, False), (5120, 17408, False)]
+
+
+@pytest.mark.parametrize(("K", "ffn", "dual"), PAIRS, ids=[f"K{k}-ffn{f}" for k, f, _ in PAIRS])
+def test_gate_up_pair_sizes(K: int, ffn: int, dual: bool) -> None:
+    """``plan_gate_up_pair``'s plans (host only) of P4_128 gate and up regions at a prefill's sub-chunk sizes with its
+    largest as ``dual_T``: of one kind at every size (one down rotation), the dual GEMM where both copies' A strip stays
+    in the memtile at the largest (K 4096's at 128 tokens, not 256); the 27B's at 128 tokens alone: 68 passes, 34 pass
+    pairs per BD."""
+    from types import SimpleNamespace
+
+    from artlite.decode.image import Block, Region
+    from artlite.operators.design import MAX_BD_ITER, MAX_CHAIN_BDS
+
+    n_kc, groups = K // 1024, ffn // COLS // 64
+    rows = np.arange(ffn, dtype=np.int32).reshape(COLS, ffn // COLS)
+    gate, up = (Region(0, n, [Block(n, (n,), rows, "P4_128", 16)], n_kc, n_kc, 9280, 1024) for n in ("gate", "up"))
+    gate.col_stride = up.col_stride = 2 * gate.col_bytes
+    up.offset = COLS * gate.col_bytes
+    img = SimpleNamespace(cfg=SimpleNamespace(intermediate_size=ffn))
+    for T in (128, 256, 1024):
+        pp = PG.plan_gate_up_pair(img, gate, up, T, {}, 2 * K, act="silu", dual_T=1024)
+        assert [(bool(g.op.dual), g.op.passes) for g in pp.gemms] == ([(True, 2 * groups)] if dual else
+                                                                      [(False, groups)] * 2), T
+    op = PG.plan_gate_up_pair(img, gate, up, 128, {}, 2 * K, act="silu").gemms[0].op
+    assert op.dual and op.passes // 2 <= MAX_BD_ITER and len(op.flow.b_chain(0)[0]) == 2 * n_kc <= MAX_CHAIN_BDS

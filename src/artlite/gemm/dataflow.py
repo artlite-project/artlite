@@ -272,9 +272,11 @@ class Dataflow:
         w_dims = (1, geo.w_bytes // 2)
         if geo.dual:  # (per pass pair, each part's chunks: a BD each, its row tiles ``dual`` on for the second)
             assert g == nk and geo.run == 1 and geo.k_rep == 1 and max(n for _, n in geo.blocks) // 2 <= MAX_BD_ITER
-            return [[TensorAccessPattern(w_dims, base + ((rt0 + part * geo.dual) * rs + k) * tw, [np_ // 2, nsl, nt, sw],
-                                         [ps * rs * tw, sw, rs * tw, 1]) for part in range(2) for k in range(nk)]
-                    for rt0, np_ in geo.blocks]
+            chains = [[TensorAccessPattern(w_dims, base + ((rt0 + part * geo.dual) * rs + k) * tw,
+                                           [np_ // 2, nsl, nt, sw], [ps * rs * tw, sw, rs * tw, 1])
+                       for part in range(2) for k in range(nk)] for rt0, np_ in geo.blocks]
+            assert sum(map(len, chains)) <= MAX_CHAIN_BDS, "chained weight fills of more than MAX_CHAIN_BDS shim BDs"
+            return chains
         taps = self.b_taps(c)
         if (len(taps) == len(geo.blocks) and geo.k_rep == 1) or max(n for _, n in geo.blocks) > MAX_BD_ITER:
             return None  # (one fill per block already; a BD iterates at most MAX_BD_ITER times)

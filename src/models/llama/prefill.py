@@ -32,9 +32,9 @@ channels to its outlier's exponent) into XR's panels, three copies (q, k, v; aft
 [token group][copy][hidden / 8 panels], each GEMM reading its copy's columns), the attention's A into AR; q, k and v
 write G in one
 layout (``prefill.gemm.joined_layout``), gate and up in one GEMM whose epilogue forms h = silu(gate) up as bf16 panels
-in GU (``plan_gate_up_pair``'s ``act``, where its A strip of both copies stays in the memtile; else gate and up as GU's
-bf16 panels, the activation on the way: ``prefill.rotate``'s ``gu``), which down's rotation reads into HR. The rotation objects
-(``paro.TanForm.pair_objects``) are in RO, compiled at bind.
+in GU (``plan_gate_up_pair``'s ``act``, where its A strip of both copies stays in the memtile at every sub-chunk
+size; else gate and up as GU's bf16 panels, the activation on the way: ``prefill.rotate``'s ``gu``), which down's
+rotation reads into HR. The rotation objects (``paro.TanForm.pair_objects``) are in RO, compiled at bind.
 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
 one chunk of ``PACK_SIZES``, after a history every one of them sees (a shared prefix in the caches, or none). Only the
@@ -208,7 +208,7 @@ class LlamaPrefill(ChunkPrefill):
                       for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay, a_width=3 * self.kh).gemms]
                 plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
                 gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms, 2 * self.kh,
-                                          act="silu")
+                                          act="silu", dual_T=max(map(self._t, self.sizes)))
                 gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
                 plans[(L, "gate_up")] = gu
                 for name in ("o", "down"):
