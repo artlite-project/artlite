@@ -11,13 +11,15 @@ run in a library program as the prefill's do, paced (``gemm.pacing``) at level 0
 twins: their outputs bit-identical."""
 
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 from ml_dtypes import bfloat16
 
 import artlite
-from artlite.decode.image import pack_rows
+from artlite.decode.image import Block, Region, pack_rows
 from artlite.formats import FORMATS
 from artlite.gemm.gemm_qd import GemmQdOperator
 from artlite.gemm.pacing import PACE, pace_word
@@ -37,7 +39,7 @@ from artlite.model_config import (
     swift_gguf,
 )
 from artlite.operators import bfp16
-from artlite.operators.design import COLS
+from artlite.operators.design import COLS, MAX_BD_ITER, MAX_CHAIN_BDS
 from artlite.operators.fused import Library
 from artlite.prefill import gemm as PG
 
@@ -443,3 +445,52 @@ def test_gate_up_dual() -> None:
     err = rel_native(got, want)
     print(f"h {err:.2e}")
     assert err < 2 * _tol(K), err
+
+
+def test_gate_up_pair_wide() -> None:
+    """``plan_gate_up_pair`` on wide P4_128 checkpoints (e.g. Qwen3.8-27B-PARO: K 5120, intermediate 17408, 34 groups,
+    so a dual GEMM takes 68 passes = 34 pass pairs <= ``MAX_BD_ITER``): at T 256 (A strip > memtile) it falls back to
+    separate gate and up GEMMs without tripping ``MAX_BD_ITER``, at T 128 it forms the 68-pass dual GEMM (or separate
+    GEMMs when ``act`` is empty, as ``QwenPrefill`` / ``LlamaPrefill`` pass when a larger sub-chunk is non-dual), and
+    with ``2 * n_kc > MAX_CHAIN_BDS`` it falls back to separate GEMMs."""
+
+    def make_pair(K: int, ffn: int) -> tuple[SimpleNamespace, Region, Region]:
+        kc, n_kc, tile_bytes = 1024, K // 1024, 9280
+        rows = np.arange(ffn, dtype=np.int32).reshape(COLS, ffn // COLS)
+        gate = Region(0, "gate", [Block("gate", ("g",), rows, "P4_128", 16)], n_kc, n_kc, tile_bytes, kc)
+        up = Region(0, "up", [Block("up", ("u",), rows, "P4_128", 16)], n_kc, n_kc, tile_bytes, kc)
+        stride = gate.col_bytes * 2
+        gate.col_stride = up.col_stride = stride
+        gate.offset, up.offset = 0, gate.col_bytes * COLS
+        return SimpleNamespace(cfg=SimpleNamespace(intermediate_size=ffn)), gate, up
+
+    stub, gate, up = make_pair(5120, 17408)
+    ops256: dict[tuple, object] = {}
+    pp256 = PG.plan_gate_up_pair(stub, gate, up, 256, ops256, 2 * 5120, act="silu")
+    assert len(pp256.gemms) == 2
+    assert [gm.op.dual for gm in pp256.gemms] == [0, 0]
+    assert [gm.op.passes for gm in pp256.gemms] == [34, 34]
+    assert [gm.c_off for gm in pp256.gemms] == [0, 64]
+
+    ops128: dict[tuple, object] = {}
+    pp128 = PG.plan_gate_up_pair(stub, gate, up, 128, ops128, 2 * 5120, act="silu")
+    assert len(pp128.gemms) == 1
+    op = pp128.gemms[0].op
+    assert op.dual > 0 and op.passes == 68 and op.flow.a_res and op.flow.a_repeat == 34
+    assert len(op.flow.b_chain(0)[0]) == 10 <= MAX_CHAIN_BDS
+
+    pp128_sep = PG.plan_gate_up_pair(stub, gate, up, 128, {}, 2 * 5120, act="")
+    assert len(pp128_sep.gemms) == 2 and [gm.op.dual for gm in pp128_sep.gemms] == [0, 0]
+
+    # 2 * n_kc = 14 > MAX_CHAIN_BDS: dual cannot fit a chained weight fill -> separate GEMMs
+    stub7, gate7, up7 = make_pair(7168, 4096)
+    pp7 = PG.plan_gate_up_pair(stub7, gate7, up7, 128, {}, 2 * 7168, act="silu")
+    assert len(pp7.gemms) == 2 and [gm.op.dual for gm in pp7.gemms] == [0, 0]
+
+    # gemm_op enforces MAX_BD_ITER per pass (non-dual) and per pass pair (dual)
+    base_kw = {"rows": 16, "kc": 1024, **next(iter(ops256))[0].operator_kwargs()}
+    with pytest.raises(AssertionError):
+        PG.gemm_op({**base_kw, "passes": MAX_BD_ITER + 1}, 256, "gu")
+    dual_kw = {"rows": 16, "kc": 1024, **next(iter(ops128))[0].operator_kwargs()}
+    with pytest.raises(AssertionError):
+        PG.gemm_op({**dual_kw, "passes": 2 * (MAX_BD_ITER + 1)}, 128, "gu")

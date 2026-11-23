@@ -176,7 +176,9 @@ class QwenPrefill(ChunkPrefill):
         self._moe_marks: dict[int, list[tuple[int, tuple[int, int, int]]]] = {}
         self._gemms: dict[str, object] = {}  # (one object per distinct GEMM)
         self._k_parts: dict[tuple, int] = {}  # (per region shape and size: output projections in resident K parts)
-        self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
+        ts = sorted({self._t(T) for T in self.sizes})
+        sz = {t: self._size_ops(t) for t in reversed(ts)}  # (largest first: ``gu_dual`` at the largest sub-chunk size)
+        self.sz = {t: sz[t] for t in ts}
         self.plans = self.sz[SUB].plans if SUB in self.sz else self.sz[max(self.sz)].plans
         self._ops: dict[tuple, object] = {}
         # (the prefill's own static buffers: per GDN layer its scan parameters, per attention layer its q / k norms)
@@ -234,8 +236,9 @@ class QwenPrefill(ChunkPrefill):
             if self.paro and name == "gate_up":  # (one design, bf16 panels into GU, or rows into GJ: down's rotation
                 # takes them)
                 gate, up = img.region(L, "gate"), img.region(L, "up")
-                if self.gu_paired:  # (one GEMM of both where it fits: h = silu(gate) up, ``act``)
-                    gu = PG.plan_gate_up_pair(img, gate, up, t, self._gemms, 2 * self.kh, act="silu")
+                if self.gu_paired:  # (one GEMM of both where it fits at every sub-chunk size: h = silu(gate) up, ``act``)
+                    gu = PG.plan_gate_up_pair(img, gate, up, t, self._gemms, 2 * self.kh,
+                                              act="silu" if getattr(self, "gu_dual", {True}) == {True} else "")
                 else:
                     gu = PG.plan_gate_up_rows(img, gate, up, t, self._gemms, 2 * self.kh)
                 n = len(gu.gemms) // 2 if not gu.gemms[0].op.dual else 1  # (gate's GEMMs, then up's; a dual GEMM)

@@ -121,7 +121,7 @@ def gemm_op(kw: dict[str, object], T: int, which: str, ops: dict[tuple, GemmQOpe
         return ops[key]
     is_planar = planar(kw["fmt"], kw["rows"], kw["kc"])
     kw = {**kw, "pace": pace_class(which, is_planar)}
-    assert kw["passes"] <= MAX_BD_ITER, kw["passes"]
+    assert kw["passes"] // (2 if kw.get("dual") else 1) <= MAX_BD_ITER, kw["passes"]
     mac_rows = gemm_mac_rows(T, which, kw["fmt"], is_planar)
     if is_planar and mac_rows == 3 and T >= 256:
         op = planar_gemm(kw, T)
@@ -359,18 +359,19 @@ def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: d
     if act:
         assert (bg.fmt, bg.R, bg.tiles) == (bu.fmt, bu.R, bu.tiles) and _tp(bg) * bg.R == ROWS, (bg, bu)
         rs = gate.kc_group  # (a row tile's tiles: its chunks together)
-        assert gate.col_stride == up.col_stride and gate.n_rt == up.n_rt and rs == gate.n_kc
-        assert (up.offset - gate.offset) % (gate.tile_bytes * rs) == 0, (up.offset, gate.offset)
-        kw = {"fmt": bg.fmt, "rows": bg.R, "M": T, "K": gate.K_in, "N": COLS * groups * 64, "tile_bytes": gate.tile_bytes,
-              "col_bytes": gate.col_stride, "passes": 2 * groups,
-              "out_cols": [[64 * (groups * c + j) for j in range(groups) for _ in range(2)] for c in range(COLS)],
-              "kc": KC, "kc_group": rs, "blocks": ((0, 2 * groups),), "region_rt": gate.n_rt, "c_panels": 64,
-              "dual": (up.offset - gate.offset) // (gate.tile_bytes * rs), "act": act,
-              **({"a_cols": (0, a_width)} if a_width else {})}
-        if gemm_op(kw, T, "gu").flow.a_res:  # (else A refetched per pass: the separate GEMMs)
-            op = gemm_op(kw, T, "gu", ops)
-            assert type(op) is GemmQOperator, "the dual epilogue: GemmQ"
-            return PhasePlan([Gemm(op, gate.offset - op.hdr_skip, c="GU")], None)
+        assert gate.col_stride == up.col_stride and gate.n_rt == up.n_rt
+        if rs == gate.n_kc and groups <= MAX_BD_ITER and 2 * rs <= MAX_CHAIN_BDS:
+            assert (up.offset - gate.offset) % (gate.tile_bytes * rs) == 0, (up.offset, gate.offset)
+            kw = {"fmt": bg.fmt, "rows": bg.R, "M": T, "K": gate.K_in, "N": COLS * groups * 64,
+                  "tile_bytes": gate.tile_bytes, "col_bytes": gate.col_stride, "passes": 2 * groups,
+                  "out_cols": [[64 * (groups * c + j) for j in range(groups) for _ in range(2)] for c in range(COLS)],
+                  "kc": KC, "kc_group": rs, "blocks": ((0, 2 * groups),), "region_rt": gate.n_rt, "c_panels": 64,
+                  "dual": (up.offset - gate.offset) // (gate.tile_bytes * rs), "act": act,
+                  **({"a_cols": (0, a_width)} if a_width else {})}
+            if gemm_op(kw, T, "gu").flow.a_res:  # (else A refetched per pass: the separate GEMMs)
+                op = gemm_op(kw, T, "gu", ops)
+                assert type(op) is GemmQOperator, "the dual epilogue: GemmQ"
+                return PhasePlan([Gemm(op, gate.offset - op.hdr_skip, c="GU")], None)
     for part, (r, b) in enumerate(((gate, bg), (up, bu))):
         assert not planar(b.fmt, b.R, KC) and _tp(b) * b.R == ROWS and not b.pt, (b.fmt, b.R)
         kw = {"fmt": b.fmt, "rows": b.R, "M": T, "K": r.K_in, "N": COLS * groups * 64, "tile_bytes": r.tile_bytes,

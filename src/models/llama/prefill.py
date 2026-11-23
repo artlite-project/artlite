@@ -167,7 +167,9 @@ class LlamaPrefill(ChunkPrefill):
         self._k_parts: dict[tuple, int] = {}  # (the output projections' K parts per region shape: plan_gemm)
         self._starts: dict[int, list[int]] = {}  # (per chunk size: its layers' first items, ``_layer_starts``)
         gemms: dict[str, object] = {}  # (one object per distinct GEMM)
-        self.ops = {t: self._ops(t, gemms) for t in sorted({self._t(T) for T in self.sizes})}
+        ts = sorted({self._t(T) for T in self.sizes})
+        ops = {t: self._ops(t, gemms) for t in reversed(ts)}  # (largest first: ``gu_dual`` at the largest sub-chunk size)
+        self.ops = {t: ops[t] for t in ts}
         self.plans = self.ops[SUB].plans if SUB in self.ops else self.ops[max(self.ops)].plans
         self.attn = {T: PA.AttnOperator(T=T, shape=s, kv_bytes=self.kv_bytes, kv_pad=self.pad, sub=self._pt(T))
                      for T in self.sizes}
@@ -208,7 +210,7 @@ class LlamaPrefill(ChunkPrefill):
                       for r in regs for g in PG.plan_phase(img, r, qt, ops=gemms, layout=lay, a_width=3 * self.kh).gemms]
                 plans[(L, "qkv")] = PG.PhasePlan(gs, lay)
                 gu = PG.plan_gate_up_pair(img, img.region(L, "gate"), img.region(L, "up"), t, gemms, 2 * self.kh,
-                                          act="silu")
+                                          act="silu" if getattr(self, "gu_dual", {True}) == {True} else "")
                 gu.gemms = [dataclasses.replace(g, a=a) for g, a in zip(gu.gemms, ("XR20", "XR21"))]
                 plans[(L, "gate_up")] = gu
                 for name in ("o", "down"):
