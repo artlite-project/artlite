@@ -459,19 +459,19 @@ __attribute__((noinline)) void {{ p }}_hstage(const float *__restrict v, float *
 // out = (v_s + sum_t w_t xp_{s + t}) / sqrt(5) (xp: h, then v), cur (the column's states ist, [state][slot 4][H8] fp32:
 // state n += out; block: state n + 1 = out), then cur's slice into res ([k block][slot sp][8] fp32: the state array's)
 __attribute__((noinline)) void {{ p }}_hink(const float *__restrict h, const bfloat16 *__restrict w, float *__restrict res,
-                                           float *__restrict ist, int inkn, int sp)
+                                           float *__restrict ist, int inkn, int sp, int pa)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    const int blk = (inkn >> 4) & 1, n1 = (inkn & 15) + blk;
+    const int blk = (inkn >> 4) & 1, n1 = (inkn & 15) + blk, a = pa & 255, n = (pa >> 8) & 15;
     AIE_LOOP_NO_UNROLL
-    for (int s = 0; s < sp; s++) {
+    for (int s = a; s < a + n; s++) {  // (the part's slots: its sequence's window h, then its rows)
         float *__restrict cur = ist + {{ H8 }} * (4 * n1 + s);
         AIE_LOOP_NO_UNROLL
         for (int c = 0; c < {{ H8 }}; c += 32) {
             aie::accum<accfloat, 32> acc(aie::load_v<32>(res + {{ RES_PITCH }} * s + c));
             for (int t = 0; t < 4; t++) {
-                const int i = s + t;
-                const float *__restrict xp = i < 3 ? h + {{ H8 }} * i + c : res + {{ RES_PITCH }} * (i - 3) + c;
+                const int i = s - a + t;
+                const float *__restrict xp = i < 3 ? h + {{ H8 }} * i + c : res + {{ RES_PITCH }} * (a + i - 3) + c;
                 aie::vector<bfloat16, 32> xh, xl;
                 al::split2<32>(aie::load_v<32>(xp), xh, xl);
                 const aie::vector<bfloat16, 32> wt = aie::load_v<32>(w + {{ H8 }} * t + c);
@@ -484,6 +484,8 @@ __attribute__((noinline)) void {{ p }}_hink(const float *__restrict h, const bfl
                 aie::store_v(cur + c, aie::add(aie::accum<accfloat, 32>(aie::load_v<32>(cur + c)), o).template to_vector<float>());
         }
     }
+    if (!(pa >> 16))  // (the step's last part: then cur's slice of every slot, over res's rows)
+        return;
     if ((inkn >> 16) & 1)  // (cur also into bank w's state i: ``protocol.M_INKN``)
         {{ p }}_cv((int32_t *)ist + {{ 4 * H8 }} * ({{ INK_STATES }} + 2 * ((inkn >> 17) & 1) + ((inkn >> 18) & 1)),
                    (const int32_t *)ist + {{ 4 * H8 }} * n1, {{ 4 * H8 // 16 }});
@@ -634,7 +636,7 @@ __attribute__((noinline)) void {{ p }}_hink_all(const int32_t *__restrict cmd, f
     const int kind = cmd[{{ C_KIND }}], inkn = cmd[{{ C_INKN }}], sp = cmd[{{ C_SP }}];
     if (kind == {{ K_INK }})
         {{ p }}_hink((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
-                     inkn, sp);
+                     inkn, sp, cmd[{{ C_PA }}]);
     else if (kind == {{ K_IPS }}) {
         {{ p }}_hips((const float *)(uintptr_t)cmd[1], ist, (float *)(uintptr_t)cmd[2] + {{ H8 }} * sp,
                      (inkn & 15) + ((inkn >> 4) & 1), cmd[3], sp);
@@ -1476,9 +1478,13 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
         }
 {% endif %}
 {% if tok %}
-        if (flags & {{ F_TOK }})  // a layer kind's token object: the column's cache objects of its attentions
+        if (flags & {{ F_TOK }}) {  // a layer kind's token object: the column's cache objects of its attentions
             st[{{ S_NAS }} + m[{{ M_TOK_KIND }}]] = m[{{ M_TOK_NG }} + col];
-        else if (m[{{ M_NASKIP }}] < 0)
+{% if states %}
+            if (m[{{ M_TOK_KIND }}] == 0)  // (the step's parts: the residual stream's step per part)
+                st[{{ S_PARTS }}] = m[{{ M_TOK_PARTS }}];
+{% endif %}
+        } else if (m[{{ M_NASKIP }}] < 0)
             st[{{ S_NASKIP }}] = st[{{ S_NAS }} - 1 - m[{{ M_NASKIP }}]];
 {% endif %}
         return;
@@ -1661,19 +1667,22 @@ __attribute__((minsize)) void {{ p }}_cinkh(const bfloat16 *__restrict x, int32_
     st[{{ S_ESRC }}] = 8;
     st[{{ S_ESLOT }}] = 0;
     st[{{ S_EJ }}] = 0;
-    st[{{ S_NE }}] = {{ H8 // 32 }} * (3 + st[{{ S_NS }}]);
+    st[{{ S_NE }}] = {{ H8 // 32 }} * (3 + ((st[{{ S_PQ }}] >> 8) & 15));  // (the pass's part's window: 3 rows and its slots')
     st[{{ S_IX }}] = (int32_t)(uintptr_t)(x + {{ 2 * META }});
 }
 
 __attribute__((minsize)) void {{ p }}_cink(const uint8_t *__restrict a, const bfloat16 *__restrict x, int32_t *__restrict ws,
                                           int32_t *__restrict cmd)
 {
-    const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     cmd[0] = (int32_t)(uintptr_t)(x + {{ 2 * META }}) + ({{ SHM }});
     cmd[1] = (int32_t)(uintptr_t)a + ({{ SHM }});
     cmd[2] = (int32_t)(uintptr_t)WS(float, {{ w_.res }}) + ({{ SHM }});
     cmd[{{ C_SP }}] = st[{{ S_SP }}];
     cmd[{{ C_INKN }}] = st[{{ S_INKN }}];
+    const int pq = st[{{ S_PQ }}], a0 = pq & 255, n = (pq >> 8) & 15;
+    cmd[{{ C_PA }}] = a0 | n << 8 | (pq >> 12 ? 0 : 1 << 16);  // (the pass's part: its first slot, its slots, the last)
+    st[{{ S_PQ }}] = (a0 + n) | (pq >> 12) << 8;
     cmd[{{ C_KIND }}] = {{ K_INK }};
 }
 
@@ -2278,7 +2287,7 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
             src = j < n0 + nb ? WS(float, {{ w_.res }}) + 32 * (j < n0 ? j : j - n0) : (const float *)(uintptr_t)st[{{ S_IX }}] + 32 * (j - n0 - nb);
             st[{{ S_EJ }}] = j + 1;
         } else {
-            src = r < 3 ? (const float *)(uintptr_t)st[{{ S_IX }}] + {{ H8 }} * r + 32 * j : WS(float, {{ w_.res }}) + {{ RES_PITCH }} * (r - 3) + 32 * j;
+            src = r < 3 ? (const float *)(uintptr_t)st[{{ S_IX }}] + {{ H8 }} * r + 32 * j : WS(float, {{ w_.res }}) + {{ RES_PITCH }} * (r - 3 + (st[{{ S_PQ }}] & 255)) + 32 * j;
             const int last = j + 1 == {{ H8 // 32 }};
             st[{{ S_EJ }}] = last ? 0 : j + 1;
             st[{{ S_ESLOT }}] = last ? r + 1 : r;
@@ -3012,6 +3021,9 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     if (flags & {{ F_INK }}) {  // (the rows into a zeroed res, then the residual stream's step)
         const int inkn = m[{{ M_INKN }}];
         st[{{ S_NINK }}] = 1;
+        const int pr = st[{{ S_PARTS }}];  // (its passes: one per part of the step, from slot 0)
+        st[{{ S_NPART }}] = pr ? pr & 15 : 1;
+        st[{{ S_PQ }}] = (pr ? pr >> 4 : m[{{ M_NS }}]) << 8;
         st[{{ S_NIQB }}] = (inkn >> 12) & 15 ? 1 : 0;
         st[{{ S_INKN }}] = inkn;
         {{ p }}_zv(WS(int32_t, {{ w_.res }}), {{ SLOTS * RES_PITCH * 4 // 64 }});

@@ -33,14 +33,16 @@ from .overlay import InklingOverlay
 
 class NpuInkling(OverlayModel):
     """The model on the NPU (module docstring). ``capacity``: the positions the KV caches hold; ``kv_k``: their K
-    precision ("hilo", "single"); ``wrap``: the sliding-window caches' ring (``InklingOverlay``)."""
+    precision ("hilo", "single"); ``wrap``: the sliding-window caches' ring (``InklingOverlay``); ``sequences``: the
+    sequences the device holds (``artlite-server -np``: lanes whose steps share a dispatch), each with its caches and
+    convs' state."""
 
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
-                 wrap: int | None = None):
+                 wrap: int | None = None, sequences: int = 1):
         self.gguf = gguf
-        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap)
+        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap, sequences=sequences)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
@@ -58,8 +60,9 @@ class NpuInkling(OverlayModel):
 
     def describe(self) -> str:
         ov = self.overlay
+        kv = f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache and conv state"
         return (f"{ov.image.nbytes / 1e9:.2f} GB of weights ({ov.image.streamed_bytes() / 1e9:.2f} GB dense), "
-                f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache and conv state ({self.capacity} positions, K "
+                f"{kv if ov.sequences == 1 else f'{ov.sequences} sequences of {kv} each'} ({self.capacity} positions, K "
                 f"{'hi + lo' if ov.kp == 2 else 'single'})")
 
     @alone
@@ -126,9 +129,9 @@ class Inkling(Model):
         text token's row takes and an image's does not)."""
         return self.gguf.rows("token_embd.weight", np.asarray(tokens))
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuInkling:
-        """(prompts as decode steps: ``prefill`` has no effect)"""
-        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k)
+    def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuInkling:
+        """(prompts as decode steps: ``prefill`` has no effect; ``sequences``: ``NpuInkling``'s)"""
+        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences)
 
 
 __all__ = ["Inkling", "NpuInkling"]

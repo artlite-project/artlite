@@ -814,6 +814,10 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% if CONV %}
     st[{{ A_WORDS }}] = 0;  // (the conv's loop count)
 {% endif %}
+{% if INK %}
+    st[{{ A_NXSKIP2 }}] = 0;  // (an F_INK phase's objects past its taps)
+    st[{{ A_NASKIP2 }}] = 0;
+{% endif %}
     if (flags & {{ F_MAIN }}) {
         if (!(flags & {{ F_LOADR }})) {  // its input objects (under its norm-weight objects), its tiles
 {% if MOE %}
@@ -844,10 +848,11 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
             }
             st[{{ A_NASKIP }}] = m[{{ M_NT }}];
 {% if INK %}
-            if (flags & {{ F_INK }}) {  // (the residual stream's step after the tiles: the history's X object, the taps' A
-                // object, a queries object)
-                st[{{ A_NXSKIP }}] += 1;
-                st[{{ A_NASKIP }}] += 1 + (((m[{{ M_INKN }}] >> 12) & 15) ? 1 : 0);
+            if (flags & {{ F_INK }}) {  // (the residual stream's step after the tiles: the taps' A object, the history's X
+                // object per part of the step, a queries object: in the main core's order)
+                st[{{ A_NASKIP }}] += 1;
+                st[{{ A_NXSKIP2 }}] = st[{{ A_NPARTS }}];
+                st[{{ A_NASKIP2 }}] = ((m[{{ M_INKN }}] >> 12) & 15) ? 1 : 0;
             }
 {% endif %}
         }
@@ -861,6 +866,8 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% endif %}
         int32_t *__restrict tk = st + {{ A_TOK }} + 4 * t;
 {% if INK %}
+        if (t == 0)  // (the step's parts: an F_INK phase's history objects, one each)
+            st[{{ A_NPARTS }}] = m[{{ M_TOK_PARTS }}] ? m[{{ M_TOK_PARTS }}] & 15 : 1;
         if ((t & {{ SMAX - 1 }}) == 0)  // (a kind's first token object: tau of the step's slots, fp32, its payload's first)
             aie::store_v(AW(float, {{ a.itau }}) + {{ SMAX }} * (t >= {{ SMAX }}), aie::load_v<{{ SMAX }}>((const float *)(x + {{ 2 * META }})));
 {% endif %}

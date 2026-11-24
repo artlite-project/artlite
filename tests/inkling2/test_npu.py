@@ -14,9 +14,12 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.decode.protocol import SLOTS
+from artlite.decode.step import Part
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import inkling_gguf
+from artlite.model_config import InklingConfig, inkling_gguf
 from models.inkling2.inkling import Inkling, NpuInkling
+from models.inkling2.overlay import InklingOverlay
 from models.sampling import Sampling
 
 from ..common import essay
@@ -123,6 +126,76 @@ def test_ring() -> None:
         del model
     bad = np.flatnonzero((rows[0] != rows[1]).any(-1))
     assert not bad.size, bad[:8]
+
+
+def test_sequences() -> None:
+    """Four sequences on the device (``InklingOverlay(sequences=4)``): alternated steps of one sequence's 1 .. 4 slots,
+    and joint steps of 2 .. 4 sequences' parts (dealt at random, one sequence joining late, a sequence's second slot
+    too), give every slot the logits of its sequence alone in steps of one, bit for bit (each sequence's caches, raw
+    rings, history windows: the residual stream's step per part)."""
+    path = _path()
+    g = GGUFFile(path)
+    cfg = InklingConfig.from_gguf(g)
+    N, NSEQ = 40, 4
+    ids = llama_tokenize(path, essay("founders.txt"))[:NSEQ * N]
+    tn = np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
+
+    def emb(t: list[int]) -> np.ndarray:
+        x = g.rows("token_embd.weight", np.asarray(t)).astype(np.float32)
+        return x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + cfg.rms_norm_eps).astype(np.float32) * tn
+
+    xs = [emb(ids[s * N:(s + 1) * N]) for s in range(NSEQ)]
+    ov = InklingOverlay(g, max_positions=1024, sequences=NSEQ)
+    ov.load()
+
+    def run(x: np.ndarray, at: int | tuple[Part, ...]) -> np.ndarray:
+        return np.asarray(ov.step(x[None], at, logits=True), np.float32).copy()
+
+    def fresh() -> None:
+        for s in range(NSEQ):
+            ov.select(s)
+            ov.reset()
+
+    want = []
+    for s in range(NSEQ):  # (alone, in steps of one, as sequence 0)
+        ov.select(0)
+        ov.reset()
+        want.append(np.concatenate([run(xs[s][p:p + 1], p) for p in range(N)]))
+    assert not np.array_equal(want[0], want[1])
+
+    def check(got: np.ndarray, at: list[tuple[int, int]], what: str) -> None:
+        bad = [(s, p) for row, (s, p) in zip(got, at, strict=True) if not np.array_equal(row, want[s][p])]
+        assert not bad, f"{what}: (sequence, position) {bad[:8]} differ from the sequence alone"
+
+    fresh()  # alternated: a step of one sequence, then of the next
+    pos, i = [0] * NSEQ, 0
+    while min(pos) < N:
+        s = i % NSEQ
+        n = min((1, 4, 3, 2)[(i // NSEQ + s) % 4], N - pos[s])
+        i += 1
+        if n:
+            ov.select(s)
+            check(run(xs[s][pos[s]:pos[s] + n], pos[s]), [(s, pos[s] + k) for k in range(n)], "alternated")
+            pos[s] += n
+    fresh()  # joint steps
+    rng = np.random.default_rng(0)
+    pos, steps, parts_seen = [0] * NSEQ, 0, set()
+    while min(pos) < N:
+        take = [[s, 1] for s in range(NSEQ) if pos[s] < N and not (s == 2 and steps < 6)]
+        parts_seen.add(len(take))
+        spare = SLOTS - len(take)
+        for t in take:
+            if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
+                t[1] += 1
+                spare -= 1
+        rng.shuffle(take)
+        parts = tuple(Part(s, pos[s], n) for s, n in take)
+        got = run(np.concatenate([xs[s][pos[s]:pos[s] + n] for s, n in take]), parts)
+        check(got, [(s, pos[s] + k) for s, n in take for k in range(n)], f"step {steps} {parts}")
+        for s, n in take:
+            pos[s] += n
+        steps += 1
+    assert {2, 3, 4} <= parts_seen, parts_seen
 
 
 def test_drafts() -> None:

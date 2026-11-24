@@ -208,6 +208,9 @@ TOKEN = XMETA.kind("token")
 # M_NASKIP = -1 - index: that token's count
 M_TOK_KIND = TOKEN.word("M_TOK_KIND", at=41)
 M_TOK_NG = TOKEN.block("M_TOK_NG", COLS, at=48)
+# (``states`` designs) the step's parts (token object 0): their count P | the slots of each, 4 bits, from bit 4 (several
+# sequences' slots, ``decode.step.Part``; 0: one part of all the slots): the residual stream's step runs per part
+M_TOK_PARTS = TOKEN.word("M_TOK_PARTS", at=42)
 F_TOK = TOKEN.flag("F_TOK", 16)  # (another core's object) a token object: the main core keeps M_TOK_NG + col (its cache A objects)
 
 # (moe) the route object's words (the layer's expert halves at M_RBASE (device address lo, hi) + k M_RSTR, M_RTGU + M_RTDN A
@@ -276,6 +279,9 @@ S_NEGRP, S_NEGA, S_NETL = STATES_STATE.words("S_NEGRP S_NEGA S_NETL", at=S_WORDS
 S_NINK = STATES_STATE.word("S_NINK", at=S_WORDS + 3)
 S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NIQB S_INKN S_IX", at=S_WORDS + 5)
 S_BLEND = STATES_STATE.word("S_BLEND", at=S_WORDS + 14)  # (F_BLEND) M_BLEND
+# (F_INK) the step's parts (M_TOK_PARTS), the residual stream's step's passes (a trip count: one per part) and the pass's
+# part: its first slot | the slots of it and the parts after it, 4 bits each, from bit 8
+S_PARTS, S_NPART, S_PQ = STATES_STATE.words("S_PARTS S_NPART S_PQ", at=60)
 # (``qtails`` designs, of the longer state: B_QT blocks) the row tile of its group (its rows at yt + S_QY: block S_QS of
 # the group's), the group's row tiles (0: a block of plain row tiles)
 QT_STATE = STATE.kind("qt", exclusive_with=(ROT_STATE, PT_STATE))
@@ -308,6 +314,7 @@ C_NST, C_CSET, C_XC0, C_ACC = CMD.common.words("C_NST C_CSET C_XC0 C_ACC", at=6)
 # them), C_INKN the phase's M_INKN, C_NS its slots; K_ILOAD (F_LOADR): word 0 the payload, C_INKN state << 2 | slot
 K_INK, K_IPS, K_ILOAD = CMD.common.values("K_INK K_IPS K_ILOAD", of="kind", start=15)
 C_INKN, C_NS = CMD.common.words("C_INKN C_NS")
+C_PA = CMD.common.word("C_PA")  # (K_INK) the pass's part: its first slot | its slots << 8 | the last part << 16
 # (``states``) a blend's input object (word 0 its payload, 3 -1) or A object i (word 1, 3 i; ``hblend``: 2 res, C_BLEND
 # M_BLEND)
 K_BLEND = CMD.common.values("K_BLEND", of="kind", start=18)[0]

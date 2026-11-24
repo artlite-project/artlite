@@ -106,7 +106,7 @@ M_TOK_G0 = TOKEN_ATT.block("M_TOK_G0", COLS, at=56)
 # two kinds of layer at most)
 A_TOK_AT = 40
 A_WORDS = A_TOK_AT + 4 * 2 * SLOTS
-STATE = WordMap("attention core state", A_WORDS + 8)  # (ink: its words past A_WORDS, ``INK_STATE``)
+STATE = WordMap("attention core state", A_WORDS + 10)  # (ink: its words past A_WORDS, ``INK_STATE``)
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_NO, A_NPS, A_XL, A_P, A_S, A_I, A_EIDX,
  A_HD, A_KIND, A_OWN, A_WIN, A_QC, A_NH, A_SA, A_POS, A_MERGE, A_CEND, A_INS, A_QS, A_KS, A_EOFF0, A_EN0, A_EOFF1,
  A_EN1, A_EREC) = STATE.common.words(
@@ -125,7 +125,12 @@ A_TOK = STATE.common.block("A_TOK", 4 * 2 * SLOTS, at=A_TOK_AT)
 INK_STATE = STATE.kind("ink")
 A_NRING, A_NKVR, A_NRE, A_NEX, A_GP0, A_FULL, A_EP0 = INK_STATE.words(
     "A_NRING A_NKVR A_NRE A_NEX A_GP0 A_FULL A_EP0", at=A_WORDS)
-A_WORDS_INK = A_WORDS + 8
+A_NPARTS = INK_STATE.word("A_NPARTS", at=A_WORDS + 7)  # (ink) the step's parts (``protocol.M_TOK_PARTS``; at least 1)
+# (ink) an F_INK phase's objects past its tiles and taps, skipped in the main core's order: the history objects (X, one per
+# part), then the queries object (A): else the main core's X FIFO holds them back from the broadcast while it waits for
+# the tiles
+A_NXSKIP2, A_NASKIP2 = INK_STATE.words("A_NXSKIP2 A_NASKIP2", at=A_WORDS + 8)
+A_WORDS_INK = A_WORDS + 10
 # (ink) an F_ATT object's words: the layer is a full one (M_AFULL), the relative extent (M_AEXT)
 ATT_INK = XMETA.kind("ink attention", extends=(ATT,))
 M_AFULL, M_AEXT = ATT_INK.words("M_AFULL M_AEXT", at=34)
@@ -406,6 +411,13 @@ class Attn:
                 for _ in range_(ws[i_a + A_NASKIP]):
                     a_f.acquire(1)
                     a_f.release(1)
+                if self.ink:
+                    for _ in range_(ws[i_a + A_NXSKIP2]):
+                        x_f.acquire(1)
+                        x_f.release(1)
+                    for _ in range_(ws[i_a + A_NASKIP2]):
+                        a_f.acquire(1)
+                        a_f.release(1)
                 for _ in range_(ws[i_a + A_NQP]):  # (an attention step)
                     if tr is not None:
                         tr.acquire(1)

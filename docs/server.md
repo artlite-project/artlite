@@ -459,9 +459,10 @@ llama-server (`--cache-ram`: 8 GiB by default, or half of the RAM left once the 
 in router mode each model's part of that: over `--models-max`): when a request continues one of them (an agent's
 subagent, a title request, another chat in the web UI), its cache is copied back to the NPU (~15 GB/s: 30-45 ms for
 32K positions of the 35B-A3B) instead of running its prompt again. The
-Qwen models' Gated DeltaNet states, LFM3's conv histories and Flint's sliding-window rings (a context past 16384
-positions) cannot go back, so for them the server saves the states (checkpoints, `--ctx-checkpoints`; Qwen3.6-35B-A3B:
-80 MB, a few milliseconds each; LFM3: 2.8 MB; Flint: ~35 MB) at the end of each
+Qwen models' Gated DeltaNet states, LFM3's conv histories, Inkling 2's conv states and Flint's sliding-window rings (a
+context past 16384 positions) cannot go back, so for them the server saves the states (checkpoints, `--ctx-checkpoints`;
+Qwen3.6-35B-A3B: 80 MB, a few milliseconds each; LFM3: 2.8 MB; Flint: ~35 MB; Inkling 2: 10.6 MB, with its rings' windows
+past 2048 positions of `-c` ~160 MB) at the end of each
 prompt and where its first
 user message begins: a prompt continues from the latest one it shares (the client's own rendering of the last answer,
 another answer to the same prompt), and a new conversation with the same system prompt and tools from the second. The
@@ -474,7 +475,7 @@ saves the state where each prompt's last message begins, and a turn continues fr
 
 ### Several requests at a time
 
-With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, Qwen3.5-9B, Qwen3.6-27B, Qwen3.8-27B (their PARO checkpoints too) and MiniCPM-V 4.7 serve up to N requests at a time. The NPU holds N
+With `-np N`, Llama 3.x, Qwen3, Gemma 4, Flint, Inkling 2, LFM3, Spark-X, Qwen3.5-9B, Qwen3.6-27B, Qwen3.8-27B (their PARO checkpoints too) and MiniCPM-V 4.7 serve up to N requests at a time. The NPU holds N
 sequences, each with KV caches of `-c` positions (N times one sequence's cache memory: llama-server divides `-c` among its slots), and the
 requests that generate share their decode steps. A step streams the weights once for 4 tokens: with one request those
 are its token and drafts of the next ones, with several a token of each, so requests that meet finish sooner than in a
@@ -675,10 +676,10 @@ Generation:
 |---|---|
 | `-c N`, `--ctx-size` | KV cache positions, rounded up to a power of two >= 4096 (default 0: 32768, at most the model's context) |
 | `-n N`, `--n-predict` | tokens to generate when a request does not say (default -1: until an end-of-sequence token or a full KV cache) |
-| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3, Gemma 4, Flint, LFM3, Spark-X, the 9B / 27B Qwen models and MiniCPM-V](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
+| `-np N`, `--parallel` | requests at a time (default 1): [Llama 3.x, Qwen3, Gemma 4, Flint, Inkling 2, LFM3, Spark-X, the 9B / 27B Qwen models and MiniCPM-V](#several-requests-at-a-time) generate for N at once, each with KV caches of `-c` positions; another model serves one at a time |
 | `--cache-prompt`, `--no-cache-prompt` | continue from the prefix a prompt shares with the cached tokens (default on) |
 | `-cram N`, `--cache-ram` | MiB of host RAM for the prompt cache: the conversations it saves and the checkpoints (default 8192, at most half of the RAM still available once the model is loaded, in router mode that over `--models-max`; -1: no limit, 0: none saved) |
-| `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3, Flint past 16384 positions; default 32) |
+| `-ctxcp N`, `--ctx-checkpoints` | checkpoints per conversation at most (Qwen3.5 / 3.6 / 3.8, Occamy, MiniCPM-V, LFM3, Inkling 2, Flint past 16384 positions; default 32) |
 | `--lookup`, `--no-lookup` | draft tokens from the prompt in the generation's steps ([artlite-cli](cli.md#text)'s; default on) |
 | `--spec-type auto\|none\|draft-mtp\|draft-dflash\|draft-dspark`, `-md FILE`, `--spec-draft-model` | the model's drafter, as [artlite-cli](cli.md)'s (default `auto`: the one found by its file name) |
 | `--spec-draft-n-max N` | draft tokens per step at most, as [artlite-cli](cli.md)'s; a request's `speculative.n_max` lowers it for its generation |

@@ -52,6 +52,7 @@ before (S3's next pieces: the whole step with the output's mix and the LM head).
 
 import math
 import os
+from typing import Self
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -109,6 +110,7 @@ from artlite.decode.protocol import (
     M_RSTR,
     M_SLOT,
     M_TOK_NG,
+    M_TOK_PARTS,
     META,
     SLOTS,
     XB,
@@ -117,7 +119,7 @@ from artlite.decode.protocol import (
     region_bytes,
 )
 from artlite.decode.screen import Screen, Screened
-from artlite.decode.step import Fill, Part, Rec, StepPlan, Tail
+from artlite.decode.step import Fill, Part, PartBD, Rec, StepPlan, Tail
 from artlite.decode.vring import PAIR, tails
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import InklingConfig
@@ -182,6 +184,27 @@ def psums(states: np.ndarray, queries: np.ndarray) -> np.ndarray:
     return out
 
 
+class Subs(tuple):
+    """A step's attention sub-steps (first slot, slots) and its parts' slots (``parts``; one part: a step of one sequence):
+    the key of its transaction, which takes a history window per part (the residual stream's step, ``_o_phase``)."""
+
+    parts: tuple[int, ...]
+
+    def __new__(cls, subs: tuple, parts: tuple[int, ...]) -> Self:
+        t = super().__new__(cls, subs)
+        t.parts = tuple(parts)
+        return t
+
+    def __eq__(self, other: object) -> bool:
+        return tuple.__eq__(self, other) and getattr(other, "parts", None) == self.parts
+
+    def __ne__(self, other: object) -> bool:
+        return not self == other
+
+    def __hash__(self) -> int:
+        return hash((tuple(self), self.parts))
+
+
 def pow2(n: int) -> int:
     """The state objects of a k range for a mix of n states (``protocol.M_NR``: 1, 2, 4 or 8)."""
     return 1 << (n - 1).bit_length()
@@ -196,12 +219,13 @@ class InklingOverlay(AttentionOverlay):
 
     CONFIG, IMAGE = InklingConfig, InklingImage
     CHAIN = 1
+    SEQ = ("KV",)  # (a sequence's caches, raw rings, history windows and open records)
     OPS = ("att", "moe")
     LOADS = INK_STATES + 2 * INK_BANKS  # (F_LOADR objects per slot at most: the states, the banks)
 
     def __init__(self, gguf: GGUFFile, *, visits: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, ffn: bool = True,
-                 paged: tuple[str, ...] | None = None, wrap: int | None = None):
+                 paged: tuple[str, ...] | None = None, wrap: int | None = None, sequences: int = 1):
         cfg = InklingConfig.from_gguf(gguf)
         vs = list(range(len(cfg.visits))) if visits is None else list(visits)
         self.vis = {v: cfg.visits[v] for v in vs}
@@ -213,7 +237,7 @@ class InklingOverlay(AttentionOverlay):
         layers = {x.layer for x in self.vis.values()} | \
             ({cfg.visits[self.after].layer} if ffn and not self.lm_ok else set())
         image = None if weights is not None else InklingImage(gguf, cfg, layers=sorted(layers), vocab=vocab)
-        super().__init__(gguf, layers=vs, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
+        super().__init__(gguf, layers=vs, vocab=vocab, kv_k=kv_k, weights=weights, image=image, sequences=sequences)
         img = self.image
         regions = ("q", "k", "v", "o") + (("router",) if ffn else ())
         fmts = {b.fmt for L in img.layers for name in regions for b in img.region(L, name).blocks}
@@ -252,7 +276,7 @@ class InklingOverlay(AttentionOverlay):
         self.HIST = HIST_ROWS * 4 * self.h8  # (a history window's bytes)
         self.nst = dict(zip(range(len(cfg.visits)), cur_states(cfg)))
         self.n0 = self.nst[vs[0]]  # (the first visit's cur: its states 0 .. n0 come from the host)
-        self._hbase = -3  # (the history windows' first position)
+        self._hbase = [-3] * sequences  # (per sequence: its history windows' first position)
         self._sa_sp = 0  # (the packed slots of the state array's layout whose padding is zero: ``write_states``)
         self._eskip: dict[tuple[int, int], tuple] = {}  # ((visit, slot) -> its raw K / V objects' EGRP words: ``_set_parts``)
         if self.lm_ok and img.screen:  # (the screened head's host side: the exact logits of its candidates)
@@ -400,12 +424,17 @@ class InklingOverlay(AttentionOverlay):
         for L, off in self.rel.items():
             E = np.asarray(g.tensor(f"blk.{L}.attn_rel_bias.weight").dequantize(), np.float32).reshape(-1, cfg.rel_length).T
             act[off:off + E_ROWS * 2 * 1280] = ink_rel(E).view(np.uint8).reshape(-1)
+        for s in range(1, self.sequences):  # (the other sequences' convs' state: zero, as ``reset`` leaves the selected one's)
+            kv = self.dev.view(self.seq_name("KV", s))
+            for o, n in self._conv_regions():
+                kv[o:o + n] = 0
+            self.dev.flush(self.seq_name("KV", s))
 
     def reset(self) -> None:
         """(and the raw rings and history windows: the convs' history before position 0 is zero)"""
         super().reset()
         self._eskip.clear()
-        self._hbase = -3
+        self._hbase[self.seq] = -3
         if self.dev is not None:
             kv = self.dev.view("KV")
             for v in self.layers:
@@ -428,13 +457,13 @@ class InklingOverlay(AttentionOverlay):
             a = host_bytes((n,))
             a[:] = kv[o:o + n]
             parts.append(a)
-        snap.extra["conv"] = (parts, self._hbase)
+        snap.extra["conv"] = (parts, self._hbase[self.seq])
         return snap
 
     def restore(self, snapshot: Snapshot) -> None:
         """(the convs' state too)"""
         super().restore(snapshot)
-        parts, self._hbase = snapshot.extra["conv"]
+        parts, self._hbase[self.seq] = snapshot.extra["conv"]
         kv = self.dev.view("KV")
         for (o, n), a in zip(self._conv_regions(), parts, strict=True):
             kv[o:o + n] = a
@@ -443,10 +472,10 @@ class InklingOverlay(AttentionOverlay):
     def _ran(self, p: int, S: int, seq: int | None = None) -> None:
         """(and the history windows: rows p - 3 .. p + S - 1)"""
         super()._ran(p, S, seq)
-        self._hbase = p - 3
+        self._hbase[self.seq if seq is None else seq] = p - 3
 
     def _ring_state(self, seq: int | None = None) -> tuple:
-        return super()._ring_state(seq) + (self._hbase,)
+        return super()._ring_state(seq) + (self._hbase[self.seq if seq is None else seq],)
 
     def _expert_vec(self, name: str) -> np.ndarray:
         """A layer's per-expert vector (n_experts,) float64; a scale the file has not (a layer of unscaled experts) ones."""
@@ -651,14 +680,27 @@ class InklingOverlay(AttentionOverlay):
         n1 = self.nst[v] + int(self.vis[v].block)
         self._sync(seq, {"o"}, {f"sa{n1}", f"ps{(v, 'f')}", "hist"})
         self._inputs(seq, self.inp[(v, "o")][0], S)
-        hf = st.__dict__.setdefault("hfills", [])
-        for c in range(COLS):
-            hf.append((seq.fill("X", c, dev.address("KV", self.hist[(v, 0)] + c * self.HIST) - (XB - XPAY), XB), v, 0, c))
+        self._windows(seq, st, v, 0)
         row = 4 * self.h8
         for c in range(COLS):
-            seq.drain("C", c, dev.address("KV", self.hist[(v, 0)] + c * self.HIST), (3 + S) * row)
             seq.drain("C", c, dev.address("ACT", self.sa + n1 * self.state_bytes(sp) + c * row * sp), row * sp)
             seq.drain("C", c, dev.address("ACT", self.ps[(v, "f")] + (XB - XPAY) + 512 * c), 512)
+
+    def _windows(self, seq: Sequence, st: StepPlan, v: int, i: int, *, fills: bool = True, drains: bool = True) -> None:
+        """Visit v's history window i (0: the attention's post conv, 1: the FFN's) of each part of the step (its sequence's,
+        in its KV: the residual stream's step per part): per column its X object (patched per step: ``_set_parts``) and
+        its drain, the 3 rows read and the part's (``PartBD``)."""
+        dev, row = self.dev, 4 * self.h8
+        parts = st.subs.parts
+        hf = st.__dict__.setdefault("hfills", [])
+        for c in range(COLS) if fills else ():
+            for q in range(len(parts)):
+                o = self.hist[(v, i)] + c * self.HIST
+                hf.append((seq.fill("X", c, dev.address("KV", o) - (XB - XPAY), XB), v, i, c, q))
+        for c in range(COLS) if drains else ():
+            for q, n in enumerate(parts):
+                o = self.hist[(v, i)] + c * self.HIST
+                st.part_bds.append(PartBD(seq.drain("C", c, dev.address("KV", o), (3 + n) * row)[0], q, o, (3 + n) * row))
 
     def _operator(self, seq: Sequence, st: StepPlan, L: int, name: str, weights: list[tuple[int, str]]) -> None:
         if name == "moe":
@@ -716,18 +758,17 @@ class InklingOverlay(AttentionOverlay):
             seq.drain("C", c, dev.address("ACT", self.part + XB + 384 * c), S * 3 * 384,
                       (96, 3, XPAY // 4, 3 * XPAY // 4), COLS, (pc // 4, COLS))
         seq.sync()
-        hf = st.__dict__.setdefault("hfills", [])
         for c in range(COLS):  # (the partials are in DDR: the experts' tasks are complete)
             seq.device_done("A", c)
             seq.fill("X", c, dev.address("ACT", self.comb[v] + c * XB), XB)  # (the visit's metadata, the partials)
             seq.fill("X", c, dev.address("ACT", self.part + c * pc + XPAY), 3 * S * XB, DIMS_OBJ)
-            hf.append((seq.fill("X", c, dev.address("KV", self.hist[(v, 1)] + c * self.HIST) - (XB - XPAY), XB), v, 1, c))
+        self._windows(seq, st, v, 1, drains=False)
         n1 = self.nst[v] + int(self.vis[v].block)
         row = 4 * self.h8
         bk, nxt = self.bank_of(v), v + 1 < len(self.cfg.visits) and self.cfg.visits[v + 1].messages
         ST = self.state_bytes(sp)
+        self._windows(seq, st, v, 1, fills=False)
         for c in range(COLS):
-            seq.drain("C", c, dev.address("KV", self.hist[(v, 1)] + c * self.HIST), (3 + S) * row)
             seq.drain("C", c, dev.address("ACT", self.sa + n1 * ST + c * row * sp), row * sp)
             seq.drain("C", c, dev.address("ACT", self.ps[(v + 1, "a")] + (XB - XPAY) + 512 * c), 512)
             if bk is not None:  # (cur again: its bank's copy)
@@ -785,18 +826,22 @@ class InklingOverlay(AttentionOverlay):
         sp, nq = packed_slots(st.S), self.q_heads * kind.hd
         rel = self.rel[self.layer(L)]
         efills = st.__dict__.setdefault("efills", [])
+        starts = np.cumsum((0, *st.subs.parts))
         for u, (a, n) in enumerate(subs):
+            q = int(np.searchsorted(starts, a, side="right")) - 1  # (the sub-step's part: its sequence's raw rings)
             seq.sync()  # (sub-step u - 1's records and raw ring in DDR, or the q and raw K / V objects)
             for c in range(COLS):
                 reg = self.att_reg[(L, c)] + a * XB
                 seq.fill("X", c, dev.address("ACT", reg), 2 * n * XB, (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
                 efills.append((seq.fill("X", c, dev.address("ACT", rel), XB, (64, E_ROWS, 640, 32)), L, u))
             for c in range(COLS):
-                seq.fill("A", c, dev.address("KV", self.raw_ring(L, c)), RING)
+                st.part_bds.append(PartBD(seq.fill("A", c, dev.address("KV", self.raw_ring(L, c)), RING), q,
+                                          self.raw_ring(L, c), RING))
                 st.fills += [Fill(seq.fill("A", c, dev.address("KV", self.kv_off[L]), T), L, c, u, f)
                              for f in range(2 if kind.wrap else 1)]
             for c in range(COLS):
-                seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)
+                st.part_bds.append(PartBD(seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)[0], q,
+                                          self.raw_ring(L, c), 8192))
             for c in range(COLS):
                 st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t)
                              for t in range(tails(n))]
@@ -837,11 +882,15 @@ class InklingOverlay(AttentionOverlay):
                 self.dev.flush("ACT", off, 4 * META)
             self._eskip[(v, s)] = (ne, nt)
         at, addr, nb = [], [], []
-        a = pos[0] - 3 - self._hbase  # (the history windows' rows of positions p - 3 ..)
-        assert 0 <= a <= HIST_ROWS - 4, (pos[0], self._hbase)
-        for x, v, i, c in st.__dict__.get("hfills", ()):
+        rows = []  # (per part: its sequence's KV and the window's rows of positions p - 3 ..)
+        for q in parts:
+            a = q.position - 3 - self._hbase[q.seq]
+            assert 0 <= a <= HIST_ROWS - 4, (q, self._hbase[q.seq])
+            rows.append((self.seq_name("KV", q.seq), a))
+        for x, v, i, c, q in st.__dict__.get("hfills", ()):
             at.append(x)
-            addr.append(self.dev.address("KV", self.hist[(v, i)] + c * self.HIST + a * 4 * self.h8) - (XB - XPAY))
+            buf, a = rows[q]
+            addr.append(self.dev.address(buf, self.hist[(v, i)] + c * self.HIST + a * 4 * self.h8, own=True) - (XB - XPAY))
             nb.append(XB)
         for x, L, u in st.__dict__.get("efills", ()):
             use = self.uses[L]
@@ -863,14 +912,18 @@ class InklingOverlay(AttentionOverlay):
         before the first with an E object; the rest by the object's EGRP words, ``_set_parts``)"""
         act = self.dev.view("ACT")
         pos = [q.position + i for q in parts for i in range(q.n)]
+        act[st.tok:][:4 * META].view(np.int32)[M_TOK_PARTS] = len(parts) | sum(q.n << 4 * (j + 1) for j, q in enumerate(parts))
         for k in range(len(self.kinds)):
             for a, n in self._kind_subs(st.subs, k):
                 _, ng = self.ranges(k, pos[a])[0]
                 me = act[st.tok + (SLOTS * k + a + n - 1) * XB:][:4 * META].view(np.int32)
                 me[M_TOK_NG:M_TOK_NG + COLS] = 1 + self.G * (ng - min(ng, INK_EG))
 
-    def subs(self, p: int, S: int) -> tuple[tuple[int, int], ...]:
-        return self._substeps(p, S, self.hd)
+    def subs(self, p: int, S: int) -> Subs:
+        return Subs(self._substeps(p, S, self.hd), (S,))
+
+    def _join(self, parts: tuple[Part, ...]) -> Subs:
+        return Subs(super()._join(parts), tuple(q.n for q in parts))
 
     def _rope(self, kind: int, positions: list[int]) -> np.ndarray:
         """(the token objects' payload: tau of the slots, fp32; 1 for the sliding-window kind)"""
@@ -931,9 +984,10 @@ class InklingOverlay(AttentionOverlay):
             act[self.ps[(v, m)] + XB - XPAY:][:ps.nbytes] = ps.reshape(-1).view(np.uint8)
             self.dev.flush("ACT", self.ps[(v, m)], XB)
 
-    def step(self, states: np.ndarray, position: int, bank: np.ndarray | None = None, *,
+    def step(self, states: np.ndarray, position: int | tuple[Part, ...], bank: np.ndarray | None = None, *,
              logits: bool = False) -> np.ndarray | Screened | None:
-        """One step of S slots at position .. position + S - 1: states (n0 + 1, S, hidden) the first visit's input states,
+        """One step of S slots at position .. position + S - 1 (several sequences' slots: their parts, ``decode.step.Part``):
+        states (n0 + 1, S, hidden) the first visit's input states,
         bank (2, S, hidden) the bank its messages mix (``write_states``); ``logits`` (the whole model): the LM head's
         (``Screened``: the logits before the softcap), else None."""
         S = states.shape[1]

@@ -195,6 +195,7 @@ from .protocol import (
     S_NLS,
     S_NM,
     S_NNO,
+    S_NPART,
     S_NPQ,
     S_NPS,
     S_NQGU,
@@ -964,18 +965,19 @@ class DecodeOverlayOperator(ArtcOperator):
                     if psums:
                         emits()  # (a header: the updated residual slice)
                     tiles()
-                if self.states:  # (F_INK) the residual stream's step on the phase's rows: the history window out, the
-                    # helper's step (the history: X, the taps: A), the next mix's partial sums (the queries: the next A
-                    # object), cur's slice and the partial sums out
+                if self.states:  # (F_INK) the residual stream's step on the phase's rows, per part of the step (several
+                    # sequences' slots): its history window out, the helper's step (its history: X, the taps: A); then the
+                    # next mix's partial sums (the queries: the next A object), cur's slice and the partial sums out
                     for _ in range_(ws[i_st + S_NINK]):
-                        x = x_f.acquire(1)
                         a = a_f.acquire(1)
-                        cinkh(x, ws)
-                        emits()
-                        command(lambda c, x=x, a=a: cink(a, x, ws, c))
-                        answer()
+                        for _ in range_(ws[i_st + S_NPART]):
+                            x = x_f.acquire(1)
+                            cinkh(x, ws)
+                            emits()
+                            command(lambda c, x=x, a=a: cink(a, x, ws, c))
+                            answer()
+                            x_f.release(1)
                         a_f.release(1)
-                        x_f.release(1)
                         for _ in range_(ws[i_st + S_NIQB]):
                             a = a_f.acquire(1)
                             command(lambda c, a=a: cips(a, ws, c))

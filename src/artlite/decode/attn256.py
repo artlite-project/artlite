@@ -113,7 +113,7 @@ from ..operators.l1_layout import L1_BYTES
 from ..operators.util import Attr, cos_sin_rows, regions, rup
 from ..operators.words import WordMap
 from .kv import Records
-from .protocol import M_MODEL, META, PHASE, SLOTS, TOK_STATE, XB, XMETA
+from .protocol import M_MODEL, META, PHASE, SLOTS, STATES_STATE, TOK_STATE, XB, XMETA
 from .protocol import STATE as MAIN_STATE
 
 
@@ -183,7 +183,7 @@ PO = 288  # bytes of an octet's P panels of a group (4 panels)
 # state words of the main core for the gates (main_gates: its workspace's words past decode.protocol's of a dense design,
 # where the token objects' words are not: ``GATES``): the q objects to gate, those seen, the slots, the query rows per slot,
 # the R objects of o, those relayed
-GATES = MAIN_STATE.kind("attn256 gates", exclusive_with=(TOK_STATE,))
+GATES = MAIN_STATE.kind("attn256 gates", exclusive_with=(TOK_STATE, STATES_STATE))  # (Gemma's designs: no Inkling states)
 MG_Q, MG_I, MG_S, MG_QR, MG_NO, MG_E, MG_SI = GATES.words("MG_Q MG_I MG_S MG_QR MG_NO MG_E MG_SI", at=56)
 # M_SPLIT, bits 1:0: the chain divides the cache (0: each column over all of it), a round's chains do; bit 2 (a round):
 # its KV head; bit 3: no records (a round's other chain)
