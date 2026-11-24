@@ -30,6 +30,15 @@ different shape, or a fixed tool.
 | Two upshifts so that 4 distinct shift amounts fit the `s` registers | II 53 vs 41 |
 | Loop-invariant x reloaded through an opaque pointer instead of hoisted and spilled | same II and NPU time |
 
+## Decode GEMV tile kernels (`formats/*.mmv`)
+
+Cycles per core and half tile, NPU event windows (`tests.decode.mmv.MmvOperator`, `variant_search --npu --region`).
+
+| idea | result |
+|---|---|
+| A format's helpers `always_inline` into its tile kernel (each has that one caller) | Q8_0 -10%, Q4_K -1%, Q5_K +1%, Q6_K +4%, NVFP4 +5% (`iq4_w` still a call): what stays a call keeps the caller's values in callee-saved registers, and the inlined loops lose II (NVFP4's `nv_x` 14 -> 20) or spill (Q5_K: 21 registers) |
+| ... the shared helpers too (`_sc`, `_sc1`, `iq4_w`: the tile kernel calls nothing) | Q8_0 -14%, Q4_K -5%, Q6_K -2%, NVFP4 -2.4% at 4 slots but +5% at 8 (`nv_sc` merged into `nv_x`'s exit block: 226 cycles), Q5_K 0% and "ran out of registers" with `_trq` inlined too. The formats that gain most are DMA-bound in decode, and a shared helper copied into each format costs program memory on full cores |
+
 ## Program memory (decode overlay main core)
 
 | idea | result |

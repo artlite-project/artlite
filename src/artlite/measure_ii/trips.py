@@ -5,8 +5,8 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from ..cxx_scan import Token, function_bodies, tokenize
-from .demangle import demangle, function_name
+from ..cxx_scan import Token, function_bodies, function_definitions, tokenize
+from .demangle import demangle, function_name, unqualified
 
 _FOR_HEADER = re.compile(
     r"\bfor\s*\(\s*(?:[\w:]+\s+)*(\w+)\s*=\s*([^;]+?)\s*;"  # [type] i = A;
@@ -39,12 +39,11 @@ def _constant(expr: str) -> int | None:
 
 
 def template_arguments(source: Path, line_no: int, function: str) -> dict[str, str]:
-    """Values of the template parameters of the function (an instance: `name<256, 4>`, demangled) whose
-    definition contains line line_no: {"N": "256", ...}; empty when unknown."""
+    """Values of the template parameters of the definition that contains line line_no, in the code of function (an
+    instance, `name<256, 4>` demangled): {"N": "256", ...}; empty when unknown. A line in another definition (a
+    template helper inlined into function) takes the arguments of the helper's calls in function's body, when they
+    are constants (function's own parameters substituted) and all the same."""
     name = function_name(demangle(function)) if function else ""
-    if "<" not in name:
-        return {}
-    arguments = [text.strip() for _, text in _split_top_level(name[name.index("<") + 1 : name.rindex(">")])]
     try:
         tokens = _tokens(source.read_text(errors="replace"))
     except OSError:
@@ -53,11 +52,77 @@ def template_arguments(source: Path, line_no: int, function: str) -> dict[str, s
     if not bodies:
         return {}
     start = max(bodies)[0]
+    parameters = _template_parameters(tokens, start)
+    caller = unqualified(name)
+    definitions = {d.body: d for d in function_definitions(tokens, "")}
+    if start in definitions and definitions[start].name != caller:
+        own: dict[str, str] = {}
+        for d in definitions.values():
+            if d.name == caller:
+                own = _bind(_template_parameters(tokens, d.body), _instance_arguments(name))
+                break
+        arguments = _call_arguments(tokens, caller, definitions[start].name, own)
+    else:
+        arguments = _instance_arguments(name)
+    return _bind(parameters, arguments)
+
+
+def _instance_arguments(name: str) -> list[str]:
+    """The template arguments of a demangled instance name (`f<8, 4u>`: ["8", "4u"])."""
+    if "<" not in name:
+        return []
+    return [text.strip() for _, text in _split_top_level(name[name.index("<") + 1 : name.rindex(">")])]
+
+
+def _bind(parameters: list[str], arguments: list[str]) -> dict[str, str]:
+    return {key: value for key, value in zip(parameters, arguments) if key and re.fullmatch(r"-?\d+[uUlL]*", value)}
+
+
+def _call_arguments(tokens: list[Token], caller: str, callee: str, own: Mapping[str, str]) -> list[str]:
+    """The constant template arguments of the calls `callee<...>(` in caller's definitions (own: caller's parameters'
+    values), when every call has the same ones; else []."""
+    found: set[tuple[str, ...]] = set()
+    for d in function_definitions(tokens, caller):
+        if d.name != caller:
+            continue
+        for index in range(d.body, d.end - 1):
+            if tokens[index].text != callee or tokens[index + 1].text != "<":
+                continue
+            depth, position, parts, current = 0, index + 1, [], []
+            while position < d.end:
+                text = tokens[position].text
+                position += 1
+                depth += text in ("<", "(")
+                depth -= text in (">", ")")
+                if depth == 0:
+                    parts.append(" ".join(current))
+                    break
+                if text == "," and depth == 1:
+                    parts.append(" ".join(current))
+                    current = []
+                elif depth > 1 or text != "<":
+                    current.append(text)
+            if tokens[position].text != "(":
+                continue  # (not a call)
+            values = []
+            for part in parts:
+                for key, value in own.items():
+                    part = re.sub(rf"\b{key}\b", f"({value})", part)
+                values.append(_constant(part))
+            if None in values:
+                return []
+            found.add(tuple(str(value) for value in values))
+    return list(found.pop()) if len(found) == 1 else []
+
+
+def _template_parameters(tokens: list[Token], start: int) -> list[str]:
+    """The template parameters' names of the definition whose body opens at tokens[start] ("" for an unnamed one);
+    [] when it is no template."""
     index = start  # back to the `template <...>` in front of the declaration
     while index > 0 and tokens[index].text not in {";", "}"} and tokens[index].text != "template":
         index -= 1
     if tokens[index].text != "template" or tokens[index + 1].text != "<":
-        return {}
+        return []
     depth, position, parameters, current = 0, index + 1, [], []
     while position < start:
         text = tokens[position].text
@@ -81,7 +146,7 @@ def template_arguments(source: Path, line_no: int, function: str) -> dict[str, s
         if "=" in parameter:
             parameter = parameter[: parameter.index("=")]
         names.append(parameter[-1] if parameter and re.fullmatch(r"[A-Za-z_]\w*", parameter[-1]) else "")
-    return {key: value for key, value in zip(names, arguments) if key and re.fullmatch(r"-?\d+[uUlL]*", value)}
+    return names
 
 
 def _split_top_level(text: str) -> list[tuple[int, str]]:

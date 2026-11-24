@@ -352,6 +352,12 @@ def test_names_and_trips_offline(tmp_path: Path) -> None:
     args = template_arguments(source, 3, "_Z1fILi8EfLj4EEvPT0_")  # (f<8, float, 4u>)
     assert args == {"N": "8", "M": "4u"}
     assert parse_source_trip(source, 3, args) == 2
+    # a template helper inlined into f<3>: its calls' arguments there (f's own parameters substituted), not f's
+    source.write_text("template <int N>\nvoid g(int *p) {\n    for (int c = 0; c < N; c++) {}\n}\n"
+                      "template <int H>\nvoid f(int *p) {\n    g<2 * H + 1>(p);\n    g<7>(p + 1);\n}\n"
+                      "template <int H>\nvoid e(int *p) {\n    g<H>(p);\n    g<4>(p);\n}\n")
+    assert template_arguments(source, 3, "_Z1fILi3EEvPi") == {"N": "7"}
+    assert template_arguments(source, 3, "_Z1eILi3EEvPi") == {}  # (calls that disagree)
 
 
 def test_statements_offline(tmp_path: Path) -> None:

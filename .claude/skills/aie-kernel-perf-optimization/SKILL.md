@@ -125,7 +125,7 @@ Violating any of these usually costs more than any micro-tuning gains.
 - **`noinline` boundaries** cost a call, a return and argument moves (~10-20 cycles). Use one when a loop pipelines
   standalone but not inside a big function (II 64 / 111 inlined vs 11 / 16); for a helper called from several places
   (one copy in program memory); when the inlined frame would blow the stack (an exact fp32 GELU inlined: 7.3 KB); for
-  a fresh noalias scope.
+  a fresh noalias scope. Inlining a chain of big helpers back can lose: the decode GEMV's (rejected.md).
 
 ## 3. Restructurings that worked
 

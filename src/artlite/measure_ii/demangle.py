@@ -134,7 +134,7 @@ def function_name(demangled: str) -> str:
     return name + suffix
 
 
-def _unqualified(name: str) -> str:
+def unqualified(name: str) -> str:
     """Last component of a qualified name, without its template arguments."""
     separators = [index for index, char in _top_level(name) if char == ":"]
     if separators:
@@ -164,4 +164,4 @@ def block_label(block: str) -> str:
     clone = _CLONE_SUFFIX.search(full)
     suffix = clone.group(1) if clone else ""
     name = function_name(full[: clone.start()] if clone else full)
-    return (_unqualified(name) or name) + suffix
+    return (unqualified(name) or name) + suffix
