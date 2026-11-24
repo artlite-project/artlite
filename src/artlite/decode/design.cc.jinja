@@ -301,6 +301,151 @@ __attribute__((noinline)) void {{ p }}_xs_sb(const float *__restrict t, uint8_t 
 }
 {% endif %}
 
+{% if states %}
+{% set cexp, crcp = km.exp(16, exp_fn=km.exp2(16, prec="fp32", inline=True)), km.recip(16, domain="normal", steps=3) %}
+{{ cexp.src }}
+{{ crcp.src }}
+
+// 16 fp32 in place -> e^v (one copy), 1 / v (one copy): out of line, their frames the callers' none
+__attribute__((noinline)) void {{ p }}_sexp(float *__restrict v)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::store_v(v, {{ cexp }}(aie::load_v<16>(v)));
+}
+
+__attribute__((noinline)) void {{ p }}_srcp(float *__restrict v)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::store_v(v, {{ crcp }}(aie::load_v<16>(v)));
+}
+
+// The helper, a phase's partial sums object ps (``protocol.F_COEF``: the 8 columns' [slot 4][32] fp32, 128 floats apart:
+// lanes b < 8 a state's sum of squares, 8 + 8 j + b its dot with query j) -> the coefficient sets set0 .. set0 + nq - 1
+// of the mix's n states (tab: [set][state 8][slot 4] fp32): per slot and query the softmax over b < n of q_j . x_b /
+// (r_b sqrt(hidden)), times 1 / r_b (r_b: the state's RMS, eps 1e-6; the other states' 0)
+__attribute__((noinline, minsize)) void {{ p }}_hcoef(const float *__restrict ps, float *__restrict tab, int set0, int nq, int n)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::mask<16> valid = aie::lt(aie::load_v<16>({{ p }}_iota).template unpack<int32>(), aie::broadcast<int32, 16>(n));
+    alignas(64) float e[16], r[16];
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < 4; s++) {
+        aie::vector<float, 32> t = aie::load_v<32>(ps + 32 * s);
+        AIE_LOOP_NO_UNROLL
+        for (int c = 1; c < {{ COLS }}; c++)
+            t = aie::add(t, aie::load_v<32>(ps + 128 * c + 32 * s));
+        const aie::vector<float, 16> ir = al::inv_rms<{{ H }}, 8>(t.template extract<16>(0), 1e-6f);  // (lanes b < 8)
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < nq; j++) {
+            const aie::vector<float, 16> d = t.template extract<8>(j + 1).template grow<16>();
+            aie::vector<float, 16> sc = al::mulff<16>(al::mulff<16>(d, ir), aie::broadcast<float, 16>({{ 1.0 / H ** 0.5 }}f));
+            sc = aie::select(aie::broadcast<float, 16>(-1e30f), sc, valid);
+            aie::store_v(e, aie::sub(sc, aie::broadcast<float, 16>(aie::reduce_max(sc))));
+            {{ p }}_sexp(e);
+            const aie::vector<float, 16> ev = aie::select(aie::zeros<float, 16>(), aie::load_v<16>(e), valid);
+            aie::store_v(r, aie::broadcast<float, 16>(aie::reduce_add(ev)));
+            {{ p }}_srcp(r);
+            aie::store_v(e, al::mulff<16>(al::mulff<16>(ev, aie::load_v<16>(r)), ir));
+            float *__restrict out = tab + 32 * (set0 + j) + s;
+            AIE_LOOP_NO_UNROLL
+            for (int b = 0; b < 8; b++)
+                out[4 * b] = e[b];
+        }
+    }
+}
+
+// The helper, an fp32 state object (``states``: ``protocol.F_STATES``): state b's part of a k range (1024 fp32: [k block
+// 128 / sp][slot sp][8]) times the slots' coefficients c (fp32 [slot 4]; nullptr: 1) into acc (first: stored, else
+// added; the main core's res region, idle in these phases): x = c_hi s_hi + c_hi s_lo + c_lo s_hi (~2^-16)
+__attribute__((noinline)) void {{ p }}_hsacc(const float *__restrict x, const float *__restrict c, float *__restrict acc,
+                                             int first, int sp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    if (!c && first) {  // (one state, coefficient 1: its values as they are)
+        {{ p }}_cv((int32_t *)acc, (const int32_t *)x, 1024 / 16);
+        return;
+    }
+    alignas(64) float cl[32];
+    for (int l = 0; l < 32; l++)  // (lane l: slot (l / 8) % sp's coefficient)
+        cl[l] = c ? c[(l >> 3) & (sp - 1)] : 1.0f;
+    aie::vector<bfloat16, 32> ch, cw;
+    al::split2<32>(aie::load_v<32>(cl), ch, cw);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 1024; i += 32) {
+        aie::vector<bfloat16, 32> h, l;
+        al::split2<32>(aie::load_v<32>(x + i), h, l);
+        aie::accum<accfloat, 32> a = first ? aie::zeros<accfloat, 32>() : aie::accum<accfloat, 32>(aie::load_v<32>(acc + i));
+        a = aie::mac(aie::mac(aie::mac(a, ch, h), ch, l), cw, h);
+        aie::store_v(acc + i, a.template to_vector<float>());
+    }
+}
+
+// The slots' 8 values of k block kb of acc ([k block][slot sp][8] fp32) as [slot 4][8] (the lanes of the slots past sp
+// undefined, as _kb's)
+[[clang::always_inline]] inline aie::vector<float, 32> {{ p }}_akb(const float *acc, int kb, int sp)
+{
+    const float *v = acc + 8 * sp * kb;
+    return aie::concat(aie::load_v<8>(v), aie::load_v<8>(v + 8), aie::load_v<8>(v + 16), aie::load_v<8>(v + 24));
+}
+
+// The helper: acc's k range (n 128-k groups of [k block][slot sp][8] fp32; the phase's groups g0 ..) times the norm
+// weights w (bf16 per k of the range; NORM) -> their x panels ([hi of the slots | lo of the slots] per k block, in the
+// panels' place of group g0 + i: chunk, core half, super-block; xc0: the phase's first chunk) and 16-k sums (t: 32 per
+// group), sq_ += acc^2 ([slot 4][8] lanes)
+template <bool NORM>
+__attribute__((noinline)) void {{ p }}_hspan(const float *__restrict acc, const bfloat16 *__restrict w, float *__restrict sq_,
+                                             uint8_t *__restrict xp, float *__restrict t, int g0, int n, int sp, int xc0)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    aie::accum<accfloat, 32> sq(aie::load_v<32>(sq_));
+    const bfloat16 __aie_dm_resource_b *__restrict pw = (const bfloat16 __aie_dm_resource_b *)w;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < n; i++) {
+        const int g = g0 + i, k = 128 * g, sb = (k >> 8) & {{ gv.NSB - 1 }};  // (its super-block of its chunk)
+        al::BOut<> o((bfp16ebs8 *)(xp + {{ gv.XPH }} * (sb >> 1) + {{ gv.XPHC }} * ((k >> 10) + xc0)
+                                   + {{ gv.PANEL }} * (32 * (sb & 1) + ((k & 255) >> 3))));
+        v64accfloat T = (v64accfloat)aie::zeros<accfloat, 64>();
+        const int8_t __aie_dm_resource_d *__restrict pb = (const int8_t __aie_dm_resource_d *){{ p }}_onehot[0];
+        AIE_PREPARE_FOR_POSTPIPELINING
+        for (int j = 0; j < 8; j++) {  // 16-k block j: k blocks 2 j, 2 j + 1 of the group
+            aie::vector<bfloat16, 32> h0, l0, h1, l1;
+            al::split2<32>({{ p }}_akb(acc, 16 * i + 2 * j, sp), h0, l0);
+            al::split2<32>({{ p }}_akb(acc, 16 * i + 2 * j + 1, sp), h1, l1);
+            sq = aie::mac(aie::mac(aie::mac_square(aie::mac_square(sq, h0), h1), aie::add(h0, h0), l0), aie::add(h1, h1), l1);
+            aie::accum<accfloat, 32> x0, x1;
+            if constexpr (NORM) {  // (the 8 weights of a k block for every slot)
+                const v16int32 w2 = (v16int32)(v32bfloat16)aie::load_v<16>(pw).template grow<32>();
+                pw += 16;
+                const aie::vector<bfloat16, 32> w0((v32bfloat16)broadcast_elem_128(w2, 0)), w1((v32bfloat16)broadcast_elem_128(w2, 1));
+                x0 = aie::mac(aie::mul(h0, w0), l0, w0);
+                x1 = aie::mac(aie::mul(h1, w1), l1, w1);
+            } else {
+                x0 = aie::mac(aie::accum<accfloat, 32>(h0), l0, aie::broadcast<bfloat16, 32>(1.0f));
+                x1 = aie::mac(aie::accum<accfloat, 32>(h1), l1, aie::broadcast<bfloat16, 32>(1.0f));
+            }
+            const aie::accum<accfloat, 64> a = aie::concat(x0, x1);
+            al::MM8 l(a);
+            l.mac(a.template to_vector<bfp16ebs8>(), aie::op_transpose(nI));  // a - hi exactly
+            const aie::accum<accfloat, 64> lo = l.to_accum();
+            const al::BV p0 = aie::concat(x0, lo.template extract<32>(0)).template to_vector<bfp16ebs8>();
+            const al::BV p1 = aie::concat(x1, lo.template extract<32>(1)).template to_vector<bfp16ebs8>();
+            o.push(p0);
+            o.push(p1);
+            v64bfp16ebs8 b;
+            b.mantissa = *(const v64int8 __aie_dm_resource_d *)pb;
+            b.exponent = al::e8(0x85);
+            pb += 64;
+            T = mac_8x8_8x8T((v64bfp16ebs8)p0, 1, b, 0, T);
+            T = mac_8x8_8x8T((v64bfp16ebs8)p1, 1, b, 0, T);
+        }
+        const aie::accum<accfloat, 64> ts(T);  // rows: the slots' hi sums, then their lo sums
+        aie::store_v(t + 32 * g, aie::add(ts.template extract<32>(0), ts.template extract<32>(1)).template to_vector<float>());
+    }
+    aie::store_v(sq_, sq.template to_vector<float>());
+}
+
+{% endif %}
 // The helper: an input's sum panels (nsb super-blocks: T16 at t) -> xs; with norm the slots' 1 / rms -> r (8 lanes
 // per slot)
 __attribute__((noinline)) void {{ p }}_hinput(uint8_t *__restrict xs, const float *__restrict t, const float *__restrict sq,
@@ -1066,6 +1211,9 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
     st[{{ S_NRA }}] = 0;
     st[{{ S_NRX }}] = 0;
 {% endif %}
+{% if states %}
+    st[{{ S_NCF }}] = 0;
+{% endif %}
     cmd[{{ C_KIND }}] = {{ K_NOP }};
     if (!(flags & {{ F_MAIN }})) {  // another core's: skip it, the X and A objects that follow it; relay its outputs
         st[{{ S_NSKIP }}] = m[{{ M_SKIP }}];
@@ -1138,6 +1286,10 @@ __attribute__((minsize)) void {{ p }}_nbegin(const uint8_t *__restrict a, int32_
 {% else %}
     st[{{ S_NXN }}] = (n + per - 1) >> (per >> 1);  // (input objects of per = 1, 2, 4 strips)
 {% endif %}
+{% if states %}
+    if (st[{{ S_FLAGS }}] & {{ F_STATES }})
+        st[{{ S_NXN }}] = st[{{ S_NX }}];  // (all its state objects under its one norm-weight object)
+{% endif %}
 {% else %}
     st[{{ S_NXN }}] = n;
 {% endif %}
@@ -1189,6 +1341,22 @@ __attribute__((noinline, minsize)) void {{ p }}_post(const bfloat16 *x, const ui
                                                   int32_t *__restrict cmd)
 {
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+{% if states %}
+    if (st[{{ S_FLAGS }}] & {{ F_STATES }}) {  // (an fp32 state object: state d % nr of k range d / nr, ``hsacc``)
+        const int d = st[{{ S_XD }}], lnr = st[{{ S_NST }}], sp = st[{{ S_SP }}], lsp = (sp > 1) + (sp > 2);
+        st[{{ S_XD }}] = d + 1;
+        cmd[0] = (int32_t)(uintptr_t)(x + {{ 2 * META }}) + ({{ SHM }});
+        cmd[1] = w ? (int32_t)(uintptr_t)(w + (2048 >> lsp) * (d >> lnr)) + ({{ SHM }}) : 0;  // (the range's weights)
+        cmd[2] = d;
+        cmd[{{ C_SP }}] = sp;
+        cmd[{{ C_NST }}] = lnr;
+        cmd[{{ C_CSET }}] = st[{{ S_CSET }}];
+        cmd[{{ C_XC0 }}] = {{ "st[%d]" % S_XC0 if moe else "0" }};
+        cmd[{{ C_ACC }}] = (int32_t)(uintptr_t)WS(float, {{ w_.res }}) + ({{ SHM }});
+        cmd[{{ C_KIND }}] = {{ K_SSTRIP }};
+        return;
+    }
+{% endif %}
     const int d = st[{{ S_XD }}];
     st[{{ S_XD }}] = d + 1;
 {% if packed %}
@@ -1213,6 +1381,18 @@ __attribute__((noinline, minsize)) void {{ p }}_post(const bfloat16 *x, const ui
 {% endif %}
 }
 
+{% if states %}
+// A phase's partial sums object (F_COEF): the helper's command for its coefficient sets (``hcoef``)
+__attribute__((minsize)) void {{ p }}_ccoef(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t *__restrict cmd)
+{
+    const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    cmd[0] = (int32_t)(uintptr_t)(x + {{ 2 * META }}) + ({{ SHM }});
+    cmd[1] = st[{{ S_CSET }}];
+    cmd[2] = st[{{ S_CQN }}];
+    cmd[{{ C_KIND }}] = {{ K_COEF }};
+}
+
+{% endif %}
 __attribute__((minsize)) void {{ p }}_strip_n(const bfloat16 *__restrict x, const uint8_t *__restrict a, int32_t *__restrict ws,
                      int32_t *__restrict cmd)
 {
@@ -2219,6 +2399,16 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     st[{{ S_NXS }}] = 1 << lper;
     st[{{ S_NXS1 }}] = (1 << lper) - 1;
 {% endif %}
+{% if states %}
+    if (flags & {{ F_STATES }}) {  // (fp32 state objects: a command each, ``post``)
+        st[{{ S_NXS }}] = 1;
+        st[{{ S_NXS1 }}] = 0;
+        st[{{ S_NST }}] = (m[{{ M_NR }}] > 1) + (m[{{ M_NR }}] > 2) + (m[{{ M_NR }}] > 4);  // (log2 of the states: 1 .. 8)
+        st[{{ S_CSET }}] = m[{{ M_CSET }}];
+        st[{{ S_NCF }}] = (flags & {{ F_COEF }}) ? 1 : 0;
+        st[{{ S_CQN }}] = m[{{ M_NQ }}] | m[{{ M_NMIX }}] << 8;
+    }
+{% endif %}
     st[{{ S_NX }}] = nx;
     st[{{ S_NIN }}] = 1;
     st[{{ S_K8 }}] = m[{{ M_K }}] >> 3;
@@ -2288,6 +2478,12 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
 {% endif %}
 {% else %}
         st[{{ S_NXP }}] = nx;
+{% endif %}
+{% if states %}
+    if (flags & {{ F_STATES }}) {  // (its input under one norm-weight object at most)
+        st[{{ S_NNO }}] = (flags & {{ F_NORM }}) ? 1 : 0;
+        st[{{ S_NXP }}] = (flags & {{ F_NORM }}) ? 0 : nx;
+    }
 {% endif %}
 {% if pli %}
     if (flags & {{ F_PLI }}) {  // the per-layer inputs ([p: slot][{{ 32 * COLS }}] | [e: slot][{{ 32 * COLS }}] bf16): the
@@ -2438,6 +2634,29 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
     }
     if (kind == {{ K_ACC }}) {
         {{ p }}_hacc((const float *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]);
+        return;
+    }
+{% endif %}
+{% if states %}
+    if (kind == {{ K_COEF }}) {  // a phase's partial sums object: its coefficient sets (``ccoef``)
+        {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
+        return;
+    }
+    if (kind == {{ K_SSTRIP }}) {  // an fp32 state object d: state d % nr of k range d / nr (``post``)
+        {{ p }}_Win<4> w_;
+        const int d = cmd[2], lnr = cmd[{{ C_NST }}], sp = cmd[{{ C_SP }}], lsp = (sp > 1) + (sp > 2);
+        const int b = d & ((1 << lnr) - 1), rg = d >> lnr, n = 8 >> lsp, nr = 1 << lnr;
+        if (d == 0)
+            aie::store_v(sq, aie::zeros<float, 32>());
+        float *acc = (float *)(uintptr_t)cmd[{{ C_ACC }}];
+        const int cs = cmd[{{ C_CSET }}];  // (the coefficient set; -1: one state of coefficient 1)
+        {{ p }}_hsacc((const float *)(uintptr_t)cmd[0], cs < 0 ? nullptr : sq + 32 + 32 * cs + 4 * b, acc, b == 0, sp);
+        if (b == nr - 1) {  // (the range's sum: its panels, n 128-k groups)
+            if (cmd[1])
+                {{ p }}_hspan<true>(acc, (const bfloat16 *)(uintptr_t)cmd[1], sq, xp, (float *)scr, n * rg, n, sp, cmd[{{ C_XC0 }}]);
+            else
+                {{ p }}_hspan<false>(acc, nullptr, sq, xp, (float *)scr, n * rg, n, sp, cmd[{{ C_XC0 }}]);
+        }
         return;
     }
 {% endif %}

@@ -156,6 +156,7 @@ from .protocol import (
     BC_ID,
     C_LEN,
     CMD_WORDS,
+    INK,
     ITEM_WORDS,
     MAX_K,
     META,
@@ -177,6 +178,7 @@ from .protocol import (
     ROT_STATE,
     RPOST,
     S_NASKIP,
+    S_NCF,
     S_NE,
     S_NGA,
     S_NIN,
@@ -287,7 +289,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
                  a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False,
                  tails: bool = False, tail_pairs: bool = False, gating: str = "softmax", shared_gate: bool = True,
-                 rot: bool = False, norm_objs: bool = True, rg: bool = False):
+                 rot: bool = False, norm_objs: bool = True, rg: bool = False, states: bool = False):
         """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
@@ -311,7 +313,9 @@ class DecodeOverlayOperator(ArtcOperator):
         inputs": PARO linears; with ``post``: R phases, a PARO Gemma's), norm_objs: phases normed by norm-weight objects (F_NORM
         inputs; a rotated design whose normed inputs are all rotated copies, the LM head's too, has none: its program
         memory); rg: a dense design's row-group tiles (``decode.image.Block.G``: a PARO Gemma's proj of K 256; an MoE design
-        has them)."""
+        has them); states: phases whose input is fp32 states (``protocol.F_STATES``: Inkling's; the helper mixes a k
+        range's states into the main core's res, ``hsacc``, then builds its panels, ``hspan``; packed designs of 4 slots,
+        inputs of at most one norm-weight object)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
         assert not rot or (post or hidden // COLS % ROT_GROUP == 0), \
             "rotated inputs: residual slices of whole rotation groups (a post design's: R phases)"
@@ -319,10 +323,12 @@ class DecodeOverlayOperator(ArtcOperator):
         STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
                        *([MOE_STATE] if moe else []), *(self.GATE_STATE if self.gate else ()), *([ROT_STATE] if rot else []))
         self.rot = rot
+        assert not states or (packed and slots == 4 and not (post or rot or tails)), "states: packed designs of 4 slots"
+        self.states = states
         assert norm_objs or rot, "norm_objs: rotated designs only"
         self.norm_objs = norm_objs
         # (the design's words and flags: each name and bit once; a rotated post design's R phases: RPOST)
-        XMETA.consts(PHASE, TOKEN, MOE, *self.META_KINDS, *([RPOST] if rot and post else []))
+        XMETA.consts(PHASE, TOKEN, MOE, *self.META_KINDS, *([RPOST] if rot and post else []), *([INK] if states else []))
         self.slots, self.bcast = slots, bcast
         assert not (bcast and moe) and (slots == 8 or not bcast), "bcast: designs of 8 slots (placed: ``pin_l1_buffers``)"
         if bcast:
@@ -337,7 +343,8 @@ class DecodeOverlayOperator(ArtcOperator):
         assert max_k % self.chunk.k == 0 and max_k <= MAX_K
         self.max_k = max_k
         self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
-        assert hidden % (COLS * C_LEN) == 0 and hidden <= max_k
+        # (a column's residual slice in whole C objects: bf16, or fp32 in a states design, ``protocol.F_STATES``)
+        assert hidden % (COLS * C_LEN // (2 if states else 1)) == 0 and hidden <= max_k
         assert not moe or not (post or pli) and act == "silu" and nsb == 4
         self.gating, self.shared_gate = gating, shared_gate
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
@@ -473,7 +480,7 @@ class DecodeOverlayOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         """Byte offsets of the main core's workspace regions (and "size")."""
         S = self.slots
-        sizes = [("st", 4 * (S_WORDS_ROT if self.rot or self.moe else S_WORDS)), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
+        sizes = [("st", 4 * (S_WORDS_ROT if self.rot or self.moe or self.states else S_WORDS)), ("res", 4 * self.res_slots * self.res_pitch), ("inv", 4 * 8 * S),
                  ("yt", 4 * self.yt), ("stg", 2 * (2 * S + (2 if self.rot and S == 8 else 0)) * C_LEN),  # (rot, 8 slots:
                  # a rotated copy's group after its two partial sums objects, ``rote``)
                  ("gs", 2 * 16 * (max(S, 8) if self.split else S)),
@@ -510,7 +517,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
     def get_kernel_src(self) -> str:
         p = self.pfx
-        consts = protocol.consts(rpost=self.rot and self.post)
+        consts = protocol.consts(rpost=self.rot and self.post, states=self.states)
         fmts = list(self.rows)
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
@@ -541,6 +548,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  rot=self.rot, norm_objs=self.norm_objs, ROT_OBJ=ROT_OBJ, ROT_W=ROT_OBJ - 2 * ROT_GROUP,
                                  rg=self.rg, hdr=self.post and not self.rot, RWP_AT=RWP_AT, RWS_AT=RWS_AT, RPL_AT=RPL_AT,
+                                 states=self.states,
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
@@ -700,7 +708,8 @@ class DecodeOverlayOperator(ArtcOperator):
         xp_ty = np.ndarray[(self.xp_bytes,), u8]
         xs_ty = np.ndarray[(self.xs_bytes,), u8]
         hs_ty = np.ndarray[(self.hs_bytes,), u8]
-        sq_ty = np.ndarray[(8 * self.slots,), f32]
+        # (the helper's squares; a states design's coefficient sets after them, [set 8][state 8][slot 4]: ``hcoef``)
+        sq_ty = np.ndarray[(8 * self.slots + (256 if self.states else 0),), f32]
         hres_ty = np.ndarray[(max(self.hres_bytes, 4) // 4,), f32]  # (8 slots: slots 4 .. 7's residual)
         oh_ty = np.ndarray[(ONEHOT.size,), np.dtype[np.int8]]  # (8 slots: the B operands of the helper's 16-k sums)
         s8 = self.slots == 8
@@ -723,6 +732,7 @@ class DecodeOverlayOperator(ArtcOperator):
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty, oh_ty] * s8,
                                                     *[hst_ty] * bool(self.help_flag)])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
+        k_ccoef = [Kernel(f"{p}_ccoef", "kernel.o", [x_ty, ws_ty, cmd_ty])] if self.states else []
         # (the rotations: the helper's, these the main core's commands)
         k_rot = [Kernel(f"{p}_cpsq", "kernel.o", [x_ty, ws_ty, cmd_ty]), Kernel(f"{p}_crote", "kernel.o", [a_ty, ws_ty, cmd_ty]),
                  Kernel(f"{p}_crotx", "kernel.o", [x_ty, a_ty, ws_ty, cmd_ty])] if self.rot else []
@@ -773,6 +783,7 @@ class DecodeOverlayOperator(ArtcOperator):
             xgate = rest.pop(0) if self.gate else None
             psq, rote, rotx = (rest.pop(0), rest.pop(0), rest.pop(0)) if self.rot else (None, None, None)
             wpupd = rest.pop(0) if self.rot and self.post else None
+            ccoef = rest.pop(0) if self.states else None
             begin, *rest = rest
             nbegin, strip_n = (rest.pop(0), rest.pop(0)) if self.norm_objs else (None, None)
             strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
@@ -817,6 +828,12 @@ class DecodeOverlayOperator(ArtcOperator):
                     for _ in range_(ws[i_st + S_NPS]):  # (a header: the partial sums object)
                         x = x_f.acquire(1)
                         psums[0](x, ws)
+                        x_f.release(1)
+                if ccoef is not None:
+                    for _ in range_(ws[i_st + S_NCF]):  # (F_COEF: the partial sums object, the helper's coefficient sets)
+                        x = x_f.acquire(1)
+                        command(lambda c, x=x: ccoef(x, ws, c))
+                        answer()
                         x_f.release(1)
                 if psq is not None:
                     for _ in range_(ws[i_st + S_NPQ]):  # (rotated x: the partial sums object)
@@ -989,7 +1006,7 @@ class DecodeOverlayOperator(ArtcOperator):
             workers.append(Worker(main_fn, [a_l1[c].cons(depth=self.A_L1), x_l1[c].cons(depth=self.x_l1_depth, **x_kw), c_fifos[c].prod(), cmds[c].prod(),
                                             ress[c].cons(), *([m_fifos[c].prod()] if self.msg else []),
                                             *([r_fifos[c].cons()] if self.relay else []), *moe_args, *hres,
-                                            *([k_xgate] if self.gate else []), *k_rot, k_begin, *k_norm,
+                                            *([k_xgate] if self.gate else []), *k_rot, *k_ccoef, k_begin, *k_norm,
                                             k_strip, k_input, k_inv, k_cmd, k_tile, k_collect, k_emit, k_relay,
                                             *([k_psums] if self.post else []), ws, xp, xs,
                                             (COLS if self.paged else 0) + c, *pg_main.get(c, []),

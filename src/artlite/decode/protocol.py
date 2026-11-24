@@ -68,7 +68,7 @@ C_LEN = 64  # bf16 elements of a C object
 NBLK = 4  # blocks of row tiles a phase may have
 MAX_K = 5120  # k of a phase's K group: its x panels (46 KB) in the helper's memory
 CMD_WORDS = 16  # words of the helper's command
-S_WORDS = 64  # state words of the main core's workspace (a ``rot`` or ``moe`` design's: ``S_WORDS_ROT``, words past them)
+S_WORDS = 64  # state words of the main core's workspace (a ``rot``, ``moe`` or ``states`` design's: ``S_WORDS_ROT``, words past them)
 S_WORDS_ROT = 80
 N_TOK = 8  # token objects (``tok`` designs: the cache objects per token object, TOK_STATE's S_NAS)
 POST_K = 256  # (post designs) k of a header phase's input object: [k block 32][v | r][slot 4][8] bf16
@@ -155,6 +155,18 @@ B_SPLIT = PHASE.flag("B_SPLIT", 14, of="format")
 B_PT = PHASE.flag("B_PT", 15, of="format")
 B_FMT2, B_NA, B_NB = 16, 24, 28  # (a split block's second format, its gate and up tiles per group: their bits' shifts)
 
+# (``states`` designs: Inkling's, ``models.inkling2``) a phase whose input is fp32 states: per k range of 1024 / sp k
+# (sp: the step's packed slots) M_NR objects, one per state b < M_NR, its range [k block][slot sp][8] fp32 (the state
+# array's, ``models.inkling2.overlay``), mixed by the slots' coefficients of set M_CSET (-1: one state, coefficient 1) into
+# the x panels (the helper's ``hsacc`` / ``hspan``)
+INK = XMETA.kind("ink", extends=(PHASE,))
+F_STATES = INK.flag("F_STATES", 8)
+# its first X object after the metadata is a partial sums object (the 8 columns' [slot 4][32] fp32 at 512 c: lanes b < 8
+# the states' sums of squares, 8 + 8 j + b their dots with query j < 3 of the mix): the helper's coefficient sets M_CSET ..
+# M_CSET + M_NQ - 1 of its M_NMIX states (``hcoef``) before its objects
+F_COEF = INK.flag("F_COEF", 9)
+M_NR, M_CSET, M_NQ, M_NMIX = INK.words("M_NR M_CSET M_NQ M_NMIX", at=44)
+
 TOKEN = XMETA.kind("token")
 # (``tok`` designs) a token object's index (< N_TOK) and per column its cache objects; an object of another core with
 # M_NASKIP = -1 - index: that token's count
@@ -215,6 +227,11 @@ ROT_STATE = STATE.kind("rot")
 S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_NRA S_NGA S_NRX S_NRP S_RC S_RG S_RN",
                                                                       at=S_WORDS)
 S_NWP = ROT_STATE.word("S_NWP", at=S_WORDS + 9)
+# (``states``) an F_STATES phase's states per k range (log2) and coefficient set (M_NR, M_CSET): past S_WORDS, in a states
+# design's longer state
+STATES_STATE = STATE.kind("states")
+# (S_NCF: a trip count, F_COEF; S_CQN: M_NQ | M_NMIX << 8)
+S_NST, S_CSET, S_NCF, S_CQN = STATES_STATE.words("S_NST S_CSET S_NCF S_CQN", at=S_WORDS + 10)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -230,6 +247,11 @@ K_TILE, K_STRIP, K_INPUT, K_PSTRIP, K_NOP, K_BEGIN, K_SUB, K_ACC, K_HELP = CMD.c
 K_PSQ, K_ROTE, K_ROTX, K_HROT = CMD.common.values("K_PSQ K_ROTE K_ROTX K_HROT", of="kind", start=9)
 C_SP = CMD.common.word("C_SP")  # (K_STRIP, K_PSTRIP) the input's slots per k block
 C_MIRROR = CMD.common.flag("C_MIRROR", 3, of="sp")  # (K_PSTRIP: C_SP + C_MIRROR: strip 0 into slot 1, F_KPAIR)
+# (``states``) an fp32 state object: words 0 .. 2 its payload, the norm weights of its range (0: none), its index d in the
+# phase's objects; C_NST log2 of the states per range, C_CSET the coefficient set (-1: unit), C_XC0 the phase's first panel chunk, C_ACC the
+# main core's res region (the range's sum)
+K_SSTRIP, K_COEF = CMD.common.values("K_SSTRIP K_COEF", of="kind", start=13)
+C_NST, C_CSET, C_XC0, C_ACC = CMD.common.words("C_NST C_CSET C_XC0 C_ACC", at=6)
 
 # ----------------------------------------------------------------------
 # Streams, packets and pages
@@ -250,11 +272,12 @@ PG_PAGE_ID, PG_REQ_ID = (1, 2), (3, 4)
 WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6, "preplain": 7, "gap": 8, "gapm": 9}
 
 
-def consts(rpost: bool = False) -> dict[str, int]:
+def consts(rpost: bool = False, states: bool = False) -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``; ``rpost``:
-    a rotated post design's, RPOST's flags too)."""
-    return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else [])) | \
-        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE) | CMD.consts() | {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
+    a rotated post design's, RPOST's flags too; ``states``: INK's)."""
+    return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else []), *([INK] if states else [])) | \
+        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE) | CMD.consts() | \
+        {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
 
 
 # ----------------------------------------------------------------------
