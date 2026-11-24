@@ -589,9 +589,10 @@ class InklingOverlay(AttentionOverlay):
             self._blend(seq, st, v, name[1:])
             return
         dev, S, sp = self.dev, st.S, packed_slots(st.S)
-        seq.sync()
         ST = self.state_bytes(sp)
         first, nr, _, coef = self._mix(v, name)
+        out = {"d": f"g{name[1:-1]}", "r": "route", "l": "logits"}.get(name[0], "att")
+        self._sync(seq, {f"sa{i}" for i in range(first, first + nr)} | ({f"ps{coef[0]}"} if coef else set()), {out})
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", self.meta[phase]), XB)
             if coef is not None:  # (the partial sums object of its mix)
@@ -626,7 +627,7 @@ class InklingOverlay(AttentionOverlay):
         """Visit v's blend of stream c (``protocol.F_BLEND``): its metadata and g object (X), the rows (A: the weight run),
         the blended slice (C) into the state array's slot of the stream (``BLENDED``)."""
         dev, sp = self.dev, packed_slots(st.S)
-        seq.sync()  # (g's halves in DDR)
+        self._sync(seq, {f"g{c}"}, {f"sa{BLENDED[c]}"})  # (g's halves in DDR)
         for col in range(COLS):
             seq.fill("X", col, dev.address("ACT", self.bmeta[(v, c)]), XB)
             seq.fill("X", col, dev.address("ACT", self.gobj[(v, c)]), XB)
@@ -639,12 +640,12 @@ class InklingOverlay(AttentionOverlay):
         step: ``_set_parts``); out (C) the window (the 3 rows read, the step's), cur's slice of the state array, the
         column's partial sums of the FFN's mix."""
         dev, S, sp = self.dev, st.S, packed_slots(st.S)
-        seq.sync()
+        n1 = self.nst[v] + int(self.vis[v].block)
+        self._sync(seq, {"o"}, {f"sa{n1}", f"ps{(v, 'f')}", "hist"})
         self._inputs(seq, self.inp[(v, "o")][0], S)
         hf = st.__dict__.setdefault("hfills", [])
         for c in range(COLS):
             hf.append((seq.fill("X", c, dev.address("KV", self.hist[(v, 0)] + c * self.HIST) - (XB - XPAY), XB), v, 0, c))
-        n1 = self.nst[v] + int(self.vis[v].block)
         row = 4 * self.h8
         for c in range(COLS):
             seq.drain("C", c, dev.address("KV", self.hist[(v, 0)] + c * self.HIST), (3 + S) * row)
@@ -656,6 +657,19 @@ class InklingOverlay(AttentionOverlay):
             self._moe(seq, st, L, weights)
         else:
             super()._operator(seq, st, L, name, weights)
+        seq.ink_dirty = None  # (its outputs: the next phase syncs)
+
+    @staticmethod
+    def _sync(seq: Sequence, reads: set[str], writes: set[str]) -> None:
+        """Before a GEMV phase's transfers: a sync only when it reads what a phase since the last one writes (``reads``,
+        ``writes``: the state array's slots "sa<i>", partial sums objects "ps<key>", g objects "g<stream>", ...; after an
+        operator phase, which syncs itself, all of them). Its fills queue behind the phase before, whose outputs drain
+        first on C: the cores take the phases in order."""
+        dirty = getattr(seq, "ink_dirty", None)
+        if dirty is None or dirty & reads:
+            seq.sync()
+            dirty = set()
+        seq.ink_dirty = dirty | writes
 
     def _begin(self, seq: Sequence) -> None:
         """(an FFN's MoE: the control packets' route, the routing's shim locks)"""
