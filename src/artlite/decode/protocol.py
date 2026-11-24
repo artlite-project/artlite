@@ -239,7 +239,8 @@ S_SP, S_NXS, S_NXS1 = _S.words("S_SP S_NXS S_NXS1")
 S_GN, S_GK = _S.words("S_GN S_GK")
 # (``tails`` designs) the row tile's place in a B_PT block's pairs: 1 its first (its tail tile's second half: the next
 # row tile's), 2 its second (its tail came with the first's: one chunk less), else 0
-S_PT = _S.word("S_PT")
+PT_STATE = STATE.kind("tail pairs")
+S_PT = PT_STATE.word("S_PT", at=31)
 S_B = _S.block("S_B", 3 * NBLK, at=32)  # the block table, 3 words per block
 S_TEND = _S.word("S_TEND", at=S_WORDS - 1)  # (tile) the window's end
 # (``post`` designs) the partial sums object (a trip count), the scale (bf16 bits), the column, the phase's residual
@@ -277,10 +278,12 @@ S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NIQB S_INKN S_IX", at=S_WORDS + 5)
 S_BLEND = STATES_STATE.word("S_BLEND", at=S_WORDS + 14)  # (F_BLEND) M_BLEND
 # (``qtails`` designs, of the longer state: B_QT blocks) the row tile of its group (its rows at yt + S_QY: block S_QS of
 # the group's), the group's row tiles (0: a block of plain row tiles)
-QT_STATE = STATE.kind("qt", exclusive_with=(ROT_STATE,))
+QT_STATE = STATE.kind("qt", exclusive_with=(ROT_STATE, PT_STATE))
 S_QS = QT_STATE.word("S_QS", at=S_WORDS + 4)
 S_QM = QT_STATE.word("S_QM", at=S_WORDS + 9)
 S_QY = QT_STATE.word("S_QY", at=S_WORDS + 15)
+# (qtails, moe) a group of gate / up row tiles is through: the helper's epilogue of it (K_QGU, a trip count)
+S_NQGU = QT_STATE.word("S_NQGU", at=31)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -308,6 +311,9 @@ C_INKN, C_NS = CMD.common.words("C_INKN C_NS")
 # (``states``) a blend's input object (word 0 its payload, 3 -1) or A object i (word 1, 3 i; ``hblend``: 2 res, C_BLEND
 # M_BLEND)
 K_BLEND = CMD.common.values("K_BLEND", of="kind", start=18)[0]
+# (qtails, moe) a group of gate / up row tiles' epilogue on the helper (``hqgu``): word 0 the main core's workspace, 1 G |
+# R << 8 | n << 16 (its row tiles, their rows, the outputs staged before it)
+K_QGU = CMD.common.values("K_QGU", of="kind", start=19)[0]
 C_BLEND = CMD.common.word("C_BLEND")
 C_NG = CMD.common.word("C_NG")  # (``qtails``, K_SSTRIP) the phase's 128-k groups (its last range: what is left of them)
 
@@ -334,7 +340,7 @@ def consts(rpost: bool = False, states: bool = False) -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``; ``rpost``:
     a rotated post design's, RPOST's flags too; ``states``: INK's)."""
     return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else []), *([INK, EGRP] if states else [])) | \
-        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE, QT_STATE) | CMD.consts() | \
+        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE, QT_STATE, PT_STATE) | CMD.consts() | \
         {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB, "B_QM": B_QM}
 
 

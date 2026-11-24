@@ -178,6 +178,8 @@ from .protocol import (
     PHASE,
     POST_K,
     POST_STATE,
+    PT_STATE,
+    QT_STATE,
     ROT_STATE,
     RPOST,
     S_NASKIP,
@@ -195,6 +197,7 @@ from .protocol import (
     S_NNO,
     S_NPQ,
     S_NPS,
+    S_NQGU,
     S_NR,
     S_NRA,
     S_NRP,
@@ -338,6 +341,7 @@ class DecodeOverlayOperator(ArtcOperator):
         # (a ``post`` design has TOK_STATE's words too: S_NAS is always declared)
         STATE.together(*([POST_STATE] if post else []), *([TOK_STATE] if tok or post else []),
                        *([MOE_STATE] if moe else []), *(self.GATE_STATE if self.gate else ()), *([ROT_STATE] if rot else []),
+                       *([PT_STATE] if tails else []), *([QT_STATE] if qtails else []),
                        *([STATES_STATE] if states else []))
         self.rot = rot
         assert not states or (packed and slots == 4 and not (post or rot or tails)), "states: packed designs of 4 slots"
@@ -578,7 +582,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  rg=self.rg, hdr=self.post and not self.rot, RWP_AT=RWP_AT, RWS_AT=RWS_AT, RPL_AT=RPL_AT,
                                  states=self.states, units=self.units, CPARTS=self.cparts, situ=self.situ,
                                  ink_page=self.ink_page, pg_state=0x70000 + PG_STATE, INK_STATES=INK_STATES,
-                                 INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS,
+                                 INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS, paged_fmts=list(self.paged),
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
@@ -681,6 +685,12 @@ class DecodeOverlayOperator(ArtcOperator):
                 pages["INK"] = (f"{self.pfx}_pgr_ink",)
                 pages["MIX"] = (f"{self.pfx}_pgr_mix",)
                 calls[f"{self.pfx}_htask"] = (f"{self.pfx}_pgr_ink", f"{self.pfx}_pgr_mix")
+            if h == 1 and self.qtails and self.moe:  # (a gate / up group's epilogue: an entry of every format's page, the
+                # page of its tiles' format is in: ``hqgu``)
+                for f in self.paged:
+                    pages[f] = (*pages[f], f"{self.pfx}_pgq_{f.lower()}")
+                calls[f"{self.pfx}_htask"] = (*calls.get(f"{self.pfx}_htask", ()),
+                                              *(f"{self.pfx}_pgq_{f.lower()}" for f in self.paged))
             return paging.link(wd, pages=pages, pager=f"{fp}_pg_request", calls=calls,
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
@@ -795,6 +805,7 @@ class DecodeOverlayOperator(ArtcOperator):
             k_emit = Kernel(f"{p}_emit", "kernel.o", [ws_ty, c_ty, aw_ty])
             k_sub = Kernel(f"{p}_sub", "kernel.o", [ws_ty, cmd_ty])
             k_lstrip = Kernel(f"{p}_lstrip", "kernel.o", [ws_ty, cmd_ty])
+            k_qgu = [Kernel(f"{p}_qgu", "kernel.o", [ws_ty, cmd_ty])] if self.qtails else []
 
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
         akw, amt = ({"transport": Transport.dma(Packet(AID))}, {"port": Port.dma(A_MT)}) if self.a_bcast else ({}, {})
@@ -829,8 +840,11 @@ class DecodeOverlayOperator(ArtcOperator):
                 rest = rest[:-2]
             m_f = rest.pop(0) if self.msg else None
             r_f = rest.pop(0) if self.relay else None
+            qgu = None
             if self.moe:
-                sub, lstrip, acc, *rest = rest
+                sub, lstrip = rest.pop(0), rest.pop(0)
+                qgu = rest.pop(0) if self.qtails else None
+                acc, *rest = rest
             elif s8:
                 acc, *rest = rest  # (8 slots: hres)
             xgate = rest.pop(0) if self.gate else None
@@ -928,6 +942,10 @@ class DecodeOverlayOperator(ArtcOperator):
                         collect(r, ws, *ea)
                         res_f.release(1)
                         a_f.release(1)
+                        if qgu is not None:  # (a group of gate / up row tiles through: its epilogue on the helper)
+                            for _ in range_(ws[i_st + S_NQGU]):
+                                command(lambda c: qgu(ws, c))
+                                answer()
                         emits()  # (after the last tile: the phase's last outputs too)
 
                 if self.moe:  # (the object's passes: its own, or an expert object's sub-phases, which the helper sets up)
@@ -1076,7 +1094,7 @@ class DecodeOverlayOperator(ArtcOperator):
         for c in range(COLS):
             ws = Buffer(ws_ty, name=f"{P}_ws{c}", **({"tile": Tile(c, mr)} if self.LENDS_WS else {}))
             m_ws.append(ws)
-            moe_args = [k_sub, k_lstrip, self._acc(c)] if self.moe else []
+            moe_args = [k_sub, k_lstrip, *k_qgu, self._acc(c)] if self.moe else []
             hres = [Buffer(hres_ty, name=f"{P}_hres{c}", tile=Tile(c, hr))] if s8 else []
             oh = [Buffer(oh_ty, name=f"{P}_oh{c}", tile=Tile(c, self.HS8_ROW), initial_value=ONEHOT)] if s8 else []
             xp = Buffer(xp_ty, name=f"{P}_xp{c}", tile=Tile(c, hr))  # (the x panels in the helper's memory)
