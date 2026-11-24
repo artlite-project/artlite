@@ -1,8 +1,8 @@
 
 // ---- MoE routing (moe/route.py): the helper, on the route object m (its META words, then the slots'
-// logits [slot][E] fp32) for column col -> the control packets and the expert object's metadata in rbuf (the main core
+// logits [slot][E] fp32{{ "; then bias, dscale, gscale [E] fp32 and the units' table [unit][4] int32" if units else "" }}) for column col -> the control packets and the expert object's metadata in rbuf (the main core
 // emits them next){{ ", the shared expert's gate per slot (sigmoid of S_SG) in wsc" if shared_gate else "" }}; the K's
-// weights: {{ "sigmoid(l) / max(sum, 2^-14) over the K" if sigmoid else "the softmax over the K" }}
+// weights: {{ "sigmoid(l) / (sum + 1e-20) over the K times the expert's dscale, the K chosen by sigmoid(l) + bias" if units else ("sigmoid(l) / max(sum, 2^-14) over the K" if sigmoid else "the softmax over the K") }}
 alignas(64) static const uint32_t {{ p }}_ech[{{ 2 * MAX_ITEMS }}] = { {% for h in ch %}{{ h }}u, {% endfor %}};  // (the BDs' control headers)
 alignas(64) static const int32_t {{ p }}_ebd[{{ MAX_ITEMS + 1 }}] = { {% for b in bds %}{{ b }}, {% endfor %}0 };
 
@@ -46,7 +46,7 @@ __attribute__((noinline, minsize)) void {{ p }}_rsig(float *__restrict v, float 
     const aie::vector<float, 16> rv = aie::load_v<16>(r);
     aie::store_v(v, aie::select(rv, al::mulff<16>(aie::load_v<16>(t), rv), aie::lt(aie::load_v<16>(v), aie::zeros<float, 16>())));
 }
-{% if sigmoid %}
+{% if sigmoid and not units %}
 
 // v (16 fp32, in place) -> sigmoid(v) / max(sum of them, 2^-14) (llama.cpp's normalized sigmoid gating; t, r: 16 fp32
 // of scratch each)
@@ -70,6 +70,12 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     int32_t *__restrict U = WS(int32_t, {{ w_.hold }}) + 128;
     int32_t *__restrict lv = WS(int32_t, {{ w_.hold }}) + 192;  // (and 32 words of scratch)
     int32_t *__restrict it = WS(int32_t, {{ w_.hold }}) + 240;
+{% if units %}
+    float *__restrict sg = WS(float, {{ w_.hold }}) + 256;  // (a slot's sigmoids of its E logits)
+    const float *__restrict bias = (const float *)(m + {{ META + 4 * E }}), *__restrict dsc = bias + {{ E }};
+    const int32_t *__restrict ut = m + {{ META + 7 * E }};  // (per unit: its bytes' offset in the expert's run, work, A
+    // objects, template)
+{% endif %}
     uint32_t used[{{ E // 32 }}];
     const int S = m[{{ M_NS }}];
     const int32_t *__restrict lg = m + {{ META }};
@@ -86,9 +92,20 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
             ti[j] = 0;
         }
         const int32_t *__restrict kl = lg + {{ E }} * s;
+{% if units %}
+        AIE_LOOP_NO_UNROLL
+        for (int e = 0; e < {{ E }}; e += 16) {  // (the keys: sigmoid(l) + bias)
+            aie::store_v(sg + e, aie::load_v<16>((const float *)kl + e));
+            {{ p }}_rsig(sg + e, (float *)lv, (float *)lv + 16);
+        }
+{% endif %}
         AIE_LOOP_NO_UNROLL
         for (int e = 0; e < {{ E }}; e++) {
+{% if units %}
+            const int32_t b = __builtin_bit_cast(int32_t, sg[e] + bias[e]), k = b ^ ((b >> 31) & 0x7FFFFFFF);
+{% else %}
             const int32_t b = kl[e], k = b ^ ((b >> 31) & 0x7FFFFFFF);  // (fp32 order as int32 order)
+{% endif %}
             if (k > tk[{{ K - 1 }}]) {
                 int j = {{ K - 1 }};
                 AIE_LOOP_NO_UNROLL
@@ -100,11 +117,26 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
                 ti[j] = e;
             }
         }
+{% if units %}
+        float *__restrict w = wt + 16 * s;  // (the K sigmoids / (their sum + 1e-20), times the experts' dscale)
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < 16; j++)
+            w[j] = j < {{ K }} ? sg[ti[j]] : 0.0f;
+        aie::store_v((float *)lv, aie::broadcast<float, 16>(aie::reduce_add(aie::load_v<16>(w)) + 1e-20f));
+        {{ p }}_rrcp((float *)lv);
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < 16; j++)
+            ((float *)lv)[16 + j] = j < {{ K }} ? dsc[ti[j]] : 0.0f;
+        aie::store_v(w, al::mulff<16>(al::mulff<16>(aie::load_v<16>(w), aie::load_v<16>((const float *)lv)),
+                                      aie::load_v<16>((const float *)lv + 16)));
+{% else %}
         int32_t *__restrict w = (int32_t *)(wt + 16 * s);  // (the K logits, then -1e30: weights below 2^-126 of the sum)
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < 16; j++)
             w[j] = j < {{ K }} ? kl[ti[j]] : (int32_t)0xF149F2CA;
-{% if sigmoid %}
+{% endif %}
+{% if units %}
+{% elif sigmoid %}
         {{ p }}_rsigw(wt + 16 * s, (float *)lv, (float *)lv + 16);
 {% else %}
         {{ p }}_rsoft(wt + 16 * s, (float *)lv);
@@ -127,6 +159,34 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     for (int e = 0; e < {{ E }}; e++)
         if ((used[e >> 5] >> (e & 31)) & 1)
             U[u++] = e;
+{% if units %}
+    // column col's items (e | u0 << 8 | u1 << 12): whole experts U[col + COLS q], then of the rest's units in order (each
+    // its work, the units' table) those whose work starts in the column's share [col, col + 1) R / COLS, R the rest's work
+    const int nw = u >> {{ (COLS - 1).bit_length() }}, rest = u - {{ COLS }} * nw;
+    int n = 0, we = 0;
+    AIE_LOOP_NO_UNROLL
+    for (int q = 0; q < nw; q++)
+        it[n++] = U[col + {{ COLS }} * q] | {{ units - 1 }} << 12;
+    AIE_LOOP_NO_UNROLL
+    for (int v = 0; v < {{ units }}; v++)
+        we += ut[4 * v + 1];
+    const int R = rest * we;
+    int a = 0;
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < rest; t++) {
+        const int e = U[{{ COLS }} * nw + t];
+        AIE_LOOP_NO_UNROLL
+        for (int v = 0; v < {{ units }}; v++) {
+            if (col * R <= a * {{ COLS }} && a * {{ COLS }} < (col + 1) * R) {
+                if (n > nw && (it[n - 1] & 255) == e)  // (the next unit of the last item's expert)
+                    it[n - 1] = (it[n - 1] & ~(15 << 12)) | v << 12;
+                else
+                    it[n++] = e | v << 8 | v << 12;
+            }
+            a += ut[4 * v + 1];
+        }
+    }
+{% else %}
     // column col's items (e | h0 << 8 | h1 << 9): whole experts U[col + COLS q], then the halves j = col, col + COLS
     // of the rest
     const int nw = u >> {{ (COLS - 1).bit_length() }}, rest = u - {{ COLS }} * nw;
@@ -137,18 +197,28 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     AIE_LOOP_NO_UNROLL
     for (int j = col; j < 2 * rest; j += {{ COLS }})
         it[n++] = U[{{ COLS }} * nw + (j >> 1)] | (j & 1) << 8 | (j & 1) << 9;
+{% endif %}
     // the expert object's metadata: its items with their weights per slot, its A objects
     int32_t *__restrict em = WS(int32_t, {{ w_.rbuf }}) + {{ RBUF_META }};
     {{ p }}_zv(em, {{ META // 16 }});
     em[{{ M_FLAGS }}] = {{ F_MAIN + F_EXPERT }};
     em[{{ M_NS }}] = S;
     em[{{ M_NITEM }}] = n;
+{% if not units %}
     const int per = m[{{ M_RTGU }}] + m[{{ M_RTDN }}];
+{% endif %}
     int nt = 0;
     AIE_LOOP_NO_UNROLL
     for (int i = 0; i < n; i++) {
         const int e = it[i] & 255;
+{% if units %}
+        AIE_LOOP_NO_UNROLL
+        for (int v = (it[i] >> 8) & 15; v <= ((it[i] >> 12) & 15); v++)
+            nt += ut[4 * v + 2];
+        em[{{ M_IGS }} + i] = m[{{ META + 6 * E }} + e];  // (its gate / up scale)
+{% else %}
         nt += (((it[i] >> 9) & 1) - ((it[i] >> 8) & 1) + 1) * per;
+{% endif %}
         int32_t *__restrict ei = em + {{ M_ITEM }} + {{ ITEM_WORDS }} * i;
         ei[0] = it[i];
         AIE_LOOP_NO_UNROLL
@@ -166,11 +236,20 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     for (int i = 0; i < {{ MAX_ITEMS }}; i++) {
         uint32_t w0 = 0, w1 = 0, w2 = 0, w4 = 0, w5 = 0, w7 = 0;
         if (i < n) {
+{% if units %}
+            // (units u0 .. u1 of expert e: the run's bytes ut[4 u0] .. ut[4 (u1 + 1)] of the expert's, str apart; the
+            // table's offset past the last unit: str)
+            const int u0 = (it[i] >> 8) & 15, u1 = (it[i] >> 12) & 15;
+            const uint32_t off = (uint32_t)(it[i] & 255) * str + (uint32_t)ut[4 * u0];
+            const uint32_t end = u1 + 1 < {{ units }} ? (uint32_t)ut[4 * (u1 + 1)] : str;
+            w0 = (end - (uint32_t)ut[4 * u0]) >> 2;
+{% else %}
             const int h0 = (it[i] >> 8) & 1, h1 = (it[i] >> 9) & 1;
             const uint32_t off = (uint32_t)(2 * (it[i] & 255) + h0) * str;
+            w0 = (uint32_t)(h1 - h0 + 1) * (str >> 2);
+{% endif %}
             w1 = blo + off;
             w2 = ((bhi + (w1 < off ? 1u : 0u)) & 0xFFFFu) | {{ bd_w2 }}u;
-            w0 = (uint32_t)(h1 - h0 + 1) * (str >> 2);
             w4 = {{ BD_W4 }}u;
             w5 = {{ BD_W5 }}u;
             w7 = {{ BD_VALID }}u | (i + 1 < n ? {{ BD_USE_NEXT }}u | (uint32_t){{ p }}_ebd[i + 1] << 27 : 0u);

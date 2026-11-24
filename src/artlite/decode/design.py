@@ -298,8 +298,10 @@ class DecodeOverlayOperator(ArtcOperator):
                  max_k: int = MAX_K, win: str = "", slots: int = SLOTS, bcast: bool = False,
                  a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False,
                  tails: bool = False, tail_pairs: bool = False, gating: str = "softmax", shared_gate: bool = True,
-                 rot: bool = False, norm_objs: bool = True, rg: bool = False, states: bool = False):
-        """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"); post: post-norm residual updates (F_POST, F_VOUT); pli: the
+                 rot: bool = False, norm_objs: bool = True, rg: bool = False, states: bool = False, units: int = 0,
+                 situ: tuple[float, float] = (4.0, 25.0)):
+        """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"; "situ": Inkling's experts' b tanh(g / b)
+        sigmoid(g) lb tanh(u / lb), (b, lb) = ``situ``, fp32 through ``kmath.sigmoid``); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
         count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold other
@@ -324,7 +326,8 @@ class DecodeOverlayOperator(ArtcOperator):
         memory); rg: a dense design's row-group tiles (``decode.image.Block.G``: a PARO Gemma's proj of K 256; an MoE design
         has them); states: phases whose input is fp32 states (``protocol.F_STATES``: Inkling's; the helper mixes a k
         range's states into the main core's res, ``hsacc``, then builds its panels, ``hspan``; packed designs of 4 slots,
-        inputs of at most one norm-weight object)."""
+        inputs of at most one norm-weight object); units: (moe) an expert's units of the routing instead of halves
+        (``moe.route.render(units=)``: Inkling's; the gate / up sub-phases scaled by the item's gscale, F_WS)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
         assert not rot or (post or hidden // COLS % ROT_GROUP == 0), \
             "rotated inputs: residual slices of whole rotation groups (a post design's: R phases)"
@@ -355,11 +358,13 @@ class DecodeOverlayOperator(ArtcOperator):
         self.max_g = max_k // self.chunk.k + int(self.moe)  # K chunks of a phase's group (moe: and the side chunk)
         # (a column's residual slice in whole C objects: bf16, or fp32 in a states design, ``protocol.F_STATES``)
         assert hidden % (COLS * C_LEN // (2 if states else 1)) == 0 and hidden <= max_k
-        assert not moe or not (post or pli) and act == "silu" and nsb == 4
+        assert not moe or not (post or pli) and act in ("silu", "situ") and nsb == 4
         self.gating, self.shared_gate = gating, shared_gate
+        assert not units or moe, "units: an MoE design's"
+        self.units, self.situ = units, situ
         assert all(gemv.tile_rows_of(f, tile_bytes, nsb) == r for f, r in rows.items()), rows
         assert all(gemv.supported(f, nsb, slots) for f in rows), (rows, slots)
-        assert act in ("silu", "gelu", "gelu_erf") and (not pli or act == "gelu")
+        assert act in ("silu", "gelu", "gelu_erf", "situ") and (not pli or act == "gelu") and (act != "situ" or states)
         self.hidden, self.rows, self.tile_bytes, self.eps = hidden, dict(sorted(rows.items())), tile_bytes, eps
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
         self.paged = tuple(sorted(paged))
@@ -405,6 +410,10 @@ class DecodeOverlayOperator(ArtcOperator):
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips,
         # "rot": the rotations' rounds)
         self.h8 = hidden // COLS
+        # (moe) the combine's objects per slot: halves of the residual slice (8 columns' fp32 partials within XPAY), or
+        # thirds (Inkling's slice of 288)
+        self.cparts = 2 if self.h8 % 256 == 0 else 3
+        assert not moe or self.h8 % (32 * self.cparts) == 0, self.h8
         # (fp32 per slot: the window adds reach 32 past a row's 16-aligned base, 16 past the row's end; 8 slots with gather
         # tables: just that, ``l1_8``)
         self.res_pitch = -(-(self.h8 + (16 if slots == 8 and self.tables else 32)) // 16) * 16
@@ -505,7 +514,7 @@ class DecodeOverlayOperator(ArtcOperator):
         if self.moe:  # (the slots' scales of F_WS, the hold buffer ([h | h] of a half: [k block][slot][8] bf16), the
             # routing's C objects (control packets, the expert object's metadata), the expert object's plan)
             sizes += [("wsc", 4 * 32), ("hold", 2 * S * self.obj_k), ("rbuf", 2 * C_LEN * moe_k.RBUF_OBJECTS),
-                      ("plan", 4 * moe_k.PLAN_WORDS)]
+                      ("plan", 4 * moe_k.plan_layout(self.units)[2])]
         out = regions(sizes)
         assert self.slots == 8 or MAX_K + 2048 <= self.hs_bytes  # (the 16-k sums of a K group, fp32, and hpstrip's nb
         # in the helper's scratch)
@@ -558,7 +567,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,
                                  rot=self.rot, norm_objs=self.norm_objs, ROT_OBJ=ROT_OBJ, ROT_W=ROT_OBJ - 2 * ROT_GROUP,
                                  rg=self.rg, hdr=self.post and not self.rot, RWP_AT=RWP_AT, RWS_AT=RWS_AT, RPL_AT=RPL_AT,
-                                 states=self.states,
+                                 states=self.states, units=self.units, CPARTS=self.cparts, situ=self.situ,
+                                 ink_page=self.ink_page, pg_state=0x70000 + PG_STATE,
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
@@ -568,16 +578,23 @@ class DecodeOverlayOperator(ArtcOperator):
             return {}
         route = moe_k.render(p, consts | {"META": META, "SLOTS": self.slots, "ITEM_WORDS": ITEM_WORDS,
                                           "w_": Attr(self.workspace())}, experts=self.experts, top=self.top, cols=COLS,
-                             a_packet=AID if self.a_bcast else None, gating=self.gating, shared_gate=self.shared_gate)
-        return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": moe_k.PLAN_SUBS, "PLAN_META": moe_k.PLAN_META,
-                "ITEM_WORDS": ITEM_WORDS, "route_page": len(self.paged) + 1 if self.route_page else 0,
-                "pg_state": 0x70000 + PG_STATE}
+                             a_packet=AID if self.a_bcast else None, gating=self.gating, shared_gate=self.shared_gate,
+                             units=self.units)
+        subs, meta, _ = moe_k.plan_layout(self.units)
+        return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": subs, "PLAN_META": meta,
+                "ITEM_WORDS": ITEM_WORDS, "route_page": len(self.paged) + 1 if self.route_page else 0}
 
     @property
     def route_page(self) -> bool:
         """(moe) Whether the routing is a page of the helper (after the paged formats' pages: their ids from 1): a rotated
-        design's, whose helper holds the rotations (``rote`` ..)."""
-        return self.moe and self.rot and bool(self.paged)
+        design's, whose helper holds the rotations (``rote`` ..), or a states design's (the mixes, the residual stream)."""
+        return self.moe and (self.rot or self.states) and bool(self.paged)
+
+    @property
+    def ink_page(self) -> int:
+        """(states) The page of the helper that holds the residual stream's work (``hink_all``: the step, the partial
+        sums, the coefficient sets; its id after the formats' and the routing's pages), 0: resident (no paged formats)."""
+        return len(self.paged) + 1 + int(self.route_page) if self.states and self.paged else 0
 
     @property
     def pg_split(self) -> bool:
@@ -644,6 +661,8 @@ class DecodeOverlayOperator(ArtcOperator):
             calls = {f"{fp}_mmv": tuple(e for es in pages.values() for e in es)}
             if h == 1 and self.route_page:  # (the routing: the helper's page after the formats', ``route_page``)
                 pages["ROUTE"] = calls[f"{self.pfx}_hbegin"] = (f"{self.pfx}_pgr_route",)
+            if h == 1 and self.ink_page:  # (the residual stream's work: the helper's page after those, ``ink_page``)
+                pages["INK"] = calls[f"{self.pfx}_htask"] = (f"{self.pfx}_pgr_ink",)
             return paging.link(wd, pages=pages, pager=f"{fp}_pg_request", calls=calls,
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,

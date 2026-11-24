@@ -36,7 +36,7 @@ from models.inkling2.overlay import InklingOverlay, psums
 
 from ..model_files import require
 from ..numerics import rel
-from .ref import Model, rms
+from .ref import Model, VisitCache, rms
 
 PAD = 512  # (bytes before the state array: a state object's fill reads the XB bytes that end with its payload)
 
@@ -264,7 +264,7 @@ def test_attention(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     one of 3 (crossing groups and records): o (gated) of every step against the reference's attention from the same
     inputs (fp32 activations; a sliding-window visit and a full one: tau, the taps' deltas)."""
     g, cfg = ink
-    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov = InklingOverlay(g, visits=[v], max_positions=1024, ffn=False)
     ov.load()
     ref = Model(g, cfg, q8=False)
     rng = np.random.default_rng(3)
@@ -290,7 +290,7 @@ def test_o(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     post conv over the visit's history window, cur (visit 0: a block visit, its output a new state; visit 5: added to cur,
     the states x and 2 x), the partial sums of the FFN's mix, the history window, against the reference."""
     g, cfg = ink
-    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov = InklingOverlay(g, visits=[v], max_positions=1024, ffn=False)
     ov.load()
     ref = Model(g, cfg, q8=False)
     rng = np.random.default_rng(5)
@@ -321,3 +321,88 @@ def test_o(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     assert max(perr) < 2e-2, (np.argmax(perr), max(perr), np.median(perr))
     hist = ov.history(v, 0, 3 + 3)  # (positions p - 3 .. p + 2 of the last step at p = T - 3)
     assert rel(hist, y[T - 6:].numpy()) < 1e-2
+
+
+@pytest.mark.parametrize("v", [0, 5])
+def test_ffn(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
+    """A whole visit with its FFN (the MoE: the router on the FFN's mix, the routing by sigmoid + bias, the units' situ
+    and downs, the combine and its residual step) over steps of 1, then 4, 4, 3 slots: the visit's output (cur) and the
+    next visit's attention-mix partial sums against the reference's ``visit`` from the same states (fp32; the NPU's
+    activations bf16), but where the routing's 8th and 9th keys tie within 5e-3 (a near-tie may choose the other
+    expert)."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    ref.record = {"ffn_moe_logits"}
+    rng = np.random.default_rng(7)
+    T = 31
+    toks = rng.integers(0, cfg.vocab_size, T)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    vis = cfg.visits[v]
+    x2 = rms(torch.from_numpy(g.rows("token_embd.weight", rng.integers(0, cfg.vocab_size, T))), cfg.rms_norm_eps) * tn
+    states = np.stack([x.numpy(), 3 * x2.numpy()])[:ov.n0 + 1]  # (distinct states: the mixes' coefficients matter)
+    blocks = [torch.from_numpy(b) for b in states[:-1]]
+    with torch.no_grad():
+        want = ref.visit(vis, torch.from_numpy(states[-1]), blocks, VisitCache(), 0).numpy()
+    n1 = ov.n0 + int(vis.block)
+    La, nq = ov.queries_after(v)
+    qn = np.asarray(g.tensor(f"blk.{La}.attn_res_query.weight").dequantize(), np.float32).reshape(nq, -1)
+    # (the routing's keys: where the 8th and 9th are within 5e-3, the logits' ~0.3% from the attention's bf16 outputs may
+    # pick the other expert)
+    bias = np.asarray(g.tensor(f"blk.{vis.layer}.exp_probs_b.bias").dequantize(), np.float32).reshape(-1)
+    keys = np.sort(1 / (1 + np.exp(-ref.out["ffn_moe_logits", vis.slot].numpy().astype(np.float64))) + bias, 1)[:, ::-1]
+    tie = keys[:, cfg.n_experts_used - 1] - keys[:, cfg.n_experts_used] < 5e-3
+    errs, perr = np.zeros(T), np.zeros(T)
+    p = 0
+    for S in [1] * 20 + [4, 4, 3]:
+        ov.step(states[:, p:p + S], p)
+        got = ov.state(n1, S)
+        errs[p:p + S] = [rel(got[i], want[p + i]) for i in range(S)]
+        mixed = np.concatenate([states[:n1, p:p + S], want[None, p:p + S]])
+        ps, pw = ov.psums(v + 1, "a"), psums(mixed, qn)
+        perr[p:p + S] = [rel(ps[:, i], pw[:, i]) for i in range(S)]
+        p += S
+    assert errs[~tie].max() < 3e-2 and np.median(errs) < 1e-2, (np.argmax(errs * ~tie), errs[~tie].max(), np.median(errs))
+    assert perr[~tie].max() < 4e-2 and np.median(perr) < 2e-2, (perr[~tie].max(), np.median(perr))
+
+
+def test_prelude(ink: tuple[GGUFFile, InklingConfig]) -> None:
+    """The prelude's six visits in one step (the states, the mixes' partial sums, the block state of visit 0 chained on
+    the NPU) over steps of 1, then 4, 3 slots: the prelude's output and the next visit's attention-mix partial sums
+    against the reference's visits, but where a visit's routing ties (as ``test_ffn``)."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=list(range(6)), max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    ref.record = {"ffn_moe_logits"}
+    rng = np.random.default_rng(11)
+    T = 15
+    toks = rng.integers(0, cfg.vocab_size, T)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    cur, blocks = x, []
+    tie = np.zeros(T, bool)
+    with torch.no_grad():
+        for v in range(6):
+            vis = cfg.visits[v]
+            cur = ref.visit(vis, cur, blocks, VisitCache(), 0)
+            bias = np.asarray(g.tensor(f"blk.{vis.layer}.exp_probs_b.bias").dequantize(), np.float32).reshape(-1)
+            lg = ref.out["ffn_moe_logits", vis.slot].numpy().astype(np.float64)
+            keys = np.sort(1 / (1 + np.exp(-lg)) + bias, 1)[:, ::-1]
+            tie |= keys[:, cfg.n_experts_used - 1] - keys[:, cfg.n_experts_used] < 5e-3
+    want = cur.numpy()
+    qn = np.asarray(g.tensor("blk.6.attn_res_query.weight").dequantize(), np.float32).reshape(1, -1)
+    errs, perr = np.zeros(T), np.zeros(T)
+    p = 0
+    for S in [1] * 8 + [4, 3]:
+        ov.step(x.numpy()[None, p:p + S], p)
+        got = ov.state(1, S)
+        errs[p:p + S] = [rel(got[i], want[p + i]) for i in range(S)]
+        mixed = np.stack([x.numpy()[p:p + S], want[p:p + S]])
+        ps, pw = ov.psums(6, "a"), psums(mixed, qn)
+        perr[p:p + S] = [rel(ps[:, i], pw[:, i]) for i in range(S)]
+        p += S
+    assert errs[~tie].max() < 3e-2 and np.median(errs) < 1.5e-2, (errs, tie)
+    assert perr[~tie].max() < 4e-2, (perr, tie)

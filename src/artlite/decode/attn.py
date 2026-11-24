@@ -206,12 +206,13 @@ class Attn:
     its X objects from one with its ``flag``, its outputs on D). ``pages``: the cores' code as pages (a program beyond 16
     KB: ``PAGES``), the memtile transport's words (``paging.PageSpec``: one core half). ``sinks``: a learned sink per query
     head (module docstring); ``moe``: the design's MoE layers pass (their combine's objects are skipped whole, not as an
-    input's strips)."""
+    input's strips); ``acc``: (moe) the bytes from y on in which the design's main core holds its acc
+    (``AttentionDecodeOperator.ACC_AT``: the workspace is at least that long; what persists over a step lies before y)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
                  c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None,
-                 sinks: bool = False, moe: bool = False, ink: bool = False):
+                 sinks: bool = False, moe: bool = False, ink: bool = False, acc: int = 0):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and (1 <= heads <= 4 or (heads == 8 and max(hds) <= 128)), (chain, heads, hds)
@@ -224,6 +225,7 @@ class Attn:
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
         self.qk_weights, self.gate, self.conv, self.pages, self.sinks, self.moe = qk_weights, gate, conv, pages, sinks, moe
+        self.acc = acc
         self.kv_heads = COLS // chain
         self.d_len = min(256, min(hds)) // 2  # (bf16 of a D object: every record, ring slot and o in whole objects)
         self.kper = {hd: Records(hd, kp).kper(a_bytes) for hd in hds}  # K records per K object
@@ -264,7 +266,8 @@ class Attn:
         sets = max(self.rows(hd) // 4 for hd in self.hds)
         kb = max(self.kb_slot * SLOTS, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
         words = A_WORDS_INK if self.ink else A_WORDS + (self.conv.words if self.conv is not None else 0)
-        sizes = [("st", 4 * words), ("cs", 4 * 2 * SLOTS * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
+        sizes = [("st", 4 * words), ("cs", 4 * 2 * SLOTS * sum(self.rot)), *([("itau", 64)] if self.ink else []),
+                 ("y", 4 * self.y_floats()), ("qa", qa),
                  ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SLOTS), ("sc", 4 * 32 * rg * sets),
                  ("pp", self.ppo * sets // 2 if len(self.hds) == 1 else 72 * rg), ("m", 4 * 32 * sets)]
         if self.gate:
@@ -276,10 +279,12 @@ class Attn:
             # [row][96] fp32, log2 units)
             nr = self.heads * SLOTS
             sizes += [("ic", 2 * (3 * 128 + 64 + 8 * 128)), ("ir", 4 * 16 * nr), ("isk", 4 * 16), ("ig", 2 * 128 * nr),
-                      ("itau", 64), ("ib", 4 * 96 * nr)]
+                      ("ib", 4 * 96 * nr)]
         if self.pages is not None:
             sizes.append(("keep", 192))  # (the pager's slow path: the pages' constant data read into it)
         out = regions(sizes)
+        if self.acc and out["size"] < out["y"] + self.acc:  # (an MoE design's acc from y on)
+            out = regions(sizes + [("accpad", out["y"] + self.acc - out["size"])])
         assert 16 * hm <= qa and 2 * self.heads * hm <= qa  # (a record's rows; the first q object's heads)
         assert not self.gate or 2 * (self.goff + 64 * self.chain) <= qa  # (and its gates)
         assert self.conv is None or out["size"] - out["y"] >= self.conv.need, (out, self.conv.need)  # (the conv's)

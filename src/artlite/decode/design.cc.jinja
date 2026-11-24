@@ -388,12 +388,13 @@ __attribute__((noinline)) void {{ p }}_hsacc(const float *__restrict x, const fl
     return aie::concat(aie::load_v<8>(v), aie::load_v<8>(v + 8), aie::load_v<8>(v + 16), aie::load_v<8>(v + 24));
 }
 
+alignas(32) static const uint16_t {{ p }}_ones[16] = { {% for i in range(16) %}0x3F80, {% endfor %}};  // (bf16 1.0)
+
 // The helper: acc's k range (n 128-k groups of [k block][slot sp][8] fp32; the phase's groups g0 ..) times the norm
-// weights w (bf16 per k of the range; NORM) -> their x panels ([hi of the slots | lo of the slots] per k block, in the
-// panels' place of group g0 + i: chunk, core half, super-block; xc0: the phase's first chunk) and 16-k sums (t: 32 per
-// group), sq_ += acc^2 ([slot 4][8] lanes)
-template <bool NORM>
-__attribute__((noinline)) void {{ p }}_hspan(const float *__restrict acc, const bfloat16 *__restrict w, float *__restrict sq_,
+// weights w (bf16 per k of the range, 16 apart per 16 k: ws 16; none: ``ones``, ws 0) -> their x panels ([hi of the
+// slots | lo of the slots] per k block, in the panels' place of group g0 + i: chunk, core half, super-block; xc0: the
+// phase's first chunk) and 16-k sums (t: 32 per group), sq_ += acc^2 ([slot 4][8] lanes)
+__attribute__((noinline)) void {{ p }}_hspan(const float *__restrict acc, const bfloat16 *__restrict w, int ws, float *__restrict sq_,
                                              uint8_t *__restrict xp, float *__restrict t, int g0, int n, int sp, int xc0)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -413,17 +414,11 @@ __attribute__((noinline)) void {{ p }}_hspan(const float *__restrict acc, const 
             al::split2<32>({{ p }}_akb(acc, 16 * i + 2 * j, sp), h0, l0);
             al::split2<32>({{ p }}_akb(acc, 16 * i + 2 * j + 1, sp), h1, l1);
             sq = aie::mac(aie::mac(aie::mac_square(aie::mac_square(sq, h0), h1), aie::add(h0, h0), l0), aie::add(h1, h1), l1);
-            aie::accum<accfloat, 32> x0, x1;
-            if constexpr (NORM) {  // (the 8 weights of a k block for every slot)
-                const v16int32 w2 = (v16int32)(v32bfloat16)aie::load_v<16>(pw).template grow<32>();
-                pw += 16;
-                const aie::vector<bfloat16, 32> w0((v32bfloat16)broadcast_elem_128(w2, 0)), w1((v32bfloat16)broadcast_elem_128(w2, 1));
-                x0 = aie::mac(aie::mul(h0, w0), l0, w0);
-                x1 = aie::mac(aie::mul(h1, w1), l1, w1);
-            } else {
-                x0 = aie::mac(aie::accum<accfloat, 32>(h0), l0, aie::broadcast<bfloat16, 32>(1.0f));
-                x1 = aie::mac(aie::accum<accfloat, 32>(h1), l1, aie::broadcast<bfloat16, 32>(1.0f));
-            }
+            // (the 8 weights of a k block for every slot)
+            const v16int32 w2 = (v16int32)(v32bfloat16)aie::load_v<16>(pw).template grow<32>();
+            pw += ws;
+            const aie::vector<bfloat16, 32> w0((v32bfloat16)broadcast_elem_128(w2, 0)), w1((v32bfloat16)broadcast_elem_128(w2, 1));
+            const aie::accum<accfloat, 32> x0 = aie::mac(aie::mul(h0, w0), l0, w0), x1 = aie::mac(aie::mul(h1, w1), l1, w1);
             const aie::accum<accfloat, 64> a = aie::concat(x0, x1);
             al::MM8 l(a);
             l.mac(a.template to_vector<bfp16ebs8>(), aie::op_transpose(nI));  // a - hi exactly
@@ -513,6 +508,21 @@ __attribute__((noinline)) void {{ p }}_hips(const float *__restrict q, const flo
         aie::store_v(out + 32 * s, aie::load_v<16>(e));
         aie::store_v(out + 32 * s + 16, aie::load_v<16>(e + 16));
     }
+}
+
+// The helper's residual-stream commands: K_INK (``cink``: the step), K_IPS (``cips``: the next mix's partial sums
+// after cur's slice in res), K_COEF (``ccoef``: a phase's partial sums object -> its coefficient sets)
+__attribute__((noinline)) void {{ p }}_hink_all(const int32_t *__restrict cmd, float *__restrict sq, float *__restrict ist)
+{
+    const int kind = cmd[{{ C_KIND }}], inkn = cmd[{{ C_INKN }}], sp = cmd[{{ C_SP }}];
+    if (kind == {{ K_INK }})
+        {{ p }}_hink((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
+                     inkn, sp);
+    else if (kind == {{ K_IPS }})
+        {{ p }}_hips((const float *)(uintptr_t)cmd[1], ist, (float *)(uintptr_t)cmd[2] + {{ H8 }} * sp,
+                     (inkn & 15) + ((inkn >> 4) & 1), cmd[3], sp);
+    else
+        {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
 }
 
 {% endif %}
@@ -699,8 +709,37 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 
 {% endif %}
 {% endif %}
+{% if act == "situ" %}
+// situ (Inkling's experts) of 16 gate values g (in place) and up values u: b tanh(g / b) sigmoid(g) lb tanh(u / lb) (b, lb
+// = {{ situ[0] }}, {{ situ[1] }}), as b lb (2 sigmoid(2 g / b) - 1) sigmoid(g) (2 sigmoid(2 u / lb) - 1) in fp32: sigmoid(x) = r or
+// e r (x < 0), e = e^-|x|, r = 1 / (1 + e) (``sexp``, ``srcp`` in place: t, 128 floats of scratch, keep the frames small)
+__attribute__((noinline)) void {{ p }}_situ(float *__restrict g, const float *__restrict u, float *__restrict t)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<float, 16> z = aie::zeros<float, 16>(), one = aie::broadcast<float, 16>(1.0f);
+    aie::store_v(t + 64, aie::load_v<16>(g));
+    aie::store_v(t + 80, al::mulff<16>(aie::load_v<16>(g), aie::broadcast<float, 16>({{ 2 / situ[0] }}f)));
+    aie::store_v(t + 48, al::mulff<16>(aie::load_v<16>(u), aie::broadcast<float, 16>({{ 2 / situ[1] }}f)));
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 3; i++) {  // (x_i at t + 48 + 16 ((i + 1) % 3): g, 2 g / b, 2 u / lb -> sigmoid at t + 16 i)
+        float *__restrict e = t + 16 * i;
+        const aie::vector<float, 16> x = aie::load_v<16>(t + 48 + 16 * (i == 2 ? 0 : i + 1));
+        aie::store_v(e, aie::min(x, aie::sub(z, x)));
+        {{ p }}_sexp(e);
+        aie::store_v(t + 112, aie::load_v<16>(e));
+        aie::store_v(e, aie::add(one, aie::load_v<16>(e)));
+        {{ p }}_srcp(e);
+        const aie::vector<float, 16> r = aie::load_v<16>(e);
+        aie::store_v(e, aie::select(r, al::mulff<16>(aie::load_v<16>(t + 112), r), aie::lt(x, z)));
+    }
+    const aie::vector<float, 16> s0 = aie::load_v<16>(t), s1 = aie::load_v<16>(t + 16), s2 = aie::load_v<16>(t + 32);
+    const aie::vector<float, 16> a = aie::sub(aie::add(s1, s1), one), b = aie::sub(aie::add(s2, s2), one);
+    aie::store_v(g, al::mulff<16>(al::mulff<16>(al::mulff<16>(a, s0), b), aie::broadcast<float, 16>({{ situ[0] * situ[1] }}f)));
+}
+{% else %}
 {% set lut = km.act(km.TABLES[act], table_arg=SLOTS == 8) %}
 {{ lut.src }}
+{% endif %}
 {% set gwin = wide and (SLOTS == 8 or act == "silu") %}{# (the gate / up windows' rows of every act at 8 slots, SiLU's at 4) #}
 
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM{{ ", F_PSQ" if rot else "" }}: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
@@ -756,6 +795,14 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
             aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(yt + h)).template to_vector<bfloat16>());
             {{ lut }}<32>(gs, gs + 32);
             aie::store_v(yt + h, al::mulc<32>(aie::load_v<32>(yt + h + 32), aie::load_v<32>(gs + 32)).template to_vector<float>());
+        }
+    }
+{% elif act == "situ" %}
+    if (flags & {{ F_GU }}) {  // (situ: gate yt's g 0, up g 1 of each 16 rows)
+        AIE_LOOP_NO_UNROLL
+        for (int h = 0; h < {{ "nf" if rg else YT }}; h += 64) {
+            {{ p }}_situ(yt + h, yt + h + 32, WS(float, {{ w_.scr }}));
+            {{ p }}_situ(yt + h + 16, yt + h + 48, WS(float, {{ w_.scr }}));
         }
     }
 {% elif SLOTS == 8 %}
@@ -863,6 +910,9 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
         bfloat16 *__restrict ph = WS(bfloat16, {{ w_.hold }}) + 32 * (n >> 3) + 8 * s;
         const aie::vector<bfloat16, 8> o = aie::accum<accfloat, 16>(y).template to_vector<bfloat16>().template extract<8>(0);
         aie::store_v(ph, o);
+{% if units %}
+        if (n < 256)
+{% endif %}
         aie::store_v(ph + {{ 32 * (OBJ_K // 16) }}, o);
         return nv;
     }
@@ -1955,7 +2005,13 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
 {% if moe %}
     // (acc: its counter over slot 4 + object, the 4 objects of 32 rows of a slot's 128 rows j in a row: a combine's object,
     // half j & 1 of column j / 2's slice)
+{% if CPARTS == 2 %}
     const int s = st[{{ S_ESLOT }}], S = st[{{ S_NS }}] << (st[{{ S_ESRC }}] == 4 ? 2 : 0);
+{% else %}
+    // (acc: its counter over slot {{ H8 // 32 }} + object, the {{ H8 // 32 }} objects of 32 rows of a slot's slice of
+    // column j in a row: a combine's objects, [column][96] per slot and third)
+    const int s = st[{{ S_ESLOT }}], S = st[{{ S_NS }}] * (st[{{ S_ESRC }}] == 4 ? {{ H8 // 32 }} : 1);
+{% endif %}
 {% else %}
     const int s = st[{{ S_ESLOT }}], S = st[{{ S_NS }}];
 {% endif %}
@@ -2009,7 +2065,12 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
         st[{{ S_EJ }}] = last ? j + 1 : j;
 {% if moe %}
         if (st[{{ S_ESRC }}] == 4) {  // 4: acc (fp32 [slot][H])
+{% if CPARTS == 2 %}
             aie::store_v((float *)c, aie::load_v<32>((const float *)((const uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * (s >> 2) + 128 * j + 32 * (s & 3)));
+{% else %}
+            const int sl = (s * 57) >> 9;  // (s / 9, s < 36)
+            aie::store_v((float *)c, aie::load_v<32>((const float *)((const uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * sl + {{ H8 }} * j + 32 * (s - 9 * sl)));
+{% endif %}
             return;
         }
         if (st[{{ S_ESRC }}] == 5) {  // 5: the routing's objects (S_NS 1)
@@ -2405,6 +2466,20 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
 {
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     int32_t *__restrict pl = WS(int32_t, {{ w_.plan }});
+{% if units %}
+    {{ p }}_cv(pl, m, {{ PLAN_SUBS // 16 }});  // (its metadata, the templates per kind, the units' kinds)
+    int ns = 0, first = 2;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < m[{{ M_NITEM }}]; i++) {
+        const int w = m[{{ M_ITEM }} + {{ ITEM_WORDS }} * i];
+        AIE_LOOP_NO_UNROLL
+        for (int u = (w >> 8) & 15; u <= ((w >> 12) & 15); u++) {  // (word: down | first << 1 | last << 2 | u << 3 | item << 5)
+            pl[{{ PLAN_SUBS }} + ns++] = i << 5 | u << 3;
+            pl[{{ PLAN_SUBS }} + ns++] = i << 5 | u << 3 | first | 1;
+            first = 0;
+        }
+    }
+{% else %}
     {{ p }}_cv(pl, m, {{ 3 * META // 16 }});
     int ns = 0, first = 2;
     AIE_LOOP_NO_UNROLL
@@ -2417,6 +2492,7 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
             first = 0;
         }
     }
+{% endif %}
     pl[{{ PLAN_SUBS }} + ns - 1] |= 4;
     st[{{ S_NSUB }}] = ns;  // (its passes: each sets up its sub-phase first)
     st[{{ S_NSUBC }}] = 1;
@@ -2424,12 +2500,12 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
     st[{{ S_NS }}] = m[{{ M_NS }}];
 }
 
-__attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col);
+__attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col{{ ", float *__restrict ist" if states else "" }});
 
 // The helper, the next sub-phase of an expert object (``hexpert``): its metadata from its template (gate / up: on the
 // normed phase's x panels and 1 / rms, its outputs into the hold buffer; down: on two strips of the hold buffer in the
 // side chunk, its rows times the item's weights into acc)
-__attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws)
+__attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws{{ ", float *__restrict ist" if states else "" }})
 {
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     int32_t *__restrict pl = WS(int32_t, {{ w_.plan }});
@@ -2437,13 +2513,21 @@ __attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws)
     st[{{ S_SUB }}] = j + 1;
     const int w = pl[{{ PLAN_SUBS }} + j], down = w & 1;
     int32_t *__restrict sm = pl + {{ PLAN_META }};
+{% if units %}
+    // (the unit's templates: its kind's; gate / up: F_WS, its wsc 1 / rms times the item's gscale)
+    const int item = w >> 5, kind = pl[{{ PLAN_SUBS - 16 }} + ((w >> 3) & 3)];
+    {{ p }}_cv(sm, pl + {{ META }} + {{ META }} * (2 * kind + down), {{ META // 16 }});
+    sm[{{ M_FLAGS }}] = down ? {{ F_MAIN + F_WS + F_ACCUM }} | ((w & 2) ? {{ F_ACC0 }} : 0) | ((w & 4) ? {{ F_EMITA }} : 0)
+                             : {{ F_MAIN + F_WS + F_GU + F_HOUT }};
+{% else %}
     {{ p }}_cv(sm, pl + {{ META }} + {{ META }} * down, {{ META // 16 }});
     sm[{{ M_FLAGS }}] = down ? {{ F_MAIN + F_WS + F_ACCUM }} | ((w & 2) ? {{ F_ACC0 }} : 0) | ((w & 4) ? {{ F_EMITA }} : 0)
                              : {{ F_MAIN + F_NORM + F_GU + F_HOUT }};
+{% endif %}
     sm[{{ M_NS }}] = pl[{{ M_NS }}];
     sm[{{ M_NX }}] = 0;
     sm[{{ M_XC0 }}] = down ? {{ SIDE }} : 0;
-    {{ p }}_hbegin((const bfloat16 *)sm, ws, 0);
+    {{ p }}_hbegin((const bfloat16 *)sm, ws, 0{{ ", ist" if states else "" }});
 {% if rot %}
     st[{{ S_NT }}] += down ? 0 : sm[{{ M_NRA }}];  // (a PARO gate / up: its half's rotation object after its tiles: ``hrot``)
 {% endif %}
@@ -2453,26 +2537,38 @@ __attribute__((noinline, minsize)) void {{ p }}_hsub(int32_t *__restrict ws)
     st[{{ S_NE }}] = 0;
     st[{{ S_NM }}] = 0;
     if (down) {  // (the item's weights per slot)
-        const int32_t *__restrict ei = pl + {{ M_ITEM }} + {{ ITEM_WORDS }} * (w >> 4);
+        const int32_t *__restrict ei = pl + {{ M_ITEM }} + {{ ITEM_WORDS }} * {{ "item" if units else "(w >> 4)" }};
         float *__restrict wsc = WS(float, {{ w_.wsc }});
         AIE_LOOP_NO_UNROLL
         for (int s = 0; s < {{ SLOTS }}; s++)
             aie::store_v(wsc + 8 * s, aie::broadcast<float, 8>(__builtin_bit_cast(float, ei[1 + s])));
     }
+{% if units %}
+    else {  // (gate / up: the slots' 1 / rms times the expert's gate / up scale)
+        aie::set_rounding(aie::rounding_mode::conv_even);
+        aie::store_v(WS(float, {{ w_.wsc }}), al::mulff<32>(aie::load_v<32>(WS(float, {{ w_.inv }})),
+                                                          aie::broadcast<float, 32>(__builtin_bit_cast(float, pl[{{ M_IGS }} + item]))));
+    }
+{% endif %}
 }
 
-// The helper, a combine's object d: half d & 1 of slot d / 2's partials of the columns ([column][H8 / 2] fp32 at x, on
+// The helper, a combine's object d: part d % {{ CPARTS }} of slot d / {{ CPARTS }}'s partials of the columns ([column][H8 / {{ CPARTS }}] fp32 at x, on
 // the slot's grid: ``_gacc``) summed (exact), then into the main core's residual slice of the slot (fp32)
 __attribute__((noinline)) void {{ p }}_hacc(const float *__restrict x, int32_t *__restrict ws, int d)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if CPARTS == 2 %}
     float *__restrict r = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * (d >> 1) + {{ H8 // 2 }} * (d & 1);
+{% else %}
+    const int sl = (d * 11) >> 5;  // (d / 3, d < 12)
+    float *__restrict r = WS(float, {{ w_.res }}) + {{ RES_PITCH }} * sl + {{ H8 // 3 }} * (d - 3 * sl);
+{% endif %}
     AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < {{ H8 // 2 }}; i += 32) {
+    for (int i = 0; i < {{ H8 // CPARTS }}; i += 32) {
         aie::accum<accfloat, 32> a(aie::load_v<32>(x + i));
         AIE_LOOP_NO_UNROLL
         for (int c = 1; c < {{ COLS }}; c++)
-            a = aie::add(a, aie::load_v<32>(x + {{ H8 // 2 }} * c + i));
+            a = aie::add(a, aie::load_v<32>(x + {{ H8 // CPARTS }} * c + i));
         aie::store_v(r + i, aie::add(aie::load_v<32>(r + i), a.template to_vector<float>()));
     }
 }
@@ -2591,6 +2687,8 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
         st[{{ S_NIN }}] = 0;
 {% if rot %}
         st[{{ S_NE }}] = (flags & {{ F_ROTE }}) ? 0 : m[{{ M_NS }}] * {{ H8 // C_LEN }};
+{% elif states %}
+        st[{{ S_NE }}] = (flags & {{ F_INK }}) ? 0 : m[{{ M_NS }}] * {{ H8 // C_LEN }};  // (F_INK: the step's own)
 {% else %}
         st[{{ S_NE }}] = m[{{ M_NS }}] * {{ H8 // C_LEN }};
 {% endif %}
@@ -2779,7 +2877,7 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 {% endif %}
 {% if moe %}
     if (kind == {{ K_SUB }}) {
-        {{ p }}_hsub((int32_t *)(uintptr_t)cmd[1]);
+        {{ p }}_hsub((int32_t *)(uintptr_t)cmd[1]{{ ", ist" if states else "" }});
         return;
     }
     if (kind == {{ K_ACC }}) {
@@ -2788,19 +2886,14 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
     }
 {% endif %}
 {% if states %}
-    if (kind == {{ K_INK }}) {  // the residual stream's step (``cink``)
-        {{ p }}_hink((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
-                     cmd[{{ C_INKN }}], cmd[{{ C_SP }}]);
-        return;
-    }
-    if (kind == {{ K_IPS }}) {  // the next mix's partial sums (``cips``): after cur's slice in res
-        const int inkn = cmd[{{ C_INKN }}], sp = cmd[{{ C_SP }}];
-        {{ p }}_hips((const float *)(uintptr_t)cmd[1], ist, (float *)(uintptr_t)cmd[2] + {{ H8 }} * sp,
-                     (inkn & 15) + ((inkn >> 4) & 1), cmd[3], sp);
-        return;
-    }
-    if (kind == {{ K_COEF }}) {  // a phase's partial sums object: its coefficient sets (``ccoef``)
-        {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
+    if (kind == {{ K_INK }} || kind == {{ K_IPS }} || kind == {{ K_COEF }}) {  // (the residual stream's work: ``hink_all``)
+{% if ink_page %}
+        // (a page of the helper, ``ink_page``; its scratch, idle between the strips' 16-k sums, takes the pager's data reads)
+        {{ mp }}_pg_need<1>({{ ink_page }}, scr);
+        ((void (*)(const int32_t *, float *, float *))(intptr_t)((const volatile int32_t *){{ pg_state }})[1])(cmd, sq, ist);
+{% else %}
+        {{ p }}_hink_all(cmd, sq, ist);
+{% endif %}
         return;
     }
     if (kind == {{ K_SSTRIP }}) {  // an fp32 state object d: state d % nr of k range d / nr (``post``)
@@ -2813,10 +2906,8 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         const int cs = cmd[{{ C_CSET }}];  // (the coefficient set; -1: one state of coefficient 1)
         {{ p }}_hsacc((const float *)(uintptr_t)cmd[0], cs < 0 ? nullptr : sq + 32 + 32 * cs + 4 * b, acc, b == 0, sp);
         if (b == nr - 1) {  // (the range's sum: its panels, n 128-k groups)
-            if (cmd[1])
-                {{ p }}_hspan<true>(acc, (const bfloat16 *)(uintptr_t)cmd[1], sq, xp, (float *)scr, n * rg, n, sp, cmd[{{ C_XC0 }}]);
-            else
-                {{ p }}_hspan<false>(acc, nullptr, sq, xp, (float *)scr, n * rg, n, sp, cmd[{{ C_XC0 }}]);
+            {{ p }}_hspan(acc, cmd[1] ? (const bfloat16 *)(uintptr_t)cmd[1] : (const bfloat16 *){{ p }}_ones, cmd[1] ? 16 : 0, sq, xp, (float *)scr,
+                          n * rg, n, sp, cmd[{{ C_XC0 }}]);
         }
         return;
     }
@@ -2919,6 +3010,14 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
 void {{ p }}_pgr_route(const int32_t *__restrict m, int32_t *__restrict ws, int col)
 {
     {{ p }}_route(m, ws, col);
+}
+{% endif %}
+{% if ink_page %}
+
+// (a page of the helper: the residual stream's work, ``hink_all``; external, as ``pgr_route``)
+void {{ p }}_pgr_ink(const int32_t *__restrict cmd, float *__restrict sq, float *__restrict ist)
+{
+    {{ p }}_hink_all(cmd, sq, ist);
 }
 {% endif %}
 

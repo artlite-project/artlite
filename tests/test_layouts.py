@@ -27,8 +27,8 @@ _EXPLICIT = {"C_LEN", "B_G4", "V_NORM", "REC_K", "REC_V", "A_HI", "A_OBJ", "L_DO
 def _templates() -> dict[str, dict[str, int]]:
     """Template file -> the constants its renderers pass from the layouts."""
     out = {
-        "artlite/decode/design.cc.jinja": protocol.consts(rpost=True),
-        "artlite/decode/attn.cc.jinja": decode_attn.consts(),
+        "artlite/decode/design.cc.jinja": protocol.consts(rpost=True) | protocol.consts(states=True),
+        "artlite/decode/attn.cc.jinja": decode_attn.consts(ink=True),
         "artlite/decode/gemv.cc.jinja": {},
         "models/lfm/conv.cc.jinja": lfm_conv.STATE.consts() | decode_attn.consts(),
         "artlite/vision/core.cc.jinja": vision_core.consts(),

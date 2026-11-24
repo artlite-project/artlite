@@ -199,6 +199,7 @@ M_NITEM = MOE.word("M_NITEM", at=M_MODEL)
 M_ITEM = MOE.block("M_ITEM", ITEM_WORDS * MAX_ITEMS)
 M_RBASE = MOE.block("M_RBASE", 2, at=50)
 M_RSTR, M_RTGU, M_RTDN = MOE.words("M_RSTR M_RTGU M_RTDN")
+M_IGS = MOE.block("M_IGS", MAX_ITEMS, at=56)  # (``units`` routings) the expert object's items' gate / up scales (fp32 bits)
 F_ROUTE = MOE.flag("F_ROUTE", 20)  # the route object: the router's logits as its payload -> the routing (control packets, expert object)
 F_EXPERT = MOE.flag("F_EXPERT", 21)  # the expert object: the column's items, M_NT their A objects (the main core's sub-phases)
 

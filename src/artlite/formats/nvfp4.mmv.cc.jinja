@@ -99,10 +99,11 @@ __attribute__((noinline)) void {{ p }}_nv_sc(const bfloat16 *__restrict c, const
     aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
 }
 
-// super-blocks 2 H, 2 H + 1 of an NVFP4 tile: y[g][{{ L }}] (rows 8 g ..) += their rows against xp (their 64 panels)
+// super-blocks 2 H, 2 H + 1 of an NVFP4 tile: y[g][{{ L }}] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; rg:
+// super-block 2 H + 1's rows into y + ys (row groups of 4: rows of their own)" if rg else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
-                                             float *__restrict y, uint8_t *__restrict scr)
+                                             float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *sct = (bfloat16 *)(scr + 4096);
     // (the table copies' addresses through a volatile word: constants at the call would specialize _iq4_w, and the
@@ -114,6 +115,6 @@ __attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_
         {{ p }}_nv_ss(un + {{ 128 * R4 }}, sct);
         {{ p }}_iq4_w(un, tab_ab, tab_cd, scr);
         {{ p }}_nv_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
-        {{ p }}_nv_sc((const bfloat16 *)scr, sct, y);
+        {{ p }}_nv_sc((const bfloat16 *)scr, sct, y{{ " + u * ys" if rg else "" }});
     }
 }

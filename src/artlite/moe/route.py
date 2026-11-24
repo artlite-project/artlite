@@ -37,6 +37,16 @@ RBUF_META = 96  # the metadata's first word in them
 # the expert object's plan (the main core's workspace): its metadata, the gate / up and down templates, the
 # sub-phases, a sub-phase's metadata
 PLAN_SUBS, PLAN_META, PLAN_WORDS = 192, 208, 272
+UNIT_KINDS = 2  # (``units``) the templates' kinds (an expert's units of two shapes: Inkling's 512 and 128 channels)
+
+
+def plan_layout(units: int) -> tuple[int, int, int]:
+    """(PLAN_SUBS, PLAN_META, PLAN_WORDS) of an expert object's plan: halves (units 0), or units (``render``): its
+    metadata, a gate / up and a down template per kind, the units' kinds (16 words), then up to 32 sub-phases."""
+    if not units:
+        return PLAN_SUBS, PLAN_META, PLAN_WORDS
+    subs = 64 * (1 + 2 * UNIT_KINDS) + 16
+    return subs, subs + 32, subs + 32 + 64
 
 
 # the control packets' route on a shim's MM2S1 (stream-switch slave South 7; aiecc: slot 0, the X objects' id -> a low
@@ -99,6 +109,39 @@ def route(logits: np.ndarray, k: int, cols: int, gating: str = "softmax") -> tup
     return ids, w, deal(sorted({int(e) for e in ids.reshape(-1)}), cols)
 
 
+def top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``render(units=)``'s top k of each slot's fp32 logits (S, E): (ids (S, k): the k largest sigmoid(l) + bias, ties
+    to the lower id; weights (S, k), float64: sigmoid(l) / (their sum + 1e-20) times dscale of the expert)."""
+    sg = 1 / (1 + np.exp(-np.asarray(logits, np.float64)))
+    keys = (sg.astype(np.float32) + np.asarray(bias, np.float32)).astype(np.float64)
+    order = np.argsort(-keys, axis=1, kind="stable")[:, :k]
+    top = np.take_along_axis(sg, order, 1)
+    return order, top / (top.sum(1, keepdims=True) + 1e-20) * np.asarray(dscale, np.float64)[order]
+
+
+def deal_units(union: list[int], cols: int, work: list[int]) -> list[list[tuple[int, int, int]]]:
+    """``render(units=)``'s deal: the columns' items (expert, first unit, last unit) of the union's experts (increasing
+    ids): whole experts U[i] to column i % cols for i < cols nw, then the rest's units in order (unit u's ``work``) to the
+    column whose share [c, c + 1) R / cols of the rest's work R holds the unit's start; a column's consecutive units of
+    one expert one item."""
+    nw = len(union) // cols
+    out: list[list[tuple[int, int, int]]] = [[] for _ in range(cols)]
+    for i in range(cols * nw):
+        out[i % cols].append((union[i], 0, len(work) - 1))
+    rest = union[cols * nw:]
+    R, a = len(rest) * sum(work), 0
+    for e in rest:
+        for u, wu in enumerate(work):
+            c = next(c for c in range(cols) if c * R <= a * cols < (c + 1) * R)
+            if len(out[c]) > nw and out[c][-1][0] == e:  # (the next unit of the column's last item's expert)
+                out[c][-1] = (e, out[c][-1][1], u)
+            else:
+                out[c].append((e, u, u))
+            a += wu
+    assert all(len(items) <= MAX_ITEMS for items in out)
+    return out
+
+
 def item_weights(ids: np.ndarray, w: np.ndarray, e: int) -> np.ndarray:
     """An item's weights per slot (S,): expert e's weight in each slot's top k, else 0."""
     hit = ids == e
@@ -138,12 +181,18 @@ _SRC = templating.load("artlite/moe/route.cc.jinja")
 
 
 def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: int, a_packet: int | None = None,
-           gating: str = "softmax", shared_gate: bool = True) -> str:
+           gating: str = "softmax", shared_gate: bool = True, units: int = 0) -> str:
     """The routing kernel ``{p}_route`` (in the helper's anonymous namespace; ``WS``, ``{p}_zv`` and the workspace
     regions ``w_`` from the overlay's kernel source; ``consts``: its M_ / F_ / S_ words, META, SLOTS; a_packet: the A
     stream's packet id where it is packet-switched: the items' BDs carry its header; gating: the K's weights, "softmax"
-    or "sigmoid" (``top_k``); shared_gate: the shared expert's sigmoid gate of S_SG into wsc)."""
+    or "sigmoid" (``top_k``); shared_gate: the shared expert's sigmoid gate of S_SG into wsc; units: an expert's units
+    (Inkling's: its h in parts of unequal sizes, ``route_units``) instead of halves: the route object's payload after
+    the logits [slot 4][E] holds bias, dscale, gscale [E] fp32 and the units' table [unit][4] int32 (offset of its bytes
+    in the expert's run, its work, its A objects, its templates' kind), the K chosen by sigmoid(l) + bias, weighted
+    sigmoid(l) / (sum + 1e-20) times dscale; the items units u0 .. u1 of an expert, the expert object's M_IGS the items'
+    gscale)."""
     assert gating in ("softmax", "sigmoid"), gating
+    assert not units or (gating == "sigmoid" and 4 * (7 * experts + 4 * units) <= 4096), (units, gating)
     assert experts % 32 == 0 and experts <= 256 and top <= 8 and cols == 8
     assert RBUF_META + consts["META"] <= 32 * RBUF_OBJECTS and PACKET_WORDS <= RBUF_META
     regs = [txn.SHIM_BD0 + txn.BD_BYTES * bd for bd in EXPERT_BDS]
@@ -153,4 +202,4 @@ def render(p: str, consts: dict[str, object], *, experts: int, top: int, cols: i
                        ch_lock=_ctl(txn.SHIM_LOCK0 + 16 * LOCK_DONE, 1), RBUF_OBJECTS=RBUF_OBJECTS,
                        RBUF_META=RBUF_META, BD_W4=txn.BD_BURST_512B, BD_W5=txn.BD_AXCACHE, BD_VALID=txn.BD_VALID,
                        BD_USE_NEXT=txn.BD_USE_NEXT, bd_w2=0 if a_packet is None else txn.bd_packet_bits(a_packet),
-                       sigmoid=gating == "sigmoid", shared_gate=shared_gate, **consts)
+                       sigmoid=gating == "sigmoid", shared_gate=shared_gate, units=units, **consts)

@@ -41,6 +41,37 @@ def test_deal(u: int) -> None:
         assert whole == sorted(whole, reverse=True)
 
 
+@pytest.mark.parametrize("u", list(range(1, 33)))
+def test_deal_units(u: int) -> None:
+    """``route.render(units=)``'s deal (Inkling's units of 512, 512, 128 channels: work 4, 4, 1) of a union of u
+    experts: every unit once, whole experts first, at most MAX_ITEMS items a column, a column's work within one expert's
+    of the even share."""
+    work = [4, 4, 1]
+    union = sorted(np.random.default_rng(u).choice(128, u, replace=False).tolist())
+    items = MR.deal_units(union, COLS, work)
+    units = [(e, x) for col in items for e, u0, u1 in col for x in range(u0, u1 + 1)]
+    assert sorted(units) == sorted((e, x) for e in union for x in range(3))
+    assert max(len(col) for col in items) <= MR.MAX_ITEMS
+    loads = [sum(work[x] for _, u0, u1 in col for x in range(u0, u1 + 1)) for col in items]
+    assert max(loads) - u * sum(work) / COLS <= sum(work), loads
+
+
+def test_top_k_bias() -> None:
+    """The units routing's top 8 by sigmoid(l) + bias (ties to the lower id), weights sigmoid / (sum + 1e-20) times the
+    down's scale."""
+    rng = np.random.default_rng(1)
+    lg = rng.standard_normal((16, 128)).astype(np.float32) * 3
+    bias = rng.standard_normal(128).astype(np.float32) * 0.1
+    dsc = rng.uniform(0.5, 2, 128)
+    ids, w = MR.top_k_bias(lg, 8, bias, dsc)
+    sg = 1 / (1 + np.exp(-lg.astype(np.float64)))
+    keys = sg.astype(np.float32) + bias
+    for s in range(16):
+        want = np.argsort(-keys[s].astype(np.float64), kind="stable")[:8]
+        assert ids[s].tolist() == want.tolist()
+        assert np.allclose(w[s], sg[s, want] / sg[s, want].sum() * dsc[want])
+
+
 def test_check_route() -> None:
     """The configuration may leave the control route's arbiter and msel unused only: a stream on them would feed
     TileControl (one on the arbiter with another msel does not), a written route register would be overwritten."""
