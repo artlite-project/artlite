@@ -6,7 +6,8 @@
 - a checkpoint: the steps after a restore give the logits they gave before it, bit for bit (the convs' state and the
   sliding-window caches back with it);
 - steps of S tokens against steps of one, a rollback of rejected drafts, greedy text with the context's drafts: bit for
-  bit, the same text.
+  bit, the same text;
+- greedy text after five prompts against llama.cpp's decode of the same tokens (``test_text``).
 """
 
 import numpy as np
@@ -123,3 +124,49 @@ def test_drafts() -> None:
         texts.append(list(model.generate(logits, 64, Sampling(greedy=True), prompt, drafts=drafts)))
     assert texts[0] == texts[1]
     assert model.accepted_ctx > 0.5 * model.drafted_ctx > 0, (model.drafted_ctx, model.accepted_ctx)
+
+
+NEAR = 1.0  # (logits: a token within this of llama.cpp's top one is a near tie, as test_teacher_forced's sure tokens)
+TEXT_PROMPTS = {
+    "chat": [{"role": "user", "content": "Hi! I'm planning a weekend trip to Lisbon in October. What should I see, "
+                                         "and is it worth taking a day trip to Sintra?"}],
+    "code": [{"role": "user", "content": "Write a Python function that merges overlapping intervals, given as a list of "
+                                         "(start, end) tuples, and returns them sorted. Include a short docstring."}],
+    "math": [{"role": "user", "content": "A train leaves at 9:40 and travels 270 km at an average of 90 km/h, then "
+                                         "waits 25 minutes and covers another 120 km at 80 km/h. When does it arrive? "
+                                         "Show the steps."}],
+    "instruction": [{"role": "user", "content": (
+        "You are helping me prepare a one-page brief for a city council meeting about adding protected bike lanes on "
+        "Main Street. Please: (1) open with a two-sentence summary of the proposal; (2) list three benefits, each with "
+        "one concrete example from another city; (3) list the two strongest objections local shop owners are likely "
+        "to raise, and a fair response to each; (4) propose a six-month pilot with measurable goals; (5) end with a "
+        "single question the council should vote on. Keep the tone neutral and avoid jargon, use short paragraphs, "
+        "and do not invent statistics: where a number would help, say what should be measured instead.")}],
+}
+
+
+def test_text() -> None:
+    """Greedy text of 128 tokens after five prompts (a chat, code, math, a long instruction as chat turns without
+    thinking; an essay's first 400 tokens) against llama.cpp's decode of the prompt and our tokens (``goldens.text``,
+    teacher-forced on ours): each of our tokens is llama.cpp's top one, or within ``NEAR`` of it (a near tie)."""
+    path = _path()
+    host = Inkling(path)
+    prompts = {k: host.chat(m) for k, m in TEXT_PROMPTS.items()}
+    prompts["essay"] = llama_tokenize(path, essay("founders.txt"))[:400]
+    model = host.load(capacity=1024)
+    near, total = 0, 0
+    for name, toks in prompts.items():
+        model.reset()
+        logits = model.prompt(toks, logits=True)
+        out = list(model.generate(logits, 128, Sampling(greedy=True), toks))
+        assert len(out) == 128 or out[-1] in host.eos_token_ids, (name, len(out))
+        ref = np.asarray(golden(path, toks + out, ubatch=512, split=len(toks), logits="f32",
+                                logits_from=len(toks) - 1).logits, np.float32)
+        gap = ref[np.arange(len(out)), :].max(-1) - ref[np.arange(len(out)), out]
+        bad = np.flatnonzero(gap >= NEAR)
+        near += int(((gap > 0) & (gap < NEAR)).sum())
+        total += len(out)
+        print(f"{name}: {len(out)} tokens, {int((gap == 0).sum())} llama.cpp's top, {int(((gap > 0) & (gap < NEAR)).sum())} "
+              f"near ties: {host.tokenizer.decode(out)[:160]!r}")
+        assert not bad.size, (name, bad[:8], gap[bad[:8]])
+    print(f"{total} tokens, {near} near ties")

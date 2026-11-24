@@ -22,6 +22,7 @@ from artlite.decode.protocol import (
     M_NR,
     M_NX,
     META,
+    SLOTS,
     XB,
     XPAY,
     packed_slots,
@@ -35,6 +36,7 @@ from models.inkling2.image import InklingImage
 from models.inkling2.overlay import InklingOverlay, psums
 from models.tokenizer import BpeTokenizer
 
+from ..decode.attn_ink_ref import InkAttentionRef
 from ..model_files import require
 from ..numerics import rel
 from .ref import Model, VisitCache, rms
@@ -279,13 +281,15 @@ def test_attention(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     vis = cfg.visits[v]
     with torch.no_grad():
         want = _attention_ref(ref, vis, x, 91).numpy()
-    errs = []
+    errs, gots = [], []
     p = 0
     for S in [1] * 80 + [4, 4, 3]:
         ov.step(np.stack([x[p:p + S].numpy()] * (ov.n0 + 1)), p)  # (a mix of equal states: x / rms(x))
         got = ov.attn_out(v, S)
         errs.append(rel(got, want[p:p + S]))
+        gots.append(got)
         p += S
+    print(f"visit {v} ({cfg.visits[v].kind}): o's relative RMS error {rel(np.concatenate(gots), want):.2e}")
     assert max(errs) < 2e-2, (np.argmax(errs), max(errs), np.median(errs))
 
 
@@ -330,6 +334,54 @@ def test_ring(ink: tuple[GGUFFile, InklingConfig]) -> None:
     ov.restore(snap)
     for q, S, got in again:
         assert np.array_equal(step(q, S), got), q
+
+
+@pytest.mark.parametrize(("v", "wrap", "T"), [(0, 18, 1400), (5, 0, 160)])
+def test_attn_core(ink: tuple[GGUFFile, InklingConfig], v: int, wrap: int, T: int) -> None:
+    """The attention cores alone against their host model (``decode.attn_ink_ref``) from the q and raw K / V objects the
+    q, k, v phases wrote: a sliding-window visit over 1400 positions (past its window; its cache a ring of 18 groups,
+    across a turn) and a full one (tau, the taps' deltas), steps of 1 to 4: o of every step and KV head within 4e-3 of
+    the host model's (relative RMS; it leaves out what ``attn_ref`` does)."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=[v], max_positions=2048, ffn=False, wrap=wrap)
+    ov.load()
+    P, hd, nq = ov.layer(v), ov.hd, ov.q_heads
+    full = cfg.kinds[P] == "full"
+    b = f"blk.{P}."
+    qc = np.asarray(g.tensor(b + "attn_q_clip.weight").dequantize(), np.float32).reshape(-1, hd)
+    rc = np.asarray(g.tensor(b + "attn_rel_clip.weight").dequantize(), np.float32).reshape(-1, cfg.rel_length)
+    kt = np.asarray(g.tensor(b + "attn_k_conv.weight").dequantize(), np.float32).reshape(-1, cfg.conv_taps).T
+    vt = np.asarray(g.tensor(b + "attn_v_conv.weight").dequantize(), np.float32).reshape(-1, cfg.conv_taps).T
+    E = np.asarray(g.tensor(b + "attn_rel_bias.weight").dequantize(), np.float32).reshape(-1, cfg.rel_length).T
+    heads = [InkAttentionRef(qc=qc[nq * c:nq * (c + 1)], rc=rc[nq * c:nq * (c + 1)], E=E, eps=cfg.rms_norm_eps,
+                             taps=np.concatenate([kt[:, hd * c:hd * (c + 1)], vt[:, hd * c:hd * (c + 1)]]),
+                             window=0 if full else cfg.sliding_window, kp=ov.kp) for c in range(ov.kv_heads)]
+    toks = np.random.default_rng(7).integers(0, cfg.vocab_size, T)
+    tn = np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
+    x = _rms(g.rows("token_embd.weight", toks), cfg.rms_norm_eps) * tn
+    act = ov.dev.view("ACT")
+    got, want = [], []
+    p, sizes = 0, [1, 4, 3, 2, 4, 4]
+    while p < T:
+        S = min(sizes[len(got) % len(sizes)], T - p)
+        ov.step(np.stack([x[p:p + S]] * (ov.n0 + 1)), p)
+        o = ov.attn_out(v, S).reshape(S, ov.kv_heads, nq, hd)
+        tau = cfg.tau(range(p, p + S)) if full else np.ones(S, np.float32)
+        for c, ref in enumerate(heads):
+            base = ov.att_reg[(v, c)]
+            ov.dev.fetch("ACT", base, 2 * SLOTS * XB)
+            for a in range(S):
+                qo = act[base + a * XB + 4 * META:][:2 * 822].view(bfloat16).astype(np.float32)
+                ro = act[base + (SLOTS + a) * XB + 4 * META:][:4 * 292].view(np.float32)
+                ref.store(ro[:128], ro[160:288], ro[128:132] if full else None, ro[288:292] if full else None)
+                sink = act[base + a * XB + 4 * META + 2 * 816:][:12].view(np.float32)
+                want.append(ref.attend(qo[:384].reshape(nq, hd), qo[384:768].reshape(nq, hd),
+                                       qo[768:816].reshape(nq, -1), sink, float(tau[a])))
+                got.append(o[a, c])
+        p += S
+    err = rel(np.stack(got), np.stack(want))
+    print(f"visit {v} ({'full' if full else 'swa'}, ring {wrap}): o against the host model, relative RMS {err:.2e}")
+    assert err < 4e-3, err
 
 
 @pytest.mark.parametrize("v", [0, 5])
@@ -442,7 +494,7 @@ def test_prelude(ink: tuple[GGUFFile, InklingConfig]) -> None:
             tie |= keys[:, cfg.n_experts_used - 1] - keys[:, cfg.n_experts_used] < 5e-3
     want = cur.numpy()
     qn = np.asarray(g.tensor("blk.6.attn_res_query.weight").dequantize(), np.float32).reshape(1, -1)
-    errs, perr = np.zeros(T), np.zeros(T)
+    errs, perr, outs = np.zeros(T), np.zeros(T), []
     p = 0
     for S in [1] * 8 + [4, 3]:
         ov.step(x.numpy()[None, p:p + S], p)
@@ -451,9 +503,48 @@ def test_prelude(ink: tuple[GGUFFile, InklingConfig]) -> None:
         mixed = np.stack([x.numpy()[p:p + S], want[p:p + S]])
         ps, pw = ov.psums(6, "a"), psums(mixed, qn)
         perr[p:p + S] = [rel(ps[:, i], pw[:, i]) for i in range(S)]
+        outs.append(got)
         p += S
+    print(f"visits 0 .. 5: relative RMS error {rel(np.concatenate(outs)[~tie], want[~tie]):.2e} over {int((~tie).sum())} "
+          f"of {T} tokens")
     assert errs[~tie].max() < 3e-2 and np.median(errs) < 1.5e-2, (errs, tie)
     assert perr[~tie].max() < 4e-2, (perr, tie)
+
+
+def test_pass(ink: tuple[GGUFFile, InklingConfig]) -> None:
+    """The prelude and the loop's first pass, visits 0 .. 17 in one step (every phase kind of a visit without messages:
+    the block states, the depth mixes' partial sums, the pass's bank copies, sliding-window and full visits) over steps
+    of 1, then 4: visit 17's output against the reference's visits (fp32 activations), within the error of the same
+    reference with llama.cpp's Q8 activations (``ref.Model(q8=True)``). (Over 18 visits every token has a near-tied
+    expert somewhere, ~1e-3 apart: either side's rounding takes the other one, and the error is that of the routing, ~4e-2
+    for both; a single visit's error is ~6e-3: ``test_attention``, ``test_loop``.)"""
+    g, cfg = ink
+    vs = list(range(18))
+    assert not any(cfg.visits[v].messages for v in vs)
+    ov = InklingOverlay(g, visits=vs, max_positions=1024)
+    ov.load()
+    T = 24
+    toks = np.random.default_rng(17).integers(0, cfg.vocab_size, T)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    refs = []
+    with torch.no_grad():
+        for q8 in (False, True):
+            ref, cur, blocks = Model(g, cfg, q8=q8), x, []
+            for v in vs:
+                cur = ref.visit(cfg.visits[v], cur, blocks, VisitCache(), 0)
+            refs.append(cur.numpy())
+    want, q8 = refs
+    n1 = ov.nst[vs[-1]] + int(cfg.visits[vs[-1]].block)
+    got = np.zeros_like(want)
+    p = 0
+    for S in [1] * 8 + [4] * 4:
+        ov.step(x.numpy()[None, p:p + S], p)
+        got[p:p + S] = ov.state(n1, S)
+        p += S
+    err, floor = rel(got, want), rel(q8, want)
+    print(f"visits 0 .. 17: relative RMS error {err:.2e} (Q8 activations: {floor:.2e}) over {T} tokens")
+    assert err < floor, (err, floor)
 
 
 @pytest.mark.parametrize("v", [18, 23])
@@ -485,13 +576,16 @@ def test_loop(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     keys = np.sort(1 / (1 + np.exp(-ref.out["ffn_moe_logits", vis.slot].numpy().astype(np.float64))) + bias, 1)[:, ::-1]
     tie = keys[:, cfg.n_experts_used - 1] - keys[:, cfg.n_experts_used] < 5e-3
     n1 = ov.n0 + int(vis.block)
-    errs = np.zeros(T)
+    errs, outs = np.zeros(T), []
     p = 0
     for S in [1] * 8 + [4, 3]:
         ov.step(states[:, p:p + S], p, bank[:, p:p + S])
         got = ov.state(n1, S)
         errs[p:p + S] = [rel(got[i], want[p + i]) for i in range(S)]
+        outs.append(got)
         p += S
+    print(f"visit {v}: relative RMS error {rel(np.concatenate(outs)[~tie], want[~tie]):.2e} over {int((~tie).sum())} "
+          f"of {T} tokens")
     assert errs[~tie].max() < 3e-2 and np.median(errs) < 1e-2, (errs, tie)
 
 
