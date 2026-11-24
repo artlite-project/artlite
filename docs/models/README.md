@@ -2,7 +2,7 @@
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
 [Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B, d1-2B, d1-Omni-2B)](lfm3.md),
-[Spark-X2.6 4B, 1.7B](spark.md), [Flint](flint.md), [Stable Diffusion 1.5](sd15.md).
+[Spark-X2.6 4B, 1.7B](spark.md), [Flint](flint.md), [Inkling 2 Mini](inkling2.md), [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
 `~/.artlite/models`) as `<account>/<repository>/<file>`: [Installation](../install.md#models-directory). A GGUF file's
@@ -92,4 +92,5 @@ chunk is compute bound.
 | spark2_5 | ✅ Spark-X2.6 4B | XHToken Q4_K_M, Q8_0, with its DSpark drafter; bartowski Q4_K_M, Q4_0 | Spark-X2.5 4B |
 | | ✅ Spark-X2.6 1.7B | XHToken Q4_K_M, Q8_0, with its DSpark drafter | |
 | flint | ✅ Flint (40B MoE, ~2.5B active) | RecursiveSI int4 (Q4_1 pairs, packed as Q4_1_64), with incoai's DFlash2 drafter (Q4_K_M) | unsloth UD-Q4_K_XL |
+| inkling2_loop, inkling2 | ✅ Inkling 2 Mini (26B MoE, 8 of 128 experts, a looped core) | unsloth UD-Q4_K_XL (NVFP4 / Q8_0 experts) | a prefill |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
