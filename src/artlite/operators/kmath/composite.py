@@ -1,5 +1,5 @@
-"""Functions built on exp2 and recip: e^x, e^-|x|, e^g - 1, softplus, sigmoid, silu (templates:
-``composite.*.cc.jinja``).
+"""Functions built on exp2 and recip: e^x, e^-|x|, e^g - 1, softplus, sigmoid, silu; situ (Inkling's experts' activation:
+rationals and recip) (templates: ``composite.*.cc.jinja``).
 A composite calls the functions a caller names (``exp_fn``, ``recip_fn``; a caller's own, e.g. one its template
 already defines) or the defaults, and its name carries the choice."""
 
@@ -13,6 +13,10 @@ from .reciprocal import recip
 
 EXPM1_C = tuple(np.float32(1) / np.float32(k) for k in (5040, 720, 120, 24, 6, 2))  # (e^g - 1 - g) / g^2, highest first
 ATANH_C = tuple(np.float32(1) / np.float32(k) for k in (11, 9, 7, 5, 3, 1))  # atanh(s) / s in s^2, highest first
+# situ's tanh: tanh(x) ~ x P(x^2) / Q(x^2), P = p0 + p1 x^2 + p2 x^4 + p3 x^6, Q = 1 + q1 x^2 + q2 x^4 + q3 x^6, of x clamped
+# to 7 (tanh(7) = 1 - 1.7e-6): a weighted least-squares fit within 9e-7 of tanh
+SITU_TANH = ((0.9999956894384776, 0.12302230986947059, 0.002277031900786566, 3.930214770282807e-06),
+             (0.45634080054768666, 0.021072380027093683, 0.0001423555092368685), 7.0)
 
 
 def _local(fn: Fn) -> str:
@@ -151,3 +155,37 @@ def silu(lanes: int, *, exp_fn: Fn | None = None, recip_fn: Fn | None = None, in
                 params={"exp_fn": e, "recip_fn": r}, domain=(-80.0, 80.0), valid=(-1e38, 1e38),
                 rel=None if etag or rtag else 4.5e-3,
                 variables={"N": lanes, "exp": x.name, "recip": r.name})
+
+
+def situ_coefficients(linear_beta: float) -> np.ndarray:
+    """situ's terms tanh(g / 4), tanh(u / lb) (``SITU_TANH``) on the unscaled input: per term [clamp, p0 .. p3, q1 .. q3]
+    (2, 8) fp32, the term's scale s in its coefficients (p_k s^(2k + 1), q_k s^(2k)), the second's P times 2 lb."""
+    p, q, c = SITU_TANH
+    out = []
+    for b, m in ((4.0, 1.0), (linear_beta, 2 * linear_beta)):
+        s = 1 / b
+        out.append([c * b, *(m * pk * s ** (2 * k + 1) for k, pk in enumerate(p)),
+                    *(qk * s ** (2 * k + 2) for k, qk in enumerate(q))])
+    return np.array(out, np.float32)
+
+
+def situ(lanes: int = 16, *, beta: float, linear_beta: float, unroll: bool = False, inline: bool = False) -> Fn:
+    """situ(g, u) = b tanh(g / b) sigmoid(g) lb tanh(u / lb) (b = ``beta``, lb = ``linear_beta``: Inkling's experts'
+    activation) of n fp32 values (an array function: g in place, u, n a multiple of 16), within 3e-4 of
+    max(|situ|, 1) (its output rounds to bf16 in a GEMV's hold buffer: 2e-3): with s = tanh(g / 4) the gate term is
+    2 s (1 + s)^2 / (1 + s^2) (sigmoid(g) = (1 + tanh(g / 2)) / 2 in the half angle: 1 + tanh(g / 2) itself cancels
+    for g below -8, 1e-3 off with fp32 products of 2^-16), so b is 4; two rationals (``SITU_TANH``) and one reciprocal
+    (2 Newton steps), 30 fp32 products per 16 values; ``unroll``: the Horner steps unrolled. (Both terms as one 32-lane
+    chain: 15% more code and 2.2 KB of stack under a decode main core's collect.)"""
+    check("lanes", lanes, (16,))
+    check("beta", beta, (4.0,))
+    r = recip(lanes, domain="normal", steps=2)
+    tag = f"{linear_beta:g}".replace(".", "p")
+    c = situ_coefficients(linear_beta)
+    rel = 3e-4
+    return make(f"situ_{lanes}_{tag}" + ("_u" if unroll else "") + ("_i" if inline else ""), "composite.situ.cc.jinja",
+                inline=inline, deps=(r,), lanes=lanes, arg="pair", ret="float", func="situ",
+                params={"beta": beta, "linear_beta": linear_beta, "unroll": unroll}, domain=(-1e4, 1e4),
+                valid=(-3e38, 3e38), rel=rel, floor=1.0,
+                variables={"N": lanes, "lb": f"{linear_beta:g}", "recip": r.name, "unroll": unroll,
+                           "c": [f"{v:.9e}f" for v in c.reshape(-1)], "bound": bound(None, rel)})

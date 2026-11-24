@@ -353,6 +353,15 @@ void {{ name }}(float *__restrict input, float *__restrict output)
         aie::store_v(x + j, aie::accum<accfloat, 32>(aie::load_v<32>(input + j)).template to_vector<bfloat16>());
     {{ fn }}<{{ ts }}>(x, t, output);
 }
+{% elif fn.arg == "pair" %}
+extern "C"
+void {{ name }}(float *__restrict input, float *__restrict output)
+{  // (a tile: the first array's values in its first half, the second's in its second; out: the result, then the second)
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int j = 0; j < {{ ts }}; j += {{ fn.lanes }})
+        aie::store_v(output + j, aie::load_v<{{ fn.lanes }}>(input + j));
+    {{ fn }}(output, input + {{ ts // 2 }}, {{ ts // 2 }});
+}
 {% elif fn.arg == "ptr" %}
 extern "C"
 void {{ name }}(bfloat16 *__restrict input, bfloat16 *__restrict output)
@@ -380,7 +389,9 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
 
 class KmOperator(StreamOperator):
     """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument and result)
-    on a 1-D fp32 vector, one core; an array function (``kmath.act``: a table's name as ``table``) on a bf16 one."""
+    on a 1-D fp32 vector, one core; an array function (``kmath.act``: a table's name as ``table``) on a bf16 one; a pair
+    function (``kmath.situ``) on tiles of [first array | second array] (``tile``), the result into each tile's first
+    half."""
 
     def __init__(self, *, size: int, func: str, **kwargs: object):
         self.func, self.kwargs = func, kwargs

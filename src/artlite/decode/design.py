@@ -302,7 +302,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  rot: bool = False, norm_objs: bool = True, rg: bool = False, states: bool = False, units: int = 0,
                  situ: tuple[float, float] = (4.0, 25.0)):
         """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"; "situ": Inkling's experts' b tanh(g / b)
-        sigmoid(g) lb tanh(u / lb), (b, lb) = ``situ``, fp32 through ``kmath.sigmoid``); post: post-norm residual updates (F_POST, F_VOUT); pli: the
+        sigmoid(g) lb tanh(u / lb), (b, lb) = ``situ``: ``kmath.situ``); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
         (``packed_slots``), not 4; tok: token objects (F_TOK: the main cores skip an attention's cache objects by the
         count of its token, M_NASKIP < 0; ``post`` designs have them); gu_win: the gate/up phases' tiles hold other
@@ -408,7 +408,7 @@ class DecodeOverlayOperator(ArtcOperator):
             self.A_DEPTH = self.moe_a_depth()
         self.win = win  # (a stats build: the event window of a region, WINS)
         self.ablate: tuple[str, ...] = ()  # (a timing build: work compiled out, results wrong; "strip": the input strips,
-        # "rot": the rotations' rounds)
+        # "rot": the rotations' rounds, "situ": the experts' activation)
         self.h8 = hidden // COLS
         # (moe) the combine's objects per slot: halves of the residual slice (8 columns' fp32 partials within XPAY), or
         # thirds (Inkling's slice of 288)

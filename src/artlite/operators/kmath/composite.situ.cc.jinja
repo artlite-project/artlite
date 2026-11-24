@@ -1,0 +1,42 @@
+{% macro term(src) %}
+            const float *__restrict k = {{ name }}_c + 8 * j;
+            const aie::vector<float, 16> c = aie::broadcast<float, 16>(k[0]);
+            const aie::vector<float, 16> x = aie::max(aie::min(aie::load_v<16>({{ src }} + e), c), aie::sub(aie::zeros<float, 16>(), c));
+            const aie::vector<float, 16> z = al::mulff<16>(x, x);
+            aie::vector<float, 16> P = aie::broadcast<float, 16>(k[4]), d = aie::broadcast<float, 16>(k[7]);
+{% if unroll %}
+{% for i in (3, 2, 1) %}
+            P = aie::add(al::mulff<16>(P, z), aie::broadcast<float, 16>(k[{{ i }}]));
+            d = aie::add(al::mulff<16>(d, z), aie::broadcast<float, 16>({{ "k[%d]" % (i + 3) if i > 1 else "1.0f" }}));
+{% endfor %}
+{% else %}
+            AIE_LOOP_NO_UNROLL
+            for (int i = 3; i > 0; i--) {  // (Horner: P's k[3] .. k[1], Q's k[6], k[5], then 1)
+                P = aie::add(al::mulff<16>(P, z), aie::broadcast<float, 16>(k[i]));
+                d = aie::add(al::mulff<16>(d, z), aie::broadcast<float, 16>(i > 1 ? k[i + 3] : 1.0f));
+            }
+{% endif %}
+            const aie::vector<float, 16> n = al::mulff<16>(x, P);
+{% endmacro %}
+// situ(g, u) = 4 tanh(g / 4) sigmoid(g) lb tanh(u / lb) (lb = {{ lb }}: Inkling's experts' activation, kmath.situ) of n fp32
+// values (a multiple of 16) into g: with s = tanh(g / 4), t = tanh(u / lb), 2 lb s (1 + s)^2 / (1 + s^2) t, each tanh
+// n / d, the rational x P(x^2) / Q(x^2) of x clamped (kmath.SITU_TANH; per term [clamp, p0 .. p3, q1 .. q3] of g and u
+// themselves, t's P times 2 lb), the quotients through one reciprocal (its argument within [1, 1.4e8]); {{ bound }} of
+// max(|situ|, 1).
+alignas(64) static const float {{ name }}_c[16] = { {% for v in c %}{{ v }}, {% endfor %}};
+
+{{ attr }} void {{ name }}(float *__restrict g, const float *__restrict u, int n)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int e = 0; e < n; e += 16) {
+        aie::vector<float, 16> N, D;
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < 2; j++) {  // (s: n (d + n)^2 / d (d^2 + n^2), then times t)
+{{ term("(j ? u : g)") }}
+            const aie::vector<float, 16> a = aie::add(n, d), q = aie::add(al::mulff<16>(n, n), al::mulff<16>(d, d));
+            N = al::mulff<16>(j ? N : al::mulff<16>(a, a), n);  // (one site for both terms: s's three products, needed or not)
+            D = al::mulff<16>(j ? D : q, d);
+        }
+        aie::store_v(g + e, al::mulff<16>(N, {{ recip }}(D)));
+    }
+}

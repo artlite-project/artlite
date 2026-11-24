@@ -409,6 +409,33 @@ def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray, rot: int | None = None, 
     return out
 
 
+def situ(fn: kmath.Fn, g: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """``kmath.situ``'s results for fp32 g and u."""
+    k = kmath.situ_coefficients(fn.params["linear_beta"])
+    for j in range(2):
+        x = _f32(np.maximum(np.minimum(_f32(g if j == 0 else u), k[j, 0]), -k[j, 0]))
+        z = mulff(x, x)
+        P, d = np.full(x.shape, k[j, 4], np.float32), np.full(x.shape, k[j, 7], np.float32)
+        for i in (3, 2, 1):
+            P = add(mulff(P, z), k[j, i])
+            d = add(mulff(d, z), k[j, i + 3] if i > 1 else np.float32(1))
+        n = mulff(x, P)
+        if j == 0:
+            a = add(n, d)
+            N, D = mulff(mulff(a, a), n), mulff(add(mulff(n, n), mulff(d, d)), d)
+        else:
+            N, D = mulff(N, n), mulff(D, d)
+    return mulff(N, _recip(D, "normal", 2))
+
+
+def situ_exact(fn: kmath.Fn, g: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """situ in float64."""
+    b, lb = fn.params["beta"], fn.params["linear_beta"]
+    g, u = np.asarray(g, np.float64), np.asarray(u, np.float64)
+    sig = np.where(g >= 0, 1 / (1 + np.exp(-np.abs(g))), np.exp(-np.abs(g)) / (1 + np.exp(-np.abs(g))))
+    return b * np.tanh(g / b) * sig * lb * np.tanh(u / lb)
+
+
 def emulate(fn: kmath.Fn, x: np.ndarray) -> np.ndarray:
     """``fn``'s results for the arguments x."""
     p = fn.params

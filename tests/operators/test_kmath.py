@@ -45,6 +45,8 @@ CASES = {  # id: the function and its arguments
     "act-gelu": ("act", {"table": "gelu"}),
     "act-gelu_erf": ("act", {"table": "gelu_erf"}),
     "silu_tanh": ("silu_tanh", {}),
+    "situ": ("situ", {"lanes": 16, "beta": 4.0, "linear_beta": 25.0}),
+    "situ-u": ("situ", {"lanes": 16, "beta": 4.0, "linear_beta": 25.0, "unroll": True}),
 }
 
 EDGES = np.float32([-np.inf, -1e30, -4e6, -32000, -16384, -1000, -200, -127.5, -127.25, -127, -126.9, -126.5, -126.1, 0, 100,
@@ -93,6 +95,7 @@ def _contracts() -> list[kmath.Fn]:
         fns += [kmath.act(t), kmath.act(t, f32=True)] + [kmath.table_pass(t, table_arg=a, walk=w)
                                                           for a, w in itertools.product((False, True), ((1, 32), (1, 64), (2, 128)))]
         fns += [kmath.act(t, table_arg=True, walk=(2, 128))]
+    fns += [kmath.situ(beta=4.0, linear_beta=25.0, unroll=u, inline=i) for u, i in itertools.product((False, True), (False, True))]
     return fns + [kmath.table_pass(kmath.SILU, table_arg=True, n=640), kmath.silu_tanh(walk=(2, 128)),
                   kmath.act(kmath.SILU, table_arg=True, n=640, scale=2, clamp=16.0, walk=(10, 640))]
 
@@ -150,6 +153,9 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     if "aie::inv" in fn.src or "al::inv_rms" in fn.src:
         for op, r in request.getfixturevalue("inv_results").items():
             kmath_sim.load_inv(op, r)
+    if fn.arg == "pair":
+        _pair(fn, func, kwargs)
+        return
     dom, edges = _arguments(fn)
     x = np.concatenate([dom, edges])
     xp = np.concatenate([x, np.full(-len(x) % 1024, dom[0])])
@@ -175,6 +181,35 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
         r = np.abs(o / ref - 1)
         print(f"\n{fn.name}: max rel. error {r.max():.3g}")
         assert r.max() <= fn.rel, f"max rel. error {r.max():.3g} at {dom[np.argmax(r)]}"
+
+
+def _pair(fn: kmath.Fn, func: str, kwargs: dict) -> None:
+    """A pair function (situ: g, u): every finite bf16 g in its domain and 2^18 of a normal and a uniform spread, each
+    with a u of the same set (a permutation), and the edges of ``fn.valid`` against each other; bit-exact against the
+    model, within ``fn.rel`` of max(|exact|, ``fn.floor``)."""
+    lo, hi = fn.domain
+    b = kmath.bf16_values()
+    b = b[(np.abs(b) >= 1e-30) | (b == 0)]  # (as an array function's: no results below the normal range)
+    rng = np.random.default_rng(0)
+    g = np.concatenate([b[(b >= lo) & (b < hi)], rng.normal(0, 4, 1 << 17), rng.uniform(-60, 60, 1 << 17)]).astype(np.float32)
+    u = rng.permutation(g)
+    e = EDGES[(EDGES >= fn.valid[0]) & (EDGES < fn.valid[1])]
+    eg, eu = (a.reshape(-1) for a in np.meshgrid(e, e))
+    G, U = np.concatenate([g, eg]), np.concatenate([u, eu])
+    op = KmOperator(size=-(-2 * len(G) // 4096) * 4096, func=func, **kwargs)
+    h = op.tile // 2
+    n = op.size // op.tile
+    x = np.zeros((n, 2, h), np.float32)
+    x[:, 0] = np.pad(G, (0, n * h - len(G))).reshape(n, h)
+    x[:, 1] = np.pad(U, (0, n * h - len(U))).reshape(n, h)
+    out = op.compile().run(x.reshape(-1)).reshape(n, 2, h)[:, 0].reshape(-1)[:len(G)]
+    em = kmath_sim.situ(fn, G, U)
+    same = (out == em) | (np.isnan(out) & np.isnan(em))
+    assert same.all(), f"{(~same).sum()} results differ from the emulation; at {G[~same][:4]}, {U[~same][:4]}"
+    ref = kmath_sim.situ_exact(fn, g, u)
+    r = np.abs(out[:len(g)].astype(np.float64) - ref) / np.maximum(np.abs(ref), fn.floor)
+    print(f"\n{fn.name}: max error {r.max():.3g} of max(|situ|, {fn.floor:g})")
+    assert r.max() <= fn.rel, f"max error {r.max():.3g} at g {g[np.argmax(r)]}, u {u[np.argmax(r)]}"
 
 
 ROWS = {  # id: a row function's arguments; and for run-time extents the values they take in the run
