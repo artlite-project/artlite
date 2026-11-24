@@ -126,11 +126,12 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
             return super().page_store()
         wd = os.path.dirname(self._program.insts_path)
         p, conv = self.pfx, self.attn.conv is not None
-        stubs = tuple(page_calls(p, conv))
+        ink = self.attn.ink
+        stubs = tuple(page_calls(p, conv, ink))
         stores = []
         for j in range(self.attn.chain):
             cols = range(j, COLS, self.attn.chain)
-            pg = paging.link(wd, pages=page_entries(p, conv), pager=f"{p}_pg_request", calls=page_calls(p, conv),
+            pg = paging.link(wd, pages=page_entries(p, conv), pager=f"{p}_pg_request", calls=page_calls(p, conv, ink),
                              roots=(f"{p}_abegin", f"{p}_anb", *stubs), stack=self.ATTN_STACK,
                              cores=[(c, self.ATTN_ROW) for c in cols], state=PG_STATE, wake=PG_WAKE,
                              stream_id=OP_PAGE_ID)

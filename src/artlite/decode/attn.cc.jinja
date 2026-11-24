@@ -15,14 +15,16 @@ struct {{ p }}_AWin {
    (kmath's run-time extents) where the kinds differ, compile-time numbers where they do not. The V norm (rot 0) shares
    the copy #}
 {% set hd_rt = HDS | length > 1 %}
-{% set rot_rt = ROT | length > 1 or V_NORM %}
+{% set rot_rt = ROT | length > 1 or (V_NORM and not INK) %}
 {% if QK_NORM %}
 {% set nrm = km.rms_norm(HDS if hd_rt else HDS[0], eps=eps | float, weight=QK_W, lanes=32 if QK_W else 64, minsize=True) %}
 {{ nrm.src }}
 {% endif %}
-{% set rots = ROT if ROT | length > 1 else (ROT[0], 0) if V_NORM else ROT[0] %}
+{% set rots = ROT if ROT | length > 1 else (ROT[0], 0) if V_NORM and not INK else ROT[0] %}
+{% if not INK %}
 {% set rope = km.rope(rots, dist=[HDS[0] // 2, HDS[1] // 2] if hd_rt else HDS[0] // 2, minsize=True) %}
 {{ rope.src }}
+{% endif %}
 
 // x (hd bf16) -> out (hd fp32){{ " = x / rms(x)" + (" w" if QK_W else "") if QK_NORM }}, then the pairs (i, i + hd / 2) of i < rot rotated by cs (cos rot | sin rot,
 // fp32)
@@ -37,7 +39,9 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
     for (int i = 0; i < {{ "hd" if hd_rt else HDS[0] }}; i += 32)
         aie::store_v(out + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
 {% endif %}
+{% if not INK %}
     {{ rope }}(out, cs{{ ", rot" if rot_rt }}{{ ", hd >> 1" if hd_rt }});
+{% endif %}
 }
 
 {# 2^x of 64 lanes, one copy for the softmax and the merge (two records or two partials at a time, two independent
@@ -49,6 +53,101 @@ __attribute__((noinline, minsize)) void {{ p }}_nrope(const bfloat16 *__restrict
 {{ exp2.src }}
 {% if SINKS %}
 {{ exp2s.src }}
+{% endif %}
+{% if INK %}
+{% if not SINKS %}
+{% set exp2s = km.exp2(16, prec="fp32") %}
+{{ exp2s.src }}
+{% endif %}
+{% set isig = km.sigmoid(32, prec="bf16") %}
+{{ isig.src }}
+
+// (ink) v (n fp32, n of 16 / 128) times min(1, thr / |v|) mul (Inkling's L2 clip, then tau or log2 e): the scalar unit
+// has no floating point, so the factor goes through vector lanes
+__attribute__((noinline, minsize)) void {{ p }}_iclip(float *__restrict v, int n, float thr, float mul)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::accum<accfloat, 16> ss = aie::zeros<accfloat, 16>();
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < n; i += 16) {
+        aie::vector<bfloat16, 16> h, l;
+        al::split2<16>(aie::load_v<16>(v + i), h, l);
+        ss = aie::mac(aie::mac(aie::mac_square(ss, h), aie::add(h, h), l), l, l);
+    }
+    const float r = aie::invsqrt(aie::reduce_add(ss.template to_vector<float>()));
+    aie::vector<float, 16> f = al::mulff<16>(aie::broadcast<float, 16>(r), aie::broadcast<float, 16>(thr));
+    f = al::mulff<16>(aie::min(f, aie::broadcast<float, 16>(1.0f)), aie::broadcast<float, 16>(mul));
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < n; i += 16)
+        aie::store_v(v + i, al::mulff<16>(aie::load_v<16>(v + i), f));
+}
+
+// (ink) a raw K or V row's conv (128 fp32 at out): (x + sum_k t_k x_(P - 3 + k) (+ full: sum_lag d_lag x_(P - lag))) sc,
+// the history rows in the raw ring (rr: [position 8][K 128 | V 128] fp32, position P's row the current), t: the taps [4]
+// [128] bf16, dl: the deltas [4] fp32 (nullptr: none)
+__attribute__((noinline, minsize)) void {{ p }}_iconv(const float *__restrict rr, int P, int part, const bfloat16 *__restrict t,
+                                                     const float *__restrict dl, float sc, float *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 128; i += 16) {
+        aie::accum<accfloat, 16> a(aie::load_v<16>(rr + 256 * (P & 7) + 128 * part + i));
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < 4; k++) {  // (tap k: position P - 3 + k; tap 3 the current)
+            aie::vector<bfloat16, 16> h, l;
+            al::split2<16>(aie::load_v<16>(rr + 256 * ((P - 3 + k) & 7) + 128 * part + i), h, l);
+            const aie::vector<bfloat16, 16> w = aie::load_v<16>(t + 128 * k + i);
+            a = aie::mac(aie::mac(a, h, w), l, w);
+        }
+        aie::vector<float, 16> y = a.template to_vector<float>();
+        if (dl)
+            AIE_LOOP_NO_UNROLL
+            for (int lag = 0; lag < 4; lag++)  // (lag 0: the current row)
+                y = aie::add(y, al::mulff<16>(aie::load_v<16>(rr + 256 * ((P - lag) & 7) + 128 * part + i),
+                                              aie::broadcast<float, 16>(dl[lag])));
+        aie::store_v(out + i, al::mulff<16>(y, aie::broadcast<float, 16>(sc)));
+    }
+}
+
+// (ink) a group's E object (e: [rel 16][{{ INK_EW }}] bf16, entry i of distance p + S - 1 - P0 + e0 - i: the window's
+// first entry even, e0 its parity) -> per query row its bias at the group's keys 0 .. 63 (log2 units: r holds log2
+// e), ib [row][64]: entry e0 + (S - 1 - s) + k of the row's slot s
+__attribute__((noinline, minsize)) void {{ p }}_ibias(const bfloat16 *__restrict e, const float *__restrict ir,
+                                                     float *__restrict ib, int nq, int S, int e0)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_NO_UNROLL
+    for (int row = 0; row < nq; row++) {
+        aie::accum<accfloat, 32> t0 = aie::zeros<accfloat, 32>(), t1 = t0, t2 = t0;
+        AIE_LOOP_NO_UNROLL
+        for (int r = 0; r < 16; r++) {
+            aie::vector<bfloat16, 32> h, l;
+            al::split2<32>(aie::broadcast<float, 32>(ir[16 * row + r]), h, l);
+            const bfloat16 *__restrict er = e + {{ INK_EW }} * r;
+            const aie::vector<bfloat16, 32> w0 = aie::load_v<32>(er), w1 = aie::load_v<32>(er + 32), w2 = aie::load_v<32>(er + 64);
+            t0 = aie::mac(aie::mac(t0, h, w0), l, w0);
+            t1 = aie::mac(aie::mac(t1, h, w1), l, w1);
+            t2 = aie::mac(aie::mac(t2, h, w2), l, w2);
+        }
+        const int sh = e0 + S - 1 - (row * 22 >> 6);  // (the row's slot: row / 3)
+        const aie::vector<float, 32> v0 = t0.template to_vector<float>(), v1 = t1.template to_vector<float>(), v2 = t2.template to_vector<float>();
+        aie::store_v(ib + 64 * row, aie::shuffle_down_fill(v0, v1, sh));
+        aie::store_v(ib + 64 * row + 32, aie::shuffle_down_fill(v1, v2, sh));
+    }
+}
+
+// (ink) a record's bias (positions Pr .., the group's keys k0 = Pr - P0 ..) onto each set's scores (so: [set][record][8 q
+// + j], {{ 32 * RG_MAX }} floats per set)
+__attribute__((noinline, minsize)) void {{ p }}_ibrec(const float *__restrict ib, float *__restrict so, int k0, int nsets)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int set = 0; set < nsets; set++) {
+        const float *__restrict b = ib + 64 * 4 * set + k0;
+        const aie::vector<float, 32> v = aie::concat(aie::load_v<8>(b), aie::load_v<8>(b + 64), aie::load_v<8>(b + 128), aie::load_v<8>(b + 192));
+        aie::store_v(so, aie::add(aie::load_v<32>(so), v));
+        so += {{ 32 * RG_MAX }};
+    }
+}
 {% endif %}
 
 // Q (the set's panels) against {{ DB }} d-blocks of K panels: two MMUL chains (even, odd d-blocks), two panel streams
@@ -306,6 +405,12 @@ __attribute__((noinline, minsize)) void {{ p }}_kobj(uint8_t *__restrict a, int3
     AIE_LOOP_NO_UNROLL
     for (int r = rm; r < nr; r++)
         {{ p }}_mrec(st, sc + 32 * r, P0 + 8 * r, nsets);
+{% if INK %}
+    if (P0 - (P0 & 63) == st[{{ A_GP0 }}] && st[{{ A_GP0 }}] >= st[{{ A_EP0 }}])  // (a group with its bias table: ``aebias``)
+        AIE_LOOP_NO_UNROLL
+        for (int r = 0; r < nr; r++)
+            {{ p }}_ibrec(AW(float, {{ a.ib }}), sc + 32 * r, P0 + 8 * r - st[{{ A_GP0 }}], nsets);
+{% endif %}
 }
 {% else %}
 // A K object (kper records, record index ri0 .. of its group, positions P0 + 8 r ..): the step's K inserted (the chain's
@@ -667,6 +772,30 @@ __attribute__((noinline, minsize)) void {{ p }}_pack(const float *__restrict y, 
     }
 }
 
+{% if INK %}
+// (ink) _pack's o times the rows' gates (g: [row 4][128] bf16, sigmoid(gate)): o = y il g
+__attribute__((noinline, minsize)) void {{ p }}_ipack(const float *__restrict y, aie::vector<float, 32> il, const bfloat16 *__restrict g,
+                                             bfloat16 *__restrict o0, bfloat16 *__restrict o1, bfloat16 *__restrict o2,
+                                             bfloat16 *__restrict o3, int step)
+{
+    AIE_LOOP_NO_UNROLL
+    for (int db = 0; db < 16; db++) {
+        const aie::vector<bfloat16, 32> gv = aie::concat(aie::load_v<8>(g + 8 * db), aie::load_v<8>(g + 128 + 8 * db),
+                                                         aie::load_v<8>(g + 256 + 8 * db), aie::load_v<8>(g + 384 + 8 * db));
+        const aie::vector<bfloat16, 32> o = al::mulc<32>(al::mulff<32>(aie::load_v<32>(y), il), gv).template to_vector<bfloat16>();
+        y += 32;
+        aie::store_v(o0, o.template extract<8>(0));
+        aie::store_v(o1, o.template extract<8>(1));
+        aie::store_v(o2, o.template extract<8>(2));
+        aie::store_v(o3, o.template extract<8>(3));
+        o0 += step;
+        o1 += step;
+        o2 += step;
+        o3 += step;
+    }
+}
+
+{% endif %}
 }  // namespace
 
 extern "C" {
@@ -695,6 +824,18 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% endif %}
             st[{{ A_NPS }}] = (flags & {{ F_POST }}) ? 1 : 0;
             st[{{ A_LPER }}] = lper;
+{% if INK %}
+            if (flags & {{ F_STATES }}) {  // (fp32 state objects: an object each, under one norm-weight object at most; a
+                // partial sums object first: F_COEF)
+                st[{{ A_LPER }}] = 0;
+                st[{{ A_NPS }}] = (flags & {{ F_COEF }}) ? 1 : 0;
+                st[{{ A_NNO }}] = (flags & {{ F_NORM }}) ? 1 : 0;
+                st[{{ A_XL }}] = nx;
+                st[{{ A_NXSKIP }}] = (flags & {{ F_NORM }}) ? 0 : nx;
+                st[{{ A_NASKIP }}] = m[{{ M_NT }}];
+                return;
+            }
+{% endif %}
             if (flags & {{ F_NORM + F_POST }}) {
                 st[{{ A_NNO }}] = (nx + {{ NX_PER_NORM - 1 }}) / {{ NX_PER_NORM }};
                 st[{{ A_XL }}] = nx;
@@ -702,6 +843,13 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
                 st[{{ A_NXSKIP }}] = (nx + (1 << lper) - 1) >> lper;
             }
             st[{{ A_NASKIP }}] = m[{{ M_NT }}];
+{% if INK %}
+            if (flags & {{ F_INK }}) {  // (the residual stream's step after the tiles: the history's X object, the taps' A
+                // object, a queries object)
+                st[{{ A_NXSKIP }}] += 1;
+                st[{{ A_NASKIP }}] += 1 + (((m[{{ M_INKN }}] >> 12) & 15) ? 1 : 0);
+            }
+{% endif %}
         }
         return;
     }
@@ -712,6 +860,10 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         const int t = m[{{ M_TOK_KIND }}];
 {% endif %}
         int32_t *__restrict tk = st + {{ A_TOK }} + 4 * t;
+{% if INK %}
+        if ((t & {{ SMAX - 1 }}) == 0)  // (a kind's first token object: tau of the step's slots, fp32, its payload's first)
+            aie::store_v(AW(float, {{ a.itau }}) + {{ SMAX }} * (t >= {{ SMAX }}), aie::load_v<{{ SMAX }}>((const float *)(x + {{ 2 * META }})));
+{% endif %}
         tk[0] = m[{{ M_TOK_G0 }} + col];
         tk[1] = m[{{ M_TOK_NA }} + col] >> 16;
         tk[2] = m[{{ M_TOK_NA }} + col] & 0xFFFF;
@@ -782,6 +934,8 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% if SINKS %}
     aie::store_v(AW(float, {{ a.sk }}), aie::load_v<{{ HEADS }}>((const float *)(x + {{ 2 * META + QCOPY + 2 * HDS[0] }})));  // (| the heads' sinks log2 e)
 {% endif %}
+{% elif INK %}
+    al::copy<{{ INK_QC }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([q | gates | r | sinks]: ``aq``'s)
 {% else %}
     al::copy<{{ QCOPY }}, 64>(AW(bfloat16, {{ a.qa }}), x + {{ 2 * META }});  // ([head nh][hd])
 {% if SINKS %}
@@ -790,6 +944,23 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% endif %}
     st[{{ A_I }}] = 0;
     st[{{ A_KS }}] = 0;
+{% if INK %}
+    // (ink: the layer's q / r clip scales into ic; the raw ring and its raw K / V objects instead of akv's; the groups
+    // from A_EP0 on have E objects, the first one's before the range's first object)
+    al::copy<{{ 3 * 128 }}, 64>(AW(bfloat16, {{ a.ic }}), x + {{ 2 * META + INK_QC }});
+    al::copy<64, 64>(AW(bfloat16, {{ a.ic }}) + {{ 3 * 128 }}, x + {{ 2 * META + INK_RC }});
+    st[{{ A_FULL }}] = m[{{ M_AFULL }}];
+    st[{{ A_NRING }}] = st[{{ A_OWN }}];
+    st[{{ A_NKVR }}] = st[{{ A_NKV }}];
+    st[{{ A_NKV }}] = 0;
+    st[{{ A_NRE }}] = {{ 8192 // (2 * D_LEN) }};  // (the ring's 8 KB)
+    // (the E objects: for the range's last 17 groups at most, every key within the relative extent of any row is there)
+    const int ng = al::div_small<{{ KP + 1 }}>(tk[2]), skip = ng > {{ INK_EG }} ? ng - {{ INK_EG }} : 0;
+    st[{{ A_EP0 }}] = st[{{ A_POS }}] + {{ 8 * KP * KPER[HDS[0]] }} * skip;
+    st[{{ A_GP0 }}] = st[{{ A_POS }}];
+    st[{{ A_NEX }}] = ng > 0 && skip == 0;
+    st[{{ A_EIDX }}] = 0;
+{% endif %}
 {% if WIN in (40, 41) %}
     event0();
 {% endif %}
@@ -799,7 +970,11 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
 {
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
+{% if INK %}
+    const int left = st[{{ A_XL }}], n = st[{{ A_NNO }}] == 1 ? left : (left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left), lper = st[{{ A_LPER }}];
+{% else %}
     const int left = st[{{ A_XL }}], n = left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left, lper = st[{{ A_LPER }}];
+{% endif %}
     st[{{ A_NXN }}] = (n + (1 << lper) - 1) >> lper;
     st[{{ A_XL }}] = left - n;
 }
@@ -820,6 +995,43 @@ __attribute__((noinline, minsize)) void {{ p }}_gates(const bfloat16 *__restrict
 }
 
 {% endif %}
+{% if INK %}
+// (ink) The next q object (slot s of the sub-step, the step's a + s): per head h (row 3 s + h) q times its clip scales,
+// L2-clipped to sqrt(512), times tau on a full layer -> the query row; r likewise (clip 8, and log2 e) -> ir; its sink
+// (log2 units) -> isk; its gates -> ig
+__attribute__((minsize)) void {{ p }}_aq{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    {{ p }}_AWin<{{ WINS['aq'] }}> win_;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int s = st[{{ A_QS }}];
+    st[{{ A_QS }}] = s + 1;
+    const float tau = st[{{ A_FULL }}] ? AW(float, {{ a.itau }})[{{ SMAX }} + st[{{ A_SA }}] + s] : 1.0f;
+    const bfloat16 *__restrict qc = AW(bfloat16, {{ a.ic }}), *__restrict rc = qc + {{ 3 * 128 }};
+    const bfloat16 *__restrict src = x + {{ 2 * META }};
+    AIE_LOOP_NO_UNROLL
+    for (int h = 0; h < 3; h++) {
+        const int row = 3 * s + h;
+        float *__restrict q = AW(float, {{ a.y }}) + 128 * row;
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < 128; i += 32)
+            aie::store_v(q + i, aie::mul(aie::load_v<32>(src + {{ INK_Q }} + 128 * h + i), aie::load_v<32>(qc + 128 * h + i))
+                                    .template to_vector<float>());
+        {{ p }}_iclip(q, 128, {{ 512 ** 0.5 }}f, tau);
+        float *__restrict r = AW(float, {{ a.ir }}) + 16 * row;
+        aie::store_v(r, aie::mul(aie::load_v<16>(src + {{ INK_R }} + 16 * h), aie::load_v<16>(rc + 16 * h)).template to_vector<float>());
+        {{ p }}_iclip(r, 16, 8.0f, tau);
+        aie::store_v(r, al::log2e<16>(aie::load_v<16>(r)));
+        al::copy<128, 64>(AW(bfloat16, {{ a.ig }}) + 128 * row, src + {{ INK_G }} + 128 * h);
+    }
+    aie::vector<float, 16> sk = aie::zeros<float, 16>();  // (the 3 sinks: fp32 as bf16 pairs)
+    sk.insert(0, aie::load_v<4>((const float *)(src + {{ INK_SK }})));
+    float *__restrict isk = AW(float, {{ a.isk }});
+    const aie::vector<float, 16> sl = al::log2e<16>(sk);
+    for (int h = 0; h < 3; h++)
+        isk[3 * s + h] = sl[h];
+}
+{% else %}
 // The next q object (slot s of the sub-step, the step's a + s: [head nh][hd]): its heads {{ "normed and " if QK_NORM else "" }}rotated into the
 // query rows (row s nh + h)
 __attribute__((minsize)) void {{ p }}_aq{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws)
@@ -842,6 +1054,7 @@ __attribute__((minsize)) void {{ p }}_aq{{ X }}(const bfloat16 *__restrict x, in
     {{ p }}_gates(x + {{ 2 * META + GOFF }}, AW(float, {{ a.gt }}) + nh * s);
 {% endif %}
 }
+{% endif %}
 
 // The sub-step's first q object, as abegin left it in qa
 __attribute__((minsize)) void {{ p }}_aq0{{ X }}(int32_t *__restrict ws)
@@ -950,6 +1163,82 @@ __attribute__((minsize)) void {{ p }}_akv{{ X }}(const bfloat16 *__restrict x, i
 {% endif %}
 }
 
+{% if INK %}
+// (ink) The raw K, V object of the next slot (position P = p + s; [K 128 | V 128 | K deltas 4 | V deltas 4] fp32, the
+// layer's taps after them; rr: the raw ring object, [position 8][K | V] fp32, the slot's row written into it): K and V
+// conv'd over the ring (full layers: with the deltas; sc 1 / sqrt(5), full 1 / 3), K L2-clipped to sqrt(512) -> its
+// {{ "hi + lo blocks" if KP == 2 else "bfp16 blocks" }} (as akv's), V / rms(V) -> bf16 (vn)
+__attribute__((minsize)) void {{ p }}_akvr{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws, uint8_t *__restrict rr)
+{
+    {{ p }}_AWin<{{ WINS['akv'] }}> win_;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int s = st[{{ A_KS }}], P = st[{{ A_P }}] + s, full = st[{{ A_FULL }}];
+    st[{{ A_KS }}] = s + 1;
+    const float *__restrict kv = (const float *)(x + {{ 2 * META }});
+    bfloat16 *__restrict taps = AW(bfloat16, {{ a.ic }}) + {{ 3 * 128 + 64 }};
+    if (s == 0)  // (the layer's taps: K's, then V's)
+        al::copy<1024, 64>(taps, (const bfloat16 *)((const uint8_t *)kv + {{ INK_TAPS }}));
+    float *__restrict ring = (float *)rr;
+    al::copy<128, 32>(ring + 256 * (P & 7), kv + {{ INK_K }});  // (the slot's K | V)
+    al::copy<128, 32>(ring + 256 * (P & 7) + 128, kv + {{ INK_V }});
+    float *__restrict kf = AW(float, {{ a.kf }});
+    const float sc = full ? {{ 1.0 / 3.0 }}f : {{ 1.0 / 5 ** 0.5 }}f;
+    {{ p }}_iconv(ring, P, 0, taps, full ? kv + {{ INK_KD }} : nullptr, sc, kf);
+    {{ p }}_iclip(kf, 128, {{ 512 ** 0.5 }}f, 1.0f);
+    int8_t *__restrict km = AW(int8_t, {{ a.kb }}) + {{ KB_SLOT }} * s;
+    int8_t *__restrict ke = km + {{ 8 * KP * 16 }};
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 2; i++) {
+{% if KP == 2 %}
+        al::BV hi, lo;
+        al::split_hilo(aie::accum<accfloat, 64>(aie::load_v<64>(kf + 64 * i)), al::neg_eye(), hi, lo);
+        const v64bfp16ebs8 h = (v64bfp16ebs8)hi, l = (v64bfp16ebs8)lo;
+        *(v64int8 *)(km + 64 * i) = h.mantissa;
+        *(v64int8 *)(km + 128 + 64 * i) = l.mantissa;
+        *(v8int8 *)(ke + 8 * i) = h.exponent;
+        *(v8int8 *)(ke + 16 + 8 * i) = l.exponent;
+{% else %}
+        const v64bfp16ebs8 h = (v64bfp16ebs8)aie::accum<accfloat, 64>(aie::load_v<64>(kf + 64 * i)).template to_vector<bfp16ebs8>();
+        *(v64int8 *)(km + 64 * i) = h.mantissa;
+        *(v8int8 *)(ke + 8 * i) = h.exponent;
+{% endif %}
+    }
+    {{ p }}_iconv(ring, P, 1, taps + 512, full ? kv + {{ INK_VD }} : nullptr, sc, kf);
+    aie::accum<accfloat, 16> ss = aie::zeros<accfloat, 16>();
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 128; i += 16) {
+        aie::vector<bfloat16, 16> h, l;
+        al::split2<16>(aie::load_v<16>(kf + i), h, l);
+        ss = aie::mac(aie::mac(aie::mac_square(ss, h), aie::add(h, h), l), l, l);
+    }
+    aie::vector<float, 16> ms = aie::zeros<float, 16>();
+    ms[0] = aie::reduce_add(ss.template to_vector<float>());
+    const aie::vector<float, 16> iv = aie::broadcast<float, 16>(al::inv_rms<128, 1>(ms, {{ eps }}f)[0]);
+    bfloat16 *__restrict vn = AW(bfloat16, {{ a.vn }}) + 128 * s;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 128; i += 16)
+        aie::store_v(vn + i, aie::accum<accfloat, 16>(al::mulff<16>(aie::load_v<16>(kf + i), iv)).template to_vector<bfloat16>());
+}
+
+// (ink) The next D object of the raw ring (its 8 KB, the step's rows in: one drain of the whole ring)
+__attribute__((minsize)) void {{ p }}_aring{{ X }}(const uint8_t *__restrict rr, int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int e = st[{{ A_EIDX }}];
+    st[{{ A_EIDX }}] = e + 1 == st[{{ A_NRE }}] ? 0 : e + 1;
+    al::copy<{{ D_LEN }}, {{ [D_LEN, 64] | min }}>(d, (const bfloat16 *)(rr + {{ 2 * D_LEN }} * e));
+}
+
+// (ink) The E object of the next cache object's group (positions A_GP0 ..): its bias table (``ibias``)
+__attribute__((minsize)) void {{ p }}_aebias{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    int32_t *__restrict st = AW(int32_t, {{ a.st }});
+    const int S = st[{{ A_S }}], e0 = ({{ INK_ED0 }} - (st[{{ A_P }}] + S - 1 - st[{{ A_GP0 }}])) & 1;
+    {{ p }}_ibias(x + {{ 2 * META }}, AW(float, {{ a.ir }}), AW(float, {{ a.ib }}), 3 * S, S, e0);
+}
+
+{% endif %}
 // A cache object (i = {{ KP + 1 }} k + ph of the column's group k: K objects ph < {{ KP }}, the V object ph {{ KP }}), or at the chain's end
 // one of its last tails (``tobj``); st[A_NE]: the D objects of the records to emit from it
 __attribute__((minsize)) void {{ p }}_aobj{{ X }}(uint8_t *__restrict a, int32_t *__restrict ws)
@@ -981,6 +1270,13 @@ __attribute__((minsize)) void {{ p }}_aobj{{ X }}(uint8_t *__restrict a, int32_t
             {{ p }}_vobj(a, ws, P0);
     }
     st[{{ A_NE }}] = st[{{ A_EN0 }}] + st[{{ A_EN1 }}];
+{% if INK %}
+    // (the next object: a group's first, within the range, its group from A_EP0 on: its E object before it)
+    const int gn = st[{{ A_POS }}] + {{ 8 * KP }} * {{ by_hd(KPER) }} * (k3 + 1);
+    st[{{ A_NEX }}] = ph == {{ KP }} && i + 1 < st[{{ A_NATT }}] && gn >= st[{{ A_EP0 }}];
+    if (ph == {{ KP }})
+        st[{{ A_GP0 }}] = gn;
+{% endif %}
 {% if WIN == 42 %}
     if (i + 1 == st[{{ A_NOBJ }}])
         event0();
@@ -1048,10 +1344,30 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
     const int sp = st[{{ A_S }}], nh = st[{{ A_NH }}], nhm = st[{{ A_NHM }}];
 {% endif %}
     bfloat16 *__restrict o = AW(bfloat16, {{ a.qa }});
+{% if INK %}
+    // (ink: per row its sink term 2^(sink - m) into l (a row past the sub-step's: 2^-126); the gates sigmoid(g), in place)
+    float *__restrict isk = AW(float, {{ a.isk }});
+    const float *__restrict mr = AW(float, {{ a.m }});
+    bfloat16 *__restrict ig = AW(bfloat16, {{ a.ig }});
+    aie::vector<float, 16> sv = aie::broadcast<float, 16>(-126.0f), mv = aie::zeros<float, 16>();
+    AIE_LOOP_NO_UNROLL
+    for (int r = 0; r < 3 * st[{{ A_S }}]; r++) {  // (moves, no scalar arithmetic)
+        sv[r] = isk[r];
+        mv[r] = mr[8 * r];
+    }
+    aie::store_v(isk, {{ exp2s }}(aie::min(aie::sub(sv, mv), aie::broadcast<float, 16>(127.0f))));
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 128 * 4 * nsets; i += 32)
+        aie::store_v(ig + i, {{ isig }}(aie::load_v<32>(ig + i)));
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < (st[{{ A_CEND }}] ? nsets : 0); set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + 32 * (nd + 1) * set + 32 * nd;
-{% if GATE %}
+{% if INK %}
+        aie::vector<float, 16> sk4 = aie::zeros<float, 16>();  // (rows 4 set ..: their sink terms)
+        sk4.insert(0, aie::load_v<4>(isk + 4 * set));
+        const aie::vector<float, 32> il = al::rows4(aie::inv(aie::add(al::sum8(aie::load_v<32>(l)), sk4)));
+{% elif GATE %}
         aie::vector<float, 16> gs = aie::broadcast<float, 16>(1.0f);  // (rows 4 set ..: 1 + e^-g)
         gs.insert(0, aie::load_v<4>(AW(float, {{ a.gt }}) + 4 * set));
         const aie::vector<float, 32> il = al::rows4(aie::inv(al::mulff<16>(al::sum8(aie::load_v<32>(l)), gs)));
@@ -1072,7 +1388,11 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
             po[q] = s < sp ? o + 8 * (sp * nd * (r - nh * s) + s) : AW(bfloat16, {{ a.kf }});
 {% endif %}
         }
+{% if INK %}
+        {{ p }}_ipack(AW(float, {{ a.y }}) + 32 * (nd + 1) * set, il, ig + 512 * set, po[0], po[1], po[2], po[3], 8 * sp);
+{% else %}
         {{ p }}_pack(AW(float, {{ a.y }}) + 32 * (nd + 1) * set, il, po[0], po[1], po[2], po[3], nd, 8 * sp);
+{% endif %}
     }
 {% if WIN == 40 %}
     if (!st[{{ A_NE }}])
@@ -1140,6 +1460,12 @@ void {{ p }}_pgprep(int op, void *a, int32_t *ws, void *d)
     if (op >= 4) {  // (the chain's end. Two chains of compares: one of six would be a jump table, data a page may not read)
         if (op == 4)
             {{ p }}_aend_x(ws, (const int32_t *)d);
+{% if INK %}
+        else if (op == 6)  // (ink: a raw K / V object into the ring object d, the ring's rows out)
+            {{ p }}_akvr_x((const bfloat16 *)a, ws, (uint8_t *)d);
+        else if (op == 7)
+            {{ p }}_aring_x((const uint8_t *)a, ws, (bfloat16 *)d);
+{% endif %}
         else
             {{ p }}_aemit_x(ws, (bfloat16 *)d);
         return;
@@ -1167,6 +1493,10 @@ void {{ p }}_pgmain(int op, void *a, int32_t *ws, void *d)
     else
         {{ p }}_aemit_x(ws, (bfloat16 *)d);
 {% else %}
+{% if INK %}
+    else if (op == 2)  // (ink: a group's E object)
+        {{ p }}_aebias_x((const bfloat16 *)a, ws);
+{% endif %}
     else
         {{ p }}_arec_x((const uint8_t *)a, ws, (bfloat16 *)d);
 {% endif %}
@@ -1200,6 +1530,17 @@ __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__
 {% else %}
 __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t *__restrict pw) { {{ p }}_enter(1, 4, nullptr, ws, (void *)pw); }
 __attribute__((minsize)) void {{ p }}_aemit(int32_t *__restrict ws, bfloat16 *__restrict d) { {{ p }}_enter(1, 5, nullptr, ws, d); }
+{% endif %}
+{% if INK %}
+__attribute__((minsize)) void {{ p }}_akvr(const bfloat16 *__restrict x, int32_t *__restrict ws, uint8_t *__restrict rr)
+{
+    {{ p }}_enter(1, 6, (void *)x, ws, rr);
+}
+__attribute__((minsize)) void {{ p }}_aring(const uint8_t *__restrict rr, int32_t *__restrict ws, bfloat16 *__restrict d)
+{
+    {{ p }}_enter(1, 7, (void *)rr, ws, d);
+}
+__attribute__((minsize)) void {{ p }}_aebias(const bfloat16 *__restrict x, int32_t *__restrict ws) { {{ p }}_enter(2, 2, (void *)x, ws, nullptr); }
 {% endif %}
 {% if CONV %}
 __attribute__((minsize)) void {{ p }}_cobj(const bfloat16 *__restrict x, int32_t *__restrict ws) { {{ p }}_enter(3, 0, (void *)x, ws, nullptr); }

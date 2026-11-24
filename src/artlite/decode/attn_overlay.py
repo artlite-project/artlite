@@ -433,8 +433,7 @@ class AttentionOverlay(ModelOverlay):
         st = StepPlan(S, subs, tok=self._token_at(b))
         for c in range(COLS):
             seq.fill("X", c, dev.address("ACT", st.tok), self._tok_bytes)
-        for c in range(COLS):
-            seq.fill("X", c, dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
+        self._fill_loadr(seq, S)
         ph = self.phases(lm)
 
         def run(i: int) -> list[tuple[int, str]]:  # (the GEMV phases from i to the next operator phase: one A fill)
@@ -449,6 +448,11 @@ class AttentionOverlay(ModelOverlay):
         seq.sync(fills=True)
         st.tr = Transaction(dev, seq.words())
         return st
+
+    def _fill_loadr(self, seq: Sequence, S: int) -> None:
+        """A step's F_LOADR objects (the slots' residual slices: ``_write_loadr``)."""
+        for c in range(COLS):
+            seq.fill("X", c, self.dev.address("ACT", self.loadr + c * SLOTS * XB), S * XB)
 
     def _lm_phase(self, seq: Sequence) -> None:
         self._weight_run(seq, [(-1, "lm")])

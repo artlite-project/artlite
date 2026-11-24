@@ -25,6 +25,6 @@ def test_plan_planar_covers_the_rows(fmt: str, R: int, rows: list[int], few: boo
 
 def test_gemm_mac_rows() -> None:
     assert [P.gemm_mac_rows(T, "gu", "Q4_K") for T in (64, 256, 512)] == [0, 0, 0]
-    assert [P.gemm_mac_rows(T, "qkv", "Q4_K") for T in (64, 256, 512)] == [0, 0, 3]
+    assert [P.gemm_mac_rows(T, "qkv", "Q4_K") for T in (64, 256, 512, 576)] == [0, 0, 0, 3]  # (GemmQd: whole 3 x 96 passes)
     assert P.gemm_mac_rows(512, "down", "Q4_K") == 0 and P.gemm_mac_rows(512, "qkv", "BFP16") == 0
     assert [P.gemm_mac_rows(T, "o", "Q6_K", True) for T in (64, 128, 129)] == [1, 2, 3]

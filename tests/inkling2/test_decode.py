@@ -4,6 +4,7 @@ builds the x panels) against numpy's products of the file's dequantized weights.
 
 import numpy as np
 import pytest
+import torch
 from ml_dtypes import bfloat16
 
 from artlite.decode import phases as mp
@@ -26,14 +27,16 @@ from artlite.decode.protocol import (
     packed_slots,
 )
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import InklingConfig, inkling_gguf
+from artlite.model_config import InklingConfig, Visit, inkling_gguf
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence, Transaction
 from models.inkling2.decode import InklingDecodeOperator
 from models.inkling2.image import InklingImage
+from models.inkling2.overlay import InklingOverlay, psums
 
 from ..model_files import require
 from ..numerics import rel
+from .ref import Model, rms
 
 PAD = 512  # (bytes before the state array: a state object's fill reads the XB bytes that end with its payload)
 
@@ -134,22 +137,6 @@ def test_qkv_states(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
         o += COLS * per
 
 
-def _psums(states: np.ndarray, queries: np.ndarray) -> np.ndarray:
-    """The partial sums object's payload a producer writes ((COLS, 4 slots, 32) fp32: per column the states' sums of
-    squares over its channels, lanes 0 .. 7, their dots with the queries, lanes 8 + 8 j + b) of states (n, S, H) and
-    queries (J, H)."""
-    n, S, H = states.shape
-    h8 = H // COLS
-    out = np.zeros((COLS, 4, 32), np.float32)
-    for c in range(COLS):
-        x = states[..., h8 * c:h8 * (c + 1)].astype(np.float32)
-        q = queries[:, h8 * c:h8 * (c + 1)]
-        out[c, :S, :n] = (x * x).sum(-1).T
-        for j in range(len(q)):
-            out[c, :S, 8 + 8 * j:8 + 8 * j + n] = (x @ q[j]).T
-    return out
-
-
 @pytest.mark.parametrize("S", [1, 4])
 def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     """A full layer's (5) attention inputs as depth mixes of 3 states (read as 4: the fourth's coefficient 0): the q
@@ -185,7 +172,7 @@ def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
         xs[:H // 8, :S] = states[b].reshape(S, H // 8, 8).transpose(1, 0, 2)
         act[st_off + b * ST:st_off + (b + 1) * ST] = xs.reshape(-1).view(np.uint8)
     queries = np.asarray(g.tensor(f"blk.{L}.attn_res_query.weight").dequantize(), np.float32).reshape(3, H)
-    act[ps_off + XB - XPAY:ps_off + XB] = _psums(states, queries).reshape(-1).view(np.uint8)
+    act[ps_off + XB - XPAY:ps_off + XB] = psums(states, queries).reshape(-1).view(np.uint8)
     for i, name in enumerate(phases):
         gr = mp.groups(img.region(L, name), F_NORM, S, block_flags=dict.fromkeys(("sink", "kd", "vd"), B_PAIR | B_F32))
         m = gr[0].meta.copy()
@@ -242,3 +229,95 @@ def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
                 err = rel(got, xn @ wr.T)
                 assert err < (2e-3 if b.pairs else 8e-3), (name, b.name, c, err)
         o += COLS * per
+
+
+def _attention_ref(ref: "Model", v: Visit, x: torch.Tensor, rows: int) -> torch.Tensor:
+    """The reference's attention output (the gated o before W_o) of visit v for inputs x (T, H) at positions 0 .. T - 1
+    (the visit's three inputs alike: one state; ``ref.Model.visit``'s steps), the last ``rows`` positions'."""
+    c, b, L = ref.cfg, f"blk.{v.layer}.", v.layer
+    T, eps, hd = x.shape[0], c.rms_norm_eps, c.head_dim
+    swa = v.kind == "swa"
+    norm = (lambda n: ref.vec(b + "attn_norm.weight")) if swa else (lambda n: ref.vec(b + f"attn_{n}_inp_norm.weight"))
+    xq, xk, xv = (rms(x, eps) * norm(n) for n in "qkv")
+    q, kraw, vraw = ref.mm(xq, b + "attn_q.weight"), ref.mm(xk, b + "attn_k.weight"), ref.mm(xv, b + "attn_v.weight")
+    kdyn = None if swa else ref.mm(xk, b + "attn_k_conv_proj.weight")
+    vdyn = None if swa else ref.mm(xv, b + "attn_v_conv_proj.weight")
+    k, _ = ref.conv(kraw, ref.w(b + "attn_k_conv.weight"), None, kdyn)
+    vv, _ = ref.conv(vraw, ref.w(b + "attn_v_conv.weight"), None, vdyn)
+    r = ref.mm(xq, b + "attn_rel.weight")
+    nh, kvh = c.num_attention_heads, c.num_key_value_heads
+    q = ref.clip(q.reshape(T, nh, hd), ref.w(b + "attn_q_clip.weight"), c.qk_clip)
+    k = ref.clip(k.reshape(T, kvh, hd), None, c.qk_clip)
+    vv = rms(vv.reshape(T, kvh, hd), eps)
+    r = ref.clip(r.reshape(T, nh, c.rel_length), ref.w(b + "attn_rel_clip.weight"), c.rel_clip)
+    if not swa:
+        tau = torch.from_numpy(c.tau(range(T)))[:, None, None]
+        q, r = q * tau, r * tau
+    o = ref.attention(L, q, k, vv, r, ref.mm(xq, b + "attn_sink_proj.weight"), 0)
+    o = o * torch.sigmoid(ref.mm(xq, b + "attn_gate.weight"))
+    return o[T - rows:]
+
+
+@pytest.mark.parametrize("v", [0, 5])
+def test_attention(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
+    """A visit's q, k, v phases and its attention (``Attn(ink=True)``) over 80 steps of one token, then two of 4 and
+    one of 3 (crossing groups and records): o (gated) of every step against the reference's attention from the same
+    inputs (fp32 activations; a sliding-window visit and a full one: tau, the taps' deltas)."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    rng = np.random.default_rng(3)
+    toks = rng.integers(0, cfg.vocab_size, 91)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    vis = cfg.visits[v]
+    with torch.no_grad():
+        want = _attention_ref(ref, vis, x, 91).numpy()
+    errs = []
+    p = 0
+    for S in [1] * 80 + [4, 4, 3]:
+        ov.step(np.stack([x[p:p + S].numpy()] * (ov.n0 + 1)), p)  # (a mix of equal states: x / rms(x))
+        got = ov.attn_out(v, S)
+        errs.append(rel(got, want[p:p + S]))
+        p += S
+    assert max(errs) < 2e-2, (np.argmax(errs), max(errs), np.median(errs))
+
+
+@pytest.mark.parametrize("v", [0, 5])
+def test_o(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
+    """A visit's o phase with the residual stream's step (F_INK) over steps of 1, then 4, 4, 3 slots: W_o's rows, the
+    post conv over the visit's history window, cur (visit 0: a block visit, its output a new state; visit 5: added to cur,
+    the states x and 2 x), the partial sums of the FFN's mix, the history window, against the reference."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    rng = np.random.default_rng(5)
+    T = 31
+    toks = rng.integers(0, cfg.vocab_size, T)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    vis, L = cfg.visits[v], cfg.visits[v].layer
+    b = f"blk.{L}."
+    with torch.no_grad():
+        y = ref.mm(_attention_ref(ref, vis, x, T), b + "attn_output.weight")
+        out, _ = ref.conv(y, ref.w(b + "attn_post_conv.weight"), None)
+    states = np.stack([x.numpy(), 2 * x.numpy()])[:ov.n0 + 1]  # (T, H) each
+    cur = out.numpy() if vis.block else states[-1] + out.numpy()
+    qf = np.asarray(g.tensor(b + "ffn_res_query.weight").dequantize(), np.float32).reshape(1, -1)
+    n1 = ov.n0 + int(vis.block)
+    errs, perr = [], []
+    p = 0
+    for S in [1] * 20 + [4, 4, 3]:
+        ov.step(states[:, p:p + S], p)
+        got = ov.state(n1, S)
+        errs.append(rel(got, cur[p:p + S]))
+        mixed = np.concatenate([states[:n1, p:p + S], cur[None, p:p + S]])  # (states 0 .. n1 - 1, cur)
+        want = psums(mixed, qf)
+        perr.append(rel(ov.psums(v, "f")[:, :S], want[:, :S]))
+        p += S
+    assert max(errs) < 1e-2, (np.argmax(errs), max(errs), np.median(errs))
+    assert max(perr) < 2e-2, (np.argmax(perr), max(perr), np.median(perr))
+    hist = ov.history(v, 0, 3 + 3)  # (positions p - 3 .. p + 2 of the last step at p = T - 3)
+    assert rel(hist, y[T - 6:].numpy()) < 1e-2

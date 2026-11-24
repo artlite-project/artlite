@@ -7,21 +7,22 @@ regions), each normed phase's norm-weight objects before its tiles, the experts'
 holds KV head c's attention (its query heads 3 c .. 3 c + 2) and the residual's channels 288 c .. (``H8``). Per layer
 L:
 
-- "inkq" (L > 0; and the LM head's): the ink core's queries object (``ink_queries``): the column's slices of the
+- "inkq" (L > 0; and the LM head's): the residual stream's queries object (``ink_queries``): the column's slices of the
   layer's depth-mix queries of its attention input (1, or 3 on a full layer), then of its 4 message queries (loop layers),
   fp32 [query][288]: the visit before reads it for the partial sums of this visit's mixes;
 - loop layers: "dq", "dk", "dv" (the controllers' down of the q, k, v streams: 64 rows of K 4608, rows 8 c .. of each
-  column as two BFP16 planes: B_PAIR) and "ctl_q", "ctl_k", "ctl_v" (the ink core's: per stream the column's rows of the
+  column as two BFP16 planes: B_PAIR) and "ctl_q", "ctl_k", "ctl_v" (the blends': per stream the column's rows of the
   forget and gain matrices, bf16 [288][64] each, 4 objects each: ``ctl_objects``);
 - "q" (normed: ``attn_norm``, a full layer's ``attn_q_inp_norm``): blocks "q" (``attn_q`` rows 384 c ..), "gate"
   (``attn_gate`` rows 384 c ..), "r" (``attn_rel`` rows 48 c ..), "sink" (``attn_sink_proj`` rows 3 c .., two planes);
 - "k" (``attn_norm`` / ``attn_k_inp_norm``): "k" (``attn_k`` rows 128 c ..), a full layer's "kd" (``attn_k_conv_proj``
   rows 4 c .., two planes); "v" likewise;
 - "o" (``attn_output`` rows 288 c .., K 3072);
-- "inkf": the ink core's object of the o phase: the FFN mix's query, the attention's post-conv taps (``ink_objects``);
+- "inkf": the residual stream's object of the o phase (``decode.protocol.F_INK``): the attention's post-conv taps (bf16
+  [4][288]), the FFN mix's query (fp32 [288]) (``ink_objects``);
 - loop layers: "dffn", "ctl_ffn" (the FFN stream's controller);
 - "router" (``ffn_norm``): the router's rows of the column's experts 16 c .., two planes (fp32 logits: B_PAIR);
-- "inkc": the ink core's object of the combine: the FFN's post-conv taps.
+- "inkc": the residual stream's object of the combine: the FFN's post-conv taps.
 
 The BF16 tensors read as two planes (sink, the tap deltas) are substituted by F32 copies of theirs (exact: ``_own``).
 
@@ -114,7 +115,7 @@ class InklingImage(NormedImage):
         return 0 if L == 0 else (1 if self.cfg.kinds[L] == "swa" else 3)
 
     def _ink(self, L: int, name: str, n: int) -> None:
-        """A data region of n objects of the ink core."""
+        """A data region of n objects of the residual stream's (``ink_objects``)."""
         self._add_data(L, name, n * self.tile_bytes)
 
     def _layer(self, L: int) -> None:
@@ -194,7 +195,7 @@ class InklingImage(NormedImage):
         return f"blk.{L}.attn_{name}_inp_norm.weight", None
 
     # ------------------------------------------------------------------
-    # The ink core's objects
+    # The residual stream's objects
     # ------------------------------------------------------------------
 
     def ctl_objects(self) -> int:
@@ -217,6 +218,10 @@ class InklingImage(NormedImage):
             qs.append(self.cfg.msg_queries(g, L))
         return self._slices(np.concatenate(qs), np.float32)
 
+    def _taps(self, name: str) -> np.ndarray:
+        """A conv's taps (taps, hidden) fp32 (the file's rows: a channel's taps)."""
+        return np.asarray(self.gguf.tensor(name).dequantize(), np.float32).reshape(self.cfg.hidden_size, -1).T
+
     def ink_objects(self, L: int, name: str) -> np.ndarray:
         """(COLS, objects, tile_bytes) uint8: each column's data of an ink region (module docstring)."""
         g, b, T = self.gguf, f"blk.{L}.", self.tile_bytes
@@ -224,11 +229,10 @@ class InklingImage(NormedImage):
             parts = [self.ink_queries(L).reshape(COLS, -1).view(np.uint8)]
         elif name == "inkf":
             q = self._slices(g.tensor(b + "ffn_res_query.weight").dequantize(), np.float32)
-            taps = self._slices(g.tensor(b + "attn_post_conv.weight").dequantize(), bfloat16)
-            parts = [q.reshape(COLS, -1).view(np.uint8), taps.reshape(COLS, -1).view(np.uint8)]
+            taps = self._slices(self._taps(b + "attn_post_conv.weight"), bfloat16)
+            parts = [taps.reshape(COLS, -1).view(np.uint8), q.reshape(COLS, -1).view(np.uint8)]
         elif name == "inkc":
-            parts = [self._slices(g.tensor(b + "ffn_post_conv.weight").dequantize(), bfloat16).reshape(COLS, -1)
-                     .view(np.uint8)]
+            parts = [self._slices(self._taps(b + "ffn_post_conv.weight"), bfloat16).reshape(COLS, -1).view(np.uint8)]
         else:  # (ctl_<stream>: the forget rows, then the gain rows)
             s = name.removeprefix("ctl_")
             n = self.ctl_objects()

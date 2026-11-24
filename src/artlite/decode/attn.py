@@ -78,7 +78,7 @@ from ..operators.design import COLS
 from ..operators.util import Attr, bf16_bits, bf16_hilo, regions, rup
 from ..operators.words import WordMap
 from .kv import Records
-from .protocol import M_MODEL, META, NX_PER_NORM, PHASE, SLOTS, TOKEN, XMETA
+from .protocol import INK, M_MODEL, META, NX_PER_NORM, PHASE, SLOTS, TOKEN, XMETA
 from .protocol import WINS as DESIGN_WINS
 
 U = 3  # sub-steps of a layer kind per step at most (``substeps``: slots of 2 at head_dim 512)
@@ -106,7 +106,7 @@ M_TOK_G0 = TOKEN_ATT.block("M_TOK_G0", COLS, at=56)
 # two kinds of layer at most)
 A_TOK_AT = 40
 A_WORDS = A_TOK_AT + 4 * 2 * SLOTS
-STATE = WordMap("attention core state", A_WORDS)
+STATE = WordMap("attention core state", A_WORDS + 8)  # (ink: its words past A_WORDS, ``INK_STATE``)
 (A_NNO, A_NXN, A_NXSKIP, A_NASKIP, A_NQ, A_NQP, A_NKV, A_NOBJ, A_NE, A_NO, A_NPS, A_XL, A_P, A_S, A_I, A_EIDX,
  A_HD, A_KIND, A_OWN, A_WIN, A_QC, A_NH, A_SA, A_POS, A_MERGE, A_CEND, A_INS, A_QS, A_KS, A_EOFF0, A_EN0, A_EOFF1,
  A_EN1, A_EREC) = STATE.common.words(
@@ -118,6 +118,29 @@ A_NATT = STATE.common.word("A_NATT")  # the attended cache objects (the others a
 A_YNZ = STATE.common.word("A_YNZ")  # y holds P V terms (else zero: a rise of the running maxima needs no rescale)
 A_TREC = STATE.common.word("A_TREC")  # (M_ATREC)
 A_TOK = STATE.common.block("A_TOK", 4 * 2 * SLOTS, at=A_TOK_AT)
+# (``ink``: Inkling's attention, ``Attn(ink=True)``) state words past A_WORDS: the raw ring's loop (1), the raw K / V objects
+# under it, the ring's D objects to emit, the E objects before the next cache object (0, 1), the current group's first
+# position (its bias table's), the layer's kind (1: full: tau, the taps' deltas, the conv's scale 1 / 3), the first
+# position whose group has a bias (keys within the relative extent of some row)
+INK_STATE = STATE.kind("ink")
+A_NRING, A_NKVR, A_NRE, A_NEX, A_GP0, A_FULL, A_EP0 = INK_STATE.words(
+    "A_NRING A_NKVR A_NRE A_NEX A_GP0 A_FULL A_EP0", at=A_WORDS)
+A_WORDS_INK = A_WORDS + 8
+# (ink) an F_ATT object's words: the layer is a full one (M_AFULL), the relative extent (M_AEXT)
+ATT_INK = XMETA.kind("ink attention", extends=(ATT,))
+M_AFULL, M_AEXT = ATT_INK.words("M_AFULL M_AEXT", at=34)
+# (ink) a q object's payload (bf16 elements): q of the 3 heads, their gates, r (16 per head), the sinks (3 fp32 as bf16
+# pairs); the F_ATT object's static constants after them: the q clip scales [head][128], the r clip scales [head][16]
+INK_Q, INK_G, INK_R, INK_SK, INK_QC, INK_RC = 0, 384, 768, 816, 832, 1216
+# (ink) a raw K / V object's payload (fp32): K, its taps' deltas (full layers; a C object of their own), V, its deltas: the
+# k and v phases' outputs, one drain each; the layer's static taps after them (bf16 [tap 4][128] of K, then of V, at byte
+# INK_TAPS)
+INK_K, INK_KD, INK_V, INK_VD, INK_TAPS = 0, 128, 160, 288, 1280
+INK_EW = 128  # (ink) an E object's window: [rel 16][128] bf16 of E's reversed rows (``ink_rel``)
+INK_ED0 = 1151  # (ink) E_rev[r][j] = E[r][INK_ED0 - j] (zero past E's distances: ``ink_rel``)
+INK_EL = 1280  # (ink) E_rev's row length
+INK_EG = 17  # (ink) the E objects of a sub-step: its range's last groups, at most this many (all of a window's)
+
 # the event windows of a stats build (the decode operator's win=): the attention core's kernels
 WINS = {"abegin": 11, "aq": 12, "aqpan": 13, "akv": 14, "kobj": 15, "vobj": 16, "arec": 17, "aend": 18, "aemit": 19,
         "put_k": 20, "tobj": 21, "scores": 22, "pv": 23,
@@ -127,10 +150,24 @@ WINS = {"abegin": 11, "aq": 12, "aqpan": 13, "akv": 14, "kobj": 15, "vobj": 16, 
 assert not set(WINS.values()) & set(DESIGN_WINS.values()), "event windows of the design and of the attention core collide"
 
 
-def consts() -> dict[str, int]:
+def consts(ink: bool = False) -> dict[str, int]:
     """The words, flags and ids the attention cores' kernels take: their own, and of the protocol the phase objects they
-    skip (``PHASE``) and the token objects (``TOKEN``)."""
-    return XMETA.consts(PHASE, ATT, TOKEN_ATT) | STATE.consts() | {"A_WORDS": A_WORDS}
+    skip (``PHASE``) and the token objects (``TOKEN``); ``ink``: Inkling's (``Attn(ink=True)``)."""
+    return XMETA.consts(PHASE, ATT, TOKEN_ATT, *([ATT_INK, INK] if ink else [])) | \
+        STATE.consts(*([INK_STATE] if ink else [])) | {"A_WORDS": A_WORDS}
+
+
+def ink_rel(E: np.ndarray) -> np.ndarray:
+    """(ink) A layer's relative-bias table E (rel, extent) fp32 as E_rev (rel + 1, INK_EL) bf16 bits: row r + 1 holds
+    E[r][INK_ED0 - j] at j (zero where that is no distance of E), row 0 zero (the E objects' fill reads XB bytes from a
+    row before their window: ``Attn(ink=True)``)."""
+    rel, ext = E.shape
+    out = np.zeros((rel + 1, INK_EL), np.float32)
+    j = np.arange(INK_EL)
+    d = INK_ED0 - j
+    ok = (d >= 0) & (d < ext)
+    out[1:, ok] = E[:, d[ok]]
+    return out.astype(bfloat16).view(np.uint16)
 
 
 _SRC = templating.load("artlite/decode/attn.cc.jinja")
@@ -174,13 +211,16 @@ class Attn:
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
                  c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None,
-                 sinks: bool = False, moe: bool = False):
+                 sinks: bool = False, moe: bool = False, ink: bool = False):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and (1 <= heads <= 4 or (heads == 8 and max(hds) <= 128)), (chain, heads, hds)
         assert not qk_weights or (qk_norm and not v_norm and len(hds) == 1), "per-dim weights: q / k norms, one head dim"
         assert not gate or (len(hds) == 1 and heads % chain == 0), "gates: one head dim, a chain column's heads alike"
         assert not sinks or (len(hds) == 1 and not gate), "sinks: one head dim, no gate"
+        assert not ink or (hds == (128,) and rot == (0,) and chain == 1 and heads == 3 and v_norm and not
+                           (qk_norm or gate or sinks or conv)), "ink: Inkling's attention (module docstring)"
+        self.ink = ink
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
         self.qk_weights, self.gate, self.conv, self.pages, self.sinks, self.moe = qk_weights, gate, conv, pages, sinks, moe
@@ -223,7 +263,7 @@ class Attn:
         rg = max(self.rg.values())
         sets = max(self.rows(hd) // 4 for hd in self.hds)
         kb = max(self.kb_slot * SLOTS, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
-        words = A_WORDS + (self.conv.words if self.conv is not None else 0)
+        words = A_WORDS_INK if self.ink else A_WORDS + (self.conv.words if self.conv is not None else 0)
         sizes = [("st", 4 * words), ("cs", 4 * 2 * SLOTS * sum(self.rot)), ("y", 4 * self.y_floats()), ("qa", qa),
                  ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SLOTS), ("sc", 4 * 32 * rg * sets),
                  ("pp", self.ppo * sets // 2 if len(self.hds) == 1 else 72 * rg), ("m", 4 * 32 * sets)]
@@ -231,6 +271,12 @@ class Attn:
             sizes.append(("gt", 4 * 4 * sets))  # (1 + e^-g per query row)
         if self.sinks:  # (the heads' sinks log2 e; the rows' sink terms, 64-byte aligned for their 16-lane loads)
             sizes += [("sk", 4 * self.heads), ("tz", 4 * 4 * sets)]
+        if self.ink:  # (the layer's constants: q clip [3][128], r clip [3][16] (in 64), K / V taps [4][128] bf16; per query
+            # row its r [16] fp32 (times log2 e), sink (log2 units), gates [128] bf16; per slot tau; a group's bias table
+            # [row][96] fp32, log2 units)
+            nr = self.heads * SLOTS
+            sizes += [("ic", 2 * (3 * 128 + 64 + 8 * 128)), ("ir", 4 * 16 * nr), ("isk", 4 * 16), ("ig", 2 * 128 * nr),
+                      ("itau", 64), ("ib", 4 * 96 * nr)]
         if self.pages is not None:
             sizes.append(("keep", 192))  # (the pager's slow path: the pages' constant data read into it)
         out = regions(sizes)
@@ -282,7 +328,10 @@ class Attn:
                            lnh=lambda nh: f"{nh} == 8 ? 3 : ({nh} == 4 ? 2 : 1)" if self.heads == 8 else f"{nh} == 4 ? 2 : 1",
                            SINKS=self.sinks, MOE=self.moe, HEADS=self.heads, ROWS=max(self.rows(hd) for hd in hds),
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
-                           META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts())
+                           INK=self.ink, INK_Q=INK_Q, INK_G=INK_G, INK_R=INK_R, INK_SK=INK_SK, INK_QC=INK_QC, INK_RC=INK_RC,
+                           INK_K=INK_K, INK_V=INK_V, INK_KD=INK_KD, INK_VD=INK_VD, INK_TAPS=INK_TAPS, INK_EW=INK_EW,
+                           INK_ED0=INK_ED0, INK_EG=INK_EG,
+                           META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts(self.ink))
 
     def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1,
                 extra: dict[int, list] | None = None,
@@ -309,6 +358,9 @@ class Attn:
         k_aobj = Kernel(f"{p}_aobj", "kernel.o", [a_ty, aws_ty])
         k_arec = Kernel(f"{p}_arec", "kernel.o", [a_ty, aws_ty, d_ty])
         k_aend = Kernel(f"{p}_aend", "kernel.o", [aws_ty, aws_ty])
+        # (ink: the raw K / V objects into the ring object, its D objects, a cache group's E object)
+        k_ink = [Kernel(f"{p}_akvr", "kernel.o", [x_ty, aws_ty, a_ty]), Kernel(f"{p}_aring", "kernel.o", [a_ty, aws_ty, d_ty]),
+                 Kernel(f"{p}_aebias", "kernel.o", [x_ty, aws_ty])] if self.ink else []
         k_aemit = Kernel(f"{p}_aemit", "kernel.o", [aws_ty, d_ty])
         conv = self.conv
         k_conv = [Kernel(f"{p}_cobj", "kernel.o", [x_ty, aws_ty]), Kernel(f"{p}_cemit", "kernel.o", [aws_ty, d_ty])] \
@@ -327,6 +379,7 @@ class Attn:
             tl = rest.pop(0) if j > 0 else None
             tr = rest.pop(0) if j < chain - 1 else None
             cobj, cemit = (rest.pop(10), rest.pop(10)) if conv is not None else (None, None)
+            akvr, aring, aebias = (rest.pop(10), rest.pop(10), rest.pop(10)) if self.ink else (None, None, None)
             abegin, anb, aq, aq0, aqpan, akv, aobj, arec, aend, aemit, ws, pw = rest
             for _ in forever_():
                 x = x_f.acquire(1)
@@ -361,7 +414,24 @@ class Attn:
                         x = x_f.acquire(1)
                         akv(x, ws, col // chain)
                         x_f.release(1)
+                    if akvr is not None:
+                        for _ in range_(ws[i_a + A_NRING]):  # (ink: the raw ring object, the raw K / V objects into it)
+                            r = a_f.acquire(1)
+                            for _ in range_(ws[i_a + A_NKVR]):
+                                x = x_f.acquire(1)
+                                akvr(x, ws, r)
+                                x_f.release(1)
+                            for _ in range_(ws[i_a + A_NRE]):  # (the step's raw rows out)
+                                d = d_f.acquire(1)
+                                aring(r, ws, d)
+                                d_f.release(1)
+                            a_f.release(1)
                     for _ in range_(ws[i_a + A_NOBJ]):
+                        if aebias is not None:
+                            for _ in range_(ws[i_a + A_NEX]):  # (ink: a cache group's E object, its bias table)
+                                x = x_f.acquire(1)
+                                aebias(x, ws)
+                                x_f.release(1)
                         a = a_f.acquire(1)
                         aobj(a, ws)
                         for _ in range_(ws[i_a + A_NE]):  # (records to emit from it)
@@ -402,7 +472,7 @@ class Attn:
             links = ([toks[c - 1].cons()] if j > 0 else []) + ([toks[c].prod()] if j < chain - 1 else [])
             workers.append(Worker(attn_fn, [s.a_l1[c].cons(depth=a_depth), s.x_l1[c].cons(depth=1), d.prod(), *links,
                                             k_abegin, k_anb, k_aq, k_aq0, k_aqpan, k_akv, k_aobj, k_arec, k_aend, k_aemit,
-                                            *k_conv, aws[c], aws[c - 1] if j > 0 else aws[c],
+                                            *k_conv, *k_ink, aws[c], aws[c - 1] if j > 0 else aws[c],
                                             *(extra or {}).get(c, []), c],
                                   tile=Tile(c, row), stack_size=stack, dynamic_objfifo_lowering=True, while_true=False))
         return workers, d_fifos
@@ -414,11 +484,14 @@ def page_entries(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
     return {"prep": (f"{p}_pgprep",), "main": (f"{p}_pgmain",), **({"conv": (f"{p}_pgconv",)} if conv else {})}
 
 
-def page_calls(p: str, conv: bool) -> dict[str, tuple[str, ...]]:
+def page_calls(p: str, conv: bool, ink: bool = False) -> dict[str, tuple[str, ...]]:
     """The resident stubs' calls of the pages' entries (``paging.link``'s ``calls``): the chain's end (aend, aemit) in the
-    page the core needs next, the main page's with a conv job, else the next layer's preparation's."""
-    out = {f"{p}_{k}": (f"{p}_pgprep",) for k in ("aq0", "aq", "aqpan", "akv", *(() if conv else ("aend", "aemit")))}
-    out |= {f"{p}_{k}": (f"{p}_pgmain",) for k in ("aobj", "arec", *(("aend", "aemit") if conv else ()))}
+    page the core needs next, the main page's with a conv job, else the next layer's preparation's; ``ink``: the raw
+    ring's kernels in the preparation's, the E objects' in the main page."""
+    out = {f"{p}_{k}": (f"{p}_pgprep",) for k in ("aq0", "aq", "aqpan", "akv", *(() if conv else ("aend", "aemit")),
+                                                   *(("akvr", "aring") if ink else ()))}
+    out |= {f"{p}_{k}": (f"{p}_pgmain",) for k in ("aobj", "arec", *(("aend", "aemit") if conv else ()),
+                                                    *(("aebias",) if ink else ()))}
     return out | ({f"{p}_{k}": (f"{p}_pgconv",) for k in ("cobj", "cemit")} if conv else {})
 
 

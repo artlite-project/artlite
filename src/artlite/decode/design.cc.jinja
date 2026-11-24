@@ -445,6 +445,76 @@ __attribute__((noinline)) void {{ p }}_hspan(const float *__restrict acc, const 
     aie::store_v(sq_, sq.template to_vector<float>());
 }
 
+// The helper, the residual stream's step (``protocol.F_INK``): h the visit's 3 inputs before the step ([3][H8] fp32: the
+// history's X object), w the conv's taps (bf16 [4][H8]), res the step's rows v ([slot][RES_PITCH] fp32) -> per slot s < sp
+// out = (v_s + sum_t w_t xp_{s + t}) / sqrt(5) (xp: h, then v), cur (the column's states ist, [state][slot 4][H8] fp32:
+// state n += out; block: state n + 1 = out), then cur's slice into res ([k block][slot sp][8] fp32: the state array's)
+__attribute__((noinline)) void {{ p }}_hink(const float *__restrict h, const bfloat16 *__restrict w, float *__restrict res,
+                                           float *__restrict ist, int inkn, int sp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const int blk = (inkn >> 4) & 1, n1 = (inkn & 15) + blk;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < sp; s++) {
+        float *__restrict cur = ist + {{ H8 }} * (4 * n1 + s);
+        AIE_LOOP_NO_UNROLL
+        for (int c = 0; c < {{ H8 }}; c += 32) {
+            aie::accum<accfloat, 32> acc(aie::load_v<32>(res + {{ RES_PITCH }} * s + c));
+            for (int t = 0; t < 4; t++) {
+                const int i = s + t;
+                const float *__restrict xp = i < 3 ? h + {{ H8 }} * i + c : res + {{ RES_PITCH }} * (i - 3) + c;
+                aie::vector<bfloat16, 32> xh, xl;
+                al::split2<32>(aie::load_v<32>(xp), xh, xl);
+                const aie::vector<bfloat16, 32> wt = aie::load_v<32>(w + {{ H8 }} * t + c);
+                acc = aie::mac(aie::mac(acc, xh, wt), xl, wt);
+            }
+            const aie::vector<float, 32> o = al::mulff<32>(acc.template to_vector<float>(), aie::broadcast<float, 32>({{ 5 ** -0.5 }}f));
+            if (blk)
+                aie::store_v(cur + c, o);
+            else
+                aie::store_v(cur + c, aie::add(aie::accum<accfloat, 32>(aie::load_v<32>(cur + c)), o).template to_vector<float>());
+        }
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < {{ H8 // 8 }}; kb++)
+        for (int s = 0; s < sp; s++)
+            aie::store_v(res + 8 * (sp * kb + s), aie::load_v<8>(ist + {{ H8 }} * (4 * n1 + s) + 8 * kb));
+}
+
+// The helper, the partial sums of the next mix (``protocol.F_INK``, after ``hink``): per slot s < sp and state b <= n1 of
+// the column's states ist the sum of squares (lane b) and the dots with the nq <= 3 queries q ([j][H8] fp32: lane 8 + 8 j
+// + b), fp32 from hi + lo products -> out [slot 4][32] (the slots past sp zero)
+__attribute__((noinline)) void {{ p }}_hips(const float *__restrict q, const float *__restrict ist, float *__restrict out,
+                                           int n1, int nq, int sp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    alignas(64) float e[32];
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < 4; s++) {
+        aie::store_v(e, aie::zeros<float, 16>());
+        aie::store_v(e + 16, aie::zeros<float, 16>());
+        AIE_LOOP_NO_UNROLL
+        for (int b = 0; b <= n1 && s < sp; b++) {
+            const float *__restrict x = ist + {{ H8 }} * (4 * b + s);
+            AIE_LOOP_NO_UNROLL
+            for (int j = -1; j < nq; j++) {  // (-1: the sum of squares)
+                const float *__restrict y = j < 0 ? x : q + {{ H8 }} * j;
+                aie::accum<accfloat, 32> a = aie::zeros<accfloat, 32>();
+                AIE_LOOP_NO_UNROLL
+                for (int c = 0; c < {{ H8 }}; c += 32) {
+                    aie::vector<bfloat16, 32> xh, xl, yh, yl;
+                    al::split2<32>(aie::load_v<32>(x + c), xh, xl);
+                    al::split2<32>(aie::load_v<32>(y + c), yh, yl);
+                    a = aie::mac(aie::mac(aie::mac(a, xh, yh), xh, yl), xl, yh);
+                }
+                e[j < 0 ? b : 8 + 8 * j + b] = aie::reduce_add(a.template to_vector<float>());
+            }
+        }
+        aie::store_v(out + 32 * s, aie::load_v<16>(e));
+        aie::store_v(out + 32 * s + 16, aie::load_v<16>(e + 16));
+    }
+}
+
 {% endif %}
 // The helper: an input's sum panels (nsb super-blocks: T16 at t) -> xs; with norm the slots' 1 / rms -> r (8 lanes
 // per slot)
@@ -1213,12 +1283,21 @@ __attribute__((minsize)) void {{ p }}_begin(const bfloat16 *__restrict x, int32_
 {% endif %}
 {% if states %}
     st[{{ S_NCF }}] = 0;
+    st[{{ S_NEGRP }}] = 0;
+    st[{{ S_NETL }}] = 0;
+    st[{{ S_NINK }}] = 0;
+    st[{{ S_NIQB }}] = 0;
 {% endif %}
     cmd[{{ C_KIND }}] = {{ K_NOP }};
     if (!(flags & {{ F_MAIN }})) {  // another core's: skip it, the X and A objects that follow it; relay its outputs
         st[{{ S_NSKIP }}] = m[{{ M_SKIP }}];
         st[{{ S_NASKIP }}] = m[{{ M_NASKIP }}];
         st[{{ S_NR }}] = m[{{ M_NREL }}];
+{% if states %}
+        st[{{ S_NEGRP }}] = m[{{ M_EGRP }}];  // (interleaved X and A objects: EGRP)
+        st[{{ S_NEGA }}] = m[{{ M_EGA }}];
+        st[{{ S_NETL }}] = m[{{ M_ETAIL }}];
+{% endif %}
 {% if gate %}
         {{ p }}_gbegin(m, st, col);  // (the model's: the gates its relay applies)
 {% endif %}
@@ -1390,6 +1469,47 @@ __attribute__((minsize)) void {{ p }}_ccoef(const bfloat16 *__restrict x, int32_
     cmd[1] = st[{{ S_CSET }}];
     cmd[2] = st[{{ S_CQN }}];
     cmd[{{ C_KIND }}] = {{ K_COEF }};
+}
+
+// (F_INK) The residual stream's step, the main core's part (the history's X object x, the taps' A object a): cinkh, the
+// history window goes out first (``emit``'s source 8: x's 3 rows, then res's S rows, the step's v); cink, the helper's
+// command (``hink``: the conv, cur, cur's slice into res); cips, the partial sums of the queries in a (j 0: the taps'
+// object, after the taps; 1: a queries object) after cur's slice (``hips``), then the staging goes out (source 9)
+__attribute__((minsize)) void {{ p }}_cinkh(const bfloat16 *__restrict x, int32_t *__restrict ws)
+{
+    int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    st[{{ S_ESRC }}] = 8;
+    st[{{ S_ESLOT }}] = 0;
+    st[{{ S_EJ }}] = 0;
+    st[{{ S_NE }}] = {{ H8 // 32 }} * (3 + st[{{ S_NS }}]);
+    st[{{ S_IX }}] = (int32_t)(uintptr_t)(x + {{ 2 * META }});
+}
+
+__attribute__((minsize)) void {{ p }}_cink(const uint8_t *__restrict a, const bfloat16 *__restrict x, int32_t *__restrict ws,
+                                          int32_t *__restrict cmd)
+{
+    const int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    cmd[0] = (int32_t)(uintptr_t)(x + {{ 2 * META }}) + ({{ SHM }});
+    cmd[1] = (int32_t)(uintptr_t)a + ({{ SHM }});
+    cmd[2] = (int32_t)(uintptr_t)WS(float, {{ w_.res }}) + ({{ SHM }});
+    cmd[{{ C_SP }}] = st[{{ S_SP }}];
+    cmd[{{ C_INKN }}] = st[{{ S_INKN }}];
+    cmd[{{ C_KIND }}] = {{ K_INK }};
+}
+
+__attribute__((minsize)) void {{ p }}_cips(const uint8_t *__restrict a, int32_t *__restrict ws, int32_t *__restrict cmd, int32_t j)
+{
+    int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+    const int inkn = st[{{ S_INKN }}];
+    cmd[1] = (int32_t)(uintptr_t)(a + (j ? 0 : {{ 8 * H8 }})) + ({{ SHM }});  // (after the taps: bf16 [4][H8])
+    cmd[2] = (int32_t)(uintptr_t)WS(float, {{ w_.res }}) + ({{ SHM }});
+    cmd[3] = (inkn >> (j ? 12 : 8)) & 15;  // (the queries)
+    cmd[{{ C_SP }}] = st[{{ S_SP }}];
+    cmd[{{ C_INKN }}] = inkn;
+    cmd[{{ C_KIND }}] = {{ K_IPS }};
+    st[{{ S_ESRC }}] = 9;
+    st[{{ S_EJ }}] = 0;
+    st[{{ S_NE }}] = {{ H8 // 32 }} * st[{{ S_SP }}] + 4;
 }
 
 {% endif %}
@@ -1815,6 +1935,23 @@ __attribute__((minsize)) void {{ p }}_emit(int32_t *__restrict ws, bfloat16 *__r
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
+{% if states %}
+    if (st[{{ S_ESRC }}] >= 8) {  // (F_INK) 8: the history window (row r < 3: the X object's, then res's), 9: the staging
+        const int r = st[{{ S_ESLOT }}], j = st[{{ S_EJ }}];
+        const float *__restrict src;
+        if (st[{{ S_ESRC }}] == 9) {
+            src = WS(float, {{ w_.res }}) + 32 * j;
+            st[{{ S_EJ }}] = j + 1;
+        } else {
+            src = r < 3 ? (const float *)(uintptr_t)st[{{ S_IX }}] + {{ H8 }} * r + 32 * j : WS(float, {{ w_.res }}) + {{ RES_PITCH }} * (r - 3) + 32 * j;
+            const int last = j + 1 == {{ H8 // 32 }};
+            st[{{ S_EJ }}] = last ? 0 : j + 1;
+            st[{{ S_ESLOT }}] = last ? r + 1 : r;
+        }
+        aie::store_v((float *)c, aie::load_v<32>(src));
+        return;
+    }
+{% endif %}
 {% if moe %}
     // (acc: its counter over slot 4 + object, the 4 objects of 32 rows of a slot's 128 rows j in a row: a combine's object,
     // half j & 1 of column j / 2's slice)
@@ -2343,12 +2480,17 @@ __attribute__((noinline)) void {{ p }}_hacc(const float *__restrict x, int32_t *
 
 // The helper: a phase's metadata object x (in the main core's memory, as its workspace ws) -> the main core's trip
 // counts and the phase's state, or a slot's residual slice -> its residual (``begin``'s F_MAIN objects){{ "; the route object (``route``), an expert object (``hexpert``); a combine" if moe else "" }}
-__attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col{{ ", float *__restrict hres" if SLOTS == 8 else "" }})
+__attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col{{ ", float *__restrict hres" if SLOTS == 8 else "" }}{{ ", float *__restrict ist" if states else "" }})
 {
     const int32_t *__restrict m = (const int32_t *)x;
     int32_t *__restrict st = WS(int32_t, {{ w_.st }});
     const int flags = m[{{ M_FLAGS }}];
     if (flags & {{ F_LOADR }}) {
+{% if states %}
+        // (slot M_SLOT's slice of state M_INKN & 15: into the column's states, ``hink``)
+        {{ p }}_cv((int32_t *)ist + {{ H8 }} * (4 * (m[{{ M_INKN }}] & 15) + m[{{ M_SLOT }}]), (const int32_t *)(x + {{ 2 * META }}), {{ H8 // 16 }});
+        return;
+{% endif %}
 {% if SLOTS == 8 %}
         {{ p }}_cv((int32_t *){{ p }}_res(ws, hres, m[{{ M_SLOT }}]), (const int32_t *)(x + {{ 2 * META }}), {{ H8 // 16 }});
 {% else %}
@@ -2407,6 +2549,14 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
         st[{{ S_CSET }}] = m[{{ M_CSET }}];
         st[{{ S_NCF }}] = (flags & {{ F_COEF }}) ? 1 : 0;
         st[{{ S_CQN }}] = m[{{ M_NQ }}] | m[{{ M_NMIX }}] << 8;
+    }
+    if (flags & {{ F_INK }}) {  // (the rows into a zeroed res, then the residual stream's step)
+        const int inkn = m[{{ M_INKN }}];
+        st[{{ S_NINK }}] = 1;
+        st[{{ S_NIQA }}] = (inkn >> 8) & 15 ? 1 : 0;
+        st[{{ S_NIQB }}] = (inkn >> 12) & 15 ? 1 : 0;
+        st[{{ S_INKN }}] = inkn;
+        {{ p }}_zv(WS(int32_t, {{ w_.res }}), {{ SLOTS * RES_PITCH * 4 // 64 }});
     }
 {% endif %}
     st[{{ S_NX }}] = nx;
@@ -2594,7 +2744,7 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
 // object (its x panels into xp, its 16-k sums into the scratch); K_INPUT: the sum panels of every chunk (into the main
 // core's xs), the slots' 1 / rms -> r (8 lanes per slot); K_BEGIN: a phase's metadata (hbegin)
 void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *__restrict scr, float *__restrict sq,
-                   uint8_t *__restrict xp{{ ", float *__restrict hres, const int8_t *__restrict oh" if SLOTS == 8 else "" }}{{ ", int32_t *__restrict hst" if help_flag else "" }})
+                   uint8_t *__restrict xp{{ ", float *__restrict hres, const int8_t *__restrict oh" if SLOTS == 8 else "" }}{{ ", float *__restrict ist" if states else "" }}{{ ", int32_t *__restrict hst" if help_flag else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const int kind = cmd[{{ C_KIND }}];
@@ -2606,7 +2756,7 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
     if (kind == {{ K_NOP }})
         return;
     if (kind == {{ K_BEGIN }}) {
-        {{ p }}_hbegin((const bfloat16 *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]{{ ", hres" if SLOTS == 8 else "" }});
+        {{ p }}_hbegin((const bfloat16 *)(uintptr_t)cmd[0], (int32_t *)(uintptr_t)cmd[1], cmd[2]{{ ", hres" if SLOTS == 8 else "" }}{{ ", ist" if states else "" }});
         return;
     }
 {% if rot %}
@@ -2638,6 +2788,17 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
     }
 {% endif %}
 {% if states %}
+    if (kind == {{ K_INK }}) {  // the residual stream's step (``cink``)
+        {{ p }}_hink((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
+                     cmd[{{ C_INKN }}], cmd[{{ C_SP }}]);
+        return;
+    }
+    if (kind == {{ K_IPS }}) {  // the next mix's partial sums (``cips``): after cur's slice in res
+        const int inkn = cmd[{{ C_INKN }}], sp = cmd[{{ C_SP }}];
+        {{ p }}_hips((const float *)(uintptr_t)cmd[1], ist, (float *)(uintptr_t)cmd[2] + {{ H8 }} * sp,
+                     (inkn & 15) + ((inkn >> 4) & 1), cmd[3], sp);
+        return;
+    }
     if (kind == {{ K_COEF }}) {  // a phase's partial sums object: its coefficient sets (``ccoef``)
         {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
         return;

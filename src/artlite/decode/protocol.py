@@ -166,6 +166,23 @@ F_STATES = INK.flag("F_STATES", 8)
 # M_CSET + M_NQ - 1 of its M_NMIX states (``hcoef``) before its objects
 F_COEF = INK.flag("F_COEF", 9)
 M_NR, M_CSET, M_NQ, M_NMIX = INK.words("M_NR M_CSET M_NQ M_NMIX", at=44)
+# the phase's rows (into a zeroed res: F_RESID, F_COMB) are a sub-layer's output v, which the residual stream's step takes
+# after the tiles (the helper's ``hink``, ``hips``): the post conv out = (v + sum_t w_t xp_t) / sqrt(5) over the visit's
+# history (an X object: its 3 inputs before the step's, fp32 [3][hidden / 8]) and the step's rows, with the conv's taps (an A
+# object: bf16 [4][hidden / 8], then nqa queries); cur (state n of the column's states, fp32 in the helper's south
+# neighbour) += out, or with ``block`` state n + 1 = out (n stays: a completed block state); then the partial sums of the
+# next mix (as F_COEF reads them) of states 0 .. n + block with the nqa queries after the taps or the nqb of the next A
+# object. Out (C): the history window (the 3 inputs, the step's S: [3 + S][hidden / 8] fp32), cur's slice ([k block][slot
+# sp][8] fp32) and the partial sums ([slot 4][32] fp32). M_INKN: n | block << 4 | nqa << 8 | nqb << 12
+F_INK = INK.flag("F_INK", 10)
+M_INKN = INK.word("M_INKN", at=48)
+INK_STATES = 5  # the column's states the helper keeps (fp32 [state][slot 4][hidden / 8]; F_LOADR: slot M_SLOT of state M_INKN)
+
+# (``states`` designs) another core's object whose X and A objects interleave after it (Inkling's attention: per cache group
+# with a bias, its E object, then its A objects): the main core skips M_EGRP times one X object and M_EGA A objects, then
+# M_ETAIL A objects (after M_SKIP / M_NASKIP's): both cores take the broadcast streams' objects in one order
+EGRP = XMETA.kind("ink groups")
+M_EGRP, M_EGA, M_ETAIL = EGRP.words("M_EGRP M_EGA M_ETAIL", at=45)
 
 TOKEN = XMETA.kind("token")
 # (``tok`` designs) a token object's index (< N_TOK) and per column its cache objects; an object of another core with
@@ -229,9 +246,13 @@ S_NPQ, S_NRA, S_NGA, S_NRX, S_NRP, S_RC, S_RG, S_RN = ROT_STATE.words("S_NPQ S_N
 S_NWP = ROT_STATE.word("S_NWP", at=S_WORDS + 9)
 # (``states``) an F_STATES phase's states per k range (log2) and coefficient set (M_NR, M_CSET): past S_WORDS, in a states
 # design's longer state
-STATES_STATE = STATE.kind("states")
+STATES_STATE = STATE.kind("states", exclusive_with=(ROT_STATE,))
 # (S_NCF: a trip count, F_COEF; S_CQN: M_NQ | M_NMIX << 8)
 S_NST, S_CSET, S_NCF, S_CQN = STATES_STATE.words("S_NST S_CSET S_NCF S_CQN", at=S_WORDS + 10)
+S_NEGRP, S_NEGA, S_NETL = STATES_STATE.words("S_NEGRP S_NEGA S_NETL", at=S_WORDS)  # (trip counts: ``EGRP``)
+# (F_INK) the residual stream's step, its queries in the taps' object, in the next A object (trip counts), M_INKN, the
+# history's X object (its address)
+S_NINK, S_NIQA, S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NINK S_NIQA S_NIQB S_INKN S_IX", at=S_WORDS + 3)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -252,6 +273,10 @@ C_MIRROR = CMD.common.flag("C_MIRROR", 3, of="sp")  # (K_PSTRIP: C_SP + C_MIRROR
 # main core's res region (the range's sum)
 K_SSTRIP, K_COEF = CMD.common.values("K_SSTRIP K_COEF", of="kind", start=13)
 C_NST, C_CSET, C_XC0, C_ACC = CMD.common.words("C_NST C_CSET C_XC0 C_ACC", at=6)
+# (``states``) the residual stream's step (F_INK): words 0 .. 2 the history's payload, the A object, res (as the helper sees
+# them), C_INKN the phase's M_INKN, C_NS its slots; K_ILOAD (F_LOADR): word 0 the payload, C_INKN state << 2 | slot
+K_INK, K_IPS, K_ILOAD = CMD.common.values("K_INK K_IPS K_ILOAD", of="kind", start=15)
+C_INKN, C_NS = CMD.common.words("C_INKN C_NS")
 
 # ----------------------------------------------------------------------
 # Streams, packets and pages
@@ -275,7 +300,7 @@ WINS = {"tile": 1, "htile": 2, "collect": 3, "hstrip": 4, "pre": 5, "prehdr": 6,
 def consts(rpost: bool = False, states: bool = False) -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``; ``rpost``:
     a rotated post design's, RPOST's flags too; ``states``: INK's)."""
-    return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else []), *([INK] if states else [])) | \
+    return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else []), *([INK, EGRP] if states else [])) | \
         STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE) | CMD.consts() | \
         {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
 

@@ -117,9 +117,11 @@ def test_ink_objects(ink: tuple[GGUFFile, InklingConfig]) -> None:
             got = q[c][:(J + 4) * 288 * 4].view(np.float32).reshape(J + 4, 288)
             assert np.array_equal(got, want[:, 288 * c:288 * c + 288]), (L, c)
         f = img.ink_objects(L, "inkf").reshape(COLS, -1)
-        taps = g.tensor(f"blk.{L}.attn_post_conv.weight").dequantize().reshape(4, H)
-        got = f[2][1152:1152 + 2304].view(bfloat16).astype(np.float32).reshape(4, 288)
+        taps = g.tensor(f"blk.{L}.attn_post_conv.weight").dequantize().reshape(H, 4).T  # (a channel's taps per row)
+        got = f[2][:2304].view(bfloat16).astype(np.float32).reshape(4, 288)
         assert np.array_equal(got, taps[:, 576:864])  # (bf16-exact)
+        qf = g.tensor(f"blk.{L}.ffn_res_query.weight").dequantize().reshape(H)
+        assert np.array_equal(f[2][2304:2304 + 1152].view(np.float32), qf[576:864])
         ctl = img.ink_objects(L, "ctl_k").reshape(COLS, 2, -1)
         for i, part in enumerate(("forget", "gain")):
             w = g.tensor(cfg.ctrl_tensor(L, "k", part)).dequantize().reshape(H, CTL_RANK)
