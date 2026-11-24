@@ -770,12 +770,14 @@ class InklingOverlay(AttentionOverlay):
     def _attention(self, seq: Sequence, st: StepPlan, L: int, weights: list[tuple[int, str]]) -> None:
         """Visit L's attention, per sub-step (each after the last one's records are in DDR, the first after the q and raw
         K / V objects): per column the sub-step's q and raw K / V objects and its E objects (X; their window and count
-        patched per step: ``_set_parts``), the raw ring, its range of the cache and the tail objects (A; the range and
-        tails patched per step), the raw ring back, the records (D, patched) and o into o's input (D), then the weights of
-        the GEMV phases after it. The drains go before those weights: the attention core holds the raw ring while it
-        sends it back, and a range of more cache objects than the A stream's memtile FIFO holds completes its fill only as
-        the cores take them, so a host wait on A (the weights' task waits for a BD) must find the cores' outputs drained
-        (a step from position 192 on, 14 A objects a sub-step against 11, deadlocked otherwise)."""
+        patched per step: ``_set_parts``), the raw ring and its range of the cache (A; the range patched per step), the raw
+        ring back (D), the tail objects (A, patched), the records (D, patched) and o into o's input (D), then the weights
+        of the GEMV phases after it. A host wait on A (a task waiting for one of the stream's 3 BDs) must find the
+        outputs it depends on drained: the attention core holds the raw ring while it sends it back, and a range of more
+        cache objects than the A stream's memtile FIFO holds completes its fill only as the cores take them (a step from
+        position 192 on, 14 A objects a sub-step against 11, deadlocked otherwise); so the raw ring's drain goes before
+        the tails' fills (a ring's range in two fills: the tails' then wait for the raw ring's), the other drains before
+        the weights."""
         dev, T = self.dev, self.T
         use = self.uses[L]
         kind = self.kinds[use.kind]
@@ -793,11 +795,13 @@ class InklingOverlay(AttentionOverlay):
                 seq.fill("A", c, dev.address("KV", self.raw_ring(L, c)), RING)
                 st.fills += [Fill(seq.fill("A", c, dev.address("KV", self.kv_off[L]), T), L, c, u, f)
                              for f in range(2 if kind.wrap else 1)]
+            for c in range(COLS):
+                seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)
+            for c in range(COLS):
                 st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t)
                              for t in range(tails(n))]
             o = self.inp[(L, "o")][0]
             for c in range(COLS):
-                seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)
                 for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
                     st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[L]), 2 * self.at.d_len), L, c, u, i))
                 at = dev.address("ACT", o.off + o.x0 + 2 * sp * nq * c + 16 * a)

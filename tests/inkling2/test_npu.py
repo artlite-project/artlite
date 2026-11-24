@@ -14,8 +14,9 @@ import numpy as np
 import pytest
 import torch
 
+from artlite.gguf_model import GGUFFile
 from artlite.model_config import inkling_gguf
-from models.inkling2.inkling import Inkling
+from models.inkling2.inkling import Inkling, NpuInkling
 from models.sampling import Sampling
 
 from ..common import essay
@@ -106,6 +107,21 @@ def test_rollback() -> None:
         i += 1
     got = np.stack(got)
     bad = np.flatnonzero((got != want[20:]).any(-1))
+    assert not bad.size, bad[:8]
+
+
+def test_ring() -> None:
+    """The sliding-window caches as rings (``InklingOverlay(wrap=)``: 18 groups, 1152 positions) give the logits of
+    linear caches, bit for bit, past a turn: 1300 essay tokens in steps of 4, the last 64 positions' logits (a ring's
+    range in two fills, every sub-step's transfers ordered so that no host wait blocks a core: ``_attention``)."""
+    path = _path()
+    tokens = llama_tokenize(path, essay("founders.txt"))[:1300]
+    rows = []
+    for wrap in (18, 0):
+        model = NpuInkling(GGUFFile(path), capacity=2048, wrap=wrap)
+        rows.append(model.forced_logits(tokens, len(tokens) - 64, batch=4))
+        del model
+    bad = np.flatnonzero((rows[0] != rows[1]).any(-1))
     assert not bad.size, bad[:8]
 
 
