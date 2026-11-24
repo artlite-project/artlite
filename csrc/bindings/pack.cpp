@@ -34,8 +34,9 @@ void bind_pack(nb::module_& m) {
         std::vector<artlite::PackBlock> bs;
         for (nb::handle h : blocks) {
           auto t = nb::cast<nb::tuple>(h);
-          if (t.size() != 14 && t.size() != 17)
-            throw artlite::Error("pack_tiles: a block is a tuple of 14 (or 17: with tile0, pair, col_tiles)");
+          if (t.size() != 14 && t.size() != 17 && t.size() != 19)
+            throw artlite::Error("pack_tiles: a block is a tuple of 14 (or 17: with tile0, pair, col_tiles; 19: and k0, "
+                                 "k_bytes)");
           artlite::PackBlock b{};
           b.fmt = artlite::tile_format(nb::cast<std::string>(t[0]));
           b.R = nb::cast<int>(t[1]);
@@ -49,15 +50,23 @@ void bind_pack(nb::module_& m) {
           b.col_stride = nb::cast<size_t>(t[9]);
           b.row_sb = nb::cast<int>(t[12]);
           b.G = nb::cast<int>(t[13]);
-          if (t.size() == 17) {
+          if (t.size() >= 17) {
             b.tile0 = nb::cast<int64_t>(t[14]);
             b.pair = nb::cast<int>(t[15]);
             b.col_tiles = nb::cast<int64_t>(t[16]);
           }
+          if (t.size() == 19) {
+            b.k0 = nb::cast<size_t>(t[17]);
+            b.k_bytes = nb::cast<size_t>(t[18]);
+          }
           const size_t row_bytes = size_t(b.row_sb) * artlite::block_bytes(b.fmt);
           for (nb::handle r : nb::cast<nb::list>(t[10])) {
             auto raw = nb::cast<Raw>(r, false);
-            if (raw.shape(1) != row_bytes)
+            if (b.k_bytes) {  // (a K slice: the tensors' rows whole, of one width)
+              if (b.row_stride && raw.shape(1) != b.row_stride)
+                throw artlite::Error("pack_tiles: a K slice's tensors have rows of one width");
+              b.row_stride = raw.shape(1);
+            } else if (raw.shape(1) != row_bytes)
               throw artlite::Error(std::format("pack_tiles: tensor rows of {} bytes, the block's are {}",
                                                raw.shape(1), row_bytes));
             b.tensors.emplace_back(raw.data(), static_cast<int64_t>(raw.shape(0)));
@@ -92,7 +101,8 @@ void bind_pack(nb::module_& m) {
       "tensor row's super-blocks, at most n_kc nsb: zero super-blocks past them; G: tensor rows per tile row, "
       "consecutive in rows, along K), or that and (tile0, pair, col_tiles): a Region.half region's block, its tiles "
       "from tile tile0 of a column block of col_tiles tiles, pair 1: row tiles in pairs sharing their tail tile "
-      "(artlite::PackBlock). threads: 0 = one per physical core; files: (path, the caller's mapping of the "
+      "(tile0 -1: none), or that and (k0, k_bytes): a K slice, the tensors' rows whole, the block's row their k_bytes "
+      "from byte k0 on, zero bytes past them (artlite::PackBlock). threads: 0 = one per physical core; files: (path, the caller's mapping of the "
       "whole file) of the files the tensors lie in: a tensor inside one of these mappings is read through views of the "
       "packer's own, read into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping "
       "stays untouched), any other as the memory it is; "

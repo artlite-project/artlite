@@ -1049,6 +1049,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     const PackBlock& b = blocks[bi];
     const FormatInfo& fi = info(b.fmt);
     const size_t row_bytes = size_t(b.row_sb) * fi.block_bytes;
+    const size_t stride = b.k_bytes ? b.row_stride : row_bytes;  // (a tensor row's bytes)
     const bool pairs = fi.pairs, bfp = fi.bfp, f32 = b.fmt == TileFormat::BFP16_F32;
     const int64_t tile_rows = int64_t(b.R) * b.G;  // (entries of rows per row tile)
     // (tiles of a column block, of this block: by index from tile0; a pair's 2 n_kc - 1 tiles, a single's n_kc)
@@ -1063,7 +1064,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
         b.col_stride < col_tiles * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||
         b.offset + (b.cols - 1) * b.col_stride + col_tiles * b.S > out_size ||
         (b.tile0 >= 0 && (b.kc_group != b.n_kc || b.G > 1 || b.tile0 + block_tiles > b.col_tiles)) ||
-        (b.pair && (b.tile0 < 0 || b.n_kc < 2 || b.nsb % 2 || b.row_sb != (2 * b.n_kc - 1) * b.nsb / 2 || f32)))
+        (b.pair && (b.tile0 < 0 || b.n_kc < 2 || b.nsb % 2 || b.row_sb != (2 * b.n_kc - 1) * b.nsb / 2 || f32)) ||
+        (b.k_bytes && (b.k_bytes > row_bytes || b.k0 + b.k_bytes > b.row_stride || b.pair || f32)))
       throw Error(std::format("pack_tiles: block {}: inconsistent geometry (R {}, G {}, S {}, nsb {}, row_sb {}, n {}, "
                               "n_kc {} / {}, row tiles {} + {} of {}, {} B at {} of {})", bi, b.R, b.G, b.S, b.nsb,
                               b.row_sb, b.n, b.n_kc, b.kc_group, b.rt0, b.n / tile_rows, b.n_rt,
@@ -1076,7 +1078,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       auto [it, added] = tensor_of.try_emplace(data, static_cast<uint32_t>(run.tensors.size()));
       if (added) run.tensors.push_back({data, 0, file_of(data)});
       pack::Tensor& x = run.tensors[it->second];  // (the bytes any block reads of it)
-      x.bytes = std::max(x.bytes, size_t(rows) * row_bytes);
+      x.bytes = std::max(x.bytes, size_t(rows) * stride);
       block_tensors[bi].push_back(it->second);
     }
     const int64_t indices = f32 ? 2 * total : total;  // (F32: two planes per row)
@@ -1090,7 +1092,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     for (int c = 0; c < b.cols; c++)
       for (int64_t t0 = 0; t0 < tiles; t0 += step) {
         items.push_back({static_cast<int>(bi), c, t0, std::min(step, tiles - t0)});
-        run.add(block_tensors[bi], size_t(items.back().nt) * tile_rows * row_bytes);
+        run.add(block_tensors[bi], size_t(items.back().nt) * tile_rows * stride);
       }
   }
 
@@ -1114,6 +1116,8 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
       const int tile_rows = b.R * b.G;
       const FormatInfo& fi = info(b.fmt);
       const size_t bb = fi.block_bytes, row_bytes = size_t(b.row_sb) * bb;
+      const size_t stride = b.k_bytes ? b.row_stride : row_bytes, k0 = b.k_bytes ? b.k0 : 0;
+      const size_t kb = b.k_bytes ? b.k_bytes : row_bytes;  // (a row's bytes of the tensor's; zero bytes past them)
       std::memset(tile.get(), 0, b.S);  // (the padding stays zero: every tile writes the same bytes)
       uint8_t* col = out + b.offset + it.col * b.col_stride;
       const int64_t tiles = b.n / tile_rows;
@@ -1127,7 +1131,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
           for (size_t t = 0; t < b.tensors.size() && i >= 0; t++) {
             const int64_t n = b.tensors[t].second;
             if (i < n) {
-              out_base[r] = rows_of[it.block][t] + i * row_bytes;
+              out_base[r] = rows_of[it.block][t] + i * stride + k0;
               break;
             }
             i -= n;
@@ -1156,23 +1160,26 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
             memory::stream_copy(col + (b.tile0 + rt / 2 * (2 * b.n_kc - 1) + kc) * b.S, tile.get(), b.S);
             continue;
           }
-          const int have = std::clamp(b.row_sb - kc * b.nsb, 0, b.nsb);  // (the chunk's super-blocks in a row)
-          if ((have < b.nsb || b.G > 1) && part->size() < size_t(b.R) * b.nsb * bb)
+          // (the chunk's bytes of a row: its super-blocks, a slice's last part of one)
+          const size_t have = std::min(kb - std::min(kb, kc * b.nsb * bb), size_t(b.nsb) * bb);
+          if ((have < b.nsb * bb || b.G > 1) && part->size() < size_t(b.R) * b.nsb * bb)
             part->assign(size_t(b.R) * b.nsb * bb, 0);
           for (int r = 0; r < b.R; r++) {
             if (b.G > 1) {  // (a tile row of G rows of row_sb super-blocks)
               uint8_t* p = part->data() + size_t(r) * b.nsb * bb;
-              for (int j = 0; j < b.G; j++)
-                std::memcpy(p + j * row_bytes, base[b.G * r + j] ? base[b.G * r + j] : kZeroRow, row_bytes);
+              for (int j = 0; j < b.G; j++) {
+                std::memcpy(p + j * row_bytes, base[b.G * r + j] ? base[b.G * r + j] : kZeroRow, kb);
+                std::memset(p + j * row_bytes + kb, 0, row_bytes - kb);
+              }
               src[r] = p;
             } else if (!base[r] || have == 0) {
               src[r] = kZeroRow;
-            } else if (have == b.nsb) {
+            } else if (have == b.nsb * bb) {
               src[r] = base[r] + kc * b.nsb * bb;
             } else {
               uint8_t* p = part->data() + size_t(r) * b.nsb * bb;
-              std::memcpy(p, base[r] + kc * b.nsb * bb, have * bb);
-              std::memset(p + have * bb, 0, (b.nsb - have) * bb);
+              std::memcpy(p, base[r] + kc * b.nsb * bb, have);
+              std::memset(p + have, 0, b.nsb * bb - have);
               src[r] = p;
             }
           }

@@ -94,6 +94,8 @@ class Block:
     fmt2: str = ""
     R2: int = 0
     pt: bool = False  # (a ``Region.half`` region's) its row tiles in pairs that share their last chunk's tile (``Region``)
+    kslice: tuple[int, int] = (0, 0)  # (k0, k > 0) its tensors' columns k0 .. k0 + k only (whole GGUF blocks; an MoE
+    # down's part of its K: ``models.inkling2.image``), zeros past them
 
     @property
     def formats(self) -> tuple[str, ...]:
@@ -471,11 +473,16 @@ class TileImage:
         out = []
         for fmt, R, rt, names, rows in b.parts(self.tensor(b.tensors[0]).rows):
             ts = [self.tensor(t) for t in names]
+            k0, k = b.kslice
             blk = (_native_format(fmt, ts), R, self.tile_bytes, self.nsb, r.n_kc, r.kc_group, r.n_rt,
                    r.rt0[b.name] + rt, r.offset, r.col_stride, [_raw_bytes(t) for t in ts], np.ascontiguousarray(rows),
-                   ts[0].cols // 256, b.G)
+                   -(-(k or ts[0].cols) // 256), b.G)
             if r.half:
                 blk += (r.t0[b.name] + rt * r.n_kc, int(b.pt), r.n_t)
+            if k:  # (a K slice: its bytes of the tensors' rows)
+                rb = _raw_bytes(ts[0]).shape[1]
+                assert (k0 * rb) % ts[0].cols == 0 and (k * rb) % ts[0].cols == 0 and not r.half, (b.name, k0, k)
+                blk += (-1, 0, 0, k0 * rb // ts[0].cols, k * rb // ts[0].cols)
             out.append(blk)
         return out
 

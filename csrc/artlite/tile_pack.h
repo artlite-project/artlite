@@ -48,6 +48,9 @@ constexpr int kMaxNsb = 16;
 /// chunks, the tail tile's tile rows those of 2 q's rows (its first nsb / 2 super-blocks) and 2 q + 1's (the others)
 /// over the tensor rows' last nsb / 2 super-blocks (row_sb = (n_kc - 1) nsb + nsb / 2); an odd last row tile's
 /// second half zero super-blocks.
+///
+/// k_bytes > 0 (a K slice: an MoE down's part of its K, ``models.inkling2.image``): a tensor row is row_stride bytes, the
+/// block's row its k_bytes from byte k0 on (whole GGUF blocks), the rest of its row_sb super-blocks zero bytes.
 struct PackBlock {
   TileFormat fmt;
   int R;
@@ -68,6 +71,9 @@ struct PackBlock {
   int64_t tile0 = -1;    // (>= 0) the block's first tile in a column block: its tiles by index (see above)
   int pair = 0;          // (tile0) row tiles in pairs sharing their tail tile
   int64_t col_tiles = 0; // (tile0) tiles of a column block
+  size_t row_stride = 0; // (k_bytes) bytes of a tensor row
+  size_t k0 = 0;         // (k_bytes) the slice's first byte in a tensor row
+  size_t k_bytes = 0;    // (> 0) the slice's bytes (at most row_sb super-blocks)
 };
 
 struct PackOptions {
