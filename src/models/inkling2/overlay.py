@@ -746,39 +746,33 @@ class InklingOverlay(AttentionOverlay):
         return sum(nv * (2 if BLOCK_FLAGS.get(b.name) == B_F32 else 1) for b, nv in zip(r.blocks, mp.valid_rows(r)))
 
     def _attention(self, seq: Sequence, st: StepPlan, L: int, weights: list[tuple[int, str]]) -> None:
-        """Visit L's attention, per sub-step (each after the last one's records are in DDR): per column the raw ring, its
-        range of the cache and the tail objects (A; the range and tails patched per step), the sub-step's q and raw K / V
-        objects and its E objects (X; their window and count patched per step: ``_set_parts``), the raw ring back, the
-        records (D, patched) and o into o's input (D). The weights of the GEMV phases after it go before the sync of its
-        inputs (``AttentionOverlay._attention``)."""
+        """Visit L's attention, per sub-step (each after the last one's records are in DDR, the first after the q and raw
+        K / V objects): per column the sub-step's q and raw K / V objects and its E objects (X; their window and count
+        patched per step: ``_set_parts``), the raw ring, its range of the cache and the tail objects (A; the range and
+        tails patched per step), the raw ring back, the records (D, patched) and o into o's input (D), then the weights of
+        the GEMV phases after it. The drains go before those weights: the attention core holds the raw ring while it
+        sends it back, and a range of more cache objects than the A stream's memtile FIFO holds completes its fill only as
+        the cores take them, so a host wait on A (the weights' task waits for a BD) must find the cores' outputs drained
+        (a step from position 192 on, 14 A objects a sub-step against 11, deadlocked otherwise)."""
         dev, T = self.dev, self.T
         use = self.uses[L]
         kind = self.kinds[use.kind]
         subs = self._kind_subs(st.subs, use.kind)
         sp, nq = packed_slots(st.S), self.q_heads * kind.hd
-        before = self.a_bds > 3
         rel = self.rel[self.layer(L)]
         efills = st.__dict__.setdefault("efills", [])
         for u, (a, n) in enumerate(subs):
-            if u:
-                seq.sync()  # (sub-step u - 1's records and raw ring in DDR: this one reads them)
+            seq.sync()  # (sub-step u - 1's records and raw ring in DDR, or the q and raw K / V objects)
+            for c in range(COLS):
+                reg = self.att_reg[(L, c)] + a * XB
+                seq.fill("X", c, dev.address("ACT", reg), 2 * n * XB, (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
+                efills.append((seq.fill("X", c, dev.address("ACT", rel), XB, (64, E_ROWS, 640, 32)), L, u))
             for c in range(COLS):
                 seq.fill("A", c, dev.address("KV", self.raw_ring(L, c)), RING)
                 st.fills += [Fill(seq.fill("A", c, dev.address("KV", self.kv_off[L]), T), L, c, u, f)
                              for f in range(2 if kind.wrap else 1)]
                 st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t)
                              for t in range(tails(n))]
-            last = u == len(subs) - 1 and weights
-            if last and before:
-                self._weight_run(seq, weights, blocks=slice(1))
-            if u == 0:
-                seq.sync()  # (the q and raw K / V objects in DDR)
-            for c in range(COLS):
-                reg = self.att_reg[(L, c)] + a * XB
-                seq.fill("X", c, dev.address("ACT", reg), 2 * n * XB, (XB // 8, 2 * n, XB // 8, SLOTS * XB // 4))
-                efills.append((seq.fill("X", c, dev.address("ACT", rel), XB, (64, E_ROWS, 640, 32)), L, u))
-            if last:
-                self._weight_run(seq, weights, blocks=slice(1, None) if before else slice(None))
             o = self.inp[(L, "o")][0]
             for c in range(COLS):
                 seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)
@@ -786,6 +780,8 @@ class InklingOverlay(AttentionOverlay):
                     st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[L]), 2 * self.at.d_len), L, c, u, i))
                 at = dev.address("ACT", o.off + o.x0 + 2 * sp * nq * c + 16 * a)
                 seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
+            if u == len(subs) - 1 and weights:
+                self._weight_run(seq, weights)
 
     def _set_parts(self, st: StepPlan, parts: tuple[Part, ...], ahead: bool = False) -> bool:
         """(and the E objects: per visit and sub-step those of its range's last INK_EG groups, ``decode.attn``'s

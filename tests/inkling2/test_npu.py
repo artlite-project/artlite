@@ -4,7 +4,9 @@
   ``tests/goldens/text.py``): KL of the next-token distributions and argmax agreement against its decode (ubatch 1),
   next to its own prompt run against it (its graphs differ: Q8_0 activations, and the routing of near-tied experts);
 - a checkpoint: the steps after a restore give the logits they gave before it, bit for bit (the convs' state and the
-  sliding-window caches back with it).
+  sliding-window caches back with it);
+- steps of S tokens against steps of one, a rollback of rejected drafts, greedy text with the context's drafts: bit for
+  bit, the same text.
 """
 
 import numpy as np
@@ -13,6 +15,7 @@ import torch
 
 from artlite.model_config import inkling_gguf
 from models.inkling2.inkling import Inkling
+from models.sampling import Sampling
 
 from ..common import essay
 from ..goldens.text import golden
@@ -64,3 +67,59 @@ def test_checkpoint() -> None:
     model.reset()
     model.prompt(tokens[:37])
     assert np.array_equal(np.asarray(model.step(tokens[37]), np.float32), first[0])
+
+
+def test_steps_of_s() -> None:
+    """Steps of S = 2, 3, 4 tokens give every position the logits steps of one give, bit for bit (positions 0 .. 79:
+    across the first cache group, the history windows and the raw rings at every offset)."""
+    path = _path()
+    tokens = llama_tokenize(path, essay("founders.txt"))[:80]
+    model = Inkling(path).load(capacity=1024)
+    one = model.forced_logits(tokens, batch=1)
+    for S in (2, 3, 4):
+        got = model.forced_logits(tokens, batch=S)
+        bad = np.flatnonzero((got != one).any(-1))
+        assert not bad.size, (S, bad[:8])
+
+
+def test_rollback() -> None:
+    """A step of a token and drafts that are rejected, then the steps after the kept tokens (``SpeculativeMixin``'s
+    round: the position back to after them), give the logits the steps that never ran the drafts give, bit for bit: the
+    raw rings, the history windows' offset and the open records follow the position."""
+    path = _path()
+    tokens = llama_tokenize(path, essay("founders.txt"))[:48]
+    model = Inkling(path).load(capacity=1024)
+    want = model.forced_logits(tokens, batch=1)
+    model.reset()
+    model.prompt(tokens[:20])
+    got = []
+    i = 20
+    for keep, wrong in ((1, [7, 8, 9]), (2, [11, 12]), (3, [13]), (1, []), (4, [])):
+        run = tokens[i:i + keep] + wrong
+        rows = model.cap(np.asarray(model.steps(run)))
+        got += list(rows[:keep])
+        model.position = i + keep  # (as ``SpeculativeMixin._kept``: the rejected drafts' positions forgotten)
+        i += keep
+    while i < len(tokens):
+        got.append(model.cap(np.asarray(model.steps([tokens[i]])))[0])
+        i += 1
+    got = np.stack(got)
+    bad = np.flatnonzero((got != want[20:]).any(-1))
+    assert not bad.size, bad[:8]
+
+
+def test_drafts() -> None:
+    """Greedy text with the context's drafts is the text without them, and the drafts are kept: an essay's first 300
+    tokens, then its first 100 again (the model goes on repeating it, as the drafts guess)."""
+    path = _path()
+    tokens = llama_tokenize(path, essay("founders.txt"))[:300]
+    prompt = tokens + tokens[:100]
+    model = Inkling(path).load(capacity=1024)
+    texts = []
+    for drafts in (0, 3):
+        model.reset()
+        logits = model.prompt(prompt, logits=True)
+        model.lookup = drafts > 0
+        texts.append(list(model.generate(logits, 64, Sampling(greedy=True), prompt, drafts=drafts)))
+    assert texts[0] == texts[1]
+    assert model.accepted_ctx > 0.5 * model.drafted_ctx > 0, (model.drafted_ctx, model.accepted_ctx)
