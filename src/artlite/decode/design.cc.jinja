@@ -356,13 +356,17 @@ __attribute__((noinline, minsize)) void {{ p }}_hcoef(const float *__restrict ps
 
 // The helper, an fp32 state object (``states``: ``protocol.F_STATES``): state b's part of a k range (1024 fp32: [k block
 // 128 / sp][slot sp][8]) times the slots' coefficients c (fp32 [slot 4]; nullptr: 1) into acc (first: stored, else
-// added; the main core's res region, idle in these phases): x = c_hi s_hi + c_hi s_lo + c_lo s_hi (~2^-16)
+// added; the main core's res region, idle in these phases): x = c_hi s_hi + c_hi s_lo + c_lo s_hi (~2^-16){{ "; its first nf
+// floats (a range past the input's end: what is left)" if qtails else "" }}
 __attribute__((noinline)) void {{ p }}_hsacc(const float *__restrict x, const float *__restrict c, float *__restrict acc,
-                                             int first, int sp)
+                                             int first, int sp{{ ", int nf" if qtails else "" }})
 {
+{% if not qtails %}
+    constexpr int nf = 1024;
+{% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
     if (!c && first) {  // (one state, coefficient 1: its values as they are)
-        {{ p }}_cv((int32_t *)acc, (const int32_t *)x, 1024 / 16);
+        {{ p }}_cv((int32_t *)acc, (const int32_t *)x, nf / 16);
         return;
     }
     alignas(64) float cl[32];
@@ -371,7 +375,7 @@ __attribute__((noinline)) void {{ p }}_hsacc(const float *__restrict x, const fl
     aie::vector<bfloat16, 32> ch, cw;
     al::split2<32>(aie::load_v<32>(cl), ch, cw);
     AIE_PREPARE_FOR_POSTPIPELINING
-    for (int i = 0; i < 1024; i += 32) {
+    for (int i = 0; i < nf; i += 32) {
         aie::vector<bfloat16, 32> h, l;
         al::split2<32>(aie::load_v<32>(x + i), h, l);
         aie::accum<accfloat, 32> a = first ? aie::zeros<accfloat, 32>() : aie::accum<accfloat, 32>(aie::load_v<32>(acc + i));
@@ -662,6 +666,15 @@ __attribute__((noinline)) void {{ p }}_hinput(uint8_t *__restrict xs, const floa
     for (int s = 0; s < nsb + nh; s++)  // (super-block s: chunk s / {{ gv.NSB }})
         {{ p }}_xs_sb(t + {{ 16 * SLOTS }} * (s < nsb ? s : s - nh), xs + {{ gv.XS_CHUNK }} * (s >> {{ gv.NSB.bit_length() - 1 }}),
                       s & {{ gv.NSB - 1 }});
+{% elif qtails %}
+    // (an input that ends a tail of q super-blocks into its last chunk, ``decode.image.Region.qt``: the tail repeated
+    // through the chunk, the tail tiles' row groups)
+    const int q = nsb & {{ gv.NSB - 1 }}, n = q ? (nsb | {{ gv.NSB - 1 }}) + 1 : nsb;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < n; s++) {  // (super-block s: chunk s / {{ gv.NSB }})
+        const int j = s & {{ gv.NSB - 1 }};
+        {{ p }}_xs_sb(t + {{ 16 * SLOTS }} * (s < nsb ? s : s - j + (j & (q - 1))), xs + {{ gv.XS_CHUNK }} * (s >> {{ gv.NSB.bit_length() - 1 }}), j);
+    }
 {% else %}
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < nsb; s++)  // (super-block s: chunk s / {{ gv.NSB }})
@@ -898,7 +911,7 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
 {% elif act == "situ" %}
     if (flags & {{ F_GU }}) {  // (situ: gate yt's g 0, up g 1 of each 16 rows{{ ": the ng windows completed" if gwin else "; nf 0: one tile's, the windows' ``guwin``" }})
         AIE_LOOP_NO_UNROLL
-        for (int h = 0; h < {{ "64 * ng" if gwin else ("(nf ? nf : 64)" if rg else YT) }}; h += 64) {
+        for (int h = 0; h < {{ "64 * ng" if gwin else (("nf" if qtails else "(nf ? nf : 64)") if rg else YT) }}; h += 64) {
 {% if "situ" not in ablate %}
             {{ ksitu }}(yt + h, yt + h + 32, WS(int32_t, {{ w_.st }})[{{ S_NS }}] > 2 ? 32 : 16);  // (slots 0, 1; 2, 3 where the step has them)
 {% endif %}
@@ -998,10 +1011,12 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
 {% if moe %}
     if (fw & {{ B_PAIR }}) {  // (rows [hi, lo] of nv / 2 values: their sums, fp32 as two bf16 slots each)
         const aie::vector<float, 8> pv = aie::add(aie::filter_even(y, 1), aie::filter_odd(y, 1));
+{% if keep_sg %}
         if (fw & {{ B_KEEP }}) {
             WS(float, {{ w_.st }})[{{ S_SG }} + s] = pv[0];
             return 0;
         }
+{% endif %}
         {{ p }}_put_bf16(WS(bfloat16, {{ w_.stg }}) + {{ 2 * C_LEN }} * s + n, pv.template cast_to<bfloat16>(), nv);
         return nv;
     }
@@ -1009,10 +1024,19 @@ __attribute__((noinline)) int {{ p }}_slot(int32_t *__restrict ws, int s, int fl
         bfloat16 *__restrict ph = WS(bfloat16, {{ w_.hold }}) + 32 * (n >> 3) + 8 * s;
         const aie::vector<bfloat16, 8> o = aie::accum<accfloat, 16>(y).template to_vector<bfloat16>().template extract<8>(0);
         aie::store_v(ph, o);
+{% if qtails %}
+        if (n < 128) {  // (copies at 128, 256, 384: the 128-channel unit's [h h h h], B_G8 downs; a 512-unit's rows on
+            // overwrite them)
+            aie::store_v(ph + {{ 32 * 16 }}, o);
+            aie::store_v(ph + {{ 32 * 32 }}, o);
+            aie::store_v(ph + {{ 32 * 48 }}, o);
+        }
+{% else %}
 {% if units %}
         if (n < 256)
 {% endif %}
         aie::store_v(ph + {{ 32 * (OBJ_K // 16) }}, o);
+{% endif %}
         return nv;
     }
 {% if not wide %}
@@ -1590,6 +1614,9 @@ __attribute__((noinline, minsize)) void {{ p }}_post(const bfloat16 *x, const ui
         cmd[{{ C_CSET }}] = st[{{ S_CSET }}];
         cmd[{{ C_XC0 }}] = {{ "st[%d]" % S_XC0 if moe else "0" }};
         cmd[{{ C_ACC }}] = (int32_t)(uintptr_t)WS(float, {{ w_.res }}) + ({{ SHM }});
+{% if qtails %}
+        cmd[{{ C_NG }}] = st[{{ S_K8 }}] >> 4;  // (its 128-k groups)
+{% endif %}
         cmd[{{ C_KIND }}] = {{ K_SSTRIP }};
         return;
     }
@@ -1802,7 +1829,7 @@ void {{ p }}_tile(uint8_t *__restrict a, int32_t *__restrict ws, uint8_t *__rest
     }
 {% endif %}
     {{ p }}_Win<1> w_;
-    {{ mp }}_mmv<0>(a, xp + {{ gv.XPHC if xh else gv.XP_CHUNK }} * kc, xs + {{ gv.XS_CHUNK }} * kc, WS(float, {{ w_.yt }}),
+    {{ mp }}_mmv<0>(a, xp + {{ gv.XPHC if xh else gv.XP_CHUNK }} * kc, xs + {{ gv.XS_CHUNK }} * kc, WS(float, {{ w_.yt }}){{ " + st[%d]" % S_QY if qtails else "" }},
                     WS(uint8_t, {{ w_.scr }}), st[{{ S_FMT }}]);
 }
 
@@ -1869,7 +1896,20 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     if (st[{{ S_FLAGS }}] & {{ F_BLEND }})  // (a blend's object: no rows; its outputs ``cmd``'s)
         return;
 {% endif %}
-{% if moe %}
+{% if qtails %}
+    // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks, or its group's; else its
+    // partial sums of our block, at yt + S_QY: a B_QT group's row tile's. Added: a group's blocks hold its row tiles' sums
+    // of their chunks before the tail tile's)
+    const int fm = st[{{ S_FMT }}], qy = st[{{ S_QY }}];
+    {
+        const int gh = (fm & {{ B_G8 }}) ? {{ 4 * YB }} : ((fm & {{ B_G4 }}) ? {{ 2 * YB }} : ((fm & {{ B_G2 }}) ? {{ YB }} : 0));
+        float *__restrict yd = yt + (gh ? gh : qy);  // (B_G8: its 4 half super-blocks' blocks after ours)
+        const int nf = gh ? gh : {{ YB }};
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < nf; i += 32)
+            aie::store_v(yd + i, aie::add(aie::load_v<32>(yd + i), aie::load_v<32>(r + i)));
+    }
+{% elif moe %}
     const int fm = st[{{ S_FMT }}];
     if (fm & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
         al::copy<{{ 2 * YB }}, 32>(yt + {{ 2 * YB }}, r);
@@ -1922,6 +1962,22 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     }
 {% else %}
     const int kc = st[{{ S_KC }}];
+{% if qtails %}
+    const int qm = st[{{ S_QM }}], qs = st[{{ S_QS }}];
+    if (qs < qm) {  // (a B_QT group's row tile qs: its chunks, then the next one's; after the last, the group's tail tile:
+        // the last chunk, as row groups)
+        if (kc + 1 < st[{{ S_G }}] - 1) {
+            st[{{ S_KC }}] = kc + 1;
+            return;
+        }
+        const int last = qs + 1 == qm;
+        st[{{ S_QS }}] = qs + 1;
+        st[{{ S_QY }}] = last ? 0 : qy + {{ YB }};
+        st[{{ S_KC }}] = last ? st[{{ S_G }}] - 1 : st[{{ S_XC0 }}];
+        st[{{ S_FMT }}] = last ? fm | {{ B_G4 }} : fm;
+        return;
+    }
+{% endif %}
     if (kc + 1 < st[{{ S_G }}]) {
         st[{{ S_KC }}] = kc + 1;
         return;
@@ -1941,7 +1997,19 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
 {% if tail_pairs %}
     {{ p }}_pplace(st, bn, nrt);
 {% endif %}
-{% if rg %}
+{% if qtails %}
+    const int nfw = st[{{ S_B }} + 3 * bn + 1];
+    st[{{ S_FMT }}] = nfw & {{ 255 + B_G2 + B_G4 + B_G8 }};
+    // (a tile's outputs: G R rows; a B_QT group's: its row tiles', the groups 4 R rows apart; the next group's row tiles)
+    const int G = qm ? qm : ((fw & {{ B_G8 }}) ? 8 : ((fw & {{ B_G4 }}) ? 4 : ((fw & {{ B_G2 }}) ? 2 : 1)));
+    const int r0 = (rt - rt0) * R * (qm ? 4 : G);
+    st[{{ S_QM }}] = (nfw & {{ B_QT }}) ? (nrt + 1 < st[{{ S_B }} + 3 * bn] ? 4 : ((nfw >> {{ B_QM }}) & 3) + 1) : 0;
+    st[{{ S_QS }}] = 0;
+    st[{{ S_QY }}] = 0;
+    int nv = st[{{ S_B }} + 3 * b + 2] - r0;
+    if (nv > R * G)
+        nv = R * G;
+{% elif rg %}
     st[{{ S_FMT }}] = st[{{ S_B }} + 3 * bn + 1] & {{ 255 + B_G2 + B_G4 }};
     const int G = (fw & {{ B_G4 }}) ? 4 : ((fw & {{ B_G2 }}) ? 2 : 1);  // (a tile's outputs: G R rows)
     const int r0 = (rt - rt0) * R * G;
@@ -1991,6 +2059,15 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     {{ p }}_rows(ws, flags & ~{{ F_GU }}, {{ YB }} * G);
     const int nw = gu ? {{ p }}_guwin(ws, S, R) : 0;  // (gate / up: 8 outputs once the window completes, else none)
 {% else %}
+{% if qtails %}
+    // (a B_QT group's gate / up rows: [8 gate | 8 up] windows of its row tiles, 16 rows each, or of pairs of 8-row ones:
+    // the second's rows as the first's rows 8 .. 15)
+    if (gu && R < 16) {
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < G; j += 2)
+            {{ p }}_cv((int32_t *)(yt + {{ YB }} * j + {{ YB // 2 }}), (const int32_t *)(yt + {{ YB }} * (j + 1)), {{ YB * 2 // 64 }});
+    }
+{% endif %}
     {{ p }}_rows(ws, flags | gu, {{ YB }} * G);
 {% endif %}
 {% if not wide %}
@@ -2000,8 +2077,12 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
         int a = 0;
         float *__restrict as = (float *)((uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * s;
         AIE_LOOP_NO_UNROLL
-        for (int j = 0; j < G; j++) {  // (a gate / up tile: one row group)
+        for (int j = 0; j < G; j++) {  // (a gate / up tile: one row group{{ "; a B_QT group's of 8-row tiles: their pairs'" if qtails else "" }})
+{% if qtails and not gu_win %}
+            const int k = gu ? (R < 16 && (j & 1) ? 0 : 8) : (nv - R * j > R ? R : nv - R * j);
+{% else %}
             const int k = gu ? {{ "nw" if gu_win else 8 }} : (nv - R * j > R ? R : nv - R * j);
+{% endif %}
             if (k > 0)
                 a += {{ p }}_slot(ws, s, flags, fw, k, row0 + r0 + R * j, n + a, j, as);
         }
@@ -2803,7 +2884,12 @@ __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restric
     st[{{ S_NB }}] = m[{{ M_NB }}];
     for (int i = 0; i < {{ 3 * NBLK }}; i++)
         st[{{ S_B }} + i] = m[{{ M_B }} + i];
-    st[{{ S_FMT }}] = m[{{ M_B + 1 }}] & {{ 255 + B_G2 + B_G4 if rg else 255 }};  // (the first row tile's)
+    st[{{ S_FMT }}] = m[{{ M_B + 1 }}] & {{ (255 + B_G2 + B_G4 + (B_G8 if qtails else 0)) if rg else 255 }};  // (the first row tile's)
+{% if qtails %}
+    st[{{ S_QM }}] = (m[{{ M_B + 1 }}] & {{ B_QT }}) ? (m[{{ M_B }}] > 1 ? 4 : ((m[{{ M_B + 1 }}] >> {{ B_QM }}) & 3) + 1) : 0;
+    st[{{ S_QS }}] = 0;
+    st[{{ S_QY }}] = 0;
+{% endif %}
 {% if tail_pairs %}
     st[{{ S_PT }}] = (m[{{ M_B + 1 }}] & {{ B_PT }}) && m[{{ M_B }}] > 1;  // (the first row tile: a pair's first)
 {% endif %}
@@ -3062,10 +3148,16 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
             aie::store_v(sq, aie::zeros<float, 32>());
         float *acc = (float *)(uintptr_t)cmd[{{ C_ACC }}];
         const int cs = cmd[{{ C_CSET }}];  // (the coefficient set; -1: one state of coefficient 1)
+{% if qtails %}
+        const int ng = cmd[{{ C_NG }}] - n * rg, nn = ng < n ? ng : n;  // (the range's groups: the last range's what is left)
+        {{ p }}_hsacc((const float *)(uintptr_t)cmd[0], cs < 0 ? nullptr : sq + 32 + 32 * cs + 4 * b, acc, b == 0, sp, 128 * sp * nn);
+{% else %}
+        const int nn = n;
         {{ p }}_hsacc((const float *)(uintptr_t)cmd[0], cs < 0 ? nullptr : sq + 32 + 32 * cs + 4 * b, acc, b == 0, sp);
-        if (b == nr - 1) {  // (the range's sum: its panels, n 128-k groups)
+{% endif %}
+        if (b == nr - 1) {  // (the range's sum: its panels, nn 128-k groups)
             {{ p }}_hspan(acc, cmd[1] ? (const bfloat16 *)(uintptr_t)cmd[1] : (const bfloat16 *){{ p }}_ones, cmd[1] ? 16 : 0, sq, xp, (float *)scr,
-                          n * rg, n, sp, cmd[{{ C_XC0 }}]);
+                          n * rg, nn, sp, cmd[{{ C_XC0 }}]);
         }
         return;
     }
@@ -3157,6 +3249,17 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         // half of the chunk too, ``hinput``)
         const int c = cmd[2] >> {{ 5 + gv.NSB.bit_length() - 1 }};
         {{ p }}_cv((int32_t *)(xp + {{ gv.XPH }} + {{ gv.XPHC }} * c), (const int32_t *)(xp + {{ gv.XPHC }} * c), {{ gv.XPHC // 64 }});
+    }
+{% elif qtails %}
+    if (const int q = cmd[2] >> 5 & {{ gv.NSB - 1 }}) {  // (a tail of q super-blocks at the end, ``Region.qt``: its x panels
+        // repeated through the chunk, ``hinput``; the phase's first chunk 0: a states phase's)
+        uint8_t *__restrict xc = xp + {{ gv.XPHC }} * (cmd[2] >> {{ 5 + gv.NSB.bit_length() - 1 }});
+        AIE_LOOP_NO_UNROLL
+        for (int j = q; j < {{ gv.NSB }}; j++) {
+            const int i = j & (q - 1);
+            {{ p }}_cv((int32_t *)(xc + {{ gv.XPH }} * (j >> 1) + {{ 32 * gv.PANEL }} * (j & 1)),
+                       (const int32_t *)(xc + {{ gv.XPH }} * (i >> 1) + {{ 32 * gv.PANEL }} * (i & 1)), {{ 32 * gv.PANEL // 64 }});
+        }
     }
 {% endif %}
     {{ p }}_hinput((uint8_t *)(uintptr_t)cmd[0], (const float *)scr, sq, r, cmd[2] >> 5, cmd[1]{{ ", __builtin_bit_cast(float, cmd[3])" if post else "" }});

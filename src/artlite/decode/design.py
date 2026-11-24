@@ -300,7 +300,7 @@ class DecodeOverlayOperator(ArtcOperator):
                  a_bcast: tuple[tuple[int, int], ...] = (), pairs: bool = False, split: bool = False,
                  tails: bool = False, tail_pairs: bool = False, gating: str = "softmax", shared_gate: bool = True,
                  rot: bool = False, norm_objs: bool = True, rg: bool = False, states: bool = False, units: int = 0,
-                 situ: tuple[float, float] = (4.0, 25.0)):
+                 situ: tuple[float, float] = (4.0, 25.0), qtails: bool = False):
         """act: the gate/up activation ("silu", "gelu": its tanh form, "gelu_erf"; "situ": Inkling's experts' b tanh(g / b)
         sigmoid(g) lb tanh(u / lb), (b, lb) = ``situ``: ``kmath.situ``); post: post-norm residual updates (F_POST, F_VOUT); pli: the
         F_PLI epilogue (gelu(y) times per-layer inputs); packed: the phases' inputs hold the step's slots only
@@ -328,7 +328,10 @@ class DecodeOverlayOperator(ArtcOperator):
         has them); states: phases whose input is fp32 states (``protocol.F_STATES``: Inkling's; the helper mixes a k
         range's states into the main core's res, ``hsacc``, then builds its panels, ``hspan``; packed designs of 4 slots,
         inputs of at most one norm-weight object); units: (moe) an expert's units of the routing instead of halves
-        (``moe.route.render(units=)``: Inkling's; the gate / up sub-phases scaled by the item's gscale, F_WS)."""
+        (``moe.route.render(units=)``: Inkling's; the gate / up sub-phases scaled by the item's gscale, F_WS); qtails:
+        phases of ``decode.image.Region.qt`` regions (B_QT blocks: row tiles in tail-last groups sharing a tail tile, run
+        as row groups; their input's last chunk the tail's super-blocks repeated, ``hinput``; a states design's, row-group
+        tiles of every format)."""
         assert slots in (4, 8) and (slots == 4 or not (post or pli or tok or moe)), slots
         assert not rot or (post or hidden // COLS % ROT_GROUP == 0), \
             "rotated inputs: residual slices of whole rotation groups (a post design's: R phases)"
@@ -351,7 +354,10 @@ class DecodeOverlayOperator(ArtcOperator):
         self.nx_per_norm = NORM_K // self.obj_k  # (input objects per norm-weight object)
         self.chunk = gemv.Chunk(nsb, slots)
         self.moe = moe is not None
-        self.rg = rg or self.moe  # (row-group tiles)
+        assert not qtails or (states and not gu_win), \
+            "qtails: states designs (the longer state: QT_STATE); a tail group's gate / up rows are whole windows"
+        self.qtails = qtails
+        self.rg = rg or self.moe or qtails  # (row-group tiles; qtails: a group's tail tile, its yt blocks)
         self.pairs = pairs
         self.experts, self.top = moe or (0, 0)
         assert max_k % self.chunk.k == 0 and max_k <= MAX_K
@@ -398,6 +404,8 @@ class DecodeOverlayOperator(ArtcOperator):
             assert self.moe or not self.wide, "row groups: tiles of 16 rows at most (an MoE design's: windows)"
             self.yb = 128 if self.wide else 64
             self.yt, self.yn = 4 * self.yb, 2 * self.yb
+            if qtails:  # (B_G8 tiles: 8 row groups, the helper's 4)
+                self.yt, self.yn = 8 * self.yb, 4 * self.yb
             self.gu_win = self.gu_win or self.yb == 128
         if self.moe:
             self.PACKET, self.BD_COUNT = {"X": XID}, {"A": 3}  # (shim BD 3: the experts' tasks, ``moe``)
@@ -541,7 +549,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
                           pg=self._page_spec() if self.paged else None, rg=self.rg, yb=self.yb, slots=self.slots,
-                          tab=self.tab)
+                          tab=self.tab, rg_all=self.qtails)
         src += self._extra_src(p)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
               "XS_SLOT": gemv.xs_slot(self.slots),
@@ -561,7 +569,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                            if gemv.helper_y(f, self.chunk.nsb)],
                                  YT=self.yt, YB=self.yb, YN=self.yn, act=self.act, post=self.post, pli=self.pli, tok=self.tok,
                                  gu_win=self.gu_win, split=self.split, split_rows=SPLIT_ROWS, POST_K=POST_K, xh=self.xh,
-                                 tails=self.tails, tail_pairs=self.tail_pairs,
+                                 tails=self.tails, tail_pairs=self.tail_pairs, qtails=self.qtails,
+                                 keep_sg=self.shared_gate or not self.qtails,  # (B_KEEP: a shared expert's gate)
                                  COLS=COLS, paged=bool(self.paged),
                                  packed=self.packed, MAX_K=MAX_K, ablate=self.ablate, ACT8=self.act8_addresses(),
                                  moe=self.moe, pairs=self.pairs, gate=self.gate, help_flag=self.help_flag, help_word=self.help_word,

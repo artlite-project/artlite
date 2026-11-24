@@ -5,7 +5,7 @@ Qwen3.8-27B-PARO's (int4: gate and up as two GEMMs; int5) and Gemma 4 E4B PARO's
 inputs, the 27B's also with its base model's DFlash2 drafter; Qwen3.6-35B-A3B (and its PARO checkpoint) also with its
 MTP drafter file, the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots
 with its MTP block and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark
-drafter), the vision overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py``
+drafter; Inkling 2's whole step), the vision overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py``
 builds them, ``schedule_ledger.py`` reads their builds."""
 
 import os
@@ -21,6 +21,7 @@ from artlite.model_config import (
     checkpoint,
     flint_gguf,
     gemma_gguf,
+    inkling_gguf,
     lfm3_gguf,
     llama_gguf,
     occamy_gguf,
@@ -169,6 +170,14 @@ def _spark(path: str) -> AppBuild:
     return _built([ov.op, pf.lib], pf, ov)
 
 
+def _inkling(path: str) -> AppBuild:
+    """Inkling 2's whole step (prompts as decode steps: no prefill)."""
+    from models.inkling2.overlay import InklingOverlay
+
+    ov = InklingOverlay(GGUFFile(path), max_positions=4096)
+    return _built([ov.op], None, ov)
+
+
 def _sd15(path: str) -> AppBuild:
     from artlite.vision.design import VisionDesign
     from artlite.vision.device import role_pages
@@ -209,5 +218,6 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "lfm3-Q4_K_M": (lfm3_gguf("Q4_K_M"), _lfm),
     "spark-4B-Q4_K_M": (spark_gguf("4B", "Q4_K_M"), _spark),
     "flint-int4": (flint_gguf(), _flint),
+    "inkling2-UD-Q4_K_XL": (inkling_gguf(), _inkling),
     "sd15": (sd15_dir(), _sd15),
 }

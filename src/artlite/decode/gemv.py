@@ -43,7 +43,7 @@ from ..formats import FORMATS, kernel_template, slot
 from ..formats import SLOTS as FORMAT_SLOTS
 from ..formats.common import MMV_SLOTS
 from ..operators import paging, templating
-from .protocol import B_G4
+from .protocol import B_G4, B_G8
 
 SLOTS = MMV_SLOTS  # token slots of an x panel (designs of 8: ``render(slots=8)``)
 KB = 8  # k per block
@@ -68,6 +68,8 @@ def scr_bytes(slots: int = SLOTS) -> int:
 SCR_BYTES = 8192  # a core's scratch: transposed codes, tables, partial sums
 RG_FORMATS = ("Q4_0", "Q4_K", "Q6_K", "Q3_K", "IQ3_XXS", "Q8_0", "Q4_1_64", "P4_128", "NVFP4")  # (``render(rg=)``) the formats of
 # row-group tiles
+RG_ALL = ("BFP16", "Q8_0H")  # (``render(rg_all=)``) and these, in a design whose every format's tiles may be row groups
+G8_FORMATS = ("NVFP4", "Q8_0")  # (``render(rg_all=)``) the formats of B_G8 tiles (an expert unit's down of K 128)
 NZ_FORMATS = ("Q4_0", "Q4_1", "Q4_1_64", "Q4_K", "Q5_K", "Q6_K", "P4_128", "P5_128")  # the formats whose kernels read the -z e_i panels (``_nz``)
 
 
@@ -127,13 +129,15 @@ def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str,
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
            pg: paging.PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS,
-           tab: tuple[tuple[int, int], tuple[int, int]] | None = None) -> str:
+           tab: tuple[tuple[int, int], tuple[int, int]] | None = None, rg_all: bool = False) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
     are code pages (``pg``: their pager), in page-id order (from 1). ``rg``: the format word's B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``decode.image.Block.G``) put super-block 2 H + 1's rows
-    ``yb`` floats after 2 H's instead of adding them. ``slots``: the design's token slots (module docstring). ``tab``: the
-    gather tables' two copies per core half (default ``formats.TAB``)."""
+    ``yb`` floats after 2 H's instead of adding them; ``rg_all``: and those of ``RG_ALL`` (a design whose every format's
+    tiles may be row groups: the tail tiles of ``decode.image.Region.qt`` regions), and B_G8 tiles of ``G8_FORMATS`` (row
+    groups of half super-blocks: each super-block's halves rows of their own, ``yb`` apart: ys -yb). ``slots``: the design's token slots
+    (module docstring). ``tab``: the gather tables' two copies per core half (default ``formats.TAB``)."""
     assert all(supported(f, nsb, slots) for f in fmts), (fmts, nsb, slots)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
     assert not rg or (nsb == 4 and slots == 4), (rg, nsb, slots)
@@ -156,8 +160,8 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
                             keep=bool(paged) and (set(paged) == set(fmts) or "Q6_KH" in paged),
                             keep_nz=bool(nz) and set(nz) <= set(paged),
-                            rg=rg,
-                            rg_fmts=RG_FORMATS if rg else (), B_G4=B_G4, yb=yb,
+                            rg=rg, rg_all=rg_all,
+                            rg_fmts=(RG_FORMATS + (RG_ALL if rg_all else ())) if rg else (), B_G4=B_G4, B_G8=B_G8, yb=yb,
                             rowsplit=any(row_split(f, nsb) for f in fmts),
                             fid={f: FORMATS[f].fid for f in FORMATS}, fn={f: FORMATS[f].mmv for f in FORMATS}, NSB=nsb,
                             PANEL=PANEL, XS_SLOT=xs_slot(slots), slots=slots, L=8 * slots, **var)

@@ -154,6 +154,14 @@ B_SPLIT = PHASE.flag("B_SPLIT", 14, of="format")
 # chunks; an odd block's last row tile as a plain one
 B_PT = PHASE.flag("B_PT", 15, of="format")
 B_FMT2, B_NA, B_NB = 16, 24, 28  # (a split block's second format, its gate and up tiles per group: their bits' shifts)
+# (``qtails`` designs) its row tiles in tail-last groups (``decode.image.Region.qt``): a group of up to 4 row tiles (one of
+# the phase's M_NRT: its rows 4 R) is their full chunks (M_G - 1 each), then their tail tile (row groups: B_G4, super-block j
+# row tile j's tail); the block's last group's row tiles less one at B_QM (2 bits)
+B_QT = PHASE.flag("B_QT", 16, of="format")
+B_QM = 24
+# (``qtails`` designs) its tiles hold row groups of 8 rows of half a super-block each (``decode.image.Block.G`` 8: an
+# expert unit's down of K 128)
+B_G8 = PHASE.flag("B_G8", 17, of="format")
 
 # (``states`` designs: Inkling's, ``models.inkling2``) a phase whose input is fp32 states: per k range of 1024 / sp k
 # (sp: the step's packed slots) M_NR objects, one per state b < M_NR, its range [k block][slot sp][8] fp32 (the state
@@ -267,6 +275,12 @@ S_NEGRP, S_NEGA, S_NETL = STATES_STATE.words("S_NEGRP S_NEGA S_NETL", at=S_WORDS
 S_NINK = STATES_STATE.word("S_NINK", at=S_WORDS + 3)
 S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NIQB S_INKN S_IX", at=S_WORDS + 5)
 S_BLEND = STATES_STATE.word("S_BLEND", at=S_WORDS + 14)  # (F_BLEND) M_BLEND
+# (``qtails`` designs, of the longer state: B_QT blocks) the row tile of its group (its rows at yt + S_QY: block S_QS of
+# the group's), the group's row tiles (0: a block of plain row tiles)
+QT_STATE = STATE.kind("qt", exclusive_with=(ROT_STATE,))
+S_QS = QT_STATE.word("S_QS", at=S_WORDS + 4)
+S_QM = QT_STATE.word("S_QM", at=S_WORDS + 9)
+S_QY = QT_STATE.word("S_QY", at=S_WORDS + 15)
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -295,6 +309,7 @@ C_INKN, C_NS = CMD.common.words("C_INKN C_NS")
 # M_BLEND)
 K_BLEND = CMD.common.values("K_BLEND", of="kind", start=18)[0]
 C_BLEND = CMD.common.word("C_BLEND")
+C_NG = CMD.common.word("C_NG")  # (``qtails``, K_SSTRIP) the phase's 128-k groups (its last range: what is left of them)
 
 # ----------------------------------------------------------------------
 # Streams, packets and pages
@@ -319,8 +334,8 @@ def consts(rpost: bool = False, states: bool = False) -> dict[str, int]:
     """The words, flags and values the decode design's kernels take (``DecodeOverlayOperator.get_kernel_src``; ``rpost``:
     a rotated post design's, RPOST's flags too; ``states``: INK's)."""
     return XMETA.consts(PHASE, TOKEN, MOE, *([RPOST] if rpost else []), *([INK, EGRP] if states else [])) | \
-        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE) | CMD.consts() | \
-        {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB}
+        STATE.consts(POST_STATE, TOK_STATE, MOE_STATE, ROT_STATE, STATES_STATE, QT_STATE) | CMD.consts() | \
+        {"B_FMT2": B_FMT2, "B_NA": B_NA, "B_NB": B_NB, "B_QM": B_QM}
 
 
 # ----------------------------------------------------------------------

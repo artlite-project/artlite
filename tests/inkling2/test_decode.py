@@ -66,8 +66,8 @@ def test_qkv_states(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     if (store := op.page_store()) is not None:  # (the formats' pages loadable: ``decode.model.ModelOverlay.load``)
         dev.set_prologue(op.page_prologue(store))
     sp = packed_slots(S)
-    K = img.region(0, "q").K  # (3072: the hidden padded to whole chunks)
-    state = K * sp * 4
+    state = -(-H * sp * 4 // XPAY) * XPAY  # (a state's bytes: the hidden's whole k ranges, ``protocol.F_STATES``)
+    K = state // (4 * sp)
     n_obj = state // XPAY
     phases = ("q", "k", "v")
     # (C objects per slot and column: the valid rows' outputs, a pair's sum as fp32 in two bf16 slots)
@@ -154,9 +154,9 @@ def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     if (store := op.page_store()) is not None:  # (the formats' pages loadable: ``decode.model.ModelOverlay.load``)
         dev.set_prologue(op.page_prologue(store))
     sp = packed_slots(S)
-    K = img.region(L, "q").K
     n, nr = 3, 4
-    ST = K * sp * 4  # (a state's bytes in the state array)
+    ST = -(-H * sp * 4 // XPAY) * XPAY  # (a state's bytes in the state array: the hidden's whole k ranges)
+    K = ST // (4 * sp)
     ranges = ST // XPAY
     phases = ("q", "k", "v")
     out_obj = {m: -(-sum(mp.valid_rows(img.region(L, m))) // C_LEN) for m in phases}

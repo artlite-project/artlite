@@ -70,6 +70,7 @@ def head_region(lm: Region, cols: int) -> Region:
     """The drafter head of an LM region: its first ``cols`` rows of each column, in place."""
     b = lm.block("lm")
     assert lm.kc_group == lm.n_kc, "a row tile's K chunks consecutive: the head's rows a prefix of each column"
+    assert not lm.qt, "row tiles of their own tail tiles"
     assert not b.pt or cols % (2 * b.R * b.G) == 0, "whole pairs of row tiles (their shared tail tiles)"
     return Region(-1, "lm", [Block(b.name, b.tensors, b.rows[:, :cols], b.fmt, b.R, b.G, pt=b.pt)], lm.n_kc, lm.kc_group,
                   lm.tile_bytes, lm.kc, offset=lm.offset, col_stride=lm.col_stride, half=lm.half)

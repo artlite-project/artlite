@@ -21,7 +21,9 @@ its tiles' columns past the matrix are zero super-blocks; an input of a fraction
 or 256) takes row groups instead (``Block.G``, ``group_rows``: G rows of K columns per tile row, no padding bytes). An
 input half a chunk short of whole chunks in one K group (the 4B Spark-X's hidden 2560) may be a ``Region.half`` region
 (``tails``): its phases' inputs of that K, the blocks the model pairs (``pairs``: those the prefill reads in pairs)
-without zero super-blocks (``Block.pt``).
+without zero super-blocks (``Block.pt``). With ``qtails`` every input that ends a tail of whole super-blocks into its last
+chunk in one K group (Inkling's hidden 2304: 2 chunks and a quarter) is a ``Region.qt`` region: its row tiles in
+tail-last groups that share a tail tile, no zero super-blocks but in a block's last group of fewer row tiles.
 The image starts and ends with ``PAD`` bytes: a GEMM reads a Q4_K header unit from 1 KB before a tile, and past a
 region's last tile.
 
@@ -147,7 +149,14 @@ class Region:
     order (the main core runs a tile's first super-blocks, the helper the others: 2 p's tail on the main core, 2 p + 1's
     on the helper, whose partial rows start 2 p + 1's sums, ``decode.design``); the prefill GEMMs read pass pairs of
     their even and odd row tiles (``gemm.geometry.GemmSpec.ptail``), the other blocks' tail tiles for their first half
-    (``Geometry.tail``). The 4B Q4_K_M's gate / up and LM head in pairs: a decode step streams 3.04 GB instead of 3.33."""
+    (``Geometry.tail``). The 4B Q4_K_M's gate / up and LM head in pairs: a decode step streams 3.04 GB instead of 3.33.
+
+    A ``qt`` region's input ends a tail of qt super-blocks into its last chunk (``K_in`` = (n_kc - 1) kc + 256 qt: Inkling's
+    hidden 2304, qt 1; one K group): every block's row tiles in groups of ``qg`` = nsb / qt (a block's last group: what
+    is left), a group's tiles its row tiles' full chunks (n_kc - 1 each, row tile after row tile), then its tail tile,
+    whose super-blocks j qt .. are the group's row tile j's tail (a group of fewer row tiles: zero super-blocks past
+    theirs). The decode runs the tail tile as row groups (B_G4: each super-block's rows their own), a group's rows the
+    outputs of one step of its row tiles (``decode.design``'s B_QT)."""
 
     layer: int  # -1: the LM head
     name: str
@@ -162,12 +171,17 @@ class Region:
     rt0: dict[str, int] = field(default_factory=dict)  # first row tile of each block
     cols: int = COLS
     half: bool = False  # (the input: ``K_in`` = K - kc / 2; module docstring)
-    t0: dict[str, int] = field(default_factory=dict)  # (``half``) first tile of each block in a column's block
+    t0: dict[str, int] = field(default_factory=dict)  # (``half``, ``qt``) first tile of each block in a column's block
+    qt: int = 0  # (the input: a tail of qt super-blocks in its last chunk, tail-last groups; module docstring)
 
     def __post_init__(self) -> None:
         assert self.n_kc % self.kc_group == 0
+        assert all(b.G in (1, 2, 4, 8) for b in self.blocks), self.name
         assert not self.half or (self.kc_group == self.n_kc and self.n_kc >= 2), (self.name, self.n_kc, self.kc_group)
         assert self.half or not any(b.pt for b in self.blocks), self.name
+        assert not self.qt or (not self.half and self.kc_group == self.n_kc and self.n_kc >= 2
+                               and (self.kc // 256) % self.qt == 0 and all(b.G == 1 and not b.fmt2 for b in self.blocks)), \
+            (self.name, self.n_kc, self.kc_group, self.qt)
         rt = t = 0
         for b in self.blocks:
             self.rt0[b.name], self.t0[b.name] = rt, t
@@ -181,8 +195,24 @@ class Region:
 
     @property
     def K_in(self) -> int:
-        """The input's elements (a ``half`` region's: half a chunk short of K)."""
+        """The input's elements (a ``half`` region's: half a chunk short of K; a ``qt`` region's: its tail's)."""
+        if self.qt:
+            return self.K - self.kc + 256 * self.qt
         return self.K - self.kc // 2 if self.half else self.K
+
+    @property
+    def qg(self) -> int:
+        """(``qt``) Row tiles of a group (1: none)."""
+        return self.kc // 256 // self.qt if self.qt else 1
+
+    def groups(self, b: Block) -> int:
+        """(``qt``) Groups of block b's row tiles (a ``qt`` region's; else its row tiles)."""
+        return -(-b.tiles // self.qg)
+
+    @property
+    def n_grp(self) -> int:
+        """Row tiles of the decode's phase: a ``qt`` region's groups, else its row tiles."""
+        return sum(self.groups(b) for b in self.blocks) if self.qt else self.n_rt
 
     @property
     def pair(self) -> int:
@@ -192,6 +222,8 @@ class Region:
     def block_tiles(self, b: Block) -> int:
         """Tiles of block b in a column's block."""
         n = b.tiles
+        if self.qt:
+            return n * (self.n_kc - 1) + self.groups(b)
         return n // 2 * self.pair + n % 2 * self.n_kc if b.pt else n * self.n_kc
 
     @property
@@ -214,6 +246,12 @@ class Region:
     def tile(self, rt: int, kc: int) -> int:
         """Index in a column block of row tile rt's tile of K chunk kc (a ``pt`` block's last chunk: the pair's tail tile,
         row tile rt's super-blocks in its half ``tail_half``)."""
+        if self.qt:  # (tail-last groups: the group's tail tile after its row tiles' full chunks)
+            b = self.block_of(rt)
+            q, i = divmod(rt - self.rt0[b.name], self.qg)
+            nf = self.n_kc - 1
+            base = self.t0[b.name] + q * (self.qg * nf + 1)
+            return base + (i * nf + kc if kc < nf else min(self.qg, b.tiles - q * self.qg) * nf)
         if not self.half:
             g = self.kc_group
             return (kc // g * self.n_rt + rt) * g + kc % g
@@ -223,6 +261,10 @@ class Region:
             return self.t0[b.name] + j * self.n_kc + kc
         base = self.t0[b.name] + j // 2 * self.pair
         return base + (self.n_kc - 1 if kc == self.n_kc - 1 else kc + (self.n_kc if j % 2 else 0))
+
+    def tail_sb(self, rt: int) -> int:
+        """(``qt``) The first super-block of row tile rt's tail in its group's tail tile."""
+        return (rt - self.rt0[self.block_of(rt).name]) % self.qg * self.qt
 
     def tail_half(self, rt: int) -> int:
         """Which half of its last chunk's tile holds row tile rt's tail: 1 for the second of a ``pt`` block's pair."""
@@ -248,14 +290,16 @@ class TileImage:
     fills a buffer of nbytes. A model's subclass adds its regions (``_add``, ``_add_slab``) and calls ``_place``."""
 
     def __init__(self, gguf: GGUFFile, *, kc: int, payload: int, tile_bytes: int, vocab: int,
-                 max_rows: dict[str, int] | None = None, column_major: bool = False, tails: frozenset[str] = frozenset()):
+                 max_rows: dict[str, int] | None = None, column_major: bool = False, tails: frozenset[str] = frozenset(),
+                 qtails: bool = False):
         """kc: the K chunk of a tile (columns); payload: the elements of an activation object's payload (the K groups);
         tile_bytes: the object size (0: chosen from the file's formats, ``choose_tile_bytes``); max_rows: the rows of
         a format's tile at most (default: the format's); column_major: the layout (module docstring); tails: the regions
         (names) whose input of half a chunk short of whole chunks is a ``Region.half`` region, its blocks of one tile
-        format read in the super-block split ``pt`` blocks."""
+        format read in the super-block split ``pt`` blocks; qtails: every input of whole super-blocks that ends inside
+        its last chunk is a ``Region.qt`` region (one K group)."""
         self.gguf, self.kc, self.nsb, self.payload, self.vocab = gguf, kc, kc // 256, payload, vocab
-        self.tails = tails
+        self.tails, self.qtails = tails, qtails
         self.tile_bytes = tile_bytes or self._choose_tile_bytes()
         mr = max_rows or {}
         self.R = {f: FORMATS[f].rows(self.tile_bytes, self.nsb, mr.get(f, 0)) for f in FORMATS
@@ -339,6 +383,8 @@ class TileImage:
         n_kc = -(-K // self.kc)
         g = kc_group(n_kc, self.payload, self.kc)
         half = name in self.tails and K % self.kc == self.kc // 2 and n_kc >= 2 and g == n_kc and G == 1
+        qt = (K % self.kc) // 256 if self.qtails and K % self.kc and G == 1 else 0
+        assert not qt or (K % 256 == 0 and n_kc >= 2 and g == n_kc and self.nsb % qt == 0), (name, K, g)
         blocks = []
         for bname, tensors, rows, *own in parts:  # (own: the block's tile format, a plane of its tensors': ``packs_from``)
             fmts = [self.fmt(t) for t in tensors]
@@ -361,7 +407,7 @@ class TileImage:
             # (a tail tile's halves: the super-block split's)
             pt = half and not pairs and not slot(fmt).mmv_split(fmt, self.nsb) and self.pairs(name, bname, fmt, R)
             blocks.append(Block(bname, tensors, rows if G > 1 else _pad_rows(rows, R), fmt, R, G, pairs, pt=pt))
-        return Region(layer, name, blocks, n_kc, g, self.tile_bytes, self.kc, cols=parts[0][2].shape[0], half=half)
+        return Region(layer, name, blocks, n_kc, g, self.tile_bytes, self.kc, cols=parts[0][2].shape[0], half=half, qt=qt)
 
     def pairs(self, region: str, block: str, fmt: str, R: int) -> bool:
         """Whether a block of a ``Region.half`` region holds its row tiles in pairs (``Block.pt``): the model's (the
@@ -479,6 +525,9 @@ class TileImage:
                    -(-(k or ts[0].cols) // 256), b.G)
             if r.half:
                 blk += (r.t0[b.name] + rt * r.n_kc, int(b.pt), r.n_t)
+            if r.qt:  # (tail-last groups: the block's tiles from its first, ``Region.tile``)
+                assert rt == 0 and not k, (b.name, rt, k)
+                blk += (r.t0[b.name], 0, r.n_t, 0, 0, r.qt)
             if k:  # (a K slice: its bytes of the tensors' rows)
                 rb = _raw_bytes(ts[0]).shape[1]
                 assert (k0 * rb) % ts[0].cols == 0 and (k * rb) % ts[0].cols == 0 and not r.half, (b.name, k0, k)
@@ -532,6 +581,7 @@ class TileImage:
         the other row tile of its pair in a ``pt`` block (their shared tail tile): the (offset, bytes) of the tiles (a
         half-precision head's Q4_0 plane: those rows quantized again)."""
         assert not b.fmt2, "a split block's row tiles are of two formats"
+        assert not r.qt, "a qt region's row tiles share tail tiles in groups"
         n = b.R * b.G
         lo = rt - rt % 2 if b.pt else rt
         hi = min(lo + 2, b.tiles) if b.pt else rt + 1
@@ -636,10 +686,11 @@ def pack_rows(tensors: list[QTensor], rows: np.ndarray, fmt: str, R: int, S: int
     assert rows.size % (R * G) == 0
     n = rows.size // (R * G)
     out = np.zeros(n * nch * S, np.uint8)
-    _pack_tiles(out, [(_native_format(fmt, tensors), R, S, kc // 256, nch, nch, n, 0, 0, out.size,
-                              [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1),
-                              t.cols // 256, G)],
-                       threads=1)
+    blk = (_native_format(fmt, tensors), R, S, kc // 256, nch, nch, n, 0, 0, out.size,
+           [_raw_bytes(x) for x in tensors], np.ascontiguousarray(rows, np.int64).reshape(1, -1), -(-t.cols // 256), G)
+    if t.cols % 256:  # (rows of part of a super-block: half ones of G 8 row groups, a K slice of the whole row)
+        blk += (-1, 0, 0, 0, _raw_bytes(t).shape[1])
+    _pack_tiles(out, [blk], threads=1)
     return out.reshape(n, nch, S)
 
 

@@ -295,3 +295,58 @@ def _check_gemv(fmt: str, S_BYTES: int, NSB: int, key: tuple[str, ...], name: st
         # format; x as single bfp16 (8 slots): its rounding too)
         err = np.sqrt(((gs - ex) ** 2).mean() / (ex ** 2).mean())
         assert err < (2.5e-3 if slots == 4 else 1.5e-2), (S, err)
+
+
+# (format, tile bytes, row groups G, the file, a tensor of that format): the row-group tiles of a qtails design
+# (``decode.image.Region.qt``: a group's tail tile, B_G4; an expert unit's down of K 128, B_G8)
+GROUPS = [
+    ("BFP16", 9216, 4, ("random",), "BF16"),
+    ("Q8_0", 9216, 4, ("inkling",), "blk.0.attn_q.weight"),
+    ("NVFP4", 9216, 4, ("inkling",), "blk.0.ffn_gate_up_exps.weight"),
+    ("Q8_0H", 9216, 4, ("inkling",), "output.weight"),
+    ("NVFP4", 9216, 8, ("inkling",), "blk.0.ffn_down_exps.weight"),
+    ("Q8_0", 9216, 8, ("inkling",), "blk.20.ffn_down_exps.weight"),
+]
+
+
+@pytest.mark.parametrize(("fmt", "S_BYTES", "G", "key", "name"), GROUPS, ids=[f"{c[0]}-G{c[2]}" for c in GROUPS])
+def test_gemv_groups(fmt: str, S_BYTES: int, G: int, key: tuple[str, ...], name: str) -> None:
+    """Tiles of G row groups (a tile row: G rows of K 1024 / G, ``decode.image.Block.G``) on a qtails design's kernels:
+    each group's rows bit-exact against the plain kernel on a tile of that group's rows alone (zeros outside its K
+    range: exact zero terms), and within 1e-5 of the host model, with 1 and 4 slots."""
+    if key[0] == "random":
+        t = random_tensor(name, 256, 1024, 5)
+    else:
+        path = _path(key)
+        require(path)
+        t = open_weights(path).tensor(name)
+    qtype = "Q8_0" if fmt == "Q8_0H" else ("BF16" if fmt == "BFP16" else fmt)
+    assert t.qtype == qtype, t.qtype
+    n_tiles, K = 2, 1024 // G
+    op, op1 = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, G=G), \
+        mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles * G, tile_bytes=S_BYTES)
+    R = op.rows
+    raw = np.ascontiguousarray(t.raw[:n_tiles * R * G])
+    kb = raw.shape[1] * K // t.cols  # (a row's bytes of K columns: whole GGUF blocks)
+    tg = QTensor(name="g", qtype=t.qtype, rows=len(raw), cols=K, raw=np.ascontiguousarray(raw[:, :kb]))
+    tiles = pack_rows([tg], np.arange(len(raw)), fmt, R, S_BYTES, 1, G=G).reshape(-1)
+    alone, fields = [], []  # (per tile and group: its rows alone in a tile of 1024 columns)
+    for i in range(n_tiles):
+        for j in range(G):
+            r1 = np.zeros((R, raw.shape[1] * 1024 // t.cols), raw.dtype)
+            r1[:, j * kb:(j + 1) * kb] = raw[i * R * G + j:(i + 1) * R * G:G, :kb]
+            t1 = QTensor(name="a", qtype=t.qtype, rows=R, cols=1024, raw=r1)
+            alone.append(pack_rows([t1], np.arange(R), fmt, R, S_BYTES, 1).reshape(-1))
+            fields.append(t1.fields())
+    a, a1 = op.compile(), op1.compile()
+    rng = np.random.default_rng(1)
+    for S in (1, 4):
+        x = (rng.standard_normal((S, 1024)) * np.exp(rng.standard_normal((S, 1024)))).astype(np.float32)
+        x = torch.from_numpy(x).bfloat16().float().numpy()
+        X = np.concatenate([mmv.x_panels(x).reshape(-1), mmv.xs_panels(x, 4).reshape(-1)])
+        got = a.run(tiles, X).reshape(n_tiles, G, -1)  # ([core 0's groups | core 1's]: G blocks of a 16-row tile)
+        ref = a1.run(np.concatenate(alone), X).reshape(n_tiles, G, -1)
+        gs, rs = mmv.tile_rows(got, R)[..., :S, :], mmv.tile_rows(ref, R)[..., :S, :]
+        assert np.array_equal(gs, rs), (S, np.argwhere(gs != rs)[:8])
+        host = np.stack([mmv.ref_tile(fmt, f, x)[:S] for f in fields]).reshape(gs.shape)
+        assert not (np.abs(gs - host) > 1e-5 * np.abs(host).max()).any(), S

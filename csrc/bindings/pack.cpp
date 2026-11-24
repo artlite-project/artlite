@@ -34,9 +34,9 @@ void bind_pack(nb::module_& m) {
         std::vector<artlite::PackBlock> bs;
         for (nb::handle h : blocks) {
           auto t = nb::cast<nb::tuple>(h);
-          if (t.size() != 14 && t.size() != 17 && t.size() != 19)
+          if (t.size() != 14 && t.size() != 17 && t.size() != 19 && t.size() != 20)
             throw artlite::Error("pack_tiles: a block is a tuple of 14 (or 17: with tile0, pair, col_tiles; 19: and k0, "
-                                 "k_bytes)");
+                                 "k_bytes; 20: and qt)");
           artlite::PackBlock b{};
           b.fmt = artlite::tile_format(nb::cast<std::string>(t[0]));
           b.R = nb::cast<int>(t[1]);
@@ -55,10 +55,11 @@ void bind_pack(nb::module_& m) {
             b.pair = nb::cast<int>(t[15]);
             b.col_tiles = nb::cast<int64_t>(t[16]);
           }
-          if (t.size() == 19) {
+          if (t.size() >= 19) {
             b.k0 = nb::cast<size_t>(t[17]);
             b.k_bytes = nb::cast<size_t>(t[18]);
           }
+          if (t.size() == 20) b.qt = nb::cast<int>(t[19]);
           const size_t row_bytes = size_t(b.row_sb) * artlite::block_bytes(b.fmt);
           for (nb::handle r : nb::cast<nb::list>(t[10])) {
             auto raw = nb::cast<Raw>(r, false);
@@ -102,7 +103,8 @@ void bind_pack(nb::module_& m) {
       "consecutive in rows, along K), or that and (tile0, pair, col_tiles): a Region.half region's block, its tiles "
       "from tile tile0 of a column block of col_tiles tiles, pair 1: row tiles in pairs sharing their tail tile "
       "(tile0 -1: none), or that and (k0, k_bytes): a K slice, the tensors' rows whole, the block's row their k_bytes "
-      "from byte k0 on, zero bytes past them (artlite::PackBlock). threads: 0 = one per physical core; files: (path, the caller's mapping of the "
+      "from byte k0 on, zero bytes past them (k_bytes 0: none), or that and qt: a tail of qt super-blocks, the row tiles "
+      "in tail-last groups of nsb / qt (artlite::PackBlock). threads: 0 = one per physical core; files: (path, the caller's mapping of the "
       "whole file) of the files the tensors lie in: a tensor inside one of these mappings is read through views of the "
       "packer's own, read into the page cache ahead of the workers and unmapped tensor by tensor (the caller's mapping "
       "stays untouched), any other as the memory it is; "

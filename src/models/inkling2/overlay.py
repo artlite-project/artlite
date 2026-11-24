@@ -227,8 +227,9 @@ class InklingOverlay(AttentionOverlay):
         self.op = InklingDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                         eps=cfg.rms_norm_eps, attn=at, moe=moe,
                                         paged=paged,
-                                        situ=(cfg.situ_beta, cfg.situ_linear_beta),
-                                        gu_win=ffn and img.gu_rows() != {16})
+                                        situ=(cfg.situ_beta, cfg.situ_linear_beta))
+        # (the experts' gate / up: tail groups of 16-row tiles or of 8-row ones in pairs, whole [8 gate | 8 up] windows)
+        assert all(r.qt and r.qg % 2 == 0 for r in img.slabs if r.name.startswith("exp_gu")) and img.gu_rows() <= {8, 16}
         self.pg = at.pg[self.hd]
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)
         full = -(-max_positions // self.pg)
@@ -238,7 +239,7 @@ class InklingOverlay(AttentionOverlay):
                       CacheKind(hd=self.hd, pg=self.pg, groups=full))
         self.uses = {v: CacheUse(kind=KINDS.index(x.kind), source=v, ring=v) for v, x in self.vis.items()}
         self.period = PAIR
-        self.K = img.region(img.layers[0], "q").K  # (an attention input's K: the hidden padded to whole chunks)
+        self.K = img.region(img.layers[0], "q").K_in  # (an attention input's K: the hidden)
         self.h8 = self.H // COLS
         self.HIST = HIST_ROWS * 4 * self.h8  # (a history window's bytes)
         self.nst = dict(zip(range(len(cfg.visits)), cur_states(cfg)))
@@ -320,7 +321,7 @@ class InklingOverlay(AttentionOverlay):
         # the state array ([state][k block][slot sp][8] fp32, after the XB - XPAY bytes its objects' fill reads before
         # it); per visit: the q, k, v phases' metadata objects, the partial sums objects of its attention's and FFN's
         # mixes, the attention region [q objects | raw K / V objects] per KV head, o's input
-        self.sa = take("ACT", XB + SA_SLOTS * 4 * SLOTS * self.K) + XB
+        self.sa = take("ACT", XB + SA_SLOTS * self.state_bytes(SLOTS)) + XB
         self.meta = {(v, n): take("ACT", XB) for v in self.layers for n in ("q", "k", "v")}
         self.ps = {(v, m): take("ACT", XB) for v in self.layers for m in "af"}
         # (the message mixes' partial sums of a loop visit after the first pass: queries 0 .. 2, 3)
@@ -358,8 +359,13 @@ class InklingOverlay(AttentionOverlay):
         return XB + 3 * SLOTS * XPAY
 
     def state_bytes(self, sp: int) -> int:
-        """A state's bytes in the state array of a step of sp packed slots."""
-        return 4 * sp * self.K
+        """A state's bytes in the state array of a step of sp packed slots: its k ranges' (the hidden's whole objects of
+        1024 / sp k: ``protocol.F_STATES``; zero past the hidden)."""
+        return -(-4 * sp * self.K // XPAY) * XPAY
+
+    def state_k(self, sp: int) -> int:
+        """A state's k in the state array of a step of sp packed slots (the hidden's, padded to whole k ranges)."""
+        return self.state_bytes(sp) // (4 * sp)
 
     def raw_ring(self, v: int, h: int) -> int:
         """Byte offset in KV of visit v's KV head h's raw ring."""
@@ -878,7 +884,7 @@ class InklingOverlay(AttentionOverlay):
                 act[self.sa + b * ST + 4 * H * sp:self.sa + (b + 1) * ST] = 0
             self._sa_sp = sp
         for b, slot in enumerate(slots):
-            xs = np.zeros((self.K // 8, sp, 8), np.float32)
+            xs = np.zeros((self.state_k(sp) // 8, sp, 8), np.float32)
             xs[:H // 8] = x[b].reshape(sp, H // 8, 8).transpose(1, 0, 2)
             act[self.sa + slot * ST:self.sa + (slot + 1) * ST] = xs.reshape(-1).view(np.uint8)
         self.dev.flush("ACT", self.sa, SA_SLOTS * ST)
@@ -930,7 +936,7 @@ class InklingOverlay(AttentionOverlay):
         """State b of the last step's state array (S, hidden) fp32."""
         sp, ST = packed_slots(S), self.state_bytes(packed_slots(S))
         self.dev.fetch("ACT", self.sa + b * ST, ST)
-        x = self.dev.view("ACT")[self.sa + b * ST:self.sa + (b + 1) * ST].view(np.float32).reshape(self.K // 8, sp, 8)
+        x = self.dev.view("ACT")[self.sa + b * ST:self.sa + (b + 1) * ST].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
         return x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H).copy()
 
     def psums(self, v: int, m: str) -> np.ndarray:

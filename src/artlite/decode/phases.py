@@ -20,10 +20,13 @@ from .protocol import (
     B_FMT2,
     B_G2,
     B_G4,
+    B_G8,
     B_NA,
     B_NB,
     B_PAIR,
     B_PT,
+    B_QM,
+    B_QT,
     B_SPLIT,
     F_EMITR,
     F_LOADR,
@@ -46,6 +49,7 @@ from .protocol import (
     META,
     NBLK,
     POST_K,
+    XPAY,
     n_inputs,
 )
 
@@ -106,16 +110,18 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
     """The K groups of a phase on ``region``: F_NORM, F_POST, F_PZERO on the first, F_EMITR on the last (an F_POST
     header: input objects of POST_K). The "ab" block (alpha, beta, of BFP16 planes in a PARO checkpoint's: B_PAIR; or
     "alpha" of planes and "beta") goes out as fp32 with F_MSG (the GDN core's) or ``f32_ab``; ``block_flags``: a block's B_* bits by its name; a block
-    of row groups (``Block.G``) gets B_G2 / B_G4; ``slots``: the design's (its input objects of ``protocol.n_inputs``)."""
+    of row groups (``Block.G``) gets B_G2 / B_G4 / B_G8; ``slots``: the design's (its input objects of ``protocol.n_inputs``). A
+    ``Region.qt`` region's row tiles are its groups (B_QT: the block's last group's row tiles at B_QM)."""
     assert len(region.blocks) <= NBLK and 1 <= S <= slots
     blk, rt = [], 0
     for b, nv in zip(region.blocks, valid_rows(region)):
-        rt += b.tiles
+        rt += region.groups(b) if region.qt else b.tiles
+        qt = B_QT | (b.tiles - region.qg * (region.groups(b) - 1) - 1) << B_QM if region.qt else 0
         f32 = B_F32 if (flags & F_MSG or f32_ab) and b.name in ("ab", "beta") else 0
         f32 |= B_PAIR if b.name == "alpha" or (b.name == "ab" and b.pairs) else 0  # (planes of F32 rows: their sums)
-        assert b.G in (1, 2, 4), b.G
-        g = {1: 0, 2: B_G2, 4: B_G4}[b.G] | (B_PT if b.pt else 0)
-        blk += [rt, format_word(b) | f32 | g | (block_flags or {}).get(b.name, 0), nv]
+        assert b.G in (1, 2, 4, 8), b.G
+        g = {1: 0, 2: B_G2, 4: B_G4, 8: B_G8}[b.G] | (B_PT if b.pt else 0)
+        blk += [rt, format_word(b) | f32 | g | qt | (block_flags or {}).get(b.name, 0), nv]
     parts = group_chunks(region)
     out = []
     for i, (k0, g) in enumerate(parts):
@@ -124,10 +130,11 @@ def groups(region: Region, flags: int, S: int, *, f32_ab: bool = False,
         first = F_NORM | F_POST | F_PZERO
         f = F_MAIN | flags & ~(first | F_EMITR) | (flags & first if i == 0 else 0) | (flags & F_EMITR if last else 0)
         K = group_K(region, k0, g)
-        nx = K // POST_K if flags & F_POST else n_inputs(K, slots)
+        ok = XPAY // (2 * slots)  # (an input object's k: a qt region's last one part of it)
+        nx = K // POST_K if flags & F_POST else n_inputs(-(-K // ok) * ok if region.qt else K, slots)
         m[M_FLAGS], m[M_NS], m[M_NX], m[M_K] = f, S, nx, K
-        nt = region.n_t if region.half else region.n_rt * g  # (a half region: one group, its pairs' tiles)
-        m[M_NT], m[M_G], m[M_NRT], m[M_NB] = nt, g, region.n_rt, len(region.blocks)
+        nt = region.n_t if region.half or region.qt else region.n_rt * g  # (a half or qt region: one group, its tiles)
+        m[M_NT], m[M_G], m[M_NRT], m[M_NB] = nt, g, region.n_grp, len(region.blocks)
         m[M_B:M_B + len(blk)] = blk
         out.append(Group(k0, g, m, region.kc, K))
     return out
@@ -151,7 +158,7 @@ def a_reads(region: Region, c: int, group: Group) -> list[AFill]:
     S, n, g_img, n_rt = region.tile_bytes, region.n_kc, region.kc_group, region.n_rt
     tw = S // 4  # words of a tile, read in n0-word pieces (a BD's inner dimension is < 1024 words)
     n0 = next(k for k in range(1023, 0, -1) if tw % k == 0)
-    if region.half:  # (one group: the column's tiles)
+    if region.half or region.qt:  # (one group: the column's tiles)
         return [AFill(base, region.col_bytes, None, 1, None)]
     if group.g == g_img:  # a block of whole row tiles' chunk groups: contiguous
         return [AFill(base + group.k0 * n_rt * S, n_rt * group.g * S, None, 1, None)]

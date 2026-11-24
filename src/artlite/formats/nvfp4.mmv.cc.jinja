@@ -76,31 +76,44 @@ __attribute__((noinline)) void {{ p }}_nv_x(const uint8_t *__restrict xp, const 
 }
 
 // y[g] += sum over the 16 groups j of c (j, g) sct[j][g][r] for the 2 row groups (c (j, g): bf16 at c + 128 j + 32 g, 8
-// slots: slots 4 .. 7 at + 64; y [g][slot][r]; fp32 sums, the products exact)
+// slots: slots 4 .. 7 at + 64; y [g][slot][r]; fp32 sums, the products exact){{ "; h > 0 (B_G8): groups 8 .. 15 (half a
+// super-block) rows of their own, into y + h" if rg and rg_all else "" }}
 __attribute__((noinline)) void {{ p }}_nv_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
-                                             float *__restrict y)
+                                             float *__restrict y{{ ", int h" if rg and rg_all else "" }})
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
+{% if rg and rg_all %}
+    const int n = h ? 8 : 16;
+    AIE_LOOP_NO_UNROLL
+    for (int part = 0; part < 16; part += n, y += h, c += 128 * n, sct += 16 * n) {
+{% else %}
+    {
+        constexpr int n = 16;
+{% endif %}
     aie::accum<accfloat, {{ L }}> Y0(aie::load_v<{{ L }}>(y)), Y1(aie::load_v<{{ L }}>(y + {{ L }}));
     const bfloat16 __aie_dm_resource_a *__restrict pc = (const bfloat16 __aie_dm_resource_a *)c;
     const bfloat16 __aie_dm_resource_b *__restrict ps = (const bfloat16 __aie_dm_resource_b *)sct;
-    AIE_LOOP_UNROLL_FULL
-    for (int j = 0; j < 16; j++) {
+    AIE_PREPARE_FOR_POSTPIPELINING AIE_LOOP_MIN_ITERATION_COUNT(8)
+    for (int j = 0; j < n; j++) {
 {% if slots == 8 %}
-        const aie::vector<bfloat16, 64> c0 = aie::concat(aie::load_v<32>(pc + 128 * j), aie::load_v<32>(pc + 128 * j + 64));
-        const aie::vector<bfloat16, 64> c1 = aie::concat(aie::load_v<32>(pc + 128 * j + 32), aie::load_v<32>(pc + 128 * j + 96));
+        const aie::vector<bfloat16, 64> c0 = aie::concat(aie::load_v<32>(pc), aie::load_v<32>(pc + 64));
+        const aie::vector<bfloat16, 64> c1 = aie::concat(aie::load_v<32>(pc + 32), aie::load_v<32>(pc + 96));
 {% else %}
-        const aie::vector<bfloat16, 32> c0 = aie::load_v<32>(pc + 128 * j), c1 = aie::load_v<32>(pc + 128 * j + 32);
+        const aie::vector<bfloat16, 32> c0 = aie::load_v<32>(pc), c1 = aie::load_v<32>(pc + 32);
 {% endif %}
-        Y0 = aie::mac(Y0, c0, aie::load_v<8>(ps + 16 * j).template grow_replicate<{{ L }}>());
-        Y1 = aie::mac(Y1, c1, aie::load_v<8>(ps + 16 * j + 8).template grow_replicate<{{ L }}>());
+        Y0 = aie::mac(Y0, c0, aie::load_v<8>(ps).template grow_replicate<{{ L }}>());
+        Y1 = aie::mac(Y1, c1, aie::load_v<8>(ps + 8).template grow_replicate<{{ L }}>());
+        pc += 128;
+        ps += 16;
     }
     aie::store_v(y, Y0.template to_vector<float>());
     aie::store_v(y + {{ L }}, Y1.template to_vector<float>());
+    }
 }
 
 // super-blocks 2 H, 2 H + 1 of an NVFP4 tile: y[g][{{ L }}] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; rg:
-// super-block 2 H + 1's rows into y + ys (row groups of 4: rows of their own)" if rg else "" }}
+// super-block 2 H + 1's rows into y + ys (row groups of 4: rows of their own)" if rg else "" }}{{ "; ys < 0 (B_G8): each
+// super-block's halves rows of their own, -ys apart" if rg and rg_all else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
                                              float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
@@ -115,6 +128,10 @@ __attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_
         {{ p }}_nv_ss(un + {{ 128 * R4 }}, sct);
         {{ p }}_iq4_w(un, tab_ab, tab_cd, scr);
         {{ p }}_nv_x(xp + {{ 32 * PANEL }} * u, scr, (bfloat16 *)scr);
+{% if rg and rg_all %}
+        {{ p }}_nv_sc((const bfloat16 *)scr, sct, y + u * (ys < 0 ? -2 * ys : ys), ys < 0 ? -ys : 0);  // (B_G8: 2 halves)
+{% else %}
         {{ p }}_nv_sc((const bfloat16 *)scr, sct, y{{ " + u * ys" if rg else "" }});
+{% endif %}
     }
 }

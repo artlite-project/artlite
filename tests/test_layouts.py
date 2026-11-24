@@ -21,7 +21,7 @@ from models.qwen35 import gdn, words
 # the layout names a template may use: the words, flags and values of the layouts (their prefixes)
 _NAMES = re.compile(r"(M|F|S|B|K|C|A|G|V|MG|E|O|ST|DW|DW1|REC|ROLE)_[A-Z0-9_]+")
 # what the renderers pass besides the layouts' constants (sizes and addresses of the design, not words)
-_EXPLICIT = {"C_LEN", "B_G4", "V_NORM", "REC_K", "REC_V", "A_HI", "A_OBJ", "L_DONE", "L_HDONE", "L_HRDY", "H_AB", "H_DN", "H_PRM"}
+_EXPLICIT = {"C_LEN", "B_G4", "B_G8", "V_NORM", "REC_K", "REC_V", "A_HI", "A_OBJ", "L_DONE", "L_HDONE", "L_HRDY", "H_AB", "H_DN", "H_PRM"}
 
 
 def _templates() -> dict[str, dict[str, int]]:

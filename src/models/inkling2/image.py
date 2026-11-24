@@ -1,6 +1,7 @@
 """The weight image of an Inkling 2 model (``decode.image.NormedImage``): the file's tile formats over K chunks of 1024
-columns (``KC``), objects of 9216 B (Q8_0's 8 rows, NVFP4's 16, BFP16's 8); a K of no whole number of chunks (the
-hidden 2304, the controllers' 4608) is padded to the next one (zero super-blocks past the matrix).
+columns (``KC``), objects of 9216 B (Q8_0's 8 rows, NVFP4's 16, BFP16's 8); an input of the hidden 2304 (2 chunks and a
+quarter) is a ``Region.qt`` region (the row tiles in groups of 4 sharing a tail tile: no zero super-blocks but in a
+block's last group of fewer row tiles).
 
 Column-major: a column's regions of a physical layer in a visit's order (the loop core's 3 passes stream the same
 regions), each normed phase's norm-weight objects before its tiles, the experts' slabs after the layers. Column c
@@ -30,7 +31,7 @@ The BF16 tensors read as two planes (sink, the tap deltas) are substituted by F3
 The experts (``EXPERT_UNITS``): an expert's h (``expert_ffn`` 1152) in units of 512, 512 and 128 channels; unit u of
 expert e has its gate / up rows ("exp_gu<u>": groups of 64 outputs, 8 x [8 gate | 8 up] each, over K 2304) and its
 down's rows over the unit's K slice ("exp_dn<u>": every hidden row of the expert, ``Block.kslice``, as row groups of
-kc / 512 = 2 or kc / 256 = 4 rows, the last unit's 128 columns zero-padded to 256). The six slab regions back to back
+kc / 512 = 2 or kc / 128 = 8 rows: the last unit's of half a super-block each). The six slab regions back to back
 per expert: expert e's units are one run of the image.
 
 "lm": rows vocab / 8 c .. of ``output`` (the vocabulary padded to whole C objects per column; rows past the file's
@@ -68,8 +69,10 @@ def unit_gu_rows(E: int, F: int, h0: int, n: int, R: int) -> np.ndarray:
 
 
 def unit_k(n: int) -> int:
-    """The K a unit's down tiles take (its n columns padded to whole super-blocks)."""
-    return -(-n // 256) * 256
+    """The K of a unit's down tiles' row groups: its n columns (512: groups of 2 rows a tile row; 128: 8, half
+    super-blocks each)."""
+    assert KC % n == 0 and n % 128 == 0, n
+    return n
 
 
 class InklingImage(NormedImage):
@@ -83,7 +86,7 @@ class InklingImage(NormedImage):
         if vocab is None:
             vocab = -(-cfg.vocab_padded // (COLS * C_LEN)) * COLS * C_LEN
         super().__init__(gguf, cfg, layers=layers, kc=KC, payload=MAX_K,
-                         tile_bytes=FORMATS["BFP16"].tile_bytes(KC // 256), vocab=vocab)
+                         tile_bytes=FORMATS["BFP16"].tile_bytes(KC // 256), vocab=vocab, qtails=True)
         assert cfg.num_key_value_heads == COLS and H % (8 * COLS) == 0 and cfg.gate_rank == CTL_RANK, cfg
         assert sum(n for _, n in EXPERT_UNITS) == cfg.expert_ffn, cfg.expert_ffn
         self.h8 = H // COLS

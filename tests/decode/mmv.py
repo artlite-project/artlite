@@ -30,7 +30,7 @@ from artlite.decode.gemv import (
 )
 from artlite.decode.image import Region, TileImage
 from artlite.decode.phases import valid_rows
-from artlite.decode.protocol import C_LEN, F_EMITR, F_GU, F_MSG
+from artlite.decode.protocol import B_G4, B_G8, C_LEN, F_EMITR, F_GU, F_MSG
 from artlite.formats import FORMATS, TAB, q6h, q8h, slice_fields, slot
 from artlite.formats.common import table_copies
 from artlite.gguf_model import IQ4_VALUES, MXFP4_VALUES
@@ -520,18 +520,23 @@ class MmvOperator(ArtcOperator):
     into the second one's memory.
 
     Args: A (n_tiles tile_bytes uint8), X (x panels + sum panels of a chunk, uint8), OUT (n_tiles x ``y_floats`` fp32:
-    [g][slot][r])."""
+    [g][slot][r]; row groups: G blocks of ``y_floats(slots)``, the first core's G / 2, then the second's)."""
 
     def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False,
-                 slots: int = SLOTS):
+                 slots: int = SLOTS, G: int = 1):
         """win: event0 / event1 around each core's half tile (the profiling skill's counters); slots: the design's token
-        slots (``decode.gemv``)."""
-        self.fmt, self.n_tiles, self.tile_bytes, self.win, self.slots = fmt, n_tiles, tile_bytes, win, slots
+        slots (``decode.gemv``); G: the tiles as row groups of a qtails design (``render(rg_all=)``: 4, B_G4: a
+        super-block's rows their own; 8, B_G8: a half super-block's)."""
+        self.fmt, self.n_tiles, self.tile_bytes, self.win, self.slots, self.G = fmt, n_tiles, tile_bytes, win, slots, G
+        assert G in (1, 4, 8) and (G == 1 or (slots == 4 and not row_split(fmt, nsb))), (G, fmt)
         self.chunk = Chunk(nsb, slots)
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
         self.hy = helper_y(fmt, nsb)  # (where the second core's rows go)
         # (a core's output: [g][slot][r], 4 row groups for tiles of more than 16 rows)
         self.yn = (4 * 8 * slots) if self.rows > 16 and not row_split(fmt, nsb) else y_floats(slots)
+        if G > 1:  # (a core's G / 2 groups of R <= 16 rows, ``y_floats`` apart; the second core's after the first's)
+            assert self.rows <= 16, self.rows
+            self.yn = self.hy = G // 2 * y_floats(slots)
         self.y_floats = self.yn + self.hy
         super().__init__()
 
@@ -541,10 +546,12 @@ class MmvOperator(ArtcOperator):
                 ArgSpec("out", (self.n_tiles * self.y_floats,), np.float32)]
 
     def get_kernel_src(self) -> str:
-        fid, ch = FORMATS[self.fmt].fid, self.chunk
+        fid, ch = FORMATS[self.fmt].fid | {1: 0, 4: B_G4, 8: B_G8}[self.G], self.chunk
         n = ch.xp + ch.xs
         x1 = 0 if row_split(self.fmt, ch.nsb) else ch.xp // 2  # (the second core's panels)
-        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb, slots=self.slots) + f"""
+        rg = self.G > 1
+        return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb, slots=self.slots, rg=rg, rg_all=rg,
+                      yb=y_floats(self.slots)) + f"""
 extern "C" {{
 void mmvh_copy(const uint8_t *__restrict x, uint8_t *__restrict xb)
 {{

@@ -38,8 +38,9 @@ constexpr int kMaxNsb = 16;
 /// n rows (indices into the stacked tensors, -1: a zero row) as n / (R G) row tiles of S bytes over n_kc K chunks
 /// of 256 nsb columns, row tile rt's tile of chunk kc at ``Region.tile(rt0 + rt, kc)`` of the column block
 /// (column c's block at offset + c col_stride). A tensor row holds row_sb super-blocks (at most n_kc nsb): the
-/// columns past them are zero super-blocks (a K padded to whole chunks). G > 1 (row groups: one chunk, G row_sb = nsb):
-/// a tile row is G tensor rows, consecutive in ``rows``, one after the other along K. BFP16 of F32 tensors: row index
+/// columns past them are zero super-blocks (a K padded to whole chunks). G > 1 (row groups: one chunk): a tile row is G
+/// tensor rows, consecutive in ``rows``, one after the other along K, nsb / G super-blocks each (G 8: half
+/// super-blocks), a row's bytes past its own zero. BFP16 of F32 tensors: row index
 /// 2 i + p is plane p of stacked row i (0: bfp16(w), 1: bfp16(w - plane 0)).
 ///
 /// tile0 >= 0 (a ``Region.half`` region's block, one K group: a row tile's chunks consecutive): the block's tiles from
@@ -48,6 +49,12 @@ constexpr int kMaxNsb = 16;
 /// chunks, the tail tile's tile rows those of 2 q's rows (its first nsb / 2 super-blocks) and 2 q + 1's (the others)
 /// over the tensor rows' last nsb / 2 super-blocks (row_sb = (n_kc - 1) nsb + nsb / 2); an odd last row tile's
 /// second half zero super-blocks.
+///
+/// qt > 0 (with tile0, pair 0: a region whose input ends a tail of qt super-blocks into its last chunk, ``decode.image.Region``'s
+/// ``qt``): the row tiles in groups of g = nsb / qt (a block's last: what is left), a group's tiles its row tiles' full
+/// chunks (n_kc - 1 each, row tile after row tile), then its tail tile, whose super-blocks j qt .. j qt + qt - 1 are the
+/// group's row tile j's last qt super-blocks (row_sb = (n_kc - 1) nsb + qt; a group of fewer than g: zero super-blocks
+/// past its row tiles').
 ///
 /// k_bytes > 0 (a K slice: an MoE down's part of its K, ``models.inkling2.image``): a tensor row is row_stride bytes, the
 /// block's row its k_bytes from byte k0 on (whole GGUF blocks), the rest of its row_sb super-blocks zero bytes.
@@ -74,6 +81,7 @@ struct PackBlock {
   size_t row_stride = 0; // (k_bytes) bytes of a tensor row
   size_t k0 = 0;         // (k_bytes) the slice's first byte in a tensor row
   size_t k_bytes = 0;    // (> 0) the slice's bytes (at most row_sb super-blocks)
+  int qt = 0;            // (tile0, > 0) the tail's super-blocks: row tiles in tail-last groups (see above)
 };
 
 struct PackOptions {

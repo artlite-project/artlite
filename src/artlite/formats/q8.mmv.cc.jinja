@@ -51,6 +51,18 @@ __attribute__((noinline)) void {{ p }}_q80_d(const uint8_t *__restrict u, bfloat
     aie::store_v(tab + 64, aie::transpose(aie::load_v<64>((const bfloat16 *)(u + SU + 2048)), 8, 8));
 }
 
+{% if rg and rg_all and R80 == 8 %}
+// (B_G8) half a super-block: y += sum over its 4 groups i of c_i (c [i][{{ L }}]) times tab [i][r]
+__attribute__((noinline)) void {{ p }}_q80_sc4(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y)
+{
+    aie::accum<accfloat, {{ L }}> Y(aie::load_v<{{ L }}>(y));
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < 4; i++)
+        Y = aie::mac(Y, aie::load_v<{{ L }}>(c + {{ L }} * i), aie::load_v<8>(tab + 8 * i).template grow_replicate<{{ L }}>());
+    aie::store_v(y, Y.template to_vector<float>());
+}
+
+{% endif %}
 {% set unit = 272 * R80 %}
 {% set yo = (" + sb * ys" if rg else "") if R80 == 8 else " + %d * H" % L %}
 template <int H>
@@ -64,5 +76,11 @@ __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q80_mm<2, {{ unit - 2048 }}>(xp, u, c);
     AIE_LOOP_NO_UNROLL
     for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg and R80 == 8 else "" }}
+{% if rg and rg_all and R80 == 8 %}
+        if (ys < 0) {  // (B_G8: each half's 4 groups rows of their own, -ys apart)
+            {{ p }}_q80_sc4(c + {{ 8 * L }} * sb, tab + 64 * sb, y - 2 * ys * sb);
+            {{ p }}_q80_sc4(c + {{ 8 * L }} * sb + {{ 4 * L }}, tab + 64 * sb + 32, y - 2 * ys * sb - ys);
+        } else
+{% endif %}
         {{ p }}_sc1<1>(c + {{ 8 * L }} * sb, tab + 64 * sb, y{{ yo }});
 }
