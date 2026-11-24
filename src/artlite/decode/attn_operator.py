@@ -83,7 +83,7 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
     def pg_bds(self) -> int:
         """(paged formats) Their pages' BDs: a format's per core half, the routing's and the residual stream's pages of
         the helper (``route_page``, ``ink_page``)."""
-        return 2 * len(self.paged) + int(self.route_page) + int(self.ink_page > 0)
+        return 2 * len(self.paged) + int(self.route_page) + 2 * int(self.ink_page > 0)
 
     def moe_a_depth(self) -> int:
         """(beside the attention cores' pages: their BDs in the odd half, the formats' in the even half)"""

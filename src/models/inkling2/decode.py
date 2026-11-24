@@ -20,7 +20,8 @@ MAX_K = 3072  # (a phase's K group: the hidden 2304 padded to whole chunks)
 class InklingDecodeOperator(AttentionDecodeOperator):
     """The Inkling decode overlay design (module docstring): ``hidden``, ``rows``: {format: rows per tile} of tiles of
     1024 columns (``tile_bytes``); ``attn``: the attention cores (``Attn(ink=True)``; None: without); ``paged``: formats
-    whose kernels are code pages; ``win``: a stats build's event window; ``moe``: (experts, used) of the FFN's MoE
+    whose kernels are code pages (default: all of them; the cores' memory holds the residual stream's work only beside
+    pages); ``win``: a stats build's event window; ``moe``: (experts, used) of the FFN's MoE
     (``decode.design``'s "MoE": the routing's units, sigmoid + bias, the situ activation of ``situ``'s betas)."""
 
     PREFIX = "ink"
@@ -29,11 +30,12 @@ class InklingDecodeOperator(AttentionDecodeOperator):
     PAGES = True  # (the attention cores' ~23 KB of kernels: the conv, clips, the relative bias, sinks, gates)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float, attn: Attn | None = None,
-                 paged: tuple[str, ...] = (), win: str = "", moe: tuple[int, int] | None = None,
+                 paged: tuple[str, ...] | None = None, win: str = "", moe: tuple[int, int] | None = None,
                  situ: tuple[float, float] = (4.0, 25.0)):
         assert all(gemv.supported(f, 4) for f in rows), rows
         assert attn is None or attn.ink, attn
         super().__init__(attn=attn, hidden=hidden, rows=rows, tile_bytes=tile_bytes, eps=eps, nsb=4,
-                         act="situ" if moe else "silu", packed=True, tok=True, max_k=MAX_K, paged=paged, win=win,
+                         act="situ" if moe else "silu", packed=True, tok=True, max_k=MAX_K,
+                         paged=tuple(sorted(rows)) if paged is None else paged, win=win,
                          pairs=True, states=True, moe=moe, gating="sigmoid", shared_gate=False, units=3 if moe else 0,
                          situ=situ)

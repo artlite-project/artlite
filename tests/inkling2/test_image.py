@@ -53,8 +53,8 @@ def test_layout(ink: tuple[GGUFFile, InklingConfig]) -> None:
             assert np.array_equal(img.region(L, "o").blocks[0].rows[c][:288], 288 * c + np.arange(288))
         assert ("kd" in [b.name for b in img.region(L, "k").blocks]) == (cfg.kinds[L] == "full"), L
         loop = cfg.core_start <= L < cfg.core_end
-        assert all(((L, f"d{s}") in img._index) == loop and ((L, f"ctl_{s}") in img._index) == loop for s in
-                   ("q", "k", "v", "ffn")), L
+        assert all(((L, f"d{s}a") in img._index) == loop and ((L, f"d{s}b") in img._index) == loop
+                   and ((L, f"ctl_{s}") in img._index) == loop for s in ("q", "k", "v", "ffn")), L
     # the experts: per expert its units' gate / up and down back to back, a unit's gate / up its h's rows
     for L in (0, 23):
         offs = img.unit_offsets(L)
@@ -121,7 +121,7 @@ def test_ink_objects(ink: tuple[GGUFFile, InklingConfig]) -> None:
         got = f[2][:2304].view(bfloat16).astype(np.float32).reshape(4, 288)
         assert np.array_equal(got, taps[:, 576:864])  # (bf16-exact)
         qf = g.tensor(f"blk.{L}.ffn_res_query.weight").dequantize().reshape(H)
-        assert np.array_equal(f[2][2304:2304 + 1152].view(np.float32), qf[576:864])
+        assert np.array_equal(img.ink_objects(L, "inkfq").reshape(COLS, -1)[2][:1152].view(np.float32), qf[576:864])
         ctl = img.ink_objects(L, "ctl_k").reshape(COLS, 2, -1)
         for i, part in enumerate(("forget", "gain")):
             w = g.tensor(cfg.ctrl_tensor(L, "k", part)).dequantize().reshape(H, CTL_RANK)

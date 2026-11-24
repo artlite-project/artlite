@@ -10,17 +10,18 @@ L:
 - "inkq" (L > 0; and the LM head's): the residual stream's queries object (``ink_queries``): the column's slices of the
   layer's depth-mix queries of its attention input (1, or 3 on a full layer), then of its 4 message queries (loop layers),
   fp32 [query][288]: the visit before reads it for the partial sums of this visit's mixes;
-- loop layers: "dq", "dk", "dv" (the controllers' down of the q, k, v streams: 64 rows of K 4608, rows 8 c .. of each
-  column as two BFP16 planes: B_PAIR) and "ctl_q", "ctl_k", "ctl_v" (the blends': per stream the column's rows of the
-  forget and gain matrices, bf16 [288][64] each, 4 objects each: ``ctl_objects``);
+- loop layers, per stream s of q, k, v: "d<s>a", "d<s>b" (the halves of the controller's down, 64 rows of K 4608: the
+  mix's columns, the message's; rows 8 c .. of each column as two BFP16 planes, B_PAIR; normed without weights: their
+  norm-weight objects ones), "ctl_<s>" (the blend's: the column's rows of the forget and gain matrices, bf16 [288][64]
+  each, 4 objects each: ``ctl_objects``);
 - "q" (normed: ``attn_norm``, a full layer's ``attn_q_inp_norm``): blocks "q" (``attn_q`` rows 384 c ..), "gate"
   (``attn_gate`` rows 384 c ..), "r" (``attn_rel`` rows 48 c ..), "sink" (``attn_sink_proj`` rows 3 c .., two planes);
 - "k" (``attn_norm`` / ``attn_k_inp_norm``): "k" (``attn_k`` rows 128 c ..), a full layer's "kd" (``attn_k_conv_proj``
   rows 4 c .., two planes); "v" likewise;
 - "o" (``attn_output`` rows 288 c .., K 3072);
-- "inkf": the residual stream's object of the o phase (``decode.protocol.F_INK``): the attention's post-conv taps (bf16
-  [4][288]), the FFN mix's query (fp32 [288]) (``ink_objects``);
-- loop layers: "dffn", "ctl_ffn" (the FFN stream's controller);
+- "inkf", "inkfq": the residual stream's objects of the o phase (``decode.protocol.F_INK``): the attention's post-conv
+  taps (bf16 [4][288]), the FFN mix's query (fp32 [288]) (``ink_objects``);
+- loop layers: "dffna", "dffnb", "ctl_ffn" (the FFN stream's controller);
 - "router" (``ffn_norm``): the router's rows of the column's experts 16 c .., two planes (fp32 logits: B_PAIR);
 - "inkc": the residual stream's object of the combine: the FFN's post-conv taps.
 
@@ -128,9 +129,7 @@ class InklingImage(NormedImage):
         loop = self.loop_layer(L)
         if loop:
             for s in "qkv":
-                self._ctl_down(L, s)
-            for s in "qkv":
-                self._ink(L, f"ctl_{s}", 2 * self.ctl_objects())
+                self._ctl(L, s)
         heads = (nq * cols + np.arange(nq)[None])  # (COLS, 3)
         q_rows = (hd * heads[..., None] + np.arange(hd)).reshape(COLS, -1)
         self._norm(L, "q")
@@ -147,21 +146,25 @@ class InklingImage(NormedImage):
             self._add(L, s, parts, H)
         self._add(L, "o", [("o", (b + "attn_output.weight",), column_rows(H))], cfg.num_attention_heads * hd)
         self._ink(L, "inkf", 1)
+        self._ink(L, "inkfq", 1)
         if loop:
-            self._ctl_down(L, "ffn")
-            self._ink(L, "ctl_ffn", 2 * self.ctl_objects())
+            self._ctl(L, "ffn")
         E = cfg.n_experts
         mine = E // COLS * cols + np.arange(E // COLS)[None]  # (the column's experts)
         self._norm(L, "router")
         self._add(L, "router", [("router", (b + "ffn_gate_inp.weight",), f32_planes(mine, 2))], H)
         self._ink(L, "inkc", 1)
 
-    def _ctl_down(self, L: int, s: str) -> None:
-        """A loop layer's controller down of stream s (module docstring): rows CTL_RANK / 8 c .. as planes."""
-        r = CTL_RANK // COLS
+    def _ctl(self, L: int, s: str) -> None:
+        """A loop layer's controller of stream s (module docstring): its down's halves (the mix's columns, the message's:
+        rows CTL_RANK / 8 c .. as planes, normed without weights), then its blend's rows."""
+        r, H = CTL_RANK // COLS, self.cfg.hidden_size
         name = self.cfg.ctrl_tensor(L, s, "down")
-        self._add(L, f"d{s}", [(f"d{s}", (name,), f32_planes(r * np.arange(COLS)[:, None] + np.arange(r)[None], 2))],
-                  2 * self.cfg.hidden_size)
+        rows = f32_planes(r * np.arange(COLS)[:, None] + np.arange(r)[None], 2)
+        for h, part in enumerate("ab"):
+            self._norm(L, f"d{s}{part}")
+            self._add(L, f"d{s}{part}", [(f"d{s}{part}", (self._f32_cols(name, H * h, H),), rows)], H)
+        self._ink(L, f"ctl_{s}", 2 * self.ctl_objects())
 
     def _experts(self, L: int) -> None:
         """Layer L's expert slabs (module docstring)."""
@@ -184,10 +187,21 @@ class InklingImage(NormedImage):
             self._own[name] = QTensor(name=name, qtype="F32", rows=t.rows, cols=t.cols, raw=raw)
         return name
 
-    def norms(self, L: int, name: str) -> tuple[str, None]:
-        """(w1, None): the RMSNorm of a normed phase's input (module docstring)."""
+    def _f32_cols(self, name: str, c0: int, n: int) -> str:
+        """Columns c0 .. c0 + n of an F32 tensor as a tensor of their own (``_own``)."""
+        key = f"{name}[{c0}:{c0 + n}]"
+        if key not in self._own:
+            t = self.gguf.tensor(name)
+            raw = np.asarray(t.dequantize(), np.float32).reshape(t.rows, t.cols)[:, c0:c0 + n]
+            self._own[key] = QTensor(name=key, qtype="F32", rows=t.rows, cols=n, raw=np.ascontiguousarray(raw))
+        return key
+
+    def norms(self, L: int, name: str) -> tuple[str | None, None]:
+        """(w1, None): the RMSNorm of a normed phase's input (module docstring; a controller's down halves: none, ones)."""
         if L < 0:
             return "output_norm.weight", None
+        if name.startswith("d") and name[-1] in "ab":
+            return None, None
         if name == "router":
             return f"blk.{L}.ffn_norm.weight", None
         if self.cfg.kinds[L] == "swa":
@@ -228,9 +242,9 @@ class InklingImage(NormedImage):
         if name == "inkq":
             parts = [self.ink_queries(L).reshape(COLS, -1).view(np.uint8)]
         elif name == "inkf":
-            q = self._slices(g.tensor(b + "ffn_res_query.weight").dequantize(), np.float32)
-            taps = self._slices(self._taps(b + "attn_post_conv.weight"), bfloat16)
-            parts = [taps.reshape(COLS, -1).view(np.uint8), q.reshape(COLS, -1).view(np.uint8)]
+            parts = [self._slices(self._taps(b + "attn_post_conv.weight"), bfloat16).reshape(COLS, -1).view(np.uint8)]
+        elif name == "inkfq":
+            parts = [self._slices(g.tensor(b + "ffn_res_query.weight").dequantize(), np.float32).reshape(COLS, -1).view(np.uint8)]
         elif name == "inkc":
             parts = [self._slices(self._taps(b + "ffn_post_conv.weight"), bfloat16).reshape(COLS, -1).view(np.uint8)]
         else:  # (ctl_<stream>: the forget rows, then the gain rows)

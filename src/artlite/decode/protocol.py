@@ -169,14 +169,25 @@ M_NR, M_CSET, M_NQ, M_NMIX = INK.words("M_NR M_CSET M_NQ M_NMIX", at=44)
 # the phase's rows (into a zeroed res: F_RESID, F_COMB) are a sub-layer's output v, which the residual stream's step takes
 # after the tiles (the helper's ``hink``, ``hips``): the post conv out = (v + sum_t w_t xp_t) / sqrt(5) over the visit's
 # history (an X object: its 3 inputs before the step's, fp32 [3][hidden / 8]) and the step's rows, with the conv's taps (an A
-# object: bf16 [4][hidden / 8], then nqa queries); cur (state n of the column's states, fp32 in the helper's south
-# neighbour) += out, or with ``block`` state n + 1 = out (n stays: a completed block state); then the partial sums of the
-# next mix (as F_COEF reads them) of states 0 .. n + block with the nqa queries after the taps or the nqb of the next A
-# object. Out (C): the history window (the 3 inputs, the step's S: [3 + S][hidden / 8] fp32), cur's slice ([k block][slot
-# sp][8] fp32) and the partial sums ([slot 4][32] fp32). M_INKN: n | block << 4 | nqa << 8 | nqb << 12
+# object: bf16 [4][hidden / 8]); cur (state n of the column's states, fp32 in the helper's south neighbour) += out, or with
+# ``block`` state n + 1 = out (n stays: a completed block state); then the partial sums of the next mix (as F_COEF reads
+# them) of states 0 .. n + block with the nqb queries of the next A object. Out (C): the history window (the 3 inputs, the
+# step's S: [3 + S][hidden / 8] fp32), cur's slice ([k block][slot sp][8] fp32) and the partial sums ([slot 4][32] fp32).
+# M_INKN: n | block << 4 | nqb << 12 | bank << 16 | nm
+# << 20 | bank_m << 24. bank (bits 16 .. 18: enable, bank w, its state i): cur also into bank w's state i (the column's
+# copy, and its slice out a second time, after the partial sums); nm (with nqb): the message mixes' partial sums of bank
+# bank_m's 2 states with the nm queries after the nqb in the queries object, as two more objects (queries 0 .. 2, 3)
 F_INK = INK.flag("F_INK", 10)
 M_INKN = INK.word("M_INKN", at=48)
+# a blend phase (a loop visit's controller, Inkling's passes after the first): its input object (M_NX 1) holds g's halves
+# (the controller's down: [half 2][column 8][slot 4][8] fp32), its tiles (M_NT) are A objects of the column's forget rows,
+# then its gain rows (bf16 [72][64] each): out = cur - tanh(F g) cur + tanh(G g) msg (cur: the column's states 0 .. n
+# mixed by coefficient set j, msg: bank w's 2 states by set m), its slice out ([k block][slot sp][8] fp32) after the last.
+# M_BLEND: j | m << 4 | n << 8 | w << 12
+F_BLEND = INK.flag("F_BLEND", 11)
+M_BLEND = INK.word("M_BLEND", at=49)
 INK_STATES = 5  # the column's states the helper keeps (fp32 [state][slot 4][hidden / 8]; F_LOADR: slot M_SLOT of state M_INKN)
+INK_BANKS = 2  # the banks of 2 states each after them (the loop's passes: ``M_INKN``'s bank, ``M_BLEND``'s w)
 
 # (``states`` designs) another core's object whose X and A objects interleave after it (Inkling's attention: per cache group
 # with a bias, its E object, then its A objects): the main core skips M_EGRP times one X object and M_EGA A objects, then
@@ -251,9 +262,11 @@ STATES_STATE = STATE.kind("states", exclusive_with=(ROT_STATE,))
 # (S_NCF: a trip count, F_COEF; S_CQN: M_NQ | M_NMIX << 8)
 S_NST, S_CSET, S_NCF, S_CQN = STATES_STATE.words("S_NST S_CSET S_NCF S_CQN", at=S_WORDS + 10)
 S_NEGRP, S_NEGA, S_NETL = STATES_STATE.words("S_NEGRP S_NEGA S_NETL", at=S_WORDS)  # (trip counts: ``EGRP``)
-# (F_INK) the residual stream's step, its queries in the taps' object, in the next A object (trip counts), M_INKN, the
-# history's X object (its address)
-S_NINK, S_NIQA, S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NINK S_NIQA S_NIQB S_INKN S_IX", at=S_WORDS + 3)
+# (F_INK) the residual stream's step, its queries object (trip counts), M_INKN, the history's X object (its address; then
+# the message mixes' partial sums in the helper's scratch, ``emit``)
+S_NINK = STATES_STATE.word("S_NINK", at=S_WORDS + 3)
+S_NIQB, S_INKN, S_IX = STATES_STATE.words("S_NIQB S_INKN S_IX", at=S_WORDS + 5)
+S_BLEND = STATES_STATE.word("S_BLEND", at=S_WORDS + 14)  # (F_BLEND) M_BLEND
 
 # ----------------------------------------------------------------------
 # The helper's command
@@ -278,6 +291,10 @@ C_NST, C_CSET, C_XC0, C_ACC = CMD.common.words("C_NST C_CSET C_XC0 C_ACC", at=6)
 # them), C_INKN the phase's M_INKN, C_NS its slots; K_ILOAD (F_LOADR): word 0 the payload, C_INKN state << 2 | slot
 K_INK, K_IPS, K_ILOAD = CMD.common.values("K_INK K_IPS K_ILOAD", of="kind", start=15)
 C_INKN, C_NS = CMD.common.words("C_INKN C_NS")
+# (``states``) a blend's input object (word 0 its payload, 3 -1) or A object i (word 1, 3 i; ``hblend``: 2 res, C_BLEND
+# M_BLEND)
+K_BLEND = CMD.common.values("K_BLEND", of="kind", start=18)[0]
+C_BLEND = CMD.common.word("C_BLEND")
 
 # ----------------------------------------------------------------------
 # Streams, packets and pages

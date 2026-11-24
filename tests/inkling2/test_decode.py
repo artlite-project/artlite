@@ -62,6 +62,8 @@ def test_qkv_states(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     img = InklingImage(g, cfg, layers=[0], vocab=COLS * 64)
     op = InklingDecodeOperator(hidden=H, rows={"Q8_0": 8, "BFP16": 8}, tile_bytes=img.tile_bytes, eps=eps)
     dev = OverlayDevice(op)
+    if (store := op.page_store()) is not None:  # (the formats' pages loadable: ``decode.model.ModelOverlay.load``)
+        dev.set_prologue(op.page_prologue(store))
     sp = packed_slots(S)
     K = img.region(0, "q").K  # (3072: the hidden padded to whole chunks)
     state = K * sp * 4
@@ -148,6 +150,8 @@ def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     img = InklingImage(g, cfg, layers=[L], vocab=COLS * 64)
     op = InklingDecodeOperator(hidden=H, rows={"Q8_0": 8, "BFP16": 8}, tile_bytes=img.tile_bytes, eps=eps)
     dev = OverlayDevice(op)
+    if (store := op.page_store()) is not None:  # (the formats' pages loadable: ``decode.model.ModelOverlay.load``)
+        dev.set_prologue(op.page_prologue(store))
     sp = packed_slots(S)
     K = img.region(L, "q").K
     n, nr = 3, 4
@@ -406,3 +410,42 @@ def test_prelude(ink: tuple[GGUFFile, InklingConfig]) -> None:
         p += S
     assert errs[~tie].max() < 3e-2 and np.median(errs) < 1.5e-2, (errs, tie)
     assert perr[~tie].max() < 4e-2, (perr, tie)
+
+
+@pytest.mark.parametrize("v", [18, 23])
+def test_loop(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
+    """A loop visit after the first pass (its streams' controllers: the down's halves over the mix and the bank's
+    message, the blends; visit 23 also copies its output into its pass's bank) from distinct states and a bank, over steps
+    of 1, then 4, 3 slots: its output against the reference's ``visit`` with the messages, but where the routing ties."""
+    g, cfg = ink
+    ov = InklingOverlay(g, visits=[v], max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    ref.record = {"ffn_moe_logits"}
+    rng = np.random.default_rng(13)
+    T = 15
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+
+    def emb(scale: float) -> np.ndarray:
+        x = rms(torch.from_numpy(g.rows("token_embd.weight", rng.integers(0, cfg.vocab_size, T))), cfg.rms_norm_eps)
+        return (x * tn).numpy() * scale
+
+    states = np.stack([emb(1.0), emb(3.0), emb(2.0), emb(5.0)])[:ov.n0 + 1]
+    bank = np.stack([emb(4.0), emb(7.0)])
+    vis = cfg.visits[v]
+    blocks = [torch.from_numpy(b) for b in states[:-1]]
+    with torch.no_grad():
+        msgs = ref.mix([torch.from_numpy(bank[0])], torch.from_numpy(bank[1]), ref.msg_queries(vis.layer))
+        want = ref.visit(vis, torch.from_numpy(states[-1]), blocks, VisitCache(), 0, msgs).numpy()
+    bias = np.asarray(g.tensor(f"blk.{vis.layer}.exp_probs_b.bias").dequantize(), np.float32).reshape(-1)
+    keys = np.sort(1 / (1 + np.exp(-ref.out["ffn_moe_logits", vis.slot].numpy().astype(np.float64))) + bias, 1)[:, ::-1]
+    tie = keys[:, cfg.n_experts_used - 1] - keys[:, cfg.n_experts_used] < 5e-3
+    n1 = ov.n0 + int(vis.block)
+    errs = np.zeros(T)
+    p = 0
+    for S in [1] * 8 + [4, 3]:
+        ov.step(states[:, p:p + S], p, bank[:, p:p + S])
+        got = ov.state(n1, S)
+        errs[p:p + S] = [rel(got[i], want[p + i]) for i in range(S)]
+        p += S
+    assert errs[~tie].max() < 3e-2 and np.median(errs) < 1e-2, (errs, tie)

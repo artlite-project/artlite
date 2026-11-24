@@ -158,6 +158,7 @@ from .protocol import (
     CMD_WORDS,
     EGRP,
     INK,
+    INK_BANKS,
     INK_STATES,
     ITEM_WORDS,
     MAX_K,
@@ -188,7 +189,6 @@ from .protocol import (
     S_NGA,
     S_NIN,
     S_NINK,
-    S_NIQA,
     S_NIQB,
     S_NLS,
     S_NM,
@@ -242,6 +242,7 @@ PG_ROOM = 3968  # (bytes) a page's code at most: a design of 8 slots leaves its 
 # (8 slots) the helper's B operands of its 16-k sums ([j][64]: row j ones, ``_hstrip``), in the core south of it
 # (``HS8_ROW``): its own memory has no room left for them as static data
 ONEHOT = (np.arange(64)[None, :] // 8 == np.arange(8)[:, None]).astype(np.int8).reshape(-1)
+BLEND_OBJECTS = 4  # (states) a blend matrix's A objects (``protocol.F_BLEND``: the column's 288 rows of 64, 72 each)
 ROT_GROUP, ROT_OBJ = 128, 3328  # (rot) a rotation group's channels; a group's rotation object (``paro.TanForm.objects``)
 # (rot and post: an R phase's A object, ``gemma4.image``) w_post of its two groups (bf16), in its first one also w_post of
 # the column's residual slice (896 at most) and the per-layer projection norm's weights of the column (pli: PLW's), past
@@ -568,7 +569,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                  rot=self.rot, norm_objs=self.norm_objs, ROT_OBJ=ROT_OBJ, ROT_W=ROT_OBJ - 2 * ROT_GROUP,
                                  rg=self.rg, hdr=self.post and not self.rot, RWP_AT=RWP_AT, RWS_AT=RWS_AT, RPL_AT=RPL_AT,
                                  states=self.states, units=self.units, CPARTS=self.cparts, situ=self.situ,
-                                 ink_page=self.ink_page, pg_state=0x70000 + PG_STATE,
+                                 ink_page=self.ink_page, pg_state=0x70000 + PG_STATE, INK_STATES=INK_STATES,
+                                 INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS,
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:
@@ -592,8 +594,9 @@ class DecodeOverlayOperator(ArtcOperator):
 
     @property
     def ink_page(self) -> int:
-        """(states) The page of the helper that holds the residual stream's work (``hink_all``: the step, the partial
-        sums, the coefficient sets; its id after the formats' and the routing's pages), 0: resident (no paged formats)."""
+        """(states) The first of the helper's two pages of the residual stream's work (``hink_all``: the step, the partial
+        sums; then ``hmix``: the coefficient sets, the blends; their ids after the formats' and the routing's pages), 0:
+        resident (no paged formats)."""
         return len(self.paged) + 1 + int(self.route_page) if self.states and self.paged else 0
 
     @property
@@ -662,7 +665,9 @@ class DecodeOverlayOperator(ArtcOperator):
             if h == 1 and self.route_page:  # (the routing: the helper's page after the formats', ``route_page``)
                 pages["ROUTE"] = calls[f"{self.pfx}_hbegin"] = (f"{self.pfx}_pgr_route",)
             if h == 1 and self.ink_page:  # (the residual stream's work: the helper's page after those, ``ink_page``)
-                pages["INK"] = calls[f"{self.pfx}_htask"] = (f"{self.pfx}_pgr_ink",)
+                pages["INK"] = (f"{self.pfx}_pgr_ink",)
+                pages["MIX"] = (f"{self.pfx}_pgr_mix",)
+                calls[f"{self.pfx}_htask"] = (f"{self.pfx}_pgr_ink", f"{self.pfx}_pgr_mix")
             return paging.link(wd, pages=pages, pager=f"{fp}_pg_request", calls=calls,
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
@@ -758,13 +763,15 @@ class DecodeOverlayOperator(ArtcOperator):
                    Kernel(f"{p}_relay", "kernel.o", [c_ty, c_ty]))
         k_xgate = Kernel(f"{p}_mgate", "kernel.o", [x_ty, ws_ty, xp_ty]) if self.gate else None
         hst_ty = np.ndarray[(4,), i32]  # (help_flag: the helper's count of model work)
-        ist_ty = np.ndarray[(INK_STATES * SLOTS * self.h8,), f32]  # (states: the column's states, ``hink``)
+        # (states: the column's states, the banks, a blend's f / gn and its g (then its output) and scratch, ``hink``,
+        # ``hblend``)
+        ist_ty = np.ndarray[((INK_STATES + 2 * INK_BANKS + 3) * SLOTS * self.h8,), f32]
         k_htask = Kernel(f"{p}_htask", "kernel.o", [cmd_ty, r_ty, hs_ty, sq_ty, xp_ty, *[hres_ty, oh_ty] * s8,
                                                     *[ist_ty] * self.states, *[hst_ty] * bool(self.help_flag)])
         k_psums = Kernel(f"{p}_psums", "kernel.o", [x_ty, ws_ty]) if self.post else None
         k_ccoef = [Kernel(f"{p}_ccoef", "kernel.o", [x_ty, ws_ty, cmd_ty])] if self.states else []
         k_ink = [Kernel(f"{p}_cinkh", "kernel.o", [x_ty, ws_ty]), Kernel(f"{p}_cink", "kernel.o", [a_ty, x_ty, ws_ty, cmd_ty]),
-                 Kernel(f"{p}_cips", "kernel.o", [a_ty, ws_ty, cmd_ty, np.int32])] if self.states else []
+                 Kernel(f"{p}_cips", "kernel.o", [a_ty, ws_ty, cmd_ty])] if self.states else []
         # (the rotations: the helper's, these the main core's commands)
         k_rot = [Kernel(f"{p}_cpsq", "kernel.o", [x_ty, ws_ty, cmd_ty]), Kernel(f"{p}_crote", "kernel.o", [a_ty, ws_ty, cmd_ty]),
                  Kernel(f"{p}_crotx", "kernel.o", [x_ty, a_ty, ws_ty, cmd_ty])] if self.rot else []
@@ -816,7 +823,7 @@ class DecodeOverlayOperator(ArtcOperator):
             psq, rote, rotx = (rest.pop(0), rest.pop(0), rest.pop(0)) if self.rot else (None, None, None)
             wpupd = rest.pop(0) if self.rot and self.post else None
             ccoef = rest.pop(0) if self.states else None
-            cinkh, cink, cips = (rest.pop(0), rest.pop(0), rest.pop(0)) if self.states else (None, None, None)
+            cinkh, cink, cips = [rest.pop(0) for _ in range(3)] if self.states else [None] * 3
             begin, *rest = rest
             nbegin, strip_n = (rest.pop(0), rest.pop(0)) if self.norm_objs else (None, None)
             strip, inp, inv, tcmd, tile, collect, emit, relay, *psums, ws, xp, xs, col = rest
@@ -926,8 +933,8 @@ class DecodeOverlayOperator(ArtcOperator):
                         emits()  # (a header: the updated residual slice)
                     tiles()
                 if self.states:  # (F_INK) the residual stream's step on the phase's rows: the history window out, the
-                    # helper's step (the history: X, the taps: A), the next mix's partial sums (of the queries after the
-                    # taps or in the next A object), cur's slice and the partial sums out
+                    # helper's step (the history: X, the taps: A), the next mix's partial sums (the queries: the next A
+                    # object), cur's slice and the partial sums out
                     for _ in range_(ws[i_st + S_NINK]):
                         x = x_f.acquire(1)
                         a = a_f.acquire(1)
@@ -935,17 +942,14 @@ class DecodeOverlayOperator(ArtcOperator):
                         emits()
                         command(lambda c, x=x, a=a: cink(a, x, ws, c))
                         answer()
-                        for _ in range_(ws[i_st + S_NIQA]):
-                            command(lambda c, a=a: cips(a, ws, c, 0))
-                            answer()
                         a_f.release(1)
                         x_f.release(1)
                         for _ in range_(ws[i_st + S_NIQB]):
                             a = a_f.acquire(1)
-                            command(lambda c, a=a: cips(a, ws, c, 1))
+                            command(lambda c, a=a: cips(a, ws, c))
                             answer()
+                            emits()  # (cur's slice, the partial sums; a bank's copy, the message mixes' sums)
                             a_f.release(1)
-                        emits()
                 if rote is not None:
                     for _ in range_(ws[i_st + S_NRA]):  # (F_ROTE) the residual's rotated copies, per rotation object
                         a = a_f.acquire(1)
