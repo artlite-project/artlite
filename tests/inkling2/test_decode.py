@@ -33,6 +33,7 @@ from artlite.overlay import OverlayDevice, Sequence, Transaction
 from models.inkling2.decode import InklingDecodeOperator
 from models.inkling2.image import InklingImage
 from models.inkling2.overlay import InklingOverlay, psums
+from models.tokenizer import BpeTokenizer
 
 from ..model_files import require
 from ..numerics import rel
@@ -449,3 +450,29 @@ def test_loop(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
         errs[p:p + S] = [rel(got[i], want[p + i]) for i in range(S)]
         p += S
     assert errs[~tie].max() < 3e-2 and np.median(errs) < 1e-2, (errs, tie)
+
+
+@pytest.mark.slow
+def test_model(ink: tuple[GGUFFile, InklingConfig]) -> None:
+    """The whole model's decode, a token per step (the 48 visits, the output's mix and norm, the screened head),
+    teacher-forced over a short text: each step's exact top token and the reference's top 5 logits (softcapped) against
+    the reference model's."""
+    g, cfg = ink
+    ids = BpeTokenizer(g).encode("The quick brown fox jumps over the lazy dog. The capital of France is")
+    T = len(ids)
+    ov = InklingOverlay(g, max_positions=1024)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    with torch.no_grad():
+        want = ref.forward(ids).numpy()
+    tn = np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
+    x = _rms(g.rows("token_embd.weight", np.asarray(ids)), cfg.rms_norm_eps) * tn
+    cap = cfg.softcap
+    agree, diffs = 0, []
+    for p in range(T):
+        row = ov.step(x[None, p:p + 1], p, logits=True)[0]
+        top = np.argsort(-want[p])[:5]
+        got = np.tanh(row.at(top) / cap) * cap
+        diffs.append(float(np.abs(got - want[p, top]).max()))
+        agree += int(row.top(1)[1][0] == top[0])
+    assert agree >= T - 1 and np.median(diffs) < 0.5, (agree, T, diffs)

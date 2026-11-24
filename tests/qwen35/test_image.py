@@ -254,8 +254,8 @@ def test_pack_moe() -> None:
 
 def test_gate_up_windows() -> None:
     """Gate / up tiles of other than 16 rows (``QwenImage.gu_rows``: d3-lite's Q8_0, 8) take the decode design's windows
-    (``decode.design``'s ``gu_win``) and so 4 slots, and an MoE design's windows its wide frame (Qwen3.6-35B-A3B with
-    ggml-org's Q8_0 drafter: ``draft_gate_up``); MiniCPM-V's Q4_K (16 rows) none."""
+    (``decode.design``'s ``gu_win``) and so 4 slots, an MoE design's too (Qwen3.6-35B-A3B with ggml-org's Q8_0 drafter:
+    ``draft_gate_up``); MiniCPM-V's Q4_K (16 rows) none."""
     from models.qwen35.draft import draft_formats, draft_gate_up
     from models.qwen35.overlay import QwenOverlay
 
@@ -272,7 +272,7 @@ def test_gate_up_windows() -> None:
                          gu=draft_gate_up(gm) if gm is not None else frozenset())
         assert ov.image.gu_rows() == rows and ov.op.gu_win == win, (path, ov.image.gu_rows(), ov.op.gu_win)
         if gm is not None:
-            assert draft_gate_up(gm) == {8} and ov.op.wide
+            assert draft_gate_up(gm) == {8}
         elif win:
             assert ov.op.slots == 4
         ran += 1

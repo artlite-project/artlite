@@ -835,52 +835,42 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 // Eigen's 13 / 6 rational of tanh: the numerator's odd coefficients from the highest, then the denominator's even ones
 alignas(64) static const float {{ p }}_tanc[11] = { -2.76076847742355e-16f, 2.00018790482477e-13f, -8.60467152213735e-11f, 5.12229709037114e-08f, 1.48572235717979e-05f, 6.37261928875436e-04f, 4.89352455891786e-03f, 1.19825839466702e-06f, 1.18534705686654e-04f, 2.26843463243900e-03f, 4.89352518554385e-03f };
 
-// 16 fp32 in place (r: 16 of scratch) -> tanh: the rational of the value clamped to 7.9988 (3.4e-7 off; no exp: the main
-// core's program memory), the quotient through ``srcp``
-__attribute__((noinline)) void {{ p }}_tanhr(float *__restrict v, float *__restrict r)
+// situ (Inkling's experts) of 16 gate values g (in place) and up values u: b tanh(g / b) sigmoid(g) lb tanh(u / lb) (b, lb
+// = {{ situ[0] }}, {{ situ[1] }}), as b lb / 2 tanh(g / b) (1 + tanh(g / 2)) tanh(u / lb) in fp32: each tanh the rational of
+// its argument clamped to 7.9988 (3.4e-7 off; no exp: the main core's program memory), its quotient through the inline
+// reciprocal (a leaf: no frame of callee-saved registers)
+alignas(64) static const float {{ p }}_situs[3] = { {{ 1 / situ[0] }}f, 0.5f, {{ 1 / situ[1] }}f };
+
+__attribute__((noinline)) void {{ p }}_situ(float *__restrict g, const float *__restrict u)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const aie::vector<float, 16> c = aie::broadcast<float, 16>(7.99881172180175781f);
-    const aie::vector<float, 16> x = aie::max(aie::min(aie::load_v<16>(v), c), aie::sub(aie::zeros<float, 16>(), c));
-    const aie::vector<float, 16> x2 = al::mulff<16>(x, x);
-    aie::vector<float, 16> p = aie::broadcast<float, 16>({{ p }}_tanc[0]), d = aie::broadcast<float, 16>({{ p }}_tanc[7]);
+    aie::vector<float, 16> y = aie::broadcast<float, 16>({{ situ[0] * situ[1] / 2 }}f);
     AIE_LOOP_NO_UNROLL
-    for (int i = 1; i < 10; i++) {  // (Horner: the numerator's 6 steps, then the denominator's 3)
-        const aie::vector<float, 16> t = al::mulff<16>(i < 7 ? p : d, x2);
-        if (i < 7)
-            p = aie::add(t, aie::broadcast<float, 16>({{ p }}_tanc[i]));
-        else
-            d = aie::add(t, aie::broadcast<float, 16>({{ p }}_tanc[i + 1]));
+    for (int j = 0; j < 3; j++) {  // (tanh(g / b), tanh(g / 2), tanh(u / lb))
+        const aie::vector<float, 16> v = al::mulff<16>(aie::load_v<16>(j < 2 ? g : u), aie::broadcast<float, 16>({{ p }}_situs[j]));
+        const aie::vector<float, 16> x = aie::max(aie::min(v, c), aie::sub(aie::zeros<float, 16>(), c));
+        const aie::vector<float, 16> x2 = al::mulff<16>(x, x);
+        aie::vector<float, 16> n = aie::broadcast<float, 16>({{ p }}_tanc[0]), d = aie::broadcast<float, 16>({{ p }}_tanc[7]);
+        AIE_LOOP_NO_UNROLL
+        for (int i = 1; i < 11; i++) {  // (Horner: the numerator's 6 steps, its factor x, then the denominator's 3)
+            const aie::vector<float, 16> t = al::mulff<16>(i < 8 ? n : d, i == 7 ? x : x2);
+            const aie::vector<float, 16> k = aie::broadcast<float, 16>(i == 7 ? 0.0f : {{ p }}_tanc[i]);
+            if (i < 8)
+                n = aie::add(t, k);
+            else
+                d = aie::add(t, k);
+        }
+        const aie::vector<float, 16> th = al::mulff<16>(n, {{ crcp }}(d));
+        y = al::mulff<16>(y, aie::add(th, aie::broadcast<float, 16>(j == 1 ? 1.0f : 0.0f)));
     }
-    aie::store_v(r, d);
-    {{ p }}_srcp(r);
-    aie::store_v(r, al::mulff<16>(p, aie::load_v<16>(r)));
-    aie::store_v(v, al::mulff<16>(x, aie::load_v<16>(r)));
-}
-
-// situ (Inkling's experts) of 16 gate values g (in place) and up values u: b tanh(g / b) sigmoid(g) lb tanh(u / lb) (b, lb
-// = {{ situ[0] }}, {{ situ[1] }}), as b lb / 2 tanh(g / b) (1 + tanh(g / 2)) tanh(u / lb) in fp32 (``tanhr``: t, 64 floats
-// of scratch)
-alignas(64) static const float {{ p }}_situs[3] = { {{ 1 / situ[0] }}f, 0.5f, {{ 1 / situ[1] }}f };
-
-__attribute__((noinline)) void {{ p }}_situ(float *__restrict g, const float *__restrict u, float *__restrict t)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    AIE_LOOP_NO_UNROLL
-    for (int i = 0; i < 3; i++) {
-        aie::store_v(t + 16 * i, al::mulff<16>(aie::load_v<16>(i < 2 ? g : u), aie::broadcast<float, 16>({{ p }}_situs[i])));
-        {{ p }}_tanhr(t + 16 * i, t + 48);
-    }
-    aie::store_v(t + 16, aie::add(aie::broadcast<float, 16>(1.0f), aie::load_v<16>(t + 16)));
-    aie::store_v(t, al::mulff<16>(aie::load_v<16>(t), aie::load_v<16>(t + 16)));
-    aie::store_v(t, al::mulff<16>(aie::load_v<16>(t), aie::load_v<16>(t + 32)));
-    aie::store_v(g, al::mulff<16>(aie::load_v<16>(t), aie::broadcast<float, 16>({{ situ[0] * situ[1] / 2 }}f)));
+    aie::store_v(g, y);
 }
 {% else %}
 {% set lut = km.act(km.TABLES[act], table_arg=SLOTS == 8) %}
 {{ lut.src }}
 {% endif %}
-{% set gwin = wide and (SLOTS == 8 or act == "silu") %}{# (the gate / up windows' rows of every act at 8 slots, SiLU's at 4) #}
+{% set gwin = wide and (SLOTS == 8 or act in ("silu", "situ")) %}{# (the gate / up windows' rows of every act at 8 slots, SiLU's and situ's at 4) #}
 
 // A complete row tile of every slot (yt [g {{ YT // 32 }}][slot 4][r 8], rows 8 g + r): F_NORM{{ ", F_PSQ" if rot else "" }}: times the slots' 1 / rms{{ " (moe: the nf floats of the tile's row blocks)" if moe else "" }}; F_GU
 // ({{ "per 16 rows: " if rowsplit else "" }}g 0 gate, g 1 up): {{ act }}(bf16(gate)) up into g 0 (kmath.act: the gather LUT, through gs){{ "; F_PLI: gelu(bf16(y)) pli" if pli else "" }}
@@ -938,11 +928,11 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
         }
     }
 {% elif act == "situ" %}
-    if (flags & {{ F_GU }}) {  // (situ: gate yt's g 0, up g 1 of each 16 rows)
+    if (flags & {{ F_GU }}) {  // (situ: gate yt's g 0, up g 1 of each 16 rows{{ ": the ng windows completed" if gwin else "; nf 0: one tile's, the windows' ``guwin``" }})
         AIE_LOOP_NO_UNROLL
-        for (int h = 0; h < {{ "nf" if rg else YT }}; h += 64) {
-            {{ p }}_situ(yt + h, yt + h + 32, WS(float, {{ w_.scr }}));
-            {{ p }}_situ(yt + h + 16, yt + h + 48, WS(float, {{ w_.scr }}));
+        for (int h = 0; h < {{ "64 * ng" if gwin else ("(nf ? nf : 64)" if rg else YT) }}; h += 64) {
+            {{ p }}_situ(yt + h, yt + h + 32);
+            {{ p }}_situ(yt + h + 16, yt + h + 48);
         }
     }
 {% elif SLOTS == 8 %}
@@ -2028,16 +2018,21 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
             add = a;
         }
     }
+{% elif gu_win %}
+    {{ p }}_rows(ws, flags & ~{{ F_GU }}, {{ YB }} * G);
+    const int nw = gu ? {{ p }}_guwin(ws, S, R) : 0;  // (gate / up: 8 outputs once the window completes, else none)
 {% else %}
     {{ p }}_rows(ws, flags | gu, {{ YB }} * G);
+{% endif %}
+{% if not wide %}
     int add = 0;
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {  // (per block of 16 rows: R rows of a row group, or a tile's rows; F_GU: 8 outputs)
         int a = 0;
         float *__restrict as = (float *)((uint8_t *)aw + {{ ACC_AT }}) + {{ H }} * s;
         AIE_LOOP_NO_UNROLL
-        for (int j = 0; j < G; j++) {
-            const int k = gu ? 8 : (nv - R * j > R ? R : nv - R * j);
+        for (int j = 0; j < G; j++) {  // (a gate / up tile: one row group)
+            const int k = gu ? {{ "nw" if gu_win else 8 }} : (nv - R * j > R ? R : nv - R * j);
             if (k > 0)
                 a += {{ p }}_slot(ws, s, flags, fw, k, row0 + r0 + R * j, n + a, j, as);
         }

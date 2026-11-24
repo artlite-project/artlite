@@ -72,7 +72,7 @@ from artlite.decode.attn import (
 )
 from artlite.decode.attn_overlay import AttentionOverlay, CacheKind, CacheUse
 from artlite.decode.design import BLEND_OBJECTS
-from artlite.decode.model import InputRegion
+from artlite.decode.model import InputRegion, Snapshot, host_bytes
 from artlite.decode.protocol import (
     B_F32,
     B_PAIR,
@@ -115,6 +115,7 @@ from artlite.decode.protocol import (
     packed_slots,
     region_bytes,
 )
+from artlite.decode.screen import Screen, Screened
 from artlite.decode.step import Fill, Part, Rec, StepPlan, Tail
 from artlite.decode.vring import PAIR, tails
 from artlite.gguf_model import GGUFFile
@@ -129,7 +130,7 @@ from .decode import InklingDecodeOperator
 from .image import EXPERT_UNITS, InklingImage
 
 KINDS = ("swa", "full")
-FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4"})  # (the formats the overlay runs so far)
+FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4", "Q8_0H"})  # (the formats the overlay runs so far)
 PHASES = ("q", "k", "v", "att", "o")  # (a visit's attention phases)
 FFN_PHASES = ("router", "moe")  # (its FFN's: the router's GEMV, the MoE operator phase)
 RING = 9216  # (a raw ring's bytes: one A object, its first 8 KB the ring)
@@ -140,7 +141,8 @@ CTL = ("q", "k", "v", "ffn")  # (a loop visit's controlled streams, ``InklingCon
 # (the image's regions a phase reads, in the A stream's order)
 PHASE_REGIONS = {"q": ("q_norm", "q"), "k": ("k_norm", "k"), "v": ("v_norm", "v"), "o": ("o", "inkf", "inkfq"),
                  "router": ("router_norm", "router")} | \
-    {f"d{c}{h}": (f"d{c}{h}_norm", f"d{c}{h}") for c in CTL for h in "ab"} | {f"b{c}": (f"ctl_{c}",) for c in CTL}
+    {f"d{c}{h}": (f"d{c}{h}_norm", f"d{c}{h}") for c in CTL for h in "ab"} | {f"b{c}": (f"ctl_{c}",) for c in CTL} | \
+    {"lm": ("lm_norm", "lm")}
 BLENDED = {"q": 5, "k": 6, "v": 7, "ffn": 5}  # (the state array's slots of a loop visit's blended inputs)
 BANK0 = 8  # (the state array's first bank slot: bank w's states 8 + 2 w, 9 + 2 w)
 SA_SLOTS = BANK0 + 2 * INK_BANKS  # (the state array's slots)
@@ -201,8 +203,11 @@ class InklingOverlay(AttentionOverlay):
         self.vis = {v: cfg.visits[v] for v in vs}
         self.ffn = ffn
         # (the FFN's combine reads the next visit's queries: its layer's "inkq", the output's after the last visit)
-        self.after = vs[-1] + 1 if vs[-1] + 1 < len(cfg.visits) else None
-        layers = {x.layer for x in self.vis.values()} | ({cfg.visits[self.after].layer} if ffn and self.after else set())
+        self.after = vs[-1] + 1
+        # (the whole model's last visit: then the output's mix, its norm and the LM head)
+        self.lm_ok = ffn and self.after == len(cfg.visits)
+        layers = {x.layer for x in self.vis.values()} | \
+            ({cfg.visits[self.after].layer} if ffn and not self.lm_ok else set())
         image = None if weights is not None else InklingImage(gguf, cfg, layers=sorted(layers), vocab=vocab)
         super().__init__(gguf, layers=vs, vocab=vocab, kv_k=kv_k, weights=weights, image=image)
         img = self.image
@@ -210,6 +215,8 @@ class InklingOverlay(AttentionOverlay):
         fmts = {b.fmt for L in img.layers for name in regions for b in img.region(L, name).blocks}
         if ffn:
             fmts |= {f for r in img.slabs for b in r.blocks for f in b.formats}
+        if self.lm_ok:
+            fmts |= set(img.region(-1, "lm").blocks[0].formats)
         if fmts - FORMATS:
             raise NotImplementedError(f"{', '.join(sorted(fmts - FORMATS))} tiles")
         self.hd, self.q_heads = cfg.head_dim, cfg.q_per_kv
@@ -220,7 +227,8 @@ class InklingOverlay(AttentionOverlay):
         self.op = InklingDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
                                         eps=cfg.rms_norm_eps, attn=at, moe=moe,
                                         paged=paged,
-                                        situ=(cfg.situ_beta, cfg.situ_linear_beta))
+                                        situ=(cfg.situ_beta, cfg.situ_linear_beta),
+                                        gu_win=ffn and img.gu_rows() != {16})
         self.pg = at.pg[self.hd]
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)
         full = -(-max_positions // self.pg)
@@ -236,12 +244,16 @@ class InklingOverlay(AttentionOverlay):
         self.nst = dict(zip(range(len(cfg.visits)), cur_states(cfg)))
         self.n0 = self.nst[vs[0]]  # (the first visit's cur: its states 0 .. n0 come from the host)
         self._hbase = -3  # (the history windows' first position)
+        self._sa_sp = 0  # (the packed slots of the state array's layout whose padding is zero: ``write_states``)
         self._eskip: dict[tuple[int, int], tuple] = {}  # ((visit, slot) -> its raw K / V objects' EGRP words: ``_set_parts``)
+        if self.lm_ok and img.screen:  # (the screened head's host side: the exact logits of its candidates)
+            norm = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
+            self.screen = Screen(gguf, img.lm, norm, cfg.rms_norm_eps, min(self.vocab, cfg.vocab_size))
         self._plan()
 
     def layer(self, v: int) -> int:
-        """The physical layer of visit v."""
-        return self.vis[v].layer
+        """The physical layer of visit v (-1: the LM head's)."""
+        return -1 if v < 0 else self.vis[v].layer
 
     # ------------------------------------------------------------------
     # Layout
@@ -255,6 +267,8 @@ class InklingOverlay(AttentionOverlay):
             out += [(v, n) for n in ctl + list(PHASES)]
             if self.ffn:
                 out += [(v, n) for n in (["dffna", "dffnb", "bffn"] if msg else []) + list(FFN_PHASES)]
+        if lm and self.lm_ok:
+            out.append((-1, "lm"))
         return out
 
     def _mix(self, v: int, name: str) -> tuple[int, int, int, tuple | None]:
@@ -262,6 +276,9 @@ class InklingOverlay(AttentionOverlay):
         by: -1 one state, coefficient 1; F_COEF's (partial sums object, its queries, the mix's states) or None). A loop
         visit's GEMV phases read their blended inputs, its controllers' down halves the mix (states 0 .. n) and the
         message (the bank its pass reads); a set's F_COEF writes it and the stream's ones after it."""
+        if v < 0:  # (the LM head: the output's mix of the last visit's states, one query)
+            n = self.nst[self.layers[-1]] + int(self.vis[self.layers[-1]].block)
+            return 0, pow2(n + 1), 0, ((self.after, "a"), 1, n + 1)
         vis = self.vis[v]
         n = self.nst[v] + (int(vis.block) if name in ("router", "dffna") else 0)
         j = 0 if vis.kind == "swa" else None
@@ -308,8 +325,10 @@ class InklingOverlay(AttentionOverlay):
         self.ps = {(v, m): take("ACT", XB) for v in self.layers for m in "af"}
         # (the message mixes' partial sums of a loop visit after the first pass: queries 0 .. 2, 3)
         self.ps |= {(v, m): take("ACT", XB) for v in self.layers if self.vis[v].messages for m in ("ma", "mb")}
-        if self.after is not None:  # (the visit after the last: its attention mix's, the last FFN's output)
-            self.ps |= {(self.after, m): take("ACT", XB) for m in ("a", "ma", "mb")}
+        # (the visit after the last: its attention mix's, or the output's, of the last FFN's output)
+        self.ps |= {(self.after, m): take("ACT", XB) for m in ("a", "ma", "mb")}
+        if self.lm_ok:
+            self.meta[(-1, "lm")] = take("ACT", XB)
         # per loop visit after the first pass and stream: its controller's down halves' metadata objects, their g object
         # (and the dumps of their C objects' other strips past it: ``_gemv``), its blend's metadata object
         msg = [v for v in self.layers if self.vis[v].messages]
@@ -358,9 +377,9 @@ class InklingOverlay(AttentionOverlay):
         act[self.loadr:self.loadr + COLS * self.LOADS * SLOTS * XB] = 0
         for v in self.layers if self.ffn else ():  # (the routing's tables after the logits: ``moe.route.render(units=)``)
             b, E = f"blk.{self.layer(v)}.", cfg.n_experts
-            bias = np.asarray(g.tensor(b + "exp_probs_b.bias").dequantize(), np.float32).reshape(-1)
-            dsc = np.asarray(g.tensor(b + "ffn_down_exps.scale").dequantize(), np.float64).reshape(-1) * cfg.expert_weights_scale
-            gsc = np.asarray(g.tensor(b + "ffn_gate_up_exps.scale").dequantize(), np.float32).reshape(-1)
+            bias = self._expert_vec(b + "exp_probs_b.bias").astype(np.float32)
+            dsc = self._expert_vec(b + "ffn_down_exps.scale") * cfg.expert_weights_scale
+            gsc = self._expert_vec(b + "ffn_gate_up_exps.scale").astype(np.float32)
             pay = act[self.xch[v] + 4 * META:self.xch[v] + XB].view(np.float32)
             pay[4 * E:5 * E], pay[5 * E:6 * E], pay[6 * E:7 * E] = bias, dsc.astype(np.float32), gsc
             pay[7 * E:7 * E + 4 * len(EXPERT_UNITS)].view(np.int32)[:] = self.unit_table(self.layer(v)).reshape(-1)
@@ -381,6 +400,32 @@ class InklingOverlay(AttentionOverlay):
                     kv[self.hist[(v, i)]:self.hist[(v, i)] + COLS * self.HIST] = 0
             self.dev.flush("KV")
 
+    def _conv_regions(self) -> list[tuple[int, int]]:
+        """(offset, bytes) in KV of each visit's raw rings and history windows: the convs' state."""
+        return [(self.raw[v], self.kv_heads * RING) for v in self.layers] + \
+            [(self.hist[(v, i)], COLS * self.HIST) for v in self.layers for i in range(2)]
+
+    def snapshot(self, position: int) -> Snapshot:
+        """(and the convs' state: the raw rings, the history windows and their first position)"""
+        snap = super().snapshot(position)
+        kv, parts = self.dev.view("KV"), []
+        for o, n in self._conv_regions():
+            self.dev.fetch("KV", o, n)
+            a = host_bytes((n,))
+            a[:] = kv[o:o + n]
+            parts.append(a)
+        snap.extra["conv"] = (parts, self._hbase)
+        return snap
+
+    def restore(self, snapshot: Snapshot) -> None:
+        """(the convs' state too)"""
+        super().restore(snapshot)
+        parts, self._hbase = snapshot.extra["conv"]
+        kv = self.dev.view("KV")
+        for (o, n), a in zip(self._conv_regions(), parts, strict=True):
+            kv[o:o + n] = a
+            self.dev.flush("KV", o, n)
+
     def _ran(self, p: int, S: int, seq: int | None = None) -> None:
         """(and the history windows: rows p - 3 .. p + S - 1)"""
         super()._ran(p, S, seq)
@@ -388,6 +433,12 @@ class InklingOverlay(AttentionOverlay):
 
     def _ring_state(self, seq: int | None = None) -> tuple:
         return super()._ring_state(seq) + (self._hbase,)
+
+    def _expert_vec(self, name: str) -> np.ndarray:
+        """A layer's per-expert vector (n_experts,) float64; a scale the file has not (a layer of unscaled experts) ones."""
+        if name not in self.gguf:
+            return np.ones(self.cfg.n_experts)
+        return np.asarray(self.gguf.tensor(name).dequantize(), np.float64).reshape(-1)
 
     def unit_table(self, L: int) -> np.ndarray:
         """Layer L's units (``EXPERT_UNITS``) for the routing (len, 4) int32: per unit the offset of its bytes in an
@@ -439,7 +490,8 @@ class InklingOverlay(AttentionOverlay):
         out = []
         ranges = self.state_bytes(packed_slots(S)) // XPAY
         for (v, name), off in self.meta.items():  # (every phase on states: ``_mix``)
-            flags = MOE_BLOCKS if name == "router" else BLOCK_FLAGS if name in ("q", "k", "v") else {name: B_PAIR | B_F32}
+            flags = MOE_BLOCKS if name == "router" else BLOCK_FLAGS if name in ("q", "k", "v") else \
+                None if name == "lm" else {name: B_PAIR | B_F32}
             gr = mp.groups(self.image.region(self.layer(v), name), F_NORM, S, block_flags=flags)
             assert len(gr) == 1
             m = gr[0].meta.copy()
@@ -540,6 +592,10 @@ class InklingOverlay(AttentionOverlay):
                 seq.fill("X", c, dev.address("ACT", self.ps[coef[0]]), XB)
             seq.fill("X", c, dev.address("ACT", self.sa + first * ST - (XB - XPAY)), nr * XB, (XB // 8, 2, XB // 8, ST // 4),
                      repeat=ST // XPAY, iteration=(XPAY // 4, ST // XPAY))
+        if name == "lm":
+            for c in range(COLS):
+                self._logits_out(seq, c, S)
+            return
         if name[0] == "d":  # (a controller's down half: per slot 8 fp32 of g, the first quarter of a C object: the other
             # three past the g object)
             h = "ab".index(name[-1])
@@ -816,6 +872,11 @@ class InklingOverlay(AttentionOverlay):
         if vis.messages:
             x[n:, :S] = bank
         ST = self.state_bytes(sp)
+        if sp != self._sa_sp:  # (another layout: every state's padding past the hidden zero, which the NPU's drains
+            # leave as they find it and the mixes' sums of squares read; a step of other slots put values there)
+            for b in range(SA_SLOTS):
+                act[self.sa + b * ST + 4 * H * sp:self.sa + (b + 1) * ST] = 0
+            self._sa_sp = sp
         for b, slot in enumerate(slots):
             xs = np.zeros((self.K // 8, sp, 8), np.float32)
             xs[:H // 8] = x[b].reshape(sp, H // 8, 8).transpose(1, 0, 2)
@@ -842,15 +903,28 @@ class InklingOverlay(AttentionOverlay):
             act[self.ps[(v, m)] + XB - XPAY:][:ps.nbytes] = ps.reshape(-1).view(np.uint8)
             self.dev.flush("ACT", self.ps[(v, m)], XB)
 
-    def step(self, states: np.ndarray, position: int, bank: np.ndarray | None = None) -> None:
+    def step(self, states: np.ndarray, position: int, bank: np.ndarray | None = None, *,
+             logits: bool = False) -> np.ndarray | Screened | None:
         """One step of S slots at position .. position + S - 1: states (n0 + 1, S, hidden) the first visit's input states,
-        bank (2, S, hidden) the bank its messages mix (``write_states``)."""
+        bank (2, S, hidden) the bank its messages mix (``write_states``); ``logits`` (the whole model): the LM head's
+        (``Screened``: the logits before the softcap), else None."""
         S = states.shape[1]
-        assert 1 <= S <= SLOTS
+        assert 1 <= S <= SLOTS and (not logits or self.lm_ok)
         if self._metas_s != (S, self.start):
             self._metas(S)
         self.write_states(states, bank)
-        self._run(S, position, False)
+        return self._run(S, position, logits)
+
+    def _lm_x(self, S: int) -> np.ndarray:
+        """(the screened head's input: the output's mix of the last visit's states, from the state array; the head norms
+        it, ``Screen.input``)"""
+        n = self._mix(-1, "lm")[3][2]
+        x = np.stack([self.state(b, S) for b in range(n)]).astype(np.float64)  # (n, S, H)
+        q = np.asarray(self.gguf.tensor("output_res_query.weight").dequantize(), np.float64).reshape(-1)
+        xs = x / np.sqrt((x * x).mean(-1, keepdims=True) + InklingConfig.MIX_EPS)
+        sc = xs @ q / np.sqrt(self.H)
+        w = np.exp(sc - sc.max(0))
+        return np.einsum("ns,nsh->sh", w / w.sum(0), xs).astype(np.float32)
 
     def state(self, b: int, S: int) -> np.ndarray:
         """State b of the last step's state array (S, hidden) fp32."""

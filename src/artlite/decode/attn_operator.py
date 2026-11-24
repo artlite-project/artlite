@@ -80,16 +80,26 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
         return 24 - n, PG_STORE - size, size
 
     @property
+    def a_out_channel(self) -> int | None:
+        """(an MoE design beside the attention cores' pages: an odd channel, its BDs the odd half's, as ``moe_a_depth``
+        counts them; the compiler puts both of A's channels in the even half when they fit there, A_DEPTH 12 or fewer,
+        onto the formats' page BDs)"""
+        return 1 if self.moe and self.attn_pages and self.paged else None
+
+    @property
     def pg_bds(self) -> int:
         """(paged formats) Their pages' BDs: a format's per core half, the routing's and the residual stream's pages of
         the helper (``route_page``, ``ink_page``)."""
         return 2 * len(self.paged) + int(self.route_page) + 2 * int(self.ink_page > 0)
 
     def moe_a_depth(self) -> int:
-        """(beside the attention cores' pages: their BDs in the odd half, the formats' in the even half)"""
+        """(beside the attention cores' pages: their BDs in the odd half, the formats' in the even half; as many objects
+        as the halves leave, which Inkling's eleven page BDs make fewer than ``A_DEPTH``)"""
         if not (self.attn_pages and self.paged):
             return super().moe_a_depth()
-        return max(type(self).A_DEPTH, min(A_DEPTH_MOE, 24 - self.X_DEPTH - max(self.pg_bds, 48 - PG_BD)))
+        d = min(A_DEPTH_MOE, 24 - self.X_DEPTH - max(self.pg_bds, 48 - PG_BD))
+        assert d >= DecodeOverlayOperator.A_DEPTH, (self.paged, self.pg_bds, d)
+        return d
 
     def attn_a_depth(self) -> int:
         """The objects of the A stream's memtile FIFO of a dense design: as many as the memtile's BDs leave it,

@@ -190,12 +190,10 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
     const int ys = (fmt & {{ B_G4 }}) ? {{ yb }} : 0;
     fmt &= 255;
 {% endif %}
-{% for f in fmts %}
-{% if f in paged %}
+{% for f in fmts if f not in paged %}
+{% if paged %}
     if (fmt == {{ fid[f] }}) {
-        {{ p }}_pg_need<H>({{ paged.index(f) + 1 }}, scr);
-        ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if f in rg_fmts else "" }}))(intptr_t)
-             ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+        {{ p }}_{{ fn[f] }}<H>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
         return;
     }
 {% else %}
@@ -203,6 +201,16 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
         {{ p }}_{{ fn[f] }}<H>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
 {% endif %}
 {% endfor %}
+{% if paged %}
+    // (a paged format: its page, then its entry, one signature: rg's ys for every page)
+    int page = 1;
+{% for f in paged[1:] %}
+    page = fmt == {{ fid[f] }} ? {{ loop.index + 1 }} : page;
+{% endfor %}
+    {{ p }}_pg_need<H>(page, scr);
+    ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if rg else "" }}))(intptr_t)
+         ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if rg else "" }});
+{% endif %}
 }
 
 }  // namespace
@@ -212,7 +220,7 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 // (a page: format {{ f }}'s half {{ h }}, entered through the pager's state words only; external, so that it stays in
 // the object for ``paging.link``)
 void {{ p }}_pgf{{ h }}_{{ f | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
-                                        float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if f in rg_fmts else "" }})
+                                        float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
 }

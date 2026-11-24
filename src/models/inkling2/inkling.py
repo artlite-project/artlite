@@ -9,19 +9,70 @@ not a system one; tools as one JSON line in a ``tool_declare`` block, calls ``<|
 The template opens no turn for the reply: the model writes its own blocks (``<|message_model|><|content_thinking|>``
 .. then ``<|message_model|><|content_text|>`` ..), and its turn ends at ``<|content_model_end_sampling|>``.
 
-The NPU path (decode, prefill) is not there yet: ``load`` refuses."""
+A decode dispatch runs up to 4 consecutive tokens through the 48 visits and the LM head on one stream of the weights
+(``overlay.InklingOverlay``): the projections, the depth mixes, the loop's controllers and the experts on the main cores
+and their helpers, the residual stream's state array in their memory, the attention, its KV caches and the K / V convs
+on the attention cores; the head screened (``decode.screen``: the host computes its largest logits exactly). Prompts run
+as decode steps. The convs' state holds the last positions only: a sequence goes back to a checkpoint (``recurrent``)."""
 
 from collections.abc import Sequence
 
 import numpy as np
 
+from artlite.decode.kv import kv_precision
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import InklingConfig
 
+from ..lanes import alone
 from ..model import Model
-from ..npu_model import NpuModel
+from ..overlay_model import OverlayModel
 from ..sampling import TOP_K_ALL, Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
+from .overlay import InklingOverlay
+
+
+class NpuInkling(OverlayModel):
+    """The model on the NPU (module docstring). ``capacity``: the positions the KV caches hold; ``kv_k``: their K
+    precision ("hilo", "single")."""
+
+    recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
+
+    def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0):
+        self.gguf = gguf
+        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k)
+        self.cfg = self.overlay.cfg
+        self.eos_token_ids = self.cfg.eos_token_ids
+        self.softcap = self.cfg.softcap
+        self.prefill = None
+        self._tn = np.asarray(gguf.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
+        self._open(threads=threads)
+        self._w_out = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
+        gguf.release()
+        self.position = 0
+        self._open_lanes()
+
+    @property
+    def capacity(self) -> int:
+        return self.overlay.max_positions
+
+    def describe(self) -> str:
+        ov = self.overlay
+        return (f"{ov.image.nbytes / 1e9:.2f} GB of weights ({ov.image.streamed_bytes() / 1e9:.2f} GB dense), "
+                f"{ov.sizes['KV'] / 1e6:.0f} MB of KV cache and conv state ({self.capacity} positions, K "
+                f"{'hi + lo' if ov.kp == 2 else 'single'})")
+
+    @alone
+    def reset(self) -> None:
+        """Forget the cached positions (and the convs' state)."""
+        self._abandon()
+        self.overlay.reset()
+        self.position = 0
+
+    def _step_inputs(self, tokens: list[int]) -> tuple:
+        """(the first visit's input: the embedding rows RMS-normed with ``token_embd_norm``, as one state)"""
+        x = self.gguf.rows("token_embd.weight", np.asarray(tokens)).astype(np.float32)
+        x = x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + self.cfg.rms_norm_eps).astype(np.float32)
+        return ((x * self._tn)[None],)
 
 
 class Inkling(Model):
@@ -33,11 +84,13 @@ class Inkling(Model):
     reasoning = ("<|content_thinking|>", "<|end_message|>")
     thought_first = True
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, kv_k: str = "hilo"):
+        kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = InklingConfig.from_gguf(self.gguf)
         self.tokenizer = BpeTokenizer(self.gguf)
         self.eos_token_ids = self.cfg.eos_token_ids
+        self.kv_k = kv_k
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -72,8 +125,9 @@ class Inkling(Model):
         text token's row takes and an image's does not)."""
         return self.gguf.rows("token_embd.weight", np.asarray(tokens))
 
-    def load(self, *, capacity: int, prefill: bool = True) -> NpuModel:
-        raise NotImplementedError(f"{self.name}: the NPU path (decode, prefill) is not implemented yet")
+    def load(self, *, capacity: int, prefill: bool = True) -> NpuInkling:
+        """(prompts as decode steps: ``prefill`` has no effect)"""
+        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k)
 
 
-__all__ = ["Inkling"]
+__all__ = ["Inkling", "NpuInkling"]

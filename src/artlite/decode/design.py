@@ -386,8 +386,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.tails, self.tail_pairs = tails, tail_pairs
         assert not tails or (self.xh and moe is None), "tails: dense designs of the super-block split"
         assert not tail_pairs or tails, "tail_pairs: designs with tails"
-        # (tiles of more than 16 rows, or an MoE design's gate / up windows)
-        self.wide = any(r > 16 for r in rows.values()) or (moe is not None and gu_win)
+        self.wide = any(r > 16 for r in rows.values())  # (tiles of more than 16 rows)
         self.yt = (128 if self.wide else 64) * slots // 4  # (floats of a row tile's outputs)
         # (floats of the helper's partial rows: its row groups of a tile in the super-block split, or half a row-split's)
         # (floats of the helper's partial rows: [g][slot][r] of its row groups of a tile: 4 at 4 slots, the formats' at 8)
@@ -600,6 +599,11 @@ class DecodeOverlayOperator(ArtcOperator):
         return len(self.paged) + 1 + int(self.route_page) if self.states and self.paged else 0
 
     @property
+    def a_out_channel(self) -> int | None:
+        """The memtile MM2S channel of the A stream's forward to the cores (None: the compiler's choice)."""
+        return None
+
+    @property
     def pg_split(self) -> bool:
         """Whether each core half's pages have a memtile channel of their own (``pg_channels``): a design of 8 slots, whose
         memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves; an MoE design of more
@@ -786,8 +790,9 @@ class DecodeOverlayOperator(ArtcOperator):
         mr, hr = self.MAIN_ROW, self.HELPER_ROW
         akw, amt = ({"transport": Transport.dma(Packet(AID))}, {"port": Port.dma(A_MT)}) if self.a_bcast else ({}, {})
         a_l3 = [ObjectFifo(a_ty, name=f"{P}_A{c}", depth=self.A_DEPTH, **akw) for c in range(COLS)]
-        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH, **amt).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}")
-                for c in range(COLS)]
+        fwd = {} if self.a_out_channel is None else {"port": Port.dma(self.a_out_channel)}
+        a_l1 = [a_l3[c].cons(depth=self.A_DEPTH, **amt).forward(tile=Tile(c, 1), depth=self.A_FWD, name=f"{P}_a{c}",
+                                                                **fwd) for c in range(COLS)]
         # (moe: the X stream packet-switched, its channel also carries the control packets into the shim's TileControl)
         x_l3 = [ObjectFifo(x_ty, name=f"{P}_X{c}", depth=self.X_DEPTH,
                            **({"transport": Transport.dma(Packet(XID))} if self.moe or self.bcast else {})) for c in range(COLS)]
