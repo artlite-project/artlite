@@ -33,13 +33,14 @@ from .overlay import InklingOverlay
 
 class NpuInkling(OverlayModel):
     """The model on the NPU (module docstring). ``capacity``: the positions the KV caches hold; ``kv_k``: their K
-    precision ("hilo", "single")."""
+    precision ("hilo", "single"); ``wrap``: the sliding-window caches' ring (``InklingOverlay``)."""
 
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
 
-    def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0):
+    def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
+                 wrap: int | None = None):
         self.gguf = gguf
-        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k)
+        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap

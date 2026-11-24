@@ -13,7 +13,8 @@ Per visit v of physical layer L (column c holding KV head c):
   object per cache group within the relative extent (X: [rel 16][128] bf16 of the layer's reversed table, ``ink_rel``,
   each a window of the group's distances), the records and o (D: o into the o phase's input).
 
-The KV caches: per visit and KV head linear groups (``decode.kv``), a sliding-window visit's after its window's guard;
+The KV caches: per visit and KV head linear groups (``decode.kv``), a sliding-window visit's after its window's guard
+and, past ``WRAP`` groups of capacity, a ring of ``WRAP`` groups (``CacheKind.wrap``: its range read in two fills);
 the rings of open records (``decode.vring``), the raw rings (zero at a sequence's start: the convs' history before
 position 0). The token objects carry tau per slot (the full layers' factor of q and r, ``InklingConfig.tau``) where
 the other models' carry RoPE tables.
@@ -134,6 +135,8 @@ FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4", "Q8_0H"})  # (the formats the ove
 PHASES = ("q", "k", "v", "att", "o")  # (a visit's attention phases)
 FFN_PHASES = ("router", "moe")  # (its FFN's: the router's GEMV, the MoE operator phase)
 RING = 9216  # (a raw ring's bytes: one A object, its first 8 KB the ring)
+WRAP = 32  # (groups of a sliding-window cache's ring: 2048 positions, its window's 17 groups and the next one a step's drafts
+# write; decode steps only, no prefill chunks to hold)
 E_ROWS = 17  # (E_rev's rows: a zero row, then the 16 of the table)
 BLOCK_FLAGS = dict.fromkeys(("sink", "kd", "vd"), B_PAIR | B_F32) | {"k": B_F32, "v": B_F32}
 HIST_ROWS = 8  # (a history window's rows: 3 + S <= 7 written, a read's object past its 3)
@@ -188,7 +191,8 @@ class InklingOverlay(AttentionOverlay):
     """An Inkling GGUF model's visits on its decode overlay (module docstring). ``visits``: the visits to run (default all;
     tests run slices), ``max_positions``: the caches' capacity, ``kv_k``: the caches' K precision, ``ffn``: the visits'
     FFNs (False: their attention and o phases only), ``paged``: the formats whose kernels are pages (default: every
-    format, which the main and helper cores' memory does not hold with the residual stream's work)."""
+    format, which the main and helper cores' memory does not hold with the residual stream's work), ``wrap``: the
+    sliding-window caches' ring (groups; 0: linear; default ``WRAP`` past that many groups of capacity)."""
 
     CONFIG, IMAGE = InklingConfig, InklingImage
     CHAIN = 1
@@ -197,7 +201,7 @@ class InklingOverlay(AttentionOverlay):
 
     def __init__(self, gguf: GGUFFile, *, visits: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, ffn: bool = True,
-                 paged: tuple[str, ...] | None = None):
+                 paged: tuple[str, ...] | None = None, wrap: int | None = None):
         cfg = InklingConfig.from_gguf(gguf)
         vs = list(range(len(cfg.visits))) if visits is None else list(visits)
         self.vis = {v: cfg.visits[v] for v in vs}
@@ -234,8 +238,12 @@ class InklingOverlay(AttentionOverlay):
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)
         full = -(-max_positions // self.pg)
         self.max_positions = full * self.pg
-        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.guard + full, guard=self.guard,
-                                window=cfg.sliding_window),
+        wrap = (WRAP if full > WRAP else 0) if wrap is None else wrap
+        # (a ring holds the window's groups and the group after them: a step's drafts write there, kept positions' windows
+        # never)
+        assert not wrap or self.guard + 2 <= wrap < full, (wrap, self.guard, full)
+        self.kinds = (CacheKind(hd=self.hd, pg=self.pg, groups=self.guard + (wrap or full), guard=self.guard,
+                                window=cfg.sliding_window, wrap=wrap),
                       CacheKind(hd=self.hd, pg=self.pg, groups=full))
         self.uses = {v: CacheUse(kind=KINDS.index(x.kind), source=v, ring=v) for v, x in self.vis.items()}
         self.period = PAIR

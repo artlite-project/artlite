@@ -289,6 +289,49 @@ def test_attention(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     assert max(errs) < 2e-2, (np.argmax(errs), max(errs), np.median(errs))
 
 
+def test_ring(ink: tuple[GGUFFile, InklingConfig]) -> None:
+    """A sliding-window visit's cache as a ring of 18 groups (``CacheKind.wrap``: 1152 positions, the window's 17 groups
+    and one) over 2600 positions, past its window and across two turns of the ring: o of every step against the
+    reference's attention; a snapshot after the first turn, 6 steps, a restore and the same steps again: bit for bit (the
+    ring's window back with the raw rings)."""
+    g, cfg = ink
+    v = 0
+    assert cfg.visits[v].kind == "swa"
+    ov = InklingOverlay(g, visits=[v], max_positions=4096, ffn=False, wrap=18)
+    ov.load()
+    ref = Model(g, cfg, q8=False)
+    T = 2600
+    toks = np.random.default_rng(5).integers(0, cfg.vocab_size, T)
+    tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
+    x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
+    with torch.no_grad():
+        want = _attention_ref(ref, cfg.visits[v], x, T).numpy()
+    xs = x.numpy()
+
+    def step(p: int, S: int) -> np.ndarray:
+        ov.step(np.stack([xs[p:p + S]] * (ov.n0 + 1)), p)
+        return ov.attn_out(v, S)
+
+    errs, p, snap, again = [], 0, None, []
+    sizes = [4] * 287 + [3, 1] + [4] * 4 + [2, 2] + [4] * 1000
+    for S in sizes:
+        if p + S > T:
+            break
+        if p == 1300:  # (past the first turn: positions 1152 .. on in slots 0 ..)
+            snap = ov.snapshot(p)
+        got = step(p, S)
+        if snap is not None and len(again) < 6:
+            again.append((p, S, got.copy()))
+        errs.append(rel(got, want[p:p + S]))
+        p += S
+    assert p > 2 * 18 * ov.pg, p
+    print(f"{len(errs)} steps to position {p}: rel max {max(errs):.2e}, median {np.median(errs):.2e}")
+    assert max(errs) < 2e-2, (int(np.argmax(errs)), max(errs), np.median(errs))
+    ov.restore(snap)
+    for q, S, got in again:
+        assert np.array_equal(step(q, S), got), q
+
+
 @pytest.mark.parametrize("v", [0, 5])
 def test_o(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     """A visit's o phase with the residual stream's step (F_INK) over steps of 1, then 4, 4, 3 slots: W_o's rows, the
