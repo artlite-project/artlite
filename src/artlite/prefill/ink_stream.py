@@ -174,7 +174,7 @@ class InkResidOperator(ArtcOperator):
 
     def workspace(self) -> dict[str, int]:
         C = self.C
-        return regions([("taps", 8 * C), ("win", 16 * C), ("snap", 12 * C), ("st", 64)])
+        return regions([("taps", 8 * C), ("win", 16 * C), ("hl", 16 * C), ("snap", 12 * C), ("st", 64)])
 
     def get_kernel_src(self) -> str:
         return _SRC.render(op="resid", p=self.p, w=Attr(self.workspace()), C=self.C, TB=TB, BLOCK=self.block,
