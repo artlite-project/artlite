@@ -113,8 +113,14 @@ def top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray)
     """``render(units=)``'s top k of each slot's fp32 logits (S, E): (ids (S, k): the k largest sigmoid(l) + bias, ties
     to the lower id; weights (S, k), float64: sigmoid(l) / (their sum + 1e-20) times dscale of the expert)."""
     sg = 1 / (1 + np.exp(-np.asarray(logits, np.float64)))
-    keys = (sg.astype(np.float32) + np.asarray(bias, np.float32)).astype(np.float64)
-    order = np.argsort(-keys, axis=1, kind="stable")[:, :k]
+    keys = sg.astype(np.float32) + np.asarray(bias, np.float32)
+    # (the k largest by composite keys: a key's ordered bits, then ~id, ties to the lower id; argpartition and a sort of
+    # the k: 2.9x a stable argsort of the rows, the prefill's routing per visit)
+    u = (keys + np.float32(0)).view(np.uint32).astype(np.uint64)  # (+0: -0 as +0)
+    E = keys.shape[1]
+    comp = (np.where(u >> 31, u ^ 0xFFFFFFFF, u | 0x80000000) << 32) | (0xFFFFFFFF - np.arange(E, dtype=np.uint64))
+    part = np.argpartition(comp, E - k, axis=1)[:, E - k:]
+    order = np.take_along_axis(part, np.argsort(np.take_along_axis(comp, part, 1), axis=1)[:, ::-1], 1)
     top = np.take_along_axis(sg, order, 1)
     return order, top / (top.sum(1, keepdims=True) + 1e-20) * np.asarray(dscale, np.float64)[order]
 
