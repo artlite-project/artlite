@@ -47,7 +47,7 @@ from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
 SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own
-SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB))  # chunk sizes (a sliding-window ring: a chunk and its window in one turn)
+SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB)) + (1536, 2048)  # chunk sizes (the experts' weights once per chunk)
 PREP_T = 512  # tokens of a prep item at most (its chained fills)
 CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
 # the time model's constants (``layer_seconds``): a ConfigureOp, per sub-chunk a byte of a visit's weights
@@ -145,11 +145,12 @@ class InklingPrefill(ChunkPrefill):
 
     @staticmethod
     def _pt(T: int) -> int:
-        """Tokens of a chunk's prep part (the attention's items): the chunk up to ``PREP_T``, else half of it."""
-        return T if T <= PREP_T else T // 2
+        """Tokens of a chunk's prep part (the attention's items): the chunk up to ``PREP_T``, else ``PREP_T`` (768: half of
+        it)."""
+        return T if T <= PREP_T else PREP_T if T % PREP_T == 0 else T // 2
 
     def _preps(self, kind: str, T: int) -> list[InkPrepOperator]:
-        """The prep of a kind over a chunk of T tokens: one item up to ``PREP_T`` tokens, else parts of T / 2."""
+        """The prep of a kind over a chunk of T tokens: one item up to ``PREP_T`` tokens, else parts (``_pt``)."""
         pt = self._pt(T)
         assert pt <= PREP_T and pt % self.shape.pg == 0, T
         v = next(v for v in self.layers if self.vis[v].kind == kind)

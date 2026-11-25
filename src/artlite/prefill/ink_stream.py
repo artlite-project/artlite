@@ -232,28 +232,50 @@ class InkResidOperator(ArtcOperator):
                    for c in range(COLS)]
         yp, yc, nh, hr = self.y_pitch, self.y_col, self.n_hist, self.hist_rows
 
+        def fills(Y, cur, ah, c, b0, b1, tg, wait=False):  # (blocks b0 .. b1 of column c: a chained fill repeats MAX_BD_ITER
+            # times at most; ``wait``: a batch's, its group awaiting them before the next batch takes their BDs)
+            for b in range(b0, b1, MAX_BD_ITER):
+                m = min(MAX_BD_ITER, b1 - b)
+                parts = [ChainPart(Y, TensorAccessPattern((T * yp,), c * yc + TB * b * yp, [m, 1, TB, C],
+                                                          [TB * yp, 0, yp, 1]))]
+                if cur:
+                    parts.append(ChainPart(cur[0], TensorAccessPattern((2 * T * H,), 2 * C * c + TB * b * 2 * H,
+                                                                       [m, 1, TB, 2 * C], [TB * 2 * H, 0, 2 * H, 1])))
+                chained_fill(ah[c], Y, parts, tg, wait=wait)
+
+        def rest(TAPS, HIST, OUT, bh, oh, sh, c, tg):  # (column c's taps and history, its drains)
+            chained_fill(bh[c], TAPS, [
+                ChainPart(TAPS, TensorAccessPattern((COLS * 4 * C,), 4 * C * c, [1, 1, 1, 4 * C], [0, 0, 0, 1])),
+                ChainPart(HIST, TensorAccessPattern((nh,), c * hr * 2 * C, [1, 1, 3, 2 * C], [0, 0, 2 * C, 1]),
+                          offset_parameter=p_ha)], tg)
+            rows = [1, T, 1, 2 * C], [0, 2 * H, 0, 1]
+            if T > 1024:  # (a BD dimension's size: the rows as [T / 8][8])
+                rows = [1, T // 8, 8, 2 * C], [0, 16 * H, 2 * H, 1]
+            oh[c].drain(OUT, TensorAccessPattern((2 * T * H,), 2 * C * c, *rows), group=tg, wait=True)
+            sh[c].drain(HIST, TensorAccessPattern((nh,), c * hr * 2 * C, [1, 1, 3, 2 * C], [0, 0, 2 * C, 1]),
+                         group=tg, wait=True)
+
+        batch = 4 * MAX_BD_ITER  # (a group's fills at most: blocks of a shim tile's 16 BDs; a longer chunk in batches)
+
         def seq(*args):
             Y, *cur, TAPS, HIST, OUT, ah, bh, oh, sh = args
             sync_parameters()
-            tg = TaskGroup()
+            if nb <= batch:
+                tg = TaskGroup()
+                for c in range(COLS):
+                    fills(Y, cur, ah, c, 0, nb, tg)
+                    rest(TAPS, HIST, OUT, bh, oh, sh, c, tg)
+                tg.finish()
+                return
+            td = TaskGroup()  # (the taps and the drains: the chunk's; the fills in batches, each awaited)
             for c in range(COLS):
-                for b0 in range(0, nb, MAX_BD_ITER):  # (a chained fill repeats at most MAX_BD_ITER times)
-                    m = min(MAX_BD_ITER, nb - b0)
-                    parts = [ChainPart(Y, TensorAccessPattern((T * yp,), c * yc + TB * b0 * yp, [m, 1, TB, C],
-                                                              [TB * yp, 0, yp, 1]))]
-                    if cur:
-                        parts.append(ChainPart(cur[0], TensorAccessPattern((2 * T * H,), 2 * C * c + TB * b0 * 2 * H,
-                                                                           [m, 1, TB, 2 * C], [TB * 2 * H, 0, 2 * H, 1])))
-                    chained_fill(ah[c], Y, parts, tg)
-                chained_fill(bh[c], TAPS, [
-                    ChainPart(TAPS, TensorAccessPattern((COLS * 4 * C,), 4 * C * c, [1, 1, 1, 4 * C], [0, 0, 0, 1])),
-                    ChainPart(HIST, TensorAccessPattern((nh,), c * hr * 2 * C, [1, 1, 3, 2 * C], [0, 0, 2 * C, 1]),
-                              offset_parameter=p_ha)], tg)
-                oh[c].drain(OUT, TensorAccessPattern((2 * T * H,), 2 * C * c, [1, T, 1, 2 * C], [0, 2 * H, 0, 1]),
-                            group=tg, wait=True)
-                sh[c].drain(HIST, TensorAccessPattern((nh,), c * hr * 2 * C, [1, 1, 3, 2 * C], [0, 0, 2 * C, 1]),
-                            group=tg, wait=True)
-            tg.finish()
+                rest(TAPS, HIST, OUT, bh, oh, sh, c, td)
+            for f0 in range(0, nb, batch):
+                tg = TaskGroup()
+                for c in range(COLS):
+                    fills(Y, cur, ah, c, f0, min(nb, f0 + batch), tg, wait=True)
+                tg.finish()
+            td.finish()
 
         types = [np.ndarray[(T * yp,), bf]] + ([] if self.block else [np.ndarray[(2 * T * H,), bf]]) + \
             [np.ndarray[(COLS * 4 * C,), bf], np.ndarray[(nh,), bf], np.ndarray[(2 * T * H,), bf]]

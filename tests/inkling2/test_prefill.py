@@ -50,15 +50,16 @@ def _ring(ov: InklingOverlay, v: int) -> np.ndarray:
     return r.copy().view(np.float32).reshape(COLS, 8, 2, -1).transpose(1, 2, 0, 3).reshape(8, 2, -1)
 
 
-@pytest.mark.parametrize("visits, chunks", [(6, (200,)), (6, (512, 188)), (48, (200,))], ids=str)
+@pytest.mark.parametrize("visits, chunks", [(6, (200,)), (6, (512, 188)), (6, (2000,)), (48, (200,))], ids=str)
 def test_visits(ink: tuple[GGUFFile, InklingConfig], visits: int, chunks: tuple[int, ...]) -> None:
     """The first ``visits`` visits without their FFNs (6: the prelude; 48: the passes' messages and controllers too), a
-    prompt in chunks of the given tokens from position 0 (a chunk of two sub-chunks; one after a history). (With the
+    prompt in chunks of the given tokens from position 0 (a chunk of two sub-chunks; one after a history; one of 2048:
+    its prep in four parts, the attention's 64 passes). (With the
     FFNs the routing's near ties make the paths diverge: ``test_moe.test_moe_block`` checks the block on the NPU's
     routing.)"""
     g, cfg = ink
     n = sum(chunks)
-    ov = InklingOverlay(g, visits=list(range(visits)), max_positions=1024, ffn=False)
+    ov = InklingOverlay(g, visits=list(range(visits)), max_positions=max(1024, -(-n // 1024) * 1024), ffn=False)
     ov.load()
     pf = InklingPrefill(ov, sizes=tuple(sorted({256, *(-(-c // 256) * 256 for c in chunks)})), ffn=False).compile().bind()
     toks = np.random.default_rng(3).integers(0, cfg.vocab_size, n)

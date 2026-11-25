@@ -11,6 +11,7 @@ from ml_dtypes import bfloat16
 from artlite.decode import kv as KV
 from artlite.operators import FusedOperator, bfp16
 from artlite.operators.design import COLS
+from artlite.operators.util import arg_bytes
 from artlite.prefill import attn as PA
 from artlite.prefill.attn.ink import HEADS, INK_ROWS, QS_UNITS, RING_BYTES, InkPrepOperator, ink_shape
 from artlite.prefill.gemm import Layout
@@ -153,7 +154,7 @@ def test_ink_prep(T: int, p0: int, n: int, full: bool) -> None:
 
 
 # (chunk, position, a full layer)
-ATTN = [(256, 0, False), (512, 1088, False), (256, 0, True), (512, 1536, True), (128, 2048, False)]
+ATTN = [(256, 0, False), (512, 1088, False), (256, 0, True), (512, 1536, True), (128, 2048, False), (2048, 0, False)]
 
 
 @pytest.mark.parametrize(("T", "p0", "full"), ATTN, ids=[f"T{a}-p{b}-{'full' if c else 'swa'}" for a, b, c in ATTN])
@@ -166,15 +167,25 @@ def test_ink_attention(T: int, p0: int, full: bool) -> None:
     guard = PA.mode.swa_groups(WIN, s.pg)  # (a full layer's cache too: the near part reads from 16 groups before)
     n_groups = guard + max_pos // s.pg
     kvb, kv0 = n_groups * s.group, guard * s.group
-    prep = InkPrepOperator(T=T, shape=s, lq=LQ, lk=LK[full], lv=LV[full], full=full, kv_bytes=kvb,
-                           tau_positions=max_pos, kv0=kv0)
-    attn = PA.AttnOperator(T=T, shape=s, kv_bytes=kvb, swa=0 if full else WIN, kv0=kv0, ink=True)
+    pt = min(T, 512)  # (the prep in parts of 512 tokens, the attention's items: as the prefill's)
+    preps = [InkPrepOperator(T=pt, shape=s, lq=LQ, lk=LK[full], lv=LV[full], full=full, kv_bytes=kvb,
+                             tau_positions=max_pos, kv0=kv0, part=k) for k in range(T // pt)]
+    prep = preps[0]
+    attn = PA.AttnOperator(T=T, shape=s, kv_bytes=kvb, swa=0 if full else WIN, kv0=kv0, sub=pt, ink=True)
+    lk, lv = LK[full], LV[full]
+
+    def part(buf: str, k: int, row: int, op: object, i: int) -> str:
+        a = k * pt * row
+        return f"{buf}[{a}:{a + arg_bytes(op, i)}]"
+
     fused = FusedOperator(name=f"ink_attn_test_{'f' if full else 's'}{T}",
                           input_args=["GQ", "GK", "GV", "TAU", "PRM", "E"], output_args=["A", "RING"],
-                          runlist=[(prep, "GQ", "GK", "GV", "TAU", "PRM", "QS", "KV", "RING", "JUNK"),
-                                   (attn, "QS", "KV", "A", "E")]).compile()
+                          runlist=[(pp, part("GQ", k, 2 * LQ.N, pp, 0), part("GK", k, 2 * lk.N, pp, 1),
+                                    part("GV", k, 2 * lv.N, pp, 2), "TAU", "PRM", part("QS", k, 2 * pp.n_qs // pt, pp, 5),
+                                    "KV", "RING", "JUNK") for k, pp in enumerate(preps)] +
+                                  [(attn, "QS", "KV", "A", "E")],
+                          buffer_sizes={"GQ": 2 * T * LQ.N, "GK": 2 * T * lk.N, "GV": 2 * T * lv.N}).compile()
     gen = torch.Generator().manual_seed(p0 + T + 7 * full)
-    lk, lv = LK[full], LV[full]
     GQ = np.zeros((T, LQ.N), np.float32)
     GK, GV = np.zeros((T, lk.N), np.float32), np.zeros((T, lv.N), np.float32)
     for c in range(COLS):
@@ -212,12 +223,13 @@ def test_ink_attention(T: int, p0: int, full: bool) -> None:
             kv[c, guard:guard + p0 // s.pg] = KV.kv_groups(k_h, v_h, A_BYTES, 2)
     fused.get_buffer("QS").view(np.uint8)[:] = 0
     fused.sync_inputs()
-    fused.set_params(prep.params(p0, T) | attn.params(p0))
+    fused.set_params({k: v for pp in preps for k, v in pp.params(p0, T).items()} | attn.params(p0))
     fused()
     fused.sync_outputs()
     fused.sync_scratch_from_device()
 
-    qs = fused.get_buffer("QS").view(np.uint8)[:prep.n_qs * 2].reshape(COLS, T // 8, QS_UNITS, s.unit)
+    qs = fused.get_buffer("QS").view(np.uint8)[:len(preps) * prep.n_qs * 2]
+    qs = qs.reshape(len(preps), COLS, pt // 8, QS_UNITS, s.unit).transpose(1, 0, 2, 3, 4).reshape(COLS, T // 8, QS_UNITS, s.unit)
     qv = _q_values(qs[:, :, :HEADS], s.nd).transpose(0, 2, 1, 3, 4).reshape(COLS, HEADS, T, HD)
     ink = qs[:, :, 3, :INK_ROWS * 144]
     rv = _q_values(ink[:, :, :6 * 144].reshape(COLS, T // 8, HEADS, 288), 2).transpose(0, 2, 1, 3, 4)

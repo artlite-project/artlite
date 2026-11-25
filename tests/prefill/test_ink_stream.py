@@ -51,7 +51,8 @@ def test_ink_mix(T: int, n: int) -> None:
 
 
 # (chunk, valid tokens, a block's restart, the history's first row in the window, the input rows' pitch and column slice)
-RESID = [(256, 256, False, 2, 2304, 288), (128, 101, True, 0, 2560, 320), (64, 3, False, 4, 2304, 288)]
+RESID = [(256, 256, False, 2, 2304, 288), (128, 101, True, 0, 2560, 320), (64, 3, False, 4, 2304, 288),
+         (2048, 2000, True, 1, 2560, 320), (1024, 1000, True, 1, 2560, 320), (1280, 1200, True, 1, 2560, 320)]  # (2048: the fills in batches, the rows as [T / 8][8])
 
 
 @pytest.mark.parametrize(("T", "n", "block", "a", "yp", "yc"), RESID,
