@@ -479,7 +479,8 @@ class InklingPrefill(ChunkPrefill):
     def ring(max_positions: int) -> int:
         """The sliding-window caches' ring (groups; 0: linear) of an overlay of ``max_positions`` that a prefill runs on:
         two of the largest chunk (chunks of it start at its multiples, each within one turn: ``fits``), linear where the
-        capacity holds no more (33K positions: 3.3 GB of caches against 5.6 GB linear; 128K: 6 GB against 22)."""
+        capacity holds no more (33K positions: 3.4 GB of caches and conv state against 5.8 GB linear; 132K: 6.2 GB against
+        22.6)."""
         w = 2 * SIZES[-1] // CG
         return w if -(-max_positions // CG) > w else 0
 

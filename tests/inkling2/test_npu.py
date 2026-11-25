@@ -138,11 +138,12 @@ def test_steps_of_s() -> None:
 def test_rollback() -> None:
     """A step of a token and drafts that are rejected, then the steps after the kept tokens (``SpeculativeMixin``'s
     round: the position back to after them), give the logits the steps that never ran the drafts give, bit for bit: the
-    raw rings, the history windows' offset and the open records follow the position."""
+    raw rings, the history windows' offset and the open records follow the position (the first 20 tokens a prompt in
+    both: the prefill's)."""
     path = _path()
     tokens = llama_tokenize(path, essay("founders.txt"))[:48]
     model = Inkling(path).load(capacity=1024)
-    want = model.forced_logits(tokens, batch=1)
+    want = model.forced_logits(tokens, 20, batch=1)
     model.reset()
     model.prompt(tokens[:20])
     got = []
@@ -157,7 +158,7 @@ def test_rollback() -> None:
         got.append(model.cap(np.asarray(model.steps([tokens[i]])))[0])
         i += 1
     got = np.stack(got)
-    bad = np.flatnonzero((got != want[20:]).any(-1))
+    bad = np.flatnonzero((got != want).any(-1))
     assert not bad.size, bad[:8]
 
 

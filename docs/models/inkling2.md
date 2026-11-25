@@ -37,19 +37,19 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   states (the blocks' outputs, the loop's banks) in the helpers' memory, the depth mixes and the controllers' blends
   there; the attention, its caches and the K / V convolutions on the attention cores; the experts' activation (situ)
   on the helpers; the LM head screened (the host computes its largest logits exactly).
-- Prompts run in prefill chunks of 64 .. 2048 tokens (`prefill.py`, `InklingPrefill`, on the same weight image and
+- Prompts run in prefill chunks of 64 .. 8192 tokens (`prefill.py`, `InklingPrefill`, on the same weight image and
   caches): per visit the depth mixes, the loop's controllers, the attention (its prep, the relative bias and sinks on the
-  attention cores), the post convs, and the MoE (`moe.py`: the router on the NPU, the routing on the host, the experts'
-  work lists on `artlite.moe`); the prompt's last token runs as a decode step (the LM head's). With the prefill the
-  sliding-window caches are linear (no rings), and the device holds one sequence.
+  attention cores; past 2048 tokens in items of 2048), the post convs, and the MoE (`moe.py`: the router on the NPU on x
+  hi + lo, the routing on the host, the experts' work lists on `artlite.moe`); the prompt's last token runs as a decode
+  step (the LM head's). The experts stream their weights once per chunk: long prompts run in chunks of 8192.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size: 17.15 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded); nothing is written to disk. A
-decode step streams 1.09 GB of dense weights and the 8 experts of each visit (1.86 GB of expert tiles a token). With the
-prefill (one sequence) the KV caches are linear: they and the convs' state take 5.76 GB at 33K positions. Without it
-(several sequences, `-np`), past 2048 positions of capacity the sliding-window visits' caches are rings of 2048
-positions: 1.38 GB at 33K positions, 19.3 GB of RAM in all. The convs' state holds the last positions only, so a
-conversation goes back only to a checkpoint (artlite-server takes them).
+decode step streams 1.09 GB of dense weights and the 8 experts of each visit (1.86 GB of expert tiles a token). The
+sliding-window visits' caches are rings past 16K positions of capacity (16384 positions, two of the prefill's largest
+chunks): they, the full visits' caches and the convs' state take 3.4 GB at 33K positions (each sequence of `-np` its
+own), 6.2 GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last
+positions only, so a conversation goes back only to a checkpoint (artlite-server takes them).
 
 ## Speed and accuracy (Strix Halo)
 
