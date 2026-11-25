@@ -493,7 +493,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
             m = self._chunk(end - i - n, self.position + n, steps=steps) if end > i + n else 0  # (the next chunk: its
             # inputs meanwhile)
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
-                                    tokens[i + n:i + n + m]) if m else None
+                                    tokens[i + n:min(i + n + m, end)]) if m else None
             self._prefill_run(args, T, n, sets)
             self.t_host += t1 - t0
             self.t_npu += time.perf_counter() - t1
