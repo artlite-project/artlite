@@ -397,8 +397,6 @@ of 23 rows) 4596 -> ~2300 cycles:
   c ^ (c << 1)): 5 ops per 64 fields instead of a sum of 6 shifts. Write the XOR as (c | t) - (c & t) with the
   subtraction a `vaddsub8` of an all-ones mask: LLVM folds a plain subtraction back into `^`, which AIE2P expands
   into 5 ops.
-- Peano: a 128-bit vector load fed to `ext_v2int32` (through `set_v16int32`) fails to legalize (`G_UNMERGE_VALUES`
-  <4 x s32> -> <2 x s32>).
 - **16-bit entries** (`load_4x16`: 2 B per entry, 4 B per entry and copy; IQ4's value pairs, IQ3_S's grid as nibbles,
   `formats/iq4.py`, `iq3s.py`): an instruction's entries land in halfword 0 of its 64-bit lanes, and
   `shuffle(c0, c1, T16_16x4_lo)` puts those of two concatenated pairs in order (16 entries per shuffle,
