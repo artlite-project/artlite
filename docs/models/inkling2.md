@@ -37,7 +37,7 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   states (the blocks' outputs, the loop's banks) in the helpers' memory, the depth mixes and the controllers' blends
   there; the attention, its caches and the K / V convolutions on the attention cores; the experts' activation (situ)
   on the helpers; the LM head screened (the host computes its largest logits exactly).
-- Prompts run in prefill chunks of 64 .. 1024 tokens (`prefill.py`, `InklingPrefill`, on the same weight image and
+- Prompts run in prefill chunks of 64 .. 2048 tokens (`prefill.py`, `InklingPrefill`, on the same weight image and
   caches): per visit the depth mixes, the loop's controllers, the attention (its prep, the relative bias and sinks on the
   attention cores), the post convs, and the MoE (`moe.py`: the router on the NPU, the routing on the host, the experts'
   work lists on `artlite.moe`); the prompt's last token runs as a decode step (the LM head's). With the prefill the
@@ -55,7 +55,7 @@ conversation goes back only to a checkpoint (artlite-server takes them).
 
 | | 1K | 32K |
 |---|---|---|
-| a prompt (the prefill, artlite-bench) | 417 tokens/s (2.45 s for 1024 tokens) | 391 tokens/s (84 s) |
+| a prompt (the prefill, artlite-bench) | 448 tokens/s (2.29 s for 1024 tokens) | 458 tokens/s (72 s) |
 | generation (greedy, 256 tokens, essay summary) | 10.7 tokens/s | 9.0 tokens/s |
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
