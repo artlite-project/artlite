@@ -83,6 +83,7 @@ The step-by-step procedure, with its prompt and draft-count scripts, is the
 | LFM3 1.7B | QAD-Q4_0 | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-QAD-Q4_0.gguf) `LFM3-1.7B-QAD-Q4_0.gguf` | `43a7d09a0e9c` | 2026-11-10 |
 | | Q4_K_M | [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LFM3-1.7B-Q4_K_M.gguf) `LFM3-1.7B-Q4_K_M.gguf` | `3793e1e6e226` | 2026-11-10 |
 | Flint | int4 | [RecursiveSI/flint-int4-gguf](https://huggingface.co/RecursiveSI/flint-int4-gguf/blob/main/flint-int4-q4_1.gguf) `flint-int4-q4_1.gguf`, its drafter [incoai/Flint-DFlash2-GGUF](https://huggingface.co/incoai/Flint-DFlash2-GGUF/blob/main/Flint-DFlash2-Q4_K_M.gguf) `Flint-DFlash2-Q4_K_M.gguf` | `43c07baccdba`, `c14e92d3f666` | 2026-11-18 |
+| Inkling 2 Mini | UD-Q4_K_XL | [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/main/Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file) `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file` (saved as `Inkling-2-Mini-UD-Q4_K_XL.gguf`) | `e64276656f07` | 2026-11-25 |
 
 sha256: the first 12 hex digits of the file's, the same as Hugging Face's LFS object id (a checkpoint directory: its
 repository's commit). Recorded: the date of the runs, with the toolchain pinned then:
@@ -101,6 +102,7 @@ repository's commit). Recorded: the date of the runs, with the toolchain pinned 
 | 2026-11-18 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 | 2026-11-17 | 1.4.6.dev15+ge5a3fa1 | 22.0.0.2026111101+81af12b7 |
 | 2026-11-22 | 1.4.6.dev63+g0f76700 | 22.0.0.2026112001+ec5614f1 |
+| 2026-11-25 | 1.4.6.dev63+g0f76700 | 22.0.0.2026112001+ec5614f1 |
 
 The decode speeds of the files whose LM head is screened (Qwen3 0.6B, the Llama files but the BF16 ones and 3B Q3_K_M,
 Qwen3.6 35B-A3B, MiniCPM-V 4.7 1B) are runs of 2026-11-16; those of Qwen3.6 35B-A3B, Occamy 1.0 and MiniCPM-V 4.7 1B, and

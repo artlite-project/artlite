@@ -55,8 +55,8 @@ positions only, so a conversation goes back only to a checkpoint (artlite-server
 
 | | 1K | 32K |
 |---|---|---|
-| a prompt (the prefill, artlite-bench) | 448 tokens/s (2.29 s for 1024 tokens) | 458 tokens/s (72 s) |
-| generation (greedy, 256 tokens, essay summary) | 10.7 tokens/s | 9.0 tokens/s |
+| a prompt (the prefill, artlite-bench) | 472 tokens/s (2.17 s for 1024 tokens) | 578 tokens/s (56.7 s; 8K 12.8 s, 64K 132 s) |
+| generation (greedy, 256 tokens, essay summary) | 10.7 tokens/s | 9.1 tokens/s |
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
 a step (drafts, or other requests with `-np`) adds its own experts. Context drafts (artlite-cli's lookup) keep the text
@@ -67,6 +67,7 @@ Accuracy against llama.cpp's CPU runs of the same file:
 | | |
 |---|---|
 | teacher-forced decode, an essay's first 128 tokens | KL 0.0016 (llama.cpp's own prompt graph against its decode: 0.0022), argmax the same on every clear token |
-| greedy text, 128 tokens after a chat, code, math, a long instruction, an essay | 631 of 640 tokens llama.cpp's top one, the 9 others within 1 logit of it |
+| a prompt through the prefill (1024, 2560 essay tokens), then 64 teacher-forced steps | KL 0.0020, 0.0023 (llama.cpp's own prompt graph against its decode: 0.0015), argmax the same on every clear token |
+| greedy text, 128 tokens after a chat, code, math, a long instruction, an essay (prompts through the prefill) | 632 of 640 tokens llama.cpp's top one, the 8 others within 1 logit of it |
 
 Design: the module docstrings of `src/models/inkling2/`, `src/artlite/decode/attn.py` and `src/artlite/moe/`.
