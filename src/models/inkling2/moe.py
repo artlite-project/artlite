@@ -3,7 +3,9 @@
 panels of rms(x) ffn_norm; XF: the FFN's input x as bf16 rows):
 
 1. the router (``prefill.gemm.plan_phase``'s "router": its F32 rows as BFP16 planes, each expert's pair summed into
-   fp32 logits, LG) — a piece of the program ends there;
+   fp32 logits) against x hi and x lo (XR: the FFN norm's [hi | lo] panels; LG, LG2, which the host sums: the decode's
+   router takes x hi + lo too; single panels changed 2% of the top-8 sets a visit and 2.6x the prefill's KL to decode
+   steps) — a piece of the program ends there;
 2. the host's routing (``host_route``): the top 8 of sigmoid(l) + exp_probs_b (ties: the lower id), the weights
    sigmoid(l) / (their sum + 1e-20) times ``expert_weights_scale`` and the expert's down scale (``moe.route.top_k_bias``,
    the decode's); the chunks (``moe.plan.Plan``); the control streams of the gathered norm (CBG; its row groups' gate /
@@ -99,13 +101,20 @@ class InkMoE:
     # ------------------------------------------------------------------
 
     def router(self, L: int, t: int) -> PG.PhasePlan:
-        """Layer L's router over sub-chunks of t tokens."""
-        return PG.plan_phase(self.img, self.img.region(L, "router"), t, ops=self._gemms)
+        """Layer L's router over sub-chunks of t tokens, its A panels [x hi | x lo] (``PrefillNormOperator(lo=True)``):
+        an item per half (``lo_off``), the host sums their logits (``logits``)."""
+        return PG.plan_phase(self.img, self.img.region(L, "router"), t, ops=self._gemms, a_width=2 * self.H)
+
+    @property
+    def lo_off(self) -> int:
+        """Bytes from a token group's x hi panels to its x lo panels (the router's second item's A)."""
+        return self.H // 8 * 72
 
     def rows(self, t: int) -> dict[str, int]:
         """Bytes per token of the per-token buffers (LG: the router's rows at sub-chunks of t; DS: the combine's
         zero ds rows and the weights; DL: the delta)."""
-        return {"LG": 2 * self.router(self.layers[0], t).layout.N, "DS": 2 * ds_row(self.H, self.ds_pitch),
+        lg = 2 * self.router(self.layers[0], t).layout.N
+        return {"XR": 2 * self.H * 9 // 8, "LG": lg, "LG2": lg, "DS": 2 * ds_row(self.H, self.ds_pitch),
                 "DL": 2 * self.H}
 
     def fixed(self) -> dict[str, int]:
@@ -139,13 +148,16 @@ class InkMoE:
     # ------------------------------------------------------------------
 
     def logits(self, L: int, *, n: int, t: int, dev: object) -> np.ndarray:
-        """The n valid tokens' router logits (n, E) fp32 (LG: rows of the router's layout at sub-chunks of t)."""
+        """The n valid tokens' router logits (n, E) fp32: the sums of x hi's (LG) and x lo's (LG2), rows of the router's
+        layout at sub-chunks of t."""
         lay = self.router(L, t).layout
         rb = 2 * lay.N
-        dev.fetch("LG", 0, n * rb)
-        lg = dev.view("LG")[:n * rb].view(np.float32).reshape(n, COLS, lay.pitch // 2)
         o, per = lay.off["router"] // 2, self.E // COLS
-        return np.ascontiguousarray(lg[:, :, o:o + per].reshape(n, self.E))
+        out = []
+        for name in ("LG", "LG2"):
+            dev.fetch(name, 0, n * rb)
+            out.append(dev.view(name)[:n * rb].view(np.float32).reshape(n, COLS, lay.pitch // 2)[:, :, o:o + per])
+        return (out[0] + out[1]).reshape(n, self.E)
 
     def host_route(self, L: int, *, n: int, T: int, t: int, xf: str, dev: object, lib: object) -> MP.Plan:
         """Route the n valid tokens of a chunk of T from layer L's logits (LG) and write the block's work (module

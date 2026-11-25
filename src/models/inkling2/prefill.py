@@ -20,8 +20,8 @@ tokens where the operator works row by row:
   prep part) -> A, the gate (``InkGateOperator``), o -> Y;
 - the post conv and the residual (``InkResidOperator``: the chunk's rows at once, the visit's history window 0);
 - the FFN: the FFN mix (its states and cur after the attention; a loop visit's controller of the stream "ffn") -> XM0
-  (XC0), its norm -> XN0, the MoE (``moe.InkMoE``: the router, then a piece from the gathered norm on, the host's
-  routing before it) -> DL, the FFN's post conv into cur (history window 1).
+  (XC0), its norm -> XR (hi + lo panels: the router's x), the MoE (``moe.InkMoE``: the router, then a piece from the
+  gathered norm on, the host's routing before it) -> DL, the FFN's post conv into cur (history window 1).
 
 ``ffn`` False: the visits' attention parts only (the decode overlay's ``ffn=False`` slices: tests).
 """
@@ -209,6 +209,7 @@ class InklingPrefill(ChunkPrefill):
             plans=plans, d_pitch=dp, mixes=mixes,
             norm=PrefillNormOperator(T=t, add=False, E=H, eps=eps, cols=cols),
             norm1=PrefillNormOperator(T=t, add=False, E=H, eps=InklingConfig.MIX_EPS, cols=cols),
+            norm_lo=PrefillNormOperator(T=t, add=False, E=H, eps=eps, cols=cols, lo=True),
             gate=InkGateOperator(T=t, lq_pitch=lq.pitch, gate_off=lq.off["gate"]),
             blend=InkBlendOperator(T=t, d_pitch=dl.pitch, w_stride=img.region(self._loop_layer(), "ctl_q").col_stride // 2)
             if dl is not None else None)
@@ -370,10 +371,11 @@ class InklingPrefill(ChunkPrefill):
         rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, 3),
                 tok("XM0", jj, mx, i=len(states) + 1)) for jj in range(S)]
         xf = self._control(rl, o, S, tok, v, "ffn", "XM0", "XC0") if x.messages else "XM0"
-        nm = o.norm
-        rl += [(nm, tok(xf, jj, nm, i=0), self._np(L, 4), tok("XN0", jj, nm, i=2)) for jj in range(S)]
+        nm = o.norm_lo  # (the router's x as hi + lo panels)
+        rl += [(nm, tok(xf, jj, nm, i=0), self._np(L, 4), tok("XR", jj, nm, i=2)) for jj in range(S)]
         rp = self.moe.router(L, t)
-        rl += [(g.op, tok("XN0", jj, g.op, i=0), self._w(g), tok("LG", jj, g.op, i=2)) for g in rp.gemms for jj in range(S)]
+        rl += [(g.op, tok("XR", jj, g.op, i=0, extra=e), self._w(g), tok(lg, jj, g.op, i=2))
+               for e, lg in ((0, "LG"), (self.moe.lo_off, "LG2")) for g in rp.gemms for jj in range(S)]
         mark = (v, len(rl), xf)
         rl += self.moe.items(L, T, sl=lambda b, off, op, i: sl(b, off, op, i=i), norm=self._np(L, 4))
         rs = self.fresid[T]

@@ -52,24 +52,29 @@ def test_prefill_norm(T: int, add: bool, E: int, d_pitch: int, cols: int):
         assert torch.equal(to_torch(xb.numpy()).view(T, E), (x.float() + d.float()).bfloat16())
 
 
-@pytest.mark.parametrize(("T", "d_pitch"), [(256, 264)], ids=["T256-dp264"])
-def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
-    """xn as hi + lo panels (``lo``: an MoE router's x, Qwen3.6-35B-A3B's hidden 2048): per token group [hi | lo]
-    panels; hi + lo within 4e-5 of x / rms(x) w in fp64 (x the bf16 sum; 2.6e-5: lo's rounding, ~2^-16 of each block's
-    maximum; the per-token scale 1 / rms 2.4e-6), hi the single panels' rounding."""
-    E = 2048
-    g = torch.Generator().manual_seed(T)
+@pytest.mark.parametrize(("T", "E", "d_pitch"), [(256, 2048, 264), (256, 2304, -1)], ids=["T256-dp264", "T256-E2304"])
+def test_prefill_norm_lo(T: int, E: int, d_pitch: int) -> None:
+    """xn as hi + lo panels (``lo``: an MoE router's x; Qwen3.6-35B-A3B's hidden 2048 after a delta, the plain design;
+    Inkling's 2304 without one (d_pitch -1), the replay design): per token group [hi | lo] panels; hi + lo within 4e-5 of
+    x / rms(x) w in fp64 (x the bf16 sum; 2.6e-5: lo's rounding, ~2^-16 of each block's maximum; the per-token scale
+    1 / rms 2.4e-6), hi the single panels' rounding."""
+    add = d_pitch >= 0
+    g = torch.Generator().manual_seed(T + E)
     x = (torch.randn(T, E, generator=g) * 2).bfloat16()
-    d = torch.randn(T, E, generator=g).bfloat16()
+    d = torch.randn(T, E, generator=g).bfloat16() if add else torch.zeros(T, E).bfloat16()
     w = (torch.rand(E, generator=g) + 0.5).bfloat16()
-    op = PrefillNormOperator(T=T, E=E, d_pitch=d_pitch, lo=True).compile()
+    op = PrefillNormOperator(T=T, E=E, add=add, **({"d_pitch": d_pitch} if add else {}), lo=True).compile()
+    assert op.replay == (not add)
     dev = op.device
     xb, wb = artlite.from_numpy(to_numpy(x.clone().flatten()), dev), artlite.from_numpy(to_numpy(w), dev)
     xnb = artlite.empty((2 * T * E * 9 // 16,), dtype=bfloat16, device=dev)
-    dp = d_pitch or E // 8
-    dpad = torch.full((T, 8, dp), 1e30).bfloat16()
-    dpad[:, :, :E // 8] = d.view(T, 8, E // 8)
-    op.dispatch(xb, artlite.from_numpy(to_numpy(dpad.flatten()), dev), wb, xb, xnb)
+    if add:
+        dp = d_pitch or E // 8
+        dpad = torch.full((T, 8, dp), 1e30).bfloat16()
+        dpad[:, :, :E // 8] = d.view(T, 8, E // 8)
+        op.dispatch(xb, artlite.from_numpy(to_numpy(dpad.flatten()), dev), wb, xb, xnb)
+    else:
+        op.dispatch(xb, wb, xnb)
     xnb.sync_from_device()
     xs = (x.float() + d.float()).bfloat16().double()
     ref = xs * torch.rsqrt((xs ** 2).mean(-1, keepdim=True) + 1e-5) * w.double()
@@ -80,8 +85,9 @@ def test_prefill_norm_lo(T: int, d_pitch: int) -> None:
     scale = ((hi + lo) * ref).sum(1) / (ref * ref).sum(1) - 1  # (per token)
     print(f"hi + lo rel-rms {rel:.2e}; per-token scale rms {scale.pow(2).mean().sqrt():.2e}")
     assert rel < 4e-5, rel
-    xb.sync_from_device()
-    assert torch.equal(to_torch(xb.numpy()).view(T, E), xs.float().bfloat16())
+    if add:
+        xb.sync_from_device()
+        assert torch.equal(to_torch(xb.numpy()).view(T, E), xs.float().bfloat16())
 
 
 @pytest.mark.parametrize(("T", "E"), [(64, 2048), (256, 5120)])

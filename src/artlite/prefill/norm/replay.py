@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 def replay_design(op: "PrefillNormOperator") -> Module:
     """E > 2048: x (and delta) groups through the memtile, sent twice (pass A, pass B); ``pre``: the weight objects
-    w1, then w2."""
+    w1, then w2; ``lo`` (no delta): per chunk its hi panels, then its lo panels, into a group's [hi | lo] rows."""
     T, add, E, p, nd, pre = op.T, op.add, op.E, op.p, op.deltas, op.pre
     P, col = op.out_pitch, op.out_col
     n_g = T // (8 * op.cols)
@@ -28,7 +28,8 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     bf = np.dtype[bfloat16]
     chunk_ty = np.ndarray[(8 * CH,), bf]
     U = op.unit
-    pan_ty = np.ndarray[(CH // 8 * U,), bf]
+    nl = 2 if op.lo else 1  # (lo: the chunk's hi panels, then its lo panels)
+    pan_ty = np.ndarray[(nl * CH // 8 * U,), bf]
     w_ty = np.ndarray[(E,), bf]
     st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
     k_w = Kernel(f"{p}_wc", "kernel.o", [chunk_ty, w_ty, np.int32])
@@ -36,7 +37,7 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     dch = [np.ndarray[(8 * CH * nd,), bf]] if nd else []  # (two deltas: one object of both chunks)
     w1 = [w_ty] if pre else []  # (pre: w1 before the deltas' place)
     k_a = Kernel(f"{p}_ra{sfx}", "kernel.o", [chunk_ty, *dch, *w1, st_ty, np.int32])
-    k_b = Kernel(f"{p}_rb{sfx}", "kernel.o",
+    k_b = Kernel(f"{p}_rb0l" if op.lo else f"{p}_rb{sfx}", "kernel.o",
                  [chunk_ty, *dch, *w1, w_ty, st_ty, pan_ty, *([chunk_ty] if add else []), np.int32])
     # memtile: a group [8 tokens][E] -> the core as chunks [kc][8 tokens][CH], twice; two deltas: their groups
     # side by side, as chunk pairs [kc][delta][8 tokens][CH] (a core has two input DMA channels, a shim two
@@ -147,6 +148,12 @@ def replay_design(op: "PrefillNormOperator") -> Module:
                 # x_out chunks [group][kc][8 tokens][CH]
                 oh[c].drain(xo, TensorAccessPattern((n,), 8 * E * c, [n_g, n_kc, 8, CH], [8 * op.cols * E, CH, E, 1]),
                             group=tg, wait=True)
+            if op.lo:  # (a group's chunks [hi | lo] -> [hi panels | lo panels]: rows of 2 E)
+                ph[c].drain(xn, TensorAccessPattern((2 * T * E // 64 * U,), c * (E // 4) * U,
+                                                    [n_g, n_kc, 2, CH // 8 * U],
+                                                    [op.cols * (E // 4) * U, CH // 8 * U, E // 8 * U, 1]),
+                            group=tg, wait=True)
+                continue
             ph[c].drain(xn, TensorAccessPattern((T * P // 64 * U,), (c * (P // 8) + col // 8) * U,
                                                 [1, n_g, 8 * ps, E // 64 // ps * U],
                                                 [0, op.cols * (P // 8) * U, E // 64 // ps * U, 1]),
@@ -157,6 +164,6 @@ def replay_design(op: "PrefillNormOperator") -> Module:
     n_ds = (nd - 1) * op.d_stride + n_d
     types = [vt] + ([np.ndarray[(n_ds,), bf]] if add else []) + [np.ndarray[((2 if pre else 1) * E,), bf]]
     types += [vt] if add else []
-    types.append(np.ndarray[(T * P // 64 * U,), bf])
+    types.append(np.ndarray[(nl * T * P // 64 * U,), bf])
     rt = Runtime(seq, [*types, x_h, p_h, *([d_h, o_h] if add else [])])
     return Program(NPU2(), rt, workers=workers).resolve_program()

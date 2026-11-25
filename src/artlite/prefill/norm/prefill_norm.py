@@ -41,7 +41,7 @@ class PrefillNormOperator(ArtcOperator):
         K parts: summed in fp32, rounded once), both at d_pitch, d2 ``d_stride`` elements after d
         in the delta argument (default T 8 d_pitch; e.g. the C size of a GEMM that pads the tokens). lo: xn as
         hi + lo panels (an MoE router's x), panels of 2 E columns: per token group [bfp16(v) | bfp16(v - bfp16(v))]
-        (one delta, E <= 2048). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
+        (one delta, E <= 2048; past it without a delta: Inkling's router). pre (no add): the weight argument [w1 | w2], xn = (x w1) w2 / rms(x w1) (a norm of a
         norm's output: an MTP drafter's hnorm of the model's output norm). out_pitch, out_col (the plain design): xn's
         panel rows ``out_pitch`` columns wide (default E), these at columns out_col .. (another norm's beside them; not
         in the hold design). raw (no add): xn = x w, without the norm (a drafter's taps as panels: w of ones). bf16:
@@ -65,7 +65,7 @@ class PrefillNormOperator(ArtcOperator):
         self.ch = min(CH, E // 8)  # (columns per chunk)
         assert self.replay or self.hold or 8 * self.ch == E, "the norm weight: one chunk object"
         assert E % 1024 == 0 or self.replay, "the plain design: E of whole 1024 columns"
-        assert not lo or not (self.replay or self.hold), "lo panels: the plain design"
+        assert not lo or not (self.hold or (self.replay and (add or pre))), "lo panels: the plain design, or the replay's alone"
         self.pre, self.raw, self.bf16 = pre, raw, bf16
         assert not (bf16 and lo), "bf16 blocks: no lo panels"
         assert not raw or not (add or pre or lo), "raw: x's own panels"
