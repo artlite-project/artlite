@@ -2978,8 +2978,8 @@
 {"fn": "g4ap_scatter", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 75, "upper": false, "bytes": 192, "stack": 0, "calls": [], "loops": [{"at": "kernel_lib.h:560", "parent": -1, "sched": "post-RA", "ii": 1, "ns": 8, "bound": 1, "iters": 57, "spills": 0, "bytes": 16}]}
 {"fn": "g4ap_v", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 3927, "upper": false, "bytes": 752, "stack": 64, "calls": [["f6ab6646e1ca", "km_rms_512_l32_e1em06", 8]], "loops": [{"at": "g4ap_v+8", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}, {"at": "g4ap_v+10", "parent": 0, "sched": "pre-RA", "ii": 9, "ns": 2, "bound": 3, "iters": 15, "spills": 0, "bytes": 112}, {"at": "g4ap_v+15", "parent": -1, "sched": "post-RA", "ii": 11, "ns": 3, "bound": 10, "iters": 62, "spills": 0, "bytes": 96}]}
 {"fn": "km_rms_512_l32_e1em06", "in": "f6ab6646e1ca", "apps": ["gemma-E4B-PARO"], "cycles": 236, "upper": false, "bytes": 672, "stack": 0, "calls": [], "loops": [{"at": "km_rms_512_l32_e1em06+16", "parent": -1, "sched": "post-RA", "ii": 7, "ns": 3, "bound": 3, "iters": 14, "spills": 0, "bytes": 96}]}
-{"fn": "ibl_prm", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 135, "upper": false, "bytes": 432, "stack": 0, "calls": [], "loops": [{"at": "ibl_prm+9", "parent": -1, "sched": "post-RA", "ii": 13, "ns": 3, "bound": 10, "iters": 6, "spills": 0, "bytes": 112}]}
-{"fn": "ibl_run", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 17923, "upper": true, "bytes": 3104, "stack": 1216, "calls": [["a908aca53332", "km_sigmoid_64", 18]], "loops": [{"at": "ibl_run+11", "parent": -1, "sched": "pre-RA", "ii": 22, "ns": 3, "bound": 16, "iters": 6, "spills": 0, "bytes": 144}, {"at": "ibl_run+20", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 18, "spills": 0, "bytes": 208}, {"at": "ibl_run+24", "parent": 1, "sched": "pre-RA", "ii": 9, "ns": 3, "bound": 4, "iters": 6, "spills": 0, "bytes": 96}, {"at": "ibl_run+32", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 9, "spills": 49, "bytes": 1776}, {"at": "ibl_run+39", "parent": 3, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}]}
+{"fn": "ibl_prm", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 164, "upper": false, "bytes": 480, "stack": 0, "calls": [], "loops": [{"at": "ibl_prm+10", "parent": -1, "sched": "post-RA", "ii": 16, "ns": 3, "bound": 10, "iters": 6, "spills": 0, "bytes": 112}]}
+{"fn": "ibl_run", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 14987, "upper": true, "bytes": 1856, "stack": 1280, "calls": [["a908aca53332", "km_sigmoid_64", 18]], "loops": [{"at": "ibl_run+12", "parent": -1, "sched": "pre-RA", "ii": 22, "ns": 3, "bound": 16, "iters": 6, "spills": 0, "bytes": 144}, {"at": "ibl_run+21", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 18, "spills": 0, "bytes": 204}, {"at": "ibl_run+25", "parent": 1, "sched": "pre-RA", "ii": 9, "ns": 3, "bound": 4, "iters": 6, "spills": 0, "bytes": 96}, {"at": "ibl_run+34", "parent": -1, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 9, "spills": 20, "bytes": 560}, {"at": "ibl_run+43", "parent": 3, "sched": "none", "ii": null, "ns": 1, "bound": null, "iters": 8, "spills": 0, "bytes": 176}]}
 {"fn": "km_exp2_v64_fp32", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 210, "upper": false, "bytes": 928, "stack": 0, "calls": [], "loops": []}
 {"fn": "km_sigmoid_64", "in": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 510, "upper": false, "bytes": 1248, "stack": 2560, "calls": [["a908aca53332", "km_exp2_v64_fp32", 1]], "loops": [{"at": "km_recip_64_n3+8", "parent": -1, "sched": "none", "ii": 43, "ns": 1, "bound": 9, "iters": 3, "spills": 0, "bytes": 160}]}
 {"fn": "igt_run", "in": "69b1a3092cd3", "apps": ["inkling2-UD-Q4_K_XL"], "cycles": 12468, "upper": false, "bytes": 496, "stack": 1152, "calls": [["69b1a3092cd3", "km_sigmoid_b64", 48]], "loops": [{"at": "igt_run+12", "parent": -1, "sched": "none", "ii": 53, "ns": 1, "bound": 22, "iters": 48, "spills": 27, "bytes": 290}]}
@@ -6651,18 +6651,18 @@
 {"core": 3, "design": "inkling_prefill", "entry": "22e716e2f322", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 2304}
 {"core": 4, "design": "inkling_prefill", "entry": "22e716e2f322", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 1488}
 {"core": 5, "design": "inkling_prefill", "entry": "22e716e2f322", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 1488}
-{"core": 2, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 7008}
-{"core": 3, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 7008}
-{"core": 4, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 7008}
-{"core": 5, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 7008}
-{"core": 2, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 8032}
-{"core": 3, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 8032}
-{"core": 4, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 8032}
-{"core": 5, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 8032}
-{"core": 2, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6496}
-{"core": 3, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6496}
-{"core": 4, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6496}
-{"core": 5, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6496}
+{"core": 2, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5808}
+{"core": 3, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5808}
+{"core": 4, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5808}
+{"core": 5, "design": "inkling_prefill", "entry": "d340c43c582a", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5808}
+{"core": 2, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6832}
+{"core": 3, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6832}
+{"core": 4, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6832}
+{"core": 5, "design": "inkling_prefill", "entry": "a908aca53332", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 6832}
+{"core": 2, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5296}
+{"core": 3, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5296}
+{"core": 4, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5296}
+{"core": 5, "design": "inkling_prefill", "entry": "aad3bf7a0f51", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 5296}
 {"core": 2, "design": "inkling_prefill", "entry": "aa05a09c6a7c", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 1888}
 {"core": 3, "design": "inkling_prefill", "entry": "aa05a09c6a7c", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 1888}
 {"core": 4, "design": "inkling_prefill", "entry": "aa05a09c6a7c", "apps": ["inkling2-UD-Q4_K_XL"], "bytes": 1888}

@@ -180,32 +180,34 @@ void {{ p }}_run(const uint8_t *__restrict x, uint8_t *__restrict out)
 }  // extern "C"
 {% endif %}
 {% if op == "blend" %}
-// The blend core's workspace (bytes): wp [matrix 2 (F, G)][output tile 9][k block 8][hi, lo] bfp16 panels | gp [k block 8][hi,
-// lo] (a block's g) | c [matrix 2][output tile 9][64] fp32
+// The blend core's workspace (bytes): wp [matrix 2 (-2 F, 2 G)][output tile 9][k block 8][hi, lo] bfp16 panels | gp [k block 8]
+// [hi, lo] (a block's g) | c [matrix 2][output tile 9][64] fp32
 {% set sig = km.sigmoid(64, prec="fp32") %}
 {{ sig.src }}
 
 extern "C" {
 
 // Output tile t (matrix t / 9: F, G) of the core's rows of the forget and gain matrices (w: [output 8][64] bf16) -> its hi + lo
-// panels per k block (rows: outputs, columns: k)
+// panels per k block (rows: outputs, columns: k) of -2 F, 2 G (exact): the epilogue's sigmoid arguments
 void {{ p }}_prm(const bfloat16 *__restrict w, float *__restrict ws, int32_t t)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     const al::BV nI = al::neg_eye();
+    const aie::vector<bfloat16, 64> sc = aie::broadcast<bfloat16, 64>(t < 9 ? -2.0f : 2.0f);
     al::BOut<> po((bfp16ebs8 *)(SW(uint8_t, {{ wb.wp }}) + {{ 16 * 72 }} * t));
     AIE_LOOP_NO_UNROLL
     for (int kb = 0; kb < 8; kb++) {
         al::BV h, l;
-        al::split_hilo(aie::accum<accfloat, 64>(al::gather<8, 8>(w + 8 * kb, 64)), nI, h, l);
+        al::split_hilo(aie::mul(al::gather<8, 8>(w + 8 * kb, 64), sc), nI, h, l);
         po.push(h);
         po.push(l);
     }
 }
 
 // A block of 8 tokens (x: g's halves [token 8][64] fp32 each, then cur_s, msg_s [token 8][{{ C }}] bf16: the column's slices) ->
-// out [token 8][72] bf16 of the core's channels 72 r ..: g = g_a + g_b, F g and G g on the MMUL (g and the rows hi + lo:
-// three products), (1 - tanh(F g)) cur + tanh(G g) msg (tanh = 2 sigmoid(2 x) - 1, fp32)
+// out [token 8][72] bf16 of the core's channels 72 r ..: g = g_a + g_b, a = -2 F g and b = 2 G g on the MMUL (g and the rows
+// hi + lo: three products), (1 - tanh(F g)) cur + tanh(G g) msg = 2 sigmoid(a) cur + (2 sigmoid(b) - 1) msg (the sigmoids
+// fp32, as bf16 hi + lo against the exact 2 cur, 2 msg: one rounding)
 void {{ p }}_run(const bfloat16 *__restrict x, float *__restrict ws, bfloat16 *__restrict out, int32_t r)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -233,14 +235,17 @@ void {{ p }}_run(const bfloat16 *__restrict x, float *__restrict ws, bfloat16 *_
         aie::store_v(cc + 64 * t, c.template to_vector<float>());
     }
     const bfloat16 *__restrict cs = x + 2048 + 72 * r, *__restrict ms = x + 2048 + {{ 8 * C }} + 72 * r;
+    const aie::vector<bfloat16, 64> two = aie::broadcast<bfloat16, 64>(2.0f), one = aie::broadcast<bfloat16, 64>(1.0f);
     AIE_LOOP_NO_UNROLL
     for (int j = 0; j < 9; j++) {  // (lane 8 token + o of output tile j)
-        const aie::vector<float, 64> tf = aie::sub(aie::mul({{ sig }}(aie::mul(aie::load_v<64>(cc + 64 * j), 2.0f).template to_vector<float>()), 2.0f).template to_vector<float>(), aie::broadcast<float, 64>(1.0f));
-        const aie::vector<float, 64> tg = aie::sub(aie::mul({{ sig }}(aie::mul(aie::load_v<64>(cc + 576 + 64 * j), 2.0f).template to_vector<float>()), 2.0f).template to_vector<float>(), aie::broadcast<float, 64>(1.0f));
-        const aie::vector<float, 64> c_ = aie::accum<accfloat, 64>(al::gather<8, 8>(cs + 8 * j, {{ C }})).template to_vector<float>();
-        const aie::vector<float, 64> m_ = aie::accum<accfloat, 64>(al::gather<8, 8>(ms + 8 * j, {{ C }})).template to_vector<float>();
-        const aie::vector<float, 64> y = aie::add(al::mulff<64>(aie::sub(aie::broadcast<float, 64>(1.0f), tf), c_), al::mulff<64>(tg, m_));
-        const aie::vector<bfloat16, 64> yb = aie::accum<accfloat, 64>(y).template to_vector<bfloat16>();
+        aie::vector<bfloat16, 64> fh, fl, gh, gl;
+        al::split2<64>({{ sig }}(aie::load_v<64>(cc + 64 * j)), fh, fl);
+        al::split2<64>({{ sig }}(aie::load_v<64>(cc + 576 + 64 * j)), gh, gl);
+        const aie::vector<bfloat16, 64> m = al::gather<8, 8>(ms + 8 * j, {{ C }});
+        const aie::vector<bfloat16, 64> c2 = aie::mul(al::gather<8, 8>(cs + 8 * j, {{ C }}), two).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, 64> m2 = aie::mul(m, two).template to_vector<bfloat16>();
+        const aie::accum<accfloat, 64> y = aie::mac(aie::mac(aie::mac(aie::mul(fh, c2), fl, c2), gh, m2), gl, m2);
+        const aie::vector<bfloat16, 64> yb = aie::msc(y, m, one).template to_vector<bfloat16>();
         for (int t = 0; t < 8; t++)
             aie::store_v(out + 72 * t + 8 * j, yb.template extract<8>(t));
     }

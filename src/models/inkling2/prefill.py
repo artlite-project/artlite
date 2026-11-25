@@ -54,9 +54,15 @@ ATTN_T = 2048  # an attention item's tokens at most (its 64 passes of 32 queries
 SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB)) + (1536, 2048, 4096, 6144, 8192)
 PREP_T = 512  # tokens of a prep item at most (its chained fills)
 CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
-# the time model's constants (``layer_seconds``): a ConfigureOp, per sub-chunk a byte of a visit's weights
-CFG_S, WEIGHT_S = 0.12e-3, 3.69e-11
-HOST_STEP_S = 3e-3  # (an MoE's routing on the host, between two pieces)
+# the time model's constants (``layer_seconds``; fitted to chunks of 1024 .. 8192 tokens at p0 0 and a 2048-token one at
+# 30720, Strix Halo): a ConfigureOp; per sub-chunk a visit's attention side (its GEMMs, mixes, norms, prep, gate, post
+# convs) and a loop visit's controllers; per cache group an attention pass streams, the near part's (the relative bias:
+# the cores bind) and a full layer's far part's (~52 GB/s); the experts per expert chunk of the busiest column; per token
+# the gathered norm and the combine, the host's routing (and per visit its fixed part)
+CFG_S = 0.12e-3
+SUB_S, CTL_S = 2.1e-3, 2.6e-3
+NEAR_S, FAR_S = 7.5e-6, 4.2e-6
+CHUNK_S, MOE_TOK_S, ROUTE_TOK_S, ROUTE_S = 1.29e-3, 2.6e-6, 0.7e-6, 1.5e-3
 
 
 class InklingPrefill(ChunkPrefill):
@@ -64,7 +70,7 @@ class InklingPrefill(ChunkPrefill):
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, SIZES[-1], "inkling_prefill", KV_PAD
     MIN_TOKENS = 3  # (the post convs' windows: the chunk's last 3 valid tokens' inputs)
-    CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
+    CFG_S = CFG_S
 
     def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True):
         ov = overlay
@@ -502,15 +508,33 @@ class InklingPrefill(ChunkPrefill):
     # ------------------------------------------------------------------
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
-        """(per sub-chunk the visit's attention weights' bytes, WEIGHT_S each; CFG_S per ConfigureOp; the attention as
-        its window's records; the MoE: its chunks' expert runs, WEIGHT_S a byte, and the host's step)"""
+        """(module constants: per sub-chunk the attention side and a loop visit's controllers, the ConfigureOps, the
+        attention by the cache groups its passes stream, the MoE by its busiest column's expert chunks: the experts hit
+        by T tokens' routing, or ~0.62 of them plus a chunk per CHUNK pairs (the routing statistics of 8192 essay tokens:
+        the busiest column within ~6%), per token the gathered norm, the combine and the routing)"""
         x = self.vis[L]
-        b = sum(self.img.region(x.layer, n).nbytes for n in ("q", "k", "v", "o"))
-        out = S * WEIGHT_S * b + self.layer_configs(L) * CFG_S + 1e-3 * S
+        T = S * SUB
+        out = S * (SUB_S + (CTL_S if x.messages else 0)) + self.layer_configs(L) * CFG_S + self._attn_seconds(x.kind, p0, T)
         if self.moe is not None:
-            pairs = S * SUB * self.cfg.n_experts_used
-            chunks = min(self.cfg.n_experts, pairs) + pairs / CHUNK
-            out += chunks * self.moe.unit_offsets[x.layer][-1] * WEIGHT_S + HOST_STEP_S
+            E, k = self.cfg.n_experts, self.cfg.n_experts_used
+            chunks = max(E * (1 - (1 - k / E) ** T), 0.62 * E + T * k / CHUNK)
+            out += chunks / COLS * CHUNK_S + T * (MOE_TOK_S + ROUTE_TOK_S) + ROUTE_S
+        return out
+
+    def _attn_seconds(self, kind: str, p0: int, T: float) -> float:
+        """A visit's attention over T tokens at p0: per pass of 32 queries its near part's groups (the window and the
+        pass's own; a full layer's also the item's groups before the pass) and a full layer's far part's (from position
+        0 to 16 groups before the item: at least one)."""
+        pg, items = self.shape.pg, max(1, round(T / ATTN_T))
+        t = T / items  # (an item's tokens)
+        out = 0.0
+        for j in range(items):
+            passes, ng = t / 32, t / pg
+            if kind == "swa":
+                out += passes * (self.guard + 1) * NEAR_S
+            else:
+                far = max(1.0, (p0 + j * t) / pg - self.guard)
+                out += passes * ((self.guard + 1 + (ng - 1) / 2) * NEAR_S + far * FAR_S)
         return out
 
     def layer_configs(self, L: int) -> int:

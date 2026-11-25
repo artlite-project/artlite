@@ -19,7 +19,9 @@ H, token-major).
 - ``InkBlendOperator``: a loop visit's controller of a stream: g = g_a + g_b (its down's two halves, the GEMMs' fp32 sums of
   plane pairs: 8 a column), out = (1 - tanh(F g)) cur + tanh(G g) msg (cur, msg: the stream's mix and message, bf16
   rows), F and G the image's ``ctl_<stream>`` rows (bf16 [288][64] a column, read in place). Column c its slice, core r
-  its 72 channels: their F, G rows resident as hi + lo panels, F g and G g on the MMUL per 8 tokens.
+  its 72 channels: their -2 F, 2 G rows resident as hi + lo panels, a = -2 F g and b = 2 G g on the MMUL per 8 tokens,
+  out = 2 sigmoid(a) cur + (2 sigmoid(b) - 1) msg (tanh x = 2 sigmoid(2 x) - 1; the fp32 sigmoids as bf16 hi + lo against
+  2 cur and 2 msg on the accumulator: no fp32 products, one rounding).
 """
 
 import numpy as np
