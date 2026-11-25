@@ -22,7 +22,7 @@ import numpy as np
 
 from artlite import txn
 from artlite.moe import plan as MP
-from artlite.moe.expert_gemm import CHUNK, MAX_REPEAT, N_GROUPS, N_PARAM, ExpertGemmOperator, M
+from artlite.moe.expert_gemm import CHUNK, MARKER, MAX_REPEAT, N_GROUPS, N_PARAM, ExpertGemmOperator, M
 from artlite.moe.gather import CHAIN, CombineOperator, GatherNormOperator, ds_row
 from artlite.moe.route import top_k_bias
 from artlite.operators.design import COLS
@@ -161,9 +161,11 @@ class InkMoE:
         px = addr(xf) + 2 * self.H * np.arange(T, dtype=np.int64)
         w = g.cb_words
         v = dev.view("CBG").view(np.uint32)
-        g.streams([px[r] for r in plan.rows], plan.sizes, cb=[addr("CBG", 4 * c * w) for c in range(COLS)],
-                  xp=[addr("XP", 2 * c * self.cap * g.slot) for c in range(COLS)],
-                  out=[v[c * w:(c + 1) * w] for c in range(COLS)])
+        # (per buffer the ranges the host wrote, flushed alone: the buffers hold a 2048-token chunk's worst case)
+        dirty = [("CBG", 4 * c * w, 4 * len(x)) for c, x in enumerate(
+            g.streams([px[r] for r in plan.rows], plan.sizes, cb=[addr("CBG", 4 * c * w) for c in range(COLS)],
+                      xp=[addr("XP", 2 * c * self.cap * g.slot) for c in range(COLS)],
+                      out=[v[c * w:(c + 1) * w] for c in range(COLS)]))]
         gs = g.group_scales(plan.sizes, [gsc[e] for e in plan.experts])
         dev.view("GS")[:gs.nbytes] = gs.view(np.uint8).reshape(-1)
         _, u = self.units[L]
@@ -173,11 +175,13 @@ class InkMoE:
             o = u[op]
             v = dev.view(name).view(np.uint32)
             w = o.cb_words
-            o.streams(plan.experts, active, cb=[addr(name, 4 * c * w) for c in range(COLS)],
-                      slab=addr("W", slab), slab_stride=uo[1], expert_stride=uo[3], col0=col0,
-                      c_address=[addr(out, 2 * c * self.cap * o.c_slot) for c in range(COLS)],
-                      a_address=[addr(a_buf, 2 * c * self.cap * o.a_slot) for c in range(COLS)],
-                      out=[v[c * w:(c + 1) * w] for c in range(COLS)])
+            res = o.streams(plan.experts, active, cb=[addr(name, 4 * c * w) for c in range(COLS)],
+                            slab=addr("W", slab), slab_stride=uo[1], expert_stride=uo[3], col0=col0,
+                            c_address=[addr(out, 2 * c * self.cap * o.c_slot) for c in range(COLS)],
+                            a_address=[addr(a_buf, 2 * c * self.cap * o.a_slot) for c in range(COLS)],
+                            out=[v[c * w:(c + 1) * w] for c in range(COLS)])
+            for c, x in enumerate(res):  # (its words, and the marker panel at the column's end)
+                dirty += [(name, 4 * c * w, 4 * len(x)), (name, 4 * ((c + 1) * w - MARKER), 4 * MARKER)]
         pos = np.zeros((T, self.K), np.int64)
         pos[:n] = plan.pos
         rows = np.concatenate([addr("Y01") + 2 * u["dn01"].y_offset(pos), addr("Y2") + 2 * u["dn2"].y_offset(pos)], 1)
@@ -185,14 +189,16 @@ class InkMoE:
         v = dev.view("CBC").view(np.uint32)
         tpc, w = T // COLS, cb.cb_words
         for c in range(COLS):
-            cb.stream(rows[c * tpc:(c + 1) * tpc], cb=addr("CBC", 4 * c * w), out=v[c * w:(c + 1) * w])
+            x = cb.stream(rows[c * tpc:(c + 1) * tpc], cb=addr("CBC", 4 * c * w), out=v[c * w:(c + 1) * w])
+            dirty.append(("CBC", 4 * c * w, 4 * len(x)))
         rb = 2 * ds_row(self.H, self.ds_pitch)
         wt = dev.view("DS")[:T * rb].view(np.float32).reshape(T, -1)[:, COLS * self.ds_pitch // 2:]
         wt[:] = 0
         wt[:n, :self.K] = wts
-        for name in ("CBG", "GS", "CBC", *(it[0] for it in self.gemm_items[L])):
-            dev.flush(name)
-        dev.flush("DS", 0, T * rb)
+        for name, a, b in dirty:
+            dev.flush(name, a, b)
+        dev.flush("GS", 0, gs.nbytes)
+        dev.flush_at("DS", rb * np.arange(T, dtype=np.int64) + 2 * COLS * self.ds_pitch)  # (the weights' lines alone)
         groups = [int((-(-plan.sizes[c] // CHAIN)).sum()) for c in range(COLS)]  # (the gathered norm's)
         lib.set_params({f"{N_PARAM}{c}": plan.counts[c] | groups[c] << N_GROUPS for c in range(COLS)})
         return plan
