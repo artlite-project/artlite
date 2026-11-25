@@ -46,7 +46,7 @@ from ..gemm.pacing import PACE_ROLES, pace_class
 from ..operators.design import COLS, MAX_BD_ITER, MAX_CHAIN_BDS
 from ..operators.util import arg_bytes
 from .gate_up import GateUpActOperator
-from .planar import choose_planar_plan, gemm_mac_rows, planar_gemm
+from .planar import PlanarPlan, choose_planar_plan, gemm_mac_rows, planar_gemm
 
 LINES = True  # packed C drains in whole 64-byte lines (GemmQOperator lines=; artlite-probe --diagnose measures both)
 ROWS = 64  # rows of a tile-major pass (gemm_q: 4 tiles of 16 rows, 8 BFP16 tiles of 8)
@@ -55,7 +55,8 @@ OUT = {"gdn_out", "attn_out", "down", "o", "proj", "eh", "fc", "out"}  # project
 WHICH = {"gdn_in": "qkv", "attn_in": "qkv", "gdn_out": "o", "attn_out": "o", "gate_up": "gu", "down": "down",
          "qkv": "qkv", "o": "o", "gate": "qkv", "proj": "o", "eh": "o", "fc": "o", "ikv": "qkv", "in": "qkv", "out": "o",
          "ple": "qkv", "q": "qkv", "k": "qkv", "v": "qkv", "gin_q": "qkv", "gin_z": "qkv", "attn_q": "qkv", "attn_k": "qkv",
-         "attn_v": "qkv", "up": "qkv", "pgate": "qkv"}
+         "attn_v": "qkv", "up": "qkv", "pgate": "qkv", "router": "qkv",
+         **{f"d{s}{h}": "qkv" for s in ("q", "k", "v", "ffn") for h in "ab"}}  # (Inkling's router, controllers' downs)
 assert set(WHICH.values()) == set(PACE_ROLES), "a GEMM's role is a pace class's (gemm.pacing)"
 
 
@@ -171,8 +172,33 @@ def _valid(region: Region, i: int) -> int:
 
 def _plan(region: Region, run: list[int], T: int, K: int, few: bool) -> object:
     b = region.blocks[run[0]]
+    if region.qt:
+        return _qt_plan(region, run)
     return choose_planar_plan([_valid(region, i) for i in run], b.R, few_passes=few, T=T, fmt=b.fmt, K=K,
                               kc_group=region.kc_group, tile_bytes=region.tile_bytes, kc=region.kc)
+
+
+def _qt_plan(region: Region, run: list[int]) -> PlanarPlan:
+    """The passes of a ``Region.qt`` region's planar run: a group of row tiles each (``Region.qg``: they share their tail
+    tile), a block's partial last group a block of its own (its tail tile closer: the weight fills' group stride
+    changes there, ``geometry.Geometry.qt``)."""
+    b0 = region.blocks[run[0]]
+    t, R = region.qg, b0.R
+    assert slot(b0.fmt).pass_tiles(b0.fmt, R, t), (b0.fmt, R, t)
+    blocks, pitches, rt = [], [], 0
+    for i in run:
+        nt = region.blocks[i].tiles
+        full, rem = divmod(nt, t)
+        blocks += [(rt, full)] if full else []
+        blocks += [(rt + full * t, 1)] if rem else []
+        pitches.append(-(-nt // t) * t * R)
+        rt += nt
+    return PlanarPlan(t, R, tuple(blocks), t * R, tuple(pitches), rt)
+
+
+def _qt(region: Region) -> tuple[tuple[int, int, int], ...]:
+    """A ``Region.qt`` region's blocks for ``geometry.GemmSpec.qt``: (first row tile, first tile, row tiles) each."""
+    return tuple((region.rt0[b.name], region.t0[b.name], b.tiles) for b in region.blocks) if region.qt else ()
 
 
 def _extents(region: Region, run: list[int], T: int, K: int, few: bool) -> list[int]:
@@ -234,10 +260,14 @@ def _kw(region: Region, run: list[int], T: int, K: int, N: int, out_cols: list[l
     else:
         blocks = tuple((region.rt0[region.blocks[i].name], -(-region.blocks[i].tiles // _tp(region.blocks[i])))
                        for i in run)
+        # (a qt region's tile-major passes: one group's row tiles each, the pass's other tiles padding)
+        assert not region.qt or all(region.blocks[i].tiles <= region.qg for i in run), "qt: tile-major blocks of a group"
         kw.update(blocks=blocks)
         rt_end = max(r + _tp(b0) * n for r, n in blocks)
     # (the chunk group stride; a run that reads past the region: its last column's extra tiles counted)
     kw["region_rt"] = min(region.n_rt, rt_end)
+    if region.qt:  # (the column's tiles: the tail groups' layout, ``geometry.Geometry.qt``)
+        kw.update(qt=_qt(region), region_rt=region.n_t)
     if k_part[1]:
         kw["a_cols"] = (k_part[0] * region.kc, region.K_in)
     return kw

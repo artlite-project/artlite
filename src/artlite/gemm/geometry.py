@@ -149,9 +149,10 @@ class GemmSpec:
     run: int = 1
     ptail_part: int = -1
     dual: int = 0
+    qt: tuple[tuple[int, int, int], ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("out_cols", "blocks", "a_cols", "ablate"):
+        for name in ("out_cols", "blocks", "a_cols", "ablate", "qt"):
             value = getattr(self, name)
             object.__setattr__(self, name, tuple(tuple(v) if isinstance(v, (list, tuple)) else v for v in value))
 
@@ -222,6 +223,8 @@ class Geometry:
     dual: int  # (> 0: passes in pairs, the second's ``pass_rt`` this many on (pt_part: tiles, else row tiles): another
     # region's, on A's second half; C = act(first) second, ``GemmSpec.dual``)
     run: int  # tiles of an image object (tile_bytes): back to back from its start (``GemmSpec.run``)
+    qt: tuple[tuple[int, int, int], ...]  # (a ``decode.image.Region.qt`` region) per image block (first row tile, first
+    # tile, row tiles): its row tiles in groups of ``qg`` sharing their tail tile (``tile``, ``tail_unit``)
     KA: int  # A's columns
     a_k0: int
     a_K: int
@@ -302,8 +305,20 @@ class Geometry:
         (``decode.image.Region``'s pairs of 2 n_kc - 1 tiles, a block's (first tile, passes) in ``blocks``): pass pair q
         of a block reads pairs q tiles .. as even row tiles (pass 2 q) and odd ones (2 q + 1), the last chunk from the
         pair's tail tile."""
+        if self.qt:
+            return _qt_tile(self.qt, self.qg, self.n_kc, self.pass_rt[p], t, k)
         return _tile(self.blocks, self.pass_rt, self.ptail or self.pt_part >= 0, self.tiles, self.n_kc, self.kc_group,
                      self.region_rt, self.rt_stride, p, t, k, self.pt_part)
+
+    @property
+    def qg(self) -> int:
+        """(``qt``) Row tiles of a group sharing a tail tile."""
+        return self.nsb // self.tail if self.qt else 1
+
+    def tail_unit(self, p: int, t: int) -> int:
+        """(``qt``) The first unit of pass p's tile t in its tail tile (``tile(p, t, n_kc - 1)``): its row tile's place in
+        its group times the tail's super-blocks (past the group's row tiles, a pass's padding tiles: the units after)."""
+        return _qt_member(self.qt, self.qg, self.pass_rt[p], t)[2] * self.tail
 
     @property
     def hdr_groups(self) -> list[tuple[int, int]]:
@@ -347,8 +362,14 @@ class Geometry:
         nsb = kc // 256
         # (a K of part of the last chunk, ``decode.image.Region.half``'s: its first tail super-blocks read)
         tail = K % kc // 256
-        assert not tail or (2 * tail == nsb and K > kc and spec.k_rep == 1 and groups == 1
+        assert not tail or ((2 * tail == nsb or spec.qt) and K > kc and spec.k_rep == 1 and groups == 1
                             and spec.kc_group in (0, -(-K // kc))), (K, kc, spec.kc_group)
+        # (a ``Region.qt`` region: groups of nsb / tail row tiles share a tail tile; a pass's tiles one group's, its first
+        # row tile at a group's start; a tile-major pass may run past its group's row tiles: tiles after them read
+        # whatever follows, its padding rows)
+        assert not spec.qt or (tail and nsb % tail == 0 and not spec.ptail and spec.ptail_part < 0 and not spec.dual
+                               and (spec.tiles or 64 // rows) % (nsb // tail) == 0 or (spec.tiles or 64 // rows) <= nsb // tail), \
+            (spec.qt, tail, spec.tiles)
         assert not spec.ptail or (tail and spec.blocks and all(cnt % 2 == 0 for _, cnt in spec.blocks)), "ptail: pairs"
         # (one parity of ``ptail``'s pairs: a GEMM of plain C, its passes the pairs' even or odd row tiles)
         assert spec.ptail_part < 0 or (tail and spec.blocks and not spec.ptail and not silu and spec.ptail_part in (0, 1))
@@ -413,8 +434,9 @@ class Geometry:
             pass_rt = tuple(rt0 + step * i for rt0, cnt in blocks for i in range(cnt))
             rt_end = max(rt0 + step * (cnt - 1) + tiles for rt0, cnt in blocks)  # row tiles read
             region_rt = spec.region_rt or rt_end  # row tiles of a column's region (the chunk group stride)
-            # (one chunk per group: any chunk stride; the passes' steps: the tiles stepped over after the last pass too)
-            assert region_rt <= max(rt0 + step * cnt for rt0, cnt in blocks) or (spec.kc_group or n_kc) == 1
+            # (one chunk per group: any chunk stride; the passes' steps: the tiles stepped over after the last pass too;
+            # qt: the column's tiles)
+            assert region_rt <= max(rt0 + step * cnt for rt0, cnt in blocks) or (spec.kc_group or n_kc) == 1 or spec.qt
         # a row tile's K chunks come in groups of kc_group consecutive tiles (row tiles of a group
         # consecutive): the image's groups of a long-K projection (``decode.image.kc_group``: the decode overlay's
         # activation objects)
@@ -496,7 +518,16 @@ class Geometry:
         # last column's: a column stride longer than the region (a column-major image's) is not read past it there,
         # where the image may end
         nk, g, rt, rs = n_kc, kc_group, region_rt, rt_stride
-        if spec.ptail or spec.ptail_part >= 0:  # (the last tile any pass reads; the region: the column's tiles, dual:
+        if spec.qt:  # (the last tile any pass reads, its tail units included; the region: the column's tiles)
+            qg = nsb // tail
+            last = 0
+            for p in range(passes):
+                for t in range(tiles):
+                    last = max(last, 1 + _qt_tile(spec.qt, qg, nk, pass_rt[p], t, nk - 2))
+                    u = _qt_member(spec.qt, qg, pass_rt[p], t)[2] * tail + tail
+                    last = max(last, _qt_tile(spec.qt, qg, nk, pass_rt[p], t, nk - 1) + -(-u // nsb))
+            region = rt * spec.tile_bytes
+        elif spec.ptail or spec.ptail_part >= 0:  # (the last tile any pass reads; the region: the column's tiles, dual:
             # through the second region's)
             last = 1 + max(_tile(blocks, pass_rt, True, tiles, nk, g, rt, rs, p, t, k, spec.ptail_part)
                            for p in range(passes) for t in range(tiles) for k in range(nk))
@@ -519,7 +550,7 @@ class Geometry:
             planar=is_planar, nsb=nsb, units=units, slice=slice_bytes, hdr_units=hdr_units, hdr_skip=hdr_skip, hg=hg,
             us=us, dequant=dequant, ws_planes=FORMATS[fmt].ws_planes, pair=pair, tq=tq, tiles=tiles, TR=TR,
             blocks=blocks, pass_step=step, pass_rt=pass_rt, region_rt=region_rt, n_kc=n_kc, kc_group=kc_group, rt_stride=rt_stride,
-            tail=tail, ptail=spec.ptail, pt_part=spec.ptail_part, dual=dual, run=spec.run,
+            tail=tail, ptail=spec.ptail, pt_part=spec.ptail_part, dual=dual, run=spec.run, qt=spec.qt,
             KA=KA, a_k0=a_k0, a_K=a_K, overrun=overrun, w_bytes=w_bytes, halves=halves, n_read=n_read, n=n, nm=nm,
             c_pack=c_pack, slots=slots, vp=vp, n_out=n_out, n_c=n_c, carry=None, win=n_out, c_parts=1,
             c_panels=spec.c_panels)
@@ -551,6 +582,24 @@ def _tile(blocks: tuple[tuple[int, int], ...], pass_rt: tuple[int, ...], ptail: 
     if k < n_kc - 1:
         return pass_rt[p] + pair * t + k
     return pass_rt[p] - n_kc * (i % 2 if part < 0 else part) + pair * t + n_kc - 1
+
+
+def _qt_member(qt: tuple[tuple[int, int, int], ...], qg: int, rt: int, t: int) -> tuple[tuple[int, int, int], int, int]:
+    """(``Geometry.qt``) The image block of the pass whose first row tile is rt, its group of rt, and tile t's place in
+    the group (t past the group's row tiles: on, the pass's padding tiles)."""
+    b = next(x for x in reversed(qt) if x[0] <= rt)
+    G, i0 = divmod(rt - b[0], qg)
+    assert i0 == 0, ("a qt pass starts at a group", rt, b)
+    return b, G, t
+
+
+def _qt_tile(qt: tuple[tuple[int, int, int], ...], qg: int, n_kc: int, rt: int, t: int, k: int) -> int:
+    """(``Geometry.qt``) The tile that tile t of the pass whose first row tile is rt reads for K chunk k
+    (``decode.image.Region.tile``: per group its row tiles' full chunks, then the tail tile)."""
+    (_, t0, n_rt), G, i = _qt_member(qt, qg, rt, t)
+    nf = n_kc - 1
+    base = t0 + G * (qg * nf + 1)
+    return base + (i * nf + k if k < nf else min(qg, n_rt - G * qg) * nf)
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,7 @@ from artlite.model_config import (
     decision_gguf,
     flint_gguf,
     gemma_gguf,
+    inkling_gguf,
     lfm3_gguf,
     llama_gguf,
     occamy_gguf,
@@ -105,7 +106,14 @@ CASES = [("llama", "Q4_K_M", "1B", (0, 3), 3, "qkv", 64), ("llama", "Q4_K_M", "1
          ("qwen3-paro", "P4_128", "0.6B", (0, 3), 0, "down", 256), ("qwen3-paro", "P4_128", "0.6B", (0, 3), 3, "o", 64),
          # P5_128 (int5: GemmQd, Q5_K's dequant; 13-row tiles of a qwen35 image): Qwen3.8-27B-PARO-int5's
          ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gin_q", 256), ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gdn_out", 256),
-         ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gate", 128), ("qwen35-paro5", "P5_128", "27B", (0, 3), 3, "down", 256)]
+         ("qwen35-paro5", "P5_128", "27B", (0, 3), 0, "gate", 128), ("qwen35-paro5", "P5_128", "27B", (0, 3), 3, "down", 256),
+         # Inkling 2 Mini (``decode.image.Region.qt``: the hidden 2304, a quarter tail shared by groups of 4 row tiles):
+         # q (Q8_0 q, gate, r: passes of a group, r's partial last group; the sink's F32 rows as BFP16 planes), a full
+         # layer's k (the tap deltas' planes), the router (planes: fp32 logits), a controller's down half, o (K 3072)
+         ("inkling", "UD-Q4_K_XL", "", (0, 5, 11), 0, "q", 256), ("inkling", "UD-Q4_K_XL", "", (0, 5, 11), 5, "k", 256),
+         ("inkling", "UD-Q4_K_XL", "", (0, 5, 11), 0, "router", 256),
+         ("inkling", "UD-Q4_K_XL", "", (0, 5, 11), 11, "dqa", 256),
+         ("inkling", "UD-Q4_K_XL", "", (0, 5, 11), 0, "o", 256)]
 
 _images: dict[tuple, tuple] = {}
 
@@ -125,6 +133,7 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             "kev": lambda: decision_gguf("kev"), "qwen3": lambda: qwen3_gguf(size), "lfm": lambda: lfm3_gguf(quant),
             "spark": lambda: spark_gguf(size, quant), "spark-bartowski": lambda: spark_gguf(size, quant, "bartowski"),
             "flint": lambda: flint_gguf(quant), "qwen3-paro": lambda: checkpoint("qwen3-0.6B-paro"),
+            "inkling": lambda: inkling_gguf(quant),
             "qwen35-paro5": lambda: checkpoint("qwen3.8-27B-paro-int5")}[base]()
     require(path)
     key = (path, layers, model)
@@ -142,6 +151,12 @@ def _image(model: str, quant: str, size: str, layers: tuple[int, ...]) -> tuple[
             from models.spark.image import SparkImage as Image
         elif base == "flint":
             from models.flint.image import FlintImage as Image
+        elif base == "inkling":
+            from models.inkling2.image import InklingImage
+
+            def Image(g: GGUFFile, *, layers: list[int], vocab: int) -> object:
+                from artlite.model_config import InklingConfig
+                return InklingImage(g, InklingConfig.from_gguf(g), layers=layers, vocab=vocab)
         else:
             from models.gemma4.image import GemmaImage as Image
         if base in ("llama", "qwen3", "qwen3-paro", "qwen35", "occamy", "d3-lite", "swift", "kev"):
@@ -309,9 +324,11 @@ def test_prefill_gemm(model: str, quant: str, size: str, layers: tuple[int, ...]
         for c in range(COLS):
             rows = b.rows[c][b.rows[c] >= 0]
             o = lay.pitch * c + lay.off[b.name]
-            if b.pairs:  # (fp32 sums of the planes: the F32 rows times the norm's w / bf16(w), as the image packs them)
+            if b.pairs:  # (fp32 sums of the planes: the F32 rows times the norm's w / bf16(w), as the image packs them;
+                # Inkling's normed image: the F32 rows)
                 got = Cb[:T, o:o + rows.size].contiguous().view(torch.float32).float()
-                want = Aq[:T] @ (_rows(img, b.tensors, rows[0::2] // 2) * _ratio(img, region)[None]).T
+                ratio = 1 if model == "inkling" else _ratio(img, region)[None]
+                want = Aq[:T] @ (_rows(img, b.tensors, rows[0::2] // 2) * ratio).T
                 assert rel_native(got, want) < 5e-5, (b.name, c, rel_native(got, want))  # (hi + lo: ~2^-16 of a row)
                 agree(lambda C, Cb, o=o, n=rows.size: Cb[:T, o:o + n])
                 continue

@@ -182,6 +182,23 @@ class Dataflow:
         step = 2 if geo.ptail or geo.dual else 1  # (passes per iteration)
         pt = max(geo.pt_part, 0)  # (parity e: ``pt_part``'s every pass; ``dual``: both parts of a pair)
         out = []
+        if geo.qt:  # (``Geometry.qt``: a pass's tiles one group's, row tile after row tile in the full chunks; the tail's
+            # units in the group's tail tile, tile t's at ``tail_unit``; a block's passes at one group stride)
+            assert geo.hdr_units == 0, "qt: tiles of units without headers"
+            last = geo.n_kc - 1
+            for k in range(geo.n_kc):
+                it = (geo.tile(p0 + 1, 0, k) - geo.tile(p0, 0, k)) * tw if np_ > 1 else tw
+                if k < last:
+                    ts = (geo.tile(p0, 1, k) - geo.tile(p0, 0, k)) * tw if geo.tiles > 1 else tw
+                    out.append(TensorAccessPattern(w_dims, base + geo.tile(p0, 0, k) * tw, [np_, geo.nsb, geo.tiles, sw],
+                                                   [it, sw, ts, 1]))
+                else:
+                    assert all(geo.tail_unit(p0, t) == geo.tail * t for t in range(geo.tiles))
+                    out.append(TensorAccessPattern(w_dims, base + geo.tile(p0, 0, k) * tw + geo.tail_unit(p0, 0) * sw,
+                                                   [np_, geo.tail, geo.tiles, sw], [it, sw, geo.tail * sw, 1]))
+                assert all(geo.tile(p0 + q, 0, k) - geo.tile(p0, 0, k) == q * it // tw for q in range(np_)), \
+                    "qt: a block's passes at one group stride (a partial last group: a block of its own)"
+            return out
         for i, e in enumerate((0, 1) if geo.ptail else (pt, pt) if geo.dual else (pt,)):
             p = p0 + i
             it = (geo.tile(p + step, 0, 0) - geo.tile(p, 0, 0)) * tw if np_ > step else tw  # (the next iteration's)
