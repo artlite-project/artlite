@@ -118,7 +118,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 | [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B; the decision models d1-2B, d1-Omni-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio, LFM3-Omni Q4_K_M, Q4_0; d1-Omni Q8_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images and videos through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription) and its generator (text to speech, spoken replies); all of them in one model (LFM3-Omni: videos with their sound, realtime conversations); decisions, also about images, videos and audio |
 | [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.7x on code and math); tool calls, thinking levels |
 | [Flint](docs/models/flint.md) | GGUF int4 (Recursive's official file) | prefill, decode (a 40B mixture of experts, ~2.5B active: 31 tokens/s at 1K); tool calls, thinking |
-| [Inkling 2 Mini](docs/models/inkling2.md) | GGUF UD-Q4_K_XL (unsloth) | decode, prompts as decode steps (a 26B mixture of experts whose middle layers loop 3 times: 10.7 tokens/s at 1K); thinking, several requests at a time |
+| [Inkling 2 Mini](docs/models/inkling2.md) | GGUF UD-Q4_K_XL (unsloth) | decode and a prefill (a 26B mixture of experts whose middle layers loop 3 times: 10.7 tokens/s at 1K, a 1K prompt in 2.5 s); thinking, several requests at a time |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).
