@@ -7,8 +7,10 @@
   sliding-window caches back with it);
 - steps of S tokens against steps of one, a rollback of rejected drafts, greedy text with the context's drafts: bit for
   bit, the same text;
-- greedy text after five prompts against llama.cpp's decode of the same tokens (``test_text``);
-- a prompt through the prefill against the same prompt as decode steps (``test_prefill``).
+- greedy text after five prompts against llama.cpp's decode of the same tokens (``test_text``; the prompts through the
+  prefill);
+- a prompt through the prefill against the same prompt as decode steps (``test_prefill``), and the decode after it
+  against llama.cpp's (``test_prefill_quality``).
 """
 
 import numpy as np
@@ -23,7 +25,7 @@ from models.inkling2.inkling import Inkling, NpuInkling
 from models.inkling2.overlay import InklingOverlay
 from models.sampling import Sampling
 
-from ..common import essay
+from ..common import essay, essays
 from ..goldens.text import golden
 from ..llama_cpp import llama_tokenize
 from ..model_files import require
@@ -73,6 +75,33 @@ def test_prefill() -> None:
     kl = float(kl_rows(torch.from_numpy(out[False][0][None]), torch.from_numpy(out[True][0][None])).mean())
     print(f"KL {kl:.4f}; text {host.tokenizer.decode(out[True][1])!r}")
     assert kl < 0.01 and out[True][1] == out[False][1]
+
+
+@pytest.mark.parametrize("P", [1024, 2048 + 512])
+def test_prefill_quality(P: int) -> None:
+    """An essay prompt of P tokens through the prefill (its chunks, the last token a decode step), then 64 tokens
+    teacher-forced as decode steps, against llama.cpp's decode of the same tokens: KL of the next-token distributions and
+    argmax agreement over the sure tokens, next to llama.cpp's own prompt run (a prompt graph over the first P tokens,
+    then decode graphs) against its decode: within 2x its KL (P 1024 / 2560: 0.0018 / 0.0025 against 0.0015 / 0.0015;
+    our decode steps over the prompt 0.0018 / 0.0020), the same argmax."""
+    path = _path()
+    Q = 64
+    tokens = llama_tokenize(path, essays())[:P + Q]
+
+    def ref(**kw: object) -> torch.Tensor:
+        return torch.from_numpy(np.asarray(golden(path, tokens, logits="f32", logits_from=P, **kw).logits, np.float32).copy())
+
+    dec, pro = ref(ubatch=1), ref(ubatch=512, split=P)
+    model = Inkling(path).load(capacity=4096)
+    got = torch.from_numpy(model.forced_logits(tokens, P))
+    kl, kl_llama = float(kl_rows(dec, got).mean()), float(kl_rows(dec, pro).mean())
+    top2 = torch.topk(dec, 2).values
+    sure = top2[:, 0] - top2[:, 1] >= 1
+    agree = float((dec.argmax(-1) == got.argmax(-1))[sure].float().mean())
+    agree_llama = float((dec.argmax(-1) == pro.argmax(-1))[sure].float().mean())
+    print(f"P {P}: KL {kl:.4f} (llama.cpp prompt vs decode {kl_llama:.4f}), argmax agreement {agree:.3f} "
+          f"({agree_llama:.3f}) over {int(sure.sum())} of {Q} tokens; chunks {model.prefill.plan(0, P - 1)}")
+    assert kl < 2 * kl_llama and agree > agree_llama - 0.05
 
 
 def test_checkpoint() -> None:
@@ -145,6 +174,42 @@ def test_ring() -> None:
         del model
     bad = np.flatnonzero((rows[0] != rows[1]).any(-1))
     assert not bad.size, bad[:8]
+
+
+def test_prefill_rings() -> None:
+    """Prompts through the prefill on sliding-window rings (40 groups: each chunk within one turn, ``fits``; a window
+    across the wrap from the guard, ``mirror``) and on two sequences (lanes: a prompt of the second between the first's
+    prompt and its steps) give the decode steps after them the logits of linear caches on one sequence after the same
+    chunks, bit for bit."""
+    path = _path()
+    g = GGUFFile(path)
+    ids = llama_tokenize(path, essays())
+    a, b, a2 = ids[:3000], ids[3000:4900], ids[4900:4908]  # (two prompts; the first one's tokens after the second's)
+    Q, W = 16, 40
+    ring = NpuInkling(g, capacity=4096, wrap=W, prefill=True, sequences=2)
+    l0, l1 = ring.lanes
+    chunks = []
+    run = ring.prefill.run
+    ring.prefill.run = lambda e, p0, T=0: (chunks.append(p0), run(e, p0, T))[1]
+
+    def steps(lane: NpuInkling, toks: list[int]) -> np.ndarray:
+        return np.concatenate([lane.cap(np.asarray(lane.steps([t]))) for t in toks])
+
+    l0.reset()
+    l0.prompt(a[:-Q])
+    l1.reset()
+    l1.prompt(b[:-Q])
+    got_a, got_b, got_a2 = steps(l0, a[-Q:]), steps(l1, b[-Q:]), steps(l0, a2)
+    assert any(p // ring.prefill.group % W == 0 for p in chunks[1:]), ("no chunk at a ring's wrap", chunks)
+    del ring, l0, l1
+    lin = NpuInkling(g, capacity=4096, wrap=0, prefill=True)
+    fits = lin.prefill.fits
+    lin.prefill.fits = lambda T, p0: fits(T, p0) and (p0 // 64) % W + -(-T // 64) <= W  # (the ring's chunks)
+    want_a = lin.forced_logits(a + a2, len(a) - Q)
+    want_b = lin.forced_logits(b, len(b) - Q)
+    for what, x, y in (("a", np.concatenate([got_a, got_a2]), want_a), ("b", got_b, want_b)):
+        bad = np.flatnonzero((x != y).any(-1))
+        assert not bad.size, (what, bad[:8])
 
 
 def test_sequences() -> None:

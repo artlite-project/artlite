@@ -53,6 +53,7 @@ ATTN_T = 2048  # an attention item's tokens at most (its 64 passes of 32 queries
 # per token, its experts' rows 82% valid)
 SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB)) + (1536, 2048, 4096, 6144, 8192)
 PREP_T = 512  # tokens of a prep item at most (its chained fills)
+CG = 64  # positions of a cache group (the overlay's ``pg``)
 CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
 # the time model's constants (``layer_seconds``; fitted to chunks of 1024 .. 8192 tokens at p0 0 and a 2048-token one at
 # 30720, Strix Halo): a ConfigureOp; per sub-chunk a visit's attention side (its GEMMs, mixes, norms, prep, gate, post
@@ -84,7 +85,8 @@ class InklingPrefill(ChunkPrefill):
         self.shape = ink_shape(ov.T, ov.kp)
         self.group = self.shape.pg
         self.guard = PA.mode.swa_groups(cfg.sliding_window, self.shape.pg)
-        assert self.guard == ov.guard and ov.kinds[0].wrap == 0, "linear sliding-window caches (a chunk past a ring's turn)"
+        self.wrap = ov.kinds[0].wrap  # (the sliding-window caches' ring: a chunk within one turn of it, ``fits``)
+        assert self.guard == ov.guard and self.shape.pg == ov.pg == CG, (self.guard, self.shape.pg)
         self.walk = self._walk()
         self._gemms: dict = {}
         self._starts: dict[int, list[int]] = {}
@@ -155,7 +157,8 @@ class InklingPrefill(ChunkPrefill):
         kv0 = self.guard * s.group
         first = next(v for v in self.layers if self.vis[v].kind == kind)
         return PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes(first), kv_pad=self.pad, sub=self._pt(T),
-                               swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True, part=part)
+                               swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True, part=part,
+                               wrap=self.wrap if kind == "swa" else 0)
 
     def _attns(self, kind: str, T: int) -> list[PA.AttnOperator]:
         """The attention items of a chunk of size T (one, or its parts of ATTN_T tokens)."""
@@ -177,7 +180,8 @@ class InklingPrefill(ChunkPrefill):
         return [InkPrepOperator(T=pt, shape=self.shape, lq=plans[(L, "q")].layout, lk=plans[(L, "k")].layout,
                                 lv=plans[(L, "v")].layout, full=kind == "full", kv_bytes=ov.kv_bytes(v),
                                 tau_positions=ov.max_positions + self.MAX_T, kv_pad=self.pad, eps=self.cfg.rms_norm_eps,
-                                kv0=self.guard * self.shape.group, part=k) for k in range(T // pt)]
+                                kv0=self.guard * self.shape.group, part=k, wrap=self.wrap if kind == "swa" else 0)
+                for k in range(T // pt)]
 
     @property
     def pad(self) -> int:
@@ -463,6 +467,20 @@ class InklingPrefill(ChunkPrefill):
     # Run
     # ------------------------------------------------------------------
 
+    def fits(self, T: int, p0: int) -> bool:
+        """(and within one turn of the sliding-window caches' ring: its window's history before the chunk is the ring's
+        or its guard's, ``AttentionOverlay.mirror``)"""
+        w, pg = self.wrap, self.shape.pg
+        return super().fits(T, p0) and (not w or (p0 // pg) % w + -(-T // pg) <= w)
+
+    @staticmethod
+    def ring(max_positions: int) -> int:
+        """The sliding-window caches' ring (groups; 0: linear) of an overlay of ``max_positions`` that a prefill runs on:
+        two of the largest chunk (chunks of it start at its multiples, each within one turn: ``fits``), linear where the
+        capacity holds no more (33K positions: 3.3 GB of caches against 5.6 GB linear; 128K: 6 GB against 22)."""
+        w = 2 * SIZES[-1] // CG
+        return w if -(-max_positions // CG) > w else 0
+
     def params(self, T: int, p0: int, n: int) -> dict[str, int]:
         """The scratchpad parameters of a chunk of size T at position p0 of n valid tokens."""
         out = {}
@@ -490,6 +508,7 @@ class InklingPrefill(ChunkPrefill):
         eb = dev.view("EB")[:2 * T * H].view(bfloat16).reshape(T, H)
         eb[:n], eb[n:] = e.astype(bfloat16), 0
         dev.flush("EB", 0, 2 * T * H)
+        ov.mirror(p0)  # (a ring's window before the chunk across its wrap: the guard)
         hooks = {i: functools.partial(self.moe.host_route, self.vis[v].layer, n=n, T=T, t=self._t(T), xf=xf, dev=dev,
                                       lib=self.lib) for v, i, xf in self._marks.get(T, ())}
         # (the host's routing reads the router's logits: after the piece that ends with the router)

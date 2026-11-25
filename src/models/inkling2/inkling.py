@@ -13,7 +13,8 @@ A decode dispatch runs up to 4 consecutive tokens through the 48 visits and the 
 (``overlay.InklingOverlay``): the projections, the depth mixes, the loop's controllers and the experts on the main cores
 and their helpers, the residual stream's state array in their memory, the attention, its KV caches and the K / V convs
 on the attention cores; the head screened (``decode.screen``: the host computes its largest logits exactly). Prompts run
-in prefill chunks (``prefill.InklingPrefill``; its sliding-window caches linear), a prompt's last token as a decode step
+in prefill chunks (``prefill.InklingPrefill``; its sliding-window caches a ring that its largest chunk fits in,
+``InklingPrefill.ring``), a prompt's last token as a decode step
 (the head's); without the prefill as decode steps. The convs' state holds the last positions only: a sequence goes back
 to a checkpoint (``recurrent``)."""
 
@@ -38,17 +39,18 @@ class NpuInkling(OverlayModel):
     """The model on the NPU (module docstring). ``capacity``: the positions the KV caches hold; ``kv_k``: their K
     precision ("hilo", "single"); ``wrap``: the sliding-window caches' ring (``InklingOverlay``); ``sequences``: the
     sequences the device holds (``artlite-server -np``: lanes whose steps share a dispatch), each with its caches and
-    convs' state; ``prefill``: prompts in prefill chunks (one sequence)."""
+    convs' state; ``prefill``: prompts in prefill chunks (``wrap`` by default ``InklingPrefill.ring``)."""
 
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
     last_step = True  # (the prefill has no LM head)
+    LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn")
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
                  wrap: int | None = None, sequences: int = 1, prefill: bool = False):
-        assert not prefill or sequences == 1, "the prefill: one sequence"
         self.gguf = gguf
-        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=0 if prefill else wrap,
-                                      sequences=sequences)
+        if prefill and wrap is None:  # (a ring a chunk of the largest size fits in, from its multiples)
+            wrap = InklingPrefill.ring(capacity)
+        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap, sequences=sequences)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
@@ -140,9 +142,8 @@ class Inkling(Model):
         return self.gguf.rows("token_embd.weight", np.asarray(tokens))
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuInkling:
-        """(``prefill``: with one sequence; ``sequences``: ``NpuInkling``'s)"""
-        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences,
-                          prefill=prefill and sequences == 1)
+        """(``sequences``: ``NpuInkling``'s)"""
+        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences, prefill=prefill)
 
 
 __all__ = ["Inkling", "NpuInkling"]
