@@ -13,6 +13,13 @@ namespace artlite {
 void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t pitch, int E, int k, bool sigmoid,
                int32_t* ids, float* weights);
 
+/// The routing of n tokens by biased keys (``moe.route.top_k_bias``: Inkling's): per token t (its E logits at
+/// logits + t E, E a multiple of 16, k <= 16) the k largest keys float(sigmoid(l)) + bias[e] (sigmoid in double), largest
+/// first, ties to the lower id, into ids (n x k), and weights (n x k, double): sigmoid(l) / (their sum + 1e-20) times
+/// dscale[e].
+void moe_route_bias(const float* logits, int64_t n, int E, int k, const float* bias, const double* dscale, int32_t* ids,
+                    double* weights);
+
 /// The chunks of n tokens' routing (ids n x k, ``moe.plan.Plan``): an expert's (token, slot) pairs in token order, in
 /// chunks of at most ``chunk``, dealt to the cols columns in turn (expert by expert): experts (cols x cap) each
 /// column's chunks' experts, counts (cols), sizes (cols x cap) their pairs, rows (cols x cap x chunk) their tokens

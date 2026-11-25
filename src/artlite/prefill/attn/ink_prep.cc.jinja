@@ -110,12 +110,12 @@ void {{ p }}_q(const bfloat16 *__restrict x, float *__restrict ws, bfloat16 *__r
 
 {% for role, w in (("k", wk), ("v", wv)) %}
 // The {{ role | upper }} core's constants (its part of the PRM object: the old ring's {{ role | upper }} rows [slot 8][{{ HD }}] fp32, the raw rows of
-// positions p0 - 8 .. p0 - 1, then its taps [4][{{ HD }}] bf16); its token count reset
+// positions p0 - 8 .. p0 - 1, then its taps [4][{{ HD }}] bf16); its token count from the part's first token
 void {{ p }}_{{ role }}prm(const bfloat16 *__restrict prm, float *__restrict ws)
 {
     al::copy<{{ 8 * HD }}, 16>(PW(float, {{ w.hist }}), (const float *)prm);
     al::copy<{{ 4 * HD }}, 16>(PW(bfloat16, {{ w.taps }}), prm + {{ 16 * HD }});
-    PW(int32_t, {{ w.st }})[0] = 0;
+    PW(int32_t, {{ w.st }})[0] = {{ T0 }};  // (the part's first token in the chunk: n counts the chunk's)
 }
 
 // The ring after the chunk's last valid token ([slot 8][{{ HD }}] fp32, slot = position % 8) into out

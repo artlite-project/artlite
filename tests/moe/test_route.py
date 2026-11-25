@@ -56,20 +56,38 @@ def test_deal_units(u: int) -> None:
     assert max(loads) - u * sum(work) / COLS <= sum(work), loads
 
 
-def test_top_k_bias() -> None:
+def _top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``top_k_bias``'s numpy model: the k largest by composite keys (a key's ordered bits, then ~id)."""
+    sg = 1 / (1 + np.exp(-np.asarray(logits, np.float64)))
+    keys = sg.astype(np.float32) + np.asarray(bias, np.float32)
+    u = (keys + np.float32(0)).view(np.uint32).astype(np.uint64)
+    E = keys.shape[1]
+    comp = (np.where(u >> 31, u ^ 0xFFFFFFFF, u | 0x80000000) << 32) | (0xFFFFFFFF - np.arange(E, dtype=np.uint64))
+    part = np.argpartition(comp, E - k, axis=1)[:, E - k:]
+    order = np.take_along_axis(part, np.argsort(np.take_along_axis(comp, part, 1), axis=1)[:, ::-1], 1)
+    top = np.take_along_axis(sg, order, 1)
+    return order, top / (top.sum(1, keepdims=True) + 1e-20) * np.asarray(dscale, np.float64)[order]
+
+
+@pytest.mark.parametrize("n", [16, 5000])
+def test_top_k_bias(n: int) -> None:
     """The units routing's top 8 by sigmoid(l) + bias (ties to the lower id), weights sigmoid / (sum + 1e-20) times the
-    down's scale."""
+    down's scale: the native routing (5000 tokens: its threads) against the numpy model, ties included."""
     rng = np.random.default_rng(1)
-    lg = rng.standard_normal((16, 128)).astype(np.float32) * 3
+    lg = rng.standard_normal((n, 128)).astype(np.float32) * 3
+    lg[:, 7] = lg[:, 3]  # (equal keys: the lower id first)
     bias = rng.standard_normal(128).astype(np.float32) * 0.1
+    bias[7] = bias[3]
     dsc = rng.uniform(0.5, 2, 128)
     ids, w = MR.top_k_bias(lg, 8, bias, dsc)
+    want, ww = _top_k_bias(lg, 8, bias, dsc)
+    assert np.array_equal(ids, want)
+    assert np.allclose(w, ww, rtol=1e-13, atol=0)
     sg = 1 / (1 + np.exp(-lg.astype(np.float64)))
     keys = sg.astype(np.float32) + bias
     for s in range(16):
-        want = np.argsort(-keys[s].astype(np.float64), kind="stable")[:8]
-        assert ids[s].tolist() == want.tolist()
-        assert np.allclose(w[s], sg[s, want] / sg[s, want].sum() * dsc[want])
+        top = np.argsort(-keys[s].astype(np.float64), kind="stable")[:8]
+        assert ids[s].tolist() == top.tolist()
 
 
 def test_check_route() -> None:

@@ -22,7 +22,7 @@ task acquires ``LOCK_CP``) and later the expert object from DDR into the X strea
 
 import numpy as np
 
-from .. import txn
+from .. import _native, txn
 from ..operators import templating
 from ..operators.fused.ctrlpkt import parity, slot
 
@@ -110,19 +110,13 @@ def route(logits: np.ndarray, k: int, cols: int, gating: str = "softmax") -> tup
 
 
 def top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """``render(units=)``'s top k of each slot's fp32 logits (S, E): (ids (S, k): the k largest sigmoid(l) + bias, ties
-    to the lower id; weights (S, k), float64: sigmoid(l) / (their sum + 1e-20) times dscale of the expert)."""
-    sg = 1 / (1 + np.exp(-np.asarray(logits, np.float64)))
-    keys = sg.astype(np.float32) + np.asarray(bias, np.float32)
-    # (the k largest by composite keys: a key's ordered bits, then ~id, ties to the lower id; argpartition and a sort of
-    # the k: 2.9x a stable argsort of the rows, the prefill's routing per visit)
-    u = (keys + np.float32(0)).view(np.uint32).astype(np.uint64)  # (+0: -0 as +0)
-    E = keys.shape[1]
-    comp = (np.where(u >> 31, u ^ 0xFFFFFFFF, u | 0x80000000) << 32) | (0xFFFFFFFF - np.arange(E, dtype=np.uint64))
-    part = np.argpartition(comp, E - k, axis=1)[:, E - k:]
-    order = np.take_along_axis(part, np.argsort(np.take_along_axis(comp, part, 1), axis=1)[:, ::-1], 1)
-    top = np.take_along_axis(sg, order, 1)
-    return order, top / (top.sum(1, keepdims=True) + 1e-20) * np.asarray(dscale, np.float64)[order]
+    """``render(units=)``'s top k of each slot's fp32 logits (S, E): (ids (S, k): the k largest float(sigmoid(l)) + bias,
+    ties to the lower id; weights (S, k), float64: sigmoid(l) / (their sum + 1e-20) times dscale of the expert)
+    (``_native.moe_route_bias``: the prefill's routing per visit)."""
+    lg = np.ascontiguousarray(logits, np.float32)
+    ids, w = np.empty((lg.shape[0], k), np.int32), np.empty((lg.shape[0], k), np.float64)
+    _native.moe_route_bias(lg, np.ascontiguousarray(bias, np.float32), np.ascontiguousarray(dscale, np.float64), ids, w)
+    return ids, w
 
 
 def deal_units(union: list[int], cols: int, work: list[int]) -> list[list[tuple[int, int, int]]]:

@@ -35,6 +35,27 @@ void bind_moe(nb::module_& m) {
       "The top k of n tokens' E logits (token t's at logits[t row ..], expert e at (e / per_col) pitch + e % per_col) "
       "into ids and weights (n x k), softmax or (sigmoid) sigmoid weights over the k: artlite::moe_route.");
   m.def(
+      "moe_route_bias",
+      [](nb::ndarray<const float, nb::ndim<2>, nb::c_contig, nb::device::cpu> logits,
+         nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> bias,
+         nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu> dscale,
+         nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
+         nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> weights) {
+        const int64_t n = int64_t(logits.shape(0));
+        const int E = int(logits.shape(1)), k = int(ids.shape(1));
+        if (bias.shape(0) != size_t(E) || dscale.shape(0) != size_t(E) || ids.shape(0) != size_t(n) ||
+            weights.shape(0) != size_t(n) || weights.shape(1) != size_t(k))
+          throw artlite::Error("moe_route_bias: array shapes");
+        nb::gil_scoped_release release;
+        artlite::moe_route_bias(logits.data(), n, E, k, bias.data(), dscale.data(), ids.data(), weights.data());
+      },
+      "logits"_a, "bias"_a, "dscale"_a, "ids"_a, "weights"_a,
+      nb::sig("def moe_route_bias(logits: numpy.ndarray[numpy.float32], bias: numpy.ndarray[numpy.float32], "
+              "dscale: numpy.ndarray[numpy.float64], ids: numpy.ndarray[numpy.int32], "
+              "weights: numpy.ndarray[numpy.float64]) -> None"),
+      "The top k (ids.shape[1]) of n tokens' biased keys float(sigmoid(l)) + bias into ids, and weights sigmoid(l) / "
+      "(their sum + 1e-20) times dscale: artlite::moe_route_bias.");
+  m.def(
       "moe_plan",
       [](nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids, int E, int chunk,
          nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> experts,

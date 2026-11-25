@@ -90,8 +90,9 @@ class AttnOperator(ArtcOperator):
         reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring);
         ``part``: the item's place in a larger chunk whose attention runs as items of T tokens, each at its own position
         (its cores read the chunk's P_P8 and P_FQ plus the part's offsets, its fills' parameters are named with the suffix
-        ``_<part>``: a library's runtime sequence reads 32 at most; the cache holds the whole chunk's records before the
-        first item: ``PrepOperator``); ``wrap`` (sliding window): the cache a ring of that many groups, ``P_SW`` the chunk's
+        ``_<part>``, Inkling's but its far part's counts the chunk's with the part's offsets in the taps: a library's
+        runtime sequence reads 32 at most; the cache holds the whole chunk's records before the first item:
+        ``PrepOperator``); ``wrap`` (sliding window): the cache a ring of that many groups, ``P_SW`` the chunk's
         slot (``PrepOperator(wrap=)``); ``ink``: Inkling's attention (class docstring's "Inkling")."""
         s = shape
         self.ink = ink
@@ -131,8 +132,11 @@ class AttnOperator(ArtcOperator):
         super().__init__()
 
     def _pn(self, name: str) -> str:
-        """A scratchpad parameter's name in this design (``part``: its fills' own; the cores' the chunk's)."""
-        return f"{name}_{self.part}" if self.part and name in (P_FG, P_FO, P_SW, P_IF, P_IFQ, P_IFR, P_INO) else name
+        """A scratchpad parameter's name in this design (``part``: its fills' own; the cores' the chunk's; Inkling's
+        parts the far part's counts alone, their window and near-part offsets in their taps: a library's runtime
+        sequence reads 32 parameters at most)."""
+        own = (P_IF, P_IFQ, P_IFR) if self.ink else (P_FG, P_FO, P_SW, P_IF, P_IFQ, P_IFR, P_INO)
+        return f"{name}_{self.part}" if self.part and name in own else name
 
     def _offset(self, value: object, name: str) -> object:
         """A core's read of the chunk's P_P8 / P_FQ as this part's (``part``: its queries T part positions on)."""
@@ -670,6 +674,7 @@ class AttnOperator(ArtcOperator):
             a full layer's one pass at a time (its 8 BDs a pass)."""
             inflight = []
             tw, L, n_e = s.tgu // 2, self.e_len, self.n_e
+            po = self.part * (self.T // s.pg) * g2  # (a part's window and near part: the chunk's offsets, its groups on)
             for b in range(n_pass):
                 tp = TaskGroup()
                 ng = b // m
@@ -682,14 +687,14 @@ class AttnOperator(ArtcOperator):
                     k0, v0 = base + self.kv0 // 2, base + self.kv0 // 2 + s.kp * o2
                     near = [1, G, *k_tap[0][2:]], [0, *k_tap[1][1:]]
                     if self.swa:
-                        w0 = (ng - self.iwg) * g2
+                        w0 = (ng - self.iwg) * g2 + po
                         ka = [ChainPart(KV, TensorAccessPattern((n_kv,), k0 + w0, *near), offset_parameter=p_sw)]
                         vn, pn = v0 + w0, p_sw
                     else:
                         ka = [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 2, *k_tap[0][2:]], [0, *k_tap[1][1:]]),
                                         length_parameter=p_if, length_unit=k_tap[0][2] * k_tap[0][3]),
-                              ChainPart(KV, TensorAccessPattern((n_kv,), base, *near), offset_parameter=p_ino)]
-                        vn, pn = base + s.kp * o2, p_ino
+                              ChainPart(KV, TensorAccessPattern((n_kv,), base + po, *near), offset_parameter=p_ino)]
+                        vn, pn = base + s.kp * o2 + po, p_ino
                     chained_fill(ah[c], KV, ka, tp, wait=True)
                     bq = [ChainPart(QS, TensorAccessPattern((n_qs,), q0 + c * sg * tw, [1, 1, 1, 4 * qb * tw], [0, 0, 0, 1]))]
                     if not self.swa:

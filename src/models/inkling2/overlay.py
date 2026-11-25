@@ -142,7 +142,7 @@ WRAP = 32  # (groups of a sliding-window cache's ring: 2048 positions, its windo
 E_ROWS = 17  # (E_rev's rows: a zero row, then the 16 of the table)
 BLOCK_FLAGS = dict.fromkeys(("sink", "kd", "vd"), B_PAIR | B_F32) | {"k": B_F32, "v": B_F32}
 HIST_ROWS = 8  # (a history window's rows: 3 + S <= 7 written, a read's object past its 3)
-KV_PAD = 2048  # positions past the caches (the last visit's): the prefill's slices of a cache (``prefill.InklingPrefill``)
+KV_PAD = 8192  # positions past the caches (the last visit's): the prefill's slices of a cache (``prefill.InklingPrefill``)
 CTL = ("q", "k", "v", "ffn")  # (a loop visit's controlled streams, ``InklingConfig.CTRL_STREAMS``)
 # (the image's regions a phase reads, in the A stream's order)
 PHASE_REGIONS = {"q": ("q_norm", "q"), "k": ("k_norm", "k"), "v": ("v_norm", "v"), "o": ("o", "inkf", "inkfq"),

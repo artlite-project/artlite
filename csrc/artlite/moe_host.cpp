@@ -173,6 +173,76 @@ void route_rows_avx512(const float* logits, int64_t t0, int64_t t1, int64_t row,
   }
 }
 
+// moe_route_bias's tokens t0 .. t1: per token sigmoid(l) of its E logits in double (e = e^-|l| by exp_nonpos: 1 / (1 + e)
+// or e / (1 + e)), the keys float(sigmoid) + bias, their k largest as route_rows_avx512's (the k-th largest lane maximum
+// bounds them, the keys >= it compressed in id order, an insertion sort: ties to the lower id)
+void route_bias_rows(const float* logits, int64_t t0, int64_t t1, int E, int k, const float* bias, const double* dscale,
+                     int32_t* ids, double* weights) {
+  const int nv = E / 16;
+  const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  const __m512d one = _mm512_set1_pd(1.0);
+  alignas(64) double sg[512];
+  alignas(64) float cv[512 + 16];
+  alignas(64) int32_t ci[512 + 16];
+  __m512 v[32];
+  for (int64_t t = t0; t < t1; t++) {
+    const float* p = logits + t * E;
+    for (int j = 0; j < 2 * nv; j++) {  // (8 logits a step: sigmoid in double)
+      const __m512d l = _mm512_cvtps_pd(_mm256_loadu_ps(p + 8 * j));
+      const __m512d e = exp_nonpos(_mm512_sub_pd(_mm512_setzero_pd(), _mm512_abs_pd(l)));
+      const __m512d r = _mm512_div_pd(one, _mm512_add_pd(one, e));
+      const __mmask8 neg = _mm512_cmp_pd_mask(l, _mm512_setzero_pd(), _CMP_LT_OQ);
+      _mm512_store_pd(sg + 8 * j, _mm512_mask_mul_pd(r, neg, r, e));
+    }
+    for (int j = 0; j < nv; j++) {  // (the keys; +0: -0 as +0)
+      const __m512 s = _mm512_castps256_ps512(_mm512_cvtpd_ps(_mm512_load_pd(sg + 16 * j)));
+      const __m512 key = _mm512_insertf32x8(s, _mm512_cvtpd_ps(_mm512_load_pd(sg + 16 * j + 8)), 1);
+      v[j] = _mm512_add_ps(_mm512_add_ps(key, _mm512_loadu_ps(bias + 16 * j)), _mm512_setzero_ps());
+    }
+    __m512 m[32];  // (a max tree)
+    for (int j = 0; j < nv; j++) m[j] = v[j];
+    for (int w = nv; w > 1;) {
+      const int h = w / 2;
+      for (int j = 0; j < h; j++) m[j] = _mm512_max_ps(m[2 * j], m[2 * j + 1]);
+      if (w % 2) m[h] = m[w - 1];
+      w = h + w % 2;
+    }
+    const __m512 lm = m[0];
+    __m512i above = _mm512_setzero_si512();
+    for (int r = 1; r < 16; r++) {
+      const __m512 rot = _mm512_permutexvar_ps(_mm512_and_si512(_mm512_add_epi32(lane, _mm512_set1_epi32(r)),
+                                                                _mm512_set1_epi32(15)), lm);
+      above = _mm512_mask_add_epi32(above, _mm512_cmp_ps_mask(rot, lm, _CMP_GT_OQ), above, _mm512_set1_epi32(1));
+    }
+    const __mmask16 top = _mm512_cmplt_epi32_mask(above, _mm512_set1_epi32(k));
+    const __m512 th = _mm512_set1_ps(_mm512_mask_reduce_min_ps(top, lm));
+    int n = 0;
+    for (int j = 0; j < nv; j++) {
+      const __mmask16 ge = _mm512_cmp_ps_mask(v[j], th, _CMP_GE_OQ);
+      _mm512_storeu_ps(cv + n, _mm512_maskz_compress_ps(ge, v[j]));
+      _mm512_storeu_si512(ci + n, _mm512_maskz_compress_epi32(ge, _mm512_add_epi32(lane, _mm512_set1_epi32(16 * j))));
+      n += std::popcount(unsigned(ge));
+    }
+    float tv[16];
+    int32_t ti[16];
+    int nt = 0;
+    for (int i = 0; i < n; i++) {
+      const float x = cv[i];
+      if (nt == k && !(x > tv[k - 1])) continue;
+      int j = nt < k ? nt++ : k - 1;
+      for (; j > 0 && tv[j - 1] < x; j--) tv[j] = tv[j - 1], ti[j] = ti[j - 1];
+      tv[j] = x, ti[j] = ci[i];
+    }
+    double e[16];
+    for (int j = 0; j < k; j++) e[j] = sg[ti[j]];
+    const double s = row_sum(e, k) + 1e-20;
+    for (int j = 0; j < k; j++) {
+      ids[t * k + j] = ti[j];
+      weights[t * k + j] = e[j] / s * dscale[ti[j]];
+    }
+  }
+}
+
 void route_rows(const float* logits, int64_t t0, int64_t t1, int64_t row, int per_col, int64_t pitch, int E, int k,
                 bool sigmoid, int32_t* ids, float* weights) {
   if (k <= 16 && per_col % 16 == 0 && E % per_col == 0 && E <= 512)
@@ -195,6 +265,23 @@ void moe_route(const float* logits, int64_t n, int64_t row, int per_col, int64_t
   std::vector<std::thread> ts;
   for (int64_t t = 0; t < nt; t++)
     ts.emplace_back(route_rows, logits, n * t / nt, n * (t + 1) / nt, row, per_col, pitch, E, k, sigmoid, ids, weights);
+  for (auto& t : ts) t.join();
+}
+
+void moe_route_bias(const float* logits, int64_t n, int E, int k, const float* bias, const double* dscale, int32_t* ids,
+                    double* weights) {
+  if (k < 1 || k > 16 || k > E || E % 16 || E > 512) throw Error(std::format("moe_route_bias: k {} of E {}", k, E));
+  for (int64_t i = 0; i < n * E; i++)
+    if (std::isnan(logits[i])) throw Error("moe_route_bias: a NaN logit");
+  // (threads of 2048 tokens at least: ~0.15 us a token, a thread's start ~0.1 ms)
+  const int64_t nt = std::min<int64_t>(n / 2048, std::max(1u, std::thread::hardware_concurrency() / 2));
+  if (nt <= 1) {
+    route_bias_rows(logits, 0, n, E, k, bias, dscale, ids, weights);
+    return;
+  }
+  std::vector<std::thread> ts;
+  for (int64_t t = 0; t < nt; t++)
+    ts.emplace_back(route_bias_rows, logits, n * t / nt, n * (t + 1) / nt, E, k, bias, dscale, ids, weights);
   for (auto& t : ts) t.join();
 }
 

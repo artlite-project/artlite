@@ -14,7 +14,8 @@ H, token-major).
   another state); the inputs of the chunk's last 3 valid tokens (``P_N`` = n >= 3) into the window's rows 0 .. 2 (the
   decode's next step: its window's first position p0 + n - 3). Column c its slice of the hidden (``C`` channels), one core.
 - ``InkGateOperator``: the attention's output gate: o (bfp16 panels, ``prefill.attn.AttnOperator``'s A) times sigmoid of
-  the gate logits (the q GEMM's "gate" block, bf16), per channel. Column c its KV head's query heads, one core.
+  the gate logits (the q GEMM's "gate" block, bf16), per channel. Column c its KV head's query heads: per token group
+  its panels and gates as one object (a chained fill), the memtile dealing each 4 of them to the column's cores.
 - ``InkBlendOperator``: a loop visit's controller of a stream: g = g_a + g_b (its down's two halves, the GEMMs' fp32 sums of
   plane pairs: 8 a column), out = (1 - tanh(F g)) cur + tanh(G g) msg (cur, msg: the stream's mix and message, bf16
   rows), F and G the image's ``ctl_<stream>`` rows (bf16 [288][64] a column, read in place). Column c its slice, core r
@@ -295,7 +296,7 @@ class InkGateOperator(ArtcOperator):
     p = kernel_prefix("igt")
 
     def __init__(self, *, T: int, lq_pitch: int, gate_off: int, heads: int = 3, hd: int = 128):
-        assert T % 8 == 0 and heads * hd % 8 == 0
+        assert T % 32 == 0 and heads * hd % 8 == 0
         self.T, self.lq_pitch, self.gate_off, self.heads, self.hd = T, lq_pitch, gate_off, heads, hd
         self.np_ = heads * hd // 8  # (a column's panels of a token group)
         super().__init__()
@@ -315,43 +316,48 @@ class InkGateOperator(ArtcOperator):
         p, T, npn = self.p, self.T, self.np_
         bf = np.dtype[bfloat16]
         pan = npn * 36  # (bf16 units of a column's panels of a token group)
+        gr = 8 * 8 * npn  # (bf16 of a token group's gates)
+        x_ty = np.ndarray[(pan + gr,), bf]
         a_ty = np.ndarray[(pan,), bf]
-        g_ty = np.ndarray[(8 * 8 * npn,), bf]
-        k_run = Kernel(f"{p}_run", "kernel.o", [a_ty, g_ty, a_ty])
+        k_run = Kernel(f"{p}_run", "kernel.o", [x_ty, a_ty])
         n_tg = T // 8
-        af = [ObjectFifo(a_ty, name=f"gt_a{c}", depth=2) for c in range(COLS)]
-        gf = [ObjectFifo(g_ty, name=f"gt_g{c}", depth=2) for c in range(COLS)]
-        of = [ObjectFifo(a_ty, name=f"gt_o{c}", depth=2) for c in range(COLS)]
+        n_obj = n_tg // 4  # (a column's objects: 4 token groups, one a core)
+        x3 = [ObjectFifo(np.ndarray[(4 * (pan + gr),), bf], name=f"gt_x{c}", depth=2) for c in range(COLS)]
+        x1 = [x3[c].cons().split([r * (pan + gr) for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[x_ty] * 4,
+                                 names=[f"gt_x{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        o3 = [ObjectFifo(np.ndarray[(4 * pan,), bf], name=f"gt_o{c}", depth=2) for c in range(COLS)]
+        o1 = [o3[c].prod().join([r * pan for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[a_ty] * 4,
+                                names=[f"gt_o{c}_{r}" for r in range(4)]) for c in range(COLS)]
 
-        def core(a_h, g_h, o_h, frun):
+        def core(x_h, o_h, frun):
             for _ in forever_():
-                for _ in range_(n_tg):
-                    a = a_h.acquire(1)
-                    g = g_h.acquire(1)
+                for _ in range_(n_obj):
+                    x = x_h.acquire(1)
                     o = o_h.acquire(1)
-                    frun(a, g, o)
+                    frun(x, o)
                     o_h.release(1)
-                    g_h.release(1)
-                    a_h.release(1)
+                    x_h.release(1)
 
-        workers = [Worker(core, [af[c].cons(), gf[c].cons(), of[c].prod(), k_run], tile=Tile(c, 2), stack_size=self.STACK,
-                          dynamic_objfifo_lowering=True, while_true=False) for c in range(COLS)]
+        workers = [Worker(core, [x1[c][r].cons(), o1[c][r].prod(), k_run], tile=Tile(c, 2 + r), stack_size=self.STACK,
+                          dynamic_objfifo_lowering=True, while_true=False) for c in range(COLS) for r in range(4)]
         n_a, N = self.n_a, COLS * self.lq_pitch
         row = COLS * pan  # (a token group's panels of every column)
 
-        def seq(A, G, O, ah, gh, oh):
+        def seq(A, G, O, xh, oh):
             tg = TaskGroup()
-            for c in range(COLS):
-                ah[c].fill(A, TensorAccessPattern((n_a,), c * pan, [1, n_tg, 1, pan], [0, row, 0, 1]), group=tg)
-                gh[c].fill(G, TensorAccessPattern((T * N,), c * self.lq_pitch + self.gate_off, [1, n_tg, 8, 8 * npn],
-                                                  [0, 8 * N, N, 1]), group=tg)
+            for c in range(COLS):  # (per token group its panels, then its gates: a chained fill repeats MAX_BD_ITER times)
+                for g0 in range(0, n_tg, MAX_BD_ITER):
+                    m = min(MAX_BD_ITER, n_tg - g0)
+                    chained_fill(xh[c], A, [
+                        ChainPart(A, TensorAccessPattern((n_a,), c * pan + g0 * row, [m, 1, 1, pan], [row, 0, 0, 1])),
+                        ChainPart(G, TensorAccessPattern((T * N,), c * self.lq_pitch + self.gate_off + 8 * g0 * N,
+                                                         [m, 1, 8, 8 * npn], [8 * N, 0, N, 1]))], tg)
                 oh[c].drain(O, TensorAccessPattern((n_a,), c * pan, [1, n_tg, 1, pan], [0, row, 0, 1]), group=tg, wait=True)
             tg.finish()
 
         rt = Runtime(seq, [np.ndarray[(n_a,), bf], np.ndarray[(T * N,), bf], np.ndarray[(n_a,), bf],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(af)],
-                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(gf)],
-                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]])
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(x3)],
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
 

@@ -158,21 +158,22 @@ void {{ p }}_snap(float *__restrict ws, float *__restrict out)
 
 extern "C" {
 
-// A token group's panels of the column's heads (a: {{ NP }} bfp16 panels of 8 tokens x 8 channels) times sigmoid of their gates
-// (g: [token 8][{{ 8 * NP }}] bf16) -> out (the panels again)
-void {{ p }}_run(const uint8_t *__restrict a, const bfloat16 *__restrict g, uint8_t *__restrict out)
+// A token group's panels of the column's heads (x: {{ NP }} bfp16 panels of 8 tokens x 8 channels, then their gates [token 8]
+// [{{ 8 * NP }}] bf16) times sigmoid of the gates -> out (the panels again). The panels' values are bf16-exact and so is the
+// sigmoid: their bf16 product is exact before the bfp16 rounding.
+void {{ p }}_run(const uint8_t *__restrict x, uint8_t *__restrict out)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    al::BIn<> ai((const bfp16ebs8 *)a);
+    al::BIn<> ai((const bfp16ebs8 *)x);
+    const bfloat16 *__restrict g = (const bfloat16 *)(x + {{ 72 * NP }});
     al::BOut<> po((bfp16ebs8 *)out);
     const al::BV I = al::eye();
     AIE_LOOP_NO_UNROLL
     for (int db = 0; db < {{ NP }}; db++) {
         al::MM8 t(aie::zeros<accfloat, 64>());
-        t.mac(ai.pop(), aie::op_transpose(I));  // ([token][channel] fp32)
+        t.mac(ai.pop(), aie::op_transpose(I));  // ([token][channel])
         const aie::vector<bfloat16, 64> s = {{ sig }}(al::gather<8, 8>(g + 8 * db, {{ 8 * NP }}));
-        po.push(aie::mul(t.to_accum().template to_vector<float>(), aie::accum<accfloat, 64>(s).template to_vector<float>())
-                    .template to_vector<bfp16ebs8>());
+        po.push(aie::mul(t.to_accum().template to_vector<bfloat16>(), s).template to_vector<bfp16ebs8>());
     }
 }
 

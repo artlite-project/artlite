@@ -15,8 +15,9 @@ tokens where the operator works row by row:
   (q, k, v) its message (the mix of the bank with the message query s) MS, the controller's down halves (the norms
   without weights -> DP panels, the GEMMs d<s>a / d<s>b -> GA / GB), the blend (``InkBlendOperator``) -> XC rows;
 - the norms (the layer's attention norms; ``PrefillNormOperator``) -> XN panels, the q / k / v GEMMs -> GQ / GK / GV;
-- the prep (``prefill.attn.ink.InkPrepOperator``: QS, the visit's records, its raw ring), the attention
-  (``AttnOperator(ink=True)``) -> A, the gate (``InkGateOperator``), o -> Y;
+- the prep (``prefill.attn.ink.InkPrepOperator``: QS, the visit's records, its raw ring; in parts of up to 512 tokens), the
+  attention (``AttnOperator(ink=True)``; a chunk past 2048 tokens in items of 2048 at their own positions, after every
+  prep part) -> A, the gate (``InkGateOperator``), o -> Y;
 - the post conv and the residual (``InkResidOperator``: the chunk's rows at once, the visit's history window 0);
 - the FFN: the FFN mix (its states and cur after the attention; a loop visit's controller of the stream "ffn") -> XM0
   (XC0), its norm -> XN0, the MoE (``moe.InkMoE``: the router, then a piece from the gathered norm on, the host's
@@ -47,7 +48,10 @@ from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
 SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
 SMALL = (64, 128)  # chunk sizes of operators of their own
-SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB)) + (1536, 2048)  # chunk sizes (the experts' weights once per chunk)
+ATTN_T = 2048  # an attention item's tokens at most (its 64 passes of 32 queries; a larger chunk's in parts)
+# chunk sizes (the experts' weights once per chunk: a chunk of 8192 tokens moves 0.61 of a 2048-token one's expert chunks
+# per token, its experts' rows 82% valid)
+SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB)) + (1536, 2048, 4096, 6144, 8192)
 PREP_T = 512  # tokens of a prep item at most (its chained fills)
 CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
 # the time model's constants (``layer_seconds``): a ConfigureOp, per sub-chunk a byte of a visit's weights
@@ -83,7 +87,10 @@ class InklingPrefill(ChunkPrefill):
                           eps=cfg.rms_norm_eps) if ffn else None
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
         self.kinds = sorted({x.kind for x in self.vis.values()})
-        self.attn = {(k, T): self._attn(k, T) for k in self.kinds for T in self.sizes}
+        self.attn = {(k, T): self._attn(k, T) for k in self.kinds for T in self.sizes if T <= ATTN_T}
+        # (a larger chunk's parts: part 0 the ATTN_T design, the others with parameters of their own)
+        self.parts = {(k, j): self.attn[(k, ATTN_T)] if j == 0 else self._attn(k, ATTN_T, j)
+                      for k in self.kinds for j in range(self.sizes[-1] // ATTN_T) if self.sizes[-1] > ATTN_T}
         self.preps = {(k, T): self._preps(k, T) for k in self.kinds for T in self.sizes}
         self.resid = {(T, b): InkResidOperator(T=T, block=b, y_pitch=COLS * self.sz[self._t(T)].d_pitch,
                                                y_col=self.sz[self._t(T)].d_pitch, hist_rows=HIST_ROWS)
@@ -134,14 +141,19 @@ class InklingPrefill(ChunkPrefill):
     def _t(T: int) -> int:
         return min(T, SUB)
 
-    def _attn(self, kind: str, T: int) -> PA.AttnOperator:
-        """The attention of a kind over T tokens: sliding-window caches after their guard; full ones read 16 groups
-        before group 0 (the near part's, skipped there: the argument starts that far before the cache)."""
+    def _attn(self, kind: str, T: int, part: int = 0) -> PA.AttnOperator:
+        """The attention of a kind over T tokens (``part``: a larger chunk's, at its own position): sliding-window caches
+        after their guard; full ones read 16 groups before group 0 (the near part's, skipped there: the argument starts
+        that far before the cache)."""
         s, ov = self.shape, self.ov
         kv0 = self.guard * s.group
         first = next(v for v in self.layers if self.vis[v].kind == kind)
         return PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes(first), kv_pad=self.pad, sub=self._pt(T),
-                               swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True)
+                               swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True, part=part)
+
+    def _attns(self, kind: str, T: int) -> list[PA.AttnOperator]:
+        """The attention items of a chunk of size T (one, or its parts of ATTN_T tokens)."""
+        return [self.attn[(kind, T)]] if T <= ATTN_T else [self.parts[(kind, j)] for j in range(T // ATTN_T)]
 
     @staticmethod
     def _pt(T: int) -> int:
@@ -228,7 +240,7 @@ class InklingPrefill(ChunkPrefill):
         self.phys = {L: i for i, L in enumerate(phys)}
         prep = next(iter(self.preps.values()))[0]
         self.np_w, self.qr_w, self.prm_w = 5 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
-        self.e_w = {k: 2 * self.attn[(k, self.sizes[-1])].n_e for k in self.kinds}
+        self.e_w = {k: 2 * self._attns(k, self.sizes[-1])[0].n_e for k in self.kinds}
         self.tp_w = 2 * 2 * COLS * 4 * (H // COLS)
 
     def _np(self, L: int, j: int) -> str:
@@ -299,8 +311,9 @@ class InklingPrefill(ChunkPrefill):
                            sl("TAU", 0, prep, i=3), self._prm(L, prep),
                            tok("QS", 0, prep, i=5, extra=b * pt * self.rb["QS"]), self._kv(v, prep, 6), ring,
                            sl("JUNK", 0, prep, i=8)))
-            at = self.attn[(x.kind, T)]
-            rl.append((at, sl("QS", 0, at, i=0), self._kv(v, at, 1), sl("A", 0, at, i=2), self._eb(L, at)))
+            for j, at in enumerate(self._attns(x.kind, T)):  # (its parts after every prep part: the chunk's records)
+                rl.append((at, sl("QS", j * at.T * self.rb["QS"], at, i=0), self._kv(v, at, 1),
+                           sl("A", j * at.T * self.rb["A"], at, i=2), self._eb(L, at)))
             gt = o.gate
             rl += [(gt, tok("A", jj, gt, i=0), tok("GQ", jj, gt, i=1, row=gr["GQ"]), tok("A", jj, gt, i=2)) for jj in range(S)]
             (g,) = o.plans[(L, "o")].gemms
@@ -421,8 +434,8 @@ class InklingPrefill(ChunkPrefill):
             pb = prep.prm(qc, rc, kt, vt)
             prm[i * self.prm_w:i * self.prm_w + pb.size] = pb
             E = vec(b + "attn_rel_bias.weight").reshape(-1, cfg.rel_length).T  # (16, extent)
-            at = self.attn[("full" if full else "swa", self.sizes[-1])] if (("full" if full else "swa"), self.sizes[-1]) in self.attn \
-                else next(iter(self.attn.values()))
+            k = "full" if full else "swa"
+            at = self._attns(k, self.sizes[-1])[0] if k in self.kinds else next(iter(self.attn.values()))
             e = at.e_table(E).view(np.uint8)
             eb[i * max(self.e_w.values()):][:e.size] = e
             for k, name in enumerate((b + "attn_post_conv.weight", b + "ffn_post_conv.weight")):
@@ -450,7 +463,8 @@ class InklingPrefill(ChunkPrefill):
         for k in self.kinds:
             for prep in self.preps[(k, T)]:
                 out |= prep.params(p0, n)
-            out |= self.attn[(k, T)].params(p0)
+            for j, at in enumerate(self._attns(k, T)):
+                out |= at.params(p0 + j * at.T)
         a = p0 - 3 - self.ov._hbase[self.ov.seq]  # (the conv histories' first row in the windows)
         out |= self.resid[(T, False)].params(n, a)
         return out

@@ -23,8 +23,9 @@ The PRM argument per column (``prm``): its KV head's K and V taps [4][hd], its q
 split by the memtile), the Q core the clips with each token group's rows (the memtile's six output channels: three
 for A, two for B, one for the records' join). A prep item takes at most 512 tokens (64 token groups: a chained fill's
 repeats; its fills and drains use 15 of a shim tile's 16 BDs): a longer chunk's prep runs as parts (``part`` k: the
-chunk's tokens k T .., its scratchpad parameters named with the suffix k), one after the other (part k + 1 reads the
-ring part k wrote). The ring object at the end goes through the records' join as one more group object, its
+chunk's tokens k T .., reading the chunk's scratchpad parameters: its offsets in its taps, its cores counting tokens
+from k T; a library's runtime sequence reads 32 parameters at most), one after the other (part k + 1 reads the ring part
+k wrote). The ring object at the end goes through the records' join as one more group object, its
 ring parts into RING (strided: [slot][K | V]), the rest into JUNK."""
 
 import numpy as np
@@ -85,7 +86,6 @@ class InkPrepOperator(ArtcOperator):
                  tau_positions: int, kv_pad: int = 0, eps: float = 1e-6, kv0: int = 0, wrap: int = 0, part: int = 0):
         s = shape
         self.part = part
-        self.sfx = str(part) if part else ""
         assert s.hd == 128 and s.qh == 4 and s.qp == 2 and s.per == 1 and T % s.pg == 0 and T // 8 <= MAX_BD_ITER
         assert {"q", "r", "sink"} <= set(lq.off) and "k" in lk.off and "v" in lv.off
         assert (lk.off.get("kd", 128) == 128 and lv.off.get("vd", 128) == 128) and full == ("kd" in lk.off)
@@ -121,7 +121,7 @@ class InkPrepOperator(ArtcOperator):
         return _PREP.render(p=self.pfx, HD=s.hd, ND=s.nd, KP=s.kp, KREC=s.rec.k_bytes, QUNIT=s.qunit, NQ=self.nq,
                             PK=self.pk, OFF_R=self.lq.off["r"], OFF_S=self.lq.off["sink"], FULL=self.full,
                             SCALE=repr(float(np.float32(s.scale))), CSC=repr(float(np.float32(1 / 3 if self.full else 5 ** -0.5))),
-                            eps=repr(self.eps), wq=wq, wk=wk, wv=wv)
+                            eps=repr(self.eps), wq=wq, wk=wk, wv=wv, T0=self.part * self.T)
 
     # ------------------------------------------------------------------
     # Arguments
@@ -164,18 +164,18 @@ class InkPrepOperator(ArtcOperator):
                 ArgSpec("out", (self.n_junk,), bfloat16)]
 
     def params(self, p0: int, n: int) -> dict[str, int]:
-        """The scratchpad parameters of a chunk at position p0 (a group start) of n valid tokens (this part's: its
-        tokens from p0 + part T, of which n - part T valid)."""
-        s, x = self.shape, self.sfx
-        p0, n = p0 + self.part * self.T, min(n - self.part * self.T, self.T)
-        assert p0 % s.pg == 0 and 1 <= n and p0 + self.T <= self.tau_positions, (p0, n)
+        """The scratchpad parameters of a chunk at position p0 (a group start) of n valid tokens: the chunk's, which
+        every part reads (a part's offsets in its taps, its cores counting tokens from part T)."""
+        s = self.shape
+        T = (self.part + 1) * self.T  # (the chunk's tokens up to this part's end)
+        assert p0 % s.pg == 0 and 1 <= n and p0 + T <= self.tau_positions, (p0, n)
         g = p0 // s.pg
         if self.wrap:
-            assert g % self.wrap + self.T // s.pg <= self.wrap, (p0, self.T, "a chunk across the ring's wrap")
-            kv = {P_KVR + x: s.group // 2 * (g % self.wrap)}
+            assert g % self.wrap + T // s.pg <= self.wrap, (p0, T, "a chunk across the ring's wrap")
+            kv = {P_KVR: s.group // 2 * (g % self.wrap)}
         else:
-            kv = {P_KV + x: s.group // 2 * g}
-        return kv | {P_TAU + x: 2 * p0, P_N + x: n}
+            kv = {P_KV: s.group // 2 * g}
+        return kv | {P_TAU: 2 * p0, P_N: n}
 
     # ------------------------------------------------------------------
     # Design
@@ -200,10 +200,10 @@ class InkPrepOperator(ArtcOperator):
         k_vprm = Kernel(f"{p}_vprm", "kernel.o", [kvb_ty, wsv])
         k_kring = Kernel(f"{p}_kring", "kernel.o", [wsk, kg_ty])
         k_vring = Kernel(f"{p}_vring", "kernel.o", [wsv, vg_ty])
-        x = self.sfx
-        p_tau, p_n = ScratchpadParameter(P_TAU + x, np.int32), ScratchpadParameter(P_N + x, np.int32)
-        p_kv = ScratchpadParameter((P_KVR if self.wrap else P_KV) + x, np.int32)
+        p_tau, p_n = ScratchpadParameter(P_TAU, np.int32), ScratchpadParameter(P_N, np.int32)
+        p_kv = ScratchpadParameter(P_KVR if self.wrap else P_KV, np.int32)
         n_tg, rg, n_grp = T // 8, s.rg, T // s.pg
+        pt0, pg0 = self.part * T, self.part * n_grp  # (the part's first token and cache group in the chunk)
 
         # per column and token group [Q rows, clips, tau | K rows | V rows], split in the memtile
         sizes = [8 * nq + 448 + 16, 8 * pk, 8 * pk]
@@ -271,7 +271,7 @@ class InkPrepOperator(ArtcOperator):
                         ChainPart(GQ, TensorAccessPattern((T * lq.N,), c * lq.pitch + 8 * t0 * lq.N, [nt, 1, 8, nq],
                                                           [8 * lq.N, 0, lq.N, 1])),
                         ChainPart(PRM, TensorAccessPattern((COLS * pw,), c * pw + 1024, [nt, 1, 1, 448], [0, 0, 0, 1])),
-                        ChainPart(TAU, TensorAccessPattern((2 * self.tau_positions,), 16 * t0, [nt, 1, 1, 16],
+                        ChainPart(TAU, TensorAccessPattern((2 * self.tau_positions,), 2 * pt0 + 16 * t0, [nt, 1, 1, 16],
                                                            [16, 0, 0, 1]), offset_parameter=p_tau),
                         ChainPart(GK, TensorAccessPattern((T * lk.N,), c * lk.pitch + 8 * t0 * lk.N, [nt, 1, 8, pk],
                                                           [8 * lk.N, 0, lk.N, 1])),
@@ -288,7 +288,7 @@ class InkPrepOperator(ArtcOperator):
                                                     [0, tq, 0, 1]), group=tg, wait=True)
                 # per group its objects' records (rows of 576 elements: a shim BD's inner dimension <= 1023 words), then the
                 # ring object: its K rows into the ring's K halves, its V rows into the V halves
-                gh[c].drain(KV, TensorAccessPattern((n_kv,), c * hb + k0b, [n_grp, s.objects, ow // 576, 576],
+                gh[c].drain(KV, TensorAccessPattern((n_kv,), c * hb + k0b + pg0 * g2, [n_grp, s.objects, ow // 576, 576],
                                                     [g2, o2, 576, 1]), offset_parameter=p_kv, group=tg, wait=True)
                 chained_fill(gh[c], RING, [
                     ChainPart(RING, TensorAccessPattern((COLS * rb,), r0, [1, 1, 8, 256], [0, 0, 512, 1])),
