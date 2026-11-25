@@ -294,7 +294,7 @@ extern "C" {
 // A pass's start: o = 0, the reference m = -48 (bias 240: P = 2^(s + 48), a chunk's maximum above -32 raises it; rows
 // whose scores all stay below -111 would read 2^-63 for each), l = 0; the pass's first record p0 / 8 + {{ 4 * QB }}
 // (M bg + bb)
-__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq, int32_t hk{% elif NC %}, int32_t hk{% endif %})
+__attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restrict wo, int32_t p8, int32_t bg, int32_t bb{% if WIN %}, int32_t fq, int32_t hk{% elif NC %}, int32_t hk{% elif INK and not SWA %}, int32_t nfar, int32_t ffar{% endif %})
 {
 {% if "ev_q" in ablate %}
     event1();
@@ -310,6 +310,17 @@ __attribute__((minsize)) void {{ p }}_init(float *__restrict ws, float *__restri
 {% endif %}
 {% if SWA %}
     AW(int32_t, {{ w.st }})[7] = p8 + {{ RG }} * (bg - {{ WG }});  // (the window's first record: {{ WG }} groups before the pass's)
+{% endif %}
+{% if INK %}
+{% if SWA %}
+    AW(int32_t, {{ w.st }})[8] = 0;  // (no far chunks)
+{% else %}
+    // (the far chunks: from position 0, the near ones from {{ WG }} groups before the chunk's first; the far part's real end
+    // record, 0 for a chunk within {{ WG + 1 }} groups of position 0: its one far group skipped, the near part from the guard on)
+    AW(int32_t, {{ w.st }})[7] = p8 - {{ RG * WG }};
+    AW(int32_t, {{ w.st }})[8] = nfar;
+    AW(int32_t, {{ w.st }})[10] = ffar;
+{% endif %}
 {% endif %}
 {% if NC %}
     AW(int32_t, {{ w.st }})[14] = hk;  // (the state's end: the keys below it every row sees)
@@ -429,6 +440,37 @@ __attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32
     st[3] = !((ke <= st[14]) | ((kc >= st[5]) & (ke <= st[10])));
     st[9] = kc;
 }
+{% elif INK %}
+// (ink) Chunk t of the pass's stream ({{ "the window's: from st[7] on" if SWA else "the far part's (records " ~ CR ~ " t ..) below st[8], then the near part's from st[7]" }}): its first
+// record relative to the core's first query block (rho0: block j's record is rho0 - j), skipped when past every one of
+// the core's queries, {{ "below every query's window" if SWA else "beyond the far part's real end (a far chunk) or below it (a near one)" }}, or the guard's
+__attribute__((minsize)) void {{ p }}_grp(float *__restrict ws, int32_t t, int32_t r)
+{
+{% if "ev_chunk" in ablate %}
+    event0();
+{% endif %}
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    const int32_t far = t < st[8];
+    const int32_t rec = far ? {{ CR }} * t : st[7] + {{ CR }} * (t - st[8]);
+    st[0] = rec - st[2] - {{ QB }} * r;
+{% if SWA %}
+    st[1] = (st[0] - {{ QB - 1 }} > 0) | (st[0] + {{ CR - 1 }} < -{{ WR }}) | (rec < 0);
+{% else %}
+    st[1] = (st[0] - {{ QB - 1 }} > 0) | (rec < 0) | (far ? rec >= st[10] : rec < st[10]);
+{% endif %}
+}
+
+// (ink) A far chunk (no E object): ``grp``, the bias tiles the rows' references
+__attribute__((minsize)) void {{ p }}_efar(float *__restrict ws, int32_t t, int32_t r)
+{
+    {{ p }}_grp(ws, t, r);
+    if (AW(int32_t, {{ w.st }})[1])
+        return;
+    float *__restrict bt = AW(float, {{ w.bt }});
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ RB * CR }}; i++)
+        aie::store_v(bt + 64 * i, aie::load_v<64>(AW(float, {{ w.bias }}) + 64 * (i / {{ CR }})));
+}
 {% else %}
 // Chunk t of the pass's stream (records {{ CR }} t ..): its first record relative to the core's first query block
 // (rho0: block j's record is rho0 - j), skipped when past every one of the core's queries
@@ -513,6 +555,113 @@ __attribute__((minsize)) void {{ p }}_qsel(const bfloat16 *__restrict u, bfloat1
 // lo: chains of two MMULs an iteration; the lo ones from 0, added at the end){% else %}: a record [hi panels | lo panels]; per pair a loop over d-block pairs for K hi, then one for K lo, two
 // accumulators (the row blocks){% endif %}
 
+{% if INK %}
+// (ink) Object i of the pass's Q part (its 16 units of token groups 4 b ..: per token group [head 0 | head 1 | head 2 | INK
+// rows], the memtile's walk per unit pair: d half i % 2 of the pair i / 2) for the core's token group r: the pair (heads 0,
+// 1) as row blocks 0, 1; the pair (head 2, INK) as row block 2 and a zero row block 3, and the INK rows (input row rho of
+// the unit at d half rho / 4, offset (rho % 4) 288 + 144: the walk's slice 2): per head [R hi | R lo] panels into rp, the
+// sinks [head][token] fp32 into isk
+__attribute__((minsize)) void {{ p }}_qink(const bfloat16 *__restrict u, bfloat16 *__restrict q, float *__restrict ws, int32_t i,
+                                           int32_t r)
+{
+    if ((i >> 2) != r)
+        return;
+    const int pr = (i >> 1) & 1, h = i & 1;
+    bfloat16 *__restrict d = q + {{ QUNIT }} * pr + {{ QUNIT // 2 }} * h;
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < {{ ND // 4 }}; j++) {
+        al::copy<144, 16>(d + 288 * j, u + 288 * j);
+        if (pr == 0)
+            al::copy<144, 16>(d + 288 * j + 144, u + 288 * j + 144);
+        else
+            al::zero<144, 16>(d + 288 * j + 144);
+    }
+    if (pr == 0)
+        return;
+    bfloat16 *__restrict rp = AW(bfloat16, {{ w.rp }});
+    if (h == 0) {  // (rows 0 .. 3: heads 0, 1's [hi | lo])
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < 4; j++)
+            al::copy<72, 8>(rp + 72 * j, u + 288 * j + 144);
+    } else {  // (rows 4, 5: head 2's; row 6: the sinks)
+        al::copy<72, 8>(rp + 288, u + 144);
+        al::copy<72, 8>(rp + 360, u + 432);
+        al::copy<48, 16>(AW(bfloat16, {{ w.isk }}), u + 720);
+    }
+}
+
+// (ink) An E panel pair: 8 dims x 8 entries of a window (src: row-major, rows 72 apart) -> its hi and lo panels [entry][dim]
+__attribute__((noinline, minsize)) void {{ p }}_epan(const bfloat16 *__restrict src, uint8_t *__restrict out)
+{
+    const aie::vector<bfloat16, 64> pd = al::gather<8, 8>(src, 72);  // ([dim][entry])
+    al::BV h, l;
+    al::split_hilo(aie::accum<accfloat, 64>(aie::transpose(pd, 8, 8)), al::neg_eye(), h, l);
+    al::BOut<> po((bfp16ebs8 *)out);
+    po.push(h);
+    po.push(l);
+}
+
+// (ink) A T tile: a row block's R (rp: hi panels of dims 0 .. 7, 8 .. 15, then the lo ones) times an entry tile's E (ep:
+// dims 0 .. 7's hi, lo panels, dims 8 .. 15's 720 bytes on), three products a dim block -> 64 fp32 at out
+__attribute__((noinline, minsize)) void {{ p }}_tmul(const uint8_t *__restrict rp, const uint8_t *__restrict ep, float *__restrict out)
+{
+    al::BInR<aie_dm_resource::a> rs((const bfp16ebs8 *)rp);
+    const al::BV rh0 = rs.pop(), rh1 = rs.pop(), rl0 = rs.pop(), rl1 = rs.pop();
+    al::BInR<aie_dm_resource::b> e0((const bfp16ebs8 *)ep), e1((const bfp16ebs8 *)(ep + 720));
+    const al::BV eh0 = e0.pop(), el0 = e0.pop(), eh1 = e1.pop(), el1 = e1.pop();
+    al::MM8 c(aie::accum<accfloat, 64>(aie::zeros<float, 64>()));
+    al::mm3(c, rh0, rl0, eh0, el0);
+    al::mm3(c, rh1, rl1, eh1, el1);
+    aie::store_v(out, c.template to_vector<float>());
+}
+
+// (ink) Near chunk t's relative bias (its ``grp`` first): per row block b of the core's (its heads; the fourth zero) T = R E
+// on the MMUL (R: the row block's hi + lo panels; E: the chunk's window, e: [dim 16][entry 72] bf16, entry j at distance
+// pq0 + 31 - kc - j, the core's rows' entries 24 - 8 r .. 63 - 8 r as hi + lo panels; three products), sheared into the
+// bias tiles bt [row block][record][64]: lane 8 q + k of record kk T[q][7 - q + 8 kk + k] (entry 24 - 8 r + that) plus the
+// row's reference; a chunk all at distances past the table (1024: the bias zero) the references alone
+__attribute__((noinline, minsize)) void {{ p }}_ebias(const bfloat16 *__restrict e, float *__restrict ws, int32_t t, int32_t r)
+{
+    {{ p }}_grp(ws, AW(int32_t, {{ w.st }})[8] + t, r);  // (t: the near part's chunk)
+    int32_t *__restrict st = AW(int32_t, {{ w.st }});
+    if (st[1])
+        return;
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict bt = AW(float, {{ w.bt }});
+    const float *__restrict bias = AW(float, {{ w.bias }});
+    if (st[0] < -{{ (1024 + 31) // 8 }}) {  // (the core's nearest key 8 (-rho0) - 31 or more positions back: no bias)
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ RB * CR }}; i++)
+            aie::store_v(bt + 64 * i, aie::load_v<64>(bias + 64 * (i / {{ CR }})));
+        return;
+    }
+    uint8_t *__restrict ep = AW(uint8_t, {{ w.ep }});  // ([dim block 2][entry tile 5][hi, lo] panels)
+    const bfloat16 *__restrict ew = e + 24 - 8 * r;
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < 10; i++)
+        {{ p }}_epan(ew + {{ 72 * 8 }} * (i >= 5) + 8 * (i - 5 * (i >= 5)), ep + 144 * i);
+    const uint8_t *__restrict rp = AW(const uint8_t, {{ w.rp }});  // ([row block][hi db 0, hi db 1, lo db 0, lo db 1])
+    float *__restrict tt = AW(float, {{ w.tt }});
+    AIE_LOOP_NO_UNROLL
+    for (int b = 0; b < {{ RB - 1 }}; b++) {
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < 5; j++)
+            {{ p }}_tmul(rp + 288 * b, ep + 144 * j, tt + 64 * j);
+        AIE_LOOP_NO_UNROLL
+        for (int k = 0; k < {{ CR }}; k++)
+            AIE_LOOP_NO_UNROLL
+            for (int q = 0; q < 8; q++) {
+                const aie::vector<float, 16> v = aie::concat(aie::load_v<8>(tt + 64 * k + 8 * q), aie::load_v<8>(tt + 64 * k + 64 + 8 * q));
+                aie::store_v(bt + {{ 64 * CR }} * b + 64 * k + 8 * q,
+                             aie::add(aie::shuffle_down(v, 7 - q).template extract<8>(0), aie::load_v<8>(bias + 64 * b + 8 * q)));
+            }
+    }
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < {{ CR }}; k++)  // (the zero row block: its reference)
+        aie::store_v(bt + {{ 64 * CR * (RB - 1) }} + 64 * k, aie::load_v<64>(bias + {{ 64 * (RB - 1) }}));
+}
+
+{% endif %}
 {% if KP == 1 %}
 void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k0, const bfloat16 *__restrict k1,
                 float *__restrict ws, int32_t t, int32_t r)
@@ -522,8 +671,10 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k0, con
 void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, float *__restrict ws, int32_t kk, int32_t t,
                 int32_t r)
 {
+{% if not INK %}
     if (kk == 0)  // (the chunk's first K unit: ``grp``)
         {{ p }}_grp(ws, t, r);
+{% endif %}
 {% endif %}
 {% if "qk" in ablate %}
     return;
@@ -585,7 +736,16 @@ void {{ p }}_qk(const bfloat16 *__restrict q, const bfloat16 *__restrict k, floa
         al::BInR<aie_dm_resource::a> qs((const bfp16ebs8 *)qa);
         al::BInR<aie_dm_resource::b> ks((const bfp16ebs8 *)k);
         const aie::accum<accfloat, 64> z(aie::zeros<float, 64>());
+{% if INK %}
+        // (the chunk's bias tiles: the relative bias and the row's reference, ``ebias``)
+        const float *__restrict bt = AW(float, {{ w.bt }}) + {{ 128 * CR }} * pr + 64 * kk;
+        al::MM8 c0(aie::accum<accfloat, 64>(aie::load_v<64>(bt))), c0l(z),
+            c1(aie::accum<accfloat, 64>(aie::load_v<64>(bt + {{ 64 * CR }}))), c1l(z);
+        (void)b0;
+        (void)b1;
+{% else %}
         al::MM8 c0(b0), c0l(z), c1(b1), c1l(z);  // (row block 2 pr + e: K hi from its bias, K lo from 0)
+{% endif %}
         AIE_PREPARE_FOR_POSTPIPELINING
         for (int j = 0; j < {{ ND // 2 }}; j++) {  // (d-blocks 2 j, 2 j + 1)
             const al::BV H = ks.pop(), L = ks.pop(), Hn = ks.pop(), Ln = ks.pop();
@@ -758,6 +918,8 @@ __attribute__((minsize)) void {{ p }}_ssel(const bfloat16 *__restrict u, float *
         AW(float, {{ w.sk }})[h] = v[hc + h];
 }
 
+{% endif %}
+{% if SINK or INK %}
 {% set exp2s = km.exp2(16, prec="fp32") %}
 {{ exp2s.src }}
 
@@ -771,11 +933,16 @@ __attribute__((minsize)) void {{ p }}_fin(float *__restrict ws, float *__restric
     al::BOut<> po((bfp16ebs8 *)out);
     for (int j = 0; j < {{ QB }}; j++) {
         const int b = {{ QH }} * j + h;
-{% if SINK %}
-        // (8 l, each l in every lane of its row: 8 times it; the head's sink 2^(sink + bias - 128) in the same units,
+{% if SINK or INK %}
+        // (8 l, each l in every lane of its row: 8 times it; the {{ "rows' sinks" if INK else "head's sink" }} 2^(sink + bias - 128) in the same units,
         // the bias in every lane of its row; 127: the exp2's range)
+{% if INK %}
+        const aie::vector<float, 8> sb = aie::add(al::group8<true>(aie::load_v<64>(AW(float, {{ w.bias }}) + 64 * b)),
+                                                  aie::sub(aie::load_v<8>(AW(float, {{ w.isk }}) + 8 * b), aie::broadcast<float, 8>(128.0f)));
+{% else %}
         const aie::vector<float, 8> sb = aie::add(al::group8<true>(aie::load_v<64>(AW(float, {{ w.bias }}) + 64 * b)),
                                                   aie::broadcast<float, 8>(AW(float, {{ w.sk }})[h] - 128.0f));
+{% endif %}
         const aie::vector<float, 16> st = {{ exp2s }}(aie::concat(aie::min(sb, aie::broadcast<float, 8>(127.0f)),
                                                                   aie::broadcast<float, 8>(-126.0f)));
         const aie::vector<float, 8> ls = aie::add(al::group8<false>(aie::load_v<64>(AW(float, {{ w.l }}) + 64 * b)),

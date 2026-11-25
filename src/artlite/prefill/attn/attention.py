@@ -35,7 +35,7 @@ from ...operators.util import Attr, mask64, regions
 from .layout import OS, STACK, l1_layout, two_copies, workspace_regions
 from .mode import AttnMode, Kind, swa_groups
 from .ring import MT_BYTES, mt_bytes, ring_memtiles
-from .shape import P_FG, P_FH, P_FO, P_FQ, P_G0, P_HK, P_P8, P_SW, Shape
+from .shape import P_FG, P_FH, P_FO, P_FQ, P_G0, P_HK, P_IF, P_IFQ, P_IFR, P_INO, P_P8, P_SW, Shape
 
 _ATTN = templating.load("artlite/prefill/attn/attention.cc.jinja")
 
@@ -78,7 +78,7 @@ class AttnOperator(ArtcOperator):
 
     def __init__(self, *, T: int, shape: Shape, kv_bytes: int, kv_pad: int = 0, sub: int = 0,
                  ablate: tuple[str, ...] = (), window: int = 0, ring: int = 0, swa: int = 0, kv0: int = 0,
-                 bcast: bool = True, causal: bool = True, part: int = 0, wrap: int = 0):
+                 bcast: bool = True, causal: bool = True, part: int = 0, wrap: int = 0, ink: bool = False):
         """``ablate`` (timing experiments): kernel bodies compiled out ("qk", "soft", "pv": wrong results); "ev_<region>"
         (qk, soft, pv, raise, chunk: grp to the second pv) marks a region with event0 / event1 and the sequence programs the
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
@@ -92,8 +92,12 @@ class AttnOperator(ArtcOperator):
         (its cores read the chunk's P_P8 and P_FQ plus the part's offsets, its fills' parameters are named with the suffix
         ``_<part>``: a library's runtime sequence reads 32 at most; the cache holds the whole chunk's records before the
         first item: ``PrepOperator``); ``wrap`` (sliding window): the cache a ring of that many groups, ``P_SW`` the chunk's
-        slot (``PrepOperator(wrap=)``)."""
+        slot (``PrepOperator(wrap=)``); ``ink``: Inkling's attention (class docstring's "Inkling")."""
         s = shape
+        self.ink = ink
+        if ink:  # (``prefill.attn.ink``'s shape: 3 heads and a zero row block, hi + lo Q and K, single P; no sinks or gates)
+            assert s.qh == 4 and s.qp == 2 and s.kp == 2 and s.pp == 1 and s.per == 1 and not (s.gate or s.sink)
+            assert not (window or ring) and causal
         self.qb, self.cr = s.blocks
         self.pq = 32 * self.qb  # queries per pass
         self.m = s.pg // self.pq  # passes per cache group
@@ -113,11 +117,21 @@ class AttnOperator(ArtcOperator):
         if ring:
             assert mt_bytes(s, ring=ring, window=window, qb=self.qb) <= MT_BYTES, "a column's memory tile"
         self.oc = 2 if two_copies(self) is not None else 1  # (o's copies: ``l1_layout``)
+        if ink:
+            assert self.qb == 1 and self.cr == 4 and self.m == 2, s.blocks
+            # the E table's columns: x = X0 - d for the distance d (``e_table``); a pass's near part from 16 groups before its
+            # group (sliding window: the pass's; full: the chunk's first), its first window at x0 = X0 - 1055 - 32 b' (b': b % 2,
+            # full: b) and 64 on per group
+            self.iwg = swa_groups(1024, s.pg)
+            assert not swa or self.iwg == self.wg
+            self.e_x0 = 1055 + 32 * ((self.m if swa else self.n_pass) - 1)
+            near = self.iwg + 1 + (0 if swa else self.n_pass // self.m)
+            self.e_len = -(-(self.e_x0 - 1055 + 64 * near + 32 + 72 + 32) // 32) * 32
         super().__init__()
 
     def _pn(self, name: str) -> str:
         """A scratchpad parameter's name in this design (``part``: its fills' own; the cores' the chunk's)."""
-        return f"{name}_{self.part}" if self.part and name in (P_FG, P_FO, P_SW) else name
+        return f"{name}_{self.part}" if self.part and name in (P_FG, P_FO, P_SW, P_IF, P_IFQ, P_IFR, P_INO) else name
 
     def _offset(self, value: object, name: str) -> object:
         """A core's read of the chunk's P_P8 / P_FQ as this part's (``part``: its queries T part positions on)."""
@@ -165,8 +179,12 @@ class AttnOperator(ArtcOperator):
     def workspace(self) -> dict[str, int]:
         gt = [("gt", 32 * self.qb * self.shape.qh)] if self.shape.gate else []
         sk = [("sk", 4 * self.shape.qh)] if self.shape.sink else []  # (the core's heads' sinks log2 e)
-        return regions(workspace_regions(self.qb * self.shape.qh, self.cr, self.qb if self.win else 0,
-                                    self.qb if self.nc else 0) + gt + sk)
+        rb = self.qb * self.shape.qh
+        # (ink: the row blocks' R panels, the rows' sinks, a chunk's bias tiles, a row block's T tiles, the E panels)
+        ink = [("rp", 288 * rb), ("isk", 32 * rb), ("bt", 256 * rb * self.cr), ("tt", 5 * 256), ("ep", 20 * 72)] \
+            if getattr(self, "ink", False) else []
+        return regions(workspace_regions(rb, self.cr, self.qb if self.win else 0, self.qb if self.nc else 0) + gt + sk
+                       + ink)
 
     @property
     def wg(self) -> int:
@@ -191,7 +209,8 @@ class AttnOperator(ArtcOperator):
                             KP=s.kp, QP=s.qp, PP=s.pp, M=self.m, QUNIT=s.qunit, tri=f"{tri:016X}", ablate=self.ablate,
                             WIN=self.win, RG=s.rg, RING=self.ring, R=self.win + 1, GQ=s.rg // self.cr,
                             HBC=self.ring * s.rg // self.cr, SWA=self.swa > 0, WR=self.swa // 8,
-                            WG=self.wg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc, SINK=s.sink, KILV=self.kilv)
+                            WG=self.iwg if self.ink else self.wg, tril=f"{tril:016X}", GATE=s.gate, NC=self.nc,
+                            SINK=s.sink, KILV=self.kilv, INK=self.ink)
 
     @property
     def kilv(self) -> bool:
@@ -210,7 +229,26 @@ class AttnOperator(ArtcOperator):
 
     @property
     def n_a(self) -> int:
-        return self.T * COLS * self.shape.qh * self.shape.hd * 9 // 16
+        return self.T * COLS * self.oh * self.shape.hd * 9 // 16
+
+    @property
+    def oh(self) -> int:
+        """Query heads per column in A (ink: 3, the fourth row block zero)."""
+        return 3 if self.ink else self.shape.qh
+
+    @property
+    def n_e(self) -> int:
+        """(ink) bf16 of the E argument: ``e_table``'s rows (16 and a zero one) and a pass's junk reads past them."""
+        return 18 * self.e_len
+
+    def e_table(self, E: np.ndarray) -> np.ndarray:
+        """(ink) The E argument (bf16) of a layer's relative-bias table E (16, extent) fp32: row r at column X0 - d holds
+        E[r][d] (``e_x0``; zeros elsewhere: distances past the table, before 0)."""
+        rel, ext = E.shape
+        assert rel == 16 and ext <= self.e_x0 + 1
+        out = np.zeros((18, self.e_len), np.float32)
+        out[:rel, self.e_x0 - np.arange(ext)] = E
+        return out.astype(bfloat16).reshape(-1)
 
     @property
     def n_seg(self) -> int:
@@ -233,8 +271,9 @@ class AttnOperator(ArtcOperator):
     def get_arg_spec(self) -> list[ArgSpec]:
         seg = [ArgSpec("in", (self.n_seg,), bfloat16)] if self.mode.has_seg else []
         sk = [ArgSpec("in", (self.n_sk,), bfloat16)] if self.shape.sink else []
+        e = [ArgSpec("in", (self.n_e,), bfloat16)] if self.ink else []
         return [ArgSpec("in", (self.n_qs,), bfloat16), ArgSpec("in", (self.n_kv,), bfloat16),
-                ArgSpec("out", (self.n_a,), bfloat16), *seg, *sk]
+                ArgSpec("out", (self.n_a,), bfloat16), *seg, *sk, *e]
 
     def seg(self, lo: np.ndarray) -> np.ndarray:
         """The SEG argument's bytes (uint8) of a packed chunk: ``lo`` (T,) per token the chunk-relative first key of its
@@ -284,6 +323,10 @@ class AttnOperator(ArtcOperator):
             assert fg - 1 + lead // s.pg <= self.ring, (p0, lead, self.ring, "a history the memory tiles hold")
             return {P_P8: p0 // 8, P_FH: (fg - 1 + lead // s.pg) * s.rg // self.cr, P_G0: s.group // 2 * (fg - 1),
                     P_HK: lead}
+        if self.ink:  # (a full layer: the far part, from position 0, before the near part's 16 groups before the chunk)
+            g = p0 // s.pg - self.iwg
+            return {P_P8: p0 // 8, P_IF: max(1, g), P_IFQ: max(1, g) * s.rg // self.cr, P_IFR: max(0, g) * s.rg,
+                    P_INO: (self.kv0 + g * s.group) // 2}
         out = {P_P8: p0 // 8, P_FG: fg, P_FQ: fg * s.rg // self.cr} | ({P_HK: lead} if self.win else {})
         if self.n_pass > self.m:  # (a pass streams the chunk's groups after its first)
             out[P_FO] = s.group // 2 * fg
@@ -301,8 +344,13 @@ class AttnOperator(ArtcOperator):
         wo_ty = np.ndarray[((OS if self.oc == 2 else 0) + 64 * nd * rb,), f32]
         pp_ty = np.ndarray[(self.pp_bytes,), np.dtype[np.uint8]]
         win = self.win
+        ink, inkf = self.ink, self.ink and not self.swa  # (Inkling's; a full layer's: far and near parts)
         k_init = Kernel(f"{p}_init", "kernel.o", [ws_ty, wo_ty, np.int32, np.int32, np.int32] + [np.int32] * (
-            2 if win else 1 if self.nc else 0))
+            2 if win or inkf else 1 if self.nc else 0))
+        k_qink = Kernel(f"{p}_qink", "kernel.o", [u_ty, q_ty, ws_ty, np.int32, np.int32]) if ink else None
+        k_ebias = Kernel(f"{p}_ebias", "kernel.o", [u_ty, ws_ty, np.int32, np.int32]) if ink else None
+        k_efar = Kernel(f"{p}_efar", "kernel.o", [ws_ty, np.int32, np.int32]) if inkf else None
+        p_if, p_ifq, p_ifr, p_ino = (ScratchpadParameter(self._pn(x), np.int32) for x in (P_IF, P_IFQ, P_IFR, P_INO))
         k_seg = Kernel(f"{p}_seg", "kernel.o", [u_ty, ws_ty, np.int32]) if win or self.nc else None
         k_qsel = Kernel(f"{p}_qsel", "kernel.o", [u_ty, q_ty, np.int32, np.int32])
         k_qk = Kernel(f"{p}_qk", "kernel.o", [q_ty, u_ty, u_ty, ws_ty, np.int32, np.int32] if s.kp == 1 else
@@ -346,6 +394,51 @@ class AttnOperator(ArtcOperator):
         o3 = [ObjectFifo(om_ty, name=f"la_o{c}", depth=2) for c in range(COLS)]
         o1 = [o3[c].prod().join([qb * nd * 36 * r for r in range(4)], tile=Tile(c, 1), depths=[2] * 4,
                                 obj_types=[o_ty] * 4, names=[f"la_or{c}_{r}" for r in range(4)]) for c in range(COLS)]
+
+        def ink_turn(a_h, b_h, o_h, init, qk, pv, fin, ws, wo, pp, q, p8, row, bg, bb, qink, ebias, efar=None, ifq=None,
+                     ifr=None):
+            """(ink: a core's share of a pass: its token group's Q units and INK rows of the pass's 16 units, a full layer's
+            far chunks, the near chunks with their E objects, its output)"""
+            for i in range_(16):
+                u = b_h.acquire(1)
+                qink(u, q, ws, i, row)
+                b_h.release(1)
+            if inkf:
+                init(ws, wo, self._offset(p8.read(), P_P8), bg, bb, ifq.read(), ifr.read())
+                for t in range32(ifq.read()):  # (the far part)
+                    efar(ws, t, row)
+                    for kk in range(ku):
+                        k = a_h.acquire(1)
+                        qk(q, k, ws, kk, t, row)
+                        a_h.release(1)
+                    for uu in range(2):
+                        v = b_h.acquire(1)
+                        pv(v, ws, wo, pp, uu)
+                        b_h.release(1)
+                n = gq * (self.iwg + 1)
+                for _ in range(gq):
+                    n = n + bg
+            else:
+                init(ws, wo, self._offset(p8.read(), P_P8), bg, bb)
+                n = gq * (self.iwg + 1)
+            for t in range32(n):  # (the near part: per chunk its E object first, its second unit junk)
+                e = b_h.acquire(1)
+                ebias(e, ws, t, row)
+                b_h.release(1)
+                b_h.acquire(1)
+                b_h.release(1)
+                for kk in range(ku):
+                    k = a_h.acquire(1)
+                    qk(q, k, ws, kk, t, row)
+                    a_h.release(1)
+                for uu in range(2):
+                    v = b_h.acquire(1)
+                    pv(v, ws, wo, pp, uu)
+                    b_h.release(1)
+            for h in range(self.oh):
+                o = o_h.acquire(1)
+                fin(ws, wo, o, h)
+                o_h.release(1)
 
         def turn(a_h, b_h, o_h, init, qsel, qk, pv, fin, ws, wo, pp, q, p8, fq, me, row, bg, bb, nq, seg=None,
                  hk=None, full=False, gsel=None):
@@ -427,6 +520,12 @@ class AttnOperator(ArtcOperator):
                         turn(a_h, b_h, o_h, init, qsel, qk, pv, fin, ws, wo, pp, q, p8, fq, me, row, bg, 0,
                              2 * rb * s.qp, *seg)
                 return
+            if ink:  # (extra: the ink kernels, a full layer's far part's kernel and parameters)
+                for _ in forever_():
+                    for bg in range_(npg):
+                        for bb in range(m):
+                            ink_turn(a_h, b_h, o_h, init, qk, pv, fin, ws, wo, pp, q, p8, row, bg, bb, *extra)
+                return
             for _ in forever_():
                 sinks()
                 # (packed: the passes whose window is every group of the chunk after its first, then the rest's last
@@ -454,10 +553,12 @@ class AttnOperator(ArtcOperator):
                                  rb * (r + 4 * jb(c)), r,
                                  *([k_seg, ScratchpadParameter(self._pn(P_HK), np.int32)] if win or self.nc else []),
                                  *([k_gsel, r + 4 * jb(c)] if s.gate else []),
-                                 *([k_ssel, qh * c] if s.sink else [])],
+                                 *([k_ssel, qh * c] if s.sink else []),
+                                 *([k_qink, k_ebias] if ink else []), *([k_efar, p_ifq, p_ifr] if inkf else [])],
                           tile=Tile(c, 2 + r), stack_size=STACK, dynamic_objfifo_lowering=True, while_true=False)
                    for c in range(COLS) for r in range(4)]
-        n_qs, n_kv, n_a, NH = self.n_qs, self.n_kv, self.n_a, COLS * qh
+        n_qs, n_kv, n_a, noh = self.n_qs, self.n_kv, self.n_a, self.oh
+        NH = COLS * noh
         uw, hb, g2, o2, ow = s.qunit // 2, self.kv_bytes // 2, s.group // 2, s.a_bytes // 2, s.used // 2
         rows, sg = ow // 576, self.sub // 8  # (a sub-chunk's token groups)
         if s.kp == 2:  # (a group's [K obj | padding | K obj])
@@ -492,11 +593,14 @@ class AttnOperator(ArtcOperator):
                             npu_write32(reg, val, column=c, row=r + 2)
             tg = TaskGroup()
             for c in range(COLS):  # pass b: token groups 4 qb b .. of the column's heads (a pass's 4 cores joined)
-                oh[c].drain(A, TensorAccessPattern((n_a,), c * qh * nd * 36, [n_pass, qh, 4 * qb, nd * 36],
+                oh[c].drain(A, TensorAccessPattern((n_a,), c * noh * nd * 36, [n_pass, noh, 4 * qb, nd * 36],
                                                    [4 * qb * NH * nd * 36, nd * 36, NH * nd * 36, 1]),
                             group=tg, wait=True)
             if self.ring:
                 ring_fills(QS, KV, seg[0], ah, bh, tg)
+                return
+            if ink:
+                ink_fills(QS, KV, extra[0], ah, bh, tg)
                 return
             # (a pass's fills: at most three in flight, within the shim tiles' BDs; packed or gated: two, their SEG / GATE
             # parts more)
@@ -555,6 +659,56 @@ class AttnOperator(ArtcOperator):
                 tp.finish()
             tg.finish()
 
+        def ink_fills(QS: object, KV: object, E: object, ah: list, bh: list, tg: TaskGroup) -> None:
+            """(ink) Pass b's fills per column: stream A the K records of a full layer's far part (P_IF groups from position
+            0) and of the near part's G groups (from 16 groups before the pass's group, a full layer's: the chunk's first,
+            P_INO); stream B the pass's Q part (its 4 token groups' units), a full layer's far part's V, then per near group
+            [E window, the first chunk's V | E, the second chunk's V] (a task repeated over the groups: the E window
+            [dim 16][entry 72] read as the memtile's walk puts it into its first unit, ``ebias``; the second unit junk).
+            Pass b + 1's fills issued while pass b runs (a sliding window's: 2 tasks on B a pass, 6 shim BDs a column),
+            a full layer's one pass at a time (its 8 BDs a pass)."""
+            inflight = []
+            tw, L, n_e = s.tgu // 2, self.e_len, self.n_e
+            for b in range(n_pass):
+                tp = TaskGroup()
+                ng = b // m
+                t0 = 4 * qb * b
+                q0 = t0 // sg * sg * COLS * tw + t0 % sg * tw
+                G = self.iwg + 1 + (0 if self.swa else ng)
+                x0 = self.e_x0 - 1055 - 32 * (b % m if self.swa else b)
+                for c in range(COLS):
+                    base = c * hb
+                    k0, v0 = base + self.kv0 // 2, base + self.kv0 // 2 + s.kp * o2
+                    near = [1, G, *k_tap[0][2:]], [0, *k_tap[1][1:]]
+                    if self.swa:
+                        w0 = (ng - self.iwg) * g2
+                        ka = [ChainPart(KV, TensorAccessPattern((n_kv,), k0 + w0, *near), offset_parameter=p_sw)]
+                        vn, pn = v0 + w0, p_sw
+                    else:
+                        ka = [ChainPart(KV, TensorAccessPattern((n_kv,), k0, [1, 2, *k_tap[0][2:]], [0, *k_tap[1][1:]]),
+                                        length_parameter=p_if, length_unit=k_tap[0][2] * k_tap[0][3]),
+                              ChainPart(KV, TensorAccessPattern((n_kv,), base, *near), offset_parameter=p_ino)]
+                        vn, pn = base + s.kp * o2, p_ino
+                    chained_fill(ah[c], KV, ka, tp, wait=True)
+                    bq = [ChainPart(QS, TensorAccessPattern((n_qs,), q0 + c * sg * tw, [1, 1, 1, 4 * qb * tw], [0, 0, 0, 1]))]
+                    if not self.swa:
+                        bq.append(ChainPart(KV, TensorAccessPattern((n_kv,), v0, [1, 2, rows, 576], [0, g2, 576, 1]),
+                                            length_parameter=p_if, length_unit=rows * 576))
+                    chained_fill(bh[c], KV, bq, tp, wait=True)
+                    parts = []
+                    for cc in range(2):
+                        parts.append(ChainPart(E, TensorAccessPattern((n_e,), x0 + 32 * cc, [G, 8, 4, 72],
+                                                                      [64, L // 2, 4 * L, 1])))
+                        parts.append(ChainPart(KV, TensorAccessPattern((n_kv,), vn + rows * 576 // 2 * cc, [G, 1, rows // 2, 576],
+                                                                       [g2, 0, 576, 1]), offset_parameter=pn))
+                    chained_fill(bh[c], KV, parts, tp, wait=True)
+                inflight.append(tp)
+                if len(inflight) > (1 if self.swa else 0):
+                    inflight.pop(0).finish()
+            for tp in inflight:
+                tp.finish()
+            tg.finish()
+
         def ring_fills(QS: object, KV: object, SEG: object, ah: list, bh: list, tg: TaskGroup) -> None:
             """The ring variant's fills: per column the held history (groups from position 0, the chunk's first among
             them) once, then pass b's group b (stream A: its K; B: the pass's Q units, SEG, its V), each read once."""
@@ -593,6 +747,7 @@ class AttnOperator(ArtcOperator):
         rt = Runtime(seq, [np.ndarray[(n_qs,), bf], np.ndarray[(n_kv,), bf], np.ndarray[(n_a,), bf],
                            *([np.ndarray[(n_seg,), bf]] if win or self.nc else []),
                            *([np.ndarray[(n_sk,), bf]] if s.sink else []),
+                           *([np.ndarray[(self.n_e,), bf]] if self.ink else []),
                            [a3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [b3[c].prod(tile=Tile(c, 0)) for c in scols],
                            [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])

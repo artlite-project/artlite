@@ -23,6 +23,10 @@ P_FH = "pa_fh"  # the history's chunks of CR records (``AttnOperator(ring=)``: t
 P_HK = "pa_hk"  # the chunk's first keys every row sees (packed: a lead, ``AttnOperator.params``)
 P_SW = "pa_sw"  # (sliding window) bf16 offset of the chunk's first cache group from a KV head's group 0
 P_KVR = "pa_kvr"  # (a ring's prep, ``PrepOperator(wrap=)``) bf16 offset of the chunk's first cache group's slot
+# (Inkling's full layers, ``AttnOperator(ink=True)``) the far part's cache groups (max(1, p0 / pg - WG)), its chunks of CR
+# records, its real end record (max(0, p0 / pg - WG) records of a group), bf16 offset of the near part's first group in a
+# KV head's cache (its guard included: kv0 / 2 + (p0 / pg - WG) group / 2)
+P_IF, P_IFQ, P_IFR, P_INO = "pa_if", "pa_ifq", "pa_ifr", "pa_ino"
 
 
 
