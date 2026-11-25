@@ -3,9 +3,13 @@
 namespace {
 
 {{ mac_src }}
-{% if silu and act != "silu" %}
+{% if silu and act not in ("silu", "situ") %}
 {% set gact = km.act(km.TABLES[act], table_arg=True, walk=(2, 128)) %}
 {{ gact.src }}
+{% endif %}
+{% if silu and act == "situ" %}
+{% set situ_f = km.situ(16, beta=4.0, linear_beta=situ_lb) %}
+{{ situ_f.src }}
 {% endif %}
 {% if dual %}
 {% set dact = km.act(km.TABLES[act], table_arg=True) %}
@@ -204,7 +208,43 @@ void {{ p }}_{{ name }}(const bfloat16 *__restrict cacc_, bfloat16 *__restrict h
 {{ gate_up("silu", "int32_t zero", silu_t, "zero") }}
 
 {% endif %}
-{% if silu and act != "silu" %}
+{% if silu and act == "situ" %}
+{% set parts = 2 if csplit else sxp %}
+{% set mp = m // parts %}
+// gate/up epilogue (Inkling's experts): the C sub-block pairs as for SiLU ([gate 64 | up 64] per 128 values); h =
+// situ(gate, up) (kmath.situ in fp32 on the C tile's bf16 values, 64 outputs at a time through the scratch) -> hout
+// (bfp16ebs8 panels)
+void {{ p }}_situ(const bfloat16 *__restrict cacc_, bfloat16 *__restrict hout_, bfloat16 *__restrict scratch,
+                  int32_t zero{{ ", int32_t c_part" if c_parts == 2 else "" }})
+{
+{% if "act" in ablate %}
+    return;
+{% endif %}
+    aie::set_rounding(aie::rounding_mode::conv_even);
+{% if c_parts == 2 %}
+    hout_ += c_part * {{ m * n // 2 * 9 // 16 }};
+{% endif %}
+    float *__restrict g = (float *)scratch;  // (fp32 [gate 64 | up 64])
+    float *__restrict u = g + 64;
+    AIE_LOOP_NO_UNROLL
+    for (int part = 0; part < {{ parts }}; part++) {
+        const bfloat16 *__restrict pc = cacc_ + part * {{ csplit // 2 if csplit else mp * n }};
+        aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> o((bfp16ebs8 *)(hout_ + part * {{ mp * n // 2 * 9 // 16 }}));
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ mp * n // 128 }}; i++) {
+            for (int j = 0; j < 64; j += 32) {
+                aie::store_v(g + j, aie::accum<accfloat, 32>(aie::load_v<32>(pc + j)).template to_vector<float>());
+                aie::store_v(u + j, aie::accum<accfloat, 32>(aie::load_v<32>(pc + 64 + j)).template to_vector<float>());
+            }
+            {{ situ_f.name }}(g, u, 64);
+            o.push(aie::accum<accfloat, 64>(aie::load_v<64>(g)).template to_vector<bfp16ebs8>());
+            pc += 128;
+        }
+    }
+}
+
+{% endif %}
+{% if silu and act not in ("silu", "situ") %}
 // gate/up epilogue (GELU: Gemma's tanh form, Spark-X's erf): the C sub-block pairs as for SiLU; h = gelu(bf16(gate)) * up -> hout (bfp16ebs8
 // panels). Three pipelined loops through the scratch: kmath.act's two (``tab_ab``, ``tab_cd``: the core's copies of the
 // table, in two 16 KB regions), then times up.

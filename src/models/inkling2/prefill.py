@@ -18,17 +18,21 @@ tokens where the operator works row by row:
 - the prep (``prefill.attn.ink.InkPrepOperator``: QS, the visit's records, its raw ring), the attention
   (``AttnOperator(ink=True)``) -> A, the gate (``InkGateOperator``), o -> Y;
 - the post conv and the residual (``InkResidOperator``: the chunk's rows at once, the visit's history window 0);
-- the FFN: the FFN mix (and a loop visit's controller), its norm, the MoE, the FFN's post conv (history window 1).
+- the FFN: the FFN mix (its states and cur after the attention; a loop visit's controller of the stream "ffn") -> XM0
+  (XC0), its norm -> XN0, the MoE (``moe.InkMoE``: the router, then a piece from the gathered norm on, the host's
+  routing before it) -> DL, the FFN's post conv into cur (history window 1).
 
 ``ffn`` False: the visits' attention parts only (the decode overlay's ``ffn=False`` slices: tests).
 """
 
+import functools
 from types import SimpleNamespace
 
 import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite.model_config import InklingConfig
+from artlite.moe.expert_gemm import CHUNK
 from artlite.operators.design import COLS
 from artlite.operators.util import arg_bytes
 from artlite.prefill import attn as PA
@@ -38,6 +42,7 @@ from artlite.prefill.chunks import ChunkPrefill
 from artlite.prefill.ink_stream import InkBlendOperator, InkGateOperator, InkMixOperator, InkResidOperator
 from artlite.prefill.norm import PrefillNormOperator
 
+from .moe import InkMoE
 from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
 SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
@@ -47,6 +52,7 @@ PREP_T = 512  # tokens of a prep item at most (its chained fills)
 CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
 # the time model's constants (``layer_seconds``): a ConfigureOp, per sub-chunk a byte of a visit's weights
 CFG_S, WEIGHT_S = 0.12e-3, 3.69e-11
+HOST_STEP_S = 3e-3  # (an MoE's routing on the host, between two pieces)
 
 
 class InklingPrefill(ChunkPrefill):
@@ -72,6 +78,9 @@ class InklingPrefill(ChunkPrefill):
         self.walk = self._walk()
         self._gemms: dict = {}
         self._starts: dict[int, list[int]] = {}
+        self._marks: dict[int, list[tuple[int, int, str]]] = {}  # (per size: (visit, the item its host step precedes, XF))
+        self.moe = InkMoE(self.img, layers=sorted({self.vis[v].layer for v in self.layers}), sizes=self.sizes, sub=SUB,
+                          eps=cfg.rms_norm_eps) if ffn else None
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
         self.kinds = sorted({x.kind for x in self.vis.values()})
         self.attn = {(k, T): self._attn(k, T) for k in self.kinds for T in self.sizes}
@@ -79,6 +88,9 @@ class InklingPrefill(ChunkPrefill):
         self.resid = {(T, b): InkResidOperator(T=T, block=b, y_pitch=COLS * self.sz[self._t(T)].d_pitch,
                                                y_col=self.sz[self._t(T)].d_pitch, hist_rows=HIST_ROWS)
                       for T in self.sizes for b in (False, True)}
+        # (the FFN's: its delta DL as rows)
+        self.fresid = {T: InkResidOperator(T=T, block=False, y_pitch=self.H, y_col=self.H // COLS, hist_rows=HIST_ROWS)
+                       for T in self.sizes} if ffn else {}
         self._rows()
         self._library()
 
@@ -156,7 +168,7 @@ class InklingPrefill(ChunkPrefill):
         plans = {}
         for v in self.layers:
             L = self.vis[v].layer
-            names = ["q", "k", "v", "o"] + ([f"d{s}{h}" for s in CTL for h in "ab"] if self.vis[v].messages else [])
+            names = ["q", "k", "v", "o"] + ([f"d{s}{h}" for s in self.ctl for h in "ab"] if self.vis[v].messages else [])
             for n in names:
                 if (L, n) not in plans:
                     plans[(L, n)] = PG.plan_phase(img, img.region(L, n), t, pitch=dp if n == "o" else 0, ops=self._gemms)
@@ -172,6 +184,11 @@ class InklingPrefill(ChunkPrefill):
             gate=InkGateOperator(T=t, lq_pitch=lq.pitch, gate_off=lq.off["gate"]),
             blend=InkBlendOperator(T=t, d_pitch=dl.pitch, w_stride=img.region(self._loop_layer(), "ctl_q").col_stride // 2)
             if dl is not None else None)
+
+    @property
+    def ctl(self) -> tuple[str, ...]:
+        """A loop visit's controlled streams."""
+        return CTL + (("ffn",) if self.ffn else ())
 
     def _loop_layer(self) -> int:
         return next(self.vis[v].layer for v in self.layers if self.vis[v].messages)
@@ -196,13 +213,15 @@ class InklingPrefill(ChunkPrefill):
         dl = next((p.layout for (_, n), p in o.plans.items() if n == "dqa"), None)
         if dl is not None:
             self.rb |= {"GA": 2 * dl.N, "GB": 2 * dl.N}
-        # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ffn] x H bf16), its queries (QR: the
+        if self.moe is not None:
+            self.rb |= self.moe.rows(t)
+        # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ones, ffn] x H bf16), its queries (QR: the
         # attention's 3 rows (one used by a sliding-window layer), the FFN's, the 4 messages' x H fp32), its prep's PRM,
         # its E table (EB), its post convs' taps (TP: [2][COLS][4][C] bf16); TAU per position
         phys = sorted({x.layer for x in self.vis.values()})
         self.phys = {L: i for i, L in enumerate(phys)}
         prep = next(iter(self.preps.values()))[0]
-        self.np_w, self.qr_w, self.prm_w = 4 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
+        self.np_w, self.qr_w, self.prm_w = 5 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
         self.e_w = {k: 2 * self.attn[(k, self.sizes[-1])].n_e for k in self.kinds}
         self.tp_w = 2 * 2 * COLS * 4 * (H // COLS)
 
@@ -231,7 +250,7 @@ class InklingPrefill(ChunkPrefill):
 
     def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
         assert not packed and not tree, "Inkling: no packed chunks"
-        ov, sl, img = self.ov, self._sl, self.img
+        ov, sl = self.ov, self._sl
         t = self._t(T)
         S, o = T // t, self.sz[t]
 
@@ -239,7 +258,7 @@ class InklingPrefill(ChunkPrefill):
             return sl(buf, j * t * (row or self.rb[buf]) + extra, op, i=i)
 
         rl: list[tuple] = []
-        starts = []
+        starts, marks = [], []
         for v in self.layers:
             starts.append(len(rl))
             x, w = self.vis[v], self.walk[v]
@@ -256,24 +275,8 @@ class InklingPrefill(ChunkPrefill):
                             tok(f"XM{j}", jj, mx, i=len(states) + 1)) for jj in range(S)]
                     inputs.append((f"XM{j}", j if full else 0))
             if x.messages:  # (per stream its message, the controller's down halves, the blend)
-                bl, mx2 = o.blend, o.mixes[2]
-                ctl = []
-                for si, s in enumerate(CTL):
-                    xs = inputs[si if full else 0][0]
-                    rl += [(mx2, tok(w.bank[0], jj, mx2, i=0), tok(w.bank[1], jj, mx2, i=1), self._qr(L, 4 + si),
-                            tok("MS", jj, mx2, i=3)) for jj in range(S)]
-                    for h, src in (("a", xs), ("b", "MS")):
-                        nm = o.norm1
-                        rl += [(nm, tok(src, jj, nm, i=0), self._np(L, 3), tok("DP", jj, nm, i=2)) for jj in range(S)]
-                        p = o.plans[(L, f"d{s}{h}")]
-                        rl += [(g.op, tok("DP", jj, g.op, i=0), self._w(g), tok(f"G{h.upper()}", jj, g.op, i=2))
-                               for g in p.gemms for jj in range(S)]
-                    reg = img.region(L, f"ctl_{s}")
-                    wsl = f"W[{reg.offset}:{reg.offset + arg_bytes(bl, 4)}]"
-                    rl += [(bl, tok("GA", jj, bl, i=0), tok("GB", jj, bl, i=1), tok(xs, jj, bl, i=2), tok("MS", jj, bl, i=3),
-                            wsl, tok(f"XC{si}", jj, bl, i=5)) for jj in range(S)]
-                    ctl.append((f"XC{si}", si if full else 0))
-                inputs = ctl
+                inputs = [(self._control(rl, o, S, tok, v, s, inputs[si if full else 0][0], f"XC{si}"), si if full else 0)
+                          for si, s in enumerate(CTL)]
             nm = o.norm
             for j, (src, ni) in enumerate(inputs):
                 rl += [(nm, tok(src, jj, nm, i=0), self._np(L, ni), tok(f"XN{j}", jj, nm, i=2)) for jj in range(S)]
@@ -302,9 +305,52 @@ class InklingPrefill(ChunkPrefill):
             args = [sl("Y", 0, rs, i=0)] + ([] if rs.block else [sl(w.cur, 0, rs, i=1)])
             rl.append((rs, *args, self._tp(L, 0, rs), hist, sl(dst, 0, rs, i=len(args) + 2)))
             if self.ffn:
-                raise NotImplementedError("Inkling's prefill FFN (the MoE: S4b)")
+                marks.append(self._ffn(rl, o, S, tok, v, T))
         self._starts[T] = [*starts, len(rl)]
+        self._marks[T] = marks
         return rl
+
+    def _control(self, rl: list[tuple], o: SimpleNamespace, S: int, tok: object, v: int, s: str, xs: str, out: str) -> str:
+        """Visit v's controller of stream s on the rows xs (the bank's message with the stream's query, the down halves
+        on the norms without weights, the blend) into the rows ``out``; returns ``out``."""
+        w, L = self.walk[v], self.vis[v].layer
+        bl, mx2 = o.blend, o.mixes[2]
+        si = self.ctl.index(s)
+        rl += [(mx2, tok(w.bank[0], jj, mx2, i=0), tok(w.bank[1], jj, mx2, i=1), self._qr(L, 4 + si),
+                tok("MS", jj, mx2, i=3)) for jj in range(S)]
+        for h, src in (("a", xs), ("b", "MS")):
+            nm = o.norm1
+            rl += [(nm, tok(src, jj, nm, i=0), self._np(L, 3), tok("DP", jj, nm, i=2)) for jj in range(S)]
+            p = o.plans[(L, f"d{s}{h}")]
+            rl += [(g.op, tok("DP", jj, g.op, i=0), self._w(g), tok(f"G{h.upper()}", jj, g.op, i=2))
+                   for g in p.gemms for jj in range(S)]
+        reg = self.img.region(L, f"ctl_{s}")
+        wsl = f"W[{reg.offset}:{reg.offset + arg_bytes(bl, 4)}]"
+        rl += [(bl, tok("GA", jj, bl, i=0), tok("GB", jj, bl, i=1), tok(xs, jj, bl, i=2), tok("MS", jj, bl, i=3),
+                wsl, tok(out, jj, bl, i=5)) for jj in range(S)]
+        return out
+
+    def _ffn(self, rl: list[tuple], o: SimpleNamespace, S: int, tok: object, v: int, T: int) -> tuple[int, int, str]:
+        """Visit v's FFN (module docstring) after its attention's residual; returns its host step's mark (the visit,
+        the item it precedes, the FFN input's rows)."""
+        x, w, sl = self.vis[v], self.walk[v], self._sl
+        L, t = x.layer, self._t(T)
+        cur = w.new if x.block else w.cur  # (cur after the attention)
+        states = w.blocks + ([w.cur] if x.block else []) + [cur]
+        mx = o.mixes[len(states)]
+        rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, 3),
+                tok("XM0", jj, mx, i=len(states) + 1)) for jj in range(S)]
+        xf = self._control(rl, o, S, tok, v, "ffn", "XM0", "XC0") if x.messages else "XM0"
+        nm = o.norm
+        rl += [(nm, tok(xf, jj, nm, i=0), self._np(L, 4), tok("XN0", jj, nm, i=2)) for jj in range(S)]
+        rp = self.moe.router(L, t)
+        rl += [(g.op, tok("XN0", jj, g.op, i=0), self._w(g), tok("LG", jj, g.op, i=2)) for g in rp.gemms for jj in range(S)]
+        mark = (v, len(rl), xf)
+        rl += self.moe.items(L, T, sl=lambda b, off, op, i: sl(b, off, op, i=i), norm=self._np(L, 4))
+        rs = self.fresid[T]
+        hist = f"KV[{self.ov.hist[(v, 1)]}:{self.ov.hist[(v, 1)] + arg_bytes(rs, 3)}]"
+        rl.append((rs, sl("DL", 0, rs, i=0), sl(cur, 0, rs, i=1), self._tp(L, 1, rs), hist, sl(cur, 0, rs, i=4)))
+        return mark
 
     def _kv(self, v: int, op: object, i: int) -> str:
         """Visit v's caches as the argument i of the prep / attention: from its kv0 before the cache (a full visit's 16
@@ -331,6 +377,8 @@ class InklingPrefill(ChunkPrefill):
         own["PRM"] = max(own.get("PRM", 0), n * self.prm_w)
         own["ET"] = max(own.get("ET", 0), n * max(self.e_w.values()))
         own["TP"] = max(own.get("TP", 0), n * self.tp_w)
+        for name, b in (self.moe.fixed() if self.moe else {}).items():
+            own[name] = max(own.get(name, 0), b)
 
     def _bind(self) -> None:
         """The norm weights (NP), queries (QR), the preps' constants (PRM), the E tables (EB), the post convs' taps (TP),
@@ -348,8 +396,8 @@ class InklingPrefill(ChunkPrefill):
             b = f"blk.{L}."
             full = cfg.kinds[L] == "full"
             norms = [b + f"attn_{n}_inp_norm.weight" for n in "qkv"] if full else [b + "attn_norm.weight"] * 3
-            ws = [vec(n) for n in norms] + [np.ones(H, np.float32)]
-            for j, wv in enumerate(ws):  # (index 3: ones, the controllers' downs' norms)
+            ws = [vec(n) for n in norms] + [np.ones(H, np.float32), vec(b + "ffn_norm.weight")]
+            for j, wv in enumerate(ws):  # (index 3: ones, the controllers' downs' norms; 4: the FFN's)
                 o = i * self.np_w + j * 2 * H
                 npb[o:o + 2 * H] = wv.astype(bfloat16).view(np.uint8)
             q = np.zeros((8, H), np.float32)
@@ -380,7 +428,9 @@ class InklingPrefill(ChunkPrefill):
         dev.view("TAU")[:tau.nbytes] = tau.view(np.uint8)
         for name in ("NP", "QR", "PRM", "ET", "TP", "TAU"):
             dev.flush(name)
-        for name in ("QS",):  # (the INK unit's slot of a query block's fourth row block: zero where nothing writes)
+        # (QS: the INK unit's slot of a query block's fourth row block, zero where nothing writes; DS: the combine's ds
+        # rows, zero but the weights the host writes)
+        for name in ("QS", "DS") if self.moe else ("QS",):
             dev.view(name)[:] = 0
             dev.flush(name)
 
@@ -414,7 +464,10 @@ class InklingPrefill(ChunkPrefill):
         eb = dev.view("EB")[:2 * T * H].view(bfloat16).reshape(T, H)
         eb[:n], eb[n:] = e.astype(bfloat16), 0
         dev.flush("EB", 0, 2 * T * H)
-        self._launch(T, p0, self.params(T, p0, n), None)
+        hooks = {i: functools.partial(self.moe.host_route, self.vis[v].layer, n=n, T=T, t=self._t(T), xf=xf, dev=dev,
+                                      lib=self.lib) for v, i, xf in self._marks.get(T, ())}
+        # (the host's routing reads the router's logits: after the piece that ends with the router)
+        self._launch(T, p0, self.params(T, p0, n), hooks or None, synced=tuple(hooks))
         dev.stale = True  # (the chunk's configurations replaced the attention cores' code pages)
         ov._hbase[ov.seq] = p0 + n - 3  # (the windows' rows 0 .. 2: the chunk's last 3 valid tokens')
 
@@ -430,13 +483,18 @@ class InklingPrefill(ChunkPrefill):
 
     def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
         """(per sub-chunk the visit's attention weights' bytes, WEIGHT_S each; CFG_S per ConfigureOp; the attention as
-        its window's records)"""
+        its window's records; the MoE: its chunks' expert runs, WEIGHT_S a byte, and the host's step)"""
         x = self.vis[L]
         b = sum(self.img.region(x.layer, n).nbytes for n in ("q", "k", "v", "o"))
-        return S * WEIGHT_S * b + self.layer_configs(L) * CFG_S + 1e-3 * S
+        out = S * WEIGHT_S * b + self.layer_configs(L) * CFG_S + 1e-3 * S
+        if self.moe is not None:
+            pairs = S * SUB * self.cfg.n_experts_used
+            chunks = min(self.cfg.n_experts, pairs) + pairs / CHUNK
+            out += chunks * self.moe.unit_offsets[x.layer][-1] * WEIGHT_S + HOST_STEP_S
+        return out
 
     def layer_configs(self, L: int) -> int:
-        return 12 + (16 if self.vis[L].messages else 0)
+        return 12 + (16 if self.vis[L].messages else 0) + (10 if self.ffn else 0)
 
 
 __all__ = ["SIZES", "InklingPrefill"]

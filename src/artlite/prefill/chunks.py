@@ -40,7 +40,7 @@ word (``pace.resolve``: before the first chunk, or at ``prepare``; 0 where nothi
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -436,7 +436,7 @@ class ChunkPrefill:
         return T
 
     def _launch(self, T: int, p0: int, params: dict[str, int], hooks: dict[int, Callable[[], None]] | None = None, *,
-                key: int | tuple[str, int] | None = None) -> None:
+                key: int | tuple[str, int] | None = None, synced: Collection[int] = ()) -> None:
         """Dispatch a chunk's program (its inputs written; ``key``: a packed or tree chunk's, ``_program``): the
         scratchpad ``params``, the pieces of ``_splits`` (and one from each item index of ``hooks`` on, its host
         function called before it); the cache layers' rings then hold no rows of the chunk's last record
@@ -453,7 +453,7 @@ class ChunkPrefill:
         self.dispatches = self.lib.run(self._program(T if key is None else key),
                                        splits=[*self._est[cut], *(hooks or {})],
                                        bufs=list({id(b): b for b in self._buffers().values()}.values()), hooks=hooks,
-                                       guest=self.guest)
+                                       synced=synced, guest=self.guest)
         self.ov.dev.stale = True  # (another hardware context ran: the overlay's code pages again before its next dispatch)
         self.ov.vring.from_prefill.update(self.kv_layers)
 

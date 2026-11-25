@@ -1,0 +1,27 @@
+extern "C" {
+
+// the combine's second Y (CombineOperator's y2): acc[o] += w_i y[r] for its row in (pass {{ P }}, C object {{ V }}, tile
+// {{ TL }}) runs of 32: run (p, v, t) at output p {{ TL * V * 32 }} + t {{ V * 32 }} + v 32
+void {{ p }}_cy2(const bfloat16 *__restrict y, const bfloat16 *__restrict obj, float *__restrict acc, int32_t i)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float w = ((const float *)(obj + {{ COLS * DP }}))[i];
+    const bfloat16 wh = (bfloat16)w;
+    const bfloat16 wl = (bfloat16)(w - (float)wh);
+    const aie::vector<bfloat16, 32> h = aie::broadcast<bfloat16, 32>(wh), l = aie::broadcast<bfloat16, 32>(wl);
+    const bfloat16 *__restrict py = y;
+    for (int p = 0; p < {{ P }}; p++)
+        for (int v = 0; v < {{ V }}; v++) {
+            float *__restrict pa = acc + p * {{ TL * V * 32 }} + v * 32;
+            AIE_PREPARE_FOR_POSTPIPELINING
+            for (int t = 0; t < {{ TL }}; t++) {
+                const aie::vector<bfloat16, 32> x = aie::load_v<32>(py);
+                py += 32;
+                aie::accum<accfloat, 32> a(aie::load_v<32>(pa));
+                aie::store_v(pa, aie::mac(aie::mac(a, x, h), x, l).template to_vector<float>());
+                pa += {{ V * 32 }};
+            }
+        }
+}
+
+}  // extern "C"

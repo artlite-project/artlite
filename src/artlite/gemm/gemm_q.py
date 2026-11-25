@@ -152,6 +152,7 @@ class GemmQOperator(ArtcOperator):
         run: int = 1,
         dual: int = 0,
         qt: tuple[tuple[int, int, int], ...] = (),
+        situ_lb: float = 25.0,
     ):
         """``tiles``: decode tiles per pass (default 64 rows' worth; planar tiles: any count, MMUL-padded
         to a multiple of 16 rows; with ``silu`` whole SiLU groups, ``formats.gu_tiles``, or half groups of
@@ -192,7 +193,8 @@ class GemmQOperator(ArtcOperator):
         gate), each part on its half of A (K columns each: the two regions' inputs side by side, 2 K in all); C = bf16
         act(first part's C tile) times the second's (``act``: the gate / up activation), one C object per pair. ``qt``: a
         ``decode.image.Region.qt`` region's blocks (``geometry.Geometry.qt``: row tiles in groups sharing their last
-        chunk's tile, a pass a group's; ``region_rt``: a column's tiles).
+        chunk's tile, a pass a group's; ``region_rt``: a column's tiles). ``act`` "situ" (Inkling's experts, GemmQd: C
+        = situ(gate, up), ``kmath.situ``): its linear beta ``situ_lb``.
 
         Experiment switches (timing only, wrong results): ``ablate`` "dq" / "mm" compile the
         kernel bodies out ("hdr": GemmQd's Q4_K header expansion; "act": the gate/up epilogue), "ev_dq" / "ev_mm" /
@@ -205,6 +207,7 @@ class GemmQOperator(ArtcOperator):
             blocks=blocks, a_cols=a_cols, k_rep=k_rep, c_pairs=c_pairs, groups=groups, slots=slots,
             mc_param=mc_param, mc_unit=mc_unit, lines=lines, pace=pace, pass_step=pass_step, ptail=ptail, ptail_part=ptail_part,
             c_panels=c_panels, run=run, dual=dual, qt=qt)
+        self.situ_lb = situ_lb
         self.geo, self.plan = self._size(*Geometry.variants(spec, dq_core=self.DQ_CORE), m=m)
         self.flow = Dataflow.make(self.geo)
         super().__init__()
@@ -399,7 +402,7 @@ class GemmQOperator(ArtcOperator):
         mac = render_mac(k=KT, split=self.pair)
         if self.c_pairs:
             mac += render_mac(name=MACF, k=KT, f32=True)
-        return KERNEL_TEMPLATE.render(p=self.p, mac=f"{MAC}<{self.m}, {self.n}>", m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act,
+        return KERNEL_TEMPLATE.render(p=self.p, mac=f"{MAC}<{self.m}, {self.n}>", m=self.m, n=self.n, nd=self.n, halves=1, k=KT, silu=self.silu, act=self.act, situ_lb=self.situ_lb,
                                   fmt=self.fmt,
                                   nsb=self.nsb, dqb=False,
                                   c_bfp16=self.c_bfp16, ablate=self.ablate, mac_src=mac,
@@ -473,6 +476,7 @@ class GemmQOperator(ArtcOperator):
         p = self.p
         k_zero = Kernel(f"{p}_zerof" if self.c_pairs else f"{p}_zero", "kernel.o", [acc_ty])
         gelu = self.silu and self.act != "silu"  # (a GELU form: its table's two copies, ``kmath.TABLES``)
+        assert self.act != "situ", "situ: GemmQd's"
         lut_ty = np.ndarray[(kmath.TABLES[self.act].table_words().size,), np.dtype[np.uint32]]
         k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, st_ty, *([lut_ty] * 2 if gelu else [np.int32]),
                                                          *[np.int32] * (self.c_parts - 1)]) if self.silu else None

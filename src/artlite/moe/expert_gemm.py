@@ -31,6 +31,15 @@ chunks one slab stride apart (A: the expert's H, 512 columns), two slots per C o
 of up to 4 tiles of at most 64 rows (21-row tiles 3: 9 passes instead of 13 of 2, 195 -> 168 us per chunk). Tile
 formats: Q4_K, Q4_1_64 and BFP16 (tile-major; a header expanded per super-block, or the halves' headers straight into
 their scale workspaces), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS's units: ``formats.Slot.unit_bytes``).
+
+An expert of other parts (``expert_halves``, a part's bytes ``half_bytes`` apart, the experts ``expert_stride``; Inkling's
+units of 512, 512 and 128 channels): a gate / up of one part over a ``decode.image.Region.qt`` input (the hidden 2304:
+per group of 4 row tiles their 2 full chunks each, then the group's tail tile) in passes of one group (64 rows: a weight
+task of 3 BDs, a K chunk's units over the group's tiles, the tail tile's units, one a row tile), C = situ(gate, up)
+(``act``), its outputs from column ``col0`` of a wider H (``streams``: units 0 and 1 one design, the expert's first 1024
+columns); a down of 2 super-blocks a slot (G 2, units 0 and 1 as the two halves: per slot and half a BD) or of half a
+super-block a slot (G 8, one half: the units in order, slot j the k-tiles 2 j, 2 j + 1 of unit j / 2). A chunk's drained
+objects count on its shim lock, at most ``MAX_REPEAT`` (two halves of 64-row passes would be 64: one part a design).
 """
 
 import functools
@@ -83,6 +92,8 @@ LOCKS = (2, 3)  # the drain sets' shim locks
 A_CH = 0  # the A object's memtile S2MM channel (finish-on-TLAST)
 MEM_S2MM_CTRL = 0xA0600  # + 8 channel: a memtile's DMA_S2MM_<ch>_Ctrl (AM029; FoT_Mode bits 17:16, 1: no counts)
 MARKER = 32  # words of a column's control buffer at its end, all ones (a panel of them: an inactive strip)
+MEMTILE_BYTES = 512 * 1024
+MAX_REPEAT = 63  # (a memtile object's repeats: its lock's range)
 
 
 _CHK = templating.load("artlite/moe/expert_gemm.cc.jinja")
@@ -104,24 +115,41 @@ class ExpertGemmOperator(GemmQdOperator):
     mac_stack = 2048  # (the MAC cores' stack: GemmQdOperator's)
 
     def __init__(self, *, kind: str, fmt: str, R: int, row_tiles: int, G: int = 1, K: int, tile_bytes: int, kc: int,
-                 kc_group: int = 1, cap: int, out: int, ablate: tuple[str, ...] = ()):
-        assert kind in ("gu", "down")
-        self.kind, self.cap = kind, cap
+                 kc_group: int = 1, cap: int, out: int, expert_halves: int = 2, qt: int = 0, act: str = "silu",
+                 situ_lb: float = 25.0, ablate: tuple[str, ...] = ()):
+        """expert_halves: the expert's parts this operator streams (1, 2); qt: a gate / up's ``Region.qt`` tail
+        (super-blocks); act: the gate / up's activation ("silu", "situ" of linear beta ``situ_lb``)."""
+        assert kind in ("gu", "down") and expert_halves in (1, 2) and (not qt or (kind == "gu" and expert_halves == 1))
+        self.kind, self.cap, self.eh = kind, cap, expert_halves
         self._templates: dict[tuple, tuple[np.ndarray, list]] = {}
+        eh = expert_halves
         if kind == "gu":
-            tp = gu_tiles(R) if planar(fmt, R, kc) else self.GU_ROWS // R  # (tiles per pass)
+            if qt:  # (passes of one tail group's row tiles)
+                tp = kc // 256 // qt
+                assert planar(fmt, R, kc) and tp * R == 64, (fmt, R)
+                rows = tp * R
+            else:
+                tp = gu_tiles(R) if planar(fmt, R, kc) else self.GU_ROWS // R  # (tiles per pass)
+                rows = self.GU_ROWS
             assert row_tiles % tp == 0, (fmt, R, row_tiles)
             ph = row_tiles // tp  # passes per half
-            kw = {"fmt": fmt, "rows": R, "K": K, "N": out, "passes": 2 * ph,
-                  "out_cols": [[self.GU_ROWS // 2 * p for p in range(2 * ph)]] * COLS, "kc_group": kc_group,
-                  "region_rt": row_tiles, "silu": True, "act": "silu", "c_bfp16": True,
-                  "blocks": ((0, 2 * ph),), "tiles": tp, "pingpong": self.GU_ROWS == 64}
+            kw = {"fmt": fmt, "rows": R, "K": K, "N": out, "passes": eh * ph,
+                  "out_cols": [[rows // 2 * p for p in range(eh * ph)]] * COLS, "kc_group": kc_group,
+                  "region_rt": row_tiles, "silu": True, "act": act, "c_bfp16": True,
+                  "blocks": ((0, eh * ph),), "tiles": tp, "pingpong": rows == 64, "situ_lb": situ_lb}
+            if qt:
+                kw["qt"] = ((0, 0, row_tiles),)
             self.ph = ph
         else:
+            assert eh == 2 or G > 1, "a down of one half: row groups"
             tiles = min(4, 64 // R)  # (the C packing's MAC columns: at most 64; Q3_K's 21 rows 3, IQ3_XXS's 23 2)
+            if G > kc // 256:  # (half super-blocks a slot: whole passes of at most 63 A strips, the lock's range)
+                assert eh == 1 and G == 2 * (kc // 256), G
+                tiles = max(t for t in range(1, tiles + 1) if row_tiles % t == 0 and row_tiles // t * G <= MAX_REPEAT)
             passes = -(-row_tiles // tiles)
+            assert passes * G <= MAX_REPEAT, (passes, G)
             row = -(-2 * tiles * R // 8) * 8  # (a C object's token row: two slots' rows, whole 8-value items)
-            kw = {"fmt": fmt, "rows": R, "K": 2 * kc, "N": max(out, passes * G // 2 * row), "passes": passes,
+            kw = {"fmt": fmt, "rows": R, "K": eh * kc, "N": max(out, passes * G // 2 * row), "passes": passes,
                   "out_cols": [[tiles * G * R * p for p in range(passes)]] * COLS, "kc_group": 1,
                   "region_rt": row_tiles, "rt_stride": 1, "groups": G,
                   "blocks": ((0, passes),), "c_pack": True, "slots": 2}
@@ -136,12 +164,19 @@ class ExpertGemmOperator(GemmQdOperator):
             assert self.slots == 2 and self.N == max(out, self.passes * self.vp * self.n_c), "C runs of whole words"
 
     @classmethod
-    def of(cls, kind: str, region: object, *, cap: int, out: int, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
-        """The operator of a layer's slab region ("exp_gu" / "exp_down")."""
+    def of(cls, kind: str, region: object, *, cap: int, out: int, expert_halves: int = 2, act: str = "silu",
+           situ_lb: float = 25.0, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
+        """The operator of a layer's slab region ("exp_gu" / "exp_down"; Inkling's "exp_gu<u>" / "exp_dn<u>")."""
         (b,) = region.blocks
         assert not region.half, "an expert's input of whole K chunks"
-        return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=b.tiles, G=b.G, K=region.K, tile_bytes=region.tile_bytes,
-                   kc=region.kc, kc_group=region.kc_group, cap=cap, out=out, **({"ablate": ablate} if ablate else {}))
+        kw = {"act": act, "situ_lb": situ_lb} if act != "silu" else {}  # (the defaults left out: the designs' keys)
+        if expert_halves != 2:
+            kw["expert_halves"] = expert_halves
+        if kind == "gu" and region.qt:
+            kw["qt"] = region.qt
+        return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=b.tiles, G=b.G, K=region.K_in if kind == "gu" else region.K,
+                   tile_bytes=region.tile_bytes, kc=region.kc, kc_group=region.kc_group, cap=cap, out=out, **kw,
+                   **({"ablate": ablate} if ablate else {}))
 
     def get_kernel_src(self) -> str:
         return super().get_kernel_src() + _CHK.render(p=self.p)
@@ -194,17 +229,35 @@ class ExpertGemmOperator(GemmQdOperator):
 
     def w_chains(self, half_bytes: int) -> list[list[TensorAccessPattern]]:
         """A chunk's weight tasks as chains of taps (bf16 units from its expert's slab, the second half half_bytes
-        after the first): "gu" per half one chain (a BD per K chunk, [pass, unit, tile, words]); "down" one chain: the
-        header units of both halves, then per slot its super-blocks of both halves ([pass, half, tile, words])."""
+        after the first): "gu" per half one chain (a BD per K chunk, [pass, unit, tile, words]; a ``qt`` input's: its
+        full chunks over the group's row tiles, then the tail tile's units); "down" one chain: the header units of both
+        halves, then per slot its super-blocks of both halves ([pass, half, tile, words]; 2 super-blocks a slot: per
+        slot and half [pass, super-block, tile, words]; half super-blocks a slot: per half its units in order)."""
         tw, (nsl, sw) = self.tile_bytes // 2, self.fill_units
-        nt, rs = self.tiles, self.rt_stride
-        if self.kind == "gu":
-            g = self.kc_group
-            return [[TensorAccessPattern((1, 1 << 30), h * half_bytes // 2 + k * tw, [self.ph, nsl, nt, sw],
-                                         [nt * rs * tw, sw, rs * tw, 1]) for k in range(g)] for h in range(2)]
-        hu, spg = self.hdr_units, self.nsb // self.G
-        assert hu <= 1 and spg == 1, (hu, spg)
+        nt, rs, eh = self.tiles, self.rt_stride, self.eh
         half = half_bytes // 2
+        if self.kind == "gu":
+            if self.geo.qt:  # (group stride: the group's row tiles' full chunks and its tail tile)
+                qg, nf, tail = self.geo.qg, self.n_full, self.tail
+                assert nt == qg and self.hdr_units == 0
+                gs = (qg * nf + 1) * tw
+                return [[TensorAccessPattern((1, 1 << 30), h * half + k * tw, [self.ph, self.nsb, qg, sw], [gs, sw, nf * tw, 1])
+                         for k in range(nf)] +
+                        [TensorAccessPattern((1, 1 << 30), h * half + qg * nf * tw, [self.ph, tail, qg, sw],
+                                             [gs, sw, tail * sw, 1])] for h in range(eh)]
+            g = self.kc_group
+            return [[TensorAccessPattern((1, 1 << 30), h * half + k * tw, [self.ph, nsl, nt, sw],
+                                         [nt * rs * tw, sw, rs * tw, 1]) for k in range(g)] for h in range(eh)]
+        hu = self.hdr_units
+        if self.G > self.nsb:  # (half super-blocks a slot, one half: the units in order)
+            assert hu == 0 and eh == 1
+            return [[TensorAccessPattern((1, 1 << 30), 0, [self.ph, self.nsb, nt, sw], [nt * rs * tw, sw, rs * tw, 1])]]
+        spg = self.nsb // self.G
+        if spg > 1:  # (per slot and half its super-blocks)
+            assert hu == 0 and eh == 2
+            return [[TensorAccessPattern((1, 1 << 30), h * half + j * spg * sw, [self.ph, spg, nt, sw],
+                                         [nt * rs * tw, sw, rs * tw, 1]) for j in range(self.G) for h in range(2)]]
+        assert hu <= 1 and eh == 2, (hu, eh)
         return [[TensorAccessPattern((1, 1 << 30), j * sw, [self.ph, 2, nt, sw], [nt * rs * tw, half, rs * tw, 1])
                  for j in range(hu + self.G)]]
 
@@ -215,24 +268,27 @@ class ExpertGemmOperator(GemmQdOperator):
         return [TensorAccessPattern((1, 1 << 30), r * self.a_strip, [1, aK // KT, M // 8, 8 * 36],
                                     [0, 8 * 36, aK // 8 * 36, 1]) for r in range(MAC_ROWS)]
 
-    def drain_taps(self) -> tuple[TensorAccessPattern, TensorAccessPattern]:
+    def drain_taps(self, col0: int = 0) -> tuple[TensorAccessPattern, TensorAccessPattern]:
         """A chunk's C drains (bf16 units from its slot), row 0's and rows 1 and 2's: a BD iterating over the chunk's C
         objects (per pass and object ``vp``): "gu" H panels [group][N / 8][36] (a pass: its 4 panels of the rows'
-        groups), "down" the pass-major ``y_layout`` (an object: its rows' tokens whole)."""
+        groups; ``col0``: its outputs from that column of H's ``N``), "down" the pass-major ``y_layout`` (an object: its
+        rows' tokens whole)."""
         if self.kind == "gu":
             g, w = self.N // 8 * 36, self.n_out // 8 * 36  # (a token group's panels, a C object's: a pass's or its half's)
-            return tuple(TensorAccessPattern((1, 1 << 30), g0 * g, [self.passes * self.halves, 1, n, w], [w, 0, g, 1])
-                         for g0, n in ((0, M // 8), (M // 8, 2 * M // 8)))
+            assert col0 % 8 == 0 and col0 + self.passes * self.n_out <= self.N, col0
+            return tuple(TensorAccessPattern((1, 1 << 30), g0 * g + col0 // 8 * 36, [self.passes * self.halves, 1, n, w],
+                                             [w, 0, g, 1]) for g0, n in ((0, M // 8), (M // 8, 2 * M // 8)))
+        assert col0 == 0
         obj = CHUNK * self.n_c  # (a C object: its tokens' rows of n_c, the columns past n_out junk)
         return tuple(TensorAccessPattern((1, 1 << 30), t0 * self.n_c, [self.passes * self.vp, 1, 1, n * self.n_c],
                                          [obj, 0, 0, 1]) for t0, n in ((0, M), (M, 2 * M)))
 
-    def chunk_template(self, parity: int, last: bool, active: bool, half_bytes: int) -> ctl.Template:
+    def chunk_template(self, parity: int, last: bool, active: bool, half_bytes: int, col0: int = 0) -> ctl.Template:
         """A chunk's block body (its packets) and its address slots (``ctl.template``; bases: 0 the expert's slab, 1
         its C slot, 2 its A slot, 3 the marker panel): the weight tasks (``w_chains``), the A strips (rows 1 and 2's
         the marker unless ``active``), the drains in set ``parity`` (rows 1 and 2's if ``active``; the last chunk's
         pushes with a token)."""
-        key = (parity, last, active, half_bytes)
+        key = (parity, last, active, half_bytes, col0)
         if key in self._templates:
             return self._templates[key]
         out: list[int] = []
@@ -257,7 +313,7 @@ class ExpertGemmOperator(GemmQdOperator):
             else:
                 bd(A_BDS[r], ctl.bd_words(0, marker, next_bd=nxt), 3, 0)
         out.extend(ctl.push(txn.MM2S, 0, A_BDS[0]))
-        for ch, tap in enumerate(self.drain_taps()[:1 + active]):
+        for ch, tap in enumerate(self.drain_taps(col0)[:1 + active]):
             bd(C_BDS[parity][ch], ctl.bd_words(0, tap, release=(LOCKS[parity], 1)), 1, 2 * tap.offset)
             out.extend(ctl.push(txn.S2MM, ch, C_BDS[parity][ch], repeat=tap.sizes[0], token=last))
         self._templates[key] = ctl.template(out, slots)
@@ -275,11 +331,12 @@ class ExpertGemmOperator(GemmQdOperator):
                             a_address=[a_address], out=[out])[0]
 
     def streams(self, experts: list[np.ndarray], active: list[np.ndarray], *, cb: list[int], slab: int,
-                slab_stride: int, c_address: list[int], a_address: list[int], out: list[np.ndarray]
-                ) -> list[np.ndarray]:
+                slab_stride: int, c_address: list[int], a_address: list[int], out: list[np.ndarray],
+                expert_stride: int = 0, col0: int = 0) -> list[np.ndarray]:
         """``stream`` of several columns (their blocks computed together): per column its experts, active flags,
         addresses and output array (the column's whole control buffer: the marker panel at its end); returns each
-        column's words."""
+        column's words. ``expert_stride``: bytes from an expert's slab to the next's (default 2 ``slab_stride``: its
+        two halves; Inkling's: the units' run); ``col0``: a gate / up's first column of H (``drain_taps``)."""
         n = np.array([len(e) for e in experts])
         assert ((1 <= n) & (n <= self.cap)).all()
         e = np.concatenate(experts).astype(np.int64)
@@ -287,15 +344,17 @@ class ExpertGemmOperator(GemmQdOperator):
         k = np.arange(e.size) - np.repeat(np.cumsum(n) - n, n)  # (a chunk's index in its column)
         last = k == n[col] - 1
         act = np.concatenate(active).astype(bool) | last
-        ts = [self.chunk_template(p, la, ac, slab_stride) for p in (0, 1) for la in (False, True) for ac in (False, True)]
+        ts = [self.chunk_template(p, la, ac, slab_stride, col0) for p in (0, 1) for la in (False, True)
+              for ac in (False, True)]
         blocks = (4 * (k % 2) + 2 * last + act).astype(np.int32)
         marker = [x + 4 * (self.cb_words - MARKER) for x in cb]
-        bases = np.stack([slab + 2 * e * slab_stride, np.asarray(c_address, np.int64)[col] + 2 * self.c_slot * k,
+        bases = np.stack([slab + e * (expert_stride or 2 * slab_stride), np.asarray(c_address, np.int64)[col] + 2 * self.c_slot * k,
                           np.asarray(a_address, np.int64)[col] + 2 * self.a_slot * k,
                           np.asarray(marker, np.int64)[col]], 1)
         # (block k acquires its set's lock for chunk k - 2's drains: an object each of row 0's, of rows 1 and 2's if
         # active; chunks 0 and 1 the lock's initial 1)
         objs = self.passes * self.vp * self.halves  # (C objects per drain channel and chunk)
+        assert 2 * objs <= MAX_REPEAT, "a chunk's drains beyond its lock's range"
         rel = objs * (1 + act)
         val = np.where(k >= 2, np.roll(rel, 2), 1)
         locks = np.array(LOCKS, np.int64)[k % 2]
@@ -362,7 +421,7 @@ class ExpertGemmOperator(GemmQdOperator):
 
         p = self.p
         k_zero = Kernel(f"{p}_zero", "kernel.o", [acc_ty])
-        k_silu = Kernel(f"{p}_silu", "kernel.o", [acc_ty, C_l1_ty, sx_ty, np.int32]) if self.silu else None
+        k_silu = Kernel(f"{p}_{self.act}", "kernel.o", [acc_ty, C_l1_ty, sx_ty, np.int32]) if self.silu else None
         dk = slot(self.fmt).qd_kernels(self, lambda name, args: Kernel(f"{p}_{name}", "kernel.o", args),
                                        B_l1_ty=B_l1_ty, ws_ty=ws_ty, hb_ty=hb_ty, D_ty=D_ty)
         k_mm = (Kernel(f"{p}_mm2", "kernel.o", [A_l1_ty, D_ty, acc_ty, acc_ty]) if self.pingpong else
@@ -392,8 +451,12 @@ class ExpertGemmOperator(GemmQdOperator):
         # C: row 0's objects straight to the shim, rows 1 and 2's joined in the memtile (whole objects: rows of n_c)
         c0 = [ObjectFifo(C_l1_ty, name=f"egC0_{c}", depth=self.c_depth) for c in range(COLS)]
         c12, c_l1 = [], [list(c0), [], []]
+        # (the memtile: the A object, two weight objects, the join's C objects; one of those where two do not fit:
+        # Inkling's hidden 2304, an A object of 486 KB)
+        mem = 2 * MR * strip + 2 * 4 * df.b_obj
+        c12_depth = 2 if mem + 2 * 2 * (MR - 1) * c_elems <= MEMTILE_BYTES else 1
         for c in range(COLS):
-            f = ObjectFifo(C12_ty, name=f"egC_{c}", depth=2)
+            f = ObjectFifo(C12_ty, name=f"egC_{c}", depth=c12_depth)
             c12.append(f)
             parts = f.prod().join([c_elems * i for i in range(MR - 1)], obj_types=[C_l1_ty] * (MR - 1),
                                   names=[f"egC1_{c}_{r}" for r in range(1, MR)], depths=[self.c_depth] * (MR - 1),
@@ -402,7 +465,7 @@ class ExpertGemmOperator(GemmQdOperator):
                 c_l1[r].append(parts[r - 1])
 
         passes, planes, nsb = self.passes, self.hdr_units, self.nsb
-        two = down  # (the down: the halves' headers both held, ``hb`` / ``ws`` per half)
+        two = down and self.eh == 2  # (the down: the halves' headers both held, ``hb`` / ``ws`` per half)
 
         halves = self.halves
 
@@ -439,9 +502,20 @@ class ExpertGemmOperator(GemmQdOperator):
             for _ in range32(nk):
                 for _ in range_(passes):
                     if dk.units:  # (per super-block its unit: of the gate / up's half, or each down half's)
+                        if two:
+                            for sb in range_(nsb):
+                                for hb, ws in ((hb0, ws0), (hb1, ws1)):
+                                    dq_unit(bf, dfo, sbk, dq, ws, hb, sb, ex)
+                            continue
+                        if self.geo.qt:  # (a qt input: its full chunks' units, then the tail's)
+                            for _ in range(self.n_full):
+                                for sb in range_(nsb):
+                                    dq_unit(bf, dfo, sbk, dq, ws0, hb0, sb, ex)
+                            for sb in range_(self.tail):
+                                dq_unit(bf, dfo, sbk, dq, ws0, hb0, sb, ex)
+                            continue
                         for sb in range_(nsb):
-                            for hb, ws in ((hb0, ws0), (hb1, ws1)) if two else ((hb0, ws0),):
-                                dq_unit(bf, dfo, sbk, dq, ws, hb, sb, ex)
+                            dq_unit(bf, dfo, sbk, dq, ws0, hb0, sb, ex)
                         continue
                     if not two:
                         for _ in range(self.n_kc):

@@ -51,9 +51,11 @@ def _ring(ov: InklingOverlay, v: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("visits, chunks", [(6, (200,)), (6, (512, 188)), (48, (200,))], ids=str)
-def test_attention_parts(ink: tuple[GGUFFile, InklingConfig], visits: int, chunks: tuple[int, ...]) -> None:
+def test_visits(ink: tuple[GGUFFile, InklingConfig], visits: int, chunks: tuple[int, ...]) -> None:
     """The first ``visits`` visits without their FFNs (6: the prelude; 48: the passes' messages and controllers too), a
-    prompt in chunks of the given tokens from position 0 (a chunk of two sub-chunks; one after a history)."""
+    prompt in chunks of the given tokens from position 0 (a chunk of two sub-chunks; one after a history). (With the
+    FFNs the routing's near ties make the paths diverge: ``test_moe.test_moe_block`` checks the block on the NPU's
+    routing.)"""
     g, cfg = ink
     n = sum(chunks)
     ov = InklingOverlay(g, visits=list(range(visits)), max_positions=1024, ffn=False)

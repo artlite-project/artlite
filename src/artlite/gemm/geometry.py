@@ -380,14 +380,17 @@ class Geometry:
                             and all(cnt % 2 == 0 for _, cnt in blocks_of(spec))), "dual: GemmQ pass pairs"
         # planar tiles of super-block units (``Slot.unit_bytes``): the weight objects are units of the pass's tiles
         units = slot(fmt).unit_bytes(fmt, rows, nsb) if is_planar else 0
-        assert groups == 1 or (dq_core and k_rep == 1 and not silu and kc // 256 % groups == 0), groups
+        # (row groups: whole super-blocks a slot, or half a super-block: an expert's down unit of 128 columns)
+        assert groups == 1 or (dq_core and k_rep == 1 and not silu and
+                               (kc // 256 % groups == 0 or groups == 2 * (kc // 256))), groups
         KA = k_rep * K // groups * (2 if dual else 1)
         a_k0, a_K = spec.a_cols[0], spec.a_cols[1] or KA
         assert a_k0 % kc == 0 and a_k0 + KA <= a_K
         tiles = spec.tiles or 64 // rows
         TR = tiles * rows
         act = spec.act
-        assert act in ("silu", "gelu", "gelu_erf") and (silu or dual or act == "silu"), act
+        assert act in ("silu", "gelu", "gelu_erf", "situ") and (silu or dual or act == "silu") and \
+            (act != "situ" or (silu and not dual)), act
         # rows the memtile reads per pass: a planar SiLU pass of a whole group (128 rows and the padding rows of the
         # group's last tile) drops the padding rows when every part of the tile, header included, maps tile row r to
         # gathered row r (``hdr_direct``); else the dequant skips them

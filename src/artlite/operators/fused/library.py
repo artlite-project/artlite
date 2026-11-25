@@ -13,7 +13,7 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol
 
 import numpy as np
@@ -248,13 +248,14 @@ class Library(FusedElf):
             _PIECES.ensure(self._device)
 
     def run(self, items: Sequence[Item], *, splits: Iterable[int] = (), bufs: Sequence[Any],
-            hooks: Mapping[int, Callable[[], None]] | None = None, guest: Guest | None = None) -> int:
+            hooks: Mapping[int, Callable[[], None]] | None = None, synced: Collection[int] = (),
+            guest: Guest | None = None) -> int:
         """Dispatch the program of ``items`` (``items()``; consecutive items of one design share its configuration): a
         new piece of control code (a dispatch) at each item index of ``splits``, and where a piece would exceed the
         process's piece BOs (``Pieces``). ``bufs``: the data BOs the items address. ``hooks``: per item index of
         ``splits``, a host function called before the piece it starts is dispatched (while the previous one runs, the
-        one before it ended: e.g. inputs that only later items read, outputs of two pieces back). Returns the
-        dispatches.
+        one before it ended: e.g. inputs that only later items read, outputs of two pieces back; an index of
+        ``synced``: after the previous piece ended, its outputs read). Returns the dispatches.
 
         Each piece is dispatched as soon as it is assembled and its hook ran, then the previous one is waited for: the
         firmware starts it at the previous one's end (a boundary waited for first: ~35 us more of idle NPU, the wait's
@@ -270,14 +271,15 @@ class Library(FusedElf):
         cpu = irq_cpu()
         with portable.on_cpu(cpu), _PIECES.lock:
             try:
-                return self._run(items, splits=splits, bufs=bufs, hooks=hooks, cpu=cpu, guest=guest)
+                return self._run(items, splits=splits, bufs=bufs, hooks=hooks, synced=synced, cpu=cpu, guest=guest)
             except BaseException:  # (a hook's exception: the pieces dispatched end first, and with them the NPU's turn)
                 with contextlib.suppress(_native.DispatchError):
                     self._kernel().dispatch_wait()
                 raise
 
     def _run(self, items: Sequence[Item], *, splits: Iterable[int], bufs: Sequence[Any],
-             hooks: Mapping[int, Callable[[], None]] | None, cpu: int, guest: Guest | None = None) -> int:
+             hooks: Mapping[int, Callable[[], None]] | None, cpu: int, synced: Collection[int] = (),
+             guest: Guest | None = None) -> int:
         asm = self.load()._asm
         kern = self._kernel()
         limit = _PIECES.ensure(self._device)
@@ -325,6 +327,9 @@ class Library(FusedElf):
             # (slot k % 2: piece k - 2's, which has ended)
             bo = _PIECES.write(slot, piece, (self, key, asm.parity) if key is not None else None)
             if hooks and a in hooks:
+                if a in synced and last is not None:  # (the hook reads the previous piece's outputs)
+                    end = wait(last, 0)
+                    last = None
                 hooks[a]()
             ours = last is not None and guest is not None and guest.waiting()
             if last is not None and (ours or _native.turn_peers()):  # (none queued ahead of another's turn)

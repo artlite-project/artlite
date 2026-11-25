@@ -7,13 +7,18 @@ straight into the column's core, one 4 KB row an object).
   (``prefill.norm``: bf16 x, 1 / rms as bf16 hi + lo) on each gathered token group of 8, so the panels equal its own
   (the router's and the shared expert's) for the same token. Only a chunk's groups of valid rows (the last one padded
   with the chunk's first token) are gathered and drained: the rest of its slot keeps finite panels of earlier layers,
-  whose outputs are never read. Chunk k's first block pushes its drain (BD set k % 2, released lock ``LOCKS`` k % 2;
+  whose outputs are never read. ``scales`` (Inkling's NVFP4 experts): each row group's panels times its chunk's
+  expert's gate / up scale (``group_scales``: per column a table after the norm weight in the weight object, which the
+  core holds; 1 / rms times the scale before its hi + lo split). Chunk k's first block pushes its drain (BD set k % 2, released lock ``LOCKS`` k % 2;
   its block waits for chunk k - 2's drain by that lock), the last one with a token the sequence waits for.
 - ``CombineOperator`` (the experts' outputs): per token t of the chunk (column c: tokens c T / COLS ..) the delta
   w_s ds_t + sum_i w_i y_(pos[t, i]) as bf16 (the routed experts' rows of Y, gathered, and the shared expert's down
   ds; the weights fp32, as bf16 hi + lo products into an fp32 sum, rounded once), for the residual norm that adds it.
   A row of Y is read as the runs of its chunk slot's pass-major layout (``expert_gemm.ExpertGemmOperator.y_layout``),
-  through the column's memtile, which sends it on in output order.
+  through the column's memtile, which sends it on in output order. ``y2``: a second down's outputs per slot (Inkling's
+  unit 2: its own Y and layout, of the same row length), summed with the same weight: per token a block of the first
+  Y's rows, then one of the second's (each block rewriting its row BDs whole); the first layout in output order as it
+  arrives, the second's runs (pass, C object, tile) added at their output offsets by the core.
   A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_k-1, 0 .., w_s at ``SHARED_W``, 0 ..]: 64 bytes, a cache line of their own
   past the GEMM's outputs, which the host writes per layer): a column's input is one strided transfer.
 
@@ -49,6 +54,7 @@ from ml_dtypes import bfloat16
 from .. import txn
 from ..operators import templating
 from ..operators.base import ArgSpec, ArtcOperator
+from ..operators.chain import ChainPart, chained_fill
 from ..operators.design import COLS, range32, stream_walk
 from ..operators.kernel_source import kernel_prefix
 from . import ctl
@@ -63,6 +69,7 @@ WT_ROW = 16  # fp32 per token of the combine's weights
 SHARED_W = 8  # (the shared expert's weight's index in them: after 8 experts' at most)
 
 _SRC = templating.load("artlite/moe/gather.cc.jinja")
+_Y2 = templating.load("artlite/moe/combine_y2.cc.jinja")
 
 
 class _Gathered(ArtcOperator):
@@ -72,13 +79,16 @@ class _Gathered(ArtcOperator):
 
     plain = False  # (GatherNormOperator's: the rows not normed)
 
+    scales = False  # (GatherNormOperator's: per row group a scale)
+    n_groups = 0
+
     def __init__(self, *, E: int, eps: float = 1e-6, ds_pitch: int = 0):
         self.E, self.eps, self.ds_pitch = E, eps, ds_pitch
         super().__init__()
 
     def get_kernel_src(self) -> str:
         return _SRC.render(p=self.p, E=self.E, C=256, eps=repr(self.eps), WT=WT_ROW, COLS=COLS,
-                           DP=self.ds_pitch or self.E // COLS, plain=self.plain)
+                           DP=self.ds_pitch or self.E // COLS, plain=self.plain, scales=self.scales, NG=self.n_groups)
 
     @property
     def row_n(self) -> int:
@@ -146,9 +156,20 @@ class GatherNormOperator(_Gathered):
     layer's rotated copy of its normed input, ``prefill.rotate``'s rows_out, the weight unused). ``cap``: chunks per
     column at most. Arguments: the control streams (per column ``cb_words``), the norm weight (E bf16), XP (out)."""
 
-    def __init__(self, *, E: int, eps: float, cap: int, plain: bool = False):
-        self.cap, self.plain = cap, plain
+    def __init__(self, *, E: int, eps: float, cap: int, plain: bool = False, scales: bool = False):
+        assert not (plain and scales)
+        self.cap, self.plain, self.scales = cap, plain, scales
+        self.n_groups = cap * CHUNK // CHAIN if scales else 0
         super().__init__(E=E, eps=eps)
+
+    def group_scales(self, sizes: list[np.ndarray], scales: list[np.ndarray]) -> np.ndarray:
+        """(``scales``) The GS argument (COLS, n_groups) fp32: per column its chunks' row groups (ceil(size / CHAIN)
+        each) times the chunk's scale (sizes[c], scales[c]: per chunk of column c)."""
+        out = np.zeros((COLS, self.n_groups), np.float32)
+        for c in range(COLS):
+            g = np.repeat(np.asarray(scales[c], np.float32), -(-np.asarray(sizes[c], np.int64) // CHAIN))
+            out[c, :g.size] = g
+        return out
 
     @property
     def slot(self) -> int:
@@ -227,28 +248,35 @@ class GatherNormOperator(_Gathered):
         return res
 
     def get_arg_spec(self) -> list[ArgSpec]:
-        return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16), ArgSpec("in", (self.E,), bfloat16),
+        gs = [ArgSpec("in", (2 * COLS * self.n_groups,), bfloat16)] if self.scales else []
+        return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16), ArgSpec("in", (self.E,), bfloat16), *gs,
                 ArgSpec("out", (COLS * self.cap * self.slot,), bfloat16)]
 
     def get_mlir_artifact(self) -> Module:
-        E, p, cap = self.E, self.p, self.cap
+        E, p, cap, ng = self.E, self.p, self.cap, self.n_groups
         bf = np.dtype[bfloat16]
         row_ty = np.ndarray[(E,), bf]
+        wo_ty = np.ndarray[(E + 2 * ng,), bf]  # (the weight; scales: then the column's group scales)
         grp_ty = np.ndarray[(8 * E,), bf]
         pan_ty = np.ndarray[(256 // 8 * 36,), bf]  # (a chunk of 256 columns: 32 panels)
-        st_ty = np.ndarray[(256 + 64,), np.dtype[np.float32]]
-        k_w = Kernel(f"{p}_w", "kernel.o", [row_ty, row_ty])
+        st_ty = np.ndarray[(256 + 64 + (16 if self.scales else 0),), np.dtype[np.float32]]
+        k_w = Kernel(f"{p}_w", "kernel.o", [st_ty] if self.scales else [wo_ty, row_ty])
         k_row = Kernel(f"{p}_row", "kernel.o", [row_ty, grp_ty, st_ty, np.int32])
-        k_b = Kernel(f"{p}_b", "kernel.o", [grp_ty, row_ty, st_ty, pan_ty, np.int32])
+        k_b = Kernel(f"{p}_b", "kernel.o", [grp_ty, wo_ty if self.scales else row_ty, st_ty, pan_ty, np.int32])
         pg = [ScratchpadParameter(f"{N_PARAM}{c}", np.int32) for c in range(COLS)]
         xf = [ObjectFifo(row_ty, name=f"mgx{c}", depth=2, transport=Transport.dma(Packet(ctl.XID))) for c in range(COLS)]
-        wf = [ObjectFifo(row_ty, name=f"mgw{c}", depth=1) for c in range(COLS)]
+        wf = [ObjectFifo(wo_ty, name=f"mgw{c}", depth=1) for c in range(COLS)]
         pf = [ObjectFifo(pan_ty, name=f"mgp{c}", depth=2) for c in range(COLS)]
 
-        def core(x_f, w_f, p_f, kw, krow, kb, wb, st, g, prm):
+        def core(x_f, w_f, p_f, kw, krow, kb, *rest):
+            *wb, st, g, prm = rest  # (wb: the weight's copy; none with scales)
             w = w_f.acquire(1)
-            kw(w, wb)
-            w_f.release(1)
+            if self.scales:  # (the object held: the weight and the scales)
+                kw(st)
+                wb = (w,)
+            else:
+                kw(w, wb[0])
+                w_f.release(1)
             n = (prm.read() // (1 << N_GROUPS)) & 0xFFF  # (the column's row groups: ``N_PARAM``'s)
             for _ in range32(n):
                 for t in range_(8):
@@ -257,17 +285,21 @@ class GatherNormOperator(_Gathered):
                     x_f.release(1)
                 for kc in range_(E // 256):
                     o = p_f.acquire(1)
-                    kb(g, wb, st, o, kc)
+                    kb(g, wb[0], st, o, kc)
                     p_f.release(1)
+            if self.scales:
+                w_f.release(1)
 
         workers = [Worker(core, [xf[c].cons(), wf[c].cons(), pf[c].prod(), k_w, k_row, k_b,
-                                 Buffer(row_ty, name=f"mg_w{c}"), Buffer(st_ty, name=f"mg_st{c}"),
-                                 Buffer(grp_ty, name=f"mg_g{c}"), pg[c]],
+                                 *([] if self.scales else [Buffer(row_ty, name=f"mg_w{c}")]),
+                                 Buffer(st_ty, name=f"mg_st{c}"), Buffer(grp_ty, name=f"mg_g{c}"), pg[c]],
                           tile=Tile(c, 2), stack_size=1024, while_true=False, dynamic_objfifo_lowering=True)
                    for c in range(COLS)]
         n_cb, n_xp = COLS * self.cb_words * 2, COLS * cap * self.slot
 
-        def seq(CB, W, XP, xh, wh, ph):
+        def seq(CB, W, *rest):
+            GS = rest[0] if self.scales else None
+            xh, wh = rest[-3:-1]
             sync_parameters()
             self._route()
             for c in range(COLS):  # (the drains' locks free, their tokens to the controller)
@@ -276,14 +308,21 @@ class GatherNormOperator(_Gathered):
                 npu_maskwrite32(txn.CTRL[txn.S2MM][0], txn.CONTROLLER_ID << 8, 0x1F00, column=c, row=0)
             tg = TaskGroup()
             for c in range(COLS):
-                wh[c].fill(W, TensorAccessPattern((E,), 0, [1, 1, E // 1024, 1024], [0, 0, 1024, 1]), group=tg)
+                wr = 1024 if E % 1024 == 0 else 768  # (a shim BD's rows of at most 1023 words; Inkling's hidden 2304)
+                wt = TensorAccessPattern((E,), 0, [1, 1, E // wr, wr], [0, 0, wr, 1])
+                if self.scales:
+                    chained_fill(wh[c], W, [ChainPart(W, wt), ChainPart(GS, TensorAccessPattern(
+                        (2 * COLS * ng,), 2 * c * ng, [1, 1, 1, 2 * ng], [0, 0, 0, 1]))], tg)
+                else:
+                    wh[c].fill(W, wt, group=tg)
                 xh[c].fill(CB, TensorAccessPattern((n_cb,), 2 * c * self.cb_words, [1, 1, 1, 2 * self.b0_words],
                                                    [0, 0, 0, 1]), packet=(0, ctl.CID), group=tg)
             tg.finish()
             for c in range(COLS):  # (the last chunk's drain: its token)
                 _npu_sync(_as_i32(c), _as_i32(0), _as_i32(txn.S2MM), _as_i32(0), _as_i32(1), _as_i32(1))
 
-        rt = Runtime(seq, [np.ndarray[(n_cb,), bf], np.ndarray[(E,), bf], np.ndarray[(n_xp,), bf],
+        rt = Runtime(seq, [np.ndarray[(n_cb,), bf], np.ndarray[(E,), bf],
+                           *([np.ndarray[(2 * COLS * ng,), bf]] if self.scales else []), np.ndarray[(n_xp,), bf],
                            [xf[c].prod(tile=Tile(c, 0), port=Port.dma(1)) for c in range(COLS)],
                            [wf[c].prod(tile=Tile(c, 0), port=Port.dma(0)) for c in range(COLS)],
                            [pf[c].cons(tile=Tile(c, 0)) for c in range(COLS)]])
@@ -302,26 +341,67 @@ class CombineOperator(_Gathered):
     (``ExpertGemmOperator.y_layout``); K: the experts per token (their weights the first K, the shared expert's at
     ``SHARED_W``)."""
 
-    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int, int], K: int = 8):
+    def __init__(self, *, E: int, T: int, ds_pitch: int, y_layout: tuple[int, int, int, int, int], K: int = 8,
+                 y2: tuple[int, int, int, int, int] | None = None):
         assert T % COLS == 0 and ds_pitch % 32 == 0 and 1 <= K <= SHARED_W
         self.T, self.y_layout, self.K = T, tuple(y_layout), K
+        self.y2 = tuple(y2) if y2 is not None else None
         passes, vp, tiles, run, row = self.y_layout
         assert passes * vp * tiles * run >= E and run % 2 == 0 and row >= tiles * run
+        if self.y2 is not None:  # (the first in output order; the second's runs of 32: the kernel's vectors)
+            p2, v2, t2, r2, _ = self.y2
+            assert (vp == 1 or tiles == 1) and K == CHAIN and r2 == 32 and p2 * v2 * t2 * r2 == self.row_n, self.y2
         super().__init__(E=E, ds_pitch=ds_pitch)
+
+    def get_kernel_src(self) -> str:
+        src = super().get_kernel_src()
+        if self.y2 is None:
+            return src
+        p2, v2, t2, _, _ = self.y2
+        return src + "\n" + _Y2.render(p=self.p, P=p2, V=v2, TL=t2, COLS=COLS, DP=self.ds_pitch)
 
     @property
     def row_n(self) -> int:
         passes, vp, tiles, run, _ = self.y_layout
         return passes * vp * tiles * run
 
-    def row_tap(self) -> TensorAccessPattern:
+    def row_tap(self, layout: tuple[int, int, int, int, int] | None = None) -> TensorAccessPattern:
         """A row of Y from its address (``ExpertGemmOperator.y_offset``): passes x vp runs of tiles x run values, a
-        chunk's tokens (rows of ``row`` values) apart."""
-        passes, vp, tiles, run, row = self.y_layout
+        chunk's tokens (rows of ``row`` values) apart (``layout``: default the first Y's)."""
+        passes, vp, tiles, run, row = layout or self.y_layout
         return TensorAccessPattern((1, 1 << 30), 0, [1, 1, passes * vp, tiles * run], [0, 0, CHUNK * row, 1])
+
+    @functools.cached_property
+    def _templates(self) -> list[ctl.Template]:
+        """(``y2``: per Y a block that writes the chain's row BDs whole, the rows its layout's, and pushes it)"""
+        if self.y2 is None:
+            return super()._templates
+        out = []
+        for lay in (self.y_layout, self.y2):
+            words: list[int] = []
+            slots = []
+            for j in range(CHAIN):
+                slots.append((len(words) + 3, len(words) + 4, j, 0))
+                words += ctl.bd_packets(ROW_BDS[j], ctl.bd_words(0, self.row_tap(lay), packet=ctl.XID,
+                                                                  next_bd=ROW_BDS[j + 1] if j + 1 < CHAIN else None))
+            words += ctl.push(txn.MM2S, 1, ROW_BDS[0])
+            out.append(ctl.template(words, slots))
+        return out
+
+    def stream(self, rows: np.ndarray, *, cb: int, out: np.ndarray | None = None) -> np.ndarray:
+        """(``y2``: rows (tokens, 2 K): per token its K rows of the first Y, then its K of the second)"""
+        if self.y2 is None:
+            return super().stream(rows, cb=cb, out=out)
+        rows = np.asarray(rows, np.int64).reshape(-1, CHAIN)
+        blocks = (np.arange(rows.shape[0]) % 2).astype(np.int32)
+        out = np.empty(self.cb_words, np.uint32) if out is None else out
+        return out[:ctl.assemble(out, self._templates, blocks, rows, base=cb, b0_words=self.b0_words, bds=BLOCK_BDS)]
 
     @property
     def cb_words(self) -> int:
+        if self.y2 is not None:  # (whole blocks)
+            n = 2 * self.T // COLS
+            return -(-(self.b0_words + n * (len(self._templates[0][0]) + ctl.NEXT_WORDS)) // 16) * 16
         return -(-(self.b0_words + self.stream_words(self.T // COLS * self.K)) // 16) * 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
@@ -338,6 +418,7 @@ class CombineOperator(_Gathered):
         acc_ty = np.ndarray[(E,), np.dtype[np.float32]]
         k_cs = Kernel(f"{p}_cs", "kernel.o", [obj_ty, acc_ty])
         k_cy = Kernel(f"{p}_cy", "kernel.o", [row_ty, obj_ty, acc_ty, np.int32])
+        k_cy2 = Kernel(f"{p}_cy2", "kernel.o", [row_ty, obj_ty, acc_ty, np.int32]) if self.y2 else None
         out_ty = np.ndarray[(E,), bf]
         k_co = Kernel(f"{p}_co", "kernel.o", [acc_ty, out_ty])
         # (Y's rows: shim -> memtile -> the core in output order: per pass, tile and C object its run)
@@ -350,21 +431,22 @@ class CombineOperator(_Gathered):
         of = [ObjectFifo(out_ty, name=f"mco{c}", depth=2) for c in range(COLS)]
         tpc = T // COLS
 
-        def core(y_f, d_f, o_f, cs, cy, co, acc):
+        def core(y_f, d_f, o_f, cs, cy, co, acc, *cy2):
             for _ in range_(tpc):
                 d = d_f.acquire(1)
                 cs(d, acc)
-                for i in range_(self.K):
-                    y = y_f.acquire(1)
-                    cy(y, d, acc, i)
-                    y_f.release(1)
+                for k_y in (cy, *cy2):  # (the first Y's rows, then the second's)
+                    for i in range_(self.K):
+                        y = y_f.acquire(1)
+                        k_y(y, d, acc, i)
+                        y_f.release(1)
                 d_f.release(1)
                 o = o_f.acquire(1)
                 co(acc, o)
                 o_f.release(1)
 
         workers = [Worker(core, [yf[c].cons(), df[c].cons(), of[c].prod(), k_cs, k_cy, k_co,
-                                 Buffer(acc_ty, name=f"mc_acc{c}")],
+                                 Buffer(acc_ty, name=f"mc_acc{c}"), *([k_cy2] if k_cy2 else [])],
                           tile=Tile(c, 2), stack_size=1024, while_true=False, dynamic_objfifo_lowering=True)
                    for c in range(COLS)]
         n_cb, n_ds, n_o = COLS * self.cb_words * 2, T * dr, T * E
