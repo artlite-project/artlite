@@ -19,7 +19,7 @@ comment): tests/operators/test_kmath.py checks them on the NPU against the varia
 the softmax passes through the attention operators' tests).
 
 The package: ``fn`` (``Fn``, the renderer of the templates, the contract checks), ``exponent`` (``exp2``: three forms),
-``reciprocal``, ``composite`` (exp, expneg, expm1, softplus, sigmoid: fp32 or a bf16 gate, silu, situ), ``acttable`` (the gather tables' host fit),
+``reciprocal``, ``composite`` (exp, expneg, expm1, softplus, sigmoid: fp32 or a bf16 gate, silu, situ: fp32 arrays or bf16 vectors), ``acttable`` (the gather tables' host fit),
 ``gather`` (the tables' kernels: ``table_pass``, ``act``, ``silu_tanh``), ``rows`` (a head's row:
 ``rms_norm``, ``rope``), ``softmax`` (a softmax's P in two passes: ``p_pass1``, ``p_pass2``), ``rotate`` (a PARO
 rotation's rounds in their tan form: ``rotate``). Each function's C++ is a template file

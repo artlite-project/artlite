@@ -13,7 +13,9 @@ A decode dispatch runs up to 4 consecutive tokens through the 48 visits and the 
 (``overlay.InklingOverlay``): the projections, the depth mixes, the loop's controllers and the experts on the main cores
 and their helpers, the residual stream's state array in their memory, the attention, its KV caches and the K / V convs
 on the attention cores; the head screened (``decode.screen``: the host computes its largest logits exactly). Prompts run
-as decode steps. The convs' state holds the last positions only: a sequence goes back to a checkpoint (``recurrent``)."""
+in prefill chunks (``prefill.InklingPrefill``; its sliding-window caches linear), a prompt's last token as a decode step
+(the head's); without the prefill as decode steps. The convs' state holds the last positions only: a sequence goes back
+to a checkpoint (``recurrent``)."""
 
 from collections.abc import Sequence
 
@@ -29,24 +31,28 @@ from ..overlay_model import OverlayModel
 from ..sampling import TOP_K_ALL, Sampling
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .overlay import InklingOverlay
+from .prefill import InklingPrefill
 
 
 class NpuInkling(OverlayModel):
     """The model on the NPU (module docstring). ``capacity``: the positions the KV caches hold; ``kv_k``: their K
     precision ("hilo", "single"); ``wrap``: the sliding-window caches' ring (``InklingOverlay``); ``sequences``: the
     sequences the device holds (``artlite-server -np``: lanes whose steps share a dispatch), each with its caches and
-    convs' state."""
+    convs' state; ``prefill``: prompts in prefill chunks (one sequence)."""
 
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
+    last_step = True  # (the prefill has no LM head)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
-                 wrap: int | None = None, sequences: int = 1):
+                 wrap: int | None = None, sequences: int = 1, prefill: bool = False):
+        assert not prefill or sequences == 1, "the prefill: one sequence"
         self.gguf = gguf
-        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap, sequences=sequences)
+        self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=0 if prefill else wrap,
+                                      sequences=sequences)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
-        self.prefill = None
+        self.prefill = InklingPrefill(self.overlay) if prefill else None
         self._tn = np.asarray(gguf.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
         self._open(threads=threads)
         self._w_out = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
@@ -77,6 +83,10 @@ class NpuInkling(OverlayModel):
         x = self.gguf.rows("token_embd.weight", np.asarray(tokens)).astype(np.float32)
         x = x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + self.cfg.rms_norm_eps).astype(np.float32)
         return ((x * self._tn)[None],)
+
+    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
+        """(the chunk's normed embeddings (n, hidden): the first visit's input)"""
+        return (self._step_inputs(tokens)[0][0],)
 
 
 class Inkling(Model):
@@ -130,8 +140,9 @@ class Inkling(Model):
         return self.gguf.rows("token_embd.weight", np.asarray(tokens))
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuInkling:
-        """(prompts as decode steps: ``prefill`` has no effect; ``sequences``: ``NpuInkling``'s)"""
-        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences)
+        """(``prefill``: with one sequence; ``sequences``: ``NpuInkling``'s)"""
+        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences,
+                          prefill=prefill and sequences == 1)
 
 
 __all__ = ["Inkling", "NpuInkling"]

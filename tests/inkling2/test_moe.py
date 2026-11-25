@@ -1,7 +1,9 @@
 """Inkling 2's MoE in the prefill (``artlite.moe`` on ``models.inkling2.image``'s expert units: 512, 512 and 128
-channels of h, NVFP4): the experts' work-list GEMMs against fp64 models on the operators' own inputs."""
+channels of h; NVFP4 layers 0 .. 19, Q8_0 20 .. 23): the experts' work-list GEMMs against fp64 models on the operators'
+own inputs, a visit's block through the prefill."""
 
 import numpy as np
+import pytest
 import torch
 from ml_dtypes import bfloat16
 
@@ -15,13 +17,12 @@ from ..common import to_numpy
 from ..model_files import require
 from ..numerics import rel, rel_max
 
-L = 0  # (the layer of the tests' image)
 _state: dict[str, object] = {}
 
 
-def _image() -> tuple[GGUFFile, InklingConfig, object, np.ndarray]:
-    """Layer L's image, packed (cached per module)."""
-    if not _state:
+def _image(L: int) -> tuple[GGUFFile, InklingConfig, object, np.ndarray]:
+    """Layer L's image, packed (the last one cached per module)."""
+    if _state.get("L") != L:
         from models.inkling2.image import InklingImage
 
         path = inkling_gguf()
@@ -30,7 +31,7 @@ def _image() -> tuple[GGUFFile, InklingConfig, object, np.ndarray]:
         img = InklingImage(g, layers=[L], vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W)
-        _state.update(g=g, cfg=img.cfg, img=img, W=W)
+        _state.update(L=L, g=g, cfg=img.cfg, img=img, W=W)
     return _state["g"], _state["cfg"], _state["img"], _state["W"]
 
 
@@ -38,25 +39,26 @@ def _situ(g: np.ndarray, u: np.ndarray, lb: float) -> np.ndarray:
     return 4 * np.tanh(g / 4) / (1 + np.exp(-g)) * lb * np.tanh(u / lb)
 
 
-def test_expert_gemms() -> None:
-    """Inkling's expert GEMMs in one program (per column a work list of 192-token chunks of random experts, rows 64 ..
-    191 active or not): the units' gate / up (``Region.qt`` inputs: passes of a tail group; units 0 and 1 one design,
-    into columns 0 and 512 of H01), H = situ(gate, up) on the chunk's A panels (scaled by the expert's gate / up scale,
-    as the gathered norm does); their downs (units 0 and 1 as two halves: row groups of 2, two super-blocks a slot; unit
-    2: of 8, half a super-block a slot) against the exact product of the NPU's H."""
-    from artlite.moe.expert_gemm import CHUNK, N_PARAM, ExpertGemmOperator, M
+@pytest.mark.parametrize("L", [0, 20])
+def test_expert_gemms(L: int) -> None:
+    """Inkling's expert GEMMs (``models.inkling2.moe.InkMoE``'s operators and items) in one program (per column a work
+    list of 192-token chunks of random experts, rows 64 .. 191 active or not): the units' gate / up (``Region.qt``
+    inputs: passes of a tail group; units 0 and 1 one design into columns 0 and 512 of H01, layer 20's Q8_0 in parts of
+    256 columns), H = situ(gate, up) on the chunk's A panels (scaled by the expert's gate / up scale, as the gathered
+    norm does); their downs (units 0 and 1 as two halves: row groups of 2, two super-blocks a slot; unit 2: of 8, half a
+    super-block a slot) against the exact product of the NPU's H."""
+    from artlite.moe.expert_gemm import CHUNK, N_PARAM, M
     from artlite.operators.fused import Library
     from artlite.txn import device_address
+    from models.inkling2.moe import InkMoE
 
-    g, cfg, img, W = _image()
+    g, cfg, img, W = _image(L)
     H, F, cap, lb = cfg.hidden_size, cfg.expert_ffn, 3, cfg.situ_linear_beta
-    reg = {n: img.region(L, n) for n in ("exp_gu0", "exp_dn0", "exp_gu2", "exp_dn2")}
+    moe = InkMoE(img, layers=[L], sizes=(64,), sub=64, eps=cfg.rms_norm_eps)
+    cap = min(cap, moe.cap)
+    ops = moe.units[L][1]
     uo = img.unit_offsets(L)  # (unit 1 one unit's bytes after unit 0; an expert's run)
-    ops = {"gu01": ExpertGemmOperator.of("gu", reg["exp_gu0"], cap=cap, out=1024, expert_halves=1, act="situ", situ_lb=lb),
-           "gu2": ExpertGemmOperator.of("gu", reg["exp_gu2"], cap=cap, out=128, expert_halves=1, act="situ", situ_lb=lb),
-           "dn01": ExpertGemmOperator.of("down", reg["exp_dn0"], cap=cap, out=H),
-           "dn2": ExpertGemmOperator.of("down", reg["exp_dn2"], cap=cap, out=H, expert_halves=1)}
-    lib = Library("t_ink_eg", list(ops.values())).compile().load()
+    lib = Library(f"t_ink_eg{L}", list(ops.values())).compile().load()
     idx = {n: i for i, n in enumerate(ops)}
     dev = lib.device
     rng = np.random.default_rng(5)
@@ -65,7 +67,7 @@ def test_expert_gemms() -> None:
     ex = [list(rng.integers(0, cfg.n_experts, size=int(n))) for n in ns]
     act = [rng.random(int(n)) < 0.5 for n in ns]
     act[1][:] = False
-    gsc = np.asarray(g.tensor(f"blk.{L}.ffn_gate_up_exps.scale").dequantize(), np.float64).reshape(-1)
+    gsc = moe.tab[L][2].astype(np.float64)  # (the experts' gate / up scales: ones without NVFP4)
     Wd = artlite.empty((img.nbytes // 2,), dtype=bfloat16, device=dev)
     Wd._raw.map()[:] = W
     Wd._raw.sync_to_device()
@@ -74,25 +76,22 @@ def test_expert_gemms() -> None:
         for k in range(int(ns[c])):
             A[c, k] *= float(gsc[ex[c][k]])
     A = A.bfloat16()
-    pan = np.stack([np.stack([bfp16.to_panels(to_numpy(A[c, k])) for k in range(cap)]) for c in range(COLS)])
+    pan = np.stack([np.stack([bfp16.to_panels(to_numpy(A[c, k])) for k in range(cap)] +
+                             [np.zeros_like(bfp16.to_panels(to_numpy(A[c, 0])))] * (moe.cap - cap)) for c in range(COLS)])
     XP = artlite.from_numpy(pan.reshape(-1), dev)
     UNSET = 0x7FC1
     buf = {"XP": XP}
     for name, op in (("H01", ops["gu01"]), ("H2", ops["gu2"]), ("Y01", ops["dn01"]), ("Y2", ops["dn2"])):
-        buf[name] = artlite.from_numpy(np.full(COLS * cap * op.c_slot, UNSET, np.int16).view(bfloat16), dev)
+        buf[name] = artlite.from_numpy(np.full(COLS * moe.cap * op.c_slot, UNSET, np.int16).view(bfloat16), dev)
     items, cbs = [], []
-    for name, a_in, out, slab, col0 in (("gu01", "XP", "H01", reg["exp_gu0"].offset, 0),
-                                        ("gu01", "XP", "H01", reg["exp_gu0"].offset + uo[1], 512),
-                                        ("gu2", "XP", "H2", reg["exp_gu2"].offset, 0),
-                                        ("dn01", "H01", "Y01", reg["exp_dn0"].offset, 0),
-                                        ("dn2", "H2", "Y2", reg["exp_dn2"].offset, 0)):
+    for _, name, slab, col0, a_in, out in moe.gemm_items[L]:
         op = ops[name]
         cb = artlite.from_numpy(np.zeros(COLS * op.cb_words * 2, bfloat16), dev)
         cbv = cb._raw.map().view(np.uint32)
         op.streams([np.asarray(e) for e in ex], act, cb=[device_address(cb, 4 * c * op.cb_words, lib._ctx) for c in range(COLS)],
                    slab=device_address(Wd, slab, lib._ctx), slab_stride=uo[1], expert_stride=uo[3], col0=col0,
-                   c_address=[device_address(buf[out], 2 * c * cap * op.c_slot, lib._ctx) for c in range(COLS)],
-                   a_address=[device_address(buf[a_in], 2 * c * cap * op.a_slot, lib._ctx) for c in range(COLS)],
+                   c_address=[device_address(buf[out], 2 * c * moe.cap * op.c_slot, lib._ctx) for c in range(COLS)],
+                   a_address=[device_address(buf[a_in], 2 * c * moe.cap * op.a_slot, lib._ctx) for c in range(COLS)],
                    out=[cbv[c * op.cb_words:(c + 1) * op.cb_words] for c in range(COLS)])
         cb._raw.sync_to_device()
         cbs.append(cb)
@@ -101,11 +100,10 @@ def test_expert_gemms() -> None:
     lib.run(items, bufs=[b._raw for b in (Wd, *cbs, *buf.values())])
     for b in buf.values():
         b.sync_from_device()
-    hv = {n: buf[n].numpy().reshape(COLS, cap, -1) for n in ("H01", "H2")}
-    yv = {n: ops[o].y_rows(buf[n].numpy().view(np.int16).reshape(COLS, cap, -1))[..., :H].view(bfloat16)
+    hv = {n: buf[n].numpy().reshape(COLS, moe.cap, -1) for n in ("H01", "H2")}
+    yv = {n: ops[o].y_rows(buf[n].numpy().view(np.int16).reshape(COLS, moe.cap, -1))[..., :H].view(bfloat16)
           for n, o in (("Y01", "dn01"), ("Y2", "dn2"))}
     b = f"blk.{L}."
-    dsc = np.asarray(g.tensor(b + "ffn_down_exps.scale").dequantize(), np.float64).reshape(-1)
     errs: dict[str, list[float]] = {"H01": [], "H2": [], "Y01": [], "Y2": []}
     for c in range(COLS):
         for k in range(int(ns[c])):
@@ -120,9 +118,10 @@ def test_expert_gemms() -> None:
                 errs[name].append(rel_max(got, _situ(hg[:, lo:hi], hu[:, lo:hi], lb)))
                 y = yv["Y" + name[1:]][c, k, :rows].astype(np.float64)
                 errs["Y" + name[1:]].append(rel_max(y, got @ dn[:, lo:hi].T))
-            assert np.isfinite(dsc[e])
     print(f"chunks {ns.tolist()}; " + ", ".join(f"{n} err max {max(v):.2e}" for n, v in errs.items()))
-    assert max(errs["H01"] + errs["H2"]) < 3.5e-2 and max(errs["Y01"] + errs["Y2"]) < 1.35 * 2 ** -9 * (2048 / 64) ** 0.5
+    # (Q8_0's weights lose more in bfp16 blocks than NVFP4's: H up to 3.8e-2 with the epilogue's bf16 situ, 0.8% rms of
+    # its own; the downs up to 1.8e-2)
+    assert max(errs["H01"] + errs["H2"]) < 4e-2 and max(errs["Y01"] + errs["Y2"]) < 2e-2
 
 
 def test_moe_block() -> None:
@@ -136,7 +135,7 @@ def test_moe_block() -> None:
 
     from .ref import Model, VisitCache, rms
 
-    g, cfg, _, _ = _image()
+    g, cfg, _, _ = _image(0)
     H, F, n, b = cfg.hidden_size, cfg.expert_ffn, 200, "blk.0."
     toks = np.random.default_rng(3).integers(0, cfg.vocab_size, n)
     x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * \

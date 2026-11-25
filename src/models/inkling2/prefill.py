@@ -140,12 +140,17 @@ class InklingPrefill(ChunkPrefill):
         s, ov = self.shape, self.ov
         kv0 = self.guard * s.group
         first = next(v for v in self.layers if self.vis[v].kind == kind)
-        return PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes(first), kv_pad=self.pad, sub=min(T, PREP_T),
+        return PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes(first), kv_pad=self.pad, sub=self._pt(T),
                                swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True)
+
+    @staticmethod
+    def _pt(T: int) -> int:
+        """Tokens of a chunk's prep part (the attention's items): the chunk up to ``PREP_T``, else half of it."""
+        return T if T <= PREP_T else T // 2
 
     def _preps(self, kind: str, T: int) -> list[InkPrepOperator]:
         """The prep of a kind over a chunk of T tokens: one item up to ``PREP_T`` tokens, else parts of T / 2."""
-        pt = T if T <= PREP_T else T // 2
+        pt = self._pt(T)
         assert pt <= PREP_T and pt % self.shape.pg == 0, T
         v = next(v for v in self.layers if self.vis[v].kind == kind)
         plans, ov = self.sz[self._t(T)].plans, self.ov

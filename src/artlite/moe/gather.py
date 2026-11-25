@@ -18,7 +18,7 @@ straight into the column's core, one 4 KB row an object).
   through the column's memtile, which sends it on in output order. ``y2``: a second down's outputs per slot (Inkling's
   unit 2: its own Y and layout, of the same row length), summed with the same weight: per token a block of the first
   Y's rows, then one of the second's (each block rewriting its row BDs whole); the first layout in output order as it
-  arrives, the second's runs (pass, C object, tile) added at their output offsets by the core.
+  arrives, the second's runs (pass, C object, tile; of 32 or 16 values) added at their output offsets by the core.
   A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_k-1, 0 .., w_s at ``SHARED_W``, 0 ..]: 64 bytes, a cache line of their own
   past the GEMM's outputs, which the host writes per layer): a column's input is one strided transfer.
 
@@ -350,15 +350,15 @@ class CombineOperator(_Gathered):
         assert passes * vp * tiles * run >= E and run % 2 == 0 and row >= tiles * run
         if self.y2 is not None:  # (the first in output order; the second's runs of 32: the kernel's vectors)
             p2, v2, t2, r2, _ = self.y2
-            assert (vp == 1 or tiles == 1) and K == CHAIN and r2 == 32 and p2 * v2 * t2 * r2 == self.row_n, self.y2
+            assert (vp == 1 or tiles == 1) and K == CHAIN and r2 in (16, 32) and p2 * v2 * t2 * r2 == self.row_n, self.y2
         super().__init__(E=E, ds_pitch=ds_pitch)
 
     def get_kernel_src(self) -> str:
         src = super().get_kernel_src()
         if self.y2 is None:
             return src
-        p2, v2, t2, _, _ = self.y2
-        return src + "\n" + _Y2.render(p=self.p, P=p2, V=v2, TL=t2, COLS=COLS, DP=self.ds_pitch)
+        p2, v2, t2, r2, _ = self.y2
+        return src + "\n" + _Y2.render(p=self.p, P=p2, V=v2, TL=t2, RUN=r2, COLS=COLS, DP=self.ds_pitch)
 
     @property
     def row_n(self) -> int:

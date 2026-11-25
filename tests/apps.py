@@ -171,11 +171,13 @@ def _spark(path: str) -> AppBuild:
 
 
 def _inkling(path: str) -> AppBuild:
-    """Inkling 2's whole step (prompts as decode steps: no prefill)."""
+    """Inkling 2's whole step and its prefill (the sliding-window caches linear: ``NpuInkling(prefill=True)``)."""
     from models.inkling2.overlay import InklingOverlay
+    from models.inkling2.prefill import InklingPrefill
 
-    ov = InklingOverlay(GGUFFile(path), max_positions=4096)
-    return _built([ov.op], None, ov)
+    ov = InklingOverlay(GGUFFile(path), max_positions=4096, wrap=0)
+    pf = InklingPrefill(ov)
+    return _built([ov.op, pf.lib], pf, ov)
 
 
 def _sd15(path: str) -> AppBuild:

@@ -7,7 +7,8 @@
   sliding-window caches back with it);
 - steps of S tokens against steps of one, a rollback of rejected drafts, greedy text with the context's drafts: bit for
   bit, the same text;
-- greedy text after five prompts against llama.cpp's decode of the same tokens (``test_text``).
+- greedy text after five prompts against llama.cpp's decode of the same tokens (``test_text``);
+- a prompt through the prefill against the same prompt as decode steps (``test_prefill``).
 """
 
 import numpy as np
@@ -54,6 +55,24 @@ def test_teacher_forced() -> None:
     print(f"KL {kl:.4f} (llama.cpp prompt vs decode {kl_llama:.4f}), argmax agreement {agree:.3f} ({agree_llama:.3f}) "
           f"over {int(sure.sum())} of {len(tokens)} tokens")
     assert kl < 1.5 * kl_llama and agree > agree_llama - 0.05
+
+
+def test_prefill() -> None:
+    """600 essay tokens through the prefill (the planner's chunks, the last token a decode step: ``NpuInkling``'s
+    ``last_step``) against the same prompt as decode steps: the last token's next-token distributions (KL), the greedy
+    16 tokens after it."""
+    path = _path()
+    host = Inkling(path)
+    tokens = llama_tokenize(path, essay("founders.txt"))[:600]
+    out = {}
+    for prefill in (True, False):
+        model = host.load(capacity=1024, prefill=prefill)
+        logits = np.asarray(model.prompt(tokens, logits=True), np.float32).copy()
+        out[prefill] = (logits, list(model.generate(logits, 16, Sampling(greedy=True), tokens)))
+        del model
+    kl = float(kl_rows(torch.from_numpy(out[False][0][None]), torch.from_numpy(out[True][0][None])).mean())
+    print(f"KL {kl:.4f}; text {host.tokenizer.decode(out[True][1])!r}")
+    assert kl < 0.01 and out[True][1] == out[False][1]
 
 
 def test_checkpoint() -> None:

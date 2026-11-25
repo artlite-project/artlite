@@ -71,6 +71,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     slot = 0  # the slot of the last token whose logits a dispatch returned (a step's last; 0 after a chunk's)
     softcap = 0.0  # the model's logits of the overlay's l: softcap tanh(l / softcap) (0: l)
     seq = 0  # the lane's sequence on the overlay's device
+    last_step = False  # the prompt's last token as a decode step (a prefill without the LM head: no ``_chunk_logits``)
     # a block drafter's (one dispatch a round whatever number of its drafts find a slot: DSpark, DFlash2): how many
     # times what the block costs the lanes of a shared round its drafts must be kept (``_block_pays``). Measured on
     # Spark-X with two lanes and a block every round, where the two are about equal (1.0 - 1.2): -1.5% (1.7B) to +7%
@@ -468,12 +469,13 @@ class OverlayModel(SpeculativeMixin, NpuModel):
                              f"{len(tokens)} tokens at position {self.position}")
         steps = readout is None
         out, i, nxt = None, 0, None
+        end = len(tokens) - (1 if steps and self.last_step else 0)  # (the tokens a chunk may take)
         while i < len(tokens):
-            T = self._chunk(len(tokens) - i, steps=steps)
+            T = self._chunk(end - i, steps=steps) if end > i else 0
             if not T:  # (decode steps up to the next position where a chunk can start)
                 n = 1
                 while n < min(self.overlay.SLOTS, len(tokens) - i) and \
-                        not self._chunk(len(tokens) - i - n, self.position + n, steps=steps):
+                        not (end > i + n and self._chunk(end - i - n, self.position + n, steps=steps)):
                     n += 1
                 last = logits and i + n == len(tokens)
                 o = self.steps(tokens[i:i + n], logits=last or not steps)  # (a readout's rows: the LM head's input)
@@ -484,11 +486,12 @@ class OverlayModel(SpeculativeMixin, NpuModel):
                 if progress is not None:
                     progress(i)
                 continue
-            n = min(T, len(tokens) - i)
+            n = min(T, end - i)
             t0 = time.perf_counter()
             args = nxt.result() if nxt is not None else self._chunk_inputs(tokens[i:i + n], first=True)
             t1 = time.perf_counter()
-            m = self._chunk(len(tokens) - i - n, self.position + n, steps=steps)  # (the next chunk: its inputs meanwhile)
+            m = self._chunk(end - i - n, self.position + n, steps=steps) if end > i + n else 0  # (the next chunk: its
+            # inputs meanwhile)
             nxt = self._pool.submit(lambda t: self._chunk_inputs(t, first=False),
                                     tokens[i + n:i + n + m]) if m else None
             self._prefill_run(args, T, n, sets)

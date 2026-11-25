@@ -47,6 +47,7 @@ CASES = {  # id: the function and its arguments
     "silu_tanh": ("silu_tanh", {}),
     "situ": ("situ", {"lanes": 16, "beta": 4.0, "linear_beta": 25.0}),
     "situ-u": ("situ", {"lanes": 16, "beta": 4.0, "linear_beta": 25.0, "unroll": True}),
+    "situ-bf16": ("situ", {"lanes": 32, "beta": 4.0, "linear_beta": 25.0, "prec": "bf16"}),
 }
 
 EDGES = np.float32([-np.inf, -1e30, -4e6, -32000, -16384, -1000, -200, -127.5, -127.25, -127, -126.9, -126.5, -126.1, 0, 100,
@@ -96,6 +97,7 @@ def _contracts() -> list[kmath.Fn]:
                                                           for a, w in itertools.product((False, True), ((1, 32), (1, 64), (2, 128)))]
         fns += [kmath.act(t, table_arg=True, walk=(2, 128))]
     fns += [kmath.situ(beta=4.0, linear_beta=25.0, unroll=u, inline=i) for u, i in itertools.product((False, True), (False, True))]
+    fns += [kmath.situ(32, beta=4.0, linear_beta=25.0, prec="bf16", inline=i) for i in (False, True)]
     return fns + [kmath.table_pass(kmath.SILU, table_arg=True, n=640), kmath.silu_tanh(walk=(2, 128)),
                   kmath.act(kmath.SILU, table_arg=True, n=640, scale=2, clamp=16.0, walk=(10, 640))]
 
@@ -153,7 +155,7 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
     if "aie::inv" in fn.src or "al::inv_rms" in fn.src:
         for op, r in request.getfixturevalue("inv_results").items():
             kmath_sim.load_inv(op, r)
-    if fn.arg == "pair":
+    if fn.arg in ("pair", "bfpair"):
         _pair(fn, func, kwargs)
         return
     dom, edges = _arguments(fn)
@@ -185,13 +187,15 @@ def test_kmath(case: str, request: pytest.FixtureRequest) -> None:
 
 def _pair(fn: kmath.Fn, func: str, kwargs: dict) -> None:
     """A pair function (situ: g, u): every finite bf16 g in its domain and 2^18 of a normal and a uniform spread, each
-    with a u of the same set (a permutation), and the edges of ``fn.valid`` against each other; bit-exact against the
-    model, within ``fn.rel`` of max(|exact|, ``fn.floor``)."""
+    with a u of the same set (a permutation), and the edges of ``fn.valid`` against each other (a bf16 form's: rounded to
+    bf16); bit-exact against the model, within ``fn.rel`` of max(|exact|, ``fn.floor``)."""
     lo, hi = fn.domain
     b = kmath.bf16_values()
     b = b[(np.abs(b) >= 1e-30) | (b == 0)]  # (as an array function's: no results below the normal range)
     rng = np.random.default_rng(0)
     g = np.concatenate([b[(b >= lo) & (b < hi)], rng.normal(0, 4, 1 << 17), rng.uniform(-60, 60, 1 << 17)]).astype(np.float32)
+    if fn.arg == "bfpair":
+        g = kmath_sim.bf16(g)
     u = rng.permutation(g)
     e = EDGES[(EDGES >= fn.valid[0]) & (EDGES < fn.valid[1])]
     eg, eu = (a.reshape(-1) for a in np.meshgrid(e, e))

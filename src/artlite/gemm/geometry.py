@@ -402,8 +402,9 @@ class Geometry:
             gt = -(-128 // rows)  # tiles of a SiLU group (formats.gu_tiles)
             if tiles == gt:
                 halves = 2
-            else:  # (half groups of whole tiles)
-                assert 64 % rows == 0 and TR % 64 == 0, f"planar SiLU passes: a group of {gt} tiles"
+            else:  # (half groups of whole tiles; situ's: a quarter, a tail group of Q8_0's 8-row tiles)
+                assert 64 % rows == 0 and (TR % 64 == 0 or (act == "situ" and TR == 32)), \
+                    f"planar SiLU passes: a group of {gt} tiles"
         hdr_direct = bool(units) or slot(fmt).hdr_direct(fmt, nsb)
         n_read = 128 if halves == 2 and hdr_direct else TR
         q = slot(fmt).mmul_rows(fmt) if is_planar else 16

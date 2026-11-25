@@ -1,0 +1,42 @@
+// situ(g, u) = 4 tanh(g / 4) sigmoid(g) lb tanh(u / lb) (lb = {{ lb }}: Inkling's experts' activation, kmath.situ) of 32 bf16
+// g and u in bf16 arithmetic (products of bf16 into fp32 accumulators, rounded to bf16 at each step): with s = tanh(g / 4),
+// t = tanh(u / lb), 2 lb s (1 + s)^2 / (1 + s^2) t, each tanh n / d, the rational x P(x^2) / Q(x^2) of x clamped
+// (kmath.SITU_TANH; per term [clamp, p0 .. p3, q1 .. q3] of g and u themselves, t's P times 2 lb), the coefficients
+// added in fp32; N / D through one reciprocal (D >= 1: an estimate from the bf16 bits, two Newton steps r + r (1 - D r));
+// {{ bound }} of max(|situ|, 1) (fp32's form, kmath.situ: ~30x the cycles).
+[[clang::always_inline]] inline void {{ name }}_term(aie::vector<bfloat16, 32> v, aie::vector<bfloat16, 32> &n,
+                                                   aie::vector<bfloat16, 32> &d, float c, float p0, float p1, float p2,
+                                                   float p3, float q1, float q2, float q3)
+{
+    const aie::vector<bfloat16, 32> x = aie::max(aie::min(v, aie::broadcast<bfloat16, 32>(c)),
+                                                 aie::broadcast<bfloat16, 32>(-c));
+    const aie::vector<bfloat16, 32> z = aie::mul(x, x).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> P = aie::broadcast<bfloat16, 32>(p3), Q = aie::broadcast<bfloat16, 32>(q3);
+    P = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(p2)), P, z).template to_vector<bfloat16>();
+    Q = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(q2)), Q, z).template to_vector<bfloat16>();
+    P = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(p1)), P, z).template to_vector<bfloat16>();
+    Q = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(q1)), Q, z).template to_vector<bfloat16>();
+    P = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(p0)), P, z).template to_vector<bfloat16>();
+    d = aie::mac(aie::accum<accfloat, 32>(aie::broadcast<float, 32>(1.0f)), Q, z).template to_vector<bfloat16>();
+    n = aie::mul(x, P).template to_vector<bfloat16>();
+}
+
+{{ attr }} aie::vector<bfloat16, 32> {{ name }}(aie::vector<bfloat16, 32> g, aie::vector<bfloat16, 32> u)
+{
+    aie::vector<bfloat16, 32> ng, dg, nu, du;
+    {{ name }}_term(g, ng, dg, {{ c[:8] | join(", ") }});
+    {{ name }}_term(u, nu, du, {{ c[8:] | join(", ") }});
+    // (s = ng / dg: 2 s (1 + s)^2 / (1 + s^2) = 2 ng (dg + ng)^2 / (dg (dg^2 + ng^2)); t's 2 lb in nu)
+    const aie::vector<bfloat16, 32> a = aie::add(ng, dg);
+    const aie::vector<bfloat16, 32> q = aie::mac(aie::mul(ng, ng), dg, dg).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 32> a2 = aie::mul(a, a).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 32> N = aie::mul(aie::mul(a2, ng).template to_vector<bfloat16>(), nu).template to_vector<bfloat16>();
+    const aie::vector<bfloat16, 32> D = aie::mul(aie::mul(q, dg).template to_vector<bfloat16>(), du).template to_vector<bfloat16>();
+    aie::vector<bfloat16, 32> r = aie::sub(aie::broadcast<int16_t, 32>(0x7EF3), D.template cast_to<int16_t>()).template cast_to<bfloat16>();
+    const aie::accum<accfloat, 32> one(aie::broadcast<float, 32>(1.0f));
+    for (int k = 0; k < 2; k++) {
+        const aie::vector<bfloat16, 32> e = aie::msc(one, D, r).template to_vector<bfloat16>();
+        r = aie::mac(aie::accum<accfloat, 32>(r), r, e).template to_vector<bfloat16>();
+    }
+    return aie::mul(N, r).template to_vector<bfloat16>();
+}

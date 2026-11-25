@@ -28,7 +28,8 @@ class Fn:
     """A generated function: ``name`` (the placeholder name kernels call: ``{{ f }}``), ``src`` (its definition after
     those of the functions it calls, each in an anonymous namespace: ``{{ f.src }}``), its argument and result
     (``arg``, ``ret``: "float" an fp32 vector, "accum" an fp32 accumulator, "bfloat16" a bf16 vector, of ``lanes``;
-    "ptr": arrays of bf16, "pair": two fp32 arrays, the result into the first), the contract that made it (``func``: the
+    "ptr": arrays of bf16, "pair": two fp32 arrays, the result into the first; "bfpair": two bf16 vectors of ``lanes``),
+    the contract that made it (``func``: the
     kmath function, ``params``: its arguments but lanes and inline) and what the tests check: ``valid`` (the arguments it
     is defined for), ``domain`` (those the bound holds for; ranges are [lo, hi)) and the bound (``ulp``: bf16 ULPs of the
     exact value, ``rel``: relative error, of max(|exact|, ``floor``)). ``parts``: functions of its steps, for a caller

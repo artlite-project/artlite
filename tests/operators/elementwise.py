@@ -362,6 +362,17 @@ void {{ name }}(float *__restrict input, float *__restrict output)
         aie::store_v(output + j, aie::load_v<{{ fn.lanes }}>(input + j));
     {{ fn }}(output, input + {{ ts // 2 }}, {{ ts // 2 }});
 }
+{% elif fn.arg == "bfpair" %}
+extern "C"
+void {{ name }}(float *__restrict input, float *__restrict output)
+{  // (a tile: the first arguments' bf16 values (as fp32) in its first half, the second's in its second; out: the result)
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int j = 0; j < {{ ts // 2 }}; j += {{ fn.lanes }}) {
+        const aie::vector<bfloat16, {{ fn.lanes }}> a = aie::accum<accfloat, {{ fn.lanes }}>(aie::load_v<{{ fn.lanes }}>(input + j)).template to_vector<bfloat16>();
+        const aie::vector<bfloat16, {{ fn.lanes }}> b = aie::accum<accfloat, {{ fn.lanes }}>(aie::load_v<{{ fn.lanes }}>(input + {{ ts // 2 }} + j)).template to_vector<bfloat16>();
+        aie::store_v(output + j, aie::accum<accfloat, {{ fn.lanes }}>({{ fn }}(a, b)).template to_vector<float>());
+    }
+}
 {% elif fn.arg == "ptr" %}
 extern "C"
 void {{ name }}(bfloat16 *__restrict input, bfloat16 *__restrict output)
@@ -390,8 +401,8 @@ void {{ name }}(float __aie_dm_resource_a *__restrict input, float __aie_dm_reso
 class KmOperator(StreamOperator):
     """A kmath function (``km.<func>(**kwargs)``: an fp32 vector, fp32 accumulator or bf16 vector argument and result)
     on a 1-D fp32 vector, one core; an array function (``kmath.act``: a table's name as ``table``) on a bf16 one; a pair
-    function (``kmath.situ``) on tiles of [first array | second array] (``tile``), the result into each tile's first
-    half."""
+    function (``kmath.situ``; its bf16 form a vector function of two bf16 vectors) on tiles of [first array | second
+    array] (``tile``), the result into each tile's first half."""
 
     def __init__(self, *, size: int, func: str, **kwargs: object):
         self.func, self.kwargs = func, kwargs

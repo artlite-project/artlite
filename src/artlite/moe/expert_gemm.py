@@ -124,9 +124,9 @@ class ExpertGemmOperator(GemmQdOperator):
         self._templates: dict[tuple, tuple[np.ndarray, list]] = {}
         eh = expert_halves
         if kind == "gu":
-            if qt:  # (passes of one tail group's row tiles)
+            if qt:  # (passes of one tail group's row tiles: 64 rows, Q8_0's 8-row tiles 32)
                 tp = kc // 256 // qt
-                assert planar(fmt, R, kc) and tp * R == 64, (fmt, R)
+                assert planar(fmt, R, kc) and tp * R in (32, 64), (fmt, R)
                 rows = tp * R
             else:
                 tp = gu_tiles(R) if planar(fmt, R, kc) else self.GU_ROWS // R  # (tiles per pass)
@@ -143,9 +143,11 @@ class ExpertGemmOperator(GemmQdOperator):
         else:
             assert eh == 2 or G > 1, "a down of one half: row groups"
             tiles = min(4, 64 // R)  # (the C packing's MAC columns: at most 64; Q3_K's 21 rows 3, IQ3_XXS's 23 2)
-            if G > kc // 256:  # (half super-blocks a slot: whole passes of at most 63 A strips, the lock's range)
+            if G > kc // 256:  # (half super-blocks a slot)
                 assert eh == 1 and G == 2 * (kc // 256), G
-                tiles = max(t for t in range(1, tiles + 1) if row_tiles % t == 0 and row_tiles // t * G <= MAX_REPEAT)
+            if G > kc // 256 or -(-row_tiles // tiles) * G > MAX_REPEAT:  # (whole passes of at most 63 A strips, the
+                # lock's range: up to 64 MAC columns, Q8_0's 8 tiles of 8 rows)
+                tiles = max(t for t in range(1, 64 // R + 1) if row_tiles % t == 0 and row_tiles // t * G <= MAX_REPEAT)
             passes = -(-row_tiles // tiles)
             assert passes * G <= MAX_REPEAT, (passes, G)
             row = -(-2 * tiles * R // 8) * 8  # (a C object's token row: two slots' rows, whole 8-value items)
@@ -165,8 +167,9 @@ class ExpertGemmOperator(GemmQdOperator):
 
     @classmethod
     def of(cls, kind: str, region: object, *, cap: int, out: int, expert_halves: int = 2, act: str = "silu",
-           situ_lb: float = 25.0, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
-        """The operator of a layer's slab region ("exp_gu" / "exp_down"; Inkling's "exp_gu<u>" / "exp_dn<u>")."""
+           situ_lb: float = 25.0, row_tiles: int = 0, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
+        """The operator of a layer's slab region ("exp_gu" / "exp_down"; Inkling's "exp_gu<u>" / "exp_dn<u>";
+        ``row_tiles``: a gate / up of the first that many, default all: a unit's in parts)."""
         (b,) = region.blocks
         assert not region.half, "an expert's input of whole K chunks"
         kw = {"act": act, "situ_lb": situ_lb} if act != "silu" else {}  # (the defaults left out: the designs' keys)
@@ -174,7 +177,7 @@ class ExpertGemmOperator(GemmQdOperator):
             kw["expert_halves"] = expert_halves
         if kind == "gu" and region.qt:
             kw["qt"] = region.qt
-        return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=b.tiles, G=b.G, K=region.K_in if kind == "gu" else region.K,
+        return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=row_tiles or b.tiles, G=b.G, K=region.K_in if kind == "gu" else region.K,
                    tile_bytes=region.tile_bytes, kc=region.kc, kc_group=region.kc_group, cap=cap, out=out, **kw,
                    **({"ablate": ablate} if ablate else {}))
 

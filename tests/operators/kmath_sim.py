@@ -16,6 +16,7 @@ unflushed product), a bf16 conversion; a zero's sign is not modelled.
 
 import numpy as np
 import torch
+from ml_dtypes import bfloat16
 
 from artlite.operators import bfp16, kmath
 
@@ -409,8 +410,37 @@ def rope(fn: kmath.Fn, row: np.ndarray, cs: np.ndarray, rot: int | None = None, 
     return out
 
 
+def situ_bf16(fn: kmath.Fn, g: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """``kmath.situ(prec="bf16")``'s results for bf16 g and u."""
+    k = kmath.situ_coefficients(fn.params["linear_beta"])
+    terms = []
+    for j, v in enumerate((g, u)):
+        c, p0, p1, p2, p3, q1, q2, q3 = (np.float32(x) for x in k[j])
+        x = np.maximum(np.minimum(bf16(v), bf16(c)), bf16(-c))
+        z = bf16(mul(x, x))
+        P, Q = np.full(x.shape, bf16(p3), np.float32), np.full(x.shape, bf16(q3), np.float32)
+        P, Q = bf16(mac(p2, P, z)), bf16(mac(q2, Q, z))
+        P, Q = bf16(mac(p1, P, z)), bf16(mac(q1, Q, z))
+        P, d = bf16(mac(p0, P, z)), bf16(mac(np.float32(1), Q, z))
+        terms.append((bf16(mul(x, P)), d))
+    (ng, dg), (nu, du) = terms
+    a = bf16(add(ng, dg))
+    q = bf16(mac(mul(ng, ng), dg, dg))
+    a2 = bf16(mul(a, a))
+    N = bf16(mul(bf16(mul(a2, ng)), nu))
+    D = bf16(mul(bf16(mul(q, dg)), du))
+    bits = (0x7EF3 - D.astype(bfloat16).view(np.uint16).astype(np.int32)) & 0xFFFF
+    r = bits.astype(np.uint16).view(bfloat16).astype(np.float32)
+    for _ in range(2):
+        e = bf16(mac(np.float32(1), -D, r))
+        r = bf16(mac(r, r, e))
+    return bf16(mul(N, r))
+
+
 def situ(fn: kmath.Fn, g: np.ndarray, u: np.ndarray) -> np.ndarray:
-    """``kmath.situ``'s results for fp32 g and u."""
+    """``kmath.situ``'s results for fp32 g and u (``prec`` "bf16": ``situ_bf16``)."""
+    if fn.params.get("prec") == "bf16":
+        return situ_bf16(fn, g, u)
     k = kmath.situ_coefficients(fn.params["linear_beta"])
     for j in range(2):
         x = _f32(np.maximum(np.minimum(_f32(g if j == 0 else u), k[j, 0]), -k[j, 0]))
