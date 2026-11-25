@@ -13,6 +13,12 @@ H, token-major).
   window (the decode's: [row 8][column slice] fp32, ``P_HA`` its first row), cur += conv (a block visit: cur' = conv in
   another state); the inputs of the chunk's last 3 valid tokens (``P_N`` = n >= 3) into the window's rows 0 .. 2 (the
   decode's next step: its window's first position p0 + n - 3). Column c its slice of the hidden (``C`` channels), one core.
+- ``InkGateOperator``: the attention's output gate: o (bfp16 panels, ``prefill.attn.AttnOperator``'s A) times sigmoid of
+  the gate logits (the q GEMM's "gate" block, bf16), per channel. Column c its KV head's query heads, one core.
+- ``InkBlendOperator``: a loop visit's controller of a stream: g = g_a + g_b (its down's two halves, the GEMMs' fp32 sums of
+  plane pairs: 8 a column), out = (1 - tanh(F g)) cur + tanh(G g) msg (cur, msg: the stream's mix and message, bf16
+  rows), F and G the image's ``ctl_<stream>`` rows (bf16 [288][64] a column, read in place). Column c its slice, core r
+  its 72 channels: their F, G rows resident as hi + lo panels, F g and G g on the MMUL per 8 tokens.
 """
 
 import numpy as np
@@ -258,4 +264,164 @@ class InkResidOperator(ArtcOperator):
         return Program(NPU2(), rt, workers=workers).resolve_program()
 
 
-__all__ = ["CH", "P_HA", "TB", "InkMixOperator", "InkResidOperator"]
+class InkGateOperator(ArtcOperator):
+    """The attention output's gates of T tokens (module docstring). Runtime sequence: A (the attention's output: T x
+    COLS ``heads`` hd as bfp16 panels [T / 8][COLS heads hd / 8]), G (the q GEMM's output, rows of ``lq_pitch`` COLS
+    bf16, column c's gate logits from c ``lq_pitch`` + ``gate_off``), O (out: A's layout; A in place)."""
+
+    STACK = 2048  # (kmath's sigmoid of 64 lanes)
+    p = kernel_prefix("igt")
+
+    def __init__(self, *, T: int, lq_pitch: int, gate_off: int, heads: int = 3, hd: int = 128):
+        assert T % 8 == 0 and heads * hd % 8 == 0
+        self.T, self.lq_pitch, self.gate_off, self.heads, self.hd = T, lq_pitch, gate_off, heads, hd
+        self.np_ = heads * hd // 8  # (a column's panels of a token group)
+        super().__init__()
+
+    def get_kernel_src(self) -> str:
+        return _SRC.render(op="gate", p=self.p, NP=self.np_)
+
+    @property
+    def n_a(self) -> int:
+        return self.T * COLS * self.heads * self.hd * 9 // 16
+
+    def get_arg_spec(self) -> list[ArgSpec]:
+        return [ArgSpec("in", (self.n_a,), bfloat16), ArgSpec("in", (self.T * COLS * self.lq_pitch,), bfloat16),
+                ArgSpec("out", (self.n_a,), bfloat16)]
+
+    def get_mlir_artifact(self) -> Module:
+        p, T, npn = self.p, self.T, self.np_
+        bf = np.dtype[bfloat16]
+        pan = npn * 36  # (bf16 units of a column's panels of a token group)
+        a_ty = np.ndarray[(pan,), bf]
+        g_ty = np.ndarray[(8 * 8 * npn,), bf]
+        k_run = Kernel(f"{p}_run", "kernel.o", [a_ty, g_ty, a_ty])
+        n_tg = T // 8
+        af = [ObjectFifo(a_ty, name=f"gt_a{c}", depth=2) for c in range(COLS)]
+        gf = [ObjectFifo(g_ty, name=f"gt_g{c}", depth=2) for c in range(COLS)]
+        of = [ObjectFifo(a_ty, name=f"gt_o{c}", depth=2) for c in range(COLS)]
+
+        def core(a_h, g_h, o_h, frun):
+            for _ in forever_():
+                for _ in range_(n_tg):
+                    a = a_h.acquire(1)
+                    g = g_h.acquire(1)
+                    o = o_h.acquire(1)
+                    frun(a, g, o)
+                    o_h.release(1)
+                    g_h.release(1)
+                    a_h.release(1)
+
+        workers = [Worker(core, [af[c].cons(), gf[c].cons(), of[c].prod(), k_run], tile=Tile(c, 2), stack_size=self.STACK,
+                          dynamic_objfifo_lowering=True, while_true=False) for c in range(COLS)]
+        n_a, N = self.n_a, COLS * self.lq_pitch
+        row = COLS * pan  # (a token group's panels of every column)
+
+        def seq(A, G, O, ah, gh, oh):
+            tg = TaskGroup()
+            for c in range(COLS):
+                ah[c].fill(A, TensorAccessPattern((n_a,), c * pan, [1, n_tg, 1, pan], [0, row, 0, 1]), group=tg)
+                gh[c].fill(G, TensorAccessPattern((T * N,), c * self.lq_pitch + self.gate_off, [1, n_tg, 8, 8 * npn],
+                                                  [0, 8 * N, N, 1]), group=tg)
+                oh[c].drain(O, TensorAccessPattern((n_a,), c * pan, [1, n_tg, 1, pan], [0, row, 0, 1]), group=tg, wait=True)
+            tg.finish()
+
+        rt = Runtime(seq, [np.ndarray[(n_a,), bf], np.ndarray[(T * N,), bf], np.ndarray[(n_a,), bf],
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(af)],
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(gf)],
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(of)]])
+        return Program(NPU2(), rt, workers=workers).resolve_program()
+
+
+class InkBlendOperator(ArtcOperator):
+    """A controller's blend of T tokens (module docstring). Runtime sequence: GA, GB (the down halves' outputs: rows of
+    COLS ``d_pitch`` bf16, column c's 8 fp32 at c ``d_pitch``), CS, MS ((T, H) bf16), W (the image's ``ctl_<stream>``
+    region: per column [F 288][64] then [G 288][64] bf16, ``w_stride`` bf16 apart), OUT ((T, H) bf16)."""
+
+    STACK = 4096  # (the run's frame: kmath's fp32 sigmoid of 64 lanes, twice)
+    p = kernel_prefix("ibl")
+
+    def __init__(self, *, T: int, d_pitch: int, w_stride: int, H: int = 2304, rank: int = 64):
+        self.C = H // COLS
+        assert T % 8 == 0 and self.C == 4 * 72 and rank == 64 and w_stride >= 2 * self.C * rank
+        self.T, self.d_pitch, self.w_stride, self.H = T, d_pitch, w_stride, H
+        super().__init__()
+
+    def workspace(self) -> dict[str, int]:
+        return regions([("wp", 2 * 9 * 16 * 72), ("gp", 16 * 72), ("c", 18 * 256)])
+
+    def get_kernel_src(self) -> str:
+        return _SRC.render(op="blend", p=self.p, wb=Attr(self.workspace()), C=self.C)
+
+    def get_arg_spec(self) -> list[ArgSpec]:
+        T, H, nd = self.T, self.H, self.T * COLS * self.d_pitch
+        return [ArgSpec("in", (nd,), bfloat16), ArgSpec("in", (nd,), bfloat16), ArgSpec("in", (T * H,), bfloat16),
+                ArgSpec("in", (T * H,), bfloat16), ArgSpec("in", (COLS * self.w_stride,), bfloat16),
+                ArgSpec("out", (T * H,), bfloat16)]
+
+    def get_mlir_artifact(self) -> Module:
+        p, T, H, C = self.p, self.T, self.H, self.C
+        bf = np.dtype[bfloat16]
+        w_ty = np.ndarray[(8 * 64,), bf]  # an output tile's rows
+        x_ty = np.ndarray[(2048 + 16 * C,), bf]  # a block's g halves, cur, msg
+        o_ty = np.ndarray[(8 * 72,), bf]
+        ws_ty = np.ndarray[(self.workspace()["size"] // 4,), np.dtype[np.float32]]
+        k_prm = Kernel(f"{p}_prm", "kernel.o", [w_ty, ws_ty, np.int32])
+        k_run = Kernel(f"{p}_run", "kernel.o", [x_ty, ws_ty, o_ty, np.int32])
+        nb = T // 8
+        part = 2 * 72 * 64  # (a core's rows: F, G)
+        w3 = [ObjectFifo(np.ndarray[(4 * part,), bf], name=f"bl_w{c}", depth=1) for c in range(COLS)]
+        w1 = [w3[c].cons().split([r * part for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[w_ty] * 4,
+                                 names=[f"bl_w{c}_{r}" for r in range(4)]) for c in range(COLS)]
+        x3 = [ObjectFifo(x_ty, name=f"bl_x{c}", depth=2) for c in range(COLS)]
+        x1 = [x3[c].cons().forward(tile=Tile(c, 1), obj_type=x_ty, depth=2, name=f"bl_xm{c}") for c in range(COLS)]
+        o3 = [ObjectFifo(np.ndarray[(4 * 8 * 72,), bf], name=f"bl_o{c}", depth=2) for c in range(COLS)]
+        o1 = [o3[c].prod().join([r * 8 * 72 for r in range(4)], tile=Tile(c, 1), depths=[2] * 4, obj_types=[o_ty] * 4,
+                                names=[f"bl_o{c}_{r}" for r in range(4)]) for c in range(COLS)]
+
+        def core(w_h, x_h, o_h, fprm, frun, ws, r):
+            for _ in forever_():
+                for t in range_(18):
+                    w = w_h.acquire(1)
+                    fprm(w, ws, t)
+                    w_h.release(1)
+                for _ in range_(nb):
+                    x = x_h.acquire(1)
+                    o = o_h.acquire(1)
+                    frun(x, ws, o, r)
+                    o_h.release(1)
+                    x_h.release(1)
+
+        workers = [Worker(core, [w1[c][r].cons(), x1[c].cons(depth=1), o1[c][r].prod(), k_prm, k_run,
+                                 Buffer(ws_ty, name=f"bl_ws{c}_{r}"), r],
+                          tile=Tile(c, 2 + r), stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False)
+                   for c in range(COLS) for r in range(4)]
+        dp, nw, nd = self.d_pitch, COLS * self.w_stride, T * COLS * self.d_pitch
+        Nd = COLS * dp
+
+        def seq(GA, GB, CS, MS, W, OUT, wh, xh, oh):
+            tg = TaskGroup()
+            for c in range(COLS):
+                # (core r's rows: F rows 72 r .. and G rows 72 r .., a repeat each)
+                chained_fill(wh[c], W, [TensorAccessPattern((nw,), c * self.w_stride, [4, 2, 8, 576],
+                                                            [part // 2, 288 * 64, 576, 1])], tg)
+                for b0 in range(0, nb, MAX_BD_ITER):  # (a chained fill repeats at most MAX_BD_ITER times)
+                    m = min(MAX_BD_ITER, nb - b0)
+                    chained_fill(xh[c], GA, [
+                        ChainPart(GA, TensorAccessPattern((nd,), 8 * b0 * Nd, [m, 8, COLS, 16], [8 * Nd, Nd, dp, 1])),
+                        ChainPart(GB, TensorAccessPattern((nd,), 8 * b0 * Nd, [m, 8, COLS, 16], [8 * Nd, Nd, dp, 1])),
+                        ChainPart(CS, TensorAccessPattern((T * H,), c * C + 8 * b0 * H, [m, 1, 8, C], [8 * H, 0, H, 1])),
+                        ChainPart(MS, TensorAccessPattern((T * H,), c * C + 8 * b0 * H, [m, 1, 8, C], [8 * H, 0, H, 1]))],
+                        tg)
+                oh[c].drain(OUT, TensorAccessPattern((T * H,), c * C, [nb, 4, 8, 72], [8 * H, 72, H, 1]), group=tg, wait=True)
+            tg.finish()
+
+        rt = Runtime(seq, [np.ndarray[(nd,), bf], np.ndarray[(nd,), bf], np.ndarray[(T * H,), bf],
+                           np.ndarray[(T * H,), bf], np.ndarray[(nw,), bf], np.ndarray[(T * H,), bf],
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(w3)],
+                           [f.prod(tile=Tile(c, 0)) for c, f in enumerate(x3)],
+                           [f.cons(tile=Tile(c, 0)) for c, f in enumerate(o3)]])
+        return Program(NPU2(), rt, workers=workers).resolve_program()
+
+
+__all__ = ["CH", "P_HA", "TB", "InkBlendOperator", "InkGateOperator", "InkMixOperator", "InkResidOperator"]

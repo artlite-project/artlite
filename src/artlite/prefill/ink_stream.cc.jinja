@@ -152,3 +152,98 @@ void {{ p }}_snap(float *__restrict ws, float *__restrict out)
 
 }  // extern "C"
 {% endif %}
+{% if op == "gate" %}
+{% set sig = km.sigmoid(64, prec="bf16") %}
+{{ sig.src }}
+
+extern "C" {
+
+// A token group's panels of the column's heads (a: {{ NP }} bfp16 panels of 8 tokens x 8 channels) times sigmoid of their gates
+// (g: [token 8][{{ 8 * NP }}] bf16) -> out (the panels again)
+void {{ p }}_run(const uint8_t *__restrict a, const bfloat16 *__restrict g, uint8_t *__restrict out)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    al::BIn<> ai((const bfp16ebs8 *)a);
+    al::BOut<> po((bfp16ebs8 *)out);
+    const al::BV I = al::eye();
+    AIE_LOOP_NO_UNROLL
+    for (int db = 0; db < {{ NP }}; db++) {
+        al::MM8 t(aie::zeros<accfloat, 64>());
+        t.mac(ai.pop(), aie::op_transpose(I));  // ([token][channel] fp32)
+        const aie::vector<bfloat16, 64> s = {{ sig }}(al::gather<8, 8>(g + 8 * db, {{ 8 * NP }}));
+        po.push(aie::mul(t.to_accum().template to_vector<float>(), aie::accum<accfloat, 64>(s).template to_vector<float>())
+                    .template to_vector<bfp16ebs8>());
+    }
+}
+
+}  // extern "C"
+{% endif %}
+{% if op == "blend" %}
+// The blend core's workspace (bytes): wp [matrix 2 (F, G)][output tile 9][k block 8][hi, lo] bfp16 panels | gp [k block 8][hi,
+// lo] (a block's g) | c [matrix 2][output tile 9][64] fp32
+{% set sig = km.sigmoid(64, prec="fp32") %}
+{{ sig.src }}
+
+extern "C" {
+
+// Output tile t (matrix t / 9: F, G) of the core's rows of the forget and gain matrices (w: [output 8][64] bf16) -> its hi + lo
+// panels per k block (rows: outputs, columns: k)
+void {{ p }}_prm(const bfloat16 *__restrict w, float *__restrict ws, int32_t t)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    al::BOut<> po((bfp16ebs8 *)(SW(uint8_t, {{ wb.wp }}) + {{ 16 * 72 }} * t));
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < 8; kb++) {
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(al::gather<8, 8>(w + 8 * kb, 64)), nI, h, l);
+        po.push(h);
+        po.push(l);
+    }
+}
+
+// A block of 8 tokens (x: g's halves [token 8][64] fp32 each, then cur_s, msg_s [token 8][{{ C }}] bf16: the column's slices) ->
+// out [token 8][72] bf16 of the core's channels 72 r ..: g = g_a + g_b, F g and G g on the MMUL (g and the rows hi + lo:
+// three products), (1 - tanh(F g)) cur + tanh(G g) msg (tanh = 2 sigmoid(2 x) - 1, fp32)
+void {{ p }}_run(const bfloat16 *__restrict x, float *__restrict ws, bfloat16 *__restrict out, int32_t r)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    const float *__restrict ga = (const float *)x, *__restrict gb = ga + 512;
+    al::BOut<> go((bfp16ebs8 *)SW(uint8_t, {{ wb.gp }}));
+    AIE_LOOP_NO_UNROLL
+    for (int kb = 0; kb < 8; kb++) {  // (g's panel kb: [token 8][k 8])
+        const aie::vector<float, 64> g = aie::add(al::gather<8, 8>(ga + 8 * kb, 64), al::gather<8, 8>(gb + 8 * kb, 64));
+        al::BV h, l;
+        al::split_hilo(aie::accum<accfloat, 64>(g), nI, h, l);
+        go.push(h);
+        go.push(l);
+    }
+    float *__restrict cc = SW(float, {{ wb.c }});
+    AIE_LOOP_NO_UNROLL
+    for (int t = 0; t < 18; t++) {  // (matrix t / 9, output tile t % 9)
+        al::BInR<aie_dm_resource::a> gs((const bfp16ebs8 *)SW(const uint8_t, {{ wb.gp }}));
+        al::BInR<aie_dm_resource::b> ws_((const bfp16ebs8 *)(SW(const uint8_t, {{ wb.wp }}) + {{ 16 * 72 }} * t));
+        al::MM8 c(aie::zeros<accfloat, 64>());
+        for (int kb = 0; kb < 8; kb++) {
+            const al::BV gh = gs.pop(), gl = gs.pop(), wh = ws_.pop(), wl = ws_.pop();
+            al::mm3(c, gh, gl, wh, wl);
+        }
+        aie::store_v(cc + 64 * t, c.template to_vector<float>());
+    }
+    const bfloat16 *__restrict cs = x + 2048 + 72 * r, *__restrict ms = x + 2048 + {{ 8 * C }} + 72 * r;
+    AIE_LOOP_NO_UNROLL
+    for (int j = 0; j < 9; j++) {  // (lane 8 token + o of output tile j)
+        const aie::vector<float, 64> tf = aie::sub(aie::mul({{ sig }}(aie::mul(aie::load_v<64>(cc + 64 * j), 2.0f).template to_vector<float>()), 2.0f).template to_vector<float>(), aie::broadcast<float, 64>(1.0f));
+        const aie::vector<float, 64> tg = aie::sub(aie::mul({{ sig }}(aie::mul(aie::load_v<64>(cc + 576 + 64 * j), 2.0f).template to_vector<float>()), 2.0f).template to_vector<float>(), aie::broadcast<float, 64>(1.0f));
+        const aie::vector<float, 64> c_ = aie::accum<accfloat, 64>(al::gather<8, 8>(cs + 8 * j, {{ C }})).template to_vector<float>();
+        const aie::vector<float, 64> m_ = aie::accum<accfloat, 64>(al::gather<8, 8>(ms + 8 * j, {{ C }})).template to_vector<float>();
+        const aie::vector<float, 64> y = aie::add(al::mulff<64>(aie::sub(aie::broadcast<float, 64>(1.0f), tf), c_), al::mulff<64>(tg, m_));
+        const aie::vector<bfloat16, 64> yb = aie::accum<accfloat, 64>(y).template to_vector<bfloat16>();
+        for (int t = 0; t < 8; t++)
+            aie::store_v(out + 72 * t + 8 * j, yb.template extract<8>(t));
+    }
+}
+
+}  // extern "C"
+{% endif %}

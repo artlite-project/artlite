@@ -96,3 +96,71 @@ def test_ink_resid(T: int, n: int, block: bool, a: int, yp: int, yc: int) -> Non
     win = fused.get_buffer("HIST").view(np.float32).reshape(COLS, 8, C)
     wrows = np.concatenate([win[c, :3] for c in range(COLS)], -1)
     assert np.array_equal(wrows, xp[n:n + 3].astype(np.float32)), "the window: the last 3 valid tokens' inputs"
+
+
+@pytest.mark.parametrize("T", [256, 64])
+def test_ink_gate(T: int) -> None:
+    from artlite.operators import bfp16
+    from artlite.operators.design import COLS
+    from artlite.prefill.ink_stream import InkGateOperator
+
+    op = InkGateOperator(T=T, lq_pitch=896, gate_off=384)
+    fused = FusedOperator(name="ink_gate_test", input_args=["A", "G"], output_args=["O"],
+                          runlist=[(op, "A", "G", "O")]).compile()
+    gen = torch.Generator().manual_seed(T)
+    o = torch.randn(T, COLS * 384, generator=gen).numpy().astype(np.float32)
+    g = (torch.randn(T, COLS * 384, generator=gen) * 3).bfloat16().double().numpy()
+    fused.get_buffer("A")[:] = bfp16.to_panels(o)
+    G = np.zeros((T, COLS * 896), np.float32)
+    for c in range(COLS):
+        G[:, c * 896 + 384:c * 896 + 768] = g[:, 384 * c:384 * (c + 1)]
+    fused.get_buffer("G")[:] = G.astype(bfloat16).reshape(-1)
+    fused.sync_inputs()
+    fused()
+    fused.sync_outputs()
+    got = bfp16.from_panels(fused.get_buffer("O")[:op.n_a], T, COLS * 384).astype(np.float64)
+    want = bfp16.values(o).astype(np.float64) / (1 + np.exp(-g))
+    floor = rel(bfp16.values(want.astype(np.float32)).astype(np.float64), want)
+    err = rel(got, want)
+    print(f"gate {err:.2e} (bfp16 rounding {floor:.2e})")
+    assert err < 1.5 * floor
+
+
+@pytest.mark.parametrize("T", [256, 64])
+def test_ink_blend(T: int) -> None:
+    from artlite.operators.design import COLS
+    from artlite.prefill.ink_stream import InkBlendOperator
+
+    dp, ws = 64, 2 * 288 * 64 + 1024  # (the down halves' layout pitch; a column's ctl objects and a gap)
+    op = InkBlendOperator(T=T, d_pitch=dp, w_stride=ws)
+    fused = FusedOperator(name="ink_blend_test", input_args=["GA", "GB", "CS", "MS", "W"], output_args=["OUT"],
+                          runlist=[(op, "GA", "GB", "CS", "MS", "W", "OUT")]).compile()
+    gen = torch.Generator().manual_seed(T + 1)
+    ga = (torch.randn(T, 64, generator=gen) * 0.5).numpy().astype(np.float32)
+    gb = (torch.randn(T, 64, generator=gen) * 0.5).numpy().astype(np.float32)
+    cs = torch.randn(T, H, generator=gen).bfloat16().double().numpy()
+    ms = torch.randn(T, H, generator=gen).bfloat16().double().numpy()
+    F = (torch.randn(H, 64, generator=gen) * 0.3).bfloat16().double().numpy()
+    G = (torch.randn(H, 64, generator=gen) * 0.3).bfloat16().double().numpy()
+    for name, g in (("GA", ga), ("GB", gb)):  # (column c's 8 outputs at c pitch, fp32 as bf16 pairs)
+        D = np.zeros((T, COLS * dp), np.uint16)
+        for c in range(COLS):
+            D[:, c * dp:c * dp + 16] = g[:, 8 * c:8 * c + 8].copy().view(np.uint16)
+        fused.get_buffer(name).view(np.uint16)[:] = D.reshape(-1)
+    fused.get_buffer("CS")[:] = cs.astype(bfloat16).reshape(-1)
+    fused.get_buffer("MS")[:] = ms.astype(bfloat16).reshape(-1)
+    W = np.zeros((COLS, ws), np.float32)
+    for c in range(COLS):
+        W[c, :288 * 64] = F[288 * c:288 * (c + 1)].reshape(-1)
+        W[c, 288 * 64:2 * 288 * 64] = G[288 * c:288 * (c + 1)].reshape(-1)
+    fused.get_buffer("W")[:] = W.astype(bfloat16).reshape(-1)
+    fused.sync_inputs()
+    fused()
+    fused.sync_outputs()
+    got = fused.get_buffer("OUT").astype(np.float64).reshape(T, H)
+    g = (ga + gb).astype(np.float64)
+    want = (1 - np.tanh(g @ F.T)) * cs + np.tanh(g @ G.T) * ms
+    floor = rel(want.astype(np.float32).astype(bfloat16).astype(np.float64), want)
+    err = rel(got, want)
+    print(f"blend {err:.2e} (bf16 rounding {floor:.2e})")
+    assert err < 1.2 * floor
