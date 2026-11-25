@@ -124,8 +124,9 @@ class AttnOperator(ArtcOperator):
             # full: b) and 64 on per group
             self.iwg = swa_groups(1024, s.pg)
             assert not swa or self.iwg == self.wg
-            self.e_x0 = 1055 + 32 * ((self.m if swa else self.n_pass) - 1)
-            near = self.iwg + 1 + (0 if swa else self.n_pass // self.m)
+            # (one table for every chunk size: a full layer's for 64 passes, a near part of 17 + 32 groups)
+            self.e_x0 = 1055 + 32 * ((self.m if swa else 64) - 1)
+            near = self.iwg + 1 + (0 if swa else 64 // self.m)
             self.e_len = -(-(self.e_x0 - 1055 + 64 * near + 32 + 72 + 32) // 32) * 32
         super().__init__()
 

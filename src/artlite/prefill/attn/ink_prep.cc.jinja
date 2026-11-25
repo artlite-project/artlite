@@ -24,15 +24,17 @@ __attribute__((noinline)) void {{ p }}_clip(float *__restrict v, int n, float th
         aie::store_v(v + i, al::mulff<16>(aie::load_v<16>(v + i), f));
 }
 
-// Token tt's raw row (x: {{ HD }} bf16) into hist slot tt % 8 (a valid token's: tt < n; a padding token's conv reads the slot
-// as it was, its records junk that later tokens overwrite), then its conv: (x + sum_k t_k x_(tt - 3 + k){{ " + sum_lag d_lag x_(tt - lag)" if FULL else "" }})
-// sc -> row
+// Token tt's raw row (x: {{ HD }} bf16) into hist slot tt % 8, then its conv: (x + sum_k t_k x_(tt - 3 + k){{ " + sum_lag d_lag x_(tt - lag)" if FULL else "" }})
+// sc -> row; a padding token (tt >= n) a zero row (its records zero until later tokens overwrite them)
 __attribute__((noinline)) void {{ p }}_conv(const bfloat16 *__restrict x, float *__restrict hist, const bfloat16 *__restrict taps,
                                           float *__restrict row, int tt, int n, float sc)
 {
-    if (tt < n)
-        for (int i = 0; i < {{ HD }}; i += 32)
-            aie::store_v(hist + {{ HD }} * (tt & 7) + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
+    if (tt >= n) {  // (a padding token: zero records, whatever its rows hold: masked keys still weigh 2^-63 in P V)
+        al::zero<{{ HD }}, 16>(row);
+        return;
+    }
+    for (int i = 0; i < {{ HD }}; i += 32)
+        aie::store_v(hist + {{ HD }} * (tt & 7) + i, aie::accum<accfloat, 32>(aie::load_v<32>(x + i)).template to_vector<float>());
 {% if FULL %}
     const float *__restrict dl = (const float *)(x + {{ HD }});
 {% endif %}

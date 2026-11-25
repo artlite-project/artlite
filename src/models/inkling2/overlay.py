@@ -142,6 +142,7 @@ WRAP = 32  # (groups of a sliding-window cache's ring: 2048 positions, its windo
 E_ROWS = 17  # (E_rev's rows: a zero row, then the 16 of the table)
 BLOCK_FLAGS = dict.fromkeys(("sink", "kd", "vd"), B_PAIR | B_F32) | {"k": B_F32, "v": B_F32}
 HIST_ROWS = 8  # (a history window's rows: 3 + S <= 7 written, a read's object past its 3)
+KV_PAD = 2048  # positions past the caches (the last visit's): the prefill's slices of a cache (``prefill.InklingPrefill``)
 CTL = ("q", "k", "v", "ffn")  # (a loop visit's controlled streams, ``InklingConfig.CTRL_STREAMS``)
 # (the image's regions a phase reads, in the A stream's order)
 PHASE_REGIONS = {"q": ("q_norm", "q"), "k": ("k_norm", "k"), "v": ("v_norm", "v"), "o": ("o", "inkf", "inkfq"),
@@ -371,7 +372,7 @@ class InklingOverlay(AttentionOverlay):
         self.att_reg = {(v, h): take("ACT", 2 * SLOTS * XB) for v in self.layers for h in range(self.kv_heads)}
         self.inp = {(v, "o"): [InputRegion(take("ACT", region_bytes(3 * 1024)), 0, 3 * 1024)] for v in self.layers}
         self.rel = {L: take("ACT", E_ROWS * 2 * 1280) for L in self.image.layers}  # (E_rev per layer, ``ink_rel``)
-        self._plan_caches(self.layers, pad=0)
+        self._plan_caches(self.layers, pad=KV_PAD // self.pg * self.G * self.T)  # (the prefill's slices past the last cache)
         self.raw = {v: self._take("KV", self.kv_heads * RING) for v in self.layers}
         self.hist = {(v, i): self._take("KV", COLS * self.HIST) for v in self.layers for i in range(2)}  # (i: 0 attention's)
         if self.ffn:  # per visit the router's metadata object, its route object (and the router drain's other halves:

@@ -22,7 +22,9 @@ The PRM argument per column (``prm``): its KV head's K and V taps [4][hd], its q
 [3][16] scales (bf16). The K and V cores take [old ring K | K taps | old ring V | V taps] once per chunk (stream B,
 split by the memtile), the Q core the clips with each token group's rows (the memtile's six output channels: three
 for A, two for B, one for the records' join). A prep item takes at most 512 tokens (64 token groups: a chained fill's
-repeats; its fills and drains use 15 of a shim tile's 16 BDs). The ring object at the end goes through the records' join as one more group object, its
+repeats; its fills and drains use 15 of a shim tile's 16 BDs): a longer chunk's prep runs as parts (``part`` k: the
+chunk's tokens k T .., its scratchpad parameters named with the suffix k), one after the other (part k + 1 reads the
+ring part k wrote). The ring object at the end goes through the records' join as one more group object, its
 ring parts into RING (strided: [slot][K | V]), the rest into JUNK."""
 
 import numpy as np
@@ -80,8 +82,10 @@ class InkPrepOperator(ArtcOperator):
     pfx = kernel_prefix("pik")
 
     def __init__(self, *, T: int, shape: Shape, lq: Layout, lk: Layout, lv: Layout, full: bool, kv_bytes: int,
-                 tau_positions: int, kv_pad: int = 0, eps: float = 1e-6, kv0: int = 0, wrap: int = 0):
+                 tau_positions: int, kv_pad: int = 0, eps: float = 1e-6, kv0: int = 0, wrap: int = 0, part: int = 0):
         s = shape
+        self.part = part
+        self.sfx = str(part) if part else ""
         assert s.hd == 128 and s.qh == 4 and s.qp == 2 and s.per == 1 and T % s.pg == 0 and T // 8 <= MAX_BD_ITER
         assert {"q", "r", "sink"} <= set(lq.off) and "k" in lk.off and "v" in lv.off
         assert (lk.off.get("kd", 128) == 128 and lv.off.get("vd", 128) == 128) and full == ("kd" in lk.off)
@@ -160,16 +164,18 @@ class InkPrepOperator(ArtcOperator):
                 ArgSpec("out", (self.n_junk,), bfloat16)]
 
     def params(self, p0: int, n: int) -> dict[str, int]:
-        """The scratchpad parameters of a chunk at position p0 (a group start) of n valid tokens."""
-        s = self.shape
-        assert p0 % s.pg == 0 and 1 <= n <= self.T and p0 + self.T <= self.tau_positions
+        """The scratchpad parameters of a chunk at position p0 (a group start) of n valid tokens (this part's: its
+        tokens from p0 + part T, of which n - part T valid)."""
+        s, x = self.shape, self.sfx
+        p0, n = p0 + self.part * self.T, min(n - self.part * self.T, self.T)
+        assert p0 % s.pg == 0 and 1 <= n and p0 + self.T <= self.tau_positions, (p0, n)
         g = p0 // s.pg
         if self.wrap:
             assert g % self.wrap + self.T // s.pg <= self.wrap, (p0, self.T, "a chunk across the ring's wrap")
-            kv = {P_KVR: s.group // 2 * (g % self.wrap)}
+            kv = {P_KVR + x: s.group // 2 * (g % self.wrap)}
         else:
-            kv = {P_KV: s.group // 2 * g}
-        return kv | {P_TAU: 2 * p0, P_N: n}
+            kv = {P_KV + x: s.group // 2 * g}
+        return kv | {P_TAU + x: 2 * p0, P_N + x: n}
 
     # ------------------------------------------------------------------
     # Design
@@ -194,8 +200,9 @@ class InkPrepOperator(ArtcOperator):
         k_vprm = Kernel(f"{p}_vprm", "kernel.o", [kvb_ty, wsv])
         k_kring = Kernel(f"{p}_kring", "kernel.o", [wsk, kg_ty])
         k_vring = Kernel(f"{p}_vring", "kernel.o", [wsv, vg_ty])
-        p_tau, p_n = ScratchpadParameter(P_TAU, np.int32), ScratchpadParameter(P_N, np.int32)
-        p_kv = ScratchpadParameter(P_KVR if self.wrap else P_KV, np.int32)
+        x = self.sfx
+        p_tau, p_n = ScratchpadParameter(P_TAU + x, np.int32), ScratchpadParameter(P_N + x, np.int32)
+        p_kv = ScratchpadParameter((P_KVR if self.wrap else P_KV) + x, np.int32)
         n_tg, rg, n_grp = T // 8, s.rg, T // s.pg
 
         # per column and token group [Q rows, clips, tau | K rows | V rows], split in the memtile

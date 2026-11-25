@@ -1,0 +1,442 @@
+"""The prefill of an Inkling 2 model: a prompt chunk of T tokens through the visits on the decode overlay's buffers
+(``overlay.InklingOverlay``: the weight image, the visits' KV caches, raw rings and history windows), so that the decode
+continues from what the chunk leaves; the prompt's last token runs as a decode step (``ChunkPrefill.plan``).
+
+The residual stream (fp32 token rows, the prefill's buffers): E (the normed embedding), P (the prelude's output), M0 /
+X0 and M1 / X1 (a pass's mid-core block state and output: the next pass's bank, alternating), CD (the coda's cur). A
+visit's states for its mixes are the block states before it and cur (``ref.Model.walk``'s order of buffers: a block
+visit's input becomes a block state, its output starts a new cur; a pass restarts from P and the prelude's blocks).
+
+Per visit v of physical layer L (``prefill.ink_stream``, ``prefill.attn``, ``prefill.gemm``), in sub-chunks of ``SUB``
+tokens where the operator works row by row:
+
+- the attention inputs: visit 0 its embedding rows (bf16, EB); else the depth mix of its states with the layer's query
+  (1, a full layer 3: x_q, x_k, x_v; ``InkMixOperator``) -> XM rows; a loop visit after the first pass: per stream s
+  (q, k, v) its message (the mix of the bank with the message query s) MS, the controller's down halves (the norms
+  without weights -> DP panels, the GEMMs d<s>a / d<s>b -> GA / GB), the blend (``InkBlendOperator``) -> XC rows;
+- the norms (the layer's attention norms; ``PrefillNormOperator``) -> XN panels, the q / k / v GEMMs -> GQ / GK / GV;
+- the prep (``prefill.attn.ink.InkPrepOperator``: QS, the visit's records, its raw ring), the attention
+  (``AttnOperator(ink=True)``) -> A, the gate (``InkGateOperator``), o -> Y;
+- the post conv and the residual (``InkResidOperator``: the chunk's rows at once, the visit's history window 0);
+- the FFN: the FFN mix (and a loop visit's controller), its norm, the MoE, the FFN's post conv (history window 1).
+
+``ffn`` False: the visits' attention parts only (the decode overlay's ``ffn=False`` slices: tests).
+"""
+
+from types import SimpleNamespace
+
+import numpy as np
+from ml_dtypes import bfloat16
+
+from artlite.model_config import InklingConfig
+from artlite.operators.design import COLS
+from artlite.operators.util import arg_bytes
+from artlite.prefill import attn as PA
+from artlite.prefill import gemm as PG
+from artlite.prefill.attn.ink import RING_BYTES, InkPrepOperator, ink_shape
+from artlite.prefill.chunks import ChunkPrefill
+from artlite.prefill.ink_stream import InkBlendOperator, InkGateOperator, InkMixOperator, InkResidOperator
+from artlite.prefill.norm import PrefillNormOperator
+
+from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
+
+SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
+SMALL = (64, 128)  # chunk sizes of operators of their own
+SIZES = SMALL + tuple(range(SUB, 1024 + 1, SUB))  # chunk sizes (a sliding-window ring: a chunk and its window in one turn)
+PREP_T = 512  # tokens of a prep item at most (its chained fills)
+CTL = ("q", "k", "v")  # a loop visit's controlled attention streams
+# the time model's constants (``layer_seconds``): a ConfigureOp, per sub-chunk a byte of a visit's weights
+CFG_S, WEIGHT_S = 0.12e-3, 3.69e-11
+
+
+class InklingPrefill(ChunkPrefill):
+    """The prefill of an overlay's visits in chunks of the sizes ``sizes`` (module docstring); ``run`` runs one."""
+
+    SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, SIZES[-1], "inkling_prefill", KV_PAD
+    MIN_TOKENS = 3  # (the post convs' windows: the chunk's last 3 valid tokens' inputs)
+    CFG_S, WEIGHT_S = CFG_S, WEIGHT_S
+
+    def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True):
+        ov = overlay
+        assert not ffn or ov.ffn, "the overlay's FFNs"
+        super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0))
+        cfg = self.cfg
+        self.ffn = ffn
+        self.layers = list(ov.layers)  # (the visits: ``ChunkPrefill``'s layers)
+        self.kv_layers = list(self.layers)
+        self.vis = {v: cfg.visits[v] for v in self.layers}
+        self.shape = ink_shape(ov.T, ov.kp)
+        self.group = self.shape.pg
+        self.guard = PA.mode.swa_groups(cfg.sliding_window, self.shape.pg)
+        assert self.guard == ov.guard and ov.kinds[0].wrap == 0, "linear sliding-window caches (a chunk past a ring's turn)"
+        self.walk = self._walk()
+        self._gemms: dict = {}
+        self._starts: dict[int, list[int]] = {}
+        self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
+        self.kinds = sorted({x.kind for x in self.vis.values()})
+        self.attn = {(k, T): self._attn(k, T) for k in self.kinds for T in self.sizes}
+        self.preps = {(k, T): self._preps(k, T) for k in self.kinds for T in self.sizes}
+        self.resid = {(T, b): InkResidOperator(T=T, block=b, y_pitch=COLS * self.sz[self._t(T)].d_pitch,
+                                               y_col=self.sz[self._t(T)].d_pitch, hist_rows=HIST_ROWS)
+                      for T in self.sizes for b in (False, True)}
+        self._rows()
+        self._library()
+
+    # ------------------------------------------------------------------
+    # The visits' states
+    # ------------------------------------------------------------------
+
+    def _walk(self) -> dict[int, SimpleNamespace]:
+        """Per visit its states' buffers (``ref.Model.walk``): ``blocks`` (the block states before it), ``cur``, ``new``
+        (a block visit's output state), ``bank`` (a pass after the first: the previous pass's [M, X])."""
+        cfg = self.cfg
+        cur, blocks, out = "E", [], {}
+        prelude: tuple[str, list[str]] | None = None
+        mid = cfg.core_start + cfg.block_size
+        for v, x in enumerate(cfg.visits):
+            bank = None
+            if x.loop >= 0 and x.layer == cfg.core_start:
+                if x.loop == 0:
+                    prelude = cur, list(blocks)
+                else:
+                    w = (x.loop - 1) % 2
+                    bank = [f"M{w}", f"X{w}"]
+                    cur, blocks = prelude[0], list(prelude[1])
+            if x.loop >= 1:
+                bank = [f"M{(x.loop - 1) % 2}", f"X{(x.loop - 1) % 2}"]
+            new = None
+            if x.block:
+                new = "P" if x.layer == 0 else f"M{x.loop % 2}" if x.layer == cfg.core_start else \
+                    f"X{x.loop % 2}" if x.layer == mid else "CD"
+            out[v] = SimpleNamespace(blocks=list(blocks), cur=cur, new=new, bank=bank)
+            if x.block:
+                blocks.append(cur)
+                cur = new
+        return out
+
+    # ------------------------------------------------------------------
+    # The operators
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _t(T: int) -> int:
+        return min(T, SUB)
+
+    def _attn(self, kind: str, T: int) -> PA.AttnOperator:
+        """The attention of a kind over T tokens: sliding-window caches after their guard; full ones read 16 groups
+        before group 0 (the near part's, skipped there: the argument starts that far before the cache)."""
+        s, ov = self.shape, self.ov
+        kv0 = self.guard * s.group
+        first = next(v for v in self.layers if self.vis[v].kind == kind)
+        return PA.AttnOperator(T=T, shape=s, kv_bytes=ov.kv_bytes(first), kv_pad=self.pad, sub=min(T, PREP_T),
+                               swa=self.cfg.sliding_window if kind == "swa" else 0, kv0=kv0, ink=True)
+
+    def _preps(self, kind: str, T: int) -> list[InkPrepOperator]:
+        """The prep of a kind over a chunk of T tokens: one item up to ``PREP_T`` tokens, else parts of T / 2."""
+        pt = T if T <= PREP_T else T // 2
+        assert pt <= PREP_T and pt % self.shape.pg == 0, T
+        v = next(v for v in self.layers if self.vis[v].kind == kind)
+        plans, ov = self.sz[self._t(T)].plans, self.ov
+        L = self.vis[v].layer
+        return [InkPrepOperator(T=pt, shape=self.shape, lq=plans[(L, "q")].layout, lk=plans[(L, "k")].layout,
+                                lv=plans[(L, "v")].layout, full=kind == "full", kv_bytes=ov.kv_bytes(v),
+                                tau_positions=ov.max_positions + self.MAX_T, kv_pad=self.pad, eps=self.cfg.rms_norm_eps,
+                                kv0=self.guard * self.shape.group, part=k) for k in range(T // pt)]
+
+    @property
+    def pad(self) -> int:
+        """Bytes the attention's and the prep's KV arguments reach past a visit's caches (the overlay's padding)."""
+        return KV_PAD // self.shape.pg * self.shape.group
+
+    def _size_ops(self, t: int) -> SimpleNamespace:
+        """The operators of sub-chunks of t tokens: the GEMM plans, the norms, the mixes (per state count), the
+        controllers' blends, the gates."""
+        cfg, img, H = self.cfg, self.img, self.H
+        dp = PG.d_pitch(img, t)
+        plans = {}
+        for v in self.layers:
+            L = self.vis[v].layer
+            names = ["q", "k", "v", "o"] + ([f"d{s}{h}" for s in CTL for h in "ab"] if self.vis[v].messages else [])
+            for n in names:
+                if (L, n) not in plans:
+                    plans[(L, n)] = PG.plan_phase(img, img.region(L, n), t, pitch=dp if n == "o" else 0, ops=self._gemms)
+        eps = cfg.rms_norm_eps
+        cols = 4 if t < SUB else COLS
+        mixes = {n: InkMixOperator(T=t, n=n, H=H) for n in range(1, 8)}
+        lq = plans[(self.vis[self.layers[0]].layer, "q")].layout
+        dl = next((p.layout for (_, n), p in plans.items() if n == "dqa"), None)
+        return SimpleNamespace(
+            plans=plans, d_pitch=dp, mixes=mixes,
+            norm=PrefillNormOperator(T=t, add=False, E=H, eps=eps, cols=cols),
+            norm1=PrefillNormOperator(T=t, add=False, E=H, eps=InklingConfig.MIX_EPS, cols=cols),
+            gate=InkGateOperator(T=t, lq_pitch=lq.pitch, gate_off=lq.off["gate"]),
+            blend=InkBlendOperator(T=t, d_pitch=dl.pitch, w_stride=img.region(self._loop_layer(), "ctl_q").col_stride // 2)
+            if dl is not None else None)
+
+    def _loop_layer(self) -> int:
+        return next(self.vis[v].layer for v in self.layers if self.vis[v].messages)
+
+    # ------------------------------------------------------------------
+    # The runlists
+    # ------------------------------------------------------------------
+
+    def _rows(self) -> None:
+        """Bytes per token of the chunk's buffers; the static buffers' layouts (``_bind``)."""
+        H = self.H
+        t = max(self.sz)
+        o = self.sz[t]
+        lq = next(p.layout for (_, n), p in o.plans.items() if n == "q")
+        lk = max((p.layout for (_, n), p in o.plans.items() if n == "k"), key=lambda lay: lay.N)
+        lv = max((p.layout for (_, n), p in o.plans.items() if n == "v"), key=lambda lay: lay.N)
+        self.rb = {s: 4 * H for s in ("E", "P", "M0", "X0", "M1", "X1", "CD")}
+        self.rb |= {"EB": 2 * H, "XM0": 2 * H, "XM1": 2 * H, "XM2": 2 * H, "MS": 2 * H, "XC0": 2 * H, "XC1": 2 * H,
+                    "XC2": 2 * H, "XN0": 9 * H // 8, "XN1": 9 * H // 8, "XN2": 9 * H // 8, "DP": 9 * H // 8,
+                    "GQ": 2 * lq.N, "GK": 2 * lk.N, "GV": 2 * lv.N, "A": 9 * COLS * 3 * 128 // 8,
+                    "Y": 2 * COLS * o.d_pitch, "QS": COLS * self.shape.tgu // 8}
+        dl = next((p.layout for (_, n), p in o.plans.items() if n == "dqa"), None)
+        if dl is not None:
+            self.rb |= {"GA": 2 * dl.N, "GB": 2 * dl.N}
+        # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ffn] x H bf16), its queries (QR: the
+        # attention's 3 rows (one used by a sliding-window layer), the FFN's, the 4 messages' x H fp32), its prep's PRM,
+        # its E table (EB), its post convs' taps (TP: [2][COLS][4][C] bf16); TAU per position
+        phys = sorted({x.layer for x in self.vis.values()})
+        self.phys = {L: i for i, L in enumerate(phys)}
+        prep = next(iter(self.preps.values()))[0]
+        self.np_w, self.qr_w, self.prm_w = 4 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
+        self.e_w = {k: 2 * self.attn[(k, self.sizes[-1])].n_e for k in self.kinds}
+        self.tp_w = 2 * 2 * COLS * 4 * (H // COLS)
+
+    def _np(self, L: int, j: int) -> str:
+        o = self.phys[L] * self.np_w + j * 2 * self.H
+        return f"NP[{o}:{o + 2 * self.H}]"
+
+    def _qr(self, L: int, j: int) -> str:
+        o = self.phys[L] * self.qr_w + j * 4 * self.H
+        return f"QR[{o}:{o + 4 * self.H}]"
+
+    def _prm(self, L: int, op: InkPrepOperator) -> str:
+        o = self.phys[L] * self.prm_w
+        return f"PRM[{o}:{o + arg_bytes(op, 4)}]"
+
+    def _eb(self, L: int, op: PA.AttnOperator) -> str:
+        o = self.phys[L] * max(self.e_w.values())
+        return f"ET[{o}:{o + arg_bytes(op, 3)}]"
+
+    def _tp(self, L: int, i: int, op: InkResidOperator) -> str:
+        o = self.phys[L] * self.tp_w + i * self.tp_w // 2
+        return f"TP[{o}:{o + arg_bytes(op, 2 if op.block else 3)}]"
+
+    def _runlist(self, S: int) -> list[tuple]:
+        return self._runlist_of(S * SUB)
+
+    def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
+        assert not packed and not tree, "Inkling: no packed chunks"
+        ov, sl, img = self.ov, self._sl, self.img
+        t = self._t(T)
+        S, o = T // t, self.sz[t]
+
+        def tok(buf: str, j: int, op: object, *, i: int, row: int = 0, extra: int = 0) -> str:
+            return sl(buf, j * t * (row or self.rb[buf]) + extra, op, i=i)
+
+        rl: list[tuple] = []
+        starts = []
+        for v in self.layers:
+            starts.append(len(rl))
+            x, w = self.vis[v], self.walk[v]
+            L = x.layer
+            full = x.kind == "full"
+            states = w.blocks + [w.cur]
+            inputs = []  # (per stream: its rows' buffer, its norm weight's index)
+            if not x.queries:  # (layer 0: the normed embedding itself)
+                inputs = [("EB", 0)]
+            else:
+                for j in range(3 if full else 1):
+                    mx = o.mixes[len(states)]
+                    rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, j),
+                            tok(f"XM{j}", jj, mx, i=len(states) + 1)) for jj in range(S)]
+                    inputs.append((f"XM{j}", j if full else 0))
+            if x.messages:  # (per stream its message, the controller's down halves, the blend)
+                bl, mx2 = o.blend, o.mixes[2]
+                ctl = []
+                for si, s in enumerate(CTL):
+                    xs = inputs[si if full else 0][0]
+                    rl += [(mx2, tok(w.bank[0], jj, mx2, i=0), tok(w.bank[1], jj, mx2, i=1), self._qr(L, 4 + si),
+                            tok("MS", jj, mx2, i=3)) for jj in range(S)]
+                    for h, src in (("a", xs), ("b", "MS")):
+                        nm = o.norm1
+                        rl += [(nm, tok(src, jj, nm, i=0), self._np(L, 3), tok("DP", jj, nm, i=2)) for jj in range(S)]
+                        p = o.plans[(L, f"d{s}{h}")]
+                        rl += [(g.op, tok("DP", jj, g.op, i=0), self._w(g), tok(f"G{h.upper()}", jj, g.op, i=2))
+                               for g in p.gemms for jj in range(S)]
+                    reg = img.region(L, f"ctl_{s}")
+                    wsl = f"W[{reg.offset}:{reg.offset + arg_bytes(bl, 4)}]"
+                    rl += [(bl, tok("GA", jj, bl, i=0), tok("GB", jj, bl, i=1), tok(xs, jj, bl, i=2), tok("MS", jj, bl, i=3),
+                            wsl, tok(f"XC{si}", jj, bl, i=5)) for jj in range(S)]
+                    ctl.append((f"XC{si}", si if full else 0))
+                inputs = ctl
+            nm = o.norm
+            for j, (src, ni) in enumerate(inputs):
+                rl += [(nm, tok(src, jj, nm, i=0), self._np(L, ni), tok(f"XN{j}", jj, nm, i=2)) for jj in range(S)]
+            gr = {}  # (per GEMM output its rows' bytes: the visit's own layout)
+            for n, g_buf in (("q", "GQ"), ("k", "GK"), ("v", "GV")):
+                xn = f"XN{min('qkv'.index(n), len(inputs) - 1)}"
+                gr[g_buf] = 2 * o.plans[(L, n)].layout.N
+                rl += [(g.op, tok(xn, jj, g.op, i=0), self._w(g), tok(g_buf, jj, g.op, i=2, row=gr[g_buf]))
+                       for g in o.plans[(L, n)].gemms for jj in range(S)]
+            ring = f"KV[{ov.raw[v]}:{ov.raw[v] + COLS * RING_BYTES}]"
+            for b, prep in enumerate(self.preps[(x.kind, T)]):  # (its parts in order: each reads the ring before it)
+                pt = prep.T
+                rl.append((prep, *(tok(b_, 0, prep, i=i, extra=b * pt * gr[b_]) for i, b_ in enumerate(("GQ", "GK", "GV"))),
+                           sl("TAU", 0, prep, i=3), self._prm(L, prep),
+                           tok("QS", 0, prep, i=5, extra=b * pt * self.rb["QS"]), self._kv(v, prep, 6), ring,
+                           sl("JUNK", 0, prep, i=8)))
+            at = self.attn[(x.kind, T)]
+            rl.append((at, sl("QS", 0, at, i=0), self._kv(v, at, 1), sl("A", 0, at, i=2), self._eb(L, at)))
+            gt = o.gate
+            rl += [(gt, tok("A", jj, gt, i=0), tok("GQ", jj, gt, i=1, row=gr["GQ"]), tok("A", jj, gt, i=2)) for jj in range(S)]
+            (g,) = o.plans[(L, "o")].gemms
+            rl += [(g.op, tok("A", jj, g.op, i=0), self._w(g), tok("Y", jj, g.op, i=2)) for jj in range(S)]
+            rs = self.resid[(T, bool(x.block))]
+            hist = f"KV[{ov.hist[(v, 0)]}:{ov.hist[(v, 0)] + arg_bytes(rs, 2 if rs.block else 3)}]"
+            dst = w.new if x.block else w.cur
+            args = [sl("Y", 0, rs, i=0)] + ([] if rs.block else [sl(w.cur, 0, rs, i=1)])
+            rl.append((rs, *args, self._tp(L, 0, rs), hist, sl(dst, 0, rs, i=len(args) + 2)))
+            if self.ffn:
+                raise NotImplementedError("Inkling's prefill FFN (the MoE: S4b)")
+        self._starts[T] = [*starts, len(rl)]
+        return rl
+
+    def _kv(self, v: int, op: object, i: int) -> str:
+        """Visit v's caches as the argument i of the prep / attention: from its kv0 before the cache (a full visit's 16
+        groups: the near part's reads before group 0, skipped)."""
+        ov = self.ov
+        full = self.vis[v].kind == "full"
+        o = ov.kv_off[v] - (self.guard * self.shape.group if full else 0)
+        return f"KV[{o}:{o + arg_bytes(op, i)}]"
+
+    def _layer_starts(self, T: int) -> list[int]:
+        return self._starts[T]
+
+    # ------------------------------------------------------------------
+    # Buffers
+    # ------------------------------------------------------------------
+
+    def _own_sizes(self, own: dict[str, int]) -> None:
+        for name, r in self.rb.items():  # (the GEMMs' padding rows past the last sub-chunk)
+            if name in own:
+                own[name] = max(own[name], (self.sizes[-1] + 64) * r)
+        n = len(self.phys)
+        own["NP"] = max(own.get("NP", 0), n * self.np_w)
+        own["QR"] = max(own.get("QR", 0), n * self.qr_w)
+        own["PRM"] = max(own.get("PRM", 0), n * self.prm_w)
+        own["ET"] = max(own.get("ET", 0), n * max(self.e_w.values()))
+        own["TP"] = max(own.get("TP", 0), n * self.tp_w)
+
+    def _bind(self) -> None:
+        """The norm weights (NP), queries (QR), the preps' constants (PRM), the E tables (EB), the post convs' taps (TP),
+        tau per position (TAU)."""
+        dev, H, g, cfg = self.ov.dev, self.H, self.ov.gguf, self.cfg
+        C = H // COLS
+
+        def vec(name: str) -> np.ndarray:
+            return np.asarray(g.tensor(name).dequantize(), np.float32).reshape(-1)
+
+        npb, qr = dev.view("NP"), dev.view("QR")
+        prm, eb, tp = dev.view("PRM"), dev.view("ET"), dev.view("TP")
+        prep = next(iter(self.preps.values()))[0]
+        for L, i in self.phys.items():
+            b = f"blk.{L}."
+            full = cfg.kinds[L] == "full"
+            norms = [b + f"attn_{n}_inp_norm.weight" for n in "qkv"] if full else [b + "attn_norm.weight"] * 3
+            ws = [vec(n) for n in norms] + [np.ones(H, np.float32)]
+            for j, wv in enumerate(ws):  # (index 3: ones, the controllers' downs' norms)
+                o = i * self.np_w + j * 2 * H
+                npb[o:o + 2 * H] = wv.astype(bfloat16).view(np.uint8)
+            q = np.zeros((8, H), np.float32)
+            if L > 0:
+                rq = vec(b + "attn_res_query.weight").reshape(-1, H)
+                q[:len(rq)] = rq
+            q[3] = vec(b + "ffn_res_query.weight")
+            if cfg.core_start <= L < cfg.core_end:
+                q[4:8] = cfg.msg_queries(g, L)
+            qr[i * self.qr_w:(i + 1) * self.qr_w] = q.view(np.uint8).reshape(-1)
+            qc = vec(b + "attn_q_clip.weight").reshape(-1, 128)
+            rc = vec(b + "attn_rel_clip.weight").reshape(-1, cfg.rel_length)
+            kt = vec(b + "attn_k_conv.weight").reshape(-1, cfg.conv_taps).T
+            vt = vec(b + "attn_v_conv.weight").reshape(-1, cfg.conv_taps).T
+            pb = prep.prm(qc, rc, kt, vt)
+            prm[i * self.prm_w:i * self.prm_w + pb.size] = pb
+            E = vec(b + "attn_rel_bias.weight").reshape(-1, cfg.rel_length).T  # (16, extent)
+            at = self.attn[("full" if full else "swa", self.sizes[-1])] if (("full" if full else "swa"), self.sizes[-1]) in self.attn \
+                else next(iter(self.attn.values()))
+            e = at.e_table(E).view(np.uint8)
+            eb[i * max(self.e_w.values()):][:e.size] = e
+            for k, name in enumerate((b + "attn_post_conv.weight", b + "ffn_post_conv.weight")):
+                taps = vec(name).reshape(-1, cfg.conv_taps).T  # (4, H)
+                t4 = np.ascontiguousarray(np.stack([taps[:, C * c:C * (c + 1)] for c in range(COLS)]).astype(bfloat16))
+                o = i * self.tp_w + k * self.tp_w // 2
+                tp[o:o + t4.nbytes] = t4.view(np.uint8).reshape(-1)
+        tau = cfg.tau(np.arange(self.own["TAU"] // 4)).astype(np.float32)
+        dev.view("TAU")[:tau.nbytes] = tau.view(np.uint8)
+        for name in ("NP", "QR", "PRM", "ET", "TP", "TAU"):
+            dev.flush(name)
+        for name in ("QS",):  # (the INK unit's slot of a query block's fourth row block: zero where nothing writes)
+            dev.view(name)[:] = 0
+            dev.flush(name)
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+
+    def params(self, T: int, p0: int, n: int) -> dict[str, int]:
+        """The scratchpad parameters of a chunk of size T at position p0 of n valid tokens."""
+        out = {}
+        for k in self.kinds:
+            for prep in self.preps[(k, T)]:
+                out |= prep.params(p0, n)
+            out |= self.attn[(k, T)].params(p0)
+        a = p0 - 3 - self.ov._hbase[self.ov.seq]  # (the conv histories' first row in the windows)
+        out |= self.resid[(T, False)].params(n, a)
+        return out
+
+    def run(self, e: np.ndarray, p0: int, T: int = 0) -> None:
+        """A chunk of size T (default: the smallest that holds e) at p0: e (n, hidden) the tokens' normed embeddings
+        (the first visit's input state). Leaves the visits' K / V of the positions in the caches, the raw rings and the
+        history windows the decode continues from, the last visit's output in its state."""
+        ov, dev = self.ov, self.ov.dev
+        n = e.shape[0]
+        T = self._size(n, p0, T)
+        H = self.H
+        if "E" in self.own:  # (the mixes' state 0; a slice of visit 0 alone reads only EB)
+            ev = dev.view("E")[:4 * T * H].view(np.float32).reshape(T, H)
+            ev[:n], ev[n:] = e, 0
+            dev.flush("E", 0, 4 * T * H)
+        eb = dev.view("EB")[:2 * T * H].view(bfloat16).reshape(T, H)
+        eb[:n], eb[n:] = e.astype(bfloat16), 0
+        dev.flush("EB", 0, 2 * T * H)
+        self._launch(T, p0, self.params(T, p0, n), None)
+        dev.stale = True  # (the chunk's configurations replaced the attention cores' code pages)
+        ov._hbase[ov.seq] = p0 + n - 3  # (the windows' rows 0 .. 2: the chunk's last 3 valid tokens')
+
+    def state(self, name: str, i: int, n: int) -> np.ndarray:
+        """Rows i .. i + n - 1 (n, hidden) fp32 of a state buffer the last chunk left."""
+        dev, H = self.ov.dev, self.H
+        dev.fetch(name, 4 * i * H, 4 * n * H)
+        return dev.view(name)[4 * i * H:4 * (i + n) * H].view(np.float32).reshape(n, H).copy()
+
+    # ------------------------------------------------------------------
+    # Time estimates
+    # ------------------------------------------------------------------
+
+    def layer_seconds(self, L: int, p0: int, S: float = 1) -> float:
+        """(per sub-chunk the visit's attention weights' bytes, WEIGHT_S each; CFG_S per ConfigureOp; the attention as
+        its window's records)"""
+        x = self.vis[L]
+        b = sum(self.img.region(x.layer, n).nbytes for n in ("q", "k", "v", "o"))
+        return S * WEIGHT_S * b + self.layer_configs(L) * CFG_S + 1e-3 * S
+
+    def layer_configs(self, L: int) -> int:
+        return 12 + (16 if self.vis[L].messages else 0)
+
+
+__all__ = ["SIZES", "InklingPrefill"]

@@ -133,7 +133,8 @@ def replay_design(op: "PrefillNormOperator") -> Module:
         for c in range(op.cols):
             # w as a group-shaped object (8 copies; pre: w1's, then w2's)
             nw = 2 if pre else 1
-            wr = 1024 if E % 1024 == 0 else 512  # (a shim BD's rows of at most 1023 words)
+            wr = 1024 if E % 1024 == 0 else 512 if E % 512 == 0 else 768  # (a shim BD's rows of at most 1023 words;
+            # 768: Inkling's hidden 2304)
             xh[c].fill(w, TensorAccessPattern((nw * E,), 0, [nw, 8, E // wr, wr], [E if pre else 0, 0, wr, 1]),
                        group=tg)
             xh[c].fill(x, groups(c), group=tg)

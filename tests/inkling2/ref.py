@@ -244,10 +244,10 @@ class Model:
         return rms(x, self.cfg.rms_norm_eps) * self.vec("token_embd_norm.weight")
 
     def visit(self, v: Visit, cur: Tensor, blocks: list[Tensor], cache: VisitCache, p0: int,
-              messages: Tensor | None = None) -> Tensor:
+              messages: Tensor | None = None, *, ffn: bool = True) -> Tensor:
         """One visit of the tokens' rows ``cur`` (T, H) at positions p0 .. with the completed block states ``blocks``
         (appended to where the layer begins a block) and the visit's cache; ``messages`` (T, 4, H): the loop's passes
-        after the first. Returns the visit's output (the next residual)."""
+        after the first. Returns the visit's output (the next residual; ``ffn`` False: its attention part's)."""
         c, L, s = self.cfg, v.layer, v.slot
         b, T, eps = f"blk.{L}.", cur.shape[0], c.rms_norm_eps
         hd, kvh, nh = c.head_dim, c.num_key_value_heads, c.num_attention_heads
@@ -294,6 +294,8 @@ class Model:
         else:
             cur = cur + o
         self._keep("ffn_inp", s, cur)
+        if not ffn:
+            return cur
         x = self.mix(blocks, cur, self.w(b + "ffn_res_query.weight"))[:, 0]
         if messages is not None:
             x = self.control(L, "ffn", x, messages[:, 3])
