@@ -1,0 +1,154 @@
+// Inkling's residual stream in the prefill (``prefill.ink_stream``).
+#define SW(T, off) ((T *)((uint8_t *)ws + (off)))
+{% if op == "mix" %}
+// The mix core's workspace (bytes): qh, ql [{{ H }}] bf16 (the query's hi and lo parts) | acc [state {{ N }}][ss, dot][16] fp32 |
+// cf [16] fp32 (per state its coefficient: lanes 0 .. {{ N - 1 }})
+{% set exps = km.exp2(16, prec="fp32") %}
+{{ exps.src }}
+
+extern "C" {
+
+// The mix's query (q: [{{ H }}] fp32 as bf16 pairs) -> its hi and lo parts
+void {{ p }}_q(const bfloat16 *__restrict q, float *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict qf = (const float *)q;
+    bfloat16 *__restrict qh = SW(bfloat16, {{ w.qh }}), *__restrict ql = SW(bfloat16, {{ w.ql }});
+    for (int i = 0; i < {{ H }}; i += 16) {
+        aie::vector<bfloat16, 16> h, l;
+        al::split2<16>(aie::load_v<16>(qf + i), h, l);
+        aie::store_v(qh + i, h);
+        aie::store_v(ql + i, l);
+    }
+}
+
+// Pass A, chunk k of a token's states (x: [state {{ N }}][{{ CH }}] fp32): per state its sum of squares and its dot with the
+// query (hi + lo products, three)
+void {{ p }}_a(const bfloat16 *__restrict x, float *__restrict ws, int32_t k)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict acc = SW(float, {{ w.acc }});
+    if (k == 0)
+        al::zero<{{ 32 * N }}, 16>(acc);
+    const bfloat16 *__restrict qh = SW(const bfloat16, {{ w.qh }}) + {{ CH }} * k, *__restrict ql = SW(const bfloat16, {{ w.ql }}) + {{ CH }} * k;
+    const float *__restrict xf = (const float *)x;
+    for (int b = 0; b < {{ N }}; b++) {
+        aie::accum<accfloat, 16> ss(aie::load_v<16>(acc + 32 * b)), dt(aie::load_v<16>(acc + 32 * b + 16));
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < {{ CH }}; i += 16) {
+            aie::vector<bfloat16, 16> h, l;
+            al::split2<16>(aie::load_v<16>(xf + {{ CH }} * b + i), h, l);
+            ss = aie::mac(aie::mac(aie::mac_square(ss, h), aie::add(h, h), l), l, l);
+            const aie::vector<bfloat16, 16> a = aie::load_v<16>(qh + i), c = aie::load_v<16>(ql + i);
+            dt = aie::mac(aie::mac(aie::mac(dt, h, a), l, a), h, c);
+        }
+        aie::store_v(acc + 32 * b, ss.template to_vector<float>());
+        aie::store_v(acc + 32 * b + 16, dt.template to_vector<float>());
+    }
+}
+
+// The coefficients: per state b r_b = sqrt(ss_b / {{ H }} + eps), score_b = dot_b / r_b / sqrt({{ H }}) (log2 units), w = softmax(score),
+// c_b = w_b / r_b (lane b; the scalar unit has no floating point: every value through vector lanes)
+void {{ p }}_c(float *__restrict ws)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict acc = SW(const float, {{ w.acc }});
+    aie::vector<float, 16> ss = aie::zeros<float, 16>(), dt = aie::zeros<float, 16>();
+    for (int b = 0; b < {{ N }}; b++) {
+        ss[b] = aie::reduce_add(aie::load_v<16>(acc + 32 * b));
+        dt[b] = aie::reduce_add(aie::load_v<16>(acc + 32 * b + 16));
+    }
+    const aie::vector<float, 16> ir = al::inv_rms<{{ H }}, {{ N }}>(ss, {{ eps }}f);  // (1 / r_b, lanes past N 0)
+    aie::vector<float, 16> sc = al::mulff<16>(al::mulff<16>(dt, ir), aie::broadcast<float, 16>({{ SC }}f));
+    float mx = sc[0];
+    for (int b = 1; b < {{ N }}; b++)
+        mx = aie::max(sc, aie::broadcast<float, 16>(mx))[b];
+    aie::vector<float, 16> e = {{ exps }}(aie::sub(sc, aie::broadcast<float, 16>(mx)));
+    aie::vector<float, 16> m = aie::zeros<float, 16>();
+    for (int b = 0; b < {{ N }}; b++)
+        m[b] = e[b];
+    aie::vector<float, 16> s = aie::broadcast<float, 16>(aie::reduce_add(m));
+    const aie::vector<float, 16> inv = aie::inv(s);
+    aie::store_v(SW(float, {{ w.cf }}), al::mulff<16>(al::mulff<16>(m, inv), ir));
+}
+
+// Pass B, chunk k: x = sum_b c_b s_b (fp32 products, hi + lo) -> bf16 into the token's row out at {{ CH }} k
+void {{ p }}_b(const bfloat16 *__restrict x, float *__restrict ws, bfloat16 *__restrict out, int32_t k)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const float *__restrict xf = (const float *)x;
+    const float *__restrict cf = SW(const float, {{ w.cf }});
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ CH }}; i += 16) {
+        aie::vector<float, 16> y = al::mulff<16>(aie::load_v<16>(xf + i), aie::broadcast<float, 16>(cf[0]));
+        for (int b = 1; b < {{ N }}; b++)
+            y = aie::add(y, al::mulff<16>(aie::load_v<16>(xf + {{ CH }} * b + i), aie::broadcast<float, 16>(cf[b])));
+        aie::store_v(out + {{ CH }} * k + i, aie::accum<accfloat, 16>(y).template to_vector<bfloat16>());
+    }
+}
+
+}  // extern "C"
+{% endif %}
+{% if op == "resid" %}
+// The resid core's workspace (bytes): taps [4][{{ C }}] bf16 | win [row 4][{{ C }}] fp32 (the conv's last 3 inputs and the
+// current, row = token % 4) | snap [3][{{ C }}] fp32 (the inputs of the chunk's last 3 valid tokens) | st [16] int32 (token)
+
+extern "C" {
+
+// The chunk's constants (b: the column's taps [4][{{ C }}] bf16, then the conv's inputs of the 3 positions before the chunk
+// [3][{{ C }}] fp32 as bf16 pairs)
+void {{ p }}_prm(const bfloat16 *__restrict b, float *__restrict ws)
+{
+    al::copy<{{ 4 * C }}, 16>(SW(bfloat16, {{ w.taps }}), b);
+    float *__restrict win = SW(float, {{ w.win }});
+    for (int r = 0; r < 3; r++)  // (positions p0 - 3 .. p0 - 1: rows 1 .. 3 of token -4 .. -1's ring)
+        al::copy<{{ C }}, 16>(win + {{ C }} * (r + 1), (const float *)(b + {{ 4 * C }}) + {{ C }} * r);
+    SW(int32_t, {{ w.st }})[0] = 0;
+}
+
+// {{ TB }} tokens (x: their conv inputs [{{ TB }}][{{ C }}] bf16{{ ", then cur [" ~ TB ~ "][" ~ C ~ "] fp32" if not BLOCK else "" }}) -> cur' (out: [{{ TB }}][{{ C }}] fp32):
+// conv = (y_t + sum_k taps_k y_(t - 3 + k)) / sqrt(5), cur' = {{ "conv (a block's restart)" if BLOCK else "cur + conv" }}; the inputs of the last 3 valid tokens
+// (n) kept
+void {{ p }}_run(const bfloat16 *__restrict x, float *__restrict ws, float *__restrict out, int32_t n)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    int32_t *__restrict st = SW(int32_t, {{ w.st }});
+    const bfloat16 *__restrict taps = SW(const bfloat16, {{ w.taps }});
+    float *__restrict win = SW(float, {{ w.win }});
+{% if not BLOCK %}
+    const float *__restrict cur = (const float *)(x + {{ TB * C }});
+{% endif %}
+    for (int i = 0; i < {{ TB }}; i++) {
+        const int t = st[0] + i;
+        float *__restrict wt = win + {{ C }} * (t & 3);
+        for (int j = 0; j < {{ C }}; j += 32)
+            aie::store_v(wt + j, aie::accum<accfloat, 32>(aie::load_v<32>(x + {{ C }} * i + j)).template to_vector<float>());
+        AIE_LOOP_NO_UNROLL
+        for (int j = 0; j < {{ C }}; j += 16) {
+            aie::accum<accfloat, 16> a(aie::load_v<16>(wt + j));
+            for (int k = 0; k < 4; k++) {  // (tap k: token t - 3 + k; inputs bf16 values: their products exact)
+                aie::vector<bfloat16, 16> h, l;
+                al::split2<16>(aie::load_v<16>(win + {{ C }} * ((t + 1 + k) & 3) + j), h, l);
+                const aie::vector<bfloat16, 16> w = aie::load_v<16>(taps + {{ C }} * k + j);
+                a = aie::mac(aie::mac(a, h, w), l, w);
+            }
+            aie::vector<float, 16> y = al::mulff<16>(a.template to_vector<float>(), aie::broadcast<float, 16>({{ SC }}f));
+{% if not BLOCK %}
+            y = aie::add(y, aie::load_v<16>(cur + {{ C }} * i + j));
+{% endif %}
+            aie::store_v(out + {{ C }} * i + j, y);
+        }
+        if (t >= n - 3 && t < n)  // (the window's rows of the last 3 valid tokens)
+            al::copy<{{ C }}, 16>(SW(float, {{ w.snap }}) + {{ C }} * (t - n + 3), wt);
+    }
+    st[0] += {{ TB }};
+}
+
+// The conv's inputs of the chunk's last 3 valid tokens (n >= 3) -> out [3][{{ C }}] fp32
+void {{ p }}_snap(float *__restrict ws, float *__restrict out)
+{
+    al::copy<{{ 3 * C }}, 16>(out, SW(float, {{ w.snap }}));
+}
+
+}  // extern "C"
+{% endif %}
