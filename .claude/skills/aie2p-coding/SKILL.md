@@ -312,8 +312,9 @@ Silent wrong results:
 - **A load followed by a store to the same address can be reordered** (`yv = load(y); store(y, zeros); ... use(yv)`:
   the store issued one cycle after the load, which saw it). Store after the last use.
 - **A rolled `extract<8>(h)` loop stored wrong lanes** (besides compiling to a switch): unroll lane loops.
-- **`aie::shuffle_up / down(_fill)` of a 2048-bit vector with a runtime shift** returns an uninitialized vector
-  (aie_api implements only a shift by the native length, `FIXME: CRVO-12835`; no diagnostic): shift 1024-bit halves.
+- **`aie::shuffle_up / down*` of a 2048-bit vector** returns an uninitialized vector, no diagnostic, unless the shift
+  is the native length known at compile time (`shuffle_down`: for every shift); aie_api #18, fixed by its PR #19, not
+  yet in mlir-aie: shift 1024-bit halves.
   Of any width, `aie::shuffle_up(v, n)`'s lowest n lanes are not zeros (the shift's other register): `shuffle_up_fill`
   with a zero vector, or `shuffle_up_rotate` (Q8_0H's centering panels, `formats/q4.mm.cc.jinja`).
 - **A vector access of 64 B or more (`load_v<32>` of bf16, `aie::store_v` of 64 fp32) at an address 32-B but not 64-B
