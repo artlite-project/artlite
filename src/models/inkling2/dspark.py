@@ -412,10 +412,12 @@ class DSparkOverlay(AttentionOverlay):
         if weights:
             self._weight_run(seq, weights)
         o = self._o_inputs(L)[0]
-        for c in range(COLS):
-            for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
+        for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):  # (round-robin over the
+            # columns: a wait for a column's oldest task holds back no other column's, ``InklingOverlay._attention``)
+            for c in range(COLS):
                 st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[L % INJ]), 2 * self.at.d_len),
                                    L, c, 0, i))
+        for c in range(COLS):
             at = dev.address("ACT", o.off + o.x0 + 2 * sp * nq * c + 16 * a)
             seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
 

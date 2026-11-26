@@ -150,7 +150,7 @@ INK_EG = 17  # (ink) the E objects of a sub-step: its range's last groups, at mo
 
 # the event windows of a stats build (the decode operator's win=): the attention core's kernels
 WINS = {"abegin": 11, "aq": 12, "aqpan": 13, "akv": 14, "kobj": 15, "vobj": 16, "arec": 17, "aend": 18, "aemit": 19,
-        "put_k": 20, "tobj": 21, "scores": 22, "pv": 23,
+        "put_k": 20, "tobj": 21, "scores": 22, "pv": 23, "aebias": 24,
         # (spans: an attention step from its region's first object to its end; the first cache object's wait from
         # there; the merge's wait for the west neighbour from the last cache object)
         "aspan": 40, "afirst": 41, "achain": 42}

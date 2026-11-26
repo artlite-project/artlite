@@ -112,7 +112,7 @@ __attribute__((noinline, minsize)) void {{ p }}_iconv(const float *__restrict rr
 // (ink) a group's E object (e: [rel 16][{{ INK_EW }}] bf16, entry i of distance p + S - 1 - P0 + e0 - i: the window's
 // first entry even, e0 its parity) -> per query row its bias at the group's keys 0 .. 63 (log2 units: r holds log2
 // e), ib [row][64]: entry e0 + (S - 1 - s) + k of the row's slot s
-__attribute__((noinline, minsize)) void {{ p }}_ibias(const bfloat16 *__restrict e, const float *__restrict ir,
+__attribute__((noinline)) void {{ p }}_ibias(const bfloat16 *__restrict e, const float *__restrict ir,
                                                      float *__restrict ib, int nq, int S, int e0)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -120,7 +120,8 @@ __attribute__((noinline, minsize)) void {{ p }}_ibias(const bfloat16 *__restrict
     for (int row = 0; row < nq; row++) {
         aie::accum<accfloat, 32> t0 = aie::zeros<accfloat, 32>(), t1 = t0, t2 = t0;
         AIE_LOOP_NO_UNROLL
-        for (int r = 0; r < 16; r++) {
+        for (int r = 0; r < 16; r++) {  // (pipelined after register allocation, II 10: ~266 cycles a row, ~610 compiled
+            // minsize)
             aie::vector<bfloat16, 32> h, l;
             al::split2<32>(aie::broadcast<float, 32>(ir[16 * row + r]), h, l);
             const bfloat16 *__restrict er = e + {{ INK_EW }} * r;
@@ -1262,6 +1263,7 @@ __attribute__((minsize)) void {{ p }}_aring{{ X }}(const uint8_t *__restrict rr,
 // (ink) The E object of the next cache object's group (positions A_GP0 ..): its bias table (``ibias``)
 __attribute__((minsize)) void {{ p }}_aebias{{ X }}(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
+    {{ p }}_AWin<{{ WINS['aebias'] }}> win_;
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
     const int S = st[{{ A_S }}], e0 = ({{ INK_ED0 }} - (st[{{ A_P }}] + S - 1 - st[{{ A_GP0 }}])) & 1;
     {{ p }}_ibias(x + {{ 2 * META }}, AW(float, {{ a.ir }}), AW(float, {{ a.ib }}), 3 * S, S, e0);

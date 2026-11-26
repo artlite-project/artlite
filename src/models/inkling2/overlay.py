@@ -868,13 +868,15 @@ class InklingOverlay(AttentionOverlay):
             for c in range(COLS):
                 st.part_bds.append(PartBD(seq.drain("D", c, dev.address("KV", self.raw_ring(L, c)), 8192)[0], q,
                                           self.raw_ring(L, c), 8192))
-            for c in range(COLS):
-                st.tails += [Tail(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t)
-                             for t in range(tails(n))]
+            for t in range(tails(n)):  # (round-robin over the columns: a wait for a column's oldest task, its queue full,
+                # holds back no other column's)
+                for c in range(COLS):
+                    st.tails.append(Tail(seq.fill("A", c, dev.address("KV", self.ring_off[L]), T), L, c, u, t))
             o = self.inp[(L, "o")][0]
-            for c in range(COLS):
-                for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
+            for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
+                for c in range(COLS):
                     st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[L]), 2 * self.at.d_len), L, c, u, i))
+            for c in range(COLS):
                 at = dev.address("ACT", o.off + o.x0 + 2 * sp * nq * c + 16 * a)
                 seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
             if u == len(subs) - 1 and weights:
