@@ -41,7 +41,19 @@ image's patches and a class token) runs on the NPU in a hardware context of its 
 `src/models/inkling2v/`), then the image's tokens go through the prefill as text does; a conversation's image runs the
 encoder once.
 
-IMAGES_TABLE
+Speed (Strix Halo; artlite-server, one image and a question, its pixels fresh for each request: the artlite-bench
+skill's `image_ttft.py`, the median of 3), against llama.cpp's llama-server on the CPU (16 threads) and on the iGPU
+(Vulkan) with the same files:
+
+| image (pixels) | tokens | the encoder | time to the first token | llama.cpp CPU | llama.cpp Vulkan |
+|---|---|---|---|---|---|
+| sd15-astronaut.jpg (512 x 512) | 169 | 0.05 s | 1.50 s | 1.12 s | 1.13 s |
+| test-1.jpeg (640 x 488) | 208 | 0.05 s | 1.58 s | 1.29 s | 1.29 s |
+| hk_OCR.jpg (1300 x 858) | 726 | 0.21 s | 2.60 s | 3.01 s | 3.07 s |
+| airplane.jpeg (1920 x 1440) | 1728 | 0.75 s | 5.18 s | 7.47 s | 7.26 s |
+
+The prompt (the image's tokens and ~25 of text) takes most of the time, through the prefill, whose fixed costs dominate
+a short one (196 tokens: 1.25 s): llama.cpp is ahead on the small images, Artlite 1.2x and 1.4x ahead on the larger ones.
 
 Accuracy: per token the encoder's embeddings are ~4-5% from a float64 encoder's (median; llama.cpp's own are 1.3% off:
 its pixels rounded to fp16, which the network's 23 layers amplify). Teacher-forced over a description of an image after
