@@ -24,6 +24,11 @@ tokens where the operator works row by row:
   gathered norm on, the host's routing before it) -> DL, the FFN's post conv into cur (history window 1).
 
 ``ffn`` False: the visits' attention parts only (the decode overlay's ``ffn=False`` slices: tests).
+
+A DSpark drafter's taps (``taps``: the visits whose input residual feeds its cache, ``InklingOverlay(taps=)``): the
+chunk's rows of the state that holds cur when such a visit starts (a host step before its first item, after the piece
+before it: ``run``), and its final normed states (the output's mix of the last visit's states: an item at the chunk's
+end into XF, then ``output_norm`` on the host): ``taps_out`` (n, taps + 1, hidden) fp32.
 """
 
 import functools
@@ -73,12 +78,15 @@ class InklingPrefill(ChunkPrefill):
     MIN_TOKENS = 3  # (the post convs' windows: the chunk's last 3 valid tokens' inputs)
     CFG_S = CFG_S
 
-    def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True):
+    def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True,
+                 taps: tuple[int, ...] = ()):
         ov = overlay
         assert not ffn or ov.ffn, "the overlay's FFNs"
+        assert not taps or (ffn and ov.layers == list(range(len(overlay.cfg.visits)))), "taps: the whole model"
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0))
         cfg = self.cfg
-        self.ffn = ffn
+        self.ffn, self.taps = ffn, tuple(taps)
+        self.taps_out: np.ndarray | None = None  # (the last chunk's: module docstring)
         self.layers = list(ov.layers)  # (the visits: ``ChunkPrefill``'s layers)
         self.kv_layers = list(self.layers)
         self.vis = {v: cfg.visits[v] for v in self.layers}
@@ -139,6 +147,7 @@ class InklingPrefill(ChunkPrefill):
             if x.block:
                 blocks.append(cur)
                 cur = new
+        self.final = blocks + [cur]  # (the output's mix: the last visit's states)
         return out
 
     # ------------------------------------------------------------------
@@ -244,6 +253,8 @@ class InklingPrefill(ChunkPrefill):
             self.rb |= {"GA": 2 * dl.N, "GB": 2 * dl.N}
         if self.moe is not None:
             self.rb |= self.moe.rows(t)
+        if self.taps:
+            self.rb["XF"] = 2 * H
         # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ones, ffn] x H bf16), its queries (QR: the
         # attention's 3 rows (one used by a sliding-window layer), the FFN's, the 4 messages' x H fp32), its prep's PRM,
         # its E table (EB), its post convs' taps (TP: [2][COLS][4][C] bf16); TAU per position
@@ -336,6 +347,10 @@ class InklingPrefill(ChunkPrefill):
             rl.append((rs, *args, self._tp(L, 0, rs), hist, sl(dst, 0, rs, i=len(args) + 2)))
             if self.ffn:
                 marks.append(self._ffn(rl, o, S, tok, v, T))
+        if self.taps:  # (the final states' mix: the drafter's last tap, normed on the host)
+            mx = o.mixes[len(self.final)]
+            rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(self.final)), f"QO[0:{4 * self.H}]",
+                    tok("XF", jj, mx, i=len(self.final) + 1)) for jj in range(S)]
         self._starts[T] = [*starts, len(rl)]
         self._marks[T] = marks
         return rl
@@ -408,6 +423,8 @@ class InklingPrefill(ChunkPrefill):
         own["PRM"] = max(own.get("PRM", 0), n * self.prm_w)
         own["ET"] = max(own.get("ET", 0), n * max(self.e_w.values()))
         own["TP"] = max(own.get("TP", 0), n * self.tp_w)
+        if self.taps:
+            own["QO"] = max(own.get("QO", 0), 4 * self.H)
         for name, b in (self.moe.fixed() if self.moe else {}).items():
             own[name] = max(own.get(name, 0), b)
 
@@ -455,6 +472,10 @@ class InklingPrefill(ChunkPrefill):
                 t4 = np.ascontiguousarray(np.stack([taps[:, C * c:C * (c + 1)] for c in range(COLS)]).astype(bfloat16))
                 o = i * self.tp_w + k * self.tp_w // 2
                 tp[o:o + t4.nbytes] = t4.view(np.uint8).reshape(-1)
+        if self.taps:
+            dev.view("QO")[:4 * H] = vec("output_res_query.weight").view(np.uint8)
+            dev.flush("QO")
+            self._w_out = vec("output_norm.weight")
         tau = cfg.tau(np.arange(self.own["TAU"] // 4)).astype(np.float32)
         dev.view("TAU")[:tau.nbytes] = tau.view(np.uint8)
         for name in ("NP", "QR", "PRM", "ET", "TP", "TAU"):
@@ -514,10 +535,25 @@ class InklingPrefill(ChunkPrefill):
         ov.mirror(p0)  # (a ring's window before the chunk across its wrap: the guard)
         hooks = {i: functools.partial(self.moe.host_route, self.vis[v].layer, n=n, T=T, t=self._t(T), xf=xf, dev=dev,
                                       lib=self.lib) for v, i, xf in self._marks.get(T, ())}
+        if self.taps:  # (cur when a tap visit starts: after the piece before it)
+            self.taps_out = np.empty((n, len(self.taps) + 1, H), np.float32)
+            for j, v in enumerate(self.taps):
+                i = self._starts[T][v]
+                assert i not in hooks, (v, i)
+                hooks[i] = functools.partial(self._tap, self.walk[v].cur, j, n)
         # (the host's routing reads the router's logits: after the piece that ends with the router)
         self._launch(T, p0, self.params(T, p0, n), hooks or None, synced=tuple(hooks))
         dev.stale = True  # (the chunk's configurations replaced the attention cores' code pages)
         ov._hbase[ov.seq] = p0 + n - 3  # (the windows' rows 0 .. 2: the chunk's last 3 valid tokens')
+        if self.taps:
+            dev.fetch("XF", 0, 2 * n * H)
+            x = dev.view("XF")[:2 * n * H].view(bfloat16).reshape(n, H).astype(np.float64)
+            r = 1 / np.sqrt((x * x).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
+            self.taps_out[:, -1] = (x * r * self._w_out).astype(np.float32)
+
+    def _tap(self, name: str, j: int, n: int) -> None:
+        """(a host step) tap j's rows: the chunk's n valid rows of state ``name``."""
+        self.taps_out[:, j] = self.state(name, 0, n)
 
     def state(self, name: str, i: int, n: int) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of a state buffer the last chunk left."""

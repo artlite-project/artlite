@@ -111,3 +111,30 @@ def test_rounds(run: tuple[NpuInkling, list[int], np.ndarray], name: str) -> Non
         texts[drafts] = list(m.generate(logits, 96, Sampling(greedy=True), toks, drafts=drafts))
         print(f"{name}, drafts {drafts}: {m.drafted} drafted, {m.accepted} accepted")
     assert texts[3] == texts[0] and m.accepted > 0
+
+
+def test_prefill() -> None:
+    """A prompt through prefill chunks (the drafter's rows from the chunks' taps, ``InklingPrefill(taps=)``): its
+    records against the same prompt as decode steps', greedy rounds after it = no drafts."""
+    path, dpath = _paths()
+    toks = llama_tokenize(path, essay("founders.txt"))[:600]
+    m = NpuInkling(GGUFFile(path), capacity=2048, dspark=dpath, prefill=True)
+    m.prompt(toks, logits=True)
+    m._inject()
+    kp = [m.dspark.read_kv(L, range(560)) for L in range(m.dspark.cfg.layers)]
+    s = NpuInkling(GGUFFile(path), capacity=2048, dspark=dpath)
+    s.prompt(toks, logits=True)
+    s._inject()
+    for L, (k, v) in enumerate(kp):
+        ks, vs = s.dspark.read_kv(L, range(560))
+        print(f"layer {L}: K {_rel(k, ks):.2e}, V {_rel(v, vs):.2e} (the prefill's taps against the steps')")
+        assert _rel(k, ks) < 0.1 and _rel(v, vs) < 0.15  # (the prefill's GEMMs and near-tied experts: its taps' own)
+    m.lookup = False
+    texts = {}
+    for drafts in (0, 3):
+        m.reset()
+        m.drafted = m.accepted = 0
+        logits = m.prompt(toks, logits=True)
+        texts[drafts] = list(m.generate(logits, 96, Sampling(greedy=True), toks, drafts=drafts))
+        print(f"drafts {drafts}: {m.drafted} drafted, {m.accepted} accepted")
+    assert texts[3] == texts[0] and m.accepted > 0

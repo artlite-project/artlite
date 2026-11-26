@@ -76,7 +76,7 @@ class NpuInkling(OverlayModel):
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
-        self.prefill = InklingPrefill(self.overlay) if prefill else None
+        self.prefill = InklingPrefill(self.overlay, taps=taps if dg is not None else ()) if prefill else None
         self._tn = np.asarray(gguf.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
         self._open(threads=threads)
         self._w_out = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
@@ -134,9 +134,11 @@ class NpuInkling(OverlayModel):
         """(the step's taps wait for the drafter: ``_pend``)"""
         p = self.position
         out = super().steps(tokens, logits=logits, **step)
-        if self.dspark is not None and self.DRAFTS > 0:
-            for i, row in enumerate(self._rows_of(len(tokens))):
-                self._pend[p + i] = row
+        if self.dspark is not None:
+            self.dspark.dev.stale = True  # (another hardware context ran: the drafter's code pages again)
+            if self.DRAFTS > 0:
+                for i, row in enumerate(self._rows_of(len(tokens))):
+                    self._pend[p + i] = row
         return out
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
@@ -145,22 +147,24 @@ class NpuInkling(OverlayModel):
         for q in [q for q in self._pend if q >= self.position]:
             del self._pend[q]
 
-    def _inject(self) -> None:
-        """The waiting rows into the drafter's caches (dispatches of up to 4 positions from its next one)."""
-        d = self.dspark
-        for q in [q for q in self._pend if q < d.next and q != self.position - 1]:  # (injected; the last: its f_rnn)
+    def _inject(self, end: int | None = None) -> None:
+        """The waiting rows before ``end`` (default: the position) into the drafter's caches (dispatches of up to 4
+        positions from its next one; the last row stays for f_rnn)."""
+        d, end = self.dspark, self.position if end is None else end
+        for q in [q for q in self._pend if q < d.next and q != end - 1]:  # (injected)
             del self._pend[q]
-        while d.next < self.position and d.next in self._pend:
+        if d.next >= end or d.next not in self._pend:
+            return
+        while d.next < end and d.next in self._pend:
             q, n = d.next, 0
-            while n < SLOTS and q + n in self._pend and q + n < self.position:
+            while n < SLOTS and q + n in self._pend and q + n < end:
                 n += 1
             rows = np.stack([self._pend[q + i] for i in range(n)])
-            d.dev.stale = True  # (the model ran in between: the drafter's pages again)
             self._dispatch(lambda rows=rows, q=q: d.inject(rows, q))
             for i in range(n):
-                if q + i != self.position - 1:
+                if q + i != end - 1:
                     del self._pend[q + i]
-            self.stale()
+        self.stale()
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
         """A round's drafts after ``token`` (the next position's): the waiting rows injected, the block at the position,
@@ -173,7 +177,6 @@ class NpuInkling(OverlayModel):
             self._chains = ()
             return []
         f_rnn = d.mixes(last[None])[-1, 0]
-        d.dev.stale = True
         self._dispatch(lambda: d.block(self._step_inputs([token])[0][0, 0], P))
         self.stale()
         out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
@@ -214,6 +217,17 @@ class NpuInkling(OverlayModel):
         x = self.gguf.rows("token_embd.weight", np.asarray(tokens)).astype(np.float32)
         x = x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + self.cfg.rms_norm_eps).astype(np.float32)
         return ((x * self._tn)[None],)
+
+    def _prefill_run(self, args: tuple, T: int, n: int, sets: Sequence[int] | None = None) -> None:
+        """(a drafter's: the chunk's taps wait for it, injected after the chunk)"""
+        p0 = self.position
+        super()._prefill_run(args, T, n, sets)
+        if self.dspark is not None:
+            self.dspark.dev.stale = True
+        if self.dspark is not None and self.DRAFTS > 0 and self.prefill.taps_out is not None:
+            for i, row in enumerate(self.prefill.taps_out):
+                self._pend[p0 + i] = row
+            self._inject(p0 + n)
 
     def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
         """(the chunk's normed embeddings (n, hidden): the first visit's input)"""
@@ -277,7 +291,7 @@ class Inkling(Model):
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuInkling:
         """(``sequences``: ``NpuInkling``'s)"""
         return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences, prefill=prefill,
-                          dspark=self.dspark if sequences == 1 and not prefill else None)
+                          dspark=self.dspark if sequences == 1 else None)
 
 
 __all__ = ["Inkling", "NpuInkling"]
