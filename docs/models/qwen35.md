@@ -91,12 +91,13 @@ Several requests at a time (`artlite-server -np N`, up to 8; MiniCPM-V's languag
 Qwen3.8-27B and Swift 1.5: the dense files and PARO checkpoints, on the design of 8 tokens per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.1 GB a sequence on the 9B, 0.3 GB on the 27B), and a decode
 step's 8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them,
 each attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per
-sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.05x / 1.12x / 1.39x a step of one,
-so 4 requests get 3.2x and 8 get 4.8x one request's tokens per second in all (the 27B; the 9B: 1.07x / 1.16x / 1.50x,
-3.3x and 4.8x). The LM head is then read whole (a PARO checkpoint's stays screened: its plane's Q4_0 runs on that
-design), and the 9B, whose three formats' kernels do not fit a main core of
-that design together, loads each as a code page: one request alone gets 10.7 tokens per second there instead of
-12.5 (MiniCPM-V, whose own design is of 4 tokens too: 98 instead of 115, and 135 / 164 / 172 for 2 / 4 / 8 requests).
+sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.06x / 1.13x / 1.40x a step of one
+(the 27B; the 9B: 1.07x / 1.17x / 1.55x), and through `artlite-server` 4 requests get 3.1x and 8 get 4.6x one
+request's tokens per second in all (the 9B: 3.1x and 4.4x). The LM head stays screened, as for one request, and a file
+of more than two formats, the head's plane among them (the 9B's four, the 27B's and MiniCPM-V's three), loads each
+format's kernels as a code page (a main core of that design holds two): one request alone gets 12.3 tokens per second
+there instead of 12.6 on the 9B (MiniCPM-V, whose own design is of 4 tokens too: 119 instead of 122, and 148 / 165 /
+166 for 2 / 4 / 8 requests).
 A file's MTP layer (Qwen3.8-27B's, Swift 1.5's) drafts for every request (a cache of its own per sequence, its guesses for a request ahead
 of the step the requests share, for that request's share of the step's slots: 8.9 / 13.5 / 18.0 tokens per second
 for 1 / 2 / 4 requests); the DFlash2 drafter, whose records follow one sequence, does not load then:

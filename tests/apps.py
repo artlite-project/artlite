@@ -4,9 +4,10 @@ designs and returns what it built (``AppBuild``): the decode overlays and prefil
 Qwen3.8-27B-PARO's (int4: gate and up as two GEMMs; int5) and Gemma 4 E4B PARO's checkpoint directories: their rotated
 inputs, the 27B's also with its base model's DFlash2 drafter; Qwen3.6-35B-A3B (and its PARO checkpoint) also with its
 MTP drafter file, the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots
-with its MTP block and with its DFlash2 drafter; LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark
-drafter; Inkling 2's whole step), the vision overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py``
-builds them, ``schedule_ledger.py`` reads their builds."""
+with its MTP block and with its DFlash2 drafter; the dense Qwen3.5 / 3.6 files' models of several sequences (-np8);
+LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter; Inkling 2's whole step), the vision overlay
+(the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them,
+``schedule_ledger.py`` reads their builds."""
 
 import os
 from collections.abc import Callable
@@ -121,6 +122,18 @@ def _qwen_drafts(path: str, dflash: bool) -> AppBuild:
     return _built([ov.op, drafter.op, pf.lib], pf, ov)
 
 
+def _qwen_lanes(path: str) -> AppBuild:
+    """A dense qwen35 file's model of several sequences as ``artlite-server -np 8`` loads it (``Qwen.load``): the design
+    of 8 slots, its formats' kernels code pages past two (the screened LM head's plane among them), no drafter (its
+    prefill: the model's app's, on the same image)."""
+    from models.qwen35.image import QwenImage
+    from models.qwen35.overlay import QwenOverlay
+
+    gguf = GGUFFile(path)
+    ov = QwenOverlay(gguf, max_positions=4096, image=QwenImage(gguf, mtp=False), drafts=False, sequences=8)
+    return _built([ov.op], None, ov)
+
+
 def _qwen_paro_dflash(path: str) -> AppBuild:
     """A PARO checkpoint of a model with a DFlash2 drafter (Qwen3.8-27B-PARO, int4 or int5) as its app builds it: the
     drafter's head on the screened head's plane, its taps as plain copies (``qwen35.image.QwenImage``'s ``dflash``)."""
@@ -216,10 +229,13 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "gemma-E4B-Q4_0": (gemma_gguf("Q4_0"), _gemma),
     "gemma-E4B-PARO": (checkpoint("gemma-4-E4B-paro"), _gemma),
     "qwen-9B-Q4_K_M": (qwen_gguf("Q4_K_M", "9B"), _qwen),
+    "qwen-9B-Q4_K_M-np8": (qwen_gguf("Q4_K_M", "9B"), _qwen_lanes),
     "qwen-27B-Q4_K_M": (qwen_gguf("Q4_K_M", "27B"), _qwen),
+    "qwen-27B-Q4_K_M-np8": (qwen_gguf("Q4_K_M", "27B"), _qwen_lanes),
     "qwen-3.8-27B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda path: _qwen_drafts(path, dflash=False)),
     "qwen-3.8-27B-Q4_K_M-dflash": (qwen_gguf("Q4_K_M", "3.8-27B"), lambda path: _qwen_drafts(path, dflash=True)),
     "qwen-1B-Q4_K_M": (qwen_gguf("Q4_K_M", "1B"), _qwen),
+    "qwen-1B-Q4_K_M-np8": (qwen_gguf("Q4_K_M", "1B"), _qwen_lanes),
     "qwen-35B-A3B-Q4_K_M": (qwen_gguf("Q4_K_M", "35B-A3B"), _qwen),
     "qwen-35B-A3B-Q4_K_M-mtp": (qwen_gguf("Q4_K_M", "35B-A3B"), lambda path: _qwen(path, mtp=True)),
     "occamy-1.0-APEX": (occamy_gguf(), _qwen),

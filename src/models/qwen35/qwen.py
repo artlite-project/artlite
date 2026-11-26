@@ -35,10 +35,11 @@ Several sequences (``NpuQwen(sequences=N)``; a dense model whose formats run on 
 ``overlay.runs_eight``: MiniCPM-V's, the 9B, the 27B models; the first two's own design is of 4, ``overlay.slots_of``): the
 device holds the KV caches and the GDN states, objects and conv states of each, and the model has a lane for each
 (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's 8 slots dealt to them
-(``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence). The LM
-head's rows whole (a screened head's tiles do not fit that design). The file's own MTP block drafts for every lane
-(``drafting.MtpDrafting``: a cache of each sequence, its steps for a lane ahead of the lanes' joint step, for that
-lane's share of the step's slots); a DFlash2 drafter's records follow one sequence: none then.
+(``models.lanes``: one stream of the weights for all of them, an attention pass and a GDN chain per sequence), the LM
+head screened as for one (its plane's kernels a code page, as every format's past two: ``overlay``). The file's own MTP
+block drafts for every lane (``drafting.MtpDrafting``: a cache of each sequence, its steps for a lane ahead of the
+lanes' joint step, for that lane's share of the step's slots); a DFlash2 drafter's records follow one sequence: none
+then.
 
 Memory: the weights the NPU streams (the layers and the LM head: 15.95 GB of the 27B's 16.5 GB file) are
 re-laid-out into a device buffer at load, at their quantization's size; nothing is written to disk. Load (27B, the
@@ -572,15 +573,15 @@ class Qwen(Model):
 
     @property
     def parallel(self) -> bool:  # type: ignore[override]
-        """(a dense chat model whose tile formats run on the design of 8 slots, its LM head's rows whole - a PARO
-        checkpoint's screened, its plane Q4_0: ``overlay.runs_eight``)"""
+        """(a dense chat model whose tile formats, a screened LM head's plane among them, run on the design of 8 slots:
+        ``overlay.runs_eight``)"""
         if not (self.generates and self.cfg.causal):
             return False
-        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=self.paro).formats())
+        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own()).formats())
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
-        """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole (a PARO checkpoint's screened), the file's MTP
-        block as the drafter where it has one and a drafter is asked for, a DFlash2 drafter's place too)"""
+        """(``sequences``: ``NpuQwen``'s; several: the file's MTP block as the drafter where it has one and a drafter is
+        asked for, a DFlash2 drafter's place too)"""
         if sequences == 1:
             self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
                                 dflash=self.dflash, readout=not self.generates)
@@ -590,11 +591,10 @@ class Qwen(Model):
             log.warning("%s with %d sequences %s (the DFlash2 drafter's records follow one sequence)", self.name,
                         sequences, "drafts with its MTP layer" if own else "runs without a drafter")
         weights = self.weights
-        if (weights.image.screen and not self.paro) or (weights.image.mtp_layer >= 0) != own or weights.image.taps:
-            # (the image packed again: its LM head's rows whole, the MTP block where it drafts, no DFlash2 drafter's taps)
+        if (weights.image.mtp_layer >= 0) != own or weights.image.taps:
+            # (the image packed again: the MTP block where it drafts, no DFlash2 drafter's taps)
             weights.wait()
-            self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=own, pairs=self.generates,
-                                                            screen=self.paro))
+            self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=own, pairs=self.generates))
         self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights,
                             drafter="" if own else None, readout=not self.generates, sequences=sequences)
         return self._npu

@@ -664,15 +664,15 @@ def _diffusion(path: str) -> Callable[[_Log], None]:
 
 
 def _qwen_sequences(path: str) -> Callable[[Callable[[object], _Log]], None]:
-    """(``_run_sequences``; the image as a model of several sequences takes it: the LM head's rows whole. A joint
-    step's tokens: accepted, each sequence's first slot)"""
+    """(``_run_sequences``; the image as a model of several sequences takes it: no MTP block. A joint step's tokens:
+    accepted, each sequence's first slot)"""
     def run(attach: Callable[[object], _Log]) -> None:
         from models.qwen35.image import QwenImage
         from models.qwen35.overlay import QwenOverlay
 
         gguf = GGUFFile(path)
         ov = QwenOverlay(gguf, max_positions=1024, sequences=3,
-                         image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False, screen=False))
+                         image=QwenImage(gguf, QwenConfig.from_gguf(gguf), mtp=False))
 
         def step(x: np.ndarray, p: object, lg: bool) -> None:
             ov.step(x, p, logits=lg)

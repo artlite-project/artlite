@@ -646,8 +646,9 @@ def test_overlay_sequences(size: str) -> None:
     of one sequence: alternated (``select``: a round of 1 .. 8 slots of one, some of them kept, then of the next) and
     in joint steps (``step``'s parts: a GDN chain and an attention pass per sequence; slots dealt at random, drafts
     kept or not, one sequence joining later, chains across their blocks' ends); the first layers up to the first
-    full-attention layer. PARO checkpoints (Qwen3.5-0.8B-PARO, Qwen3.8-27B-PARO-int5): their rotations' inputs from the
-    attention's passes and the GDN chains staged, gin_q's and gin_z's rows per chain, the screened LM head's plane rows."""
+    full-attention layer; the screened LM head's plane rows (every file's but Qwen3.8-27B's, whose MTP block reads the
+    head's rows). PARO checkpoints (Qwen3.5-0.8B-PARO, Qwen3.8-27B-PARO-int5): their rotations' inputs from the
+    attention's passes and the GDN chains staged, gin_q's and gin_z's rows per chain."""
     from artlite.decode.step import Part
     from artlite.hf_model import HfModel
     from artlite.model_config import checkpoint
@@ -663,9 +664,8 @@ def test_overlay_sequences(size: str) -> None:
     rng = np.random.default_rng(7)
     toks = [[int(t) for t in rng.integers(0, 50000, n)] for n in lengths]
     emb = [g.rows("token_embd.weight", t) for t in toks]
-    def image() -> QwenImage:  # (the LM head's rows whole, as a model of several sequences lays them out; a PARO
-        # checkpoint's screened: the NPU's rows of its plane)
-        return QwenImage(g, layers=layers, vocab=COLS * 64, screen=bool(paro))
+    def image() -> QwenImage:
+        return QwenImage(g, layers=layers, vocab=COLS * 64)
 
     def bits(row: object) -> np.ndarray:
         return np.asarray(getattr(row, "screened", row)).view(np.uint16)
@@ -679,7 +679,7 @@ def test_overlay_sequences(size: str) -> None:
     one.dev = None
     ov = QwenOverlay(g, layers=layers, vocab=COLS * 64, max_positions=128, sequences=nseq, image=image())
     ov.load()
-    assert ov.SLOTS == 8 and bool(ov.screen) == bool(paro)
+    assert ov.SLOTS == 8 and bool(ov.screen) == (size != "3.8-27B")
 
     def check(got: object, at: list[tuple[int, int]], what: str, a: int = 0) -> None:
         bad = [(s, p) for k, (s, p) in enumerate(at) if not np.array_equal(bits(got[a + k]), want[s][p])]

@@ -49,8 +49,8 @@ def test_prefill(size: str) -> None:
     last one's logits from the LM head alone, then teacher-forced decode steps continuing from the prefill's caches
     and states; the next-token distributions against llama.cpp's split run (the prompt in one graph, then one token per
     graph), next to llama.cpp's own decode-only run against it. "-lanes": the model of two sequences (the design of 8
-    slots, the LM head's rows whole; the 9B's: every format's kernel a code page; MiniCPM-V's: a KV head's cache over
-    4 columns in one pass), on lane 0."""
+    slots, every format's kernel a code page, the screened LM head's plane among them; MiniCPM-V's: a KV head's cache
+    over 4 columns in one pass), on lane 0."""
     size, lanes, _ = size.partition("-lanes")
     path = _path(size)
     P, K = 300, 24

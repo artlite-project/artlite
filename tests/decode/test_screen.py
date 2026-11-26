@@ -161,13 +161,14 @@ def test_sampling(head: tuple) -> None:
         row, exact = _row(head, x)
         e32 = exact.astype(np.float32)
         recent = [int(t) for t in np.argsort(-exact)[[0, 2, 5]]] + [int(t) for t in rng.choice(V, 12)]
-        for cap in (0.0, 30.0):
+        for cap, k in ((0.0, 20), (30.0, 20), (0.0, 1)):  # (k 1: a greedy choice)
             p = Penalties(s, recent + recent[:2])
-            v, i = p.top(row, 20, cap)
-            wv, wi = p.top(e32, 20, cap)
+            v, i = p.top(row, k, cap)
+            wv, wi = p.top(e32, k, cap)
             # (those the window holds: the logits within it of the largest one before the penalties)
             m = int(np.cumprod(e32[wi] >= e32.max() - SC.WINDOW).sum())
-            assert np.array_equal(i[:m], wi[:m]) and np.allclose(v[:m], wv[:m], rtol=1e-5, atol=1e-5 * np.abs(wv).max())
+            assert len(i) == k and np.array_equal(i[:m], wi[:m])
+            assert np.allclose(v[:m], wv[:m], rtol=1e-5, atol=1e-5 * np.abs(wv).max())
 
         class Mask:
             def __init__(self, ids: np.ndarray):

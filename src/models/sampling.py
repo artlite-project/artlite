@@ -235,16 +235,18 @@ class Penalties:
 
     def _top_screened(self, logits: ScreenedRow, k: int, cap: float, ids: np.ndarray, count: np.ndarray,
                       bits: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """``_native.top_logits``' candidates of a screened head's row: the k largest logits of the other tokens, then
-        the recent tokens' ``ids`` (``count`` occurrences each) penalized, the k largest of all (equal ones: in that
-        order); every one of them exact. ``bits``: of the tokens a mask allows (the recent ones too)."""
+        """``_native.top_logits``' candidates of a screened head's row: the k largest logits of the other tokens (a mask
+        of all but the recent ones: the rows of a choice of k, not of k + their number), then the recent tokens' ``ids``
+        (``count`` occurrences each) penalized, the k largest of all (equal ones: in that order); every one of them
+        exact. ``bits``: of the tokens a mask allows (the recent ones too)."""
         s = self.sampling
         if bits is not None:
             ok = (bits[ids >> 5] >> (ids & 31).astype(np.uint32)) & 1 == 1
             ids, count = ids[ok], count[ok]
-        v, i = logits.top(k + len(ids), bits)
-        keep = ~np.isin(i, ids)
-        v, i = _capped(v[keep][:k], cap), i[keep][:k]
+        others = np.full(-(-len(logits) // 32), 0xFFFFFFFF, np.uint32) if bits is None else bits.copy()
+        np.bitwise_and.at(others, ids >> 5, ~(np.uint32(1) << (ids & 31).astype(np.uint32)))
+        v, i = logits.top(k, others)
+        v = _capped(v, cap)
         r = _capped(logits.at(ids), cap)
         r = np.where(r <= 0, r * np.float32(s.repeat_penalty), r / np.float32(s.repeat_penalty)) \
             - np.float32(s.presence_penalty) - count * np.float32(s.frequency_penalty)

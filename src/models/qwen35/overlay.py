@@ -216,9 +216,9 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         tiles = {f: sum(len(b.rows[0]) for r in img.regions for b in r.blocks if b.fmt == f) for f in fmts}
         paged = paged_formats(gguf, fmts, wide=cfg.moe and max(img.R[f] for f in fmts) > 16, rot=self.paro,
                               nbytes=tiles if self.paro else None)  # (PARO: its image's rows, not the file's F16 tensors)
-        if slots == 8 and not paged and len(fmts) > 2:  # (a design of 8 slots holds two formats' kernels: Qwen3.5 9B's
-            # three overflow the main core's program by 0.7 KB, and one of them beside a page slot leaves the slot
-            # 0.1 KB short of a page)
+        if slots == 8 and len(fmts) > 2:  # (a design of 8 slots holds two formats' kernels: Qwen3.5 9B's three
+            # overflow the main core's program by 0.7 KB, and one of them beside a page slot leaves the slot 0.1 KB
+            # short of a page; past two, every format is a page, a screened head's plane among them)
             paged = tuple(sorted(fmts))
         self.op = QwenDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=img.tile_bytes,
                                       **({"rot": True} if self.paro else {}),

@@ -507,11 +507,12 @@ costs more than their drafts gain. Spark-X's steps have 8 slots: with `-np 8` (i
 per second in all. Its DSpark drafter drafts for a request while its block pays: one dispatch whatever number of its
 guesses find a slot, about half a step of the model, so it runs for a request alone and stands back where requests
 share the steps (a block for each of four cost 30% of their tokens per second). The 9B and 27B Qwen models' steps have 8 slots too
-(`-np` up to 8: 8 requests at a time get 51 tokens per second in all on Qwen3.5-9B, 18 on Qwen3.6-27B), each
-sequence with its own Gated DeltaNet states (0.1 and 0.3 GB) beside its KV cache. The 9B and MiniCPM-V's language model run
-another design then than with `-np 1` (8 tokens per dispatch instead of 4, the LM head read whole): one request
-alone gets 10.7 tokens per second instead of 12.5 on the 9B and 98 instead of 115 on MiniCPM-V, whose short steps
-leave the host's work between them the larger part (8 requests at a time: 172 tokens per second in all). Qwen3.8-27B drafts with its MTP layer then, for each request
+(`-np` up to 8: 8 requests at a time get 54 tokens per second in all on Qwen3.5-9B, 19 on Qwen3.6-27B), each
+sequence with its own Gated DeltaNet states (0.1 and 0.3 GB) beside its KV cache. Qwen3.5-9B, Qwen3.6-27B and
+MiniCPM-V's language model run another design then than with `-np 1` (8 tokens per dispatch instead of 4, every
+format's kernels code pages): one request alone gets 12.3 tokens per second instead of 12.6 on the 9B and 119 instead
+of 122 on MiniCPM-V, whose short steps leave the host's work between them the larger part (8 requests at a time: 166
+tokens per second in all). Qwen3.8-27B drafts with its MTP layer then, for each request
 ahead of the step the requests share (as Gemma 4's drafter; `--spec-type none`: 3.3 / 6.4 / 11.7 tokens per second);
 its DFlash2 drafter, whose records follow one sequence, does not load with `-np` above 1 (one request alone: 8.9
 tokens per second instead of 10.7). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four

@@ -1,9 +1,9 @@
 """The dense Qwen3.5 / 3.6 models' lanes on the NPU (``NpuQwen(sequences=)``; models/lanes.py; MiniCPM-V's language
-model and the 9B: on the design of 8 slots, the 9B's formats' kernels code pages): a conversation alone on lane 1 against lane 0 (its prompt's chunks
-into its own caches, GDN states and conv states), then three conversations on one model object, each on a thread of
-its own, against each one alone: greedy replies token for token, with the context's drafts and without, the lanes'
-decode rounds in joint steps of up to 8 slots (an attention pass and a GDN chain per sequence). No drafter (files
-without an MTP block), the LM head's rows whole."""
+model and the 9B too: on the design of 8 slots, every format's kernels a code page, the screened LM head's plane among
+them): a conversation alone on lane 1 against lane 0 (its prompt's chunks into its own caches, GDN states and conv
+states), then three conversations on one model object, each on a thread of its own, against each one alone: greedy
+replies token for token, with the context's drafts and without, the lanes' decode rounds in joint steps of up to 8
+slots (an attention pass and a GDN chain per sequence). No drafter (files without an MTP block)."""
 
 import time
 from concurrent.futures import ThreadPoolExecutor

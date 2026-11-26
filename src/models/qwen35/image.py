@@ -125,16 +125,15 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
 
     def __init__(self, gguf: GGUFFile, cfg: QwenConfig | None = None, *, layers: list[int] | None = None,
                  vocab: int | None = None, tile_bytes: int = 0, mtp: bool = True, tails: bool = True,
-                 pairs: bool = True, screen: bool = True, dflash: tuple[int, ...] | None = None, rotated: bool = False):
+                 pairs: bool = True, dflash: tuple[int, ...] | None = None, rotated: bool = False):
         """layers: the layers to lay out (default: all); vocab: LM rows (default: the padded vocabulary; tests take
         fewer: the ids below it, ``n_ids``, and with an MTP block the drafter's table besides); mtp: the MTP block's regions
         (False: the drafter head's rows alone, a DFlash2 drafter reads them and not the block); tails: a dense model's
         regions of the hidden's input half regions where it is half a chunk short, pairs: their pairs of row tiles
-        (module docstring); screen: the LM head may be screened (False: its rows whole, for a design of 8 slots);
-        dflash: a PARO checkpoint's DFlash2 drafter's taps (its head's rows without an MTP block, on the screened head's
-        plane; the tap layers' inputs a plain copy more each: ``taps``); rotated: plain linears laid out as a PARO
-        checkpoint's, every rotation the identity (the norms' weights in the copies: a PARO checkpoint's MTP drafter,
-        ``draft.DraftImage``)."""
+        (module docstring); dflash: a PARO checkpoint's DFlash2 drafter's taps (its head's rows without an MTP block, on
+        the screened head's plane; the tap layers' inputs a plain copy more each: ``taps``); rotated: plain linears laid
+        out as a PARO checkpoint's, every rotation the identity (the norms' weights in the copies: a PARO checkpoint's
+        MTP drafter, ``draft.DraftImage``)."""
         self.cfg = cfg = cfg or QwenConfig.from_gguf(gguf)
         self.layers = list(range(cfg.num_hidden_layers)) if layers is None else list(layers)
         H, I = cfg.hidden_size, cfg.intermediate_size
@@ -177,10 +176,9 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
             self.vocab = self.n_ids + TABLE_ROWS
         self.lm = lm
         # (the LM head as its high plane, the logits that matter exactly on the host: ``decode.screen``. Not a dense
-        # model's with an MTP block, whatever rows of it the image holds: its drafters read the head's rows in place
-        # (``draft_cols``), and its design of 8 slots has no L1 for tiles of more than 16 rows next to two X objects,
-        # ``decode.design``'s "Designs of 8 slots")
-        self.screen = (screen and self.SCREEN and not (cfg.nextn_layers and not cfg.moe and not self.paro)
+        # model's with an MTP block, whatever rows of it the image holds: its drafters read the head's rows in place,
+        # ``draft_cols``)
+        self.screen = (self.SCREEN and not (cfg.nextn_layers and not cfg.moe and not self.paro)
                        and screened(self.qtype(lm), self.formats()))
         assert not (self.paro and self.draft_cols) or self.screen, "a PARO checkpoint's drafter head: the screened plane"
         self._add(-1, "lm", [("lm", (lm,), self.head_rows(), *((plane(self.qtype(lm)),) if self.screen else ()))], H)

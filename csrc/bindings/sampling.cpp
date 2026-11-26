@@ -155,6 +155,7 @@ void bind_sampling(nb::module_& m) {
         const artlite::Logits x = logits_arg(logits);
         if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
           throw artlite::Error("screen_lower: bf16 logits, a scale and a bound per logit");
+        nb::gil_scoped_release release;
         return artlite::screen_lower(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n,
                                      mask_arg(mask, x.n));
       },
@@ -170,6 +171,7 @@ void bind_sampling(nb::module_& m) {
         const artlite::Logits x = logits_arg(logits);
         if (!x.bf16 || bound.shape(0) != x.n || scale.shape(0) != x.n)
           throw artlite::Error("screen_above: bf16 logits, a scale and a bound per logit");
+        nb::gil_scoped_release release;
         return artlite::screen_above(static_cast<const uint16_t*>(x.data), scale.data(), bound.data(), gnorm, x.n, thr,
                                      ids.data(), ids.shape(0), mask_arg(mask, x.n));
       },
@@ -185,6 +187,7 @@ void bind_sampling(nb::module_& m) {
         const artlite::Logits x = logits_arg(logits);
         if (!x.bf16 || a.shape(0) != x.n || scale.shape(0) != x.n)
           throw artlite::Error("screen_dense: bf16 logits, a scale and a value per logit");
+        nb::gil_scoped_release release;
         artlite::screen_dense(static_cast<const uint16_t*>(x.data), scale.data(), x.n, floor, a.data());
       },
       "logits"_a, "scale"_a, "floor"_a, "a"_a,
@@ -199,7 +202,10 @@ void bind_sampling(nb::module_& m) {
         for (size_t j = 0; j < m; j++)
           if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact: a row past the matrix");
         auto out = std::make_unique<float[]>(m);
-        artlite::screen_exact(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        {
+          nb::gil_scoped_release release;
+          artlite::screen_exact(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        }
         return owned(std::move(out), m);
       },
       "raw"_a, "ids"_a, "g"_a,
@@ -230,7 +236,10 @@ void bind_sampling(nb::module_& m) {
         for (size_t j = 0; j < m; j++)
           if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact_q8: a row past the matrix");
         auto out = std::make_unique<float[]>(m);
-        artlite::screen_exact_q8(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        {
+          nb::gil_scoped_release release;
+          artlite::screen_exact_q8(raw.data(), raw.shape(1), ids.data(), m, g.data(), cols, out.get());
+        }
         return owned(std::move(out), m);
       },
       "raw"_a, "ids"_a, "g"_a,
@@ -279,7 +288,11 @@ void bind_sampling(nb::module_& m) {
         for (size_t j = 0; j < m; j++)
           if (size_t(ids.data()[j]) >= rows) throw artlite::Error("screen_exact_half: a row past the matrix");
         auto out = std::make_unique<float[]>(m);
-        artlite::screen_exact_half(raw.data(), bf16, size_t(raw.stride(0)), ids.data(), m, g.data(), cols, out.get());
+        {
+          nb::gil_scoped_release release;
+          artlite::screen_exact_half(raw.data(), bf16, size_t(raw.stride(0)), ids.data(), m, g.data(), cols,
+                                     out.get());
+        }
         return owned(std::move(out), m);
       },
       "raw"_a, "bf16"_a, "ids"_a, "g"_a,
