@@ -468,6 +468,9 @@ __attribute__((noinline)) void {{ p }}_hink(const float *__restrict h, const bfl
         float *__restrict cur = ist + {{ H8 }} * (4 * n1 + s);
         AIE_LOOP_NO_UNROLL
         for (int c = 0; c < {{ H8 }}; c += 32) {
+{% if ink_plain %}
+            const aie::vector<float, 32> o = aie::load_v<32>(res + {{ RES_PITCH }} * s + c);  // (INK_PLAIN: out = v_s, h and w unread)
+{% else %}
             aie::accum<accfloat, 32> acc(aie::load_v<32>(res + {{ RES_PITCH }} * s + c));
             for (int t = 0; t < 4; t++) {
                 const int i = s - a + t;
@@ -478,6 +481,7 @@ __attribute__((noinline)) void {{ p }}_hink(const float *__restrict h, const bfl
                 acc = aie::mac(aie::mac(acc, xh, wt), xl, wt);
             }
             const aie::vector<float, 32> o = al::mulff<32>(acc.template to_vector<float>(), aie::broadcast<float, 32>({{ 5 ** -0.5 }}f));
+{% endif %}
             if (blk)
                 aie::store_v(cur + c, o);
             else
@@ -1002,6 +1006,27 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
     const aie::vector<float, 32> nw = aie::select(old, st0 ? vg : aie::add(old, vg), aie::ge(li, (int16)lo) & aie::lt(li, (int16)hi));
     aie::store_v(pa, nw.template extract<16>(0));
     aie::store_v(pa + 16, nw.template extract<16>(1));
+}
+
+{% endif %}
+{% if qtails and not moe %}
+// A dense gate / up group of G row tiles of R rows (a B_QT group's, after its tail tile and ``_rows``): its [8 gate | 8 up]
+// windows (a 16-row tile's block, or a pair of 8-row tiles' blocks: the second's rows the up rows) -> {{ act }}(bf16(gate))
+// up into the first 32 floats of blocks 0 .. nw - 1 (in order: a window's blocks are at or past its own); returns nw
+__attribute__((noinline)) int {{ p }}_qguw(int32_t *__restrict ws, int G, int R)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict yt = WS(float, {{ w_.yt }});
+    bfloat16 *__restrict gs = WS(bfloat16, {{ w_.gs }});
+    const int nw = R < 16 ? G >> 1 : G, bs = R < 16 ? {{ 2 * YB }} : {{ YB }}, uo = R < 16 ? {{ YB }} : 32;
+    AIE_LOOP_NO_UNROLL
+    for (int w = 0; w < nw; w++) {
+        const float *__restrict g = yt + bs * w;
+        aie::store_v(gs, aie::accum<accfloat, 32>(aie::load_v<32>(g)).template to_vector<bfloat16>());
+        {{ lut }}<32>(gs, gs + 32);
+        aie::store_v(yt + {{ YB }} * w, al::mulc<32>(aie::load_v<32>(g + uo), aie::load_v<32>(gs + 32)).template to_vector<float>());
+    }
+    return nw;
 }
 
 {% endif %}
@@ -2167,6 +2192,9 @@ __attribute__((noinline)) void {{ p }}_cend(int32_t *__restrict ws{{ ", int32_t 
         AIE_LOOP_UNROLL_FULL
         for (int i = 0; i < {{ YB }}; i += 16)
             aie::store_v(yt + {{ YB }} * b + i, aie::zeros<float, 16>());
+{% elif qtails %}
+    {{ p }}_rows(ws, flags & ~{{ F_GU }}, {{ YB }} * G);  // (a dense gate / up group: its windows after it, ``qguw``)
+    const int nw = (flags & {{ F_GU }}) ? {{ p }}_qguw(ws, qm ? qm : G, R) : 0;
 {% else %}
     {{ p }}_rows(ws, {{ "flags & ~%d" % F_GU if gu_win else "flags" }}{{ ", 2" if gwin else "" }}{{ ", %d * G" % YB if rg else "" }}{{ ", row0 + r0" if pli and rot else "" }});
 {% endif %}
@@ -2225,6 +2253,8 @@ __attribute__((noinline)) void {{ p }}_cend(int32_t *__restrict ws{{ ", int32_t 
         nv = (fw & {{ B_SPLIT }}) ? {{ p }}_gusplit(ws, S, R, fw) : {{ p }}_guwin(ws, S, R);
 {% elif gu_win %}
         nv = {{ p }}_guwin(ws, S, R);
+{% elif qtails %}
+        nv = 8 * nw;
 {% else %}
         nv = 8;
 {% endif %}
@@ -2245,7 +2275,11 @@ __attribute__((noinline)) void {{ p }}_cend(int32_t *__restrict ws{{ ", int32_t 
         int a = 0;
         AIE_LOOP_NO_UNROLL
         for (int j = 0; j < G; j++) {
+{% if qtails %}
+            const int k = (flags & {{ F_GU }}) ? (j < nw ? 8 : 0) : (nv - R * j > R ? R : nv - R * j);  // (gate / up: a window's 8)
+{% else %}
             const int k = nv - R * j > R ? R : nv - R * j;
+{% endif %}
             if (k > 0)
                 a += {{ p }}_slot(ws, s, flags, fw, k, row0 + r0 + R * j, n + a, j);
         }

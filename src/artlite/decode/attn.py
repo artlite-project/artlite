@@ -125,11 +125,13 @@ A_TOK = STATE.common.block("A_TOK", 4 * 2 * SLOTS, at=A_TOK_AT)
 INK_STATE = STATE.kind("ink")
 A_NRING, A_NKVR, A_NRE, A_NEX, A_GP0, A_FULL, A_EP0 = INK_STATE.words(
     "A_NRING A_NKVR A_NRE A_NEX A_GP0 A_FULL A_EP0", at=A_WORDS)
-A_NPARTS = INK_STATE.word("A_NPARTS", at=A_WORDS + 7)  # (ink) the step's parts (``protocol.M_TOK_PARTS``; at least 1)
-# (ink) an F_INK phase's objects past its tiles and taps, skipped in the main core's order: the history objects (X, one per
-# part), then the queries object (A): else the main core's X FIFO holds them back from the broadcast while it waits for
-# the tiles
-A_NXSKIP2, A_NASKIP2 = INK_STATE.words("A_NXSKIP2 A_NASKIP2", at=A_WORDS + 8)
+# (``states``: a states design's attention, ``Attn(states=True)``; ink's too) the step's parts (``protocol.M_TOK_PARTS``; at
+# least 1); an F_INK phase's objects past its tiles and taps, skipped in the main core's order: the history objects (X,
+# one per part), then the queries object (A): else the main core's X FIFO holds them back from the broadcast while it
+# waits for the tiles
+STATES_STATE = STATE.kind("states")
+A_NPARTS = STATES_STATE.word("A_NPARTS", at=A_WORDS + 7)
+A_NXSKIP2, A_NASKIP2 = STATES_STATE.words("A_NXSKIP2 A_NASKIP2", at=A_WORDS + 8)
 A_WORDS_INK = A_WORDS + 10
 # (ink) an F_ATT object's words: the layer is a full one (M_AFULL), the relative extent (M_AEXT)
 ATT_INK = XMETA.kind("ink attention", extends=(ATT,))
@@ -155,11 +157,13 @@ WINS = {"abegin": 11, "aq": 12, "aqpan": 13, "akv": 14, "kobj": 15, "vobj": 16, 
 assert not set(WINS.values()) & set(DESIGN_WINS.values()), "event windows of the design and of the attention core collide"
 
 
-def consts(ink: bool = False) -> dict[str, int]:
+def consts(ink: bool = False, states: bool = False) -> dict[str, int]:
     """The words, flags and ids the attention cores' kernels take: their own, and of the protocol the phase objects they
-    skip (``PHASE``) and the token objects (``TOKEN``); ``ink``: Inkling's (``Attn(ink=True)``)."""
-    return XMETA.consts(PHASE, ATT, TOKEN_ATT, *([ATT_INK, INK] if ink else [])) | \
-        STATE.consts(*([INK_STATE] if ink else [])) | {"A_WORDS": A_WORDS}
+    skip (``PHASE``) and the token objects (``TOKEN``); ``ink``: Inkling's (``Attn(ink=True)``); ``states``: a states
+    design's (``Attn(states=True)``, the phases' fp32 state objects and F_INK steps to skip)."""
+    states = states or ink
+    return XMETA.consts(PHASE, ATT, TOKEN_ATT, *([ATT_INK] if ink else []), *([INK] if states else [])) | \
+        STATE.consts(*([INK_STATE] if ink else []), *([STATES_STATE] if states else [])) | {"A_WORDS": A_WORDS}
 
 
 def ink_rel(E: np.ndarray) -> np.ndarray:
@@ -212,12 +216,17 @@ class Attn:
     KB: ``PAGES``), the memtile transport's words (``paging.PageSpec``: one core half). ``sinks``: a learned sink per query
     head (module docstring); ``moe``: the design's MoE layers pass (their combine's objects are skipped whole, not as an
     input's strips); ``acc``: (moe) the bytes from y on in which the design's main core holds its acc
-    (``AttentionDecodeOperator.ACC_AT``: the workspace is at least that long; what persists over a step lies before y)."""
+    (``AttentionDecodeOperator.ACC_AT``: the workspace is at least that long; what persists over a step lies before y).
+    ``states``: the cores of a states design (``decode.design``'s ``states``: they skip its phases' fp32 state objects and
+    F_INK steps; ``ink`` implies it). ``block``: every step is a block (a DSpark drafter's): each row sees all of the
+    step's positions and the window's (``M_AWIN``) positions before its first, not a causal window of its own (one head
+    dim)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
                  c_len: int = 64, gate: bool = False, conv: AttnJob | None = None, pages: paging.PageSpec | None = None,
-                 sinks: bool = False, moe: bool = False, ink: bool = False, acc: int = 0):
+                 sinks: bool = False, moe: bool = False, ink: bool = False, acc: int = 0, states: bool = False,
+                 block: bool = False):
         assert 1 <= len(hds) <= len(rot) <= 2 and all(hd % 64 == 0 and hd <= 512 for hd in hds), (hds, rot)
         assert all(r % 32 == 0 and r <= hds[min(i, len(hds) - 1)] // 2 for i, r in enumerate(rot)) and kp in (1, 2)
         assert chain in (1, 2, 4) and (1 <= heads <= 4 or (heads == 8 and max(hds) <= 128)), (chain, heads, hds)
@@ -226,7 +235,8 @@ class Attn:
         assert not sinks or (len(hds) == 1 and not gate), "sinks: one head dim, no gate"
         assert not ink or (hds == (128,) and rot == (0,) and chain == 1 and heads == 3 and v_norm and not
                            (qk_norm or gate or sinks or conv)), "ink: Inkling's attention (module docstring)"
-        self.ink = ink
+        assert not block or (len(hds) == 1 and not ink), "block: one head dim, not Inkling's"
+        self.ink, self.states, self.block = ink, states or ink, block
         self.hds, self.rot, self.chain, self.heads, self.kp = tuple(hds), tuple(rot), chain, heads, kp
         self.qk_norm, self.v_norm, self.eps, self.a_bytes, self.c_len = qk_norm, v_norm, eps, a_bytes, c_len
         self.qk_weights, self.gate, self.conv, self.pages, self.sinks, self.moe = qk_weights, gate, conv, pages, sinks, moe
@@ -270,7 +280,8 @@ class Attn:
         rg = max(self.rg.values())
         sets = max(self.rows(hd) // 4 for hd in self.hds)
         kb = max(self.kb_slot * SLOTS, 72 * hm // 8)  # (the slots' new K blocks; a record's V panels)
-        words = A_WORDS_INK if self.ink else A_WORDS + (self.conv.words if self.conv is not None else 0)
+        assert not (self.states and self.conv is not None), "states: no conv job (its words past A_WORDS)"
+        words = A_WORDS_INK if self.states else A_WORDS + (self.conv.words if self.conv is not None else 0)
         sizes = [("st", 4 * words), ("cs", 4 * 2 * SLOTS * sum(self.rot)), *([("itau", 64)] if self.ink else []),
                  ("y", 4 * self.y_floats()), ("qa", qa),
                  ("kf", 4 * hm), ("kb", kb), ("vn", 2 * hm * SLOTS), ("sc", 4 * 32 * rg * sets),
@@ -340,8 +351,8 @@ class Attn:
                            by_hd=lambda vals: by("hd", vals), by_nd=lambda vals: by("nd", vals, lambda hd: hd // 8),
                            INK=self.ink, INK_Q=INK_Q, INK_G=INK_G, INK_R=INK_R, INK_SK=INK_SK, INK_QC=INK_QC, INK_RC=INK_RC,
                            INK_K=INK_K, INK_V=INK_V, INK_KD=INK_KD, INK_VD=INK_VD, INK_TAPS=INK_TAPS, INK_EW=INK_EW,
-                           INK_ED0=INK_ED0, INK_EG=INK_EG,
-                           META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts(self.ink))
+                           INK_ED0=INK_ED0, INK_EG=INK_EG, STATES=self.states, BLOCK=self.block,
+                           META=META, NX_PER_NORM=NX_PER_NORM, COLS=COLS, **consts(self.ink, self.states))
 
     def workers(self, s: object, *, prefix: str, row: int, stack: int, a_depth: int = 1,
                 extra: dict[int, list] | None = None,
@@ -411,7 +422,7 @@ class Attn:
                 for _ in range_(ws[i_a + A_NASKIP]):
                     a_f.acquire(1)
                     a_f.release(1)
-                if self.ink:
+                if self.states:
                     for _ in range_(ws[i_a + A_NXSKIP2]):
                         x_f.acquire(1)
                         x_f.release(1)

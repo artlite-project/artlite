@@ -329,9 +329,15 @@ __attribute__((noinline, minsize)) uint32_t {{ p }}_mask(int set, int P0, int p,
 {% endif %}
         if (s >= S)
             continue;
+{% if BLOCK %}
+        int hi = p + S - P0;  // (a block: every row sees the step's positions, and the win positions before them)
+        hi = hi < 0 ? 0 : (hi > 8 ? 8 : hi);
+        int lo = (win ? p - win : 0) - P0;
+{% else %}
         int hi = p + s - P0 + 1;  // (positions P0 + j, j < hi: not past the slot's)
         hi = hi < 0 ? 0 : (hi > 8 ? 8 : hi);
         int lo = (win ? p + s - win + 1 : 0) - P0;
+{% endif %}
         lo = lo < -P0 ? -P0 : lo;
         lo = lo < 0 ? 0 : (lo > 8 ? 8 : lo);
         const uint32_t valid = ((1u << hi) - 1u) & ~((1u << lo) - 1u);
@@ -396,9 +402,15 @@ __attribute__((noinline, minsize)) void {{ p }}_kobj(uint8_t *__restrict a, int3
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < nsets; set++)
         {{ p }}_scores(a, AW(uint8_t, {{ a.qa }}) + {{ 72 * ND }} * set, sc + {{ 32 * RG_MAX }} * set, nr);
+{% if BLOCK %}
+    // masks: the records before max(window, 0) (rw of them), those from the first with a position past the step's (rm)
+    const int lo = st[{{ A_WIN }}] && p - st[{{ A_WIN }}] > 0 ? p - st[{{ A_WIN }}] : 0;
+    const int w0 = (lo - P0 + 7) >> 3, rw = w0 < 0 ? 0 : (w0 < nr ? w0 : nr), m0 = (p + S - P0) >> 3, rm = m0 < rw ? rw : m0;
+{% else %}
     // masks: the records before max(window, 0) (rw of them), those from the first with a position past p (rm)
     const int lo = st[{{ A_WIN }}] && p + S - st[{{ A_WIN }}] > 0 ? p + S - st[{{ A_WIN }}] : 0;
     const int w0 = (lo - P0 + 7) >> 3, rw = w0 < 0 ? 0 : (w0 < nr ? w0 : nr), m0 = (p - P0 + 1) >> 3, rm = m0 < rw ? rw : m0;
+{% endif %}
     AIE_LOOP_NO_UNROLL
     for (int r = 0; r < rw; r++)
         {{ p }}_mrec(st, sc + 32 * r, P0 + 8 * r, nsets);
@@ -706,11 +718,19 @@ __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int3
     if (t == 0 || r1 != r0) {
         uint8_t *__restrict pp = AW(uint8_t, {{ a.pp }});
         AIE_LOOP_NO_UNROLL
+{% if BLOCK %}
+        for (int s = 0; s < 1; s++) {  // (a block: every row sees the record up to the step's last position, at once)
+{% else %}
         for (int s = P0 > p ? P0 - p : 0; s < S; s++) {
+{% endif %}
 {% if ONE_HD %}
             // the slot's rows' P (P 0 elsewhere: their y and l as they are), y += P V (a lone record: the octet arithmetic
             // of a closed record's with a zero partner)
+{% if BLOCK %}
+            const int j = last, q0 = 0, q1 = st[{{ A_NH }}] * S;
+{% else %}
             const int j = p + s - P0, q0 = st[{{ A_NH }}] * s, q1 = q0 + st[{{ A_NH }}];
+{% endif %}
             {{ p }}_venc(rows, v, nd, j < 7 ? j + 1 : 8);
             float *__restrict y = AW(float, {{ a.y }});
             const int no = (st[{{ A_NH }}] * S + 7) >> 3;  // (the octets of the sub-step's rows)
@@ -814,7 +834,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% if CONV %}
     st[{{ A_WORDS }}] = 0;  // (the conv's loop count)
 {% endif %}
-{% if INK %}
+{% if STATES %}
     st[{{ A_NXSKIP2 }}] = 0;  // (an F_INK phase's objects past its taps)
     st[{{ A_NASKIP2 }}] = 0;
 {% endif %}
@@ -828,7 +848,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 {% endif %}
             st[{{ A_NPS }}] = (flags & {{ F_POST }}) ? 1 : 0;
             st[{{ A_LPER }}] = lper;
-{% if INK %}
+{% if STATES %}
             if (flags & {{ F_STATES }}) {  // (fp32 state objects: an object each, under one norm-weight object at most; a
                 // partial sums object first: F_COEF)
                 st[{{ A_LPER }}] = 0;
@@ -847,7 +867,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
                 st[{{ A_NXSKIP }}] = (nx + (1 << lper) - 1) >> lper;
             }
             st[{{ A_NASKIP }}] = m[{{ M_NT }}];
-{% if INK %}
+{% if STATES %}
             if (flags & {{ F_INK }}) {  // (the residual stream's step after the tiles: the taps' A object, the history's X
                 // object per part of the step, a queries object: in the main core's order)
                 st[{{ A_NASKIP }}] += 1;
@@ -865,9 +885,11 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
         const int t = m[{{ M_TOK_KIND }}];
 {% endif %}
         int32_t *__restrict tk = st + {{ A_TOK }} + 4 * t;
-{% if INK %}
+{% if STATES %}
         if (t == 0)  // (the step's parts: an F_INK phase's history objects, one each)
             st[{{ A_NPARTS }}] = m[{{ M_TOK_PARTS }}] ? m[{{ M_TOK_PARTS }}] & 15 : 1;
+{% endif %}
+{% if INK %}
         if ((t & {{ SMAX - 1 }}) == 0)  // (a kind's first token object: tau of the step's slots, fp32, its payload's first)
             aie::store_v(AW(float, {{ a.itau }}) + {{ SMAX }} * (t >= {{ SMAX }}), aie::load_v<{{ SMAX }}>((const float *)(x + {{ 2 * META }})));
 {% endif %}
@@ -977,7 +999,7 @@ __attribute__((minsize)) void {{ p }}_abegin(const bfloat16 *__restrict x, int32
 __attribute__((minsize)) void {{ p }}_anb(int32_t *__restrict ws)
 {
     int32_t *__restrict st = AW(int32_t, {{ a.st }});
-{% if INK %}
+{% if STATES %}
     const int left = st[{{ A_XL }}], n = st[{{ A_NNO }}] == 1 ? left : (left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left), lper = st[{{ A_LPER }}];
 {% else %}
     const int left = st[{{ A_XL }}], n = left > {{ NX_PER_NORM }} ? {{ NX_PER_NORM }} : left, lper = st[{{ A_LPER }}];

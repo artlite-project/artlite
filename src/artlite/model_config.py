@@ -1334,6 +1334,68 @@ class DSparkConfig:
 
 
 @dataclass(frozen=True)
+class InklingDSparkConfig:
+    """Inkling 2's DSpark block drafter (unsloth's ``dspark-*.gguf``: GGUF architecture ``dflash`` with the recurrent
+    Markov head, ``joint_proj``; vLLM's ``models/inkling2/nvidia/dspark.py``), from the metadata of its file: ``layers``
+    dense layers of ``hidden`` (SiLU GLU of ``ffn``; ``heads`` query heads over ``kv_heads`` KV heads of ``head_dim``,
+    q / k RMS-normed per head, NeoX RoPE of base ``rope_base`` on all dims), each a ``local`` one (its keys the
+    ``window`` positions before a block's anchor) or a full one (all of them), a block of ``block`` rows (the anchor's
+    normed embedding, then ``mask_embd``) that sees its keys and itself whole; ``taps``: the model's visits whose
+    residual feeds its cache (``Visit.index``; ``len(visits)``: the final normed state), mixed per layer and for the
+    Markov head by the rows of ``dspark_fuse``; the Markov head's ``rank``; its logits softcapped at ``softcap`` over
+    the head's ``vocab_padded`` rows, of which the first ``vocab_size`` are tokens."""
+
+    layers: int
+    hidden: int
+    ffn: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    block: int
+    window: int
+    local: tuple[bool, ...]
+    taps: tuple[int, ...]
+    vocab_size: int
+    vocab_padded: int
+    rank: int
+    rms_norm_eps: float
+    rope_base: float
+    softcap: float
+
+    @property
+    def hidden_size(self) -> int:
+        return self.hidden
+
+    @classmethod
+    def from_gguf(cls, gguf: Any) -> InklingDSparkConfig:
+        """From an ``artlite.gguf_model.GGUFFile``."""
+        assert gguf.arch == "dflash" and "joint_proj.weight" in gguf, f"{gguf.path}: not an Inkling DSpark drafter"
+        m = gguf.arch_meta
+        n = int(m("block_count"))
+        assert not m("sample_from_anchor", False) and not m("has_confidence_head", False) and \
+            not m("attention.causal", False), f"{gguf.path}: another DSpark form"
+        return cls(layers=n, hidden=int(m("embedding_length")), ffn=int(m("feed_forward_length")),
+                   heads=int(m("attention.head_count")), kv_heads=int(m("attention.head_count_kv")),
+                   head_dim=int(m("attention.key_length")), block=int(m("block_size")),
+                   window=int(m("attention.sliding_window")),
+                   local=tuple(bool(x) for x in m("attention.sliding_window_pattern")),
+                   taps=tuple(int(x) for x in m("target_layers")), vocab_size=int(m("vocab_size_unpadded")),
+                   vocab_padded=int(m("vocab_size")), rank=int(m("dspark.markov_rank")),
+                   rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")), rope_base=float(m("rope.freq_base")),
+                   softcap=float(m("final_logit_softcapping", 0.0)))
+
+    def rope_theta(self, positions: np.ndarray | range | list) -> np.ndarray:
+        """(n, head_dim / 2) float32 angles of positions (``DFlashConfig.rope_theta``'s)."""
+        scale = np.float32(np.power(np.float32(self.rope_base), np.float32(-2.0 / self.head_dim)))
+        th = np.asarray(positions, np.float32).reshape(-1)
+        out = np.empty((th.shape[0], self.head_dim // 2), np.float32)
+        for i in range(self.head_dim // 2):
+            out[:, i] = th
+            th = (th * scale).astype(np.float32)
+        return out
+
+
+@dataclass(frozen=True)
 class ClipConfig:
     """A vision encoder and projector, from the metadata of its GGUF file (architecture ``clip``; llama.cpp's
     ``tools/mtmd/clip.cpp``): ``projector`` (``clip.projector_type``: "minicpmv4_7", "qwen3vl_merger"), the ViT

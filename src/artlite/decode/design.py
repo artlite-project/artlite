@@ -296,6 +296,7 @@ class DecodeOverlayOperator(ArtcOperator):
     ACC_AT = 0  # (moe) acc's byte offset in ``_acc``'s buffer
     GATE_STATE: ClassVar[tuple[Kind, ...]] = ()  # (gate) the state words (``protocol.STATE``'s kinds) the model's gate code adds
     META_KINDS: ClassVar[tuple[Kind, ...]] = ()  # the kinds of X objects (``protocol.XMETA``) the model's cores add to the design's
+    INK_PLAIN = False  # (states) the F_INK steps without the conv: cur += the phase's rows (a DSpark drafter's residual)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -584,6 +585,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                  states=self.states, units=self.units, CPARTS=self.cparts, situ=self.situ,
                                  ink_page=self.ink_page, pg_state=0x70000 + PG_STATE, INK_STATES=INK_STATES,
                                  INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS, paged_fmts=list(self.paged),
+                                 ink_plain=self.INK_PLAIN,
                                  **self._moe_vars(p, consts), **consts)
 
     def _moe_vars(self, p: str, consts: dict[str, int]) -> dict[str, object]:

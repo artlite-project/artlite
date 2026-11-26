@@ -238,10 +238,11 @@ class AttentionOverlay(ModelOverlay):
                 out.append(CacheRows(np.array(offs, np.int64), self.G * self.T, kind.pg))
         return out
 
-    def ranges(self, kind: int, p: int) -> list[tuple[int, int]]:
+    def ranges(self, kind: int, p: int, n: int = 1) -> list[tuple[int, int]]:
         """The chain's columns' (first group, groups) of a cache kind for a sub-step whose slots are in the group of position
         p: those of its group (a sliding-window cache: from the guard's groups before it on, the window of any of its
-        positions), the same for each KV head in every step."""
+        positions), the same for each KV head in every step (``n``: the sub-step's slots, for a model whose sub-steps may
+        cross groups)."""
         k = self.kinds[kind]
         g = p // k.pg
         return kv.ranges(first=max(0, g - k.guard) if k.guard else 0, g=g, chain=self.CHAIN)
@@ -505,7 +506,7 @@ class AttentionOverlay(ModelOverlay):
                 m[M_NS], m[M_TOK_NG:M_TOK_NG + COLS], m[M_TOK_NA:M_TOK_NA + COLS] = 0, 0, 0
             for u, (a, n) in enumerate(self._kind_subs(st.subs, k)):
                 p = pos[a]  # (the sub-step's first position: its slots are one sequence's, consecutive)
-                r = self.ranges(k, p)
+                r = self.ranges(k, p, n)
                 o = st.tok + (SLOTS * k + a) * XB
                 m = act[o:o + 4 * META].view(np.int32)
                 me = act[o + (n - 1) * XB:][:4 * META].view(np.int32)  # (the token of its last slot)

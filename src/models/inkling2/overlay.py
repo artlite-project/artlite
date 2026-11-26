@@ -45,6 +45,10 @@ states), the next pass's messages its mixes.
 
 The state array's slots (``SA_SLOTS``): 0 .. 4 the states, 5 .. 7 the blended inputs, 8 .. 11 the banks.
 
+A DSpark drafter's taps (``taps``: the visits whose input residual feeds its cache): the combine of the visit before a
+tap emits cur a second time (``protocol.M_INKN``'s bank copy, into a bank that no pass reads before its own visits
+write it again: ``_tap_bank``), drained into TAPS ([tap][k block][slot sp][8] fp32, ``tap_rows``).
+
 The host writes the first visit's input states and, a loop visit's, the bank its messages read (``write_states``: the
 state array, the F_LOADR objects, the partial sums of its mixes); the later visits' come from the steps of the ones
 before (S3's next pieces: the whole step with the output's mix and the LM head).
@@ -216,7 +220,8 @@ class InklingOverlay(AttentionOverlay):
     tests run slices), ``max_positions``: the caches' capacity, ``kv_k``: the caches' K precision, ``ffn``: the visits'
     FFNs (False: their attention and o phases only), ``paged``: the formats whose kernels are pages (default: every
     format, which the main and helper cores' memory does not hold with the residual stream's work), ``wrap``: the
-    sliding-window caches' ring (groups; 0: linear; default ``WRAP`` past that many groups of capacity)."""
+    sliding-window caches' ring (groups; 0: linear; default ``WRAP`` past that many groups of capacity); ``taps``: a
+    DSpark drafter's visits whose input residual the steps copy out (module docstring)."""
 
     CONFIG, IMAGE = InklingConfig, InklingImage
     CHAIN = 1
@@ -226,11 +231,16 @@ class InklingOverlay(AttentionOverlay):
 
     def __init__(self, gguf: GGUFFile, *, visits: list[int] | None = None, vocab: int | None = None,
                  max_positions: int = 4096, kv_k: str = "hilo", weights: WeightBuffer | None = None, ffn: bool = True,
-                 paged: tuple[str, ...] | None = None, wrap: int | None = None, sequences: int = 1):
+                 paged: tuple[str, ...] | None = None, wrap: int | None = None, sequences: int = 1,
+                 taps: tuple[int, ...] = ()):
         cfg = InklingConfig.from_gguf(gguf)
         vs = list(range(len(cfg.visits))) if visits is None else list(visits)
         self.vis = {v: cfg.visits[v] for v in vs}
         self.ffn = ffn
+        self.taps = tuple(taps)
+        assert not taps or ffn, "taps: the combines' copies"
+        for t in self.taps:  # (the combine of the visit before: no bank copy of its own)
+            assert t - 1 in self.vis and self.bank_of(t - 1, cfg) is None, t
         # (the FFN's combine reads the next visit's queries: its layer's "inkq", the output's after the last visit)
         self.after = vs[-1] + 1
         # (the whole model's last visit: then the output's mix, its norm and the LM head)
@@ -382,6 +392,7 @@ class InklingOverlay(AttentionOverlay):
             self.cp = {v: take("ACT", COLS * (CP_BYTES + XB)) for v in self.layers}
             self.comb = {v: take("ACT", COLS * XB) for v in self.layers}  # (per visit its combine's metadata objects)
             self.part = take("ACT", COLS * self.part_col)
+        self.tap_off = take("ACT", len(self.taps) * self.state_bytes(SLOTS)) if self.taps else 0
         self._sizes()
 
     @property
@@ -774,24 +785,38 @@ class InklingOverlay(AttentionOverlay):
             seq.drain("C", c, dev.address("ACT", self.ps[(v + 1, "a")] + (XB - XPAY) + 512 * c), 512)
             if bk is not None:  # (cur again: its bank's copy)
                 seq.drain("C", c, dev.address("ACT", self.sa + (BANK0 + 2 * bk[0] + bk[1]) * ST + c * row * sp), row * sp)
+            elif v + 1 in self.taps:  # (cur again: the tap's copy)
+                t = self.taps.index(v + 1)
+                seq.drain("C", c, dev.address("ACT", self.tap_off + t * self.state_bytes(SLOTS) + c * row * sp), row * sp)
             if nxt:  # (the next visit's message mixes' partial sums)
                 for m in ("ma", "mb"):
                     seq.drain("C", c, dev.address("ACT", self.ps[(v + 1, m)] + (XB - XPAY) + 512 * c), 512)
 
-    def bank_of(self, v: int) -> tuple[int, int] | None:
+    def bank_of(self, v: int, cfg: InklingConfig | None = None) -> tuple[int, int] | None:
         """(bank, state) visit v's combine writes cur into: a pass's (not the last's) mid-core residual (after the core's
         first block) and output, which the next pass's messages mix (``ref.Model.walk``'s bank), or None."""
-        vis, cfg = self.cfg.visits[v], self.cfg
+        cfg = cfg or self.cfg
+        vis = cfg.visits[v]
         if not 0 <= vis.loop < cfg.passes - 1:
             return None
         mid = cfg.core_start + cfg.block_size - 1
         return (vis.loop % 2, 0) if vis.layer == mid else (vis.loop % 2, 1) if vis.layer == cfg.core_end - 1 else None
 
+    def _tap_bank(self, v: int) -> tuple[int, int]:
+        """(bank, state) the combine of visit v, before a tap, copies cur into: one that no pass reads before its own
+        visits write it again (a pass before the last: the bank it writes, the state its next bank visit writes; the
+        last pass: the bank it does not read; the prelude and coda: any, the passes write both before they read them)."""
+        vis, cfg = self.cfg.visits[v], self.cfg
+        if 0 <= vis.loop < cfg.passes - 1:
+            mid = cfg.core_start + cfg.block_size - 1
+            return vis.loop % 2, int(vis.layer > mid)
+        return (vis.loop % 2 if vis.loop >= 0 else 0), 0
+
     def _bank_words(self, v: int) -> int:
-        """(the combine's M_INKN past the queries) its bank's copy (``bank_of``), the next visit's message mixes' partial
-        sums (``protocol.M_INKN``)."""
+        """(the combine's M_INKN past the queries) its bank's copy (``bank_of``; before a tap, ``_tap_bank``), the next
+        visit's message mixes' partial sums (``protocol.M_INKN``)."""
         out = 0
-        if (bk := self.bank_of(v)) is not None:
+        if (bk := self.bank_of(v) or (self._tap_bank(v) if v + 1 in self.taps else None)) is not None:
             out |= 1 << 16 | bk[0] << 17 | bk[1] << 18
         if v + 1 < len(self.cfg.visits) and (nxt := self.cfg.visits[v + 1]).messages:
             out |= 4 << 20 | ((nxt.loop - 1) % 2) << 24
@@ -1015,6 +1040,18 @@ class InklingOverlay(AttentionOverlay):
         self.dev.fetch("ACT", self.sa + b * ST, ST)
         x = self.dev.view("ACT")[self.sa + b * ST:self.sa + (b + 1) * ST].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
         return x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H).copy()
+
+    def tap_rows(self, S: int) -> np.ndarray:
+        """The taps of the last step's slots (S, taps, hidden) fp32 (``taps``: the residual entering each tap visit)."""
+        sp, ST = packed_slots(S), self.state_bytes(SLOTS)
+        n = self.state_bytes(sp)
+        out = np.empty((S, len(self.taps), self.H), np.float32)
+        for t in range(len(self.taps)):
+            off = self.tap_off + t * ST
+            self.dev.fetch("ACT", off, n)
+            x = self.dev.view("ACT")[off:off + n].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
+            out[:, t] = x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H)
+        return out
 
     def psums(self, v: int, m: str) -> np.ndarray:
         """Visit v's partial sums object of its attention's (m "a") or FFN's ("f") mix (COLS, 4, 32) fp32."""
