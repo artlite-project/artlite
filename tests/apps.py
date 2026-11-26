@@ -18,9 +18,11 @@ from artlite import parallel_compile
 from artlite.gguf_model import GGUFFile
 from artlite.hf_model import open_weights
 from artlite.model_config import (
+    InklingDSparkConfig,
     checkpoint,
     flint_gguf,
     gemma_gguf,
+    inkling_dspark_of,
     inkling_gguf,
     lfm3_gguf,
     llama_gguf,
@@ -171,13 +173,19 @@ def _spark(path: str) -> AppBuild:
 
 
 def _inkling(path: str) -> AppBuild:
-    """Inkling 2's whole step and its prefill (the sliding-window caches linear: ``NpuInkling(prefill=True)``)."""
+    """Inkling 2's whole step and its prefill (the sliding-window caches linear: ``NpuInkling(prefill=True)``), with its
+    DSpark drafter (``inkling_dspark_of``: the app's default) where its file is: the steps' and the chunks' taps, the
+    drafter's design."""
+    from models.inkling2.dspark import DSparkOverlay
     from models.inkling2.overlay import InklingOverlay
     from models.inkling2.prefill import InklingPrefill
 
-    ov = InklingOverlay(GGUFFile(path), max_positions=4096, wrap=0)
-    pf = InklingPrefill(ov)
-    return _built([ov.op, pf.lib], pf, ov)
+    file = inkling_dspark_of(path)
+    dg = GGUFFile(file) if file is not None else None
+    taps = InklingDSparkConfig.from_gguf(dg).taps[:-1] if dg is not None else ()
+    ov = InklingOverlay(GGUFFile(path), max_positions=4096, wrap=0, taps=taps)
+    pf = InklingPrefill(ov, taps=taps)
+    return _built([ov.op, pf.lib, *([DSparkOverlay(ov, dg).op] if dg is not None else [])], pf, ov)
 
 
 def _sd15(path: str) -> AppBuild:

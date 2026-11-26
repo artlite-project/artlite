@@ -17,7 +17,7 @@ directory: the GGUF architecture it opens as, ``artlite.hf_model``) and opens it
 | ``qwen35moe`` | ``qwen35`` | Qwen3.6-35B-A3B (the same layers, a mixture of experts as the FFN; images: its mmproj) |
 | ``spark2_5`` | ``spark`` | Spark-X2.5 / X2.6 4B, 1.7B (sliding-window and full attention, head_dim 256) |
 | ``flint`` | ``flint`` | Recursive's Flint (40B: 256 experts of which 6 per token; sliding-window and full attention with sinks) |
-| ``inkling2_loop``, ``inkling2`` | ``inkling2`` | Thinking Machines' Inkling 2 Mini (26B: 128 experts of which 8 per token, 12 of 24 layers looped 3 times; decode on the NPU, prompts as decode steps) |
+| ``inkling2_loop``, ``inkling2`` | ``inkling2`` | Thinking Machines' Inkling 2 Mini (26B: 128 experts of which 8 per token, 12 of 24 layers looped 3 times; decode on the NPU, prompts in prefill chunks, its DSpark drafter) |
 | ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 
