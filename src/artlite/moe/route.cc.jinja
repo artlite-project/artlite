@@ -160,8 +160,10 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
         if ((used[e >> 5] >> (e & 31)) & 1)
             U[u++] = e;
 {% if units %}
-    // column col's items (e | u0 << 8 | u1 << 12): whole experts U[col + COLS q], then of the rest's units in order (each
-    // its work, the units' table) those whose work starts in the column's share [col, col + 1) R / COLS, R the rest's work
+    // column col's items (e | u0 << 8 | u1 << 12): whole experts U[col + COLS q], then the rest's units by decreasing
+    // work (each unit, in a stable order of the units' table, over the rest's experts in order) to the least loaded
+    // column (ties: the lower one) with an item left (a unit after the last unit of that column's last item, of its
+    // expert, extends the item): every core deals the same, each keeps its column's items (``route.deal_units``)
     const int nw = u >> {{ (COLS - 1).bit_length() }}, rest = u - {{ COLS }} * nw;
     int n = 0, we = 0;
     AIE_LOOP_NO_UNROLL
@@ -170,20 +172,41 @@ __attribute__((noinline, minsize)) void {{ p }}_route(const int32_t *__restrict 
     AIE_LOOP_NO_UNROLL
     for (int v = 0; v < {{ units }}; v++)
         we += ut[4 * v + 1];
-    const int R = rest * we;
-    int a = 0;
+    int32_t ld[{{ COLS }}], ni[{{ COLS }}], lt[{{ COLS }}];  // (per column its work, items, last item's t | u1 << 8)
     AIE_LOOP_NO_UNROLL
-    for (int t = 0; t < rest; t++) {
-        const int e = U[{{ COLS }} * nw + t];
+    for (int c = 0; c < {{ COLS }}; c++) {
+        ld[c] = nw * we;
+        ni[c] = nw;
+        lt[c] = -1;
+    }
+    int done = 0;  // (the units dealt: a bit each)
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ units }}; i++) {
+        int v = -1;  // (the next unit: the largest work not dealt, the first of equal ones)
         AIE_LOOP_NO_UNROLL
-        for (int v = 0; v < {{ units }}; v++) {
-            if (col * R <= a * {{ COLS }} && a * {{ COLS }} < (col + 1) * R) {
-                if (n > nw && (it[n - 1] & 255) == e)  // (the next unit of the last item's expert)
+        for (int x = 0; x < {{ units }}; x++)
+            if (!((done >> x) & 1) && (v < 0 || ut[4 * x + 1] > ut[4 * v + 1]))
+                v = x;
+        done |= 1 << v;
+        const int wv = ut[4 * v + 1];
+        AIE_LOOP_NO_UNROLL
+        for (int t = 0; t < rest; t++) {
+            const int key = t | (v - 1) << 8;  // (the last item a unit v of expert t extends)
+            int b = -1;
+            AIE_LOOP_NO_UNROLL
+            for (int c = 0; c < {{ COLS }}; c++)
+                if ((lt[c] == key || ni[c] < {{ MAX_ITEMS }}) && (b < 0 || ld[c] < ld[b]))
+                    b = c;
+            const int ext = lt[b] == key;
+            if (b == col) {
+                if (ext)
                     it[n - 1] = (it[n - 1] & ~(15 << 12)) | v << 12;
                 else
-                    it[n++] = e | v << 8 | v << 12;
+                    it[n++] = U[{{ COLS }} * nw + t] | v << 8 | v << 12;
             }
-            a += ut[4 * v + 1];
+            ni[b] += !ext;
+            lt[b] = t | v << 8;
+            ld[b] += wv;
         }
     }
 {% else %}

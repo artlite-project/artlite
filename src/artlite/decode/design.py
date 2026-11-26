@@ -237,6 +237,10 @@ ACT8_PAGED = (0x0800, 0xF980)
 # (8 slots with gather tables: ``l1_8``) the main core's table copies in regions 1 (its workspace after it) and 3, the
 # helper's in regions 0 and 3 (its scratch is in the core south of it)
 TAB8 = ((0x74000, 0x7F780), (0x70400, 0x7F780))
+# (an MoE design of qtails, Inkling's: ``_pins``) the main core's table copies at the start of region 2 and in region 3,
+# its workspace and sum panels between them, its A objects in regions 0 and 1: the DMA writing the next tile meets
+# neither the tables nor the tile the GEMV reads, which with its tables and sum panels takes three regions
+TAB_PIN = ((0x78000, 0x7F780), TAB[1])
 STACK8 = (1536, 1024)  # (8 slots with gather tables) the main and helper cores' stacks (their deepest calls, pages included)
 # paged formats whose pages a memtile channel's free BDs hold: one channel for both core halves next to a dense design of 4
 # slots (BDs 4 .. 23, two per format), a channel per core half in a design of 8 (BDs 10 .. 23, 34 .. 47)
@@ -363,6 +367,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not qtails or (states and not gu_win), \
             "qtails: states designs (the longer state: QT_STATE); a tail group's gate / up rows are whole windows"
         self.qtails = qtails
+        self.pin = bool(qtails and moe)  # (the main core's L1 pinned: ``TAB_PIN``, ``_pins``)
         self.rg = rg or self.moe or qtails  # (row-group tiles; qtails: a group's tail tile, its yt blocks)
         self.pairs = pairs
         self.experts, self.top = moe or (0, 0)
@@ -385,7 +390,8 @@ class DecodeOverlayOperator(ArtcOperator):
         # (the formats with a gather table: one table slot per core, TAB; a resident format's table resident, else every
         # one in its format's page)
         self.tables = [f for f in self.rows if slot(f).mmv_table(f) is not None]
-        self.tab = TAB8 if slots == 8 and self.tables else TAB  # (the tables' copies per core half)
+        # (the tables' copies per core half)
+        self.tab = TAB8 if slots == 8 and self.tables else TAB_PIN if self.pin else TAB
         self.stacks = STACK8 if slots == 8 and self.tables else (self.STACK, self.HELPER_STACK)  # (main, helper)
         assert len([f for f in self.tables if f not in self.paged]) <= 1 and \
             (set(self.tables) <= set(self.paged) or len(self.tables) == 1), (self.tables, self.paged)
@@ -1165,6 +1171,15 @@ class DecodeOverlayOperator(ArtcOperator):
                 at |= {f"{P}_ws{c}": L["m_ws"], f"{P}_xs{c}": L["m_xs"], f"{P}_xp{c}": L["h_xp"], f"{P}_hres{c}": L["h_hres"],
                        f"{P}_hst{c}": L["h_hst"]}
                 pools |= {f"{P}_a{c}__cons0": [L["m_a0"], L["m_a1"]], f"{P}_x{c}__cons0": [L["m_x0"]], f"{P}_res{c}": [L["h_res"]]}
+        elif self.pin:  # (the main core's A objects in regions 0 and 1 after its stack, the workspace after table copy 0
+            # at region 2's start, the sum panels after it: ``TAB_PIN``)
+            a0, a1 = self.stacks[0], 0x4000
+            ws_at = TAB_PIN[0][0] - 0x70000 + TAB_BYTES
+            assert a0 + self.tile_bytes <= a1 and a1 + self.tile_bytes <= ws_at - TAB_BYTES, (a0, a1, ws_at)
+            assert ws_at + W["size"] + self.xs_bytes <= TAB_PIN[0][1] - 0x70000, (ws_at, W["size"], self.xs_bytes)
+            for c in range(COLS):
+                at |= {f"{P}_ws{c}": ws_at, f"{P}_xs{c}": ws_at + W["size"]}
+                pools |= {f"{P}_a{c}__cons0": [a0, a1]}
         elif s8:  # (the workspace and the sum panels in the main core's regions 1, 2: the A buffers in regions 0, 3)
             at |= {f"{P}_ws{c}": WS8_AT for c in range(COLS)} | {f"{P}_xs{c}": WS8_AT + W["size"] for c in range(COLS)}
             assert WS8_AT + W["size"] + self.xs_bytes + self.tile_bytes + XB + 4 * 2 * C_LEN <= 0x10000

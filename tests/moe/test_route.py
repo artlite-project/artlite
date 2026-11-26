@@ -44,8 +44,8 @@ def test_deal(u: int) -> None:
 @pytest.mark.parametrize("u", list(range(1, 33)))
 def test_deal_units(u: int) -> None:
     """``route.render(units=)``'s deal (Inkling's units of 512, 512, 128 channels: work 4, 4, 1) of a union of u
-    experts: every unit once, whole experts first, at most MAX_ITEMS items a column, a column's work within one expert's
-    of the even share."""
+    experts: every unit once, whole experts first, at most MAX_ITEMS items a column, a column's work within its largest
+    unit's of the even share."""
     work = [4, 4, 1]
     union = sorted(np.random.default_rng(u).choice(128, u, replace=False).tolist())
     items = MR.deal_units(union, COLS, work)
@@ -53,7 +53,7 @@ def test_deal_units(u: int) -> None:
     assert sorted(units) == sorted((e, x) for e in union for x in range(3))
     assert max(len(col) for col in items) <= MR.MAX_ITEMS
     loads = [sum(work[x] for _, u0, u1 in col for x in range(u0, u1 + 1)) for col in items]
-    assert max(loads) - u * sum(work) / COLS <= sum(work), loads
+    assert max(loads) - u * sum(work) / COLS <= max(work), loads
 
 
 def _top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

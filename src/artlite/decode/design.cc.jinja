@@ -853,6 +853,10 @@ __attribute__((noinline)) void {{ p }}_hpstrip(const bfloat16 *__restrict x, con
 {% if act == "situ" %}
 {% set ksitu = km.situ(16, beta=situ[0], linear_beta=situ[1]) %}
 {{ ksitu.src }}
+{% if qtails and moe %}
+{% set ksitu_b = km.situ(32, beta=situ[0], linear_beta=situ[1], prec="bf16") %}
+{{ ksitu_b.src }}
+{% endif %}
 {% else %}
 {% set lut = km.act(km.TABLES[act], table_arg=SLOTS == 8) %}
 {{ lut.src }}
@@ -2848,8 +2852,8 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
 {% if qtails %}
 // The helper, a B_QT group of gate / up row tiles (K_QGU after its tail tile, the main core waiting: ``qgu``): per slot
 // with a routing weight (the item's) the [8 gate | 8 up] windows of the group's yt blocks (scaled: ``rows``' F_WS), a
-// window a 16-row tile's block or a pair of 8-row ones' (the second's rows the up rows), gathered for situ (16 values a
-// round: the routed slots' alone), then as bf16 into the hold buffer at outputs n .. (h as [h | h]; below 128 also at
+// window a 16-row tile's block or a pair of 8-row ones' (the second's rows the up rows), gathered for situ (in bf16, 32
+// values a round: the routed slots' alone), then into the hold buffer at outputs n .. (h as [h | h]; below 128 also at
 // 128, 256, 384: the 128-channel unit's [h h h h] for its B_G8 down, which a 512-unit's later outputs overwrite); the
 // blocks zeroed. In the helper's format pages (their second entry: ``pgq``), situ with it
 __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8_t *__restrict scr)
@@ -2875,12 +2879,17 @@ __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8
             aie::store_v(u + k, aie::load_v<8>(b + uo));
         }
     }
-    if (k & 15) {  // (a round's other half)
-        aie::store_v(g + k, aie::zeros<float, 8>());
-        aie::store_v(u + k, aie::zeros<float, 8>());
+    // (situ in bf16 arithmetic, 32 values a round: the prefill's, kmath.situ(prec="bf16"); its outputs after u)
+    bfloat16 *__restrict ob = (bfloat16 *)(u + 128);
+    AIE_LOOP_NO_UNROLL
+    for (int e = k; e & 31; e += 8) {
+        aie::store_v(g + e, aie::zeros<float, 8>());
+        aie::store_v(u + e, aie::zeros<float, 8>());
     }
-    if (k)
-        {{ ksitu }}(g, u, (k + 15) & ~15);
+    AIE_LOOP_NO_UNROLL
+    for (int e = 0; e < k; e += 32)
+        aie::store_v(ob + e, {{ ksitu_b }}(aie::accum<accfloat, 32>(aie::load_v<32>(g + e)).template to_vector<bfloat16>(),
+                                         aie::accum<accfloat, 32>(aie::load_v<32>(u + e)).template to_vector<bfloat16>()));
     k = 0;
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {
@@ -2888,8 +2897,7 @@ __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8
             continue;
         AIE_LOOP_NO_UNROLL
         for (int w = 0; w < nw; w++, k += 8) {
-            const aie::vector<bfloat16, 8> o = aie::accum<accfloat, 16>(aie::concat(aie::load_v<8>(g + k), aie::zeros<float, 8>()))
-                                                   .template to_vector<bfloat16>().template extract<8>(0);
+            const aie::vector<bfloat16, 8> o = aie::load_v<8>(ob + k);
             const int no = n + 8 * w;
             bfloat16 *__restrict ph = hold + 32 * (no >> 3) + 8 * s;
             aie::store_v(ph, o);

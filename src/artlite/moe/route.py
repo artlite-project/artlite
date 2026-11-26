@@ -121,23 +121,20 @@ def top_k_bias(logits: np.ndarray, k: int, bias: np.ndarray, dscale: np.ndarray)
 
 def deal_units(union: list[int], cols: int, work: list[int]) -> list[list[tuple[int, int, int]]]:
     """``render(units=)``'s deal: the columns' items (expert, first unit, last unit) of the union's experts (increasing
-    ids): whole experts U[i] to column i % cols for i < cols nw, then the rest's units in order (unit u's ``work``) to the
-    column whose share [c, c + 1) R / cols of the rest's work R holds the unit's start; a column's consecutive units of
-    one expert one item."""
+    ids): whole experts U[i] to column i % cols for i < cols nw, then the rest's units by decreasing work (each unit,
+    a stable order of ``work``, over the rest's experts in order) to the least loaded column (ties: the lower one) that
+    has an item left (a unit after the last unit of the column's last item, of its expert, extends that item)."""
     nw = len(union) // cols
     out: list[list[tuple[int, int, int]]] = [[] for _ in range(cols)]
     for i in range(cols * nw):
         out[i % cols].append((union[i], 0, len(work) - 1))
-    rest = union[cols * nw:]
-    R, a = len(rest) * sum(work), 0
-    for e in rest:
-        for u, wu in enumerate(work):
-            c = next(c for c in range(cols) if c * R <= a * cols < (c + 1) * R)
-            if len(out[c]) > nw and out[c][-1][0] == e:  # (the next unit of the column's last item's expert)
-                out[c][-1] = (e, out[c][-1][1], u)
-            else:
-                out[c].append((e, u, u))
-            a += wu
+    load = [nw * sum(work)] * cols
+    for u in sorted(range(len(work)), key=lambda x: -work[x]):
+        for e in union[cols * nw:]:
+            ext = [len(col) > nw and col[-1][0] == e and col[-1][2] == u - 1 for col in out]  # (extends the last item)
+            c = min((c for c in range(cols) if ext[c] or len(out[c]) < MAX_ITEMS), key=lambda c: (load[c], c))
+            out[c][-1:] = [(e, out[c][-1][1], u)] if ext[c] else [*out[c][-1:], (e, u, u)]
+            load[c] += work[u]
     assert all(len(items) <= MAX_ITEMS for items in out)
     return out
 
