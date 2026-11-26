@@ -92,6 +92,7 @@ class DSparkOverlay(AttentionOverlay):
     CHAIN = 1
     SEQ = ("KV",)
     upto = 0  # (tests: a block's first phases only)
+    _injecting = False  # (an injection's step: ``ranges``)
 
     def __init__(self, target: object, gguf: GGUFFile, *, wrap: int | None = None):
         cfg = InklingDSparkConfig.from_gguf(gguf)
@@ -203,9 +204,10 @@ class DSparkOverlay(AttentionOverlay):
         return super().kv_bytes(L % INJ)
 
     def ranges(self, kind: int, p: int, n: int = 1) -> list[tuple[int, int]]:
-        """(the cache range of a sub-step of n slots from p: to its last position's group, ``subs``)"""
+        """(the cache range of a sub-step of n slots from p: to its last position's group, ``subs``; an injection's: its
+        positions' groups alone, whose records it writes: its attention's output goes nowhere)"""
         k = self.kinds[kind]
-        first = p - k.window if k.window else 0
+        first = p if self._injecting else p - k.window if k.window else 0
         return kv.ranges(first=max(0, first // k.pg), g=(p + n - 1) // k.pg, chain=self.CHAIN)
 
     def subs(self, p: int, S: int) -> tuple[tuple[int, int], ...]:
@@ -446,7 +448,11 @@ class DSparkOverlay(AttentionOverlay):
         if self._metas_s != (S, self.start):
             self._metas(S)
         self.write_states(self.mixes(taps)[:len(self.layers)], 1)
-        self._run(S, q, False)
+        self._injecting = True
+        try:
+            self._run(S, q, False)
+        finally:
+            self._injecting = False
         self.next = q + S
 
     def block(self, anchor: np.ndarray, P: int) -> None:
