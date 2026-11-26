@@ -23,12 +23,28 @@ there; Q8_0 first) whose vocabulary and hidden size are the model's; `--spec-typ
 
 ## Thinking and tools
 
-The template puts a system block "Thinking effort level: x" before the first message (`reasoning_effort`: `none`
-.. `max`, or a number): with [artlite-cli](../cli.md)'s `--think` the template's default (0.9) or `--reasoning-effort`'s
-level, without it `none`. The model opens its own blocks (`<|message_model|><|content_thinking|>`, then
-`<|content_text|>`); the thought comes back as `reasoning_content` (artlite-server). Tools are declared to the model as
-the template writes them (one JSON line in a `tool_declare` block); artlite-server does not yet parse the model's calls
-(`<|content_invoke_tool_json|>`) into `tool_calls`. A generation ends at `<|content_model_end_sampling|>`.
+The template puts a system block "Thinking effort level: x" before the first message (`reasoning_effort`: `none` 0,
+`minimal` 0.1, `low` 0.2, `medium` 0.7, `high` 0.9, `xhigh` and `max` 0.99, or a number through
+`chat_template_kwargs`): with [artlite-cli](../cli.md)'s `--think` the template's default (0.9) or
+`--reasoning-effort`'s level, without it `none`; through [artlite-server](../server.md) a request's `reasoning_effort`
+(Responses' `reasoning.effort`, Anthropic's `output_config.effort`), the thinking switch off `none`. The level is the
+model's own control of its thought: no token budget comes with it (a request's `reasoning_budget_tokens` sets one), and
+the model writes a short thought even at `none`.
+
+The template opens no turn for the answer: the model writes its turn as blocks, each `<|message_model|>`, a kind, its
+text and `<|end_message|>`: a thought (`<|content_thinking|>`), the answer's text (`<|content_text|>`), a tool call
+(`NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}`), then `<|content_model_end_sampling|>` ends it. These
+markers are text in the generation (llama.cpp's preserved tokens: artlite-cli prints them). artlite-server reads the
+blocks as llama-server does: the thoughts come back as `reasoning_content`, the text blocks as `content`, the calls as
+`tool_calls` (streamed: a call's name first, then its arguments as the model writes them); with `reasoning_format`
+`none` the thought stays in the content (`<|content_thinking|>..<|end_message|>`). Tools are declared to the model as
+the template writes them (one JSON line in a `tool_declare` block). A grammar holds the whole turn: with tools, the
+calls are of the request's functions and their arguments follow the schemas (their keys sorted, as the template writes
+them), after the model's thought (and text) blocks; `tool_choice` `required` lets thoughts alone come first, `none`
+allows no call block; a response format (a JSON schema, a grammar) is the answer's text block, after the thoughts. A
+request whose answer is one of a few options with `logprobs` generates (the model thinks first), instead of scoring
+the options. The prompt cache takes a checkpoint where the first user message begins (the system blocks, the tools and
+the effort level before it, which an agent's sessions share).
 
 ## Images
 

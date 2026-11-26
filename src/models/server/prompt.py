@@ -226,7 +226,8 @@ class PromptBuilder:
         model may call; ``kwargs``, ``effort``: a request's ``chat_template_kwargs`` and ``reasoning_effort``,
         ``template_options``; ``cont``: the prompt ends in the last message, ``continuation``), and whether the model
         thinks, as the prompt says where the template decided (``structured.prompt_thinks``: a template's inline tags
-        over ``enable_thinking``; a continued thought: it does). A request's
+        over ``enable_thinking``; a continued thought: it does; a model of blocks thinks at any effort, but where its
+        answer's text goes on). A request's
         ``reasoning_effort`` level that the template refuses (Qwen3.8's takes xhigh, medium and low; clients send high
         or minimal) gives way to the server's, else the template's default, with a log line; one in
         ``chat_template_kwargs`` fails the request."""
@@ -268,7 +269,10 @@ class PromptBuilder:
             raise bad_request(str(e)) from None
         if cont == "reasoning_content":
             return ids, True
-        return ids, prompt_thinks(engine.model.tokenizer, token_ids(ids), engine.model.reasoning, think)
+        if cont == "content" and engine.model.blocks is not None:  # (the answer's text block goes on)
+            return ids, False
+        return ids, prompt_thinks(engine.model.tokenizer, token_ids(ids), engine.model.reasoning, think,
+                                  blocks=engine.model.blocks)
 
     def inside(self, ids: list[int]) -> bool:
         """Whether a prompt ends inside a thought (its last text is the model's open marker)."""

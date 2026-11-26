@@ -197,3 +197,24 @@ def test_chat_effort(model: Inkling) -> None:
     assert "<|content_thinking|>" not in model.chat_text(think, think=True)
     ids = model.chat(msgs)
     assert ids == llama_tokenize(MODEL, RENDERS["effort_none"]["text"]) and ids[0] == 200002  # (no BOS)
+
+
+def test_blocks(model: Inkling) -> None:
+    """The turn the model writes as blocks (``Model.blocks``): its markers are text in a generation (llama.cpp's
+    preserved tokens; another control token is not, and ``decode(special=True)`` writes it), one token each; a prompt
+    opens no block, so the model thinks first at any effort (``structured.prompt_thinks``), but where it continues the
+    answer's text; the prompt cache's mark of the first user message (``user_turn``)."""
+    from models.structured import prompt_thinks
+    b = model.blocks
+    turn = f"{b.header}{b.thought}Hmm{b.end}{b.header}{b.text}Yes{b.end}"
+    ids = model.tokenizer.encode(turn + "<|content_model_end_sampling|>")
+    assert len(ids) == 9 and model.tokenizer.decode(ids) == turn
+    assert model.tokenizer.decode(ids, special=True) == turn + "<|content_model_end_sampling|>"
+    for think in (False, True):
+        prompt = model.chat(RENDERS["basic"]["messages"], think=think)
+        assert prompt_thinks(model.tokenizer, prompt, model.reasoning, think, blocks=b)
+        assert not prompt_thinks(model.tokenizer, prompt + model.tokenizer.encode(b.answer), model.reasoning, think,
+                                 blocks=b)
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+    text = model.chat_text([{"role": "system", "content": "S"}, {"role": "user", "content": "Q"}], tools=tools)
+    assert text.count(model.user_turn) == 1 and text.index(model.user_turn) > text.index("tool_declare")

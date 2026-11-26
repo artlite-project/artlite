@@ -1,8 +1,8 @@
 """artlite-server's structured output on the NPU, one small model per family and call syntax: a JSON schema extraction
 that parses and validates, a thought then JSON; tool calls with typed and nested arguments (required, then a named
 function, auto with parallel_tool_calls false, a response format beside the tools); custom tools' inputs (a Lark
-grammar, a regex); a decision's options with their probabilities. Greedy, through the server's routes (the engine over
-the model, a test client)."""
+grammar, a regex); a decision's options with their probabilities (a model that thinks first: generated). Greedy,
+through the server's routes (the engine over the model, a test client)."""
 
 import json
 import math
@@ -13,21 +13,21 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, spark_gguf
+from artlite.model_config import gemma_gguf, inkling_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, spark_gguf
 from models import open_model
 from models.server.api import create_app
 from models.server.engine import Engine
 from models.server.settings import ModelInfo, Options
-from models.server.tools import LLAMA3, syntax_of
+from models.server.tools import INKLING, LLAMA3, syntax_of
 
 from ..model_files import require
 
 pytestmark = pytest.mark.slow  # GGUF models on the NPU: run with --run-slow
 
 # (qwen35 with a screened head: Qwen's XML calls; LFM3: the same syntax, its tags user-defined tokens; Gemma 4; Llama
-# 3's JSON calls; Spark-X: GLM-4.5's calls)
+# 3's JSON calls; Spark-X: GLM-4.5's calls; Inkling 2: a turn of blocks, its calls blocks of it)
 CASES = [minicpmv_gguf(), lfm3_gguf("QAD-Q4_0"), gemma_gguf("Q4_0"), llama_gguf("Q4_K_M", "1B"),
-         spark_gguf("1.7B")]
+         spark_gguf("1.7B"), inkling_gguf()]
 PERSON = {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"},
                                            "city": {"type": "string"}}, "required": ["name", "age", "city"]}
 WEATHER = {"type": "function", "function": {"name": "get_weather", "description": "The weather forecast for a city",
@@ -154,7 +154,7 @@ def test_custom_tool(served: tuple) -> None:
                  tool_choice={"type": "custom", "custom": {"name": "calc"}})
     (call,) = choice["message"]["tool_calls"]
     assert call["type"] == "custom" and call["custom"]["name"] == "calc", call
-    if syntax_of(client.get("/props").json()["chat_template"]) is not LLAMA3:
+    if syntax_of(client.get("/props").json()["chat_template"]) not in (LLAMA3, INKLING):  # (JSON calls: free text)
         assert re.fullmatch(r"[0-9]+([-+*][0-9]+)*", call["custom"]["input"]), call
     choice = ask(client, "Remind me about the dentist on the 3rd of March 2027.", tools=[calc, date],
                  tool_choice={"type": "custom", "custom": {"name": "remind"}})
@@ -166,10 +166,14 @@ def test_decision(served: tuple) -> None:
     """A classification with logprobs (Halogen's decision shape): the options' probabilities, summing to 1, the most
     likely one the content and the one a constrained generation writes; options that part later (decode steps from a
     checkpoint) the same probabilities in a second request, the most likely one the generation's."""
-    client, _ = served
+    client, model = served
     rf = {"type": "json_schema", "json_schema": {"name": "sentiment",
                                                  "schema": {"enum": ["positive", "negative", "neutral"]}}}
     text = "Classify the sentiment: This is the worst purchase I ever made."
+    if model.blocks is not None:  # (it thinks first, at any effort: a generation held to the options)
+        msg = ask(client, text, response_format=rf, logprobs=True)["message"]
+        assert json.loads(msg["content"]) == "negative" and msg.get("reasoning_content"), msg
+        return
     r = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": text}],
                                                   "response_format": rf, "logprobs": True, "top_logprobs": 3})
     assert r.status_code == 200, r.text

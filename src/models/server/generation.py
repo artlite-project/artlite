@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from ..detokenizer import StreamDecoder
 from ..structured import Ban, GrammarMask, thought_of
 from .jobs import Cancelled, Delta, Done, Job, Progress, prob_entry, timings
-from .textflow import ReasoningSplitter, StopMatcher, ThoughtBudget
+from .textflow import BlockSplitter, ReasoningSplitter, StopMatcher, ThoughtBudget, thought_split
 
 if TYPE_CHECKING:
     from .engine import Engine, Lane
@@ -36,6 +36,7 @@ class Generation:
     def __init__(self, engine: Engine, job: Job, lane: Lane):
         self.engine, self.job, self.lane = engine, job, lane
         self.npu, self.model, self.cache = lane.npu, engine.model, lane.cache
+        self._blocks = self.model.blocks if job.chat else None  # (a chat answer's blocks: ``textflow.BlockSplitter``)
         self.ids = job.ids
         self.gen: list[int] = []  # (the generation's tokens)
         self.finish = "length"
@@ -53,7 +54,7 @@ class Generation:
         self.budget: ThoughtBudget | None = None
         self.mask: Any = None
         self.stop = StopMatcher(job.stop)
-        self.split: ReasoningSplitter | None = None
+        self.split: ReasoningSplitter | BlockSplitter | None = None
         self.calls: Any = None
         self.text: StreamDecoder | None = None
         self.entries: list[dict[str, Any]] = []  # (llama-server's probs: one per sampled token)
@@ -95,7 +96,8 @@ class Generation:
         """The thought's budget (``Job.budget``; ``Job.control``: the control route may end it)."""
         job, model = self.job, self.model
         if model.reasoning is not None and (job.budget >= 0 or job.control):
-            self.budget = ThoughtBudget(model.reasoning, budget=job.budget, inside=job.opened, once=model.thought_first)
+            self.budget = ThoughtBudget(thought_split(model.reasoning, self._blocks, inside=job.opened,
+                                                      once=model.thought_first), budget=job.budget)
 
     def _forced_call(self) -> None:
         """The text forced at the prompt's end (a thought the prompt opened with a budget of no token: its end; the
@@ -114,10 +116,12 @@ class Generation:
         self.late = (tools.syntax.gap if job.inside else "") + self.force if self.force and thought else ""
         self.mask = None
         if job.grammar is not None:  # (the answer's and its calls'; the thought stays free)
-            thought = thought_of(model.reasoning, model.tokenizer, opened=job.opened, think=job.think,
-                                 ends=tools.syntax.ends if tools is not None else ())
+            # (a grammar of a model of blocks holds the whole turn, its thoughts too: ``Compiled.turn``)
+            thought = None if job.grammar.turn else \
+                thought_of(model.reasoning, model.tokenizer, opened=job.opened, think=job.think,
+                           ends=tools.syntax.ends if tools is not None else ())
             self.mask = GrammarMask(self.engine.vocab(), job.grammar.grammar, thought=thought,
-                                    digits=job.grammar.json, name=job.name)
+                                    digits=job.grammar.json, name=job.name, opens=job.grammar.opens)
             if tools is not None:  # (the grammar holds the answer to its call: no opener after the thought)
                 self.late = ""
         elif job.ban:
@@ -169,9 +173,11 @@ class Generation:
         job, model = self.job, self.model
         tools = job.tools
         self.text = StreamDecoder(model.tokenizer)
-        self.split = ReasoningSplitter(model.reasoning, inside=job.inside, once=model.thought_first,
-                                       ends=tools.syntax.ends if tools is not None else (), lead=not job.continued) \
-            if job.reasoning and model.reasoning is not None else None
+        inside = job.opened if self._blocks is not None else job.inside  # (blocks: read in either case)
+        self.split = thought_split(model.reasoning, self._blocks, inside=inside, once=model.thought_first,
+                                   ends=tools.syntax.ends if tools is not None else (), lead=not job.continued,
+                                   reasoning=job.reasoning) \
+            if model.reasoning is not None and (job.reasoning or self._blocks is not None) else None
         self.calls = tools.parser() if tools is not None else None
         post = job.sampling if job.post_sampling else None
         if job.n_probs > 0:

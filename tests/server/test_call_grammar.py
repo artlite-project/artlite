@@ -15,15 +15,19 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, spark_gguf
+from artlite.model_config import gemma_gguf, inkling_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, spark_gguf
 from models import structured as S
+from models.inkling2.inkling import Inkling
 from models.server import call_grammar as CG
-from models.server.tools import GEMMA4, GLM45, LLAMA3, QWEN_XML, Calls, Syntax, customs, functions
+from models.server.textflow import BlockSplitter
+from models.server.tools import GEMMA4, GLM45, INKLING, LLAMA3, QWEN_XML, Calls, Syntax, customs, functions
 
-from .test_tools import GEMMA, GLM, LLAMA, QWEN, TOOLS, glm_call, parse, qwen_call
+from .test_tools import GEMMA, GLM, INKLING_VECTORS, LLAMA, QWEN, TOOLS, glm_call, inkling_parse, parse, qwen_call
 
 TAGS = ["<tool_call>", "</tool_call>", "<|tool_call>", "<tool_call|>", '<|"|>']  # (user-defined: text, one token)
-SPECIALS = ["<|end|>"]  # (control)
+BLOCKS = Inkling.blocks
+SPECIALS = ["<|end|>", *BLOCKS.tokens]  # (control: the end of the turn, Inkling's blocks' markers)
+H, TH, TX, CALL, E = BLOCKS.header, BLOCKS.thought, BLOCKS.text, BLOCKS.call, BLOCKS.end
 
 
 class Toy:
@@ -66,7 +70,12 @@ V = S.Vocab(TOY, 0, [TOY.pieces.index(b"<|end|>")])
 
 
 def grammar(syntax: Syntax, fns: list[dict], v: S.Vocab = V, **kw: object) -> str:
-    return S.compiled(CG.answer(Calls(syntax, fns, **kw), v), v).grammar
+    return S.compiled(CG.answer(Calls(syntax, fns, **kw), v, blocks=BLOCKS if syntax is INKLING else None), v).grammar
+
+
+def ink_call(name: str, args: str) -> str:
+    """An Inkling call block as its template writes it (``args``: the arguments' JSON)."""
+    return f'{H}{name}{CALL}{{"name":{json.dumps(name)},"args":{args}}}{E}'
 
 
 def takes(g: str, ids: list[int], v: S.Vocab = V) -> bool:
@@ -128,6 +137,62 @@ def test_vectors(syntax: Syntax, vectors: list) -> None:
         assert takes(g, TOY.encode(text)) == good or (not calls and syntax is GLM45), (text, calls)
 
 
+def test_inkling_vectors() -> None:
+    """llama.cpp's Inkling vectors (``test_tools``) under the grammar (auto): a turn is taken whole when its blocks are
+    complete and its calls are the functions' (their arguments the schemas', the name written before the marker the
+    JSON's); a thought, a text block, a call cut off is not."""
+    g = grammar(INKLING, TOOLS)
+    want = [True, True, False, False, True, True, True, False, False, False, True, True, False, False, False]
+    assert len(want) == len(INKLING_VECTORS)
+    for (text, _thought, _content, _calls), good in zip(INKLING_VECTORS, want, strict=True):
+        assert takes(g, TOY.encode(text)) == good, text
+
+
+def test_inkling_modes() -> None:
+    """Inkling's calls: auto, thought and text blocks then calls (parallel false: one); required, thought blocks alone
+    before them; a named function's call alone; a JSON response format beside the tools: a call or the value in a
+    text block; a response format alone in a turn (its thoughts free, ``structured.framed``) and tool_choice none
+    (``no_calls``): no call."""
+    call, other = ink_call("get_time", '{"city":"Paris"}'), ink_call("get_weather", '{"city":"Rome"}')
+    thought, text = f"{H}{TH}Hmm, a city: {E}", f"{H}{TX}Sure.{E}"
+    auto = grammar(INKLING, TOOLS)
+    assert takes(auto, TOY.encode(thought + text + call + other)) and takes(auto, TOY.encode(thought + text))
+    assert not takes(auto, TOY.encode("Sure. " + call)) and not takes(auto, TOY.encode(call + text))
+    one = grammar(INKLING, TOOLS, parallel=False)
+    assert takes(one, TOY.encode(thought + call)) and not takes(one, TOY.encode(call + other))
+    required = grammar(INKLING, TOOLS, choice="required")
+    assert takes(required, TOY.encode(thought + call)) and not takes(required, TOY.encode(text + call))
+    assert not takes(required, TOY.encode(thought))
+    named = grammar(INKLING, TOOLS, choice="required", name="get_weather", parallel=False)
+    assert takes(named, TOY.encode(other)) and not takes(named, TOY.encode(call))
+    rf = S.Constraint.json_schema({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]})
+    both = S.compiled(CG.answer(Calls(INKLING, TOOLS), V, rf, blocks=BLOCKS), V).grammar
+    assert takes(both, TOY.encode(thought + call)) and takes(both, TOY.encode(f'{thought}{H}{TX}{{"ok": true}}{E}'))
+    assert not takes(both, TOY.encode(text)) and not takes(both, TOY.encode(text + call))
+    framed = S.compiled(rf, V, blocks=BLOCKS)
+    assert framed.turn and takes(framed.grammar, TOY.encode(f'{thought}{H}{TX}{{"ok": true}}{E}'))
+    assert not takes(framed.grammar, TOY.encode(f"{thought}{text}")) and not takes(framed.grammar, TOY.encode(thought))
+    none = S.compiled(CG.no_calls(BLOCKS, V), V).grammar
+    assert takes(none, TOY.encode(thought + text)) and not takes(none, TOY.encode(thought + call))
+    with pytest.raises(S.ConstraintError, match="blocks"):
+        CG.answer(Calls(INKLING, TOOLS), V)
+
+
+def test_inkling_digits() -> None:
+    """A JSON answer's digit runs are bounded in its text block, not in the thought before it (its quotes and digits
+    free)."""
+    framed = S.compiled(S.Constraint.json_schema({"type": "object", "properties": {"n": {"type": "integer"}}}), V,
+                        blocks=BLOCKS)
+    m = S.GrammarMask(V, framed.grammar, digits=True, opens=framed.opens)
+    for t in TOY.encode(f'{H}{TH}"7{"1" * 40}{E}{H}{TX}{{"n": '):
+        assert m.valid_prefix([t]) == 1
+        m.accept(t)
+    for _ in range(S.DIGITS):
+        m.accept(TOY.encode("1")[0])
+    b = m.bits()
+    assert not (b[TOY.encode("1")[0] >> 5] >> (TOY.encode("1")[0] & 31)) & 1  # (the run's bound)
+
+
 TEMPLATES = {  # (each syntax's call as its template writes it; a function of every type)
     "qwen": [QWEN_XML, lambda: minicpmv_gguf(), qwen_call("special_function_with_opt", arg1="1", arg2="2"),
              qwen_call("edit", filename="a.c", oldString="x\n</para", newString="y")],
@@ -137,6 +202,8 @@ TEMPLATES = {  # (each syntax's call as its template writes it; a function of ev
     "spark": [GLM45, lambda: spark_gguf("1.7B"), glm_call("get_time", city="Paris"),
               glm_call("special_function_with_opt", "\n", arg1="1", arg2="2")],
     "llama": [LLAMA3, lambda: llama_gguf("Q4_K_M", "8B"), '{"name": "get_time", "parameters": {"city": "Paris"}}'],
+    "inkling": [INKLING, inkling_gguf, ink_call("get_time", '{"city":"Paris"}'),
+                ink_call("special_function_with_opt", '{"arg1":1,"arg2":2}')],
 }
 
 
@@ -171,7 +238,7 @@ def test_templates(family: str) -> None:
     syntax, tok, v = model_vocab(family)
     g = grammar(syntax, TOOLS, v)
     for text in TEMPLATES[family][2:]:
-        lead = "" if syntax is LLAMA3 else "Let me look. "
+        lead = "" if syntax is LLAMA3 else f"{H}{TH}Let me look.{E}" if syntax is INKLING else "Let me look. "
         ids = tok.encode(lead + text)
         m = S.GrammarMask(v, g)
         for i, t in enumerate(ids):
@@ -180,7 +247,10 @@ def test_templates(family: str) -> None:
             m.accept(t)
         b = m.bits()
         assert m.active and any((b[e >> 5] >> (e & 31)) & 1 for e in v.eos), family
-        _, calls = parse(syntax, lead + text, len(text))
+        if syntax is INKLING:
+            calls = [(n, json.loads(a)) for n, a in inkling_parse(lead + text, len(text))[2]]
+        else:
+            _, calls = parse(syntax, lead + text, len(text))
         assert calls and all(valid(n, a) for n, a in calls)
 
 
@@ -222,7 +292,7 @@ def test_random_walks(family: str) -> None:
         for _ in range(400):
             b = m.bits()
             a = np.flatnonzero(np.unpackbits(b.view(np.uint8), bitorder="little")[:v.n])
-            a = a[~np.isin(a, v.eos)]
+            a = a[~np.isin(a, [*v.eos, *([v.special_id(TH)] if syntax is INKLING else [])])]  # (no thought: free)
             if not len(a):
                 break
             short = a[lens[a] <= rng.choice([1, 2, 4, 64])]
@@ -232,7 +302,9 @@ def test_random_walks(family: str) -> None:
             assert m.active, (family, walk)
         text = tok.decode_bytes(ids, special=True).decode("utf-8", errors="replace")
         p = syntax.parser(TYPED, parallel=False)
-        parts = p.parts([("content", text)]) + p.flush()
+        split = BlockSplitter(BLOCKS) if syntax is INKLING else None
+        content = [("content", text)] if split is None else split.feed(text) + split.flush()
+        parts = p.parts(content) + p.flush()
         got = [c for k, c in parts if k == "tool_call"]
         name = got[0].name if got else None
         args = json.loads("".join(c.arguments for c in got)) if got else None
@@ -341,27 +413,34 @@ def custom_call(syntax: Syntax, name: str, text: str) -> str:
         return glm_call(name, input=text)
     if syntax is GEMMA4:
         return f'<|tool_call>call:{name}{{input:<|"|>{text}<|"|>}}<tool_call|>'
+    if syntax is INKLING:
+        return ink_call(name, json.dumps({"input": text}))
     return json.dumps({"name": name, "parameters": {"input": text}})
 
 
-@pytest.mark.parametrize("syntax", [QWEN_XML, GEMMA4, GLM45, LLAMA3], ids=["qwen", "gemma", "glm", "llama"])
+@pytest.mark.parametrize("syntax", [QWEN_XML, GEMMA4, GLM45, LLAMA3, INKLING],
+                         ids=["qwen", "gemma", "glm", "llama", "inkling"])
 def test_custom(syntax: Syntax) -> None:
     """Custom tools: a Lark grammar's input, a regex's (anchored or not), any text, each taken exactly and read back by
     the parser as written; a grammar whose regex runs over the call's closing text (a catch-all), or any Lark grammar in Llama 3's
-    JSON calls, leaves the input free; a grammar that does not compile: an error that names the tool."""
+    and Inkling's JSON calls, leaves the input free; a grammar that does not compile: an error that names the tool."""
     fns = functions(CUSTOM)
     g = grammar(syntax, fns, custom=customs(CUSTOM))
-    cases = [("calc", "12+3-4", True), ("calc", "12+", syntax is LLAMA3), ("calc", "1 + 2", syntax is LLAMA3),
+    free = syntax in (LLAMA3, INKLING)  # (a JSON string holds no Lark grammar)
+    cases = [("calc", "12+3-4", True), ("calc", "12+", free), ("calc", "1 + 2", free),
              ("code", "ab-12", True), ("code", "a-1", False), ("note", "any\ntext, <b>", True),
              ("day", "2027-03", True), ("day", "2027-3", False),
              ("run", "print(1)\nprint(2)", True)]
     for name, text, good in cases:
         call = custom_call(syntax, name, text)
         assert takes(g, TOY.encode(call)) == good, (name, text)
-        if good:
+        if good and syntax is INKLING:
+            calls = [(n, json.loads(a)) for n, a in inkling_parse(call, len(call))[2]]
+            assert calls == [(name, {"input": text})], (name, text, calls)
+        elif good:
             _, calls = parse(syntax, call, len(call))
             assert calls == [(name, {"input": text})], (name, text, calls)
     bad = [{"type": "custom", "custom": {"name": "calc", "format": {"type": "grammar", "grammar": {
         "syntax": "lark", "definition": "start: nope\n"}}}}]
     with pytest.raises(S.ConstraintError, match="custom tool 'calc'"):
-        CG.answer(Calls(syntax, functions(bad), custom=customs(bad)), V)
+        CG.answer(Calls(syntax, functions(bad), custom=customs(bad)), V, blocks=BLOCKS if syntax is INKLING else None)

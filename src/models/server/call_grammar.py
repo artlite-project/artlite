@@ -20,6 +20,12 @@ call begins with ``{``. A call's name is one of the functions', its arguments th
 | ``Glm45`` | ``<arg_key>K</arg_key><arg_value>V</arg_value>`` the same (a newline between them allowed) |
 | ``Gemma4`` | ``{k:V,...}``, keys sorted (the template's ``dictsort``), strings between ``<|"|>``, nested objects too |
 | ``Llama3`` | the JSON ``{"name": NAME, "parameters": {...}}`` |
+| ``Inkling`` | ``{"name":NAME,"args":{...}}``, the arguments' JSON its keys sorted (the template's ``dictsort``) |
+
+An Inkling call is a block of the model's turn (``Model.blocks``): its grammar holds the whole turn
+(``Constraint.turn``), as llama.cpp's: thought and text blocks (their text free: any token but the blocks' end, header
+and call markers and the end of the turn) before the calls; required: thought blocks alone before them; with a
+response format, the value is a text block; ``tool_choice`` none: thought and text blocks alone (``no_calls``).
 
 A Qwen or GLM-4.5 value is the raw text of a parameter whose schema allows only strings (its ``enum``, ``const``,
 ``pattern``, ``minLength``, ``maxLength`` held; up to the closing tag, which it cannot contain, Qwen's newline before it
@@ -38,15 +44,19 @@ the call from ever ending: its input is free text there, as in Llama 3's JSON ca
 Lark grammar), logged once. OpenAI's calls end with a special token, which no lexeme takes; these syntaxes' closing
 texts are text tokens."""
 
+import dataclasses
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import llguidance
 
 from ..structured import Constraint, ConstraintError, Vocab, closed_objects
 from .lexemes import ending
-from .tools import Calls, Custom, GemmaParser, Glm45Parser, QwenParser, _GemmaValue, _types, resolve
+from .tools import Calls, Custom, GemmaParser, Glm45Parser, InklingParser, QwenParser, _GemmaValue, _types, resolve
+
+if TYPE_CHECKING:
+    from ..model import Blocks
 
 log = logging.getLogger("artlite.server")
 
@@ -304,6 +314,49 @@ def _llama_call(t: Tool) -> str:
     return t.json_value(schema)
 
 
+def _inkling_call(t: Tool) -> str:
+    """An Inkling call after its block's header: ``NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}``, the
+    block's end (the JSON one value: a token may span its name and arguments, ``":{"``)."""
+    g, P = t.g, InklingParser
+    root = _ref(t.root, t.root) or {"type": "object"}
+    if isinstance(root.get("properties"), dict):  # (the template writes the arguments' keys sorted)
+        root = {**root, "properties": dict(sorted(root["properties"].items()))}
+    schema = {"type": "object", "properties": {"name": {"const": t.name}, "args": root},
+              "required": ["name", "args"], "additionalProperties": False}
+    return f"{lit(t.name)} {g.token(P.CALL)} {t.json_value(schema)} {g.token(P.CLOSE)}"
+
+
+def _blocks(g: Grammar, blocks: "Blocks", *, text: bool = True) -> str:
+    """A rule of a turn's thought blocks (``text``: and text blocks), any number: their text any token but the
+    blocks' markers that cannot be in it (the end, a header, a call's) and the end of the turn."""
+    stops = {g.special(t) for t in (blocks.end, blocks.header, blocks.call) if t} | set(g.v.eos)
+    free = g.rule("<[^" + ",".join(str(i) for i in sorted(stops)) + "]>*", "free")
+    kinds = f"({g.token(blocks.thought)} | {g.token(blocks.text)})" if text else g.token(blocks.thought)
+    return g.rule(f"({g.token(blocks.header)} {kinds} {free} {g.token(blocks.end)})*", "blocks")
+
+
+def _turn(g: Grammar, start: str) -> Constraint:
+    return dataclasses.replace(g.constraint(start), turn=True)
+
+
+def no_calls(blocks: "Blocks", v: Vocab) -> Constraint:
+    """A block model's turn without calls (``tool_choice`` none: its thought and text blocks alone)."""
+    g = Grammar(v)
+    return _turn(g, _blocks(g, blocks))
+
+
+def _inkling(g: Grammar, calls: Calls, bodies: list[str], response: Constraint | None, b: "Blocks") -> Constraint:
+    """The whole turn of an Inkling answer with calls (module docstring)."""
+    call = g.rule(f"{g.token(b.header)} ({' | '.join(bodies)})", "call")
+    many = g.rule(f"{call}+" if calls.parallel else call, "calls")
+    if response is not None and calls.choice == "auto":
+        text = f"{g.token(b.header)} {g.token(b.text)} {response_value(response)} {g.token(b.end)}"
+        return _turn(g, f"{_blocks(g, b, text=False)} ({many} | {text})")
+    if calls.choice != "auto":
+        return _turn(g, f"{_blocks(g, b, text=False)} {many}")
+    return _turn(g, f"{_blocks(g, b)} {call}{'*' if calls.parallel else '?'}")
+
+
 class _Gemma:
     """Gemma 4's value syntax of a schema (``tools._GemmaValue``: the template's ``format_argument``): rules per
     subschema, local references as rules of their own (recursion)."""
@@ -437,12 +490,16 @@ def _seq(g: Grammar, items: list[tuple[str, bool]], sep: str) -> str:
 # ----------------------------------------------------------------------
 
 
-def answer(calls: Calls, v: Vocab, response: Constraint | None = None) -> Constraint:
+def answer(calls: Calls, v: Vocab, response: Constraint | None = None, *, blocks: "Blocks | None" = None
+           ) -> Constraint:
     """The grammar of an answer with ``calls`` (``Calls.choice``: auto, required or a named function;
     ``Calls.parallel``) over ``v``'s tokens, and with ``response`` (a JSON response format, under auto: a call or that
-    value). ConstraintError: a strict tool's schema that does not compile exactly, a response format that is not JSON."""
+    value); ``blocks``: the model's turn of blocks (``Model.blocks``: Inkling's calls are blocks of it). ConstraintError:
+    a strict tool's schema that does not compile exactly, a response format that is not JSON."""
     if response is not None and not response.json:
         raise ConstraintError("a grammar, a regex or choices cannot be combined with tools (a JSON schema can)")
+    if calls.syntax.parser_class is InklingParser and blocks is None:
+        raise ConstraintError("Inkling's calls are blocks of a turn: the model's blocks are needed")
     g = Grammar(v)
     syntax = calls.syntax
     fns = [f["function"] for f in calls.functions if calls.name is None or f["function"]["name"] == calls.name]
@@ -455,8 +512,10 @@ def answer(calls: Calls, v: Vocab, response: Constraint | None = None) -> Constr
     for fn in fns:
         t = Tool(g, fn, fn["name"] in calls.strict, calls.custom.get(fn["name"]), end=end)
         body = {"QwenParser": _qwen_call, "Glm45Parser": _glm_call, "GemmaParser": _gemma_call,
-                "LlamaParser": _llama_call}[syntax.parser_class.__name__](t)
+                "LlamaParser": _llama_call, "InklingParser": _inkling_call}[syntax.parser_class.__name__](t)
         bodies.append(g.rule(body, "fn"))
+    if syntax.parser_class is InklingParser:
+        return _inkling(g, calls, bodies, response, blocks)
     names = " | ".join(bodies)
     P = syntax.parser_class
     if llama:

@@ -59,7 +59,7 @@ def arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--think", action="store_true", help="let the model think first (default: an empty thought)")
     p.add_argument("--reasoning-effort", metavar="LEVEL", default="default",
                    help="the chat template's reasoning_effort, with --think (Qwen3.8's: xhigh, medium, low; Spark-X's: "
-                        "high, low; default: default, the template's own)")
+                        "high, low; Inkling 2's: minimal .. max; default: default, the template's own)")
     p.add_argument("--chat-template-kwargs", type=json.loads, default={},
                    help="chat template variables as a JSON object (reasoning_effort, tools_in_user_message, ...)")
     p.add_argument("--chat-template", metavar="JINJA_TEMPLATE",
@@ -348,7 +348,7 @@ def main(argv: list[str] | None = None) -> None:
                            videos=args.video, variables=variables)
         # (as the prompt says where the template decided: its inline tags over --think)
         think = args.think if args.raw else structured.prompt_thinks(model.tokenizer, token_ids(ids), model.reasoning,
-                                                                     args.think)
+                                                                     args.think, blocks=model.blocks)
         sampling = model.sampling(think=think)
         given = {"temp": args.temp, "top_k": args.top_k, "top_p": args.top_p, "repeat_penalty": args.repeat_penalty,
                  "repeat_last_n": args.repeat_last_n, "presence_penalty": args.presence_penalty,
@@ -362,10 +362,11 @@ def main(argv: list[str] | None = None) -> None:
                                  sorted(model.eos_token_ids))
             opened = not args.raw and model.reasoning is not None and \
                 structured.ends_inside(model.tokenizer, token_ids(ids), model.reasoning[0])
-            thought = structured.thought_of(model.reasoning, model.tokenizer, opened=opened,
-                                            think=think and not args.raw)
-            mask = structured.GrammarMask(v, structured.compiled(constraint, v).grammar, thought=thought,
-                                          digits=constraint.json)
+            # (a model of blocks: the grammar holds its whole turn, its thoughts too)
+            c = structured.compiled(constraint, v, blocks=None if args.raw else model.blocks)
+            thought = None if c.turn else structured.thought_of(model.reasoning, model.tokenizer, opened=opened,
+                                                                think=think and not args.raw)
+            mask = structured.GrammarMask(v, c.grammar, thought=thought, digits=constraint.json, opens=c.opens)
     except jinja2.TemplateError as e:  # (the template refuses the prompt or a variable)
         fail(f"the chat template failed: {e}")
     except (OSError, ValueError, NotImplementedError) as e:

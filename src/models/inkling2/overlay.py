@@ -1014,11 +1014,15 @@ class InklingOverlay(AttentionOverlay):
             self.dev.flush("ACT", self.ps[(v, m)], XB)
 
     def step(self, states: np.ndarray, position: int | tuple[Part, ...], bank: np.ndarray | None = None, *,
-             logits: bool = False) -> np.ndarray | Screened | None:
+             logits: bool | None = None) -> np.ndarray | Screened | None:
         """One step of S slots at position .. position + S - 1 (several sequences' slots: their parts, ``decode.step.Part``):
-        states (n0 + 1, S, hidden) the first visit's input states,
-        bank (2, S, hidden) the bank its messages mix (``write_states``); ``logits`` (the whole model): the LM head's
-        (``Screened``: the logits before the softcap), else None."""
+        states (n0 + 1, S, hidden) the first visit's input states (one state, the whole model's: (S, hidden) too, the
+        slots first as a joint step of several sequences joins them, ``lanes.Rounds``),
+        bank (2, S, hidden) the bank its messages mix (``write_states``); ``logits`` (the whole model; None: where the
+        design has the LM head, ``lm_ok``, as a joint step asks): the LM head's (``Screened``: the logits before the
+        softcap), else None."""
+        logits = self.lm_ok if logits is None else logits
+        states = states[None] if states.ndim == 2 else states
         S = states.shape[1]
         assert 1 <= S <= SLOTS and (not logits or self.lm_ok)
         if self._metas_s != (S, self.start):

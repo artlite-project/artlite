@@ -34,6 +34,29 @@ def check_tower(mmproj: str, config: Any, supported: tuple[str, ...], *, what: s
 
 
 @dataclass(frozen=True)
+class Blocks:
+    """A turn the model writes as blocks (Inkling's; ``Model.blocks``): each ``header``, a kind, its text, ``end``.
+    The kinds: ``thought`` (a thought), ``text`` (the answer's text), any other (a tool call's: ``header`` NAME
+    ``call`` JSON ``end``); the template opens no block for the reply, the model writes its own. The markers are control
+    tokens that the generation's text keeps (llama.cpp's preserved tokens: ``tokens``)."""
+
+    header: str
+    thought: str
+    text: str
+    end: str
+    call: str = ""
+
+    @property
+    def answer(self) -> str:
+        """The text that opens an answer's text block."""
+        return self.header + self.text
+
+    @property
+    def tokens(self) -> tuple[str, ...]:
+        return tuple(t for t in (self.header, self.thought, self.text, self.call, self.end) if t)
+
+
+@dataclass(frozen=True)
 class Capabilities:
     """What a loaded model takes and gives beyond text (the server's listings and routes, the tools' options read it)."""
 
@@ -58,6 +81,7 @@ class Model:
     # takes high and low); a level not in it goes as it is
     efforts: dict[str, str] = {}  # noqa: RUF012
     thought_first = False  # a thought only begins an answer (its markers later in the answer are text)
+    blocks: Blocks | None = None  # a turn the model writes as blocks (``Blocks``: Inkling's), or None
     turn: str | None = None  # the text that begins every message in the chat template (a prompt cache's marks)
     user_turn: str | None = None  # the text that begins a user message
     chat_template: str | None = None  # a Jinja chat template in place of the file's (``open_model``'s); None: the file's

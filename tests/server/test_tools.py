@@ -1,7 +1,8 @@
 """The tool-call syntaxes of ``models.server.tools`` on the host: llama.cpp's test vectors (``tests/test-chat.cpp``)
 for each syntax, each output fed whole, in pieces of 3 characters and one character at a time (the content and the
-arguments' fragments join to the same result); detection from the templates of the model files, their thoughts kept
-or dropped; requests' functions and call arguments. The call grammars: ``test_call_grammar``."""
+arguments' fragments join to the same result; Inkling's through the split of its blocks, ``textflow.BlockSplitter``);
+detection from the templates of the model files, their thoughts kept or dropped; requests' functions and call
+arguments. The call grammars: ``test_call_grammar``."""
 
 import json
 import os
@@ -9,10 +10,12 @@ import os
 import pytest
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import gemma_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf, spark_gguf
+from artlite.model_config import gemma_gguf, inkling_gguf, lfm3_gguf, llama_gguf, minicpmv_gguf, qwen_gguf, spark_gguf
+from models.server.textflow import BlockSplitter
 from models.server.tools import (
     GEMMA4,
     GLM45,
+    INKLING,
     INPUT,
     LLAMA3,
     QWEN_XML,
@@ -239,6 +242,77 @@ def test_glm(text: str, content: str, calls: list) -> None:
     check(GLM45, text, content, calls)
 
 
+def inkling_parse(text: str, step: int, *, parallel: bool = True, reasoning: bool = True
+                  ) -> tuple[str, str, list[tuple[str, object]]]:
+    """An Inkling turn's thought, content and calls (name, arguments as written) fed ``step`` characters at a time
+    through the split of its blocks and the parser."""
+    from models.inkling2.inkling import Inkling
+    split, p = BlockSplitter(Inkling.blocks, reasoning=reasoning), INKLING.parser(TOOLS, parallel=parallel)
+    parts = []
+    for i in range(0, len(text), step):
+        parts += p.parts(split.feed(text[i:i + step]))
+    parts += p.parts(split.flush()) + p.flush()
+    calls: dict[int, list[str]] = {}
+    for kind, c in parts:
+        if kind == "tool_call":
+            if c.index not in calls:
+                assert c.id and c.id.startswith("call_") and c.name, "a call's first part names it"
+                calls[c.index] = [c.name, ""]
+            calls[c.index][1] += c.arguments
+    assert p.calls == len(calls) or p.calling
+    return ("".join(v for k, v in parts if k == "reasoning_content"), "".join(v for k, v in parts if k == "content"),
+            [(n, a) for n, a in calls.values()])
+
+
+H, E = "<|message_model|>", "<|end_message|>"
+INK_CALL = 'special_function<|content_invoke_tool_json|>{"name":"special_function","args":{"arg1":1}}' + E
+INKLING_VECTORS = [  # (llama.cpp's for Inkling 2: thought, content, calls with their arguments as written)
+    (H + "<|content_text|>Hello, world!\nWhat's up?" + E, "", "Hello, world!\nWhat's up?", []),
+    (H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, world!\nWhat's up?" + E, "I'm thinking",
+     "Hello, world!\nWhat's up?", []),
+    (H + "<|content_thinking|>I was still thinking", "I was still thinking", "", []),
+    (H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello, wor", "I'm thinking", "Hello, wor", []),
+    (H + INK_CALL, "", "", [("special_function", '{"arg1":1}')]),
+    (H + "<|content_thinking|>I should call it" + E + H + "<|content_text|>On it." + E + H + INK_CALL,
+     "I should call it", "On it.", [("special_function", '{"arg1":1}')]),
+    (H + INK_CALL + H + 'special_function_with_opt<|content_invoke_tool_json|>{"name":"special_function_with_opt",'
+     '"args":{"arg1":1,"arg2":2}}' + E, "", "",
+     [("special_function", '{"arg1":1}'), ("special_function_with_opt", '{"arg1":1,"arg2":2}')]),
+    # (no name before the marker: the research model's; the JSON's name over the one before it)
+    (H + '<|content_invoke_tool_json|>{"name":"special_function","args":{"arg1":1}}' + E, "", "",
+     [("special_function", '{"arg1":1}')]),
+    (H + 'unknown_tool<|content_invoke_tool_json|>{"name": "unknown_tool", "args": {"arg1": 1}}' + E, "", "",
+     [("unknown_tool", '{"arg1": 1}')]),
+    (H + 'special<|content_invoke_tool_json|>{"name":"special_function","args":{"arg1":1}}' + E, "", "",
+     [("special_function", '{"arg1":1}')]),
+    (H + "<|content_thinking|>I'm thinking" + E + H + '<|content_text|>{"amount": 123.45}' + E, "I'm thinking",
+     '{"amount": 123.45}', []),
+    # (strings with braces and escapes; a scalar argument; a block that is no call; a call cut off)
+    (H + 'python<|content_invoke_tool_json|>{"name":"python","args":{"code":"x = {\\"a\\": [1]}"}}' + E, "", "",
+     [("python", '{"code":"x = {\\"a\\": [1]}"}')]),
+    (H + 'f<|content_invoke_tool_json|>{"name":"f","args":7}' + E, "", "", [("f", "7")]),
+    (H + "f<|content_invoke_tool_json|>not json" + E, "", H + "f<|content_invoke_tool_json|>not json" + E, []),
+    (H + 'f<|content_invoke_tool_json|>{"name":"f","args":{"a":', "", "", [("f", '{"a":')]),
+]
+
+
+@pytest.mark.parametrize("text,thought,content,calls", INKLING_VECTORS)
+def test_inkling(text: str, thought: str, content: str, calls: list) -> None:
+    for step in (len(text), 3, 1):
+        assert inkling_parse(text, step) == (thought, content, calls), f"fed {step} characters at a time"
+
+
+def test_inkling_modes() -> None:
+    """parallel_tool_calls false: the first call alone; reasoning_format none: the thought in the content, as
+    llama-server leaves it; text outside a block (a continued message's) is content."""
+    two = H + INK_CALL + H + INK_CALL
+    assert inkling_parse(two, 1, parallel=False)[2] == [("special_function", '{"arg1":1}')]
+    text = H + "<|content_thinking|>I'm thinking" + E + H + "<|content_text|>Hello" + E
+    assert inkling_parse(text, 1, reasoning=False) == ("", "<|content_thinking|>I'm thinking" + E + "Hello", [])
+    assert inkling_parse(" more text." + E, 2) == ("", "more text.", [])
+    assert INKLING.opener("get_time") == H + 'get_time<|content_invoke_tool_json|>{"name":"get_time","args":'
+
+
 def test_glm_streams_strings() -> None:
     """A string-only value goes out as it comes (less what may begin ``</arg_value>``)."""
     p = GLM45.parser(TOOLS)
@@ -273,15 +347,16 @@ def test_openers() -> None:
 
 
 def test_detection() -> None:
-    """The four syntaxes from templates like the model files' (their marker lines), none from a template without
+    """The five syntaxes from templates like the model files' (their marker lines), none from a template without
     tools."""
     qwen = "{{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}{{- '<parameter=' + args_name + '>\\n' }}"
     gemma = "{{- '<|tool_call>call:' + function['name'] + '{' -}}"
     llama = ("<|start_header_id|>{%- if tools is not none %}{{- '{\"name\": \"' + tool_call.name + '\", ' }}"
              "{{- '\"parameters\": ' }}{%- endif %}")
     glm = "{{- '<tool_call>' + tool_call.function.name }}{{- '<arg_key>' ~ k ~ '</arg_key><arg_value>' ~ v ~ '</arg_value>' }}"
+    inkling = '{{- "<|message_model|>" ~ fn.name ~ "<|content_invoke_tool_json|>" -}}'
     assert syntax_of(qwen) is QWEN_XML and syntax_of(gemma) is GEMMA4 and syntax_of(llama) is LLAMA3
-    assert syntax_of(glm) is GLM45
+    assert syntax_of(glm) is GLM45 and syntax_of(inkling) is INKLING
     assert syntax_of("{% for message in messages %}{{ message['content'] }}{% endfor %}") is None
 
 
@@ -305,7 +380,8 @@ def test_functions_and_arguments() -> None:
 
 FILES = {"qwen": (lambda: qwen_gguf("Q4_K_M", "35B-A3B"), QWEN_XML), "minicpmv": (minicpmv_gguf, QWEN_XML),
          "gemma": (gemma_gguf, GEMMA4), "llama": (lambda: llama_gguf("Q4_K_M", "8B"), LLAMA3),
-         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML), "spark": (lambda: spark_gguf("1.7B"), GLM45)}
+         "lfm3": (lambda: lfm3_gguf("QAD-Q4_0"), QWEN_XML), "spark": (lambda: spark_gguf("1.7B"), GLM45),
+         "inkling": (inkling_gguf, INKLING)}
 
 
 @pytest.mark.parametrize("family", FILES)
@@ -337,6 +413,16 @@ def test_model_templates(family: str) -> None:
         # (the answer's content closed the model's turn: a new one opens)
         assert text.endswith("Checking.<turn|>\n<|turn>model\n")
         assert chat_prompt(g, msgs[:1], tools=fns).endswith("<|turn>user\nTime in Oslo?<turn|>\n<|turn>model\n")
+    elif family == "inkling":
+        from models.inkling2.inkling import Inkling
+        m = Inkling(path, spec_type="none")
+
+        def chat_prompt(g: GGUFFile, msgs: list, tools: list, preserve_thinking: bool = False) -> str:
+            return m.chat_text(msgs, tools=tools, preserve=preserve_thinking)
+        text = chat_prompt(g, msgs, tools=fns)
+        assert '<|message_model|>get_time<|content_invoke_tool_json|>{"name":"get_time","args":{"city":"Oslo"}}' \
+            '<|end_message|>' in text and '"name":"get_time"' in text
+        assert text.endswith("<|message_tool|>get_time<|content_text|>09:30<|end_message|>")  # (no turn opened)
     elif family == "spark":
         from models.spark.spark import Spark
         m = Spark(path)

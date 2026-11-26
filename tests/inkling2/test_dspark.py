@@ -86,7 +86,7 @@ def test_block(run: tuple[NpuInkling, list[int], np.ndarray]) -> None:
         print(f"layer {L}: K {_rel(k, kr):.2e}, V {_rel(v, vr):.2e}")
         assert _rel(k, kr) < 1e-2 and _rel(v, vr) < 2e-2
     d.dev.stale = True
-    d.block(m._step_inputs([toks[44]])[0][0, 0], 44)
+    d.block(m._step_inputs([toks[44]])[0][0], 44)
     h, base = ref.block(toks[44], 44)
     jr = (h @ ref.w("joint_proj.weight")[:, 2 * d.cfg.rank:2 * d.cfg.rank + d.cfg.hidden].T).numpy()
     sc = d.screened().astype(np.float32)[:, :base.shape[1]]

@@ -29,6 +29,8 @@ from models.server.jobs import Job
 from models.templating import chat_template
 
 from .fakes import (
+    BLOCKS,
+    BLOCKS_TEMPLATE,
     BOS,
     ENGINES,
     GEMMA,
@@ -391,6 +393,64 @@ def test_reasoning_gemma() -> None:
         npu.replies = [["<|channel>thought", "\n", "Hmm", ",", " yes", "\n", "<channel|>", "Yes", ".", "<channel|>"]]
         evs = events(chat(client, "Q", stream=True))
         assert deltas(evs, "reasoning_content") == "Hmm, yes" and deltas(evs) == "Yes."
+
+
+def test_blocks() -> None:
+    """A model that writes its turn as blocks (Inkling's): its thought blocks are the thought, its text blocks the
+    content, its call blocks calls (streamed); reasoning_format none leaves the thought in the content (llama-server's
+    form); a budget ends a thought block as the template writes one's end; a response format, tools and tool_choice
+    none hold the whole turn (its thoughts free); a decision's options generate (the model thinks first, at any effort).
+    """
+    model, npu, engine = make(blocks=BLOCKS)
+    H, TH, TX, C, E = BLOCKS.header, BLOCKS.thought, BLOCKS.text, BLOCKS.call, BLOCKS.end
+    thought = [H, TH, "Let", " me", " think", E]
+    for p in ("get_weather", "get_time", '{"name":"get_weather","args":{"city":"Paris"}}', '{"ok":', " true}", '"no"',
+              '{"name":"get_time","args":{}}'):
+        model.tokenizer.id(p)  # (the tokens structured output knows: those of its first request)
+    with TestClient(app_of(engine, template=BLOCKS_TEMPLATE)) as client:
+        assert engine.wait_ready(5)
+        npu.replies = [[*thought, H, TX, "The", " answer", E]] * 2
+        evs = events(chat(client, "Q", stream=True))
+        assert deltas(evs, "reasoning_content") == "Let me think" and deltas(evs) == "The answer"
+        assert chat(client, "Q", reasoning_effort="none").json()["choices"][0]["message"] == {
+            "role": "assistant", "content": "The answer", "reasoning_content": "Let me think"}
+        assert model.thought is False  # (effort none: the template's "none", the model thinks anyway)
+        npu.replies = [[*thought, H, TX, "The", " answer", E]]
+        raw = chat(client, "Q", reasoning_format="none").json()["choices"][0]["message"]
+        assert raw == {"role": "assistant", "content": f"{TH}Let me think{E}The answer"}
+        # calls, streamed (their arguments as written), after a thought and text
+        args = '{"name":"get_weather","args":{"city":"Paris"}}'
+        npu.replies = [[*thought, H, TX, "On", " it.", E, H, "get_weather", C, args, E]]
+        evs = events(chat(client, "Weather?", tools=[WEATHER, TIME], stream=True))
+        assert deltas(evs, "reasoning_content") == "Let me think" and deltas(evs) == "On it."
+        calls = [c for e in evs if isinstance(e, dict) and e["choices"] for c in e["choices"][0]["delta"].get(
+            "tool_calls") or []]
+        assert calls[0]["function"]["name"] == "get_weather" and \
+            "".join(c["function"].get("arguments") or "" for c in calls) == '{"city":"Paris"}'
+        assert evs[-2]["choices"][0]["finish_reason"] == "tool_calls"
+        npu.replies = [[*thought, H, "get_time", C, '{"name":"get_time","args":{}}', E]]
+        msg = chat(client, "Time?", tools=[WEATHER, TIME], tool_choice="required").json()["choices"][0]["message"]
+        assert msg["reasoning_content"] == "Let me think" and msg["tool_calls"][0]["function"]["name"] == "get_time"
+        npu.replies = [[*thought, H, "get_time", C, '{"name":"get_time","args":{}}', E]]  # (tool_choice none: no call)
+        msg = chat(client, "Time?", tools=[WEATHER, TIME], tool_choice="none").json()["choices"][0]["message"]
+        ran = model.tokenizer.decode_bytes(npu.seq[:npu.position]).decode()  # (the fake's script goes on in a block)
+        assert "tool_calls" not in msg and f"{H}get_time" not in ran and C not in ran, ran
+        # a response format: the thought free, the value a text block
+        rf = {"type": "json_schema", "json_schema": {"name": "o", "schema": {
+            "type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}}}
+        npu.replies = [[*thought, H, TX, '{"ok":', " true}", E]]
+        msg = chat(client, "Q", response_format=rf).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": '{"ok": true}', "reasoning_content": "Let me think"}
+        enum = {"type": "json_schema", "json_schema": {"name": "s", "schema": {"enum": ["yes", "no"]}}}
+        npu.replies = [[*thought, H, TX, '"no"', E]]
+        r = chat(client, "Q", response_format=enum, logprobs=True).json()["choices"][0]
+        assert r["message"]["content"] == '"no"' and r["message"]["reasoning_content"] == "Let me think"
+    with TestClient(app_of(engine, template=BLOCKS_TEMPLATE, reasoning_budget_message="Enough.")) as client:
+        npu.replies = [[H, TH, "A", " B", " C", " D"], ["Yes", E]]
+        msg = chat(client, "Q", reasoning_budget_tokens=2).json()["choices"][0]["message"]
+        assert msg == {"role": "assistant", "content": "Yes", "reasoning_content": "A B\n\nEnough."}
+        ran = model.tokenizer.decode_bytes(npu.seq[:npu.position]).decode()
+        assert ran.endswith(f"{H}{TH}A B\n\nEnough.{E}{H}{TX}Yes{E}"), ran
 
 
 def test_preserve_reasoning() -> None:

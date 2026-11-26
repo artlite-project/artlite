@@ -23,7 +23,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from artlite.decode.model import HostRecords
-from models.model import Capabilities, Model
+from models.model import Blocks, Capabilities, Model
 from models.npu_model import Checkpoint, NpuModel
 from models.readouts import Readouts
 from models.sampling import Mask, Penalties, Probs, Sampling, top_logits
@@ -34,14 +34,24 @@ from models.server.engine import Engine
 from models.server.settings import ModelInfo, Options
 
 VOCAB = 2048
-SPECIAL = ["<s>", "</s>", "<|system|>", "<|user|>", "<|assistant|>", "<think>", "</think>", "<|channel>thought",
-           "<channel|>", "<tool_call>", "</tool_call>"]  # (single tokens in a text; the first CONTROL control tokens, the
-CONTROL = 5  # rest user-defined: text a model writes, Qwen's tags)
+BLOCKS = Blocks("<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|end_message|>",
+                call="<|content_invoke_tool_json|>")  # (Inkling's)
+SPECIAL = ["<s>", "</s>", "<|system|>", "<|user|>", "<|assistant|>", *BLOCKS.tokens, "<think>", "</think>",
+           "<|channel>thought", "<channel|>", "<tool_call>", "</tool_call>"]  # (single tokens in a text; the first
+CONTROL = 10  # CONTROL control tokens, the blocks' among them, the rest user-defined: text a model writes, Qwen's tags)
 BOS, EOS = 0, 1
 QWEN = ("<think>", "</think>")
 GEMMA = ("<|channel>thought", "<channel|>")
 TEMPLATE = "{% if enable_thinking %}<think>{% endif %}"  # (/props: the UI shows its thinking toggle)
 TOOLS_TEMPLATE = TEMPLATE + "{# <tool_call> <function= <parameter= #}"  # (Qwen's tool-call syntax)
+BLOCKS_TEMPLATE = (  # (Inkling's turn of blocks: its tool-call syntax, its thoughts' end, levels of reasoning_effort)
+    "{%- for m in messages -%}{%- if m.role == 'assistant' -%}"
+    "{%- if m.reasoning_content -%}<|message_model|><|content_thinking|>{{ m.reasoning_content }}<|end_message|>"
+    "{%- endif -%}{%- if m.content -%}<|message_model|><|content_text|>{{ m.content }}<|end_message|>{%- endif -%}"
+    "{%- for c in m.tool_calls or [] -%}<|message_model|>{{ c.function.name }}<|content_invoke_tool_json|>"
+    '{"name":{{ c.function.name|tojson }},"args":{{ c.function.arguments|tojson }}}<|end_message|>{%- endfor -%}'
+    "</s>{%- else -%}<|{{ m.role }}|>{{ m.content }}{%- endif -%}{%- endfor -%}"
+    "{{ {'low': 'L', 'high': 'H'}.get(reasoning_effort, '') }}")
 
 
 CHARS = "\t\n\r" + "".join(map(chr, range(32, 127)))  # (``chars``: pieces of their own from the start)
@@ -96,18 +106,22 @@ class FakeTokenizer:
 
 
 class FakeModel(Model):
-    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks); ``takes``: the
+    """``reasoning``: the thought markers (QWEN: the prompt opens the thought when the model thinks); ``blocks``: a turn
+    of blocks (``BLOCKS``, Inkling's: the model opens its own, the prompt opens no turn); ``takes``: the
     ``reasoning_effort`` levels its template takes (Qwen3.8's raises for another; None: any); ``efforts``: the model's
     mapping of the levels (``Model.efforts``)."""
 
     name = "Fake"
 
-    def __init__(self, *, reasoning: tuple[str, str] | None = None, chars: bool = True):
+    def __init__(self, *, reasoning: tuple[str, str] | None = None, chars: bool = True, blocks: Blocks | None = None):
         self.tokenizer = FakeTokenizer(chars=chars)
         self.eos_token_ids = (EOS,)
+        self.blocks = blocks
+        if blocks is not None:
+            reasoning = (blocks.header + blocks.thought, blocks.end)
         self.reasoning = reasoning
         self.thinks = reasoning is not None
-        self.thought_first = reasoning == QWEN
+        self.thought_first = reasoning == QWEN or blocks is not None
         self.rendered: tuple[list[dict[str, object]], list[dict[str, object]] | None] = ([], None)
         self.preserved: bool | None = None  # (the last chat's preserve)
         self.thought: bool | None = None  # (the last chat's think)
@@ -130,6 +144,8 @@ class FakeModel(Model):
             calls = "".join(f" call {c['function']['name']} {json.dumps(c['function']['arguments'])}"
                             for c in m.get("tool_calls") or [])
             text += f"<|{m['role']}|>{m['content']}{calls}"
+        if self.blocks is not None:  # (the model opens its own blocks)
+            return self.tokenizer.encode(text)
         text += "<|assistant|>"
         if self.reasoning == QWEN:
             text += "<think>\n" if think else "<think>\n\n</think>\n\n"
@@ -401,11 +417,13 @@ class FakeNpu(NpuModel):
 ENGINES: list[Engine] = []  # (stopped after each test: a worker left running keeps pytest from exiting)
 
 def make(*, reasoning: tuple[str, str] | None = None, load: object = None, vision: bool = False, audio: bool = False,
-         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, chars: bool = True, **kw: object
-         ) -> tuple[FakeModel, FakeNpu, Engine]:
+         turns: tuple[str, str] | None = None, cache: dict[str, int] | None = None, chars: bool = True,
+         blocks: Blocks | None = None, **kw: object) -> tuple[FakeModel, FakeNpu, Engine]:
     """A fake model's engine, started: ``turns``: the model's ``turn`` and ``user_turn`` (its prompt cache's marks),
-    ``cache``: the prompt cache's options; ``chars``: the tokenizer's ``chars``; ``kw``: the ``FakeNpu``'s."""
-    model = FakeAudio() if audio else FakeVision() if vision else FakeModel(reasoning=reasoning, chars=chars)
+    ``cache``: the prompt cache's options; ``chars``: the tokenizer's ``chars``; ``blocks``: the model's
+    (``FakeModel``'s); ``kw``: the ``FakeNpu``'s."""
+    model = FakeAudio() if audio else FakeVision() if vision else FakeModel(reasoning=reasoning, chars=chars,
+                                                                            blocks=blocks)
     model.turn, model.user_turn = turns or (None, None)
     npu = FakeNpu(model, **kw)
     engine = Engine(load or (lambda: (model, npu)), warmup=False, **(cache or {}))

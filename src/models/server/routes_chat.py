@@ -93,10 +93,11 @@ async def decide(ctx: ApiContext, req: ChatRequest, head: dict[str, Any]) -> dic
         return None
     ctx.check(req)
     ids, think = await ctx.prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort)
-    if think and ctx.engine.model.reasoning is not None and ctx.prompts.inside(ids):
-        return None  # (the template opened a thought: the answer comes after it)
+    model = ctx.engine.model
+    if think and model.reasoning is not None and (model.blocks is not None or ctx.prompts.inside(ids)):
+        return None  # (the template opened a thought, or the model opens its own: the answer comes after it)
     ctx.fits(ids)
-    model, t0 = ctx.engine.model, time.perf_counter()
+    t0 = time.perf_counter()
     texts = [opts.text(v).encode() for v in opts.values]
     await ctx.vocab()  # (the model's tokens: built aside, in a thread)
     try:

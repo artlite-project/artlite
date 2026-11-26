@@ -10,13 +10,15 @@ model writes a call, parsed as the text streams (``Parser``: text in, content an
 | ``Gemma4`` | Gemma 4 | ``<|tool_call>call:NAME{k:V,...}<tool_call|>``, strings between ``<|"|>`` |
 | ``Llama3`` | Llama 3.1 / 3.2 | the whole message ``{"name": NAME, "parameters": {...}}`` |
 | ``Glm45`` | Spark-X2.5 / X2.6 (GLM-4.5's syntax) | ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`` |
+| ``Inkling`` | Inkling 2 | a block of the turn ``<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>`` |
 
 A Qwen parameter's value is the text up to ``</parameter>`` (one newline after the tag and one before the closing tag
 are the syntax's): a string where the function's schema allows only strings, streamed as it comes; otherwise JSON when
 it parses to a type the schema allows, else the text (llama.cpp's rule), a Python literal where the schema allows no
 string (Qwen writes True and False). A GLM-4.5 value (``<arg_value>``) the same, white space between the tags
 (GLM-4.5's newlines) dropped. A Gemma or Llama call goes out whole at its end, its arguments typed the same way
-(``typed``). A call that does not parse is content.
+(``typed``). An Inkling call's name is its JSON's (llama.cpp's: a model may write none before the marker), its
+arguments the JSON as written, streamed. A call that does not parse is content.
 
 A call is held to the request's functions by a grammar built from these parsers' texts (``call_grammar``): its name
 is one of theirs, its arguments follow the function's schema in this syntax. Without it a model invents names
@@ -798,6 +800,126 @@ class LlamaParser(Parser):
         return out
 
 
+class InklingParser(Parser):
+    """Inkling's calls (``Inkling``): blocks of the turn (a ``textflow.BlockSplitter`` passes them as content, their
+    markers kept) ``<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>``; the
+    name the JSON's, the arguments streamed as written (a JSON value, up to its end); a block that is no call is
+    content."""
+
+    OPEN, CALL, CLOSE = "<|message_model|>", "<|content_invoke_tool_json|>", "<|end_message|>"
+    HEAD = re.compile(r'\s*\{\s*"name"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"args"\s*:\s*')
+    NAME_HEAD, NAME_END = OPEN, CALL
+
+    def __init__(self, functions: list[dict[str, Any]], *, parallel: bool = True):
+        super().__init__(functions, parallel=parallel)
+        self.state = "text"  # text, name (after the header), head (after the marker), args, tail (after the args)
+        self.block = ""  # (the call's text so far: content again if it is no call)
+        self.depth, self.quoted, self.escape, self.lead = 0, False, False, False  # (the arguments' JSON so far)
+
+    def _not_call(self, out: list[Part]) -> None:
+        self._content(out, self.gap + self.OPEN + self.block + self.buf)
+        self.state, self.buf, self.block = "text", "", ""
+
+    def _feed(self, text: str) -> list[Part]:
+        self.buf += text
+        out: list[Part] = []
+        while self._step(out):
+            pass
+        return out
+
+    def _flush(self) -> list[Part]:
+        out: list[Part] = []
+        while self._step(out, final=True):
+            pass
+        if self.state in ("name", "head"):
+            self._not_call(out)
+        return out
+
+    def _step(self, out: list[Part], *, final: bool = False) -> bool:
+        """One step of the parse; False: it waits for more text."""
+        b = self.buf
+        if self.state == "text":
+            if self.done:  # (the generation ends here)
+                self.buf = ""
+                return False
+            if self._text(out, self.OPEN, final=final) < 0:
+                return False
+            self.state, self.block = "name", ""
+            return True
+        if self.state == "name":
+            i = b.find(self.CALL)
+            if i >= 0 and self.CLOSE not in b[:i]:
+                self.block, self.buf, self.state = b[:i + len(self.CALL)], b[i + len(self.CALL):], "head"
+                return True
+            if not final and len(b) < 256 and self.CLOSE not in b:
+                return False
+            self._not_call(out)
+            return True
+        if self.state == "head":
+            m = self.HEAD.match(b)
+            if m:
+                try:
+                    name = json.loads(m.group(1))
+                except ValueError:
+                    name = None
+                if isinstance(name, str) and name:
+                    out.append(("tool_call", self._begin(name)))
+                    self.block, self.buf, self.state = "", b[m.end():], "args"
+                    self.depth, self.quoted, self.escape, self.lead = 0, False, False, False
+                    return True
+            if not final and m is None and len(b) < 512 and self.CLOSE not in b:
+                return False
+            self._not_call(out)
+            return True
+        if self.state == "args":
+            if not self.lead:  # (blanks before the value dropped)
+                b = b.lstrip()
+                if not b:
+                    self.buf = ""
+                    return False
+                self.lead = True
+            end = self._scan(b)
+            frag, self.buf = b[:len(b) if end is None else end], b[len(b) if end is None else end:]
+            if frag:
+                out.append(("tool_call", ToolCall(self.started - 1, arguments=frag)))
+            if end is None:
+                return False
+            self.state = "tail"
+            return True
+        # tail: the JSON's closing brace and the block's end, dropped (a call that lacks them ends anyway)
+        i = b.find(self.CLOSE)
+        if i < 0 and not final and len(b) < 64:
+            return False
+        self.buf = b[i + len(self.CLOSE):] if i >= 0 else ""
+        self._ended()
+        self.state = "text"
+        return True
+
+    def _scan(self, b: str) -> int | None:
+        """Where the arguments' JSON value ends in ``b`` (its state carried from the text before), or None: not yet."""
+        for i, c in enumerate(b):
+            if self.quoted:
+                if self.escape:
+                    self.escape = False
+                elif c == "\\":
+                    self.escape = True
+                elif c == '"':
+                    self.quoted = False
+                    if self.depth == 0:  # (a string value)
+                        return i + 1
+            elif c == '"':
+                self.quoted = True
+            elif c in "{[":
+                self.depth += 1
+            elif c in "}]" or (c == "," and self.depth == 0):
+                if self.depth == 0:  # (a scalar value: the call's own brace or comma follows it)
+                    return i
+                self.depth -= 1
+                if self.depth == 0:
+                    return i + 1
+        return None
+
+
 @dataclass(frozen=True)
 class Syntax:
     """A chat template's tool-call syntax: ``parser`` reads it in generated text; ``opener(name)`` is the text that
@@ -815,7 +937,7 @@ class Syntax:
         return self.parser_class(functions, parallel=parallel)
 
     def opener(self, name: str | None = None) -> str:
-        return self.open if name is None else self.named.format(name=name)
+        return self.open if name is None else self.named.format(name=name, qname=json.dumps(name, ensure_ascii=False))
 
 
 @dataclass(frozen=True)
@@ -843,11 +965,15 @@ QWEN_XML = Syntax("qwen-xml", QwenParser, "<tool_call>\n<function=", "<tool_call
 GEMMA4 = Syntax("gemma4", GemmaParser, "<|tool_call>call:", "<|tool_call>call:{name}{{")
 LLAMA3 = Syntax("llama3-json", LlamaParser, '{"name": "', '{{"name": "{name}", "parameters": ')
 GLM45 = Syntax("glm-4.5", Glm45Parser, "<tool_call>", "<tool_call>{name}")
+INKLING = Syntax("inkling", InklingParser, InklingParser.OPEN,
+                 InklingParser.OPEN + "{name}" + InklingParser.CALL + '{{"name":{qname},"args":')
 
 
 def syntax_of(template: str) -> Syntax | None:
     """The tool-call syntax of a chat template's source (as llama.cpp's ``common_chat_template_detect_params_init``
-    and its autoparser find these four), or None: the template takes no tools."""
+    and its autoparser find these five), or None: the template takes no tools."""
+    if InklingParser.CALL in template and "<|message_model|>" in template:
+        return INKLING
     if "'<|tool_call>call:'" in template:
         return GEMMA4
     if "<tool_call>" in template and "<arg_key>" in template and "<arg_value>" in template:

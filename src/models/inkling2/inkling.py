@@ -5,11 +5,13 @@ The chat template (the file's): a conversation is blocks ``<|message_{user,model
 .. <|end_message|>``, a model turn ends with ``<|content_model_end_sampling|>``; a system block "Thinking effort level:
 x" (``reasoning_effort``: none 0 .. max 0.99, or a number; the template's default 0.9) before the first message that is
 not a system one; tools as one JSON line in a ``tool_declare`` block, calls ``<|message_model|>NAME
-<|content_invoke_tool_json|>{"name": .., "args": {..}}``; an image part as ``<|content_image|><|unused_200054|>``
-(with the mmproj: the placeholder becomes the image's tokens, ``models.inkling2v``; their rows enter the first visit as
-they are, a text token's RMS-normed).
-The template opens no turn for the reply: the model writes its own blocks (``<|message_model|><|content_thinking|>``
-.. then ``<|message_model|><|content_text|>`` ..), and its turn ends at ``<|content_model_end_sampling|>``.
+<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>``; an image part as
+``<|content_image|><|unused_200054|>`` (with the mmproj: the placeholder becomes the image's tokens,
+``models.inkling2v``; their rows enter the first visit as they are, a text token's RMS-normed).
+The template opens no turn for the reply: the model writes its own blocks (``Model.blocks``: a thought
+``<|message_model|><|content_thinking|>`` .. ``<|end_message|>``, the answer's text ``<|message_model|><|content_text|>``
+.., its calls), a thought first even at effort none, and its turn ends at ``<|content_model_end_sampling|>``. The
+blocks' markers are control tokens that its text keeps (``BpeTokenizer``'s ``preserved``).
 
 A decode dispatch runs up to 4 consecutive tokens through the 48 visits and the LM head on one stream of the weights
 (``overlay.InklingOverlay``): the projections, the depth mixes, the loop's controllers and the experts on the main cores
@@ -21,7 +23,8 @@ in prefill chunks (``prefill.InklingPrefill``; its sliding-window caches a ring 
 to a checkpoint (``recurrent``)."""
 
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 
 import numpy as np
 
@@ -34,7 +37,7 @@ from artlite.model_config import ClipConfig, InklingConfig, InklingDSparkConfig,
 from ..inkling2v import host as vision_host
 from ..inkling2v import npu as vision_npu
 from ..lanes import alone
-from ..model import Model, check_tower
+from ..model import Blocks, Model, check_tower
 from ..npu_model import Checkpoint
 from ..overlay_model import OverlayModel
 from ..sampling import TOP_K_ALL, Penalties, Sampling
@@ -63,6 +66,10 @@ class NpuInkling(OverlayModel):
     last_step = True  # (the prefill has no LM head)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn", "dspark", "chain")
     LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist")
+    # (the drafter's rows and drafts (``__init__``); the lanes of several sequences, which have no drafter, read these)
+    _pend: Mapping[int, np.ndarray] = MappingProxyType({})
+    _shadow: list[tuple[int, list[int], list[float]]] | tuple[()] = ()
+    _hist: Mapping[int, int] = MappingProxyType({})
     STEP_COST = (1.0, 1.35, 1.61, 1.79)  # (steps of S on essay tokens: each slot's own experts)
     PLANNER = {"ewma_rate": 0.2}  # noqa: RUF012  (the drafter's edge is small: ``drafts.Planner``)
 
@@ -72,6 +79,8 @@ class NpuInkling(OverlayModel):
         self.gguf = gguf
         if prefill and wrap is None:  # (a ring a chunk of the largest size fits in, from its multiples)
             wrap = InklingPrefill.ring(capacity)
+        if dspark and sequences > 1:
+            raise ValueError("the DSpark drafter drafts for one sequence (sequences > 1: none)")
         dg = GGUFFile(dspark) if dspark else None
         if dg is not None:
             taps = InklingDSparkConfig.from_gguf(dg).taps[:-1]
@@ -213,7 +222,7 @@ class NpuInkling(OverlayModel):
             self._chains = ()
             return []
         f_rnn = d.mixes(last[None])[-1, 0]
-        self._dispatch(lambda: d.block(self._step_inputs([token])[0][0, 0], P))
+        self._dispatch(lambda: d.block(self._step_inputs([token])[0][0], P))
         self.stale()
         out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
         chains = list(self.chain.chains)  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``;
@@ -266,8 +275,9 @@ class NpuInkling(OverlayModel):
         return x
 
     def _step_inputs(self, tokens: list[int] | Tokens) -> tuple:
-        """(the first visit's inputs, as one state: ``_inputs``)"""
-        return (self._inputs(tokens)[None],)
+        """(the first visit's inputs (n, hidden), its one state, the slots first: ``_inputs``; a joint step of several
+        sequences joins the lanes' slots)"""
+        return (self._inputs(tokens),)
 
     def _prefill_run(self, args: tuple, T: int, n: int, sets: Sequence[int] | None = None) -> None:
         """(a drafter's: the chunk's taps wait for it, injected after the chunk)"""
@@ -292,8 +302,11 @@ class Inkling(Model):
 
     name = "Inkling 2"
     thinks = True
-    reasoning = ("<|content_thinking|>", "<|end_message|>")
+    blocks = Blocks("<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|end_message|>",
+                    call="<|content_invoke_tool_json|>")
+    reasoning = (blocks.header + blocks.thought, blocks.end)
     thought_first = True
+    user_turn = "<|message_user|>"  # (where the first user message begins: the system blocks and tools before it)
     projectors = vision_npu.PROJECTORS
 
     def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None,
@@ -301,7 +314,7 @@ class Inkling(Model):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = InklingConfig.from_gguf(self.gguf)
-        self.tokenizer = BpeTokenizer(self.gguf)
+        self.tokenizer = BpeTokenizer(self.gguf, preserved=self.blocks.tokens)
         self.eos_token_ids = self.cfg.eos_token_ids
         self.kv_k = kv_k
         kind = drafter_type(spec_type, draft_model, ("draft-dspark",), self.name)

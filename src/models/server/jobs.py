@@ -91,6 +91,7 @@ class Job:
     opened: bool = False  # the prompt ends inside a thought (whether or not the thoughts are split off)
     think: bool = False  # the model thinks first (it opens its thought itself unless the prompt did)
     continued: bool = False  # the prompt ends in the last message's text, which the generation continues
+    chat: bool = False  # a chat answer: a model of blocks has them read (``textflow.BlockSplitter``), not a raw text
     tools: Calls | None = None  # parse the answer's tool calls (and force one: ``Calls.force``)
     grammar: Compiled | None = None  # the answer's structured output and calls (after the thought: ``GrammarMask``)
     ban: tuple[int, ...] = ()  # tokens never sampled (tool_choice none: a call's opener)

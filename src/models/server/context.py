@@ -145,21 +145,24 @@ class ApiContext:
             got = (default, "--grammar / --json-schema")
         return got
 
-    async def compile(self, got: tuple[structured.Constraint, str] | None, *, calls: Calls | None = None
-                      ) -> structured.Compiled | None:
+    async def compile(self, got: tuple[structured.Constraint, str] | None, *, calls: Calls | None = None,
+                      chat: bool = False) -> structured.Compiled | None:
         """A request's structured output (``constraint``) and its tool calls (``calls``: their grammar,
         ``call_grammar.answer``, with a JSON response format as the answer that is no call), compiled against the
-        model's tokens (in a thread: the first request may wait for them). A field that does not compile: a 400 that
-        names it."""
+        model's tokens (in a thread: the first request may wait for them); ``chat``: a chat answer's (a model of blocks:
+        the answer its text block after its thoughts, ``structured.compiled``'s ``blocks``; a call grammar holds its
+        whole turn). A field that does not compile: a 400 that names it."""
         if got is None and calls is None:
             return None
         v = await self.vocab()
         constraint, field = got if got is not None else (None, "tools")
         if calls is not None:
             field = "tools" if got is None else f"tools with {field}"
+        blocks = self.engine.model.blocks if chat else None
         try:  # (in a thread: a custom tool's grammar is analysed too, ``lexemes``)
             return await run_in_threadpool(lambda: structured.compiled(
-                call_grammar.answer(calls, v, constraint) if calls is not None else constraint, v))
+                call_grammar.answer(calls, v, constraint, blocks=blocks) if calls is not None else constraint, v,
+                blocks=blocks))
         except structured.ConstraintError as e:
             raise bad_request(f"{field}: {e}") from None
 
@@ -219,11 +222,11 @@ class ApiContext:
             max_tokens: int | None = None, conv_id: str | None = None, tools: Calls | None = None,
             answer_mark: bool = False, grammar: structured.Compiled | None = None, ban: tuple[int, ...] = (),
             opened: bool | None = None, budget: tuple[int, str, str, bool] = (-1, "", "", False), cid: str = "",
-            continued: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
+            continued: bool = False, chat: bool = False) -> tuple[Job, asyncio.Queue[tuple[str, dict[str, Any]]]]:
         """A job for the prompt and its queue of events (filled from the worker thread; ``answer_mark``:
         ``Job.answer_mark``; ``grammar``: the answer's structured output, ``compile``; ``ban``: tokens it never
         has; ``opened``: the prompt ends inside a thought, None: where it ends with the open marker; ``budget``: the
-        thought's, ``thought_budget``; ``cid``: the chat completion's id; ``continued``: ``Job.continued``)."""
+        thought's, ``thought_budget``; ``cid``: the chat completion's id; ``continued``, ``chat``: ``Job``'s)."""
         options = self.options
         loop, events = asyncio.get_running_loop(), asyncio.Queue()
 
@@ -252,7 +255,7 @@ class ApiContext:
                 progress=bool(req.return_progress), conv_id=conv_id, tools=tools, answer_mark=answer_mark,
                 grammar=grammar, ban=ban, lane=req.id_slot if req.id_slot is not None and req.id_slot >= 0 else None,
                 budget=budget[0], budget_message=budget[1], budget_end=budget[2], control=budget[3], cid=cid,
-                continued=continued)
+                continued=continued, chat=chat)
         try:
             self.engine.submit(j)
         except RuntimeError as e:
@@ -293,11 +296,16 @@ class ApiContext:
             raise not_supported("audio output is not supported by artlite-server")
         fns, calls = prompts.calls_of(req)
         got = self.constraint(req, tools=calls is not None)
-        grammar = await self.compile(got, calls=calls)
+        grammar = await self.compile(got, calls=calls, chat=True)
         ban: tuple[int, ...] = ()
         if fns and calls is None and grammar is None and self.syntax is not None:  # (tool_choice none: no call text)
-            opener = self.engine.model.tokenizer.encode(getattr(self.syntax.parser_class, "OPEN", ""))
-            ban = tuple(opener) if len(opener) == 1 else ()  # (an opener of one token: Qwen's, Gemma's; Llama's: none)
+            blocks = self.engine.model.blocks
+            if blocks is not None:  # (a turn of thought and text blocks alone)
+                v = await self.vocab()
+                grammar = await run_in_threadpool(lambda: structured.compiled(call_grammar.no_calls(blocks, v), v))
+            else:  # (an opener of one token: Qwen's, Gemma's; Llama's: none)
+                opener = self.engine.model.tokenizer.encode(getattr(self.syntax.parser_class, "OPEN", ""))
+                ban = tuple(opener) if len(opener) == 1 else ()
         ids, think = await prompts.render(req.messages, req.chat_template_kwargs, effort=req.reasoning_effort,
                                           tools=fns, cont=cont)
         budget = self.thought_budget(req)
@@ -322,4 +330,4 @@ class ApiContext:
         return self.job(req, ids, think=think, reasoning=reasoning, max_tokens=req.max_completion_tokens,
                         conv_id=conv_id, tools=calls, answer_mark=not keeps, grammar=grammar, ban=ban,
                         opened=True if cont == "reasoning_content" else None, budget=budget, cid=cid,
-                        continued=cont is not None)
+                        continued=cont is not None, chat=True)

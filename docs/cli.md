@@ -31,8 +31,8 @@ generation speeds go to stderr.
 | `-p TEXT`, `--prompt`; `-f FILE`, `--file` | the user message, or a file holding it (one of them is required, but for a transcription: `--audio` alone) |
 | `-sys TEXT`, `--system-prompt` | system message |
 | `--raw` | the prompt as it is, without the chat template |
-| `--think` | let the model think first (Gemma 4, Qwen, LFM3; default: an empty thought) |
-| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort`, with `--think` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; default `default`: the template's own) |
+| `--think` | let the model think first (Gemma 4, Qwen, LFM3, Inkling 2; default: an empty thought; Inkling 2: its effort `none`, a short thought) |
+| `--reasoning-effort LEVEL` | the chat template's `reasoning_effort`, with `--think` (Qwen3.8: `xhigh`, `medium`, `low`; Spark-X: `high`, `low`; Inkling 2: `minimal` .. `max`; default `default`: the template's own) |
 | `--chat-template-kwargs JSON` | chat template variables as a JSON object (`{"tools_in_user_message": false}`, `{"date_string": "26 Jul 2024"}`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`); it gets the variables the file's gets (`enable_thinking`, `bos_token`, ...); where it opens or closes the thought itself (inline switches such as `<\|think_off\|>` in the prompt), that decides over `--think` |
 | `--jinja` | accepted: chat templates always render with Jinja (llama-cli's switch to them) |

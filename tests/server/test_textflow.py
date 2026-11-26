@@ -1,9 +1,9 @@
-"""The generated text's filters (``models.server.textflow``) on the host: the thought split, the stop strings and the
-text held back until what follows decides."""
+"""The generated text's filters (``models.server.textflow``) on the host: the thought split (by markers, by blocks),
+a thought's budget, the stop strings and the text held back until what follows decides."""
 
-from models.server.textflow import ReasoningSplitter, StopMatcher, held
+from models.server.textflow import BlockSplitter, ReasoningSplitter, StopMatcher, ThoughtBudget, held
 
-from .fakes import GEMMA, QWEN
+from .fakes import BLOCKS, GEMMA, QWEN
 
 
 def test_held() -> None:
@@ -34,3 +34,26 @@ def test_splitter_and_stops() -> None:
     assert m.feed("P more") == ("", True) and m.word == "STOP"
     m = StopMatcher(["STOP"])
     assert m.feed("ST") == ("", False) and m.feed("ART") == ("START", False)
+
+
+def test_blocks() -> None:
+    """A turn of blocks, whatever its pieces: the thoughts, the text blocks' content without their markers or the white
+    space around their text; another block (a call's) as it is; the thought the prompt opened; a budget counted inside
+    thought blocks alone."""
+    H, TH, TX, C, E = BLOCKS.header, BLOCKS.thought, BLOCKS.text, BLOCKS.call, BLOCKS.end
+    text = f"{H}{TH} Hmm,\nyes. \n{E}{H}{TX}\nA {E}{H}{TX}B{E}{H}f{C}{{}}{E}"
+    for step in (1, 2, 5, len(text)):
+        s = BlockSplitter(BLOCKS)
+        parts = [p for i in range(0, len(text), step) for p in s.feed(text[i:i + step])] + s.flush()
+        joined = {k: "".join(v for kk, v in parts if kk == k) for k in ("reasoning_content", "content")}
+        assert joined == {"reasoning_content": "Hmm,\nyes.", "content": f"AB{H}f{C}{{}}{E}"}, step
+    s = BlockSplitter(BLOCKS, inside=True)
+    assert s.inside and s.feed(f"still{E}") == [("reasoning_content", "still")] and s.answering and not s.inside
+    b = ThoughtBudget(BlockSplitter(BLOCKS), budget=2)
+    for piece, due in [(H, False), (TH, False), ("a", False), (" b", True)]:
+        b.feed(piece)
+        assert b.due() is due, piece
+    b = ThoughtBudget(BlockSplitter(BLOCKS), budget=1)
+    for piece in (H, TX, "a", " b"):
+        b.feed(piece)
+        assert not b.due()  # (a text block: no thought)

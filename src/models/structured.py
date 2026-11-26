@@ -41,13 +41,16 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import llguidance
 import numpy as np
 from llguidance.gbnf_to_lark import GbnfToLarkError, any_to_lark
 
 from .sampling import pack_mask
+
+if TYPE_CHECKING:
+    from .model import Blocks
 
 log = logging.getLogger("artlite")
 
@@ -78,7 +81,8 @@ class Constraint:
     pattern between a JSON value's tokens (vLLM's ``whitespace_pattern``; None: ``WHITESPACE``), ``compact``: none
     (``disable_any_whitespace``), ``closed``: every object without ``additionalProperties`` is closed
     (``disable_additional_properties``); ``name``: for the log (a schema's); ``subs``: a Lark grammar's sub-grammars
-    (name, Lark), which it references as ``@name`` (custom tools' inputs: ``call_grammar``)."""
+    (name, Lark), which it references as ``@name`` (custom tools' inputs: ``call_grammar``); ``turn``: the grammar holds
+    a block model's whole turn, its thoughts too (``call_grammar``'s: ``Compiled.turn``)."""
 
     kind: str
     source: str
@@ -88,6 +92,7 @@ class Constraint:
     closed: bool = False
     name: str = ""
     subs: tuple[tuple[str, str], ...] = ()
+    turn: bool = False
 
     def __post_init__(self) -> None:
         assert self.kind in KINDS, self.kind
@@ -366,30 +371,74 @@ def vocab(tokenizer: GrammarTokenizer, n: int, eos: Sequence[int]) -> Vocab:
 
 @dataclasses.dataclass(frozen=True)
 class Compiled:
-    """A constraint's validated grammar (``compiled``): what a ``GrammarMask`` follows."""
+    """A constraint's validated grammar (``compiled``): what a ``GrammarMask`` follows; ``turn``: it holds the whole
+    turn, the thoughts too (a block model's: no ``Thought`` before it); ``opens``: the tokens that open its answer
+    (a framed one's text block: the digit runs counted after them)."""
 
     constraint: Constraint
     grammar: str
+    turn: bool = False
+    opens: tuple[int, ...] = ()
 
     @property
     def json(self) -> bool:
         return self.constraint.json
 
 
-_compiled: collections.OrderedDict[tuple[int, Constraint], Compiled] = collections.OrderedDict()
+_compiled: collections.OrderedDict[tuple[int, Constraint, object], Compiled] = collections.OrderedDict()
 _compiled_lock = threading.Lock()
 _warned: set[tuple[str, str]] = set()
 
 
-def compiled(constraint: Constraint, v: Vocab) -> Compiled:
+def turn_tokens(blocks: "Blocks", v: Vocab) -> dict[str, int]:
+    """A block model's markers as special tokens of ``v`` (header, thought, text, call, end). ConstraintError: one is
+    not a special token."""
+    out = {}
+    for k in ("header", "thought", "text", "call", "end"):
+        t = getattr(blocks, k)
+        if t and (out.setdefault(k, v.special_id(t))) is None:
+            raise ConstraintError(f"{t!r} is no special token")
+    return out
+
+
+def thought_blocks(blocks: "Blocks", v: Vocab) -> str:
+    """A Lark expansion of a block model's thought blocks before the answer (any number; their text free: any token
+    but the blocks' markers that cannot be in it, the end, a header, a call's, and the end of the turn)."""
+    t = turn_tokens(blocks, v)
+    stops = {t[k] for k in ("end", "header", "call") if k in t} | set(v.eos)
+    free = "<[^" + ",".join(str(i) for i in sorted(stops)) + "]>*"
+    return f"(<[{t['header']}]> <[{t['thought']}]> {free} <[{t['end']}]>)*"
+
+
+def framed(grammar: str, blocks: "Blocks", v: Vocab) -> str:
+    """A grammar (``Constraint.grammar``'s) as a block model's turn: its thought blocks, then the answer's text block
+    holding the grammar (llama.cpp's response format for Inkling)."""
+    if grammar.lstrip().startswith("{"):  # (llguidance's grammars: the first is the start)
+        top = json.loads(grammar)
+        first, *rest = top["grammars"]
+    else:
+        top, first, rest = {}, {"lark_grammar": grammar}, []
+    t = turn_tokens(blocks, v)
+    frame = (f"%llguidance {{}}\nstart: {thought_blocks(blocks, v)} <[{t['header']}]> <[{t['text']}]> @answer "
+             f"<[{t['end']}]>\n")
+    return json.dumps({**top, "grammars": [{"lark_grammar": frame}, {**first, "name": "answer"}, *rest]},
+                      ensure_ascii=False)
+
+
+def compiled(constraint: Constraint, v: Vocab, *, blocks: "Blocks | None" = None) -> Compiled:
     """A constraint's grammar for ``v``'s tokens, validated (kept: the last ``COMPILED``); a lenient schema's ignored
-    keywords logged once. ConstraintError: it does not compile (llguidance's message)."""
-    key = (id(v), constraint)
+    keywords logged once; ``blocks``: a block model's (the answer its text block, after its thoughts: ``framed``; a
+    constraint that holds the turn already, ``Constraint.turn``, as it is). ConstraintError: it does not compile
+    (llguidance's message)."""
+    frame = blocks is not None and not constraint.turn
+    key = (id(v), constraint, blocks if frame else None)
     with _compiled_lock:
         if key in _compiled:
             _compiled.move_to_end(key)
             return _compiled[key]
     grammar = constraint.grammar(v)
+    if frame:
+        grammar = framed(grammar, blocks, v)
     messages: list[str] = []
     if constraint.kind == "json_schema":  # (the schema alone first: its messages without the grammar around it)
         schema = constraint.schema(json.loads(constraint.source))
@@ -400,7 +449,8 @@ def compiled(constraint: Constraint, v: Vocab) -> Compiled:
             _warned.add((constraint.name, m))
             log.info("structured output%s: %s (a lenient schema: the keyword is not enforced)",
                      f" {constraint.name!r}" if constraint.name else "", _message(m))
-    out = Compiled(constraint, grammar)
+    out = Compiled(constraint, grammar, turn=constraint.turn or frame,
+                   opens=tuple(turn_tokens(blocks, v)[k] for k in ("header", "text")) if frame else ())
     with _compiled_lock:
         _compiled[key] = out
         while len(_compiled) > COMPILED:
@@ -474,14 +524,19 @@ def ends_inside(tokenizer: Any, ids: Sequence[int], opener: str) -> bool:
     return _tail(tokenizer, ids).endswith(opener)
 
 
-def prompt_thinks(tokenizer: Any, ids: Sequence[int], reasoning: tuple[str, str] | None, think: bool) -> bool:
+def prompt_thinks(tokenizer: Any, ids: Sequence[int], reasoning: tuple[str, str] | None, think: bool, *,
+                  blocks: "Blocks | None" = None) -> bool:
     """Whether the model thinks first after a prompt, as its template rendered it: the prompt ends inside a thought
     (the template opened one) or after an empty one (it closed it), else ``think`` (what the template was asked; a
     model that opens its thought itself). A template may decide against ``enable_thinking`` (inline tags such as
-    ``<|think_off|>``, its own spellings of ``reasoning_effort``); every model's own template follows it."""
+    ``<|think_off|>``, its own spellings of ``reasoning_effort``); every model's own template follows it. A model that
+    writes its turn as blocks (``Model.blocks``: every block ends with the thought's close marker) thinks first unless
+    the prompt opened its answer's text: it writes a thought at any effort."""
     if reasoning is None:
         return think
     tail = _tail(tokenizer, ids)
+    if blocks is not None:
+        return not tail.endswith(blocks.answer)
     return True if tail.endswith(reasoning[0]) else False if tail.endswith(reasoning[1]) else think
 
 
@@ -489,7 +544,7 @@ def thought_of(reasoning: tuple[str, str] | None, tokenizer: Any, *, opened: boo
                ends: tuple[str, ...] = ()) -> "Thought | None":
     """Where a model's thought is (``Model.reasoning``: its markers; ``opened``: the prompt opened one, ``ends_inside``;
     ``think``: the model thinks first; ``ends``: texts that end it and begin the answer), or None: the answer starts
-    at once."""
+    at once (a grammar that holds the whole turn, ``Compiled.turn``, has none before it)."""
     if reasoning is None or not (opened or think):
         return None
     return Thought(reasoning[1], inside=opened, opener=None if opened else tokenizer.encode(reasoning[0])[0], ends=ends)
@@ -530,13 +585,15 @@ class GrammarMask:
     """A grammar's tokens (``sampling.Mask``): an llguidance matcher of ``grammar`` over ``v``'s tokens, told each token
     of the answer (``accept``), and the next one's ``bits``. With ``thought`` the mask starts where the thought ends (a
     thought the model may open first: its opener is allowed beside the grammar's tokens). ``digits``: a JSON answer's
-    digit runs outside strings stop at ``DIGITS``. A token the matcher rejects (the generation already holds it: a
+    digit runs outside strings stop at ``DIGITS`` (``opens``: counted after these tokens, which open the answer in a
+    grammar of the whole turn: ``Compiled.opens``). A token the matcher rejects (the generation already holds it: a
     forced opener out of step) ends the constraint with a log line (``name``: the request's): the answer goes on
     unconstrained rather than in garbage."""
 
     def __init__(self, v: Vocab, grammar: str, *, thought: Thought | None = None, digits: bool = False,
-                 name: str = ""):
+                 name: str = "", opens: Sequence[int] = ()):
         self.v, self.name, self.digits = v, name, digits
+        self._opens, self._last = tuple(opens), ()  # (the answer's opening tokens; the last tokens until they came)
         self.matcher = llguidance.LLMatcher(v.tokenizer, grammar, log_level=0, limits=LIMITS)
         if self.matcher.is_error():
             raise ConstraintError(_message(self.matcher.get_error()))
@@ -670,7 +727,11 @@ class GrammarMask:
             self.give_up(f"the grammar rejects token {token} ({piece!r}): "
                          f"{_message(self.matcher.get_error()).splitlines()[0]}")
             return
-        if self.digits:
+        if self.digits and self._opens:
+            self._last = (*self._last, token)[-len(self._opens):]
+            if self._last == self._opens:
+                self._opens, self._in_string, self._run = (), False, 0
+        elif self.digits:
             self._digits(self.v.pieces[token])
 
     def _in_thought(self, token: int) -> None:

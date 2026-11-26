@@ -20,6 +20,7 @@ templates write their own). Checked against ``llama-tokenize`` (tests/test_token
 import functools
 import re
 import unicodedata
+from collections.abc import Sequence
 
 import gigatoken
 import numpy as np
@@ -105,9 +106,11 @@ def texts_of(names: list[str], *, group: bool = False) -> re.Pattern[str]:
 
 
 class BpeTokenizer:
-    """``encode`` / ``decode`` as llama.cpp tokenizes for this vocabulary (special tokens parsed)."""
+    """``encode`` / ``decode`` as llama.cpp tokenizes for this vocabulary (special tokens parsed). ``preserved``: control
+    tokens that a generation's text writes (a model's block markers, ``Model.blocks``: llama.cpp's preserved tokens),
+    decoded as text, as the user-defined ones are."""
 
-    def __init__(self, gguf: GGUFFile):
+    def __init__(self, gguf: GGUFFile, *, preserved: Sequence[str] = ()):
         pre = gguf.meta.get("tokenizer.ggml.pre")
         if pre not in PATTERNS and pre not in SPLITS:
             raise NotImplementedError(f"{gguf.path}: pre-tokenizer {pre!r} (supported: {', '.join([*PATTERNS, *SPLITS])})")
@@ -129,6 +132,12 @@ class BpeTokenizer:
                                                                                     reverse=True)) + ")")
         # the tokens decode_bytes writes: text and user-defined tokens; with special the control tokens too
         self._decoded = {False: np.isin(types, (T_NORMAL, T_USER)), True: np.isin(types, (T_NORMAL, T_USER, T_CONTROL))}
+        if preserved:
+            names = gguf.strings("tokenizer.ggml.tokens")
+            ids = [i for i, n in enumerate(names) if n in set(preserved)]
+            if len(ids) != len(set(preserved)):
+                raise ValueError(f"{gguf.path}: no tokens {sorted(set(preserved) - {names[i] for i in ids})}")
+            self._decoded[False][ids] = True
         self.eos = int(gguf.meta["tokenizer.ggml.eos_token_id"])
 
     def encode(self, text: str) -> list[int]:

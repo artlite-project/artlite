@@ -65,8 +65,9 @@ the cache) are written for the model (0: at once; where the template renders an 
 one, that prompt), and its answer follows; with `reasoning_control: true` the control route ends the thought on demand
 (the web UI's button). A request's effort (chat's `reasoning_effort`, Responses' `reasoning.effort`, Anthropic's
 `output_config.effort`) sets the budget where the chat template renders no effort levels of its own (Qwen3.5 / 3.6,
-Gemma 4, LFM3, MiniCPM-V; Qwen3.8 and Spark-X render theirs): `none` no thought, `minimal` 0, `low` 1024, `medium`
-4096, `high` and above the server's. `continue_final_message` (`true`, `"content"` or `"reasoning_content"`)
+Gemma 4, LFM3, MiniCPM-V; Qwen3.8, Spark-X and Inkling 2 render theirs): `none` no thought, `minimal` 0, `low` 1024,
+`medium` 4096, `high` and above the server's. Inkling 2 writes a short thought even at its effort `none` (its
+template's 0). `continue_final_message` (`true`, `"content"` or `"reasoning_content"`)
 continues the last message, an assistant's, from where its content (or its thought) ends, as the chat template renders
 it (the web UI's Continue), and the answer is the new text; a conversation that ends with an assistant's message is
 continued the same way (`--prefill-assistant`, on by default: Anthropic's prefill).
@@ -75,9 +76,11 @@ Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its arguments)
 with `finish_reason: tool_calls`; the results go back as `role: tool` messages. Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7,
-Occamy and LFM3 (Qwen's XML calls), Gemma 4, Spark-X and Flint (GLM-4.5's calls) and Llama 3.1 / 3.2 have them; a template without
+Occamy and LFM3 (Qwen's XML calls), Gemma 4, Spark-X and Flint (GLM-4.5's calls), Llama 3.1 / 3.2 and Inkling 2 (a
+call is a block of its turn: [inkling2](models/inkling2.md#thinking-and-tools)) have them; a template without
 tools (Llama 3.2 1B Q3_K_L's file) ignores them. `tool_choice` takes `auto`, `none` (the tools stay in the prompt; a
-call's opener of one token, Qwen's, Gemma's, GLM-4.5's, is never sampled, and a call Llama 3 writes stays text),
+call's opener of one token, Qwen's, Gemma's, GLM-4.5's, is never sampled, Inkling's turn holds thought and text blocks
+alone, and a call Llama 3 writes stays text),
 `required`, a named function (the answer begins with the call, after the model's thought; a
 named function's call is the only one) and `allowed_tools` (the calls are of its tools, the prompt keeps them all), and
 `parallel_tool_calls: false` ends the answer after its first call. A grammar in the template's own call syntax holds the
@@ -94,7 +97,8 @@ form: [Custom tools](#custom-tools).
 Every route that generates holds its answer to a JSON schema, a grammar, a regular expression or a list of texts
 when the request asks for one: as the model writes, only the tokens that keep the answer valid can come
 ([llguidance](https://github.com/guidance-ai/llguidance) masks the others), so the answer parses; the schema does not
-go into the prompt. A model that thinks first thinks freely, and the constraint holds the answer after the thought.
+go into the prompt. A model that thinks first thinks freely, and the constraint holds the answer after the thought
+(Inkling 2: its thought blocks, then the answer in a text block, as llama-server holds it).
 The content is the answer alone (a JSON one loads with `json.loads`): a JSON schema or object, a grammar, a regex or
 choices put the thought in `reasoning_content` even where `reasoning_format` (or `--reasoning-format`) `none` leaves
 it in the content otherwise (llama-server leaves Gemma 4's there, before the JSON; vLLM and Ollama always split it
@@ -168,8 +172,8 @@ most likely option as JSON in the schema's shape, and `logprobs.content[0].top_l
 to 1), as Halogen's
 decisions read them. An option's probability is that of its text as the model's next tokens, then the end of the turn:
 the prompt runs, then a decode step from a checkpoint for each token several options share (the opening quote, a
-common first word); nothing is generated. A model whose template opened a thought, and a request with tools, generate
-as any request.
+common first word); nothing is generated. A model whose template opened a thought or that writes its own (Inkling 2,
+at any effort), and a request with tools, generate as any request.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages": [{"role": "user",

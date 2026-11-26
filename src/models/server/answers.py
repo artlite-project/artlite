@@ -10,7 +10,8 @@ tokens, as a generation held to the options would write it (``score``): the cano
 the model's (Qwen's pre-tokenizer merges an opening quote with the word: ``"very``, while a model writes ``"`` and
 then ``very``). The prompt runs as one prompt; where its logits part the options (a token only one of them continues),
 they are all; a token several continue (the opening quote) runs as a decode step from a checkpoint, a step or two in
-all. A model that thinks first (its template opened a thought) generates as any request: no decision there."""
+all. A model that thinks first (its template opened a thought, or it writes its own: a model of blocks, Inkling)
+generates as any request: no decision there."""
 
 import json
 import math
