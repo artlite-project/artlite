@@ -138,3 +138,21 @@ def test_prefill() -> None:
         texts[drafts] = list(m.generate(logits, 96, Sampling(greedy=True), toks, drafts=drafts))
         print(f"drafts {drafts}: {m.drafted} drafted, {m.accepted} accepted")
     assert texts[3] == texts[0] and m.accepted > 0
+
+
+def test_checkpoint() -> None:
+    """A checkpoint after a prompt (the drafter's caches with the model's): the rounds after a restore give the text they
+    gave before it, and the drafter drafts there."""
+    path, _ = _paths()
+    host = Inkling(path)
+    toks = host.chat(TEXT_PROMPTS["code"])
+    m = host.load(capacity=2048)
+    m.lookup = False
+    logits = np.array(m.prompt(toks, logits=True))
+    ck = m.checkpoint()
+    first = list(m.generate(logits, 64, Sampling(greedy=True), toks))
+    m.restore(ck.position, ck)
+    m.drafted = 0
+    again = list(m.generate(logits, 64, Sampling(greedy=True), toks))  # (the prompt's last logits: a copy)
+    print(f"{m.drafted} drafted after the restore")
+    assert again == first and m.drafted > 0
