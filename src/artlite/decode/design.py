@@ -454,8 +454,9 @@ class DecodeOverlayOperator(ArtcOperator):
     @property
     def x_l1_depth(self) -> int:
         """The main core's X objects: two in a design of 8 slots (the next object comes in while the helper converts this
-        one's strips), one with gather tables (``l1_8``: their room)."""
-        return 2 if self.slots == 8 and not self.tables else 1
+        one's strips), one with gather tables (``l1_8``: their room); two in a states design (its fp32 state objects: the
+        next one's 4.3 KB come in while the helper mixes this one, ``hsacc``)."""
+        return 2 if (self.slots == 8 and not self.tables) or self.states else 1
 
     def l1_8(self) -> dict[str, int]:
         """(8 slots with gather tables) The pinned buffers (local addresses) of the main core (``m_*``): A object 0 and the

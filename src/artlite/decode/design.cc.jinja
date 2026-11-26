@@ -369,18 +369,31 @@ __attribute__((noinline)) void {{ p }}_hsacc(const float *__restrict x, const fl
         {{ p }}_cv((int32_t *)acc, (const int32_t *)x, nf / 16);
         return;
     }
-    alignas(64) float cl[32];
-    for (int l = 0; l < 32; l++)  // (lane l: slot (l / 8) % sp's coefficient)
-        cl[l] = c ? c[(l >> 3) & (sp - 1)] : 1.0f;
+    // (lane l: slot (l / 8) % sp's coefficient)
+    const aie::vector<float, 32> cl = c ? aie::concat(aie::broadcast<float, 8>(c[0]), aie::broadcast<float, 8>(c[1 & (sp - 1)]),
+                                                       aie::broadcast<float, 8>(c[2 & (sp - 1)]), aie::broadcast<float, 8>(c[3 & (sp - 1)]))
+                                        : aie::broadcast<float, 32>(1.0f);
     aie::vector<bfloat16, 32> ch, cw;
-    al::split2<32>(aie::load_v<32>(cl), ch, cw);
+    al::split2<32>(cl, ch, cw);
+    // (the whole object, past the range's nf floats its zero padding into acc's idle rest: the first state's products
+    // added to zeros, 2 vectors an iteration pipelined after register allocation: 86 + 371 cycles a call; 1036 / 654 the
+    // products stored / added a vector an iteration, unpipelined / pre-RA)
+    if (first) {
+        AIE_LOOP_NO_UNROLL
+        for (int i = 0; i < 1024; i += 64) {
+            aie::store_v(acc + i, aie::zeros<float, 32>());
+            aie::store_v(acc + i + 32, aie::zeros<float, 32>());
+        }
+    }
     AIE_PREPARE_FOR_POSTPIPELINING
-    for (int i = 0; i < nf; i += 32) {
-        aie::vector<bfloat16, 32> h, l;
-        al::split2<32>(aie::load_v<32>(x + i), h, l);
-        aie::accum<accfloat, 32> a = first ? aie::zeros<accfloat, 32>() : aie::accum<accfloat, 32>(aie::load_v<32>(acc + i));
-        a = aie::mac(aie::mac(aie::mac(a, ch, h), ch, l), cw, h);
-        aie::store_v(acc + i, a.template to_vector<float>());
+    for (int i = 0; i < 1024; i += 64) {
+        aie::vector<bfloat16, 32> h0, l0, h1, l1;
+        al::split2<32>(aie::load_v<32>(x + i), h0, l0);
+        const aie::accum<accfloat, 32> a0 = aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(acc + i)), ch, h0), ch, l0), cw, h0);
+        al::split2<32>(aie::load_v<32>(x + i + 32), h1, l1);
+        const aie::accum<accfloat, 32> a1 = aie::mac(aie::mac(aie::mac(aie::accum<accfloat, 32>(aie::load_v<32>(acc + i + 32)), ch, h1), ch, l1), cw, h1);
+        aie::store_v(acc + i, a0.template to_vector<float>());
+        aie::store_v(acc + i + 32, a1.template to_vector<float>());
     }
 }
 
