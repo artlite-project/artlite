@@ -177,7 +177,10 @@ class NpuInkling(OverlayModel):
         self._dispatch(lambda: d.block(self._step_inputs([token])[0][0, 0], P))
         self.stale()
         out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
-        self._chains = tuple(self.chain.chains)
+        chains = self.chain.chains  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``; an MoE's
+        # slots route to experts of their own)
+        out = out[:next((i for i in range(len(out)) if not self._keep(chains[i], i)), len(out))]
+        self._chains = tuple(chains[:len(out)])
         self._row_time(time.perf_counter() - t0)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
