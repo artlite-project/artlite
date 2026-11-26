@@ -572,15 +572,15 @@ class Qwen(Model):
 
     @property
     def parallel(self) -> bool:  # type: ignore[override]
-        """(a dense chat model whose tile formats run on the design of 8 slots, its LM head's rows whole - a PARO
-        checkpoint's screened, its plane Q4_0: ``overlay.runs_eight``)"""
+        """(a dense chat model whose tile formats run on the design of 8 slots (``overlay.runs_eight``), its
+        screened LM head's plane among them: a design of several sequences pages every format)"""
         if not (self.generates and self.cfg.causal):
             return False
-        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=self.paro).formats())
+        return runs_eight(self.cfg, QwenImage(self.gguf, self.cfg, mtp=self._own(), screen=True).formats())
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuQwen:
-        """(``sequences``: ``NpuQwen``'s; several: the LM head's rows whole (a PARO checkpoint's screened), the file's MTP
-        block as the drafter where it has one and a drafter is asked for, a DFlash2 drafter's place too)"""
+        """(``sequences``: ``NpuQwen``'s; several: the file's MTP block as the drafter where it has one and a drafter is
+        asked for, a DFlash2 drafter's place too; its LM head keeps the plane its image screened)"""
         if sequences == 1:
             self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=self.weights, drafter=self.mtp,
                                 dflash=self.dflash, readout=not self.generates)
@@ -590,11 +590,12 @@ class Qwen(Model):
             log.warning("%s with %d sequences %s (the DFlash2 drafter's records follow one sequence)", self.name,
                         sequences, "drafts with its MTP layer" if own else "runs without a drafter")
         weights = self.weights
-        if (weights.image.screen and not self.paro) or (weights.image.mtp_layer >= 0) != own or weights.image.taps:
-            # (the image packed again: its LM head's rows whole, the MTP block where it drafts, no DFlash2 drafter's taps)
+        if (weights.image.mtp_layer >= 0) != own or weights.image.taps:
+            # (the image packed again: the MTP block where it drafts, no DFlash2 drafter's taps; the plane its first
+            # image screened stays, the design of several sequences paging it like every other format)
             weights.wait()
             self.weights = weights = WeightBuffer(QwenImage(self.gguf, self.cfg, mtp=own, pairs=self.generates,
-                                                            screen=self.paro))
+                                                            screen=True))
         self._npu = NpuQwen(self.gguf, capacity=capacity, prefill=prefill, weights=weights,
                             drafter="" if own else None, readout=not self.generates, sequences=sequences)
         return self._npu
