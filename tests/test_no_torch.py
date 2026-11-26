@@ -1,5 +1,6 @@
 """Production code runs without torch (a dev dependency: the tests' CPU references): every module of ``artlite`` and
-``models`` imports in a fresh interpreter whose import system refuses torch."""
+``models`` imports in a fresh interpreter whose import system refuses torch. GitHub also runs it on Python 3.12, with
+no conftest.py, torch, Peano or NPU (``.github/workflows/python312.yml``)."""
 
 import subprocess
 import sys

@@ -1,0 +1,28 @@
+name: python 3.12
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  # Python 3.12 (requires-python's oldest) evaluates a module's annotations as it defines its functions and classes,
+  # 3.14 when they are read: a module that imports on the venv's 3.14 can fail on 3.12, so every module of artlite and
+  # models is imported there (tests/test_no_torch.py). Syntax newer than 3.12 is ruff's (target: requires-python).
+  imports:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: libdrm, GCC 14 (the first with -march=znver5)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdrm-dev g++-14
+      - name: uv
+        run: pipx install uv
+      - name: the locked venv on Python 3.12 with the native module (no Peano, no torch)
+        run: >-
+          CXX=g++-14 uv sync --locked --python 3.12 --managed-python
+          --no-install-package llvm-aie --no-install-package torch
+      - name: every module imports on Python 3.12
+        run: uv run --no-sync pytest --noconftest tests/test_no_torch.py

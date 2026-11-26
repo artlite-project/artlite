@@ -14,8 +14,9 @@ pytest tests --dump-designs DIR                          # render every design, 
 ruff check <changed files>                               # the tree passes: fix whatever it reports
 ```
 
-GitHub runs `ruff check` on each push to `main` and each pull request; the tests need an NPU, so they run on your
-machine. The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The
+GitHub runs `ruff check` on each push to `main` and each pull request, and imports every module on Python 3.12
+(`requires-python`'s oldest, which evaluates annotations as it defines a function or class, where 3.14 defers them:
+`tests/test_no_torch.py`); the tests need an NPU, so they run on your machine. The full suite is slow: run the test file of what you changed, and the smoke set after a shared change. The
 tests need no compile plumbing: pytest plans the selected tests' designs in a subprocess and builds them in the
 background while the tests run. Whole-model tests (`slow`) need the model files; the long-prompt tests need the essay
 corpus (`python tests/datasets/fetch_datasets.py`); the reference tests need a llama.cpp CPU build

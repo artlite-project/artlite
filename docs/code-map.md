@@ -40,7 +40,7 @@ updates its row.
 | `tests/datasets/` | the long-prompt corpus and LibriSpeech test-clean's first chapter (speech clips) (gitignored; `fetch_datasets.py` fetches them, `common.essay()` reads the essays); `videos/`: the synthetic videos `common.video_file` makes with ffmpeg |
 | `scripts/` | what users install on their system (as root): `fclk-hold` and its systemd unit, the FCLK hold of Strix Halo (`docs/install.md`) |
 | `flake.nix`, `flake.lock` | NixOS's development shell (`docs/install.md`) |
-| `.github/` | GitHub: the `ruff check` workflow (on pushes to `main` and pull requests), the issue and pull request templates, the security policy |
+| `.github/` | GitHub: the workflows (on pushes to `main` and pull requests: `ruff check`, every module imported on Python 3.12), the issue and pull request templates, the security policy |
 | `docs/` | the user documentation (index: `docs/README.md`): installation, the tools' options, models (`models/`: tested files, plans, one page per model), benchmark methodology (the charts' test system and measured files), design, development; the README's performance charts: `data/*.json` (Artlite's and other runtimes' measurements), `charts.py` draws them as `images/*.svg`; `diagram.py` draws the README's how-it-works diagram; `images/`: also the logo and the docs' pictures |
 
 ## How the models run

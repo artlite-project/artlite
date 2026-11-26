@@ -18,7 +18,7 @@ from the file a window at a time, and the tools' load line ends with both figure
 | access to `/dev/accel/accel0` | the device node belongs to the `render` group: `sudo usermod -aG render $USER`, then log in again |
 | the locked-memory limit unlimited | the driver pins the NPU's buffers (a model's weights: GBs) within `ulimit -l`, which is 8 MB on many distributions: below |
 | libdrm | the runtime's build links it (`pkg-config libdrm`) |
-| CMake 3.20 or newer, a C++23 compiler (GCC 13+, Clang 17+) | the runtime and its Python bindings |
+| CMake 3.20 or newer, a C++23 compiler that knows Zen 5 (`-march=znver5`: GCC 14+, Clang 19+) | the runtime and its Python bindings |
 | Python 3.12 to 3.14 (the toolchain wheels' versions), [uv](https://docs.astral.sh/uv/) | uv installs everything else into a venv |
 | FFmpeg (optional) | videos in prompts ([LFM3-VL, LFM3-Omni](models/lfm3.md#videos)): `ffmpeg` and `ffprobe` on PATH read their frames and soundtrack, with llama.cpp's commands (llama.cpp's video input needs them too); without them a video is an error that names them |
 

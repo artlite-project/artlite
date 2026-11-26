@@ -50,8 +50,9 @@ use any modern SIMD (AVX-512 included).
 - Python: annotate all parameters and return types; functions with more than 3 parameters take keyword-only
   arguments. Code runs on Python 3.12 (`requires-python`) and every newer version a venv may have, with no
   compatibility code for older ones; `from __future__ import annotations` only where 3.12 needs it (an annotation
-  naming a class defined later in the module or imported only under `TYPE_CHECKING`, or an attribute of a package
-  still loading, such as `artlite.Device` in a module that `import artlite` loads).
+  naming a class defined later in the module or imported only under `TYPE_CHECKING`, an attribute of a package
+  still loading, such as `artlite.Device` in a module that `import artlite` loads, or a module the class body
+  rebinds, such as a dataclass field `np: int = 8` before `-> np.ndarray`). GitHub imports every module on 3.12.
 - Production code (`src/`) runs on numpy and ml_dtypes, never torch: torch is a dev dependency, the tests' CPU
   references (ruff refuses the import outside `tests/`; `tests/test_no_torch.py` imports every module without it).
   Host work numpy does badly goes to `csrc/` (AVX-512), the rest to the NPU.
@@ -116,7 +117,7 @@ or moved module updates its row).
 | `src/models/*.py` | what the models share: `Model`, `NpuModel`, `OverlayModel`, several sequences (`lanes.py`), sampling, chat templates, structured output, drafts; `artlite-cli`, `artlite-bench`, `artlite-probe` |
 | `tests/` | a directory per package of `src/`; the shared helpers (`conftest.py`, `common.py`, `numerics.py`, `model_files.py`), llama.cpp's goldens (`goldens/`), CPU references, `dma_model.py`, `design_diff.py`, `txn_dump.py`, `schedule_ledger.py`, the C++ gtests (`csrc/`), `datasets/` |
 | `docs/` | the user documentation (index: `docs/README.md`); the README's charts (`data/`, `charts.py`) |
-| `scripts/`, `flake.nix`, `.github/` | the FCLK hold of Strix Halo, NixOS's development shell, GitHub's `ruff check` workflow and templates |
+| `scripts/`, `flake.nix`, `.github/` | the FCLK hold of Strix Halo, NixOS's development shell, GitHub's workflows (`ruff check`, the imports on Python 3.12) and templates |
 
 ## Where the rest is
 
