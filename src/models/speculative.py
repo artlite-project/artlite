@@ -46,6 +46,7 @@ class SpeculativeMixin:
     share: int | None = None
     _offer: tuple[float, ...] | None = None
     STEP_COST = (1.0, 1.05, 1.1, 1.15)  # a step of S = 1 .. SLOTS tokens' time relative to one's, until measured
+    PLANNER: dict[str, float] = {}  # (the planner's options: ``drafts.Planner``)  # noqa: RUF012
     P_MIN = 0.5  # a drafter's chain of drafts stops below this probability until its rounds are measured (``_worth``)
     # (a drafter step of one row's seconds; per draft depth the rounds that kept a draft there and their chains'
     # probabilities there: running averages)
@@ -66,7 +67,7 @@ class SpeculativeMixin:
     @functools.cached_property
     def planner(self) -> Planner:
         """(across the model's generations: its steps' times, the drafts' acceptance)"""
-        return Planner(self.STEP_COST)
+        return Planner(self.STEP_COST, **self.PLANNER)
 
     @property
     def _drafting(self) -> bool:

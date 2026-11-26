@@ -56,8 +56,9 @@ class NpuInkling(OverlayModel):
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
     last_step = True  # (the prefill has no LM head)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn", "dspark", "chain")
-    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist")
     STEP_COST = (1.0, 1.51, 1.87, 2.11)  # (steps of S on essay tokens, S3's: each slot's own experts)
+    PLANNER = {"ewma_rate": 0.2}  # noqa: RUF012  (the drafter's edge is small: ``drafts.Planner``)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,
                  wrap: int | None = None, sequences: int = 1, prefill: bool = False, taps: tuple[int, ...] = (),
@@ -73,6 +74,10 @@ class NpuInkling(OverlayModel):
         self.drafter = self.dspark
         self.chain: MarkovChain | None = None
         self._pend: dict[int, np.ndarray] = {}  # (position -> its taps (taps, hidden) fp32: ``_rows_of``)
+        # (the rounds' drafts before ``_keep`` cut them: (the first one's position, drafts, chains), checked against the
+        # sequence's tokens as they come, ``_kept``: the drafter's calibration of every draft, not only the run ones)
+        self._shadow: list[tuple[int, list[int], list[float]]] = []
+        self._hist: dict[int, int] = {}  # (the sequence's tokens of the positions a shadow reads)
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
@@ -112,7 +117,7 @@ class NpuInkling(OverlayModel):
         self.overlay.reset()
         if self.dspark is not None:
             self.dspark.reset()
-        self._pend = {}
+        self._pend, self._shadow, self._hist = {}, [], {}
         self.position = 0
 
     def _overlays(self) -> list[InklingOverlay]:
@@ -142,10 +147,35 @@ class NpuInkling(OverlayModel):
         return out
 
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
-        """(the rejected drafts' taps are forgotten)"""
+        """(the rejected drafts' taps are forgotten; the rounds' drafts checked against the kept tokens: ``_shadow``)"""
         super()._kept(p, tokens, m, mtp, won)
         for q in [q for q in self._pend if q >= self.position]:
             del self._pend[q]
+        if not self._shadow:
+            return
+        for i in range(m):
+            self._hist[p + i] = tokens[i]
+        left = []
+        for q, drafts, chains in self._shadow:
+            k = 0
+            while k < len(drafts) and self._hist.get(q + k, -1) == drafts[k]:
+                k += 1
+            if k == len(drafts) or q + k < self.position:  # (decided: all kept, or a known token differs)
+                self._chains = tuple(chains)
+                super()._calibrate(k)
+            else:
+                left.append((q, drafts, chains))
+        self._shadow = left
+        lo = min((q for q, _, _ in left), default=self.position)
+        self._hist = {q: t for q, t in self._hist.items() if q >= lo}
+
+    def _begin(self) -> None:
+        """(a generation's rounds: no drafts of an earlier one to check)"""
+        super()._begin()
+        self._shadow, self._hist = [], {}
+
+    def _calibrate(self, kept: int) -> None:
+        """(a round's: from its drafts before ``_keep`` cut them, as the tokens come, ``_kept``)"""
 
     def _inject(self, end: int | None = None) -> None:
         """The waiting rows before ``end`` (default: the position) into the drafter's caches (dispatches of up to 4
@@ -180,8 +210,10 @@ class NpuInkling(OverlayModel):
         self._dispatch(lambda: d.block(self._step_inputs([token])[0][0, 0], P))
         self.stale()
         out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
-        chains = self.chain.chains  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``; an MoE's
-        # slots route to experts of their own)
+        chains = list(self.chain.chains)  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``;
+        # an MoE's slots route to experts of their own)
+        if out:
+            self._shadow.append((P + 1, list(out), chains))
         out = out[:next((i for i in range(len(out)) if not self._keep(chains[i], i)), len(out))]
         self._chains = tuple(chains[:len(out)])
         self._row_time(time.perf_counter() - t0)
@@ -204,12 +236,13 @@ class NpuInkling(OverlayModel):
     def _set_state(self, state: dict[str, object]) -> None:
         if self.dspark is not None:
             self._pend, self.dspark.next = dict(state["pend"]), state["next"]
+            self._shadow, self._hist = [], {}
 
     @alone
     def restore(self, position: int, checkpoint: Checkpoint | None = None) -> None:
         if checkpoint is None and self.dspark is not None:
             self.dspark.reset()
-            self._pend = {}
+            self._pend, self._shadow, self._hist = {}, [], {}
         super().restore(position, checkpoint)
 
     def _step_inputs(self, tokens: list[int]) -> tuple:

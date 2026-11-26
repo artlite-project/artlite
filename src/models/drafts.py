@@ -127,10 +127,11 @@ class Lookup:
 
 class Planner:
     """A model's choice of each round's drafts (module docstring): ``cost``, a step of S = 1 .. SLOTS tokens' time
-    relative to one's until measured."""
+    relative to one's until measured; ``ewma_rate``: ``EWMA_RATE``'s (a model whose drafter's edge is small, an MoE's
+    whose slots are dear: a faster average stops it within a few rounds of a text it cannot guess)."""
 
-    def __init__(self, cost: tuple[float, ...]):
-        self.cost = cost
+    def __init__(self, cost: tuple[float, ...], *, ewma_rate: float = EWMA_RATE):
+        self.cost, self.ewma_rate = cost, ewma_rate
         # (per span of positions, ``place``: the seconds of a step of S within a cache group, and those a step adds by
         # crossing a group, running averages)
         self._t: dict[int, list[float | None]] = {}
@@ -254,7 +255,7 @@ class Planner:
         self.rate_tokens = (1 - w) * self.rate_tokens + w * tokens
         self.rate_s = (1 - w) * self.rate_s + w * seconds
         b = _mtp_bucket(m)
-        w = EWMA if self.lost[b] else max(EWMA_RATE, 1.0 / (self.mtp_rounds[b] + 1))
+        w = EWMA if self.lost[b] else max(self.ewma_rate, 1.0 / (self.mtp_rounds[b] + 1))
         self.mtp_rounds[b] += 1
         self.since_mtp[b] = 0
         self.mtp_tokens[b] = (1 - w) * self.mtp_tokens[b] + w * tokens
