@@ -5,6 +5,8 @@ Attention ``Attention``: 8 heads of d 160 (16x16, 8x8): the queries of a column'
 / V^T slots in DDR, written by ``Attention.kv_drains``, on the B streams of the attention rows).
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import numpy as np
