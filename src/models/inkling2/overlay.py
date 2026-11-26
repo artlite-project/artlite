@@ -224,6 +224,7 @@ class InklingOverlay(AttentionOverlay):
     DSpark drafter's visits whose input residual the steps copy out (module docstring)."""
 
     CONFIG, IMAGE = InklingConfig, InklingImage
+    AHEAD = True  # (the next step patched while one runs: ~1.2 ms a step off the host's path)
     CHAIN = 1
     SEQ = ("KV",)  # (a sequence's caches, raw rings, history windows and open records)
     OPS = ("att", "moe")
@@ -359,7 +360,7 @@ class InklingOverlay(AttentionOverlay):
         """Byte offsets in ACT and KV."""
         self._layout = dict.fromkeys(("ACT", "KV"), 0)
         take = self._take
-        self.toks = (take("ACT", len(KINDS) * SLOTS * XB),)
+        self.toks = tuple(take("ACT", len(KINDS) * SLOTS * XB) for _ in range(2))  # (a set per buffer: AHEAD)
         self.loadr = take("ACT", COLS * self.LOADS * SLOTS * XB)  # ([column][state b][slot s] F_LOADR objects)
         # the state array ([state][k block][slot sp][8] fp32, after the XB - XPAY bytes its objects' fill reads before
         # it); per visit: the q, k, v phases' metadata objects, the partial sums objects of its attention's and FFN's
