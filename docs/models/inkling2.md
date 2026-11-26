@@ -13,9 +13,12 @@ file's (temperature 1, all tokens).
 ```
 $ARTLITE_MODELS_DIR/unsloth/Inkling-2-Mini-GGUF/        unsloth/Inkling-2-Mini-GGUF
     Inkling-2-Mini-UD-Q4_K_XL.gguf                      (NVFP4 and Q8_0 experts, Q8_0 attention, BF16 router, controllers)
+    dspark-Inkling-2-Mini-Q8_0.gguf                     (its DSpark drafter: optional)
 ```
 
-The models directory: [Installation](../install.md#models-directory).
+The drafter is the first `dspark-*.gguf` beside the model file (or in the repository's root, or a `dspark/` directory
+there; Q8_0 first) whose vocabulary and hidden size are the model's; `--spec-type none` runs without it,
+`-md FILE` names another. The models directory: [Installation](../install.md#models-directory).
 
 ## Thinking and tools
 
@@ -43,13 +46,25 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   hi + lo, the routing on the host, the experts' work lists on `artlite.moe`); the prompt's last token runs as a decode
   step (the LM head's). The experts stream their weights once per chunk: long prompts run in chunks of 8192.
 
+- The DSpark drafter (`dspark.py`, `dspark_image.py`) runs in a design and hardware context of its own: 4 token slots
+  of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step and prompt
+  chunk leaves the model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state),
+  which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other
+  two to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
+  model's screened LM head, its Markov head on the host over each row's candidates (their logits exact from the file's
+  rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.5,
+  1.9, 2.1 times a step of one for S = 2, 3, 4 (each token routes to its own experts), so a draft pays only where the
+  drafter guesses well: the rounds' planner leaves the drafter out where its rounds give fewer tokens per second than
+  steps of one.
+
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size: 17.15 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded); nothing is written to disk. A
 decode step streams 1.09 GB of dense weights and the 8 experts of each visit (1.86 GB of expert tiles a token). The
 sliding-window visits' caches are rings past 16K positions of capacity (16384 positions, two of the prefill's largest
 chunks): they, the full visits' caches and the convs' state take 3.4 GB at 33K positions (each sequence of `-np` its
 own), 6.2 GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last
-positions only, so a conversation goes back only to a checkpoint (artlite-server takes them).
+positions only, so a conversation goes back only to a checkpoint (artlite-server takes them). The drafter: 0.30 GB of
+weights, 36 MB of caches at 4K positions (~140 MB at 33K). With `-np` above 1 the drafter is not loaded.
 
 ## Speed and accuracy (Strix Halo)
 
@@ -59,8 +74,15 @@ positions only, so a conversation goes back only to a checkpoint (artlite-server
 | generation (greedy, 256 tokens, essay summary) | 10.7 tokens/s | 9.1 tokens/s |
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
-a step (drafts, or other requests with `-np`) adds its own experts. Context drafts (artlite-cli's lookup) keep the text
-the model writes alone.
+a step (drafts, or other requests with `-np`) adds its own experts. Drafts (the DSpark drafter's, the context's) keep
+the text the model writes alone.
+
+With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the prefill, against steps of one): code
+11.2 -> 12.5 tokens/s, SQL 11.8, math 11.5, the other prompts (chat, JSON, a story, explanations) 0.98 - 1.00x, where
+the planner leaves the drafter out after its first rounds; a 32K essay summary 9.2 -> 9.7 tokens/s. The drafter's work
+a round ~18 ms (its block, the head's plane, its Markov head on the host); a prompt's drafter rows ~1 ms per 4 tokens
+(a 32K prompt +7.8 s). Its drafts accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies):
+code 1.8, math 2.0, prose 2.2, chat 1.0.
 
 Accuracy against llama.cpp's CPU runs of the same file:
 

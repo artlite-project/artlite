@@ -92,5 +92,5 @@ chunk is compute bound.
 | spark2_5 | ✅ Spark-X2.6 4B | XHToken Q4_K_M, Q8_0, with its DSpark drafter; bartowski Q4_K_M, Q4_0 | Spark-X2.5 4B |
 | | ✅ Spark-X2.6 1.7B | XHToken Q4_K_M, Q8_0, with its DSpark drafter | |
 | flint | ✅ Flint (40B MoE, ~2.5B active) | RecursiveSI int4 (Q4_1 pairs, packed as Q4_1_64), with incoai's DFlash2 drafter (Q4_K_M) | unsloth UD-Q4_K_XL |
-| inkling2_loop, inkling2 | ✅ Inkling 2 Mini (26B MoE, 8 of 128 experts, a looped core) | unsloth UD-Q4_K_XL (NVFP4 / Q8_0 experts) | its DSpark drafter; images |
+| inkling2_loop, inkling2 | ✅ Inkling 2 Mini (26B MoE, 8 of 128 experts, a looped core) | unsloth UD-Q4_K_XL (NVFP4 / Q8_0 experts), with its DSpark drafter | images |
 | text to image | ✅ Stable Diffusion 1.5 | stable-diffusion-v1-5 diffusers F32 (safetensors) | the text encoder on the NPU |
