@@ -52,7 +52,8 @@ EFFORT_BUDGETS = {"minimal": 0, "low": 1024, "medium": 4096}
 class ApiContext:
     """The state of one model's server that its routes share: ``engine``, ``options``, ``info``, the template's
     properties (``syntax``: its tool calls, None: it takes no tools; ``typed``: content as text parts; ``first``: a
-    system message only first; ``efforts``: the ``reasoning_effort`` levels it renders distinctly; ``thought_end``: what
+    system message only first; ``efforts``: the ``reasoning_effort`` levels it renders distinctly (``none`` among them
+    where it renders one of its own: Inkling's effort 0); ``thought_end``: what
     it writes after a thought, ``templating.thought_end``), ``store`` (the Responses API's, for
     ``previous_response_id``), ``replies`` (the spoken replies: their audio ids in later turns)."""
 
@@ -278,7 +279,7 @@ class ApiContext:
         if model.reasoning is None:
             return -1, "", "", False
         if n is None or n == -1:
-            n = EFFORT_BUDGETS.get(req.reasoning_effort or "") if not self.efforts else None
+            n = EFFORT_BUDGETS.get(req.reasoning_effort or "") if not set(self.efforts) - {"none"} else None
             n = self.options.reasoning_budget if n is None else n
         message = req.reasoning_budget_message if req.reasoning_budget_message is not None else \
             self.options.reasoning_budget_message

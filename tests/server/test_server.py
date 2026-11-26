@@ -375,8 +375,9 @@ def test_continue_final_message() -> None:
 
 
 def test_effort_levels() -> None:
-    """/props' reasoning_effort_levels: the levels the template renders distinctly, aliases under the highest name;
-    a level the template refuses or renders as an unknown one is not offered."""
+    """/props' reasoning_effort_levels: the levels the template renders distinctly, aliases under the highest name,
+    none too where it renders one of its own (Inkling's effort 0, as llama-server lists it); a level the template
+    refuses or renders as an unknown one is not offered."""
     _model, _npu, engine = make()
     template = ("{% if reasoning_effort == 'xhigh' %}{{ raise_exception('effort') }}{% endif %}"
                 "{{ {'minimal': 'L', 'low': 'L', 'high': 'H', 'max': 'M'}.get(reasoning_effort, '') }}"
@@ -384,6 +385,9 @@ def test_effort_levels() -> None:
     with TestClient(app_of(engine, template=template)) as client:
         caps = client.get("/props").json()["chat_template_caps"]
         assert caps["reasoning_effort_levels"] == ["low", "high", "max"] and caps["supports_reasoning_effort"]
+    with TestClient(app_of(engine, template=template.replace("'minimal': 'L'", "'none': '0'"))) as client:
+        assert client.get("/props").json()["chat_template_caps"]["reasoning_effort_levels"] == \
+            ["none", "low", "high", "max"]
 
 
 def test_reasoning_gemma() -> None:

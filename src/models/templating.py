@@ -92,10 +92,10 @@ EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")  # (reasoning_eff
 
 
 def effort_levels(template: str) -> list[str]:
-    """The ``reasoning_effort`` levels of ``EFFORTS`` a chat template renders distinctly, lowest first, as llama.cpp
-    finds them (its ``chat_template_caps.reasoning_effort_levels``: the web UI's reasoning menu): a user message
-    rendered with the thought on at each level; a level that fails or renders as an unknown one does is not honored,
-    and levels that render alike are one, named by the highest."""
+    """The ``reasoning_effort`` levels a chat template renders distinctly (``none`` too, before ``EFFORTS``), lowest
+    first, as llama.cpp finds them (its ``chat_template_caps.reasoning_effort_levels``: the web UI's reasoning menu): a
+    user message rendered with the thought on at each level; a level that fails or renders as an unknown one does is
+    not honored, and levels that render alike are one, named by the highest."""
     def render(level: str) -> str | None:
         try:
             return chat_template(template, [{"role": "user", "content": "User message"}], enable_thinking=True,
@@ -106,7 +106,7 @@ def effort_levels(template: str) -> list[str]:
     unknown = render("REASONING_EFFORT_UNKNOWN")
     renders: list[str] = []
     levels: list[str] = []
-    for level in EFFORTS:
+    for level in ("none", *EFFORTS):
         if (r := render(level)) is None or r == unknown:
             continue
         if r in renders:

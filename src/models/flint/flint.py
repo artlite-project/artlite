@@ -327,6 +327,7 @@ class Flint(Model):
     thinks = True
     reasoning = ("<think>", "</think>")
     thought_first = True
+    user_turn = "<|user|>"  # (where the first user message begins: a prompt cache's mark once the rings wrap)
 
     def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)

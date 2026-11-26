@@ -2,7 +2,7 @@
 model's checkpoints (where the last message and the first user message begin; the fake's turns: its role tags),
 conversations saved to RAM and restored, the RAM limit and the checkpoints per sequence, a failure, image prompts. The
 fake's restores check that the device holds the tokens of the checkpoint they restore; saving copies a sequence past 8
-positions here (``MIN_SAVE``)."""
+positions here (``MIN_SAVE``). The recurrent models' files: their mark of the first user message."""
 
 import base64
 import contextlib
@@ -11,9 +11,15 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
+from artlite.gguf_model import GGUFFile
+from artlite.model_config import flint_gguf, inkling_gguf, lfm3_gguf, qwen_gguf, spark_gguf
+from models import model_class
 from models.server import cache
 from models.server.engine import Engine
+from models.templating import render_chat
+from models.tokenizer import BpeTokenizer
 
+from ..model_files import require
 from .fakes import QWEN, TEMPLATE, FakeModel, FakeNpu, app_of, chat, make
 
 TURNS = ("<|assistant|>", "<|user|>")  # (the fake template's: the answer's tag, the user's)
@@ -200,3 +206,26 @@ def test_images() -> None:
         more = [{"role": "assistant", "content": "a dog"}, {"role": "user", "content": "sure?"}]
         r = chat(client, turn + more).json()
         assert r["timings"]["cache_n"] == n and ("restore", n, True) in npu.calls
+
+
+RECURRENT = {"qwen-9B": lambda: qwen_gguf("Q4_K_M", "9B"), "lfm3": lambda: lfm3_gguf("QAD-Q4_0"),
+             "spark": lambda: spark_gguf("1.7B"), "flint": flint_gguf, "inkling": inkling_gguf}
+
+
+@pytest.mark.parametrize("family", RECURRENT)
+def test_model_turns(family: str) -> None:
+    """The recurrent models' mark of the first user message (``Model.user_turn``: where an agent's sessions part,
+    their system prompt and tools before it): its file's tokens, once in a conversation's prompt, after the system
+    text and the tools and before the user's."""
+    path = RECURRENT[family]()
+    require(path)
+    g = GGUFFile(path)
+    turn = model_class(g.arch).user_turn
+    assert turn, f"{family}: no user_turn"
+    ids = BpeTokenizer(g).encode
+    tools = [{"type": "function", "function": {"name": "f", "description": "", "parameters": {}}}]
+    text = render_chat(g, [{"role": "system", "content": "SYS"}, {"role": "user", "content": "Q"}], tools=tools)
+    pattern = ids(turn)
+    prompt = ids(text)
+    hits = [i for i in range(len(prompt)) if prompt[i:i + len(pattern)] == pattern]
+    assert len(hits) == 1 and text.index("SYS") < text.index(turn) < text.index("Q"), (family, text)

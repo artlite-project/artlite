@@ -81,8 +81,9 @@ def arg_parser(*, env: bool = True) -> argparse.ArgumentParser:
                           "(default: 8192, at most half of the RAM still available once the model is loaded, and in "
                           "router mode that over --models-max; -1: no limit, 0: the device's conversation alone)")
     gen.add_argument("-ctxcp", "--ctx-checkpoints", type=int, default=32,
-                     help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8, MiniCPM-V and "
-                          "LFM3 that a prompt continues from; default: 32)")
+                     help="checkpoints of a conversation at most (the states of Qwen3.5 / 3.6 / 3.8, MiniCPM-V, "
+                          "LFM3, Inkling 2, Spark-X and Flint past 16384 positions that a prompt continues from; "
+                          "default: 32)")
     gen.add_argument("--lookup", action=argparse.BooleanOptionalAction, default=True,
                      help="draft tokens from the context (prompt lookup) for the multi-token steps (default: on)")
     add_spec_options(gen)
