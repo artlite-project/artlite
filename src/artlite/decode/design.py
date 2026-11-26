@@ -617,7 +617,7 @@ class DecodeOverlayOperator(ArtcOperator):
     @property
     def ink_page(self) -> int:
         """(states) The first of the helper's two pages of the residual stream's work (``hink_all``: the step, the partial
-        sums; then ``hmix``: the coefficient sets, the blends; their ids after the formats' and the routing's pages), 0:
+        sums, the coefficient sets; then ``hmix``: the blends; their ids after the formats' and the routing's pages), 0:
         resident (no paged formats)."""
         return len(self.paged) + 1 + int(self.route_page) if self.states and self.paged else 0
 

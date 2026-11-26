@@ -543,21 +543,6 @@ __attribute__((noinline)) void {{ p }}_hips(const float *__restrict q, const flo
     }
 }
 
-// 16 fp32 in place (t: 16 of scratch) -> tanh: sign (1 - e) / (1 + e), e = e^-2|v| (``sexp``, ``srcp``)
-__attribute__((noinline)) void {{ p }}_stanh(float *__restrict v, float *__restrict t)
-{
-    aie::set_rounding(aie::rounding_mode::conv_even);
-    const aie::vector<float, 16> x = aie::load_v<16>(v), z = aie::zeros<float, 16>(), one = aie::broadcast<float, 16>(1.0f);
-    const aie::vector<float, 16> a = aie::max(x, aie::sub(z, x));
-    aie::store_v(t, aie::sub(z, aie::add(a, a)));
-    {{ p }}_sexp(t);
-    const aie::vector<float, 16> e = aie::load_v<16>(t);
-    aie::store_v(t, aie::add(one, e));
-    {{ p }}_srcp(t);
-    const aie::vector<float, 16> th = al::mulff<16>(aie::sub(one, e), aie::load_v<16>(t));
-    aie::store_v(v, aie::select(th, aie::sub(z, th), aie::lt(x, z)));
-}
-
 // a + 32 fp32 at x times the fp32 c: hi + lo products (~2^-16)
 [[clang::always_inline]] inline aie::accum<accfloat, 32> {{ p }}_cmac(aie::accum<accfloat, 32> a, const float *__restrict x, float c)
 {
@@ -567,48 +552,172 @@ __attribute__((noinline)) void {{ p }}_stanh(float *__restrict v, float *__restr
     return aie::mac(aie::mac(aie::mac(a, xh, ch), xl, ch), xh, cl);
 }
 
+// (hblend) An A object's 72 rows (ab: bf16 [72][64]) . g of every slot (gp: g's panels per k block, rows 0 .. 3 the slots'
+// hi parts, 4 .. 7 their lo parts: ``al::hilo4``) -> o ([slot 4][H8] fp32, the object's 72 rows): per 8 rows and k block the
+// rows' block as hi and lo panels (split on the MMUL against -I, as the prefill's ``InkBlendOperator``: ~14 bits below
+// each block's maximum), two MMULs; two row blocks a popped g panel (block 9 past the object: its rows unread); the hi and
+// lo rows added. 1463 cycles a call for all slots (the rows as 32-lane dot products: 2088 a slot; bf16 aie::mmul is
+// emulated on AIE2P: 4111)
+__attribute__((noinline)) void {{ p }}_hrows(const bfloat16 *__restrict ab, const uint8_t *__restrict gp, float *__restrict o)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    const al::BV nI = al::neg_eye();
+    AIE_LOOP_NO_UNROLL
+    for (int rb = 0; rb < 10; rb += 2) {
+        al::BInR<> gs((const bfp16ebs8 *)gp);
+        al::MM8 c0(aie::zeros<accfloat, 64>()), c1(aie::zeros<accfloat, 64>());
+        const bfloat16 *__restrict w = ab + 512 * rb;
+        AIE_LOOP_NO_UNROLL
+        for (int kb = 0; kb < 8; kb++) {
+            al::BV wh, wl, vh, vl;
+            const al::BV a = gs.pop();
+            al::split_hilo(aie::accum<accfloat, 64>(al::gather<8, 8>(w + 8 * kb, 64)), nI, wh, wl);
+            c0.mac(a, aie::op_transpose(wh));
+            c0.mac(a, aie::op_transpose(wl));
+            al::split_hilo(aie::accum<accfloat, 64>(al::gather<8, 8>(w + 512 + 8 * kb, 64)), nI, vh, vl);
+            c1.mac(a, aie::op_transpose(vh));
+            c1.mac(a, aie::op_transpose(vl));
+        }
+        const aie::accum<accfloat, 64> y0 = c0.to_accum(), y1 = c1.to_accum();
+        const aie::vector<float, 32> v0 = aie::add(y0.template extract<32>(0), y0.template extract<32>(1)).template to_vector<float>();
+        const aie::vector<float, 32> v1 = aie::add(y1.template extract<32>(0), y1.template extract<32>(1)).template to_vector<float>();
+        AIE_LOOP_UNROLL_FULL
+        for (int s = 0; s < 4; s++) {  // ([slot 4][row 8])
+            aie::store_v(o + {{ H8 }} * s + 8 * rb, v0.template extract<8>(s));
+            if (rb < 8)
+                aie::store_v(o + {{ H8 }} * s + 8 * rb + 8, v1.template extract<8>(s));
+        }
+    }
+}
+
+// (htanh) The passes of a tanh of H8 fp32, 32 lanes a step, each a loop of its own between the scratch arrays (distinct
+// parameters; in place where every value is read before it is written): sign (1 - e) / (1 + e) of x, e = e^-2|x| as
+// ``sexp``'s (exp2 of x log2 e: n = round, 2^f by its Taylor polynomial of degree 6 in fp32 products), 1 / (1 + e) as
+// ``srcp``'s (the mantissa's reciprocal: a linear guess, 3 Newton steps): the same operations per lane. An fp32 chain is
+// a recurrence of its whole length to the post-pipeliner (tpd: RecMII 51), so no pass pipelines; the Newton steps take
+// 3 vectors an iteration (their chains side by side). 4481 cycles a call (15.6 a value; 29 in 16-lane calls of sexp,
+// srcp)
+__attribute__((noinline)) void {{ p }}_tpa(const float *__restrict x, float *__restrict t, float *__restrict nb)
+{
+    const aie::vector<float, 32> z = aie::zeros<float, 32>(), magic = aie::broadcast<float, 32>(12582912.0f);  // 1.5 2^23
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ H8 }}; i += 32) {
+        const aie::vector<float, 32> v = aie::load_v<32>(x + i), a = aie::max(v, aie::sub(z, v));
+        const aie::vector<float, 32> y = aie::max(al::log2e<32>(aie::sub(z, aie::add(a, a))), aie::broadcast<float, 32>(-126.0f));
+        const aie::vector<float, 32> ym = aie::add(y, magic);
+        aie::store_v(nb + i, aie::sub(ym.template cast_to<int32>(), aie::broadcast<int32, 32>(0x4B400000)).template cast_to<float>());
+        aie::store_v(t + i, al::mul_hilo<32, {{ km.LN2[0] }}f, {{ km.LN2[1] }}f>(aie::sub(y, aie::sub(ym, magic))));  // (f ln 2)
+    }
+}
+
+__attribute__((noinline)) void {{ p }}_tpb(const float *__restrict t, const float *__restrict pi, float *__restrict po, float cs)
+{
+    const aie::vector<float, 32> c = aie::broadcast<float, 32>(cs);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ H8 }}; i += 32)  // (a Horner step: c + t p)
+        aie::store_v(po + i, aie::add(c, al::mulff<32>(aie::load_v<32>(t + i), aie::load_v<32>(pi + i))));
+}
+
+__attribute__((noinline)) void {{ p }}_tpb0(const float *__restrict t, float *__restrict po, float cs, float c0s)
+{
+    const aie::vector<float, 32> c = aie::broadcast<float, 32>(cs), c0 = aie::broadcast<float, 32>(c0s);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ H8 }}; i += 32)  // (the first step: c + t c0)
+        aie::store_v(po + i, aie::add(c, al::mulff<32>(aie::load_v<32>(t + i), c0)));
+}
+
+__attribute__((noinline)) void {{ p }}_tpc(const float *__restrict pp, const float *__restrict nb, float *__restrict e,
+                                                float *__restrict m, float *__restrict eb, float *__restrict r)
+{
+    const aie::vector<float, 32> one = aie::broadcast<float, 32>(1.0f);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ H8 }}; i += 32) {  // (e = 2^n p; 1 + e's mantissa m, exponent bits, the guess)
+        const aie::vector<float, 32> ev = aie::add(aie::load_v<32>(pp + i).template cast_to<int32>(),
+                                                   aie::upshift(aie::load_v<32>(nb + i).template cast_to<int32>(), 23)).template cast_to<float>();
+        const aie::vector<int32, 32> b = aie::add(one, ev).template cast_to<int32>();
+        const aie::vector<int32, 32> x = aie::sub(aie::bit_and(b, aie::broadcast<int32, 32>(0x7F800000)), aie::broadcast<int32, 32>(0x3F800000));
+        const aie::vector<float, 32> mv = aie::sub(b, x).template cast_to<float>();
+        aie::store_v(e + i, ev);
+        aie::store_v(m + i, mv);
+        aie::store_v(eb + i, x.template cast_to<float>());
+        aie::store_v(r + i, aie::sub(aie::broadcast<float, 32>(1.4117647f), al::mulc<32>(mv, aie::broadcast<bfloat16, 32>(0.47058824f)).template to_vector<float>()));
+    }
+}
+
+__attribute__((noinline)) void {{ p }}_tpd(const float *__restrict m, const float *__restrict ri, float *__restrict ro)
+{
+    const aie::vector<float, 32> two = aie::broadcast<float, 32>(2.0f);
+    AIE_LOOP_UNROLL(3)
+    for (int i = 0; i < {{ H8 }}; i += 32) {  // (a Newton step)
+        const aie::vector<float, 32> r = aie::load_v<32>(ri + i);
+        aie::store_v(ro + i, al::mulff<32>(r, aie::sub(two, al::mulff<32>(aie::load_v<32>(m + i), r))));
+    }
+}
+
+__attribute__((noinline)) void {{ p }}_tpe(const float *__restrict xi, const float *__restrict e, const float *__restrict r,
+                                                const float *__restrict eb, float *__restrict xo)
+{
+    const aie::vector<float, 32> z = aie::zeros<float, 32>(), one = aie::broadcast<float, 32>(1.0f);
+    AIE_LOOP_NO_UNROLL
+    for (int i = 0; i < {{ H8 }}; i += 32) {
+        const aie::vector<float, 32> x = aie::load_v<32>(xi + i);
+        const aie::vector<float, 32> rv = aie::sub(aie::load_v<32>(r + i).template cast_to<int32>(), aie::load_v<32>(eb + i).template cast_to<int32>()).template cast_to<float>();
+        const aie::vector<float, 32> th = al::mulff<32>(aie::sub(one, aie::load_v<32>(e + i)), rv);
+        aie::store_v(xo + i, aie::select(th, aie::sub(z, th), aie::lt(x, z)));
+    }
+}
+
+// (hblend) tanh of H8 fp32 at x in place (``tpa`` ..; s: 4 H8 fp32 of scratch)
+__attribute__((noinline)) void {{ p }}_htanh(float *__restrict x, float *__restrict s)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    float *__restrict s0 = s, *__restrict s1 = s + {{ H8 }}, *__restrict s2 = s + {{ 2 * H8 }}, *__restrict s3 = s + {{ 3 * H8 }};
+    {{ p }}_tpa(x, s0, s1);  // (s0: f ln 2, s1: n)
+    {{ p }}_tpb0(s0, s2, {{ km.TAYLOR[1] }}f, {{ km.TAYLOR[0] }}f);  // (s2: p)
+{% for c in km.TAYLOR[2:] %}
+    {{ p }}_tpb(s0, s2, s2, {{ c }}f);
+{% endfor %}
+    {{ p }}_tpc(s2, s1, s0, s1, s2, s3);  // (s0: e, s1: m, s2: its exponent bits, s3: the guess)
+    AIE_LOOP_NO_UNROLL
+    for (int k = 0; k < 3; k++)
+        {{ p }}_tpd(s1, s3, s3);
+    {{ p }}_tpe(x, s0, s3, s2, x);
+}
+
 // The helper, a blend's object (``protocol.F_BLEND``): i -1 its input object x ([half][column 8][slot 4][8] fp32): g = the
-// halves' sum into the blend's scratch; A object i (ab: bf16 [72][64] rows, i < 4 the forget matrix's 72 i .., else the
-// gain's): t[r] = tanh(rows . g) per slot; at i 7 out = cur - f cur + gn msg (cur: states 0 .. n by coefficient set j,
-// msg: bank w by set m; ``protocol.M_BLEND``) into res as the state array lies
+// halves' sum into the blend's scratch, its MMUL panels; A object i (ab: bf16 [72][64] rows, i < 4 the forget matrix's
+// 72 i .., else the gain's): the rows . g of every slot into f, gn (``hrows``); at i 7 their tanh (``htanh``: the slots'
+// 576 values each), out = cur - f cur + gn msg (cur: states 0 .. n by coefficient set j, msg: bank w by set m;
+// ``protocol.M_BLEND``) into res as the state array lies
 __attribute__((noinline)) void {{ p }}_hblend(const float *__restrict x, const bfloat16 *__restrict ab, float *__restrict res,
                                              float *__restrict ist, const float *__restrict sets, int blend, int i, int sp)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
-    float *__restrict g = ist + {{ 4 * H8 * (INK_STATES + 2 * INK_BANKS + 2) }};  // ([slot 4][64])
+    float *__restrict g = ist + {{ 4 * H8 * (INK_STATES + 2 * INK_BANKS + 2) }};  // ([slot 4][64]; at i 7 htanh's scratch)
     float *__restrict fg = ist + {{ 4 * H8 * (INK_STATES + 2 * INK_BANKS) }};  // ([f | gn][slot 4][H8])
-    float *__restrict t = g + 256;  // (80 + 16 floats of scratch)
-    if (i < 0) {  // (the input object: g)
+    uint8_t *__restrict gp = (uint8_t *)(g + 256);  // (g's 8 panels, ``hrows``)
+    if (i < 0) {  // (the input object: g, its panels)
         AIE_LOOP_NO_UNROLL
         for (int s = 0; s < 4; s++)
             AIE_LOOP_NO_UNROLL
             for (int c = 0; c < {{ COLS }}; c++)
                 aie::store_v(g + 64 * s + 8 * c, aie::add(aie::load_v<8>(x + 32 * c + 8 * s), aie::load_v<8>(x + {{ 32 * COLS }} + 32 * c + 8 * s)));
+        const al::BV nI = al::neg_eye();
+        al::BOut<> go((bfp16ebs8 *)gp);
+        AIE_LOOP_NO_UNROLL
+        for (int kb = 0; kb < 8; kb++)
+            go.push(al::hilo4(aie::accum<accfloat, 32>(aie::concat(aie::load_v<8>(g + 8 * kb), aie::load_v<8>(g + 64 + 8 * kb),
+                                                                     aie::load_v<8>(g + 128 + 8 * kb), aie::load_v<8>(g + 192 + 8 * kb))), nI));
         return;
     }
-    AIE_LOOP_NO_UNROLL
-    for (int s = 0; s < sp; s++) {
-        aie::vector<bfloat16, 32> g0h, g0l, g1h, g1l;
-        al::split2<32>(aie::load_v<32>(g + 64 * s), g0h, g0l);
-        al::split2<32>(aie::load_v<32>(g + 64 * s + 32), g1h, g1l);
-        AIE_LOOP_NO_UNROLL
-        for (int r = 0; r < 72; r++) {
-            const aie::vector<bfloat16, 32> w0 = aie::load_v<32>(ab + 64 * r), w1 = aie::load_v<32>(ab + 64 * r + 32);
-            const aie::accum<accfloat, 32> a = aie::mac(aie::mac(aie::mac(aie::mul(w0, g0h), w0, g0l), w1, g1h), w1, g1l);
-            t[r] = aie::reduce_add(a.template to_vector<float>());
-        }
-        for (int r = 72; r < 80; r++)
-            t[r] = 0.0f;
-        AIE_LOOP_NO_UNROLL
-        for (int r = 0; r < 80; r += 16)
-            {{ p }}_stanh(t + r, t + 80);
-        float *__restrict o = fg + {{ 4 * H8 }} * (i >> 2) + {{ H8 }} * s + 72 * (i & 3);
-        AIE_LOOP_NO_UNROLL
-        for (int r = 0; r < 72; r += 8)
-            aie::store_v(o + r, aie::load_v<8>(t + r));
-    }
+    {{ p }}_hrows(ab, gp, fg + {{ 4 * H8 }} * (i >> 2) + 72 * (i & 3));
     if (i != 7)
         return;
+    AIE_LOOP_NO_UNROLL
+    for (int s = 0; s < sp; s++) {
+        {{ p }}_htanh(fg + {{ H8 }} * s, g);
+        {{ p }}_htanh(fg + {{ 4 * H8 }} + {{ H8 }} * s, g);
+    }
     const int j = blend & 15, m = (blend >> 4) & 15, n = (blend >> 8) & 15, w = (blend >> 12) & 1;
     const float *__restrict bank = ist + {{ 4 * H8 }} * ({{ INK_STATES }} + 2 * w);
     float *__restrict out = fg + {{ 4 * H8 }} * 2;  // (into the g scratch's place: g is done with; [slot 4][H8])
@@ -632,26 +741,23 @@ __attribute__((noinline)) void {{ p }}_hblend(const float *__restrict x, const b
     {{ p }}_hstage(out, res, sp);
 }
 
-// The helper's mixes' commands: K_COEF (``ccoef``: a phase's partial sums object -> its coefficient sets), K_BLEND
-// (``post``, ``cmd``: a blend's objects)
+// The helper's blend commands: K_BLEND (``post``, ``cmd``: a blend's objects)
 __attribute__((noinline)) void {{ p }}_hmix(const int32_t *__restrict cmd, float *__restrict sq, float *__restrict ist)
 {
-    if (cmd[{{ C_KIND }}] == {{ K_BLEND }})
-        {{ p }}_hblend((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
-                       sq + 32, cmd[{{ C_BLEND }}], cmd[3], cmd[{{ C_SP }}]);
-    else
-        {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
+    {{ p }}_hblend((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
+                   sq + 32, cmd[{{ C_BLEND }}], cmd[3], cmd[{{ C_SP }}]);
 }
 
 // The helper's residual-stream commands: K_INK (``cink``: the step), K_IPS (``cips``: the next mix's partial sums
 // after cur's slice in res; with M_INKN's nm the message mixes' too, into the scratch scr, which the main core emits
-// after the others: its S_IX, S_NE), K_BLEND (``post``, ``cmd``: a blend's objects), K_COEF (``ccoef``: a phase's partial
-// sums object -> its coefficient sets)
+// after the others: its S_IX, S_NE), K_COEF (``ccoef``: a phase's partial sums object -> its coefficient sets)
 __attribute__((noinline)) void {{ p }}_hink_all(const int32_t *__restrict cmd, float *__restrict sq, float *__restrict ist,
                                                float *__restrict scr)
 {
     const int kind = cmd[{{ C_KIND }}], inkn = cmd[{{ C_INKN }}], sp = cmd[{{ C_SP }}];
-    if (kind == {{ K_INK }})
+    if (kind == {{ K_COEF }})
+        {{ p }}_hcoef((const float *)(uintptr_t)cmd[0], sq + 32, cmd[1], cmd[2] & 255, cmd[2] >> 8);
+    else if (kind == {{ K_INK }})
         {{ p }}_hink((const float *)(uintptr_t)cmd[0], (const bfloat16 *)(uintptr_t)cmd[1], (float *)(uintptr_t)cmd[2], ist,
                      inkn, sp, cmd[{{ C_PA }}]);
     else if (kind == {{ K_IPS }}) {
@@ -3339,9 +3445,9 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
     if (kind == {{ K_INK }} || kind == {{ K_IPS }} || kind == {{ K_COEF }} || kind == {{ K_BLEND }}) {
         // (the residual stream's work: ``hink_all``)
 {% if ink_page %}
-        // (pages of the helper, ``ink_page``: the step's, the mixes'; its scratch, idle between the strips' 16-k sums, takes
-        // the pager's data reads)
-        if (kind == {{ K_COEF }} || kind == {{ K_BLEND }}) {
+        // (pages of the helper, ``ink_page``: the step's and the mixes' coefficient sets, the blends'; its scratch, idle
+        // between the strips' 16-k sums, takes the pager's data reads)
+        if (kind == {{ K_BLEND }}) {
             {{ mp }}_pg_need<1>({{ ink_page + 1 }}, scr);
             ((void (*)(const int32_t *, float *, float *))(intptr_t)((const volatile int32_t *){{ pg_state }})[1])(cmd, sq, ist);
             return;
@@ -3350,7 +3456,7 @@ void {{ p }}_htask(const int32_t *__restrict cmd, float *__restrict r, uint8_t *
         ((void (*)(const int32_t *, float *, float *, float *))(intptr_t)((const volatile int32_t *){{ pg_state }})[1])(
             cmd, sq, ist, (float *)scr);
 {% else %}
-        if (kind == {{ K_COEF }} || kind == {{ K_BLEND }})
+        if (kind == {{ K_BLEND }})
             {{ p }}_hmix(cmd, sq, ist);
         else
             {{ p }}_hink_all(cmd, sq, ist, (float *)scr);

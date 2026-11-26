@@ -178,6 +178,15 @@ two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f
 on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238
 cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error is invisible (3.14e-3 vs 3.08e-3).
 
+### tanh of fp32 x at fp32 precision, batched (Inkling's decode blend, `decode/design.cc.jinja` `htanh`)
+
+sign (1 - e) / (1 + e), e = e^-2|x| through ``km.exp``'s fp32 form and ``km.recip``'s Newton steps: as 16-lane calls
+29 cycles a value (each call one latency-bound chain). Batched per 288 values and split into passes through L1 (the
+reduction, each Taylor step, the reciprocal's guess, each Newton step, the quotient), 32 lanes a step: 15.6. No pass
+pipelines (each fp32 chain is a recurrence of its whole length: a Newton step's RecMII 51 at ResMII 10); what overlaps
+them is unrolling a pass by 3 (independent chains in one body: 491 -> 241 cycles), as far as code and stack allow
+(unrolled, the quotient pass spilled into a 1.6 KB frame).
+
 ### GELU through the gather LUT (`km.GELU`: the Gemma prefill's gate/up epilogue and per-layer-input op)
 
 The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
