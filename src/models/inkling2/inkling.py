@@ -57,7 +57,7 @@ class NpuInkling(OverlayModel):
     last_step = True  # (the prefill has no LM head)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn", "dspark", "chain")
     LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist")
-    STEP_COST = (1.0, 1.51, 1.87, 2.11)  # (steps of S on essay tokens, S3's: each slot's own experts)
+    STEP_COST = (1.0, 1.35, 1.61, 1.79)  # (steps of S on essay tokens: each slot's own experts)
     PLANNER = {"ewma_rate": 0.2}  # noqa: RUF012  (the drafter's edge is small: ``drafts.Planner``)
 
     def __init__(self, gguf: GGUFFile, *, capacity: int = 4096, kv_k: str = "hilo", threads: int = 0,

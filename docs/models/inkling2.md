@@ -52,8 +52,8 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other
   two to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
   model's screened LM head, its Markov head on the host over each row's candidates (their logits exact from the file's
-  rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.5,
-  1.9, 2.1 times a step of one for S = 2, 3, 4 (each token routes to its own experts), so a draft pays only where the
+  rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.35,
+  1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to its own experts), so a draft pays only where the
   drafter guesses well: the rounds' planner leaves the drafter out where its rounds give fewer tokens per second than
   steps of one.
 
@@ -71,25 +71,25 @@ weights, 36 MB of caches at 4K positions (~140 MB at 33K). With `-np` above 1 th
 | | 1K | 32K |
 |---|---|---|
 | a prompt (the prefill, artlite-bench) | 472 tokens/s (2.17 s for 1024 tokens) | 578 tokens/s (56.7 s; 8K 12.8 s, 64K 132 s) |
-| generation (greedy, 256 tokens, essay summary) | 10.7 tokens/s | 9.1 tokens/s |
+| generation (greedy, 256 tokens, essay summary) | 11.5 tokens/s | 9.7 tokens/s |
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
 a step (drafts, or other requests with `-np`) adds its own experts. Drafts (the DSpark drafter's, the context's) keep
 the text the model writes alone.
 
 With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the prefill, against steps of one): code
-11.2 -> 12.5 tokens/s, SQL 11.8, math 11.5, the other prompts (chat, JSON, a story, explanations) 0.98 - 1.00x, where
-the planner leaves the drafter out after its first rounds; a 32K essay summary 9.2 -> 9.7 tokens/s. The drafter's work
-a round ~18 ms (its block, the head's plane, its Markov head on the host); a prompt's drafter rows ~1 ms per 4 tokens
-(a 32K prompt +7.8 s). Its drafts accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies):
+12.1 -> 14.8 tokens/s, an essay's continuation 1.19x, JSON 1.07x, math 1.02x, the other prompts (chat, SQL, a story,
+explanations) 0.98 - 1.01x, where the planner leaves the drafter out after its first rounds; a 32K essay summary 9.8
+-> 9.7 tokens/s. The drafter's work a round ~18 - 25 ms (its block, the head's plane, its Markov head on the host); a
+prompt's drafter rows ~1 ms per 4 tokens (a 1K prompt 2.1 -> 2.4 s, 8K 12.8 -> 15.1 s, 32K +7.8 s). Its drafts accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies):
 code 1.8, math 2.0, prose 2.2, chat 1.0.
 
 Accuracy against llama.cpp's CPU runs of the same file:
 
 | | |
 |---|---|
-| teacher-forced decode, an essay's first 128 tokens | KL 0.0016 (llama.cpp's own prompt graph against its decode: 0.0022), argmax the same on every clear token |
-| a prompt through the prefill (1024, 2560 essay tokens), then 64 teacher-forced steps | KL 0.0020, 0.0023 (llama.cpp's own prompt graph against its decode: 0.0015), argmax the same on every clear token |
-| greedy text, 128 tokens after a chat, code, math, a long instruction, an essay (prompts through the prefill) | 632 of 640 tokens llama.cpp's top one, the 8 others within 1 logit of it |
+| teacher-forced decode, an essay's first 128 tokens | KL 0.0025 (llama.cpp's own prompt graph against its decode: 0.0022), argmax the same on every clear token |
+| a prompt through the prefill (1024, 2560 essay tokens), then 64 teacher-forced steps | KL 0.0017, 0.0025 (llama.cpp's own prompt graph against its decode: 0.0015), argmax the same on every clear token |
+| greedy text, 128 tokens after a chat, code, math, a long instruction, an essay (prompts through the prefill) | 630 of 640 tokens llama.cpp's top one, the 10 others within 1 logit of it |
 
 Design: the module docstrings of `src/models/inkling2/`, `src/artlite/decode/attn.py` and `src/artlite/moe/`.
