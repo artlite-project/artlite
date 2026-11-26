@@ -1,6 +1,6 @@
 """The vision overlay's weights (artlite.vision.weights, no NPU): ``Wt``'s maps against torch's operations on the
 values, and the native packer (``Slots`` -> ``_native.pack_slots``) bit for bit against a numpy reference of the B
-slots (``slot_ref``) for every source type, row and column maps, scales, GEGLU's rows, hi + lo planes, the convs' tap
+slots (``slot_ref``) for every source type, row and column maps, scales (per row too), GEGLU's rows, hi + lo planes, the convs' tap
 orders, several parts, the identity, and the model files' sources (GGUF, safetensors)."""
 
 import json
@@ -107,6 +107,25 @@ def test_maps() -> None:
     check(Gemm(m=64, ntile=2, K=1280, N=640, x=0, y=0, tsplit=2, out="bf16"), q[:640])
     e = W.take(W.take(W.eye(1280), W.pad_index(1280, 1152), 0), W.pad_index(1280, 1152), 1) * 0.25
     check(_gemm(1280, 1280 + 576 + 1280), W.cat([q, b, e], 1))
+
+
+def test_row_scales() -> None:
+    """Per-row scales (a layer scale folded into its GEMM's rows: ``scale_rows``) times a part's scale, through row maps
+    (padding, a permutation), ``cat`` of row blocks (one part, its scales joined), hi + lo planes."""
+    rng = np.random.default_rng(6)
+    a = source("F16", rng.standard_normal((1024, 640)).astype(np.float32), "a")
+    v = (rng.random(1024) * 0.5).astype(np.float32)
+    s = W.take(W.scale_rows(a, v) * 0.3, W.pad_index(1280, 1024))
+    assert np.array_equal(s.numpy()[:1024], a.numpy() * (np.float32(0.3) * v)[:, None])
+    check(_gemm(1280, 640), s)
+    check(_gemm(1280, 640, hilo=True), s)
+    perm = rng.permutation(1280)
+    check(_gemm(1280, 640), s[perm])
+    two = W.cat([W.scale_rows(a[:512], v[:512]), a[512:]])
+    assert len(two.parts) == 1
+    assert np.array_equal(two.numpy(), np.concatenate([a.numpy()[:512] * v[:512, None], a.numpy()[512:]]))
+    check(_gemm(1280, 640), W.take(two, W.pad_index(1280, 1024)))
+    assert s.key != W.take(a * 0.3, W.pad_index(1280, 1024)).key
 
 
 def test_hilo() -> None:

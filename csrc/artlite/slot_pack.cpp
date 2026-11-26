@@ -236,9 +236,10 @@ void pack_slots(const std::vector<SlotTensor>& tensors, const std::vector<SlotPa
             base = decode(t, r, u.lo, u.hi, span.get());
             src = span.get();
           }
+          const float f = u.part->scale * u.part->rscale[int64_t(it.pass) * kPassRows + i];
           for (size_t c = u.c0; c < u.c1; c++) {
             const Clip& cl = (*clips)[c];
-            gather(x + cl.k, src, cl.src - base, cl.stride, cl.n, u.part->scale);
+            gather(x + cl.k, src, cl.src - base, cl.stride, cl.n, f);
           }
         }
         // the row's blocks: row i = 16-row block i / 16, half (i / 8) % 2, row i % 8 of its slots

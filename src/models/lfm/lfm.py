@@ -44,7 +44,7 @@ from ..lfm3a import npu as a_npu
 from ..lfm3a import speech as a_speech
 from ..lfm3vl import host as vl_host
 from ..lfm3vl import npu as vl_npu
-from ..model import Capabilities, Model
+from ..model import Capabilities, Model, check_tower
 from ..overlay_model import OverlayModel
 from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Mask, Sampling
@@ -155,16 +155,6 @@ class NpuLfm(OverlayModel):
         """(the LM head alone on the chunk's last output row)"""
         x = self.prefill.hidden(n - 1)
         return self._dispatch(lambda: self.overlay.logits_of(x))
-
-
-def check_tower(mmproj: str, config: AudioConfig | ClipConfig, supported: tuple[str, ...], *, what: str, hidden: int
-                ) -> None:
-    """NotImplementedError unless the mmproj's tower has a ``supported`` projector (``what`` names it in the message);
-    ValueError unless it embeds into the language model's ``hidden`` size."""
-    if config.projector not in supported:
-        raise NotImplementedError(f"{mmproj}: {what} {config.projector!r} (supported: {', '.join(supported)})")
-    if config.projection_dim != hidden:
-        raise ValueError(f"{mmproj}: embeddings of {config.projection_dim}, the language model's {hidden}")
 
 
 class Lfm(Model):

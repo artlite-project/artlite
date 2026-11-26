@@ -39,13 +39,14 @@ struct SlotTensor {
   int file = -1;
 };
 
-/// A part of a job's matrix: per output row (npo kPassRows of them) its row of tensor ``tensor`` (-1: zeros) times scale,
-/// over the runs [k0, n, src0, stride] of output columns k0 .. k0 + n - 1 = the row's elements src0 + i stride (columns
-/// of no run: zeros; parts' runs do not overlap).
+/// A part of a job's matrix: per output row (npo kPassRows of them) its row of tensor ``tensor`` (-1: zeros) times
+/// scale rscale[row] (an fp32 product), over the runs [k0, n, src0, stride] of output columns k0 .. k0 + n - 1 = the
+/// row's elements src0 + i stride (columns of no run: zeros; parts' runs do not overlap).
 struct SlotPart {
   int tensor;
   float scale;
   const int32_t* rows;
+  const float* rscale;
   const int32_t* runs;
   int n_runs;
 };
@@ -62,7 +63,7 @@ struct SlotJob {
 };
 
 /// Pack every job (bit-identical to the host reference's bfp16 blocks of the same fp32 values: a source element
-/// converted to fp32 exactly, Q8_0's d q in fp32, times the part's scale in fp32), on threads over items of a pass's
+/// converted to fp32 exactly, Q8_0's d q in fp32, times the part's row factor in fp32), on threads over items of a pass's
 /// 16 k-tiles, non-temporal stores (no cache flush needed for the device after it); the file tensors through views of
 /// the packer's own, read into the page cache ahead of the items and unmapped after their last item (pack::Views,
 /// pack::run_items).

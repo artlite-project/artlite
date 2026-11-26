@@ -241,7 +241,7 @@ class Encoder(W.WindowEncoder):
     def pixel_panels(self, lay: Layout, px: np.ndarray) -> dict[str, np.ndarray]:
         return W.patch_panels(lay, px, self.nm.p, kp=KP, one=ONE)
 
-    def size_inputs(self, lay: Layout) -> dict[str, np.ndarray]:
+    def size_inputs(self, lay: Layout, size: tuple[int, int]) -> dict[str, np.ndarray]:
         """The size's rows: positions, RoPE tables, key masks (the level's attention command)."""
         nm, nb, vt = self.nm, lay.nb, self.vt
         ph, pw = 2 * lay.gh, 2 * lay.gw

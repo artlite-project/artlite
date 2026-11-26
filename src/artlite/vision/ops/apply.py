@@ -1,4 +1,5 @@
-"""``Apply``: GroupNorm (+ SiLU) / LayerNorm / RMSNorm of a bf16 C-tile tensor into panels, on the cores of the norm roles.
+"""``Apply``: GroupNorm (+ SiLU) / LayerNorm / RMSNorm of a bf16 C-tile tensor into panels (or bf16 C tiles), on the cores
+of the norm roles.
 
 The i-th core of its rows normalizes the 80-channel blocks [blk0 + i nblk, ..) for the column's tokens.
 """
@@ -14,7 +15,7 @@ from .. import design as D
 from .. import layout as L
 from ..roles import Role
 from ..seq import ColOps, MemTask, RowOps
-from .common import Command, check_memtile, f32, gn_window, panel_recv
+from .common import Command, check_heap, check_memtile, f32, gn_window, panel_recv
 
 
 class Norm(StrEnum):
@@ -35,7 +36,8 @@ class Apply:
     the B stream (``row_ops(records=)``). LayerNorm / RMSNorm (no mean, beta zero): the producer's records at ``rec``
     ([tile][core][OCH]); ``C``: the norm's channels (1 / C). rows: its core rows (roles gn / ln); join: the two images are one image's halves (their records'
     sums added); ch_step: a core's channels in the statistics' space (default nblk 80), nreal: its real ones (the rest
-    pads, in their last group)."""
+    pads, in their last group). ctiles: y is a C-tile tensor like x ([block][tile][``ct_bytes``], the i-th core's
+    blocks from blk0 + i nblk), the normed values as bf16 (a LayerNorm's output as a residual stream: pre_ln)."""
 
     m: int
     nblk: int
@@ -56,6 +58,7 @@ class Apply:
     join: bool = False
     ch_step: int = 0
     nreal: int = 0
+    ctiles: bool = False
 
     def __post_init__(self) -> None:
         self.mode = Norm(self.mode)
@@ -74,6 +77,8 @@ class Apply:
         assert not self.ln or self.ntile <= 4, "LayerNorm records past their A object"
         last = self.x + (self.blk0 + (len(self.rows) - 1) * self.nblk) * self.ntile * ct + 4 * (self.nhalf - 1) * self.half_step
         check_memtile(last, D.A_OBJ // 2, "an apply's walk of x")
+        if self.ctiles:
+            check_heap(self.y, (self.blk0 + len(self.rows) * self.nblk) * self.ntile * ct, "an apply's C tiles")
 
     def ch0(self, row: int) -> int:
         """Row ``row``'s first channel in the GroupNorm's channel space."""
@@ -82,8 +87,8 @@ class Apply:
     def command(self, row: int, nrec: int = 0) -> np.ndarray:
         cmd = Command(K.K_APPLY)
         mode = {Norm.GN: K.A_GN, Norm.GNSILU: K.A_GNSILU, Norm.LN: K.A_LN, Norm.RMS: K.A_RMS}[self.mode]
-        cmd.set([K.C_M, K.C_NTILE, K.C_NBLK, K.C_MODE, K.C_NREC, K.C_EPS, K.C_JOIN],
-                (self.m, self.ntile, self.nblk, mode, nrec, f32(self.eps), self.join))
+        cmd.set([K.C_M, K.C_NTILE, K.C_NBLK, K.C_MODE, K.C_NREC, K.C_EPS, K.C_JOIN, K.C_APC],
+                (self.m, self.ntile, self.nblk, mode, nrec, f32(self.eps), self.join, self.ctiles))
         if self.gn:
             ch0, n = self.ch0(row), self.nblk * 80
             g0 = gn_window(ch0, self.nreal or n, self.gsize)
@@ -123,6 +128,12 @@ class Apply:
             chain.append({"addr": self.x + blk * self.ntile * ct, "nwords": (self.aobj - self.ln) * D.A_OBJ // 4,
                           "dims": [(D.A_OBJ // 16, 1), (2, D.A_OBJ // 16), (self.nhalf, self.half_step)]})
             co.sends[r] = [MemTask(chain)]
+            if self.ctiles:  # (per block and tile its row blocks' chunks 1280 B apart: each one's last 160 B under the
+                # next one's, the last one's in the C tile's padding)
+                nrb = self.m // 8
+                co.recvs[r] = [MemTask([{"addr": self.y + blk * self.ntile * ct, "nwords": self.nblk * self.ntile * nrb * 360,
+                                         "dims": [(360, 1), (nrb, 320), (self.nblk * self.ntile, ct // 4)]}])]
+                continue
             YN = self.y_np
             co.recvs[r] = [MemTask([panel_recv(self.y + (self.y_kb0 + 10 * i * self.nblk) * YN * L.PANEL, YN, self.np, 10,
                                                 self.nblk)])]

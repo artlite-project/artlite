@@ -583,12 +583,13 @@ static __attribute__((noinline)) void {{ p }}_apply_rb(const bfloat16 *__restric
 }
 
 // GroupNorm / LayerNorm apply (the module docstring): the row blocks in place in their A objects (``ops.Apply``: per
-// block and tile nrb + 1 slots of 3 per half, the last one the C-tile object's padding). C holds:
+// block and tile nrb + 1 slots of 3 per half, the last one the C-tile object's padding), out as panels or (C_APC) each
+// row block as it is (bf16; its chunk's last 160 B what follows it in the object). C holds:
 // the coefficients (GN: [img][ch / 8][s_hi s_lo t_hi t_lo] from 0; LN: [ch / 8][..] from 0), LN's token coefficients
 // [tile][rb][a_hi a_lo b_hi b_lo] (from 8192 B), t (640 at 16640 B), the output chunk's panels (at 17920 B)
 static __attribute__((noinline, minsize)) void {{ p }}_apply_run({{ p }}_st &s, int32_t *cb, const int32_t *ws, const uint32_t *tab) {
   const int m = ws[{{ C_M }}], ntile = ws[{{ C_NTILE }}], nblk = ws[{{ C_NBLK }}], mode = ws[{{ C_MODE }}];
-  const int nrb = m / 8, nch = 80 * nblk, ln = mode >= {{ A_LN }};
+  const int nrb = m / 8, nch = 80 * nblk, ln = mode >= {{ A_LN }}, cto = ws[{{ C_APC }}];
   bfloat16 *coef = (bfloat16 *)cb, *tokc = (bfloat16 *)((uint8_t *)cb + 8192);
   bfloat16 *tt = (bfloat16 *)((uint8_t *)cb + 16640);
   int32_t *pan = (int32_t *)((uint8_t *)cb + 17920);
@@ -610,7 +611,10 @@ static __attribute__((noinline, minsize)) void {{ p }}_apply_run({{ p }}_st &s, 
 {% if win == "apply" %}
         event1();
 {% endif %}
-        if (rb & 1) {{ p }}_out(s, pan, {{ OCH }});  // (two row blocks: 20 panels, an output chunk)
+        if (cto)
+          {{ p }}_out(s, (const int32_t *)x, {{ OCH }});  // (a row block: 1280 B, then 160 B the receive overwrites)
+        else if (rb & 1)
+          {{ p }}_out(s, pan, {{ OCH }});  // (two row blocks: 20 panels, an output chunk)
         h = h == 5 ? 0 : h + 1;
       }
       h = h == 5 ? 0 : h + 1;  // (the tile's padding slot)

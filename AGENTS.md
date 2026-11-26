@@ -112,7 +112,7 @@ or moved module updates its row).
 | `src/artlite/operators/` | the operator framework (`base.py`, `build.py`, `templating.py`, `kernel_source.py`, `checks.py`, `words.py`), `kmath/` (math functions per contract), `paging.py` (code pages), `fused/` (several designs in one ELF) |
 | `src/artlite/include/` | the kernels' headers: `operators.h`, `kernel_lib.h` |
 | `src/artlite/{formats,gemm,decode,prefill,moe,vision}/` | the subsystems the models share: the GGUF tile formats, the GEMMs on them, the decode overlay, the chunk prefill, MoE layers, the vision overlay (image networks, speech) |
-| `src/models/<model>/` | a language model per GGUF architecture (`llama`, `gemma4`, `qwen35`, `lfm`, `spark`, `flint`, `inkling2`), the media encoders (`minicpmv`, `lfm3vl`, `lfm3a`, `qwen3vl`), Stable Diffusion 1.5 (`sd15`) |
+| `src/models/<model>/` | a language model per GGUF architecture (`llama`, `gemma4`, `qwen35`, `lfm`, `spark`, `flint`, `inkling2`), the media encoders (`minicpmv`, `lfm3vl`, `lfm3a`, `qwen3vl`, `inkling2v`), Stable Diffusion 1.5 (`sd15`) |
 | `src/models/server/` | `artlite-server`: the HTTP APIs, the NPU workers, the prompt cache, tool calls, router mode |
 | `src/models/*.py` | what the models share: `Model`, `NpuModel`, `OverlayModel`, several sequences (`lanes.py`), sampling, chat templates, structured output, drafts; `artlite-cli`, `artlite-bench`, `artlite-probe` |
 | `tests/` | a directory per package of `src/`; the shared helpers (`conftest.py`, `common.py`, `numerics.py`, `model_files.py`), llama.cpp's goldens (`goldens/`), CPU references, `dma_model.py`, `design_diff.py`, `txn_dump.py`, `schedule_ledger.py`, the C++ gtests (`csrc/`), `datasets/` |

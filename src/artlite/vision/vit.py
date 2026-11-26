@@ -1,6 +1,7 @@
-"""The ViT layers of the vision encoders on the vision overlay (``models.minicpmv``'s SigLIP2 and ``models.qwen3vl``'s
-Qwen3-VL ViTs; the default widths ``VIT``: 1152 wide, 16 heads of 72, a feed-forward of 4304, LayerNorm eps 1e-6; a
-``Vit`` of other widths: Qwen3-VL's smaller towers, 1024 / 16 heads of 64 / 4096 and 768 / 12 heads of 64 / 3072).
+"""The ViT layers of the vision encoders on the vision overlay (``models.minicpmv``'s SigLIP2, ``models.qwen3vl``'s
+Qwen3-VL and ``models.inkling2v``'s ViTs; the default widths ``VIT``: 1152 wide, 16 heads of 72, a feed-forward of 4304,
+LayerNorm eps 1e-6; a ``Vit`` of other widths: Qwen3-VL's smaller towers, 1024 / 16 heads of 64 / 4096 and 768 / 12
+heads of 64 / 3072; Inkling 2's 1024 / 16 heads of 64 / 4096 with GELU erf).
 
 Channels: the hidden H (1152) padded to ``C`` = 80 x heads (1280; passes of 80 on 4 core rows): the residual's H real
 channels, then C - H that zero weight rows, biases, gamma and beta keep zero (LayerNorm's 1 / n over the H); a head's
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ..operators import kmath
 from ..operators.design import COLS
 from . import design as D
 from . import layout as L
@@ -51,7 +53,8 @@ QSCALE = L.LOG2E / math.sqrt(HD)  # (the queries' scale: the softmax in log2 uni
 @dataclass(frozen=True)
 class Vit:
     """A ViT's widths (module docstring): H real channels of the residual's C, HEADS heads of HD dims (each in HP),
-    the feed-forward's FFN_REAL in FFN, LayerNorm's eps."""
+    the feed-forward's FFN_REAL in FFN, LayerNorm's eps; the feed-forward's GELU (``kmath.TABLES``' "gelu": tanh,
+    "gelu_erf")."""
 
     H: int = H
     C: int = C
@@ -61,15 +64,16 @@ class Vit:
     FFN_REAL: int = FFN_REAL
     FFN: int = FFN
     EPS: float = EPS
+    GELU: str = "gelu"
 
     @classmethod
-    def of(cls, hidden: int, heads: int, ffn: int, eps: float) -> "Vit":
+    def of(cls, hidden: int, heads: int, ffn: int, eps: float, gelu: str = "gelu") -> "Vit":
         """The widths of a tower of ``hidden`` channels in ``heads`` heads (of at most 80 dims; 12 or 16 heads) and a
         feed-forward of ``ffn``."""
         hd = hidden // heads
         if hidden % heads or hd > HP or heads not in (12, 16):
             raise NotImplementedError(f"a ViT of {hidden} x {heads} heads (the overlay's: 12 or 16 heads of up to {HP})")
-        return cls(hidden, HP * heads, hd, HP, heads, ffn, -(-ffn // 320) * 320, eps)
+        return cls(hidden, HP * heads, hd, HP, heads, ffn, -(-ffn // 320) * 320, eps, gelu)
 
     @property
     def qscale(self) -> float:
@@ -267,7 +271,7 @@ def ffn(bd: Builder, w: dict[str, np.ndarray], name: str, x: Tensor, rec: int, p
     bd.defer(bd.spill(park, x.addr, x.nbytes), release=[(x.addr, x.size or x.nbytes)])  # (with LN2: the hidden
     # panels take the memtile)
     ln(bd, x, n, w["ln2_g"], w["ln2_b"], name=name + ".ln2", rec=rec, C=vt.C, H=vt.H, eps=vt.EPS)
-    bd.table("gelu", gelu_table())
+    bd.table(vt.GELU, gelu_table(kmath.TABLES[vt.GELU]))
     g = alloc(bd, lv, vt.FFN, "pn", top=not low)
     gemm(bd, k_view(n, w["up"]), w["up"], w["up_b"], name=name + ".up", out=g, kind="gelu")
     free(bd, n)

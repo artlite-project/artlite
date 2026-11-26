@@ -205,6 +205,7 @@ void bind_pack(nb::module_& m) {
          nb::ndarray<const int64_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> parts,
          nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> scales,
          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> rows,
+         nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> rscales,
          nb::ndarray<const int32_t, nb::ndim<2>, nb::c_contig, nb::device::cpu> runs, nb::list files,
          unsigned threads) {
         using Out = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
@@ -246,16 +247,17 @@ void bind_pack(nb::module_& m) {
           x.row_bytes = rb;
           ts.push_back(x);
         }
-        if (parts.shape(1) != 4 || scales.shape(0) != parts.shape(0) || runs.shape(1) != 4 || jobs.shape(1) != 7)
-          throw artlite::Error("pack_slots: jobs (J, 7), parts (P, 4), scales (P,), runs (R, 4)");
+        if (parts.shape(1) != 4 || scales.shape(0) != parts.shape(0) || runs.shape(1) != 4 || jobs.shape(1) != 7 ||
+            rscales.shape(0) != rows.shape(0))
+          throw artlite::Error("pack_slots: jobs (J, 7), parts (P, 4), scales (P,), rscales as rows, runs (R, 4)");
         std::vector<artlite::SlotPart> ps;
         for (size_t i = 0; i < parts.shape(0); i++) {
           const int64_t* p = parts.data() + 4 * i;
           if (p[1] < 0 || p[2] < 0 || p[3] < 0 || size_t(p[2] + p[3]) > runs.shape(0))
             throw artlite::Error(std::format("pack_slots: part {}: rows from {}, runs {} + {} of {}", i, p[1], p[2], p[3],
                                              runs.shape(0)));
-          ps.push_back({static_cast<int>(p[0]), scales.data()[i], rows.data() + p[1], runs.data() + 4 * p[2],
-                        static_cast<int>(p[3])});
+          ps.push_back({static_cast<int>(p[0]), scales.data()[i], rows.data() + p[1], rscales.data() + p[1],
+                        runs.data() + 4 * p[2], static_cast<int>(p[3])});
         }
         std::vector<artlite::SlotJob> js;
         for (size_t i = 0; i < jobs.shape(0); i++) {
@@ -274,19 +276,20 @@ void bind_pack(nb::module_& m) {
         nb::gil_scoped_release release_gil;
         artlite::pack_slots(ts, ps, js, fs, threads);
       },
-      "dsts"_a, "tensors"_a, "jobs"_a, "parts"_a, "scales"_a, "rows"_a, "runs"_a, "files"_a = nb::list(),
-      "threads"_a = 0,
+      "dsts"_a, "tensors"_a, "jobs"_a, "parts"_a, "scales"_a, "rows"_a, "rscales"_a, "runs"_a,
+      "files"_a = nb::list(), "threads"_a = 0,
       nb::sig("def pack_slots(dsts: list[numpy.ndarray[numpy.uint8]], tensors: list[tuple], "
               "jobs: numpy.ndarray[numpy.int64], parts: numpy.ndarray[numpy.int64], "
               "scales: numpy.ndarray[numpy.float32], rows: numpy.ndarray[numpy.int32], "
-              "runs: numpy.ndarray[numpy.int32], files: list[tuple[str, numpy.ndarray[numpy.uint8]]] = [], "
-              "threads: int = 0) -> None"),
+              "rscales: numpy.ndarray[numpy.float32], runs: numpy.ndarray[numpy.int32], "
+              "files: list[tuple[str, numpy.ndarray[numpy.uint8]]] = [], threads: int = 0) -> None"),
       "Pack the vision overlay's weight images (artlite::pack_slots, artlite.vision.weights): tensors (type \"F32\", "
       "\"F16\", \"BF16\", \"Q8_0\" or \"EYE\", raw (rows, row bytes) uint8 or None for EYE, rows, cols, file: an index "
       "into files or -1), jobs (J, 7) int64 [dst buffer, byte offset, passes, k-tiles, hilo, first part, parts], parts "
-      "(P, 4) int64 [tensor, first of its passes x 80 rows in rows (-1: a zero row), first run, runs], scales (P,), "
-      "runs (R, 4) int32 [first column, columns, source column, stride]; files: (path, the caller's mapping of the "
-      "whole file): their tensors through views of the packer's own, as pack_tiles; threads: 0 = one per physical core.");
+      "(P, 4) int64 [tensor, first of its passes x 80 rows in rows (-1: a zero row) and rscales, first run, runs], "
+      "scales (P,), rscales (as rows) float32: each row's own factor (times the part's scale in fp32), runs (R, 4) "
+      "int32 [first column, columns, source column, stride]; files: (path, the caller's mapping of the whole file): their "
+      "tensors through views of the packer's own, as pack_tiles; threads: 0 = one per physical core.");
 }
 
 }  // namespace artlite::bindings

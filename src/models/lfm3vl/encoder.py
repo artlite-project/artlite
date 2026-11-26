@@ -384,7 +384,7 @@ class Encoder(W.WindowEncoder):
             return W.patch_panels(lay, px, self.nm.p, kp=KP2, one=ONE2, tag="pixp")
         return W.patch_panels(lay, px, self.nm.p, kp=KP, one=ONE)
 
-    def size_inputs(self, lay: W.Layout) -> dict[str, np.ndarray]:
+    def size_inputs(self, lay: W.Layout, size: tuple[int, int]) -> dict[str, np.ndarray]:
         """The size's rows: the attention command's key masks (``lay.two``: each image's own keys, the command's per
         image masks over the joint sequence instead of its dense form), the RoPE tables, the conv's edge masks."""
         nm, nb = self.nm, lay.nb

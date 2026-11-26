@@ -1,5 +1,6 @@
-"""Vision encoders over an image's grid of 2 x 2 windows of patches on the vision overlay (Qwen3-VL's, LFM3-VL's): the
-layout of a band's tiles, the encoder's programs and dispatches, the final merger, the depthwise 3 x 3 conv's inputs.
+"""Vision encoders over an image's grid of 2 x 2 windows of patches on the vision overlay (Qwen3-VL's, LFM3-VL's, Inkling
+2's): the layout of a band's tiles, the encoder's programs and dispatches, the final merger, the depthwise 3 x 3 conv's
+inputs.
 
 Layout (``Layout``): an image of gh x gw windows (2 x 2 patches each: the merged tokens) on a level of ``nb`` bands of
 ``WIN`` = 128 windows; window w (raster order) is at (p, band, column, lane) = w's digits in (2, nb, 8, 8) (p the
@@ -8,7 +9,9 @@ half is 8 consecutive windows of the raster. The attention's keys are the joint 
 (``ops.Attention``: the overlay's two images are p), whose valid keys are whole 64-key groups up to the one of the last
 window (a lane pattern), so that ``ops.Attention(dense=True)`` takes any image size as data: the transactions depend on
 nb only. Slots past the image take the patches of window w mod windows (typical values in the bfp16 blocks over tokens
-that mix real and padding tokens; their keys masked). The merge: a band's 4 token-panel pairs are its windows' 4
+that mix real and padding tokens; their keys masked). A class token (``Layout.cls``: Inkling 2's, one per image, a key
+and query of every layer) is patch 0 of window ``windows``, the first past the image: its key the last live group's,
+so the dense key masks stay whole groups and one partial (an image of 128 k windows takes a band more). The merge: a band's 4 token-panel pairs are its windows' 4
 patches, so the final norm's panels go to DDR in the merged layout (``merger``): 4 bands' merged tokens are one m-64
 tile (token panel 2 (band % 4) + p) for the merger's MLP, its weights streamed once per 4 bands.
 
@@ -50,8 +53,8 @@ from . import design as D
 from . import layout as L
 from .builder import Builder
 from .device import VisionDevice
-from .layers import Tensor, alloc, free, gelu_table, gemm
-from .ops import dims
+from .layers import Tensor, alloc, free, gelu_table, gemm, ln_rec
+from .ops import Gemm, dims
 from .program import Program, ProgramStore
 from .vit import ln, vit_level
 
@@ -77,11 +80,16 @@ def piece_layers(nb: int, layers: int, cost: tuple[float, float]) -> int:
 class Layout:
     """An image of gh x gw merged tokens (windows of 2 x 2 patches) on a level of ``nb`` bands (module docstring);
     ``two``: two images of that size, one a half (p: window w of image p at (p, band, column, lane) = w's digits in
-    (nb, 8, 8)), each the other's padding: masked keys, masked conv neighbours (two videos' pairs a dispatch)."""
+    (nb, 8, 8)), each the other's padding: masked keys, masked conv neighbours (two videos' pairs a dispatch); ``cls``:
+    a class token at patch 0 of window ``windows`` (``cls_slot``)."""
 
     gh: int
     gw: int
     two: bool = False
+    cls: bool = False
+
+    def __post_init__(self) -> None:
+        assert not (self.two and self.cls), "a class token: one image"
 
     @property
     def windows(self) -> int:
@@ -89,7 +97,13 @@ class Layout:
 
     @property
     def nb(self) -> int:
-        return -(-self.windows // (WIN // 2 if self.two else WIN))
+        return -(-(self.windows + self.cls) // (WIN // 2 if self.two else WIN))
+
+    def cls_slot(self) -> tuple[int, int, int]:
+        """The class token's slot: (band, column, token: 8 token panel + lane), patch 0 of window ``windows``."""
+        assert self.cls
+        p, b, c, lane = (int(d) for d in np.unravel_index(self.windows, (2, self.nb, COLS, 8)))
+        return b, c, 8 * p + lane
 
     def slot_windows(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Per slot ([band][column][token 64], token = 8 token panel + lane) its window (the real one: w mod windows;
@@ -113,13 +127,15 @@ class Layout:
         return img * 4 * self.windows + (2 * r + s // 2) * (2 * self.gw) + 2 * c + s % 2
 
     def keys(self) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-        """The valid keys of the joint sequence [p][band][column][s][lane] (``two``: each image's, a pair)."""
+        """The valid keys of the joint sequence [p][band][column][s][lane] (``two``: each image's, a pair; ``cls``: the
+        class token's too)."""
         nb = self.nb
-        p, b, c, _, lane = np.meshgrid(*(np.arange(n) for n in (2, nb, COLS, 4, 8)), indexing="ij")
+        p, b, c, s, lane = np.meshgrid(*(np.arange(n) for n in (2, nb, COLS, 4, 8)), indexing="ij")
         if self.two:
             ok = (b * COLS + c) * 8 + lane < self.windows
             return (ok & (p == 0)).reshape(-1), (ok & (p == 1)).reshape(-1)
-        return (((p * nb + b) * COLS + c) * 8 + lane < self.windows).reshape(-1)
+        w = ((p * nb + b) * COLS + c) * 8 + lane
+        return ((w < self.windows) | (self.cls & (w == self.windows) & (s == 0))).reshape(-1)
 
     def merged(self, out: np.ndarray) -> np.ndarray:
         """The MLP's tiles (quads of 4 bands, [quad][column][token 64]: token panel 2 (band % 4) + p, lane; channels)
@@ -186,13 +202,15 @@ class Names:
 class Merger:
     """The final merger's widths: the norm's ``H`` real channels of ``C`` per patch, its eps, mm.0's outputs in chunks
     ``up`` (padded: ``FUP``, passes of 320 each), mm.2's outputs (the language model's width in whole passes,
-    ``out_width``) in chunks of ``dn``."""
+    ``out_width``) in chunks of ``dn``; ``norm``: the final LayerNorm (else the residual's own values as the MLP's
+    input: Inkling 2's)."""
 
     H: int
     C: int = 1280
     eps: float = 1e-6
     up: tuple[int, ...] = (960,) * 5
     dn: int = 640
+    norm: bool = True
 
     @property
     def FUP(self) -> int:
@@ -209,11 +227,12 @@ def out_width(proj: int) -> int:
 
 
 def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> None:
-    """The final LayerNorm of the residual after nl layers and the merger's MLP: per band LayerNorm -> panels drained
-    to DDR in the merged layout of its quad (<p>.mg.q: [column][kb 4 C / 8][token panel 8][72 B]; band b's patch s,
-    image p at kb C / 8 s + kb, token panel 2 (b % 4) + p); per quad its tile of 64 merged tokens: mm.0 + GELU (erf) in
-    chunks to DDR (<p>.hid.q), mm.2 in chunks -> the embeddings' C tiles (<p>.out.q: [column][out_width / 80]
-    [ct_bytes(64)]). w: "post_g", "post_b", "up", "up_b", "down", "down_b"."""
+    """The final LayerNorm of the residual after nl layers and the merger's MLP: per band LayerNorm (``md.norm``; else
+    the residual's bfp16 panels: a copy op) -> panels drained to DDR in the merged layout of its quad (<p>.mg.q:
+    [column][kb 4 C / 8][token panel 8][72 B]; band b's patch s, image p at kb C / 8 s + kb, token panel 2 (b % 4) +
+    p); per quad its tile of 64 merged tokens: mm.0 + GELU (erf) in chunks to DDR (<p>.hid.q), mm.2 in chunks -> the
+    embeddings' C tiles (<p>.out.q: [column][out_width / 80] [ct_bytes(64)]). w: "post_g", "post_b" (with the norm),
+    "up", "up_b", "down", "down_b"."""
     from .vit import Bands  # (the ViT's banded residual)
     C, MERGED, FUP = md.C, md.merged, md.FUP
     lv, l1 = vit_level(nb), vit_level(1)
@@ -224,7 +243,12 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
     for b in range(nb):
         xb, rec = x.load(bd, b)
         n = alloc(bd, lv, C, "pn")
-        ln(bd, xb, n, w["post_g"], w["post_b"], name=f"{nm.p}.post", rec=rec, C=C, H=md.H, eps=md.eps)
+        if md.norm:
+            ln(bd, xb, n, w["post_g"], w["post_b"], name=f"{nm.p}.post", rec=rec, C=C, H=md.H, eps=md.eps)
+        else:
+            bd.mem.release(rec, ln_rec(lv))
+            bd.gemm(Gemm(m=lv.m, ntile=lv.ntile, K=0, N=C, x=0, y=n.addr, out="bfp16", res=xb.addr, y_np=n.np), None,
+                    None, name=f"{nm.p}.panels")
         free(bd, xb)
         bd.op(bd.drain(f"{nm.p}.mg.{b // 4}", mgb, mem=n.addr, nbytes=pn, off=2 * (b % 4) * L.PANEL,
                    mdims=walk, sdims=(36, MERGED // 8, 144, 144 * MERGED // 8)), {})
@@ -276,7 +300,7 @@ class WindowEncoder:
     gives the network: ``patch_embed`` (``pair=True``: a video's pair of frames, where the network takes videos),
     ``layers``, ``final``, ``size_inputs``, ``layers_per_piece``, ``kinds`` (the layers' kinds: a piece of layers runs
     where the kinds are its own), ``pixel_panels`` (an image's pixels or a pair's), ``shift`` (a tagged address's bytes
-    for an image)."""
+    for an image), ``layout`` (an image's: a network that pads its pixels or adds a class token)."""
 
     PATCH = 16
 
@@ -299,7 +323,7 @@ class WindowEncoder:
         self.store = store
         self._kept: set[str] | None = set(npu.names()) if state is not None else None  # (the cached state's images)
         self.tr: dict[tuple, Transaction] = {}  # (by (program key, piece): a pair's shared pieces the image's)
-        self._inputs: OrderedDict[Layout, dict[str, np.ndarray]] = OrderedDict()
+        self._inputs: OrderedDict[tuple, dict[str, np.ndarray]] = OrderedDict()
         self._at: dict[tuple, tuple] = {}  # (a transaction's last (layer, size) its words are set for)
         self.program(1)  # (every layer's images: nb 1 runs them all in one dispatch)
         self.program(max_bands)  # (every band's DDR images: the layout that later programs take)
@@ -318,7 +342,7 @@ class WindowEncoder:
     def layers_per_piece(self, nb: int) -> int:
         raise NotImplementedError
 
-    def size_inputs(self, lay: Layout) -> dict[str, np.ndarray]:
+    def size_inputs(self, lay: Layout, size: tuple[int, int]) -> dict[str, np.ndarray]:
         raise NotImplementedError
 
     def pixel_panels(self, lay: Layout, px: np.ndarray) -> dict[str, np.ndarray]:
@@ -415,11 +439,11 @@ class WindowEncoder:
 
     def inputs(self, lay: Layout, px: np.ndarray) -> dict[str, np.ndarray]:
         """An image's DDR images: its patch panels (``pixel_panels``) and its size's rows (``size_inputs``, kept for the
-        last 4 sizes)."""
+        last 4 sizes: a layout's and its pixels' size, of a network that pads them)."""
         out = self.pixel_panels(lay, px)
-        key = lay
+        key = (lay, px.shape[-3:-1])
         if key not in self._inputs:
-            self._inputs[key] = self.size_inputs(lay)
+            self._inputs[key] = self.size_inputs(lay, px.shape[-3:-1])
             if len(self._inputs) > 4:
                 self._inputs.popitem(last=False)
         self._inputs.move_to_end(key)
@@ -443,18 +467,24 @@ class WindowEncoder:
         emb = lay.merged(tiles)[:, :self.proj]
         return emb.reshape(2, lay.windows, -1) if lay.two else emb
 
+    def layout(self, px: np.ndarray, two: bool = False) -> Layout:
+        """The layout of an image's pixels (uint8 (H, W, 3), multiples of ``TOKEN_PX``) or a video's pair ((2, H, W, 3);
+        ``two``: two of them stacked)."""
+        lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
+        assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape
+        return lay
+
     def packs(self, gh: int, gw: int) -> bool:
         """Whether two images (a video's pairs) of gh x gw tokens run as one (``Layout.two``): a subclass's network that
         takes it, where it is fewer bands than two dispatches."""
         return False
 
     def __call__(self, px: np.ndarray, two: bool = False) -> np.ndarray:
-        """An image's pixels (uint8 (H, W, 3), multiples of ``TOKEN_PX``) or a video's pair of frames ((2, H, W, 3)) ->
-        its embeddings (H / TOKEN_PX W / TOKEN_PX, proj) in raster order; ``two``: two of them of one size (px stacked;
-        ``packs``) in one run -> (2, H / TOKEN_PX W / TOKEN_PX, proj)."""
+        """An image's pixels (uint8 (H, W, 3), multiples of ``TOKEN_PX``: ``layout``) or a video's pair of frames ((2,
+        H, W, 3)) -> its embeddings (H / TOKEN_PX W / TOKEN_PX, proj) in raster order; ``two``: two of them of one size
+        (px stacked; ``packs``) in one run -> (2, H / TOKEN_PX W / TOKEN_PX, proj)."""
         pair = px.ndim == 4 + two
-        lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
-        assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape
+        lay = self.layout(px, two)
         with ThreadPoolExecutor(1) as pool:  # (the inputs while the program builds, on first use)
             host = pool.submit(self.inputs, lay, px)
             plan = self.schedule(lay.nb, pair)
@@ -473,8 +503,7 @@ class WindowEncoder:
             if x is None:
                 return None
             px, two = x
-            lay = Layout(px.shape[-3] // TOKEN_PX, px.shape[-2] // TOKEN_PX, two)
-            assert lay.gh * TOKEN_PX == px.shape[-3] and lay.gw * TOKEN_PX == px.shape[-2], px.shape
+            lay = self.layout(px, two)
             return px.ndim == 4 + two, lay, self.inputs(lay, px)
         it = iter(items)
         done = None
@@ -499,7 +528,8 @@ def patch_panels(lay: Layout, px: np.ndarray, name: str, *, kp: int, one: int, p
                  tag: str = "pix") -> dict[str, np.ndarray]:
     """Per band its patches' integer panels (DDR image <name>.<tag>.b: q = p - 128 of the patch's (c, ky, kx) inputs,
     frame by frame, the constant 1 at input ``one``, kp inputs) of an image's pixels px (uint8 (H, W, 3)) or a video
-    pair's ((2, H, W, 3)); ``lay.two``: two of them, stacked."""
+    pair's ((2, H, W, 3)); ``lay.two``: two of them, stacked; ``lay.cls``: the class token's slot zeros (its constant
+    input too)."""
     nb = lay.nb
     ph, pw = 2 * lay.gh, 2 * lay.gw
 
@@ -508,21 +538,30 @@ def patch_panels(lay: Layout, px: np.ndarray, name: str, *, kp: int, one: int, p
                                for f in (x if x.ndim == 4 else x[None])], 1)
     q = (np.concatenate([patches(x) for x in px]) if lay.two else patches(px)).astype(np.int16) - 128
     sp = lay.slot_patches().reshape(nb, COLS, 64)
+    cb, cc, ct = lay.cls_slot() if lay.cls else (-1, 0, 0)
     out = {}
     pix = np.zeros((COLS, 64, kp), np.int8)
-    pix[..., one] = 1
     for b in range(nb):
         pix[..., :q.shape[1]] = q[sp[b]]
+        pix[..., one] = 1
+        if b == cb:
+            pix[cc, ct] = 0
         out[f"{name}.{tag}.{b}"] = np.concatenate([L.int_panels(pix[c]) for c in range(COLS)])
     return out
 
 
-def band_rows(lay: Layout, rows: np.ndarray, name: str) -> dict[str, np.ndarray]:
+def band_rows(lay: Layout, rows: np.ndarray, name: str, cls: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Per band the C tiles of per-patch rows (raster order, any channels in passes of 80) at its slots: DDR images
-    <name>.b ([column][C tiles of 64])."""
+    <name>.b ([column][C tiles of 64]); ``cls``: the class token's row (``lay.cls``)."""
     sp = lay.slot_patches().reshape(lay.nb, COLS, 64)
-    return {f"{name}.{b}": np.concatenate([L.ctiles(rows[sp[b, c]], 64) for c in range(COLS)])
-            for b in range(lay.nb)}
+    out = {}
+    for b in range(lay.nb):
+        x = rows[sp[b]]
+        if cls is not None and lay.cls_slot()[0] == b:
+            _, c, t = lay.cls_slot()
+            x[c, t] = cls
+        out[f"{name}.{b}"] = np.concatenate([L.ctiles(x[c], 64) for c in range(COLS)])
+    return out
 
 
 def windows_of(nb: int, b: int, c: int, p: int) -> np.ndarray:

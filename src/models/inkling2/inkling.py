@@ -5,7 +5,9 @@ The chat template (the file's): a conversation is blocks ``<|message_{user,model
 .. <|end_message|>``, a model turn ends with ``<|content_model_end_sampling|>``; a system block "Thinking effort level:
 x" (``reasoning_effort``: none 0 .. max 0.99, or a number; the template's default 0.9) before the first message that is
 not a system one; tools as one JSON line in a ``tool_declare`` block, calls ``<|message_model|>NAME
-<|content_invoke_tool_json|>{"name": .., "args": {..}}``; an image part as ``<|content_image|><|unused_200054|>``.
+<|content_invoke_tool_json|>{"name": .., "args": {..}}``; an image part as ``<|content_image|><|unused_200054|>``
+(with the mmproj: the placeholder becomes the image's tokens, ``models.inkling2v``; their rows enter the first visit as
+they are, a text token's RMS-normed).
 The template opens no turn for the reply: the model writes its own blocks (``<|message_model|><|content_thinking|>``
 .. then ``<|message_model|><|content_text|>`` ..), and its turn ends at ``<|content_model_end_sampling|>``.
 
@@ -26,13 +28,17 @@ import numpy as np
 from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import InklingConfig, InklingDSparkConfig, inkling_dspark_of
+from artlite.hf_model import open_mmproj
+from artlite.model_config import ClipConfig, InklingConfig, InklingDSparkConfig, inkling_dspark_of
 
+from ..inkling2v import host as vision_host
+from ..inkling2v import npu as vision_npu
 from ..lanes import alone
-from ..model import Model
+from ..model import Model, check_tower
 from ..npu_model import Checkpoint
 from ..overlay_model import OverlayModel
 from ..sampling import TOP_K_ALL, Penalties, Sampling
+from ..sequence import Sequence as Tokens
 from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .dspark import DSparkOverlay, MarkovChain
@@ -245,11 +251,23 @@ class NpuInkling(OverlayModel):
             self._pend, self._shadow, self._hist = {}, [], {}
         super().restore(position, checkpoint)
 
-    def _step_inputs(self, tokens: list[int]) -> tuple:
-        """(the first visit's input: the embedding rows RMS-normed with ``token_embd_norm``, as one state)"""
-        x = self.gguf.rows("token_embd.weight", np.asarray(tokens)).astype(np.float32)
-        x = x / np.sqrt((x.astype(np.float64) ** 2).mean(-1, keepdims=True) + self.cfg.rms_norm_eps).astype(np.float32)
-        return ((x * self._tn)[None],)
+    def _inputs(self, tokens: list[int] | Tokens) -> np.ndarray:
+        """The first visit's inputs (n, hidden) fp32: a text token's embedding row RMS-normed with ``token_embd_norm``,
+        a sequence's given row (an image's) as it is (llama.cpp's)."""
+        seq = tokens if isinstance(tokens, Tokens) else Tokens.text(tokens)
+        x = np.empty((len(seq), self.cfg.hidden_size), np.float32)
+        t = ~seq.given
+        if t.any():
+            r = self.gguf.rows("token_embd.weight", seq.ids[t]).astype(np.float32)
+            r /= np.sqrt((r.astype(np.float64) ** 2).mean(-1, keepdims=True) + self.cfg.rms_norm_eps).astype(np.float32)
+            x[t] = r * self._tn
+        if seq.given.any():
+            x[seq.given] = seq.rows
+        return x
+
+    def _step_inputs(self, tokens: list[int] | Tokens) -> tuple:
+        """(the first visit's inputs, as one state: ``_inputs``)"""
+        return (self._inputs(tokens)[None],)
 
     def _prefill_run(self, args: tuple, T: int, n: int, sets: Sequence[int] | None = None) -> None:
         """(a drafter's: the chunk's taps wait for it, injected after the chunk)"""
@@ -262,21 +280,24 @@ class NpuInkling(OverlayModel):
                 self._pend[p0 + i] = row
             self._inject(p0 + n)
 
-    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
-        """(the chunk's normed embeddings (n, hidden): the first visit's input)"""
-        return (self._step_inputs(tokens)[0][0],)
+    def _chunk_inputs(self, tokens: list[int] | Tokens, *, first: bool) -> tuple:
+        """(the chunk's first visit's inputs (n, hidden): ``_inputs``)"""
+        return (self._inputs(tokens),)
 
 
 class Inkling(Model):
     """An Inkling 2 GGUF file (either layout, ``InklingConfig``): the architecture, tokenizer and chat template from its
-    metadata (module docstring)."""
+    metadata (module docstring). ``mmproj``: the vision encoder's file (images in prompts: ``models.inkling2v.npu.
+    NpuVision``; ``image_max_tokens``: an image's merged tokens at most, default 4096, llama.cpp's)."""
 
     name = "Inkling 2"
     thinks = True
     reasoning = ("<|content_thinking|>", "<|end_message|>")
     thought_first = True
+    projectors = vision_npu.PROJECTORS
 
-    def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None):
+    def __init__(self, path: str, *, kv_k: str = "hilo", spec_type: str = "auto", draft_model: str | None = None,
+                 mmproj: str | None = None, image_max_tokens: int | None = None):
         kv_precision(kv_k)  # (a K precision the overlay takes, before the file opens)
         self.gguf = GGUFFile(path)
         self.cfg = InklingConfig.from_gguf(self.gguf)
@@ -287,6 +308,10 @@ class Inkling(Model):
         self.dspark = (draft_model or inkling_dspark_of(path)) if kind in ("auto", "draft-dspark") else None
         if kind == "draft-dspark" and self.dspark is None:
             raise ValueError(f"{path}: no DSpark drafter (a dspark-*.gguf beside it)")
+        if mmproj is not None:
+            check_tower(mmproj, ClipConfig.from_gguf(open_mmproj(mmproj)), self.projectors, what="projector",
+                        hidden=self.cfg.hidden_size)
+            self.vision = vision_npu.NpuVision(mmproj, max_tokens=image_max_tokens)
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -306,9 +331,17 @@ class Inkling(Model):
 
     def chat(self, messages: list[dict[str, object]], *, think: bool = False,
              tools: list[dict[str, object]] | None = None, preserve: bool = False,
-             variables: dict[str, object] | None = None) -> list[int]:
-        return self.tokenizer.encode(self.chat_text(messages, think=think, tools=tools, preserve=preserve,
-                                                    variables=variables))
+             variables: dict[str, object] | None = None) -> list[int] | Tokens:
+        text = self.chat_text(messages, think=think, tools=tools, preserve=preserve, variables=variables)
+        images = [p["image"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
+                  if isinstance(p, dict) and p.get("type") == "image"]
+        if not images:
+            return self.tokenizer.encode(text)
+        if self.vision is None:
+            raise ValueError(f"{self.name}: images need its vision encoder (an mmproj file)")
+        seq = vision_host.image_prompt(text, images, self.tokenizer.encode, self.vision.sequence)
+        self.vision_ran()
+        return seq
 
     def sampling(self, *, think: bool = False) -> Sampling:
         """The file's sampling (general.sampling.*: temperature 1, top-k 0 (all), top-p 1, min-p 0)."""
@@ -323,8 +356,9 @@ class Inkling(Model):
 
     def load(self, *, capacity: int, prefill: bool = True, sequences: int = 1) -> NpuInkling:
         """(``sequences``: ``NpuInkling``'s)"""
-        return NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences, prefill=prefill,
-                          dspark=self.dspark if sequences == 1 else None)
+        self._npu = NpuInkling(self.gguf, capacity=capacity, kv_k=self.kv_k, sequences=sequences, prefill=prefill,
+                               dspark=self.dspark if sequences == 1 else None)
+        return self._npu
 
 
 __all__ = ["Inkling", "NpuInkling"]

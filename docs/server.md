@@ -49,7 +49,8 @@ settings for them have no effect. Log-probabilities come as llama-server's: chat
 generation, up to `--spec-draft-n-max` (0: steps of one token; a drafter still follows the tokens, so the next request
 drafts as before); `/props` and `/slots` report the cap in `params`.
 Images (a model with `--mmproj`: [Qwen3.5 / 3.6 / 3.8](models/qwen35.md#images-qwen35--36--38),
-[MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images); the decision
+[MiniCPM-V 4.7](models/qwen35.md#images-minicpm-v-47), [LFM3-VL-2B](models/lfm3.md#lfm3-vl-2b-images),
+[Inkling 2](models/inkling2.md#images); the decision
 models d3 and d1: [below](#decisions)) come as a chat message's `image_url` parts of data URIs, as llama-server takes
 them; the web UI attaches them; audio (LFM3-Audio, LFM3-Omni: [below](#speech)) as `input_audio` parts or `audio_url`
 data URIs; videos (LFM3-VL-2B, LFM3-Omni-2B: [the models](models/lfm3.md#videos); FFmpeg's `ffmpeg` and `ffprobe` on
@@ -557,7 +558,8 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   Flint: its DFlash2 repository's;
   a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
   that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
-  before the 4x one; LFM3-Audio-2B: its speech encoder, `/v1/models` lists the model's `audio` input).
+  before the 4x one; Inkling 2: its own, `mmproj-F16.gguf`; LFM3-Audio-2B: its speech encoder, `/v1/models` lists the
+  model's `audio` input).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
   one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
@@ -720,8 +722,8 @@ Images:
 
 | option | |
 |---|---|
-| `--mmproj FILE` | the vision or speech encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; d3: `mmproj-vllm-d3-lite-Q8_0.gguf`; d1-2B: `mmproj-d1-2B-Q8_0.gguf`; LFM3-Audio-2B: `mmproj-LFM3-Audio-2B-Q8_0.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)), pictures in decision requests ([Decisions](#decisions)), audio ([Speech](#speech)) |
-| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, d3's 64 / 1600, else 8 / 4096 for Qwen3-VL, 64 / 4096 for LFM3-VL, llama.cpp's; d1-2B 64 / 1600: its runner's) |
+| `--mmproj FILE` | the vision or speech encoder's file (Qwen3.5 / 3.6 / 3.8: `mmproj-<model>-BF16.gguf`; MiniCPM-V 4.7: `mmproj-model-f16.gguf`; LFM3-VL-2B: `mmproj-LFM3-VL-2B-BF16.gguf`; Inkling 2 Mini: `mmproj-F16.gguf`; d3: `mmproj-vllm-d3-lite-Q8_0.gguf`; d1-2B: `mmproj-d1-2B-Q8_0.gguf`; LFM3-Audio-2B: `mmproj-LFM3-Audio-2B-Q8_0.gguf`): images in chat messages ([models](models/qwen35.md#images-qwen35--36--38)), pictures in decision requests ([Decisions](#decisions)), audio ([Speech](#speech)) |
+| `--image-min-tokens N`, `--image-max-tokens N` | an image's tokens of 32 x 32 pixels at least / at most (Qwen3-VL's and LFM3-VL's mmproj; default the mmproj's limits where it has them, d3's 64 / 1600, else 8 / 4096 for Qwen3-VL, 64 / 4096 for LFM3-VL, llama.cpp's; d1-2B 64 / 1600: its runner's); Inkling 2's mmproj: tokens of 40 x 40 pixels at most, default 4096 (a larger image resized) |
 | `--max-slices N` | an image's slices at most (MiniCPM-V; default: the mmproj's, 9; the model card uses 36) |
 
 Logging:

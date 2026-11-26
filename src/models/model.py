@@ -23,6 +23,16 @@ def media_parts(*, images: Sequence[object] = (), videos: Sequence[object] = (),
         [{"type": "audio", "audio": a} for a in audio]
 
 
+def check_tower(mmproj: str, config: Any, supported: tuple[str, ...], *, what: str, hidden: int) -> None:
+    """NotImplementedError unless the mmproj's tower (its ``model_config.ClipConfig`` or ``AudioConfig``) has a
+    ``supported`` projector (``what`` names it in the message); ValueError unless it embeds into the language model's
+    ``hidden`` size."""
+    if config.projector not in supported:
+        raise NotImplementedError(f"{mmproj}: {what} {config.projector!r} (supported: {', '.join(supported)})")
+    if config.projection_dim != hidden:
+        raise ValueError(f"{mmproj}: embeddings of {config.projection_dim}, the language model's {hidden}")
+
+
 @dataclass(frozen=True)
 class Capabilities:
     """What a loaded model takes and gives beyond text (the server's listings and routes, the tools' options read it)."""

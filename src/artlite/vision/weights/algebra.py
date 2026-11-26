@@ -2,10 +2,11 @@
 
 A ``Wt`` is a weight matrix of parts of sources (``Source``: a tensor of a GGUF or safetensors file, read in place from
 the file's memory map; a small matrix the host computes at every load, ``computed``; the identity, ``eye``): per part
-the source row of each of its rows, the source column of each of its columns (-1: zero) and a scale. The networks'
-weight transforms (heads and channels padded, the RoPE heads' rows, the queries' scale, a GEGLU's halves, a conv's
-input slices, a sum of column blocks) are index maps on them (``take``, ``cat``, ``Wt.__getitem__``, ``*``), so a
-weight is never materialized on the host. Torch tensors take the same helpers (the tests' weights): ``Builder.gemm``
+the source row of each of its rows, the source column of each of its columns (-1: zero), a scale and per row a scale
+of its own (``Part.rscale``: None, 1). The networks' weight transforms (heads and channels padded, the RoPE heads'
+rows, the queries' scale, a layer scale folded into the rows of the GEMM before it, a GEGLU's halves, a conv's input
+slices, a sum of column blocks) are index maps and scales on them (``take``, ``cat``, ``Wt.__getitem__``, ``*``,
+``scale_rows``), so a weight is never materialized on the host. Torch tensors take the same helpers (the tests' weights): ``Builder.gemm``
 takes either, a tensor as a source of memory of its own.
 """
 
@@ -55,6 +56,16 @@ class Part(NamedTuple):
     rows: np.ndarray  # (N,) int64 source rows, -1: zero
     cols: np.ndarray  # (C inner,) int64 source columns, -1: zero
     scale: float
+    rscale: np.ndarray | None = None  # (N,) float32 per row (an element: its value times fp32(scale) rscale), None: 1
+
+    def row_scales(self) -> np.ndarray:
+        """Per row its factor fp32(scale) fp32(rscale) (float32; what the packer multiplies a row's elements by)."""
+        r = np.ones(len(self.rows), np.float32) if self.rscale is None else self.rscale
+        return np.float32(self.scale) * r
+
+
+def _same(a: np.ndarray | None, b: np.ndarray | None) -> bool:
+    return (a is None) == (b is None) and (a is None or np.array_equal(a, b))
 
 
 def _index(key: object, n: int) -> np.ndarray:
@@ -98,7 +109,9 @@ class Wt:
         """Rows idx (-1: zero rows)."""
         idx = np.asarray(idx, np.int64)
         assert idx.max(initial=-1) < self.shape[0], (idx.max(), self.shape)
-        return Wt(tuple(p._replace(rows=np.where(idx >= 0, p.rows[idx], -1)) for p in self.parts),
+        return Wt(tuple(p._replace(rows=np.where(idx >= 0, p.rows[idx], -1),
+                                   rscale=None if p.rscale is None else
+                                   np.where(idx >= 0, p.rscale[idx], 1).astype(np.float32)) for p in self.parts),
                   (len(idx),) + self.shape[1:])
 
     def take_cols(self, idx: np.ndarray) -> Wt:
@@ -136,6 +149,13 @@ class Wt:
 
     __rmul__ = __mul__
 
+    def scale_rows(self, v: np.ndarray) -> Wt:
+        """Row i times v[i] (float32: ``Part.rscale``)."""
+        v = np.asarray(v, np.float32).reshape(-1)
+        assert v.size == self.shape[0], (v.size, self.shape)
+        return Wt(tuple(p._replace(rscale=v.copy() if p.rscale is None else p.rscale * v) for p in self.parts),
+                  self.shape)
+
     @staticmethod
     def cat(ws: list[Wt], dim: int = 0) -> Wt:
         """Rows (dim 0) or columns (dim 1, of 2-D matrices) of the matrices in order."""
@@ -147,7 +167,11 @@ class Wt:
                 for p in w.parts:
                     rows = np.full(n, -1, np.int64)
                     rows[at:at + w.shape[0]] = p.rows
-                    parts.append(p._replace(rows=rows))
+                    rs = None
+                    if p.rscale is not None:
+                        rs = np.ones(n, np.float32)
+                        rs[at:at + w.shape[0]] = p.rscale
+                    parts.append(p._replace(rows=rows, rscale=rs))
                 at += w.shape[0]
             return Wt(_merge(parts), (n,) + ws[0].shape[1:])
         assert dim == 1 and all(w.ndim == 2 and w.shape[0] == ws[0].shape[0] for w in ws), [x.shape for x in ws]
@@ -162,7 +186,7 @@ class Wt:
 
     def numpy(self) -> np.ndarray:
         """The values (float32, ``shape``): the reference of what ``Slots`` packs."""
-        if len(self.parts) == 1 and (p := self.parts[0]).scale == 1.0 and \
+        if len(self.parts) == 1 and (p := self.parts[0]).scale == 1.0 and p.rscale is None and \
                 (len(p.rows), len(p.cols)) == (p.source.rows, p.source.cols) and \
                 (p.rows == np.arange(len(p.rows))).all() and (p.cols == np.arange(len(p.cols))).all():
             return p.source.values().reshape(self.shape)  # (a whole source)
@@ -171,31 +195,38 @@ class Wt:
             v = p.source.values()
             r, c = p.rows >= 0, p.cols >= 0
             block = v[np.ix_(p.rows[r], p.cols[c])]
-            out[np.ix_(r, c)] += block if p.scale == 1.0 else block * np.float32(p.scale)
+            if p.rscale is not None:
+                block = block * p.row_scales()[r][:, None]
+            elif p.scale != 1.0:
+                block = block * np.float32(p.scale)
+            out[np.ix_(r, c)] += block
         return out.reshape(self.shape)
 
     @property
     def key(self) -> tuple:
         """A fingerprint of the matrix (equal for the same parts of the same sources)."""
-        return (self.shape,) + tuple((p.source.name, p.scale, hashlib.blake2b(p.rows.tobytes(), digest_size=8).digest(),
-                                      hashlib.blake2b(p.cols.tobytes(), digest_size=8).digest()) for p in self.parts)
+        h = lambda a: hashlib.blake2b(a.tobytes(), digest_size=8).digest()
+        return (self.shape,) + tuple((p.source.name, p.scale, h(p.rows), h(p.cols)) +
+                                     (() if p.rscale is None else (h(p.rscale),)) for p in self.parts)
 
     def sources(self) -> list[Source]:
         return [p.source for p in self.parts]
 
 
 def _merge(parts: list[Part]) -> tuple[Part, ...]:
-    """Parts of the same source and scale as one where they have the same columns and rows that do not overlap, or the
-    same rows and columns that do not overlap."""
+    """Parts of the same source and scale as one where they have the same columns and rows that do not overlap (their
+    row scales joined), or the same rows (and row scales) and columns that do not overlap."""
     out: list[Part] = []
     for p in parts:
         for i, q in enumerate(out):
             if q.source is not p.source or q.scale != p.scale:
                 continue
             if np.array_equal(q.cols, p.cols) and not ((q.rows >= 0) & (p.rows >= 0)).any():
-                out[i] = q._replace(rows=np.where(p.rows >= 0, p.rows, q.rows))
+                one = lambda x: np.ones(len(x.rows), np.float32) if x.rscale is None else x.rscale
+                rs = None if p.rscale is None and q.rscale is None else np.where(p.rows >= 0, one(p), one(q))
+                out[i] = q._replace(rows=np.where(p.rows >= 0, p.rows, q.rows), rscale=rs)
                 break
-            if np.array_equal(q.rows, p.rows) and not ((q.cols >= 0) & (p.cols >= 0)).any():
+            if np.array_equal(q.rows, p.rows) and _same(q.rscale, p.rscale) and not ((q.cols >= 0) & (p.cols >= 0)).any():
                 out[i] = q._replace(cols=np.where(p.cols >= 0, p.cols, q.cols))
                 break
         else:
@@ -242,6 +273,14 @@ def flat(x: Wt | np.ndarray) -> Wt | np.ndarray:
 def f32(x: Wt | np.ndarray) -> Wt | np.ndarray:
     """A matrix as it is (a Wt), an array's values as float32."""
     return x if isinstance(x, Wt) else np.asarray(x, np.float32)
+
+
+def scale_rows(x: Wt | np.ndarray, v: np.ndarray) -> Wt | np.ndarray:
+    """Row i of x times v[i] (a Wt's ``Wt.scale_rows``; an array's product, float32)."""
+    if isinstance(x, Wt):
+        return x.scale_rows(v)
+    x = np.asarray(x, np.float32)
+    return x * np.asarray(v, np.float32).reshape((-1,) + (1,) * (x.ndim - 1))
 
 
 def take(x: Wt | np.ndarray, idx: np.ndarray, dim: int = 0) -> Wt | np.ndarray:

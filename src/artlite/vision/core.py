@@ -39,7 +39,8 @@ core copies it into its workspace and releases the slot. Kinds:
   the taps' offsets in the command (C_TOFF), 8 tokens 80 elements apart; mode 1 times a C row block (a causal 1-D
   conv), mode 2 + a bias, SiLU of the strip first where C_DWS (a stride-2 3 x 3 conv);
 - ``K_APPLY`` (roles gn / ln): GroupNorm (+ SiLU) / LayerNorm / RMSNorm of C_NBLK 80-channel blocks of a bf16 C tile (the A
-  stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block: the next B slot holds gamma,
+  stream: 3 row blocks per A half, ``ops.Apply``) -> bfp16 panels [rb][cb] per block (C_APC: bf16 C tiles, each row
+  block an output chunk of its 1280 B and 160 B after it, which the next one's receive overwrites): the next B slot holds gamma,
   beta (GroupNorm [c16][gamma 16 | beta 16], LayerNorm [gamma | beta], fp32); GroupNorm (C_JOIN: the images are one
   image's halves, their sums added): the B slots after it C_NREC
   group records (``REC_SLOT`` per slot, summed); LayerNorm: the first A object the tile's per-token records of the
@@ -81,7 +82,7 @@ CMD = WordMap("vision command", CMD_WORDS, objects=True)
 _H = CMD.common
 (C_KIND, C_M, C_NTILE, C_NPASS, C_NKT, C_NRES, C_OUT, C_STATS, C_GSIZE, C_CH0, C_G0, C_NBLK, C_MODE, C_NREC, C_INVN,
  C_EPS, C_NUNIT, C_NQP, C_NG, C_NK, C_CONV, C_NCH, C_R, C_ROT, C_STF, C_ND, C_NKP, C_TPAR, C_JOIN, C_RAISE, C_DENSE, C_NLIVE,
- C_QKN, C_QMASK, C_ROPE2, C_EPI, C_GINV, C_NOBJ, C_DWM, C_NTAP, C_DWS, C_NPAIR, C_GATE, C_DWC) = _H.words(
+ C_QKN, C_QMASK, C_ROPE2, C_EPI, C_GINV, C_NOBJ, C_DWM, C_NTAP, C_DWS, C_NPAIR, C_GATE, C_DWC, C_APC) = _H.words(
     "C_KIND C_M C_NTILE C_NPASS C_NKT C_NRES C_OUT C_STATS C_GSIZE C_CH0 C_G0 C_NBLK C_MODE C_NREC C_INVN C_EPS C_NUNIT C_NQP "
     "C_NG C_NK C_CONV C_NCH C_R C_ROT C_STF C_ND C_NKP C_TPAR C_JOIN "
     "C_RAISE "  # (attention: later key groups may raise the reference max: ``sd15_attn_raise``)
@@ -96,7 +97,8 @@ _H = CMD.common
     # (attention of d 40: the byte of the output gate's factors 1 / sigmoid(g) (bf16) in a unit's query object (0: none);
     # role g's at WIN_GATE)
     "C_GATE "
-    "C_DWC",  # (K_DW1 mode 1: a half's C row block, in elements after its strip)
+    "C_DWC "  # (K_DW1 mode 1: a half's C row block, in elements after its strip)
+    "C_APC",  # (K_APPLY: the output as bf16 C tiles, a row block an output chunk, instead of bfp16 panels)
     at=0)
 C_ZERO = _H.block("C_ZERO", 16, at=48)  # (16 zero words: a residual of zeros)
 # the values of the header words

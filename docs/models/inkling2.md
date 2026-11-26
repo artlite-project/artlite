@@ -14,6 +14,7 @@ file's (temperature 1, all tokens).
 $ARTLITE_MODELS_DIR/unsloth/Inkling-2-Mini-GGUF/        unsloth/Inkling-2-Mini-GGUF
     Inkling-2-Mini-UD-Q4_K_XL.gguf                      (NVFP4 and Q8_0 experts, Q8_0 attention, BF16 router, controllers)
     dspark-Inkling-2-Mini-Q8_0.gguf                     (its DSpark drafter: optional)
+    mmproj-F16.gguf                                     (its vision encoder: optional, for images)
 ```
 
 The drafter is the first `dspark-*.gguf` beside the model file (or in the repository's root, or a `dspark/` directory
@@ -28,6 +29,24 @@ level, without it `none`. The model opens its own blocks (`<|message_model|><|co
 `<|content_text|>`); the thought comes back as `reasoning_content` (artlite-server). Tools are declared to the model as
 the template writes them (one JSON line in a `tool_declare` block); artlite-server does not yet parse the model's calls
 (`<|content_invoke_tool_json|>`) into `tool_calls`. A generation ends at `<|content_model_end_sampling|>`.
+
+## Images
+
+With its vision encoder (`--mmproj unsloth/Inkling-2-Mini-GGUF/mmproj-F16.gguf`; artlite-server's router pairs the
+mmproj of the model's directory), a prompt takes images: [artlite-cli](../cli.md)'s `--image`, `image_url` parts through
+[artlite-server](../server.md). An image goes in at its own size, padded at the bottom and the right to multiples of 40
+pixels: a token per 40 x 40 pixels (2 x 2 patches of 20), 520 tokens for a 1024 x 768 image; one of more than 4096
+tokens (`--image-max-tokens`) is resized under that first, as llama.cpp does. The encoder (23 layers 1024 wide over the
+image's patches and a class token) runs on the NPU in a hardware context of its own (the vision overlay:
+`src/models/inkling2v/`), then the image's tokens go through the prefill as text does; a conversation's image runs the
+encoder once.
+
+IMAGES_TABLE
+
+Accuracy: per token the encoder's embeddings are ~4-5% from a float64 encoder's (median; llama.cpp's own are 1.3% off:
+its pixels rounded to fp16, which the network's 23 layers amplify). Teacher-forced over a description of an image after
+an essay paragraph, the model with the NPU's embeddings is at KL 0.0025 from llama.cpp's run of the same file and
+mmproj (on llama.cpp's own image rows: 0.0012), the argmax the same on 80 of 81 tokens.
 
 ## How the NPU path works
 

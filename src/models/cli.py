@@ -106,7 +106,7 @@ def arg_parser() -> argparse.ArgumentParser:
     vis.add_argument("--image-min-tokens", type=int,
                      help="an image's tokens at least (Qwen3-VL's, LFM3-VL's mmproj; default 8 and 64, llama.cpp's)")
     vis.add_argument("--image-max-tokens", type=int,
-                     help="an image's tokens at most (Qwen3-VL's, LFM3-VL's mmproj; default 4096, llama.cpp's)")
+                     help="an image's tokens at most (Qwen3-VL's, LFM3-VL's, Inkling 2's mmproj; default 4096, llama.cpp's)")
     aud = p.add_argument_group("audio in the prompt (LFM3-Audio)")
     aud.add_argument("--audio", action="append", default=[],
                      help=f"an audio file (repeatable; WAV, MP3, FLAC, Ogg Vorbis): where the prompt has {MEDIA_MARKER}, "

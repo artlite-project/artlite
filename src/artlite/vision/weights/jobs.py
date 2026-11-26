@@ -61,7 +61,8 @@ class Slots:
     table of every job packed (``table`` / ``restore``: a cached build's)."""
 
     def __init__(self):
-        self.pending: list[tuple] = []  # (image, offset, npo, nkt, hilo, [(source, scale, rows int32, runs int32)])
+        self.pending: list[tuple] = []  # (image, offset, npo, nkt, hilo, [(source, scale, rows int32, runs int32,
+        # row scales float32)])
         self.done: list[tuple] = []
 
     def add(self, g: Gemm, w: Wt, at: dict[int, tuple[str, int]]) -> None:
@@ -74,7 +75,8 @@ class Slots:
             idx = g.weight_rows(row)
             assert idx.max() < w.shape[0], (idx.max(), w.shape)
             self.pending.append((image, offset, g.npo, g.nkt, g.hilo,
-                                 [(p.source, p.scale, np.where(p.rows[idx] >= 0, p.rows[idx], -1).astype(np.int32), r)
+                                 [(p.source, p.scale, np.where(p.rows[idx] >= 0, p.rows[idx], -1).astype(np.int32), r,
+                                   np.ones(len(idx), np.float32) if p.rscale is None else p.rscale[idx])
                                   for p, r in parts]))
 
     def pack(self, npu: VisionDevice, *, threads: int = 0) -> None:
@@ -115,13 +117,13 @@ def job_arrays(jobs: list[tuple], place: Callable[[str], tuple[str, int, int]]) 
     srcs: list[Source] = []
     bufs: dict[str, int] = {}
     runs_at: dict[int, int] = {}
-    jt, pt, scales, rows, runs = [], [], [], [], []
+    jt, pt, scales, rows, rscales, runs = [], [], [], [], [], []
     nrow = nrun = 0
     for image, offset, npo, nkt, hilo, parts in jobs:
         chunk, off, n = place(image)
         assert offset + npo * nkt * D.Q <= n, (image, offset, npo, nkt, n)
         jt.append((bufs.setdefault(chunk, len(bufs)), off + offset, npo, nkt, int(hilo), len(pt), len(parts)))
-        for s, scale, r, u in parts:
+        for s, scale, r, u, rs in parts:
             if s.name not in src:
                 src[s.name] = len(srcs)
                 srcs.append(s)
@@ -132,10 +134,12 @@ def job_arrays(jobs: list[tuple], place: Callable[[str], tuple[str, int, int]]) 
             pt.append((src[s.name], nrow, runs_at[id(u)], len(u)))
             scales.append(scale)
             rows.append(r)
+            rscales.append(rs)
             nrow += len(r)
     return {"sources": srcs, "buffers": list(bufs), "jobs": np.array(jt, np.int64).reshape(-1, 7),
             "parts": np.array(pt, np.int64).reshape(-1, 4), "scales": np.array(scales, np.float32),
             "rows": np.concatenate(rows) if rows else np.zeros(0, np.int32),
+            "rscales": np.concatenate(rscales) if rscales else np.zeros(0, np.float32),
             "runs": np.concatenate(runs) if runs else np.zeros((0, 4), np.int32)}
 
 
@@ -151,5 +155,5 @@ def pack_arrays(t: dict, view: Callable[[str], np.ndarray], *, threads: int = 0)
             f = files[s.file[0]]
         ts.append((s.kind, s.raw, s.rows, s.cols, f))
     _native.pack_slots([view(b) for b in t["buffers"]], ts, t["jobs"], t["parts"], t["scales"],
-                       np.ascontiguousarray(t["rows"], np.int32), np.ascontiguousarray(t["runs"], np.int32), fl,
-                       threads=threads)
+                       np.ascontiguousarray(t["rows"], np.int32), np.ascontiguousarray(t["rscales"], np.float32),
+                       np.ascontiguousarray(t["runs"], np.int32), fl, threads=threads)
