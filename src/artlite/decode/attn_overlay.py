@@ -399,12 +399,15 @@ class AttentionOverlay(ModelOverlay):
                     seq.fill("X", c, dev.address("ACT", reg), n * XB)
             if last:
                 self._weight_run(seq, weights, blocks=slice(1, None) if before else slice(None))
-            for c in range(chain - 1, COLS, chain):
-                h = c // chain
-                if own:
-                    for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
+            ends = range(chain - 1, COLS, chain)
+            if own:  # (round-robin over the chain ends: a wait for an end's oldest task, its queue full, holds back no
+                # other end's: the records, its ring and o pass a channel's 4 queued tasks from S 2 on)
+                for i in range(len(kv.emit_order(p=0, S=n, hd=kind.hd, a_bytes=T, kp=self.kp))):
+                    for c in ends:
                         st.recs.append(Rec(seq.drain("D", c, dev.address("KV", self.kv_off[src]), 2 * self.at.d_len),
-                                           L, h, u, i))
+                                           L, c // chain, u, i))
+            for c in ends:
+                h = c // chain
                 o = next(rg for rg in self._o_inputs(L) if rg.k0 <= nq * h < rg.k0 + rg.K)  # (its K group)
                 at = dev.address("ACT", o.off + o.x0 + 2 * sp * (nq * h - o.k0) + 16 * a)  # ([k block][slot sp][8])
                 seq.drain("D", c, at, 2 * n * nq, None if n == sp else (4 * n, nq // 8, 4 * sp, 4 * sp * nq // 8))
