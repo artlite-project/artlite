@@ -58,6 +58,7 @@ SMOKE = (
     # host
     "decode/test_kv.py", "test_overlay.py", "test_gguf_model.py", "operators/test_render_cache.py", "test_sampling.py",
     "prefill/test_pace.py", "minicpmv/test_host.py", "moe/test_route.py", "moe/test_plan.py", "spark/test_host.py",
+    "moss_tr/test_host.py",
     "vision/test_weights.py", "test_probe.py::test_page_cases", "qwen3vl/test_ref.py::test_sizes",
     "qwen3vl/test_encoder.py::test_layout[64-64]",
     "gemm/test_dma.py::test_gemm_q_dataflow", "gemm/test_dma.py::test_gemm_qd_planar_dataflow",

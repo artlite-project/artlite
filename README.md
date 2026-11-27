@@ -47,6 +47,9 @@ device rather than for portability.
   live with the NPU busy a sixth of the time; it speaks text (`/tts`, `/v1/audio/speech`) and answers in voice
   (a chat's audio output, realtime conversations) at ~2.5x real time, as intelligibly as llama.cpp's
   ([LFM3-Audio](docs/models/lfm3.md#lfm3-audio-2b-speech)).
+- **Transcriptions with timestamps and speakers.** [MOSS-Transcribe-Diarize 0.9B](docs/models/moss.md) (a Hugging Face
+  checkpoint directory, Apache-2.0) answers a clip of up to 30 s with the model's timestamped, `[S01]`-tagged
+  segments: a Whisper encoder and a Qwen3-0.6B decoder on the NPU ([transcription](docs/models/moss.md)).
 - **Pictures, videos and voice in one model.** LFM3-Omni answers about pictures, videos with their sound and spoken
   questions, in text or in its own voice, realtime conversations included: a 30 s 720p video's first token in ~4 s,
   3x sooner than llama.cpp on the iGPU, with under a third of its energy
@@ -119,6 +122,7 @@ Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](doc
 | [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.7x on code and math); tool calls, thinking levels |
 | [Flint](docs/models/flint.md) | GGUF int4 (Recursive's official file) | prefill, decode (a 40B mixture of experts, ~2.5B active: 31 tokens/s at 1K); tool calls, thinking |
 | [Inkling 2 Mini](docs/models/inkling2.md) | GGUF UD-Q4_K_XL (unsloth) | decode and a prefill (a 26B mixture of experts whose middle layers loop 3 times: 11.5 tokens/s at 1K, a 1K prompt in 2.2 s, 8K in 12.8 s), its DSpark drafter (up to 1.2x on code); images through its vision encoder; thinking, several requests at a time |
+| [MOSS-Transcribe-Diarize 0.9B](docs/models/moss.md) | OpenMOSS-Team's checkpoint directory (BF16) | transcription: a clip's speech through its audio tower (a Whisper encoder on the vision overlay, its VQ adaptor), a Qwen3-0.6B decoder writing the timestamped, speaker-tagged text |
 | [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
 
 Each model's tested files and the planned models: [Models](docs/models/README.md).
