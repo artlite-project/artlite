@@ -18,7 +18,8 @@ Rows, one JSON object per line, sorted; a function or core row lists the apps it
   content hash (demangled), the section that defines it (a helper several sections use: the first one), measure_ii's
   cycles of a call (callees included; ``upper``: branches counted on every path or an early exit), code bytes, stack,
   calls per call of the functions it calls (by key; null: a trip count unknown) and its loops in tree order (``at``: the
-  item its line is in and the line within it, "<name>+N", or a header's file:line; ``parent``: the enclosing loop's
+  item its line is in and the line within it, "<name>+N", or a header's file:line (a helper added to ``kernel_lib.h``
+  goes at its end: lines inserted above others move every app's rows); ``parent``: the enclosing loop's
   index, -1 at the top; sched, II, NS; ``bound``: a one-block loop's resource bound, its busiest issue slot or port;
   ``iters``: iterations per entry; ``spills``: spill and reload instructions; ``bytes``: its body's);
 - a core row, ``{"core", "design", "entry", "apps", "bytes"}``: the most program memory a core of that row takes in a

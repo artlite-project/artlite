@@ -317,7 +317,10 @@ Levers that worked (the decode overlay's main core: -1.1 KB):
   design keeps on the array across dispatches needs the same: Linux suspends the idle device after 5 s, and a resume
   restores its configuration alone). Decode overlays page the tile formats beyond the one of the most bytes when
   four or more do not fit (`DecodeOverlayOperator(paged=)`: Llama 3B Q3_K_M, a few loads per step, the main core 2.4 KB
-  freer). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
+  freer). Each page also takes a memtile BD per core half, beside the A FIFO's in the same half: formats that share a
+  page (`PAGE_GROUPS`: Inkling's BFP16 + Q8_0, its A FIFO 2 objects deeper, no loads between them) and compact kernels
+  where a slot is short (`gemv.render(compact=)`: a format's loops of the fewest cycles a byte unpipelined, Q5_K 608 B
+  for ~20% of its half tile, still under the tile's DMA time). Put a rarely used epilogue in the page of the role that runs before it (sd15's GEGLU in the LayerNorm page:
   1.7 KB off the resident code). The vision overlay's pages hold 7232 B (16 KB less its 9152-B resident code; sizes:
   `llvm-readelf -S design.mlir.prj/page_0_2_<role>.elf`, `.ptxt`): a feature for a full role goes into a role of its own
   (a template instance of the role's code with the feature on and its unused paths off: role g), not into a helper the
