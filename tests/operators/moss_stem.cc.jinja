@@ -1,0 +1,65 @@
+// The MOSS encoder stem's kernels (``tests/operators/moss_stem.py``): the C stripe's zeroing, and the two epilogues
+// (GELU through its table, with or without the position embedding's residual). The GEMM itself is ``gemm/mac.py``'s MAC
+// template (bfp16ebs8 8x8x8, fp32 C), rendered next to this file with a 16 x 160 stripe per core.
+
+{% if not add_only %}
+extern "C" {
+// 2560 fp32 = a core's C stripe (16 tokens x 160 output channels, 8x8 sub-blocks)
+void {{ p }}_zero(float *__restrict c)
+{
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ nsub }}; i++)
+        aie::store_v(c + 32 * i, aie::zeros<float, 32>());
+}
+}
+
+// C stripe -> bf16, the GELU form of {{ act }} through its table's two copies, then (res) the position embedding added,
+// as bf16 tokens of 1024-bit vectors (64 values: 8 tokens x 8 channels of one sub-block)
+#define {{ p }}_STORE64(dst, i, val) aie::store_v((dst) + 64 * (i), (val))
+
+extern "C" {
+void {{ p }}_epi(const float *__restrict c, bfloat16 *__restrict s, bfloat16 *__restrict out,
+                 const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ nsub }}; i++) {
+        aie::store_v(s + 64 * i, aie::accum<accfloat, 32>(aie::load_v<32>(c + 64 * i)).template to_vector<bfloat16>());
+        aie::store_v(s + 64 * i + 32, aie::accum<accfloat, 32>(aie::load_v<32>(c + 64 * i + 32)).template to_vector<bfloat16>());
+    }
+    {{ act_t }}<{{ c_elems }}>(s, out, tab_ab, tab_cd);
+}
+}
+
+// the same with the position embedding's residual: act into y (a scratch buffer), then y + res -> out
+extern "C" {
+void {{ p }}_epir(const float *__restrict c, bfloat16 *__restrict s, bfloat16 *__restrict y,
+                  bfloat16 *__restrict out, const bfloat16 *__restrict res,
+                  const uint32_t *__restrict tab_ab, const uint32_t *__restrict tab_cd)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ nsub }}; i++) {
+        aie::store_v(s + 64 * i, aie::accum<accfloat, 32>(aie::load_v<32>(c + 64 * i)).template to_vector<bfloat16>());
+        aie::store_v(s + 64 * i + 32, aie::accum<accfloat, 32>(aie::load_v<32>(c + 64 * i + 32)).template to_vector<bfloat16>());
+    }
+    {{ act_t }}<{{ c_elems }}>(s, y, tab_ab, tab_cd);
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ nsub }}; i++)
+        {{ p }}_STORE64(out, i, aie::add(aie::load_v<64>(y + 64 * i), aie::load_v<64>(res + 64 * i)));
+}
+}
+{% endif %}
+
+extern "C" {
+// the position table's addition, in the C stripe layout: 1024-bit vectors of 64 values (8 tokens x 8 channels)
+void {{ p }}_add(const bfloat16 *__restrict col_a, const bfloat16 *__restrict col_b, bfloat16 *__restrict out,
+                 int32_t band)
+{
+    const bfloat16 *__restrict a = col_a + {{ c_elems }} * band;  // (the core's stripe in its column's object)
+    const bfloat16 *__restrict b = col_b + {{ c_elems }} * band;
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ nsub }}; i++)
+        aie::store_v(out + 64 * i, aie::add(aie::load_v<64>(a + 64 * i), aie::load_v<64>(b + 64 * i)));
+}
+}
