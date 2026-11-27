@@ -18,6 +18,7 @@ directory: the GGUF architecture it opens as, ``artlite.hf_model``) and opens it
 | ``spark2_5`` | ``spark`` | Spark-X2.5 / X2.6 4B, 1.7B (sliding-window and full attention, head_dim 256) |
 | ``flint`` | ``flint`` | Recursive's Flint (40B: 256 experts of which 6 per token; sliding-window and full attention with sinks) |
 | ``inkling2_loop``, ``inkling2`` | ``inkling2`` | Thinking Machines' Inkling 2 Mini (26B: 128 experts of which 8 per token, 12 of 24 layers looped 3 times; decode on the NPU, prompts in prefill chunks, its DSpark drafter) |
+| ``moss`` | ``moss_tr`` | MOSS-Transcribe-Diarize 0.9B (a Qwen3-0.6B decoder and a Whisper encoder on the vision overlay: audio clips in prompts) |
 | ``StableDiffusionPipeline`` | ``sd15`` | Stable Diffusion 1.5, text to image (the UNet and the VAE decoder on the NPU) |
 """
 
@@ -51,6 +52,7 @@ ARCHITECTURES = {
     "flint": ("models.flint.flint", "Flint"),
     "inkling2_loop": ("models.inkling2.inkling", "Inkling"),
     "inkling2": ("models.inkling2.inkling", "Inkling"),
+    "moss": ("models.moss_tr.model", "Moss"),
 }
 # diffusers pipeline class (``_class_name`` of model_index.json) -> (module, class), imported on use
 PIPELINES = {

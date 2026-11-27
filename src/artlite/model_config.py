@@ -370,12 +370,19 @@ HF_CHECKPOINTS = {"qwen3-0.6B": "Qwen/Qwen3-0.6B", "qwen3.5-0.8B": "Qwen/Qwen3.5
                   "qwen3.8-27B-paro-int5": "Launch80/Qwen3.8-27B-PARO-int5",
                   "qwen3.6-35B-A3B-paro": "z-lab/Qwen3.6-35B-A3B-PARO", "gemma-4-E2B": "google/gemma-4-E2B-it",
                   "gemma-4-E2B-paro": "z-lab/gemma-4-E2B-it-PARO", "gemma-4-E4B-paro": "z-lab/gemma-4-E4B-it-PARO",
-                  "llama-8B-paro": "z-lab/Llama-3.1-8B-Instruct-PARO"}
+                  "llama-8B-paro": "z-lab/Llama-3.1-8B-Instruct-PARO",
+                  "moss-tr": "OpenMOSS-Team/MOSS-Transcribe-Diarize"}
 
 
 def checkpoint(name: str) -> str:
     """A Hugging Face checkpoint directory of ``HF_CHECKPOINTS`` (by its key)."""
     return os.path.join(MODELS_DIR, HF_CHECKPOINTS[name])
+
+
+def moss_dir() -> str:
+    """MOSS-Transcribe-Diarize's directory (the decoder's shard and the tokenizer; the audio tower's tensors are the
+    front end's, fetched separately)."""
+    return checkpoint("moss-tr")
 
 
 def sd15_dir() -> str:
@@ -413,7 +420,7 @@ class LlamaConfig:
     neox: bool = False
     qk_norm: bool = False
 
-    ARCHS: ClassVar[tuple[str, ...]] = ("llama", "qwen3", "vllm-decision2")
+    ARCHS: ClassVar[tuple[str, ...]] = ("llama", "qwen3", "vllm-decision2", "moss")
     # (llama.cpp's end-of-generation tokens: Llama 3's, Qwen3's)
     EOG: ClassVar[tuple[str, ...]] = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>")
 

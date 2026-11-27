@@ -657,6 +657,27 @@ class _Qwen3(_Adapter):
     arch, model_arch, pre, split = "qwen3", gguf.MODEL_ARCH.QWEN3, "qwen2", _QWEN2_SPLIT
 
 
+class _Moss(_Qwen3):
+    """MOSS-Transcribe-Diarize's decoder (``model.language_model.*``): Qwen3-0.6B's shape, the base's name filter moving
+    the prefix to ``model.``, its tied output weight the tokens' embedding (the checkpoint has no ``lm_head.weight``; the
+    audio tower's and the VQ adaptor's tensors are the front end's: ``hf_f32`` reads them by their checkpoint names, the
+    GGUF map does not know them).
+
+    Its architecture is ``moss`` (the metadata's keys are ``moss.*``; the tensors keep the Qwen3 name map, and
+    ``model_config.LlamaConfig`` reads the keys through the file's arch, so its ``ARCHS`` lists this one): the language
+    model alone is a Qwen3, a MOSS is a Qwen3 whose prompts' audio spans are the tower's rows (``models.moss_tr``)."""
+
+    arch = "moss"
+
+    def filter(self, name: str) -> str | None:
+        return super().filter(name) if name.startswith("model.language_model.") else None
+
+    def extra(self) -> list[tuple[str, _Entry]]:
+        if "lm_head.weight" in self.hf._hf:
+            return []
+        return [("output.weight", self.hf._hf["model.language_model.embed_tokens.weight"])]
+
+
 class _Llama(_Adapter):
     """LlamaForCausalLM (LlamaModel): ``vocab_size`` and ``rope.dimension_count`` keys, the llama3 RoPE factors as
     ``rope_freqs``."""
@@ -923,6 +944,7 @@ _ADAPTERS: dict[str, type[_Adapter]] = {
     "Qwen3_5MoeForCausalLM": _Qwen35Moe,
     "Gemma4ForConditionalGeneration": _Gemma4,
     "Gemma4ForCausalLM": _Gemma4,
+    "MossTranscribeDiarizeForConditionalGeneration": _Moss,
 }
 
 
