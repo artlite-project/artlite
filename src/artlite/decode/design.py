@@ -302,6 +302,9 @@ class DecodeOverlayOperator(ArtcOperator):
     META_KINDS: ClassVar[tuple[Kind, ...]] = ()  # the kinds of X objects (``protocol.XMETA``) the model's cores add to the design's
     INK_PLAIN = False  # (states) the F_INK steps without the conv: cur += the phase's rows (a DSpark drafter's residual)
     COMPACT: ClassVar[tuple[str, ...]] = ()  # formats whose GEMV kernels trade cycles for code (``gemv.render(compact=)``)
+    # formats that share a code page where all of them are paged (``pages``: a page and its memtile BDs fewer, no page
+    # loads between them)
+    PAGE_GROUPS: ClassVar[tuple[tuple[str, ...], ...]] = ()
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -388,6 +391,10 @@ class DecodeOverlayOperator(ArtcOperator):
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
         self.paged = tuple(sorted(paged))
         assert set(self.paged) <= set(rows), (paged, rows)
+        # (the code pages of the paged formats in page-id order: a group of PAGE_GROUPS whose formats are all paged one,
+        # every other format its own)
+        groups = [tuple(sorted(g)) for g in self.PAGE_GROUPS if set(g) <= set(self.paged)]
+        self.pages = tuple(sorted(groups + [(f,) for f in self.paged if not any(f in g for g in groups)]))
         # (the formats with a gather table: one table slot per core, TAB; a resident format's table resident, else every
         # one in its format's page)
         self.tables = [f for f in self.rows if slot(f).mmv_table(f) is not None]
@@ -396,6 +403,7 @@ class DecodeOverlayOperator(ArtcOperator):
         self.stacks = STACK8 if slots == 8 and self.tables else (self.STACK, self.HELPER_STACK)  # (main, helper)
         assert len([f for f in self.tables if f not in self.paged]) <= 1 and \
             (set(self.tables) <= set(self.paged) or len(self.tables) == 1), (self.tables, self.paged)
+        assert not any(set(g) & set(self.tables) for g in self.pages if len(g) > 1), self.pages  # (a page's table slot)
         assert not split or (gu_win and moe is None), "split gate / up blocks: dense designs with the gate / up windows"
         self.split = split
         self.rowsplit = sorted(f for f in rows if gemv.row_split(f, nsb))
@@ -449,7 +457,7 @@ class DecodeOverlayOperator(ArtcOperator):
         the memtile share the even half of the memtile's BDs (0 .. 23), those out of it the odd half (24 .. 47), each
         with the X stream's and the paged formats' from the half's top (``pg_store``: two per format in the odd half, or
         with ``pg_split`` one in each)."""
-        pages = (len(self.paged) if self.pg_split else 48 - self.pg_store[0]) if self.paged else 0
+        pages = (len(self.pages) if self.pg_split else 48 - self.pg_store[0]) if self.paged else 0
         return max(type(self).A_DEPTH, min(A_DEPTH_MOE, 24 - self.X_DEPTH - pages))
 
     @property
@@ -563,7 +571,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
                           pg=self._page_spec() if self.paged else None, rg=self.rg, yb=self.yb, slots=self.slots,
-                          tab=self.tab, rg_all=self.qtails, compact=self.COMPACT)
+                          tab=self.tab, rg_all=self.qtails, compact=self.COMPACT, pages=self.pages)
         src += self._extra_src(p)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
               "XS_SLOT": gemv.xs_slot(self.slots),
@@ -592,7 +600,8 @@ class DecodeOverlayOperator(ArtcOperator):
                                  rg=self.rg, hdr=self.post and not self.rot, RWP_AT=RWP_AT, RWS_AT=RWS_AT, RPL_AT=RPL_AT,
                                  states=self.states, units=self.units, CPARTS=self.cparts, situ=self.situ,
                                  ink_page=self.ink_page, pg_state=0x70000 + PG_STATE, INK_STATES=INK_STATES,
-                                 INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS, paged_fmts=list(self.paged),
+                                 INK_BANKS=INK_BANKS, BLEND_OBJECTS=BLEND_OBJECTS,
+                                 paged_pages=[(g, sorted({self.rows[f] for f in g})) for g in self.pages],
                                  ink_plain=self.INK_PLAIN,
                                  **self._moe_vars(p, consts), **consts)
 
@@ -607,7 +616,7 @@ class DecodeOverlayOperator(ArtcOperator):
                              units=self.units)
         subs, meta, _ = moe_k.plan_layout(self.units)
         return {"route": route, "SIDE": self.max_g - 1, "PLAN_SUBS": subs, "PLAN_META": meta,
-                "ITEM_WORDS": ITEM_WORDS, "route_page": len(self.paged) + 1 if self.route_page else 0}
+                "ITEM_WORDS": ITEM_WORDS, "route_page": len(self.pages) + 1 if self.route_page else 0}
 
     @property
     def route_page(self) -> bool:
@@ -620,7 +629,7 @@ class DecodeOverlayOperator(ArtcOperator):
         """(states) The first of the helper's two pages of the residual stream's work (``hink_all``: the step, the partial
         sums, the coefficient sets; then ``hmix``: the blends; their ids after the formats' and the routing's pages), 0:
         resident (no paged formats)."""
-        return len(self.paged) + 1 + int(self.route_page) if self.states and self.paged else 0
+        return len(self.pages) + 1 + int(self.route_page) if self.states and self.paged else 0
 
     @property
     def a_out_channel(self) -> int | None:
@@ -633,7 +642,7 @@ class DecodeOverlayOperator(ArtcOperator):
         memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves; an MoE design of more
         than 4 paged formats, whose page BDs then take both halves of the memtile's BDs alike and leave the A stream's
         FIFO the more (``moe_a_depth``)."""
-        return self.slots == 8 or (self.moe and len(self.paged) > 4)
+        return self.slots == 8 or (self.moe and len(self.pages) > 4)
 
     @property
     def pg_channels(self) -> tuple[int, int]:
@@ -642,7 +651,7 @@ class DecodeOverlayOperator(ArtcOperator):
         and 5."""
         if self.pg_split:
             return 4, 5
-        ch = PG_CH if len(self.paged) <= 4 or self.moe else 4
+        ch = PG_CH if len(self.pages) <= 4 or self.moe else 4
         return ch, ch
 
     @property
@@ -653,14 +662,14 @@ class DecodeOverlayOperator(ArtcOperator):
         ``PG_ROOM``) plus 6 KB per paged format with a gather table (its two 2 KB copies), the store ending at the
         memtile's end (``pg_split``: the first BD of the main cores' pages; the helpers' end at BD 47, their bytes the
         second half)."""
-        n = len(self.paged)
+        n = len(self.pages)
         if n <= 4 and not self.tables and not self.pg_split:
             return PG_BD, PG_STORE, PG_STORE_BYTES
         if not self.pg_split and n > PG_ONE_CHANNEL:
             raise ValueError(f"{n} paged formats: a design of 4 slots holds the pages of {PG_ONE_CHANNEL} (its memtile "
                              f"channel's BDs; a design of 8 slots, a channel per core half: {PG_SPLIT})")
         page = -(-(3 * PG_ROOM // 2 + 64) // 64) * 64  # (a page's stream, its state and wake words included)
-        size = max(0xC000, 2 * page * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
+        size = max(0xC000, 2 * page * len(self.paged)) + 0x3000 * len([f for f in self.tables if f in self.paged])
         ch = self.pg_channels[0]
         return 24 * (ch % 2) + 24 - (1 if self.pg_split else 2) * n, 0x80000 - size, size
 
@@ -669,14 +678,14 @@ class DecodeOverlayOperator(ArtcOperator):
         bd0, base, size = self.pg_store
         if not self.pg_split:
             return ((self.pg_channels[0], bd0, base, size),)
-        n = len(self.paged)
+        n = len(self.pages)
         return ((4, bd0, base, size // 2), (5, 48 - n, base + size // 2, size - size // 2))
 
     def _page_spec(self) -> paging.PageSpec:
         """The pager of the paged formats (main core: half 0, helper: half 1)."""
         (h0, c0), (h1, c1) = (paging.request(stream_id=i, channel=ch) for i, ch in zip(PG_REQ_ID, self.pg_channels))
         bd0 = self.pg_store[0]
-        bd1 = self.pg_halves()[1][1] if self.pg_split else bd0 + len(self.paged)
+        bd1 = self.pg_halves()[1][1] if self.pg_split else bd0 + len(self.pages)
         return paging.PageSpec(state=0x70000 + PG_STATE, wake=PG_WAKE, hdr=(h0, h1), bd0=(bd0, bd1), ctl=(c0, c1))
 
     def page_store(self) -> tuple[paging.Store, ...] | None:
@@ -688,7 +697,7 @@ class DecodeOverlayOperator(ArtcOperator):
         fp = f"{self.pfx}m"
 
         def pager(h: int, row: int, stack: int) -> paging.Pager:
-            pages = gemv.page_entries(fp, self.paged, h)
+            pages = gemv.page_entries(fp, self.pages, h)
             calls = {f"{fp}_mmv": tuple(e for es in pages.values() for e in es)}
             if h == 1 and self.route_page:  # (the routing: the helper's page after the formats', ``route_page``)
                 pages["ROUTE"] = calls[f"{self.pfx}_hbegin"] = (f"{self.pfx}_pgr_route",)
@@ -698,10 +707,10 @@ class DecodeOverlayOperator(ArtcOperator):
                 calls[f"{self.pfx}_htask"] = (f"{self.pfx}_pgr_ink", f"{self.pfx}_pgr_mix")
             if h == 1 and self.qtails and self.moe:  # (a gate / up group's epilogue: an entry of every format's page, the
                 # page of its tiles' format is in: ``hqgu``)
-                for f in self.paged:
-                    pages[f] = (*pages[f], f"{self.pfx}_pgq_{f.lower()}")
-                calls[f"{self.pfx}_htask"] = (*calls.get(f"{self.pfx}_htask", ()),
-                                              *(f"{self.pfx}_pgq_{f.lower()}" for f in self.paged))
+                pgq = {gemv.page_name(g): f"{self.pfx}_pgq_{'_'.join(f.lower() for f in g)}" for g in self.pages}
+                for name, entry in pgq.items():
+                    pages[name] = (*pages[name], entry)
+                calls[f"{self.pfx}_htask"] = (*calls.get(f"{self.pfx}_htask", ()), *pgq.values())
             return paging.link(wd, pages=pages, pager=f"{fp}_pg_request", calls=calls,
                                roots=(f"{self.pfx}_tile",) if h == 0 else (f"{self.pfx}_htask",), stack=stack,
                                cores=[(c, row) for c in range(COLS)], state=PG_STATE, wake=PG_WAKE,
@@ -710,7 +719,7 @@ class DecodeOverlayOperator(ArtcOperator):
         for h, (row, stack) in enumerate(zip((self.MAIN_ROW, self.HELPER_ROW), self.stacks)):
             pg = pager(h, row, stack)
             data = {f: tuple((a - 0x70000, t) for a, t in zip(self.tab[h], table_copies(slot(f).mmv_table(f))))
-                    for f in self.paged if f in self.tables}
+                    for f in self.paged if f in self.tables}  # (a format of a table: a page of its own)
             pagers.append(dataclasses.replace(pg, data=data) if data else pg)
         halves = self.pg_halves()
         groups = [tuple(pagers)] if len(halves) == 1 else [(pg,) for pg in pagers]

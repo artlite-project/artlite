@@ -121,19 +121,26 @@ _SRC = templating.source("artlite/decode/gemv.cc.jinja")
 _TEMPLATE = kernel_template(_SRC)
 
 
-def page_entries(p: str, paged: tuple[str, ...], h: int) -> dict[str, tuple[str, ...]]:
-    """The pages of core half h (``paging.link``'s ``pages``) of ``render(p, paged=)``: per paged format its entry, in
-    page-id order."""
-    return {f: (f"{p}_pgf{h}_{f.lower()}",) for f in paged}
+def page_name(page: tuple[str, ...]) -> str:
+    """A code page's name: its formats'."""
+    return "+".join(page)
+
+
+def page_entries(p: str, pages: tuple[tuple[str, ...], ...], h: int) -> dict[str, tuple[str, ...]]:
+    """The pages of core half h (``paging.link``'s ``pages``) of ``render(p, pages=)``: per page (its formats) its entry,
+    in page-id order."""
+    return {page_name(g): (f"{p}_pgf{h}_{'_'.join(f.lower() for f in g)}",) for g in pages}
 
 
 def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, paged: tuple[str, ...] = (),
            pg: paging.PageSpec | None = None, rg: bool = False, yb: int = 64, slots: int = SLOTS,
            tab: tuple[tuple[int, int], tuple[int, int]] | None = None, rg_all: bool = False,
-           compact: tuple[str, ...] = ()) -> str:
+           compact: tuple[str, ...] = (), pages: tuple[tuple[str, ...], ...] = ()) -> str:
     """The kernel source of ``{p}_mmv<H>`` for the tile formats ``fmts`` (tiles of ``tile_bytes`` over nsb
     super-blocks): the frame and the slots' ``mmv/<fmt>`` sources (``Slot.mmv_parts``). ``paged``: formats whose kernels
-    are code pages (``pg``: their pager), in page-id order (from 1). ``rg``: the format word's B_G4 tiles of the
+    are code pages (``pg``: their pager); ``pages``: their pages in page-id order (from 1), the formats of each (default:
+    a page a format; a page of several enters one entry, which dispatches on the format word). ``rg``: the format word's
+    B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``decode.image.Block.G``) put super-block 2 H + 1's rows
     ``yb`` floats after 2 H's instead of adding them; ``rg_all``: and those of ``RG_ALL`` (a design whose every format's
     tiles may be row groups: the tail tiles of ``decode.image.Region.qt`` regions), and B_G8 tiles of ``G8_FORMATS`` (row
@@ -143,6 +150,8 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     fewest cycles a byte unpipelined; Q5_K: 608 B less, ~20% more cycles a half tile)."""
     assert all(supported(f, nsb, slots) for f in fmts), (fmts, nsb, slots)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
+    pages = pages or tuple((f,) for f in paged)
+    assert sorted(f for g in pages for f in g) == sorted(paged), (pages, paged)
     assert not rg or (nsb == 4 and slots == 4), (rg, nsb, slots)
     assert slots == 4 or not any(row_split(f, nsb) for f in fmts), (fmts, nsb, slots)  # (row-split tiles: 4 slots)
     parts: list[str] = []
@@ -160,7 +169,8 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     # and a page may read a table that the resident format's kernels do not (Q4_1's al::neg_eye next to Q4_0);
     # keep_nz: a paged format reads the -z e_i panels and no resident one does: a page writes no data of its own)
     nz = [f for f in fmts if f in NZ_FORMATS]
-    return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pg=pg, pager=pager, parts=parts,
+    return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pages=[list(g) for g in pages], pg=pg,
+                            shared=any(len(g) > 1 for g in pages), pager=pager, parts=parts,
                             keep=bool(paged) and (set(paged) == set(fmts) or "Q6_KH" in paged),
                             keep_nz=bool(nz) and set(nz) <= set(paged),
                             rg=rg, rg_all=rg_all, compact=list(compact),

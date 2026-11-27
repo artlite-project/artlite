@@ -205,27 +205,41 @@ __attribute__((noinline)) void {{ p }}_mmv(uint8_t *__restrict a, const uint8_t 
 {% endif %}
 {% endfor %}
 {% if paged %}
-    // (a paged format: its page, then its entry, one signature: rg's ys for every page)
+    // (a paged format: its page, then its entry, one signature: rg's ys for every page; a page of several formats: the
+    // format word)
     int page = 1;
-{% for f in paged[1:] %}
-    page = fmt == {{ fid[f] }} ? {{ loop.index + 1 }} : page;
+{% for g in pages[1:] %}
+{% set i = loop.index + 1 %}
+{% for f in g %}
+    page = fmt == {{ fid[f] }} ? {{ i }} : page;
+{% endfor %}
 {% endfor %}
     {{ p }}_pg_need<H>(page, scr);
-    ((void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if rg else "" }}))(intptr_t)
-         ((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if rg else "" }});
+    using entry = void (*)(uint8_t *, const uint8_t *, const uint8_t *, float *, uint8_t *{{ ", int" if rg else "" }}
+                           {{- ", int32_t" if shared else "" }});
+    ((entry)(intptr_t)((const volatile int32_t *){{ pg.state }})[1])(a, xp, xs, y, scr{{ ", ys" if rg else "" }}
+                                                                     {{- ", fmt" if shared else "" }});
 {% endif %}
 }
 
 }  // namespace
-{% for f in paged %}
+{% for g in pages %}
 {% for h in (0, 1) %}
 
-// (a page: format {{ f }}'s half {{ h }}, entered through the pager's state words only; external, so that it stays in
-// the object for ``paging.link``)
-void {{ p }}_pgf{{ h }}_{{ f | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
-                                        float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
+// (a page: format{{ "s " ~ g | join(", ") if g | length > 1 else " " ~ g[0] }}, half {{ h }}, entered through the
+// pager's state words only; external, so that it stays in the object for ``paging.link``)
+void {{ p }}_pgf{{ h }}_{{ g | join("_") | lower }}(uint8_t *__restrict a, const uint8_t *__restrict xp,
+                                                 const uint8_t *__restrict xs, float *__restrict y,
+                                                 uint8_t *__restrict scr{{ ", int ys" if rg else "" }}
+                                                 {{- ", int32_t fmt" if shared else "" }})
 {
-    {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+{% for f in g[:-1] %}
+    if (fmt == {{ fid[f] }}) {
+        {{ p }}_{{ fn[f] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if f in rg_fmts else "" }});
+        return;
+    }
+{% endfor %}
+    {{ p }}_{{ fn[g[-1]] }}<{{ h }}>(a, xp, xs, y, scr{{ ", ys" if g[-1] in rg_fmts else "" }});
 }
 {% endfor %}
 {% endfor %}

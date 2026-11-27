@@ -3633,13 +3633,19 @@ void {{ p }}_pgr_route(const int32_t *__restrict m, int32_t *__restrict ws, int 
 }
 {% endif %}
 {% if qtails and moe %}
-{% for f in paged_fmts %}
+{% for g, rs in paged_pages %}
 
-// (the helper's page of {{ f }}: its second entry, a gate / up group's epilogue, ``hqgu``; external, as ``pgr_route``; c:
-// situ's constants, which the resident caller names so that they stay in its data)
-void {{ p }}_pgq_{{ f | lower }}(const int32_t *__restrict cmd, uint8_t *__restrict scr, const float *__restrict c)
+// (the helper's page of {{ g | join(", ") }}: its second entry, a gate / up group's epilogue, ``hqgu`` (of its formats' rows,
+// cmd's R); external, as ``pgr_route``; c: situ's constants, which the resident caller names so that they stay in its data)
+void {{ p }}_pgq_{{ g | join("_") | lower }}(const int32_t *__restrict cmd, uint8_t *__restrict scr, const float *__restrict c)
 {
-    {{ p }}_hqgu<{{ dict(rows)[f] }}>(cmd, scr);
+{% for r in rs[:-1] %}
+    if (((cmd[1] >> 8) & 255) == {{ r }}) {
+        {{ p }}_hqgu<{{ r }}>(cmd, scr);
+        return;
+    }
+{% endfor %}
+    {{ p }}_hqgu<{{ rs[-1] }}>(cmd, scr);
 }
 {% endfor %}
 {% endif %}

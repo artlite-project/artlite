@@ -75,13 +75,14 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
 
     @property
     def pg_store(self) -> tuple[int, int, int]:
-        """(beside the attention cores' pages: the even half's top BDs, a BD per format and core half; the store below
-        the attention's)"""
+        """(beside the attention cores' pages: the even half's top BDs, a BD per page and core half; the store below the
+        attention's, sized by the formats: a shared page's code at most theirs)"""
         if not (self.attn_pages and self.paged):
             return super().pg_store
         n = self.pg_bds
         page = -(-(3 * PG_ROOM // 2 + 64) // 64) * 64  # (a page's stream: ``DecodeOverlayOperator.pg_store``)
-        size = max(PG_STORE_BYTES, page * n) + 0x3000 * len([f for f in self.tables if f in self.paged])
+        streams = n + 2 * (len(self.paged) - len(self.pages))
+        size = max(PG_STORE_BYTES, page * streams) + 0x3000 * len([f for f in self.tables if f in self.paged])
         assert n <= 24 - 8, self.paged  # (the even half's top; its bottom the A and X FIFOs')
         return 24 - n, PG_STORE - size, size
 
@@ -94,9 +95,9 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
 
     @property
     def pg_bds(self) -> int:
-        """(paged formats) Their pages' BDs: a format's per core half, the routing's and the residual stream's pages of
+        """(paged formats) Their pages' BDs: a page's per core half, the routing's and the residual stream's pages of
         the helper (``route_page``, ``ink_page``)."""
-        return 2 * len(self.paged) + int(self.route_page) + 2 * int(self.ink_page > 0)
+        return 2 * len(self.pages) + int(self.route_page) + 2 * int(self.ink_page > 0)
 
     def moe_a_depth(self) -> int:
         """(beside the attention cores' pages: their BDs in the odd half, the formats' in the even half; as many objects
@@ -115,7 +116,7 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
         no weights while the shim streams the next phase's tiles into this FIFO: Gemma 4 E4B's 24 cache layers 24.13 ->
         23.78 ms with 20 objects, a PARO checkpoint's 28.65 -> 27.73 (16 as 20)."""
         pages = max(self.pg_bds, 48 - PG_BD) if self.paged and self.attn_pages else \
-            (len(self.paged) if self.pg_split else 48 - self.pg_store[0]) if self.paged else \
+            (len(self.pages) if self.pg_split else 48 - self.pg_store[0]) if self.paged else \
             (48 - PG_BD if self.attn_pages else 0)
         return max(type(self).A_DEPTH, min(self.A_DEPTH_MAX, 24 - self.X_DEPTH - pages))
 
