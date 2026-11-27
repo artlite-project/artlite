@@ -23,7 +23,8 @@ Either layout of a file: the repository's root (`inkling2`) or its `Mainline_Sup
 
 The drafter is the first `dspark-*.gguf` beside the model file (or in the repository's root, or a `dspark/` directory
 there; Q8_0 first) whose vocabulary and hidden size are the model's; `--spec-type none` runs without it,
-`-md FILE` names another. The models directory: [Installation](../install.md#models-directory).
+`-md FILE` names another (its drafts come from the screened LM head: with `ARTLITE_LM_SCREEN=0` it is left out). The
+models directory: [Installation](../install.md#models-directory).
 
 ## Thinking and tools
 
@@ -125,6 +126,11 @@ weights, 36 MB of caches at 4K positions (~140 MB at 33K). With `-np` above 1 th
 |---|---|---|
 | a prompt (the prefill, artlite-bench) | 472 tokens/s (2.17 s for 1024 tokens) | 578 tokens/s (56.7 s; 8K 12.8 s, 64K 132 s) |
 | generation (greedy, 256 tokens, essay summary) | 11.5 tokens/s | 9.7 tokens/s |
+
+UD-Q4_K_M: generation 11.7 tokens/s at 1K (a step 0.4 ms shorter than UD-Q4_K_XL's in the same session: its experts'
+1.80 GB against 1.86), prompts as fast as UD-Q4_K_XL's (its last 4 layers' expert gate / up 17% faster in the prefill,
+~0.5% of a chunk); its accuracy against llama.cpp's runs of its file is UD-Q4_K_XL's (the table below: KL 0.0025, 0.0016,
+0.0025; greedy text 629 of 640 tokens llama.cpp's top one, the others near ties).
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
 a step (drafts, or other requests with `-np`) adds its own experts. Drafts (the DSpark drafter's, the context's) keep
