@@ -1,6 +1,7 @@
 """Audio input: OpenAI's transcriptions (``/v1/audio/transcriptions``, llama-server's) and the offline transcript of a
 clip as its pieces come (``transcribe``: the realtime transcription sessions of a model without live ASR). Both are chat
-requests with the model's ASR prompt (the system message of LFM3-Audio's card). The speech output: ``speech``."""
+requests with the model's ASR prompt: LFM3-Audio's card's system message, or a model that transcribes itself
+(MOSS-Transcribe: its official instruction as the user turn's text after the clip). The speech output: ``speech``."""
 
 from __future__ import annotations
 
@@ -20,6 +21,17 @@ from .schemas import chat_request
 from .streaming import Format, collect, events_of, stream_response, usage
 
 TRANSCRIPT_TOKENS = (64, 8)  # a transcription's tokens at most by default: 64 + 8 per second of audio
+
+
+def transcription_messages(model: Any, language: str, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A transcription's messages (the clip's part in ``content``): LFM3-Audio's ASR system message for ``language``,
+    or the instruction of a model that transcribes itself (``Model.transcribe``: MOSS-Transcribe's) as the user turn's
+    text after the clip, which has no ASR system message."""
+    if getattr(model, "transcribe", None) is None:
+        from ..lfm3a.host import asr_system  # (numpy only)
+        return [{"role": "system", "content": asr_system(language)}, {"role": "user", "content": content}]
+    from ..moss_tr.host import INSTRUCTION  # (its instruction: the user turn's text)
+    return [{"role": "user", "content": content + [{"type": "text", "text": INSTRUCTION}]}]
 
 
 def asr_usage(done: dict[str, Any]) -> dict[str, Any]:
@@ -49,11 +61,12 @@ class TranscriptFormat(Format):
 
 
 async def transcribe(ctx: ApiContext, x: np.ndarray, language: str) -> AsyncIterator[str]:
-    """A clip's transcript (16 kHz samples; the transcriptions' chat request: the ASR prompt) as its pieces come."""
-    from ..lfm3a.host import SR, asr_system, wav_bytes  # (numpy only)
+    """A clip's transcript (16 kHz samples; the transcriptions' chat request: the model's ASR prompt) as its pieces
+    come."""
+    from ..lfm3a.host import SR, wav_bytes  # (numpy only)
     clip = {"type": "input_audio", "input_audio": {"data": base64.b64encode(wav_bytes(x)).decode(), "format": "wav"}}
     _, events = await ctx.start(chat_request({
-        "messages": [{"role": "system", "content": asr_system(language)}, {"role": "user", "content": [clip]}],
+        "messages": transcription_messages(ctx.engine.model, language, [clip]),
         "stream": True, "chat_template_kwargs": {"enable_thinking": False},
         "max_tokens": TRANSCRIPT_TOKENS[0] + TRANSCRIPT_TOKENS[1] * len(x) // SR}))
     async for kind, data in events_of(events, 0):
@@ -92,11 +105,10 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         fmt = get("response_format", "json")
         if fmt not in ("json", "text"):
             raise bad_request(f"response_format {fmt!r}: json or text")
-        from ..lfm3a.host import SR, asr_system, load_audio  # (numpy only)
+        from ..lfm3a.host import SR, load_audio  # (numpy only)
         user = ([{"type": "text", "text": get("prompt")}] if get("prompt") else []) + \
             [{"type": "input_audio", "input_audio": {"data": base64.b64encode(data).decode(), "format": "wav"}}]
-        body: dict[str, Any] = {"messages": [{"role": "system", "content": asr_system(get("language"))},
-                                             {"role": "user", "content": user}],
+        body: dict[str, Any] = {"messages": transcription_messages(engine.model, get("language"), user),
                                 "stream": get("stream", "false").lower() == "true",
                                 "chat_template_kwargs": {"enable_thinking": False}}
         try:

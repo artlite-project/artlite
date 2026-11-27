@@ -10,7 +10,8 @@ options follow llama.cpp's ``llama-cli`` where it has an equivalent, the image o
 
 Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image``, ``--video`` and
 ``--audio`` files (a model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them
-(``--audio`` alone: a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then
+(``--audio`` alone: a transcription, the system message llama.cpp's ASR prompt for ``--language`` - or, of a model that
+transcribes itself, its own instruction (MOSS-Transcribe's) and its first-token guard); tokens are then
 sampled until an end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed
 report to stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr. Speech (``--tts``:
 LFM3-Audio's or LFM3-Omni's model with its mmproj, as llama.cpp's ``llama-tts``): the WAV goes to ``-o`` (default
@@ -35,6 +36,7 @@ from .detokenizer import StreamDecoder
 from .hostenv import memory_note, performance_mode, stale_install
 from .lfm3a.host import asr_system
 from .model import MEDIA_MARKER, Model, media_parts
+from .moss_tr.host import INSTRUCTION  # (MOSS-Transcribe's transcription instruction: the user turn's text)
 from .npu_model import NpuModel, auto_capacity
 from .sampling import seed
 from .sd15.pipeline import check_request
@@ -43,6 +45,9 @@ from .sd15.sampling import SAMPLERS
 from .sequence import token_ids
 from .spec_options import add_spec_options, spec_options
 from .templating import TEMPLATE_RESERVED, template_option
+
+TRANSCRIBE_PROMPT = 1024  # (the room a transcription's prompt takes: a 30 s chunk's 414-token conversation, the
+# instruction's own tokens and a system message)
 
 
 def arg_parser() -> argparse.ArgumentParser:
@@ -343,7 +348,22 @@ def main(argv: list[str] | None = None) -> None:
         if "reasoning_effort" in variables:  # (the template's spelling of a level: ``Model.efforts``)
             variables["reasoning_effort"] = model.efforts.get(variables["reasoning_effort"], variables["reasoning_effort"])
         asr = bool(args.audio) and not args.video and args.prompt is None and not args.file
-        system = args.system_prompt or (asr_system(args.language) if asr else None)
+        # (a transcription: a model that transcribes itself (MOSS-Transcribe: the official instruction as the user
+        # turn's text, a silent turn's first token forced) takes its own path; LFM3-Audio the ASR system message and
+        # the prompt's decode loop)
+        own = getattr(model, "transcribe", None) if asr else None
+        if own is not None and args.system_prompt is None:
+            npu = model.load(capacity=args.ctx_size or auto_capacity(TRANSCRIBE_PROMPT + max(args.n_predict, 0)),
+                             prefill=not args.no_prefill)
+            npu.lookup = not args.no_lookup
+            if args.spec_draft_n_max is not None:
+                npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
+            loaded(args, model, npu, t0, f"{len(args.audio)} audio clip(s)")
+            for path in args.audio:  # (a clip a file: its transcript, whole, on its own line)
+                print(own(npu, path, **({} if args.n_predict < 0 else {"max_tokens": args.n_predict})), flush=True)
+            return
+        system = args.system_prompt or (asr_system(args.language) if asr and own is None else None)
+        text = INSTRUCTION if asr and own is not None else text  # (``-sys`` with a clip: the instruction stays)
         ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
                            videos=args.video, variables=variables)
         # (as the prompt says where the template decided: its inline tags over --think)
@@ -377,8 +397,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.stderr.write(f"{what}: {v.entries} entries through the encoder in {v.t_encode:.2f} s "
                          f"({1e3 * v.t_encode / max(v.entries, 1):.0f} ms each)\n")
     if model.audio is not None and args.audio:
-        a = model.audio
-        sys.stderr.write(f"{len(args.audio)} audio clip(s) through the encoder in {a.t_encode:.2f} s\n")
+        seconds = getattr(model.audio, "t_encode", None)  # (a tower without the encoder's timing: MOSS-Transcribe's)
+        sys.stderr.write(f"{len(args.audio)} audio clip(s) through the encoder" +
+                         (f" in {seconds:.2f} s\n" if seconds is not None else "\n"))
     capacity = args.ctx_size or auto_capacity(len(ids) + max(args.n_predict, 0))
     if len(ids) >= capacity:
         fail(f"a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")
