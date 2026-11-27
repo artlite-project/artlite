@@ -1,0 +1,94 @@
+// The single attention layer's kernels (``tests/operators/moss_attn.py``): the fp32 o stripe's init, the per-query
+// maximum, P = 2^((s - m) log2e) into bfp16 panels (a whole band's keys, and the tail band's masked ones), and the
+// finalize (o's dim {{ hd }} holds the bfp16 P's row sums). The two MMUL calls (QK, P V) are ``gemm/mac.py``'s templates,
+// rendered next to this file.
+
+extern "C" {
+// o ({{ qt }} x {{ hp }} fp32, the MAC's C stripe) := 0; run ({{ qt }} fp32, the per-query maximum) := -1e30
+void {{ p }}_init(float *__restrict o, float *__restrict run)
+{
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ ovals // 32 }}; i++)
+        aie::store_v(o + 32 * i, aie::zeros<float, 32>());
+    AIE_LOOP_UNROLL_FULL
+    for (int i = 0; i < {{ qt // 32 }}; i++)
+        aie::store_v(run + 32 * i, aie::broadcast<float, 32>(-1e30f));
+}
+}
+
+// run[q] = max(run[q], the band's {{ kb }} scores of query q): the scores' C stripe is [8-query block][8-key block]
+// [8][8], so a sub-block's 64 values are contiguous; al::max8 folds an 8-key row to its maximum
+extern "C" {
+void {{ p }}_max(const float *__restrict sc, float *__restrict run)
+{
+    for (int rb = 0; rb < {{ qt // 8 }}; rb++) {
+        for (int cb = 0; cb < 8; cb++) {
+            const float *__restrict s = sc + rb * {{ 8 * kb }} + cb * 64;
+            aie::vector<float, 32> m0 = al::max8(aie::load_v<32>(s));
+            aie::vector<float, 32> m1 = al::max8(aie::load_v<32>(s + 32));
+            for (int q = 0; q < 4; q++) {
+                const float a0 = m0[8 * q], b0 = run[8 * rb + q];
+                run[8 * rb + q] = a0 > b0 ? a0 : b0;
+                const float a1 = m1[8 * q], b1 = run[8 * rb + 4 + q];
+                run[8 * rb + 4 + q] = a1 > b1 ? a1 : b1;
+            }
+        }
+    }
+}
+}
+
+{% macro pexp(name, tailless) %}
+// P = 2^((s - m[q]) * log2e) of a band, rounded once to bfp16 panels in the MAC's A pop order [16-query band][k-step]
+// [half]
+{% if not tailless %}
+// the keys past {{ nv }} are masked to 0 (a padded key's score is 0, never -inf)
+{% endif %}
+extern "C" {
+void {{ name }}(const float *__restrict sc, const float *__restrict run, uint8_t *__restrict pp)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    aie::block_vector_output_buffer_stream<bfp16ebs8, 64, aie_dm_resource::b> out((bfp16ebs8 *)pp);
+    constexpr float L2E = {{ log2e }}f;
+    for (int b = 0; b < {{ qt // 16 }}; b++)
+        for (int ks = 0; ks < 8; ks++)
+            for (int h = 0; h < 2; h++) {
+                const float *__restrict s = sc + (2 * b + h) * 512 + ks * 64;
+                aie::vector<float, 16> g;
+                for (int q = 0; q < 4; q++)
+                    g[q] = run[8 * (2 * b + h) + q];
+                aie::vector<float, 32> ma = al::rows4(g);
+                for (int q = 0; q < 4; q++)
+                    g[q] = run[8 * (2 * b + h) + 4 + q];
+                aie::vector<float, 32> mb = al::rows4(g);
+                aie::vector<float, 32> ea = {{ exp2 }}(aie::mul(aie::sub(aie::load_v<32>(s), ma), L2E));
+                aie::vector<float, 32> eb = {{ exp2 }}(aie::mul(aie::sub(aie::load_v<32>(s + 32), mb), L2E));
+{% if not tailless %}
+                ea = aie::select(ea, aie::zeros<float, 32>(), aie::mask<32>::from_uint32({{ mask0 }}u));
+                eb = aie::select(eb, aie::zeros<float, 32>(), aie::mask<32>::from_uint32({{ mask1 }}u));
+{% endif %}
+                out.push(aie::accum<accfloat, 64>(aie::concat(ea, eb)).template to_vector<bfp16ebs8>());
+            }
+}
+}
+{% endmacro %}
+
+{{ pexp(p ~ "_exp", true) }}
+{% if nv %}
+{{ pexp(p ~ "_expz", false) }}
+{% endif %}
+
+extern "C" {
+// out[q][d] = o[q][d] / o[q][{{ hd }}] of a tile (the MAC's C stripe; dim {{ hd }} the bfp16 P's row sum), as bf16 rows
+void {{ p }}_fin(const float *__restrict o, bfloat16 *__restrict y)
+{
+    aie::set_rounding(aie::rounding_mode::conv_even);
+    for (int q = 0; q < {{ qt }}; q++) {
+        const float *__restrict row = o + (q / 8) * 512 + (q % 8) * 8;
+        aie::vector<float, 8> inv8 = aie::broadcast<float, 8>(1.0f / row[8 * {{ hd }}]);
+        for (int db = 0; db < 8; db++) {
+            aie::vector<float, 8> v = aie::mul(aie::load_v<8>(row + db * 64), inv8);
+            aie::store_v(y + {{ hd }} * q + 8 * db, aie::accum<accfloat, 8>(v).template to_vector<bfloat16>());
+        }
+    }
+}
+}
