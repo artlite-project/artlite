@@ -76,13 +76,14 @@ def derived(fmt: str, qtype: str) -> bool:
     return qtype in HALF and fmt == PLANES[qtype]
 
 
-def screened(qtype: str, formats: set[str], *, opt_in: bool = False) -> bool:
+def screened(qtype: str, formats: set[str], *, opt_in: bool = False, max_formats: int | None = FILE_FORMATS) -> bool:
     """Whether a model's image screens its LM head of GGUF type ``qtype`` (``settings.LM_SCREEN``): a type with a plane, in
-    a file of up to ``FILE_FORMATS`` tile formats (``formats``: those of its other matrices; the head's own counts, not
-    its plane's). Each paged format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its
-    largest page that short with an eighth. ``OPT_IN`` types (a Q8_0 head) only with ``opt_in``."""
+    a file of up to ``max_formats`` tile formats (``formats``: those of its other matrices; the head's own counts, not
+    its plane's; None: any, a design whose formats are all code pages, whose link checks their slot). Each paged
+    format's dispatch takes 64 B of the main cores' page slot, and Occamy's seven leave its largest page that short with
+    an eighth. ``OPT_IN`` types (a Q8_0 head) only with ``opt_in``."""
     return (settings.LM_SCREEN.get() and screens(qtype) and (opt_in or qtype not in OPT_IN)
-            and len(formats | {tile_format(qtype)}) <= FILE_FORMATS)
+            and (max_formats is None or len(formats | {tile_format(qtype)}) <= max_formats))
 
 
 def half_rows(t: object) -> np.ndarray:

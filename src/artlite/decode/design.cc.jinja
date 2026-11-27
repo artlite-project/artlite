@@ -2268,8 +2268,12 @@ __attribute__((noinline)) void {{ p }}_cend(int32_t *__restrict ws{{ ", int32_t 
     if (gu) {
         {{ p }}_rows(ws, flags & ~{{ F_GU }}, {{ YB }} * G);  // (F_WS: 1 / rms times the expert's scale)
         st[{{ S_NQGU }}] = 1;
-        st[{{ S_QY }}] = G | R << 8 | n << 16;  // (for ``qgu``, which zeroes it: the next group's first row tile's yt)
-        st[{{ S_STG }}] = n + (R < 16 ? 4 : 8) * G;
+        // (the group's G R / 16 windows; those of the unit's outputs (the block's valid rows / 2) written: a unit's last
+        // group of 13-row tiles ends in zero rows)
+        const int nw = (G * R) >> 4, left = ((st[{{ S_B }} + 3 * b + 2] >> 1) - n) >> 3;
+        st[{{ S_QY }}] = G | (left < nw ? left : nw) << 4 | R << 8 | n << 16;  // (for ``qgu``, which zeroes it: the next
+        // group's first row tile's yt)
+        st[{{ S_STG }}] = n + 8 * nw;
         if (tl == 0)
             {{ p }}_fin(st);
         return;
@@ -2969,12 +2973,37 @@ __attribute__((noinline, minsize)) void {{ p }}_hexpert(const int32_t *__restric
 }
 
 {% if qtails %}
-// The helper, a B_QT group of gate / up row tiles (K_QGU after its tail tile, the main core waiting: ``qgu``): per slot
-// with a routing weight (the item's) the [8 gate | 8 up] windows of the group's yt blocks (scaled: ``rows``' F_WS), a
-// window a 16-row tile's block or a pair of 8-row ones' (the second's rows the up rows), gathered for situ (in bf16, 32
-// values a round: the routed slots' alone), then into the hold buffer at outputs n .. (h as [h | h]; below 128 also at
-// 128, 256, 384: the 128-channel unit's [h h h h] for its B_G8 down, which a 512-unit's later outputs overwrite); the
-// blocks zeroed. In the helper's format pages (their second entry: ``pgq``), situ with it
+}  // extern "C" (templates: C++ linkage)
+
+// One [8 gate | 8 up] window of a B_QT group of row tiles of R rows (row tile j's rows 0 .. R - 1 in yt block j: g 0
+// rows 0 .. 7, g 1 rows 8 ..; yt at slot s): its rows 16 W .. of the group's, in its row tiles' order (a 16-row tile's
+// block, a pair of 8-row ones', or 13-row ones' rows across two blocks: ``al::join_rows``) -> g, u
+template <int R, int W>
+[[clang::always_inline]] inline void {{ p }}_qgw(const float *__restrict yt, float *__restrict g, float *__restrict u)
+{
+    if constexpr (R == 16) {
+        aie::store_v(g, aie::load_v<8>(yt + {{ YB }} * W));
+        aie::store_v(u, aie::load_v<8>(yt + {{ YB }} * W + 32));
+    } else if constexpr (R == 8) {
+        aie::store_v(g, aie::load_v<8>(yt + {{ 2 * YB }} * W));
+        aie::store_v(u, aie::load_v<8>(yt + {{ 2 * YB }} * W + {{ YB }}));
+    } else {
+        constexpr int J = 16 * W / R, A = 16 * W % R;  // (the window's first row: row A of row tile J)
+        const float *__restrict b = yt + {{ YB }} * J, *__restrict c = b + {{ YB }};
+        const aie::vector<float, 16> v = al::join_rows<R, A>(aie::concat(aie::load_v<8>(b), aie::load_v<8>(b + 32)),
+                                                             aie::concat(aie::load_v<8>(c), aie::load_v<8>(c + 32)));
+        aie::store_v(g, v.template extract<8>(0));
+        aie::store_v(u, v.template extract<8>(1));
+    }
+}
+
+// The helper, a B_QT group of gate / up row tiles of R rows (K_QGU after its tail tile, the main core waiting: ``qgu``):
+// per slot with a routing weight (the item's) the group's first nw [8 gate | 8 up] windows (``qgw``; of the yt blocks
+// scaled by ``rows``' F_WS), gathered for situ (in bf16, 32 values a round: the routed slots' alone), then into the hold
+// buffer at outputs n .. (h as [h | h]; below 128 also at 128, 256, 384: the 128-channel unit's [h h h h] for its B_G8
+// down, which a 512-unit's later outputs overwrite); the blocks zeroed. In the helper's format pages (their second
+// entry: ``pgq``), situ with it
+template <int R>
 __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8_t *__restrict scr)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -2982,21 +3011,27 @@ __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8
     const int32_t *__restrict st = WS(int32_t, {{ w_.st }}), *__restrict pl = WS(int32_t, {{ w_.plan }});
     float *__restrict yt = WS(float, {{ w_.yt }});
     bfloat16 *__restrict hold = WS(bfloat16, {{ w_.hold }});
-    const int G = cmd[1] & 255, R = (cmd[1] >> 8) & 255, n = cmd[1] >> 16, S = st[{{ S_NS }}];
+    const int G = cmd[1] & 15, nw = (cmd[1] >> 4) & 15, n = cmd[1] >> 16, S = st[{{ S_NS }}];
     const int32_t *__restrict wt = pl + {{ M_ITEM }} + {{ ITEM_WORDS }} * (pl[{{ PLAN_SUBS }} + st[{{ S_SUB }}] - 1] >> 5) + 1;
-    const int nw = R < 16 ? G >> 1 : G, bs = R < 16 ? {{ 2 * YB }} : {{ YB }}, uo = R < 16 ? {{ YB }} : {{ YB // 2 }};
     float *__restrict g = (float *)scr, *__restrict u = g + 128;
     int k = 0;
     AIE_LOOP_NO_UNROLL
     for (int s = 0; s < S; s++) {
         if (!wt[s])
             continue;
-        AIE_LOOP_NO_UNROLL
-        for (int w = 0; w < nw; w++, k += 8) {
-            const float *__restrict b = yt + bs * w + 8 * s;
-            aie::store_v(g + k, aie::load_v<8>(b));
-            aie::store_v(u + k, aie::load_v<8>(b + uo));
+        const float *__restrict ys = yt + 8 * s;
+        {{ p }}_qgw<R, 0>(ys, g + k, u + k);
+        if (nw > 1)
+            {{ p }}_qgw<R, 1>(ys, g + k + 8, u + k + 8);
+        if constexpr (4 * R >= 48) {
+            if (nw > 2)
+                {{ p }}_qgw<R, 2>(ys, g + k + 16, u + k + 16);
         }
+        if constexpr (4 * R >= 64) {
+            if (nw > 3)
+                {{ p }}_qgw<R, 3>(ys, g + k + 24, u + k + 24);
+        }
+        k += 8 * nw;
     }
     // (situ in bf16 arithmetic, 32 values a round: the prefill's, kmath.situ(prec="bf16"); its outputs after u)
     bfloat16 *__restrict ob = (bfloat16 *)(u + 128);
@@ -3032,6 +3067,7 @@ __attribute__((noinline)) void {{ p }}_hqgu(const int32_t *__restrict cmd, uint8
         aie::store_v(yt + i, aie::zeros<float, 32>());
 }
 
+extern "C" {
 {% endif %}
 __attribute__((noinline, minsize)) void {{ p }}_hbegin(const bfloat16 *__restrict x, int32_t *__restrict ws, int32_t col{{ ", float *__restrict ist" if states else "" }});
 
@@ -3603,7 +3639,7 @@ void {{ p }}_pgr_route(const int32_t *__restrict m, int32_t *__restrict ws, int 
 // situ's constants, which the resident caller names so that they stay in its data)
 void {{ p }}_pgq_{{ f | lower }}(const int32_t *__restrict cmd, uint8_t *__restrict scr, const float *__restrict c)
 {
-    {{ p }}_hqgu(cmd, scr);
+    {{ p }}_hqgu<{{ dict(rows)[f] }}>(cmd, scr);
 }
 {% endfor %}
 {% endif %}

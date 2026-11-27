@@ -13,7 +13,8 @@ panels of rms(x) ffn_norm; XF: the FFN's input x as bf16 rows):
    CBU1, CBU2, CBD01, CBD2) and of the combine (CBC), the weights (DS), the columns' chunk counts;
 3. the gathered norm (XP: rms(x) ffn_norm times the expert's gate / up scale), the units' gate / up (H01: units 0 and 1,
    one design, into columns 0 and 512, a unit of Q8_0's 8-row tiles in two parts of 256 columns: a chunk's drains within
-   its lock's range; H2: unit 2), C = situ(gate, up); their downs (Y01: units 0 and 1 as the two halves, row groups of
+   its lock's range; H2: unit 2; UD-Q4_K_M's Q5_K units end in zero windows: H01 of 1040 columns, H2 of 144, which the
+   downs read at that pitch), C = situ(gate, up); their downs (Y01: units 0 and 1 as the two halves, row groups of
    2; Y2: unit 2's, row groups of 8); the combine (DL: per token sum_i w_i (Y01_i + Y2_i), bf16 rows; one per size and
    the downs' layouts: NVFP4's, Q8_0's), which the FFN's post conv takes.
 
@@ -31,6 +32,13 @@ from artlite.operators.design import COLS
 from artlite.prefill import gemm as PG
 
 UNITS01 = 1024  # (H01's columns: units 0 and 1)
+
+
+def gu_span(region: object) -> int:
+    """The H columns a unit's gate / up writes (a ``Region.qt`` slab region's): its groups' whole windows, 8 outputs
+    each."""
+    (b,) = region.blocks
+    return region.groups(b) * 8 * (region.qg * b.R // 16)
 
 
 class InkMoE:
@@ -53,12 +61,17 @@ class InkMoE:
             tiles, qg = g0.blocks[0].tiles, g0.qg
             parts = 1 if 2 * tiles // qg <= MAX_REPEAT else 2  # (a part's drains: 2 per pass of a group)
             assert tiles % (parts * qg) == 0 and 2 * tiles // qg // parts <= MAX_REPEAT, (L, tiles)
-            ops = {"gu01": self._op(ExpertGemmOperator.of("gu", g0, cap=self.cap, out=UNITS01, expert_halves=1, act="situ",
+            # (H's columns: a unit's whole passes from its first column, past the expert's outputs where its last group
+            # ends in zero windows (Q5_K's: ``image.unit_gu_rows``); unit 0's spare ones are unit 1's, which comes later)
+            w01, w2 = max(UNITS01, UNITS01 // 2 + gu_span(r["exp_gu1"])), max(cfg.expert_ffn - UNITS01, gu_span(r["exp_gu2"]))
+            ops = {"gu01": self._op(ExpertGemmOperator.of("gu", g0, cap=self.cap, out=w01, expert_halves=1, act="situ",
                                                           situ_lb=lb, row_tiles=tiles // parts)),
-                   "gu2": self._op(ExpertGemmOperator.of("gu", r["exp_gu2"], cap=self.cap, out=cfg.expert_ffn - UNITS01,
+                   "gu2": self._op(ExpertGemmOperator.of("gu", r["exp_gu2"], cap=self.cap, out=w2,
                                                          expert_halves=1, act="situ", situ_lb=lb)),
-                   "dn01": self._op(ExpertGemmOperator.of("down", r["exp_dn0"], cap=self.cap, out=self.H)),
-                   "dn2": self._op(ExpertGemmOperator.of("down", r["exp_dn2"], cap=self.cap, out=self.H, expert_halves=1))}
+                   "dn01": self._op(ExpertGemmOperator.of("down", r["exp_dn0"], cap=self.cap, out=self.H,
+                                                          a_pitch=w01 if w01 != UNITS01 else 0)),
+                   "dn2": self._op(ExpertGemmOperator.of("down", r["exp_dn2"], cap=self.cap, out=self.H, expert_halves=1,
+                                                         a_pitch=w2 if w2 != cfg.expert_ffn - UNITS01 else 0))}
             self.units[L] = (r, ops)
             # (per item: its control stream, its operator, its slab's offset in the image, its H column, A, C)
             gs = (qg * g0.n_kc - qg + 1) * g0.tile_bytes  # (a tail group: its row tiles' full chunks, its tail tile)
@@ -90,7 +103,7 @@ class InkMoE:
 
     def _op(self, op: ExpertGemmOperator) -> ExpertGemmOperator:
         """One object per distinct design (the layers share them)."""
-        return self._ops.setdefault((op.kind, op.fmt, op.R, op.N, op.G, op.passes, op.cap), op)
+        return self._ops.setdefault((op.kind, op.fmt, op.R, op.N, op.G, op.passes, op.cap, op.a_pitch), op)
 
     @property
     def operators(self) -> list[object]:

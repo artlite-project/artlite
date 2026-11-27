@@ -28,6 +28,7 @@ from types import MappingProxyType
 
 import numpy as np
 
+from artlite import settings
 from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS
 from artlite.gguf_model import GGUFFile
@@ -85,6 +86,8 @@ class NpuInkling(OverlayModel):
         if dg is not None:
             taps = InklingDSparkConfig.from_gguf(dg).taps[:-1]
         self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap, sequences=sequences, taps=taps)
+        if dg is not None and self.overlay.screen is None:  # (its Markov head walks the screened head's candidates)
+            raise ValueError("the DSpark drafter drafts from the screened LM head (ARTLITE_LM_SCREEN is off)")
         self.dspark = DSparkOverlay(self.overlay, dg) if dg is not None else None
         self.drafter = self.dspark
         self.chain: MarkovChain | None = None
@@ -318,6 +321,8 @@ class Inkling(Model):
         self.eos_token_ids = self.cfg.eos_token_ids
         self.kv_k = kv_k
         kind = drafter_type(spec_type, draft_model, ("draft-dspark",), self.name)
+        if kind == "auto" and not settings.LM_SCREEN.get():  # (its drafts come from the screened head: ``NpuInkling``)
+            kind = "none"
         self.dspark = (draft_model or inkling_dspark_of(path)) if kind in ("auto", "draft-dspark") else None
         if kind == "draft-dspark" and self.dspark is None:
             raise ValueError(f"{path}: no DSpark drafter (a dspark-*.gguf beside it)")

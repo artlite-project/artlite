@@ -3,12 +3,44 @@
 // (sb 2 p), (2 p + 1) | mn lo | mn lo | crumbs (2 p) | (2 p + 1) (nibble i = c_sc + 4 c_mn) | d pair | -dmin pair] | codes
 // [sb][plane 5][row R][32 B]: the low nibbles of step s (plane s), then qh (nibble of lane l: bit s = the high bit h
 // of step s). A code panel is two MMULs: the low nibbles and the masked qh at x 16 / 2^s (16 h). Scratch per
-// super-block: [i][step pair][g][ql s | ql s + 1 | h s | h s + 1: 32 B each] (4 KB) | tab [g][hl][i][r] | c [i][g][32]
+// super-block: [i][step pair][g][ql s | ql s + 1 | h s | h s + 1: 32 B each] (4 KB) | tab [g][hl][i][r] | c [i][g][32]{{ "
+// (row groups: super-block 2 H + 1's rows at y + ys)" if rg else "" }}
 
-// Pass 1: the codes of super-block sb -> scr (h 0 .. 3: the qh nibbles masked by 1 .. 8)
+// Pass 1: the codes of super-block sb -> scr (h 0 .. 3: the qh nibbles masked by 1 .. 8): per step its low-nibble plane
+// (both row groups: 256 B apart in the tile, 128 B in scr), then the qh plane transposed once and its 4 masks in turn
 __attribute__((noinline)) void {{ p }}_q5k_tr(const uint8_t *__restrict src, uint8_t *__restrict scr)
 {
-    {{ p }}_trq(src, src + {{ 4 * 32 * R5 }}, scr, {{ 32 * R5 }}, 0, 0, 0x11111111, 0x22222222, 2);
+    const uint8_t *__restrict s = src;
+    uint8_t *__restrict d = scr;
+    AIE_PREPARE_FOR_POSTPIPELINING
+{% if "Q5_K" in compact %}
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)  // (compact: one block, 192 B less)
+{% endif %}
+    for (int j = 0; j < 4; j++) {
+        v16int32 o0, o1, o2, o3, u0, u1, u2, u3;
+        {{ p }}_tr8<32>(s, o0, o1, o2, o3);
+        {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
+        {{ p }}_put8<512>(d, o0, o1, o2, o3);
+        {{ p }}_put8<512>(d + 128, u0, u1, u2, u3);
+        s += {{ 32 * R5 }};
+        d += (j & 1) ? 224 : 32;  // (ql j: [j / 2][g][j % 2])
+    }
+    v16int32 o0, o1, o2, o3, u0, u1, u2, u3;  // (s: the qh plane)
+    {{ p }}_tr8<32>(s, o0, o1, o2, o3);
+    {{ p }}_tr8<32>(s + 256, u0, u1, u2, u3);
+    uint8_t *__restrict dh = scr + 64;
+{% if "Q5_K" in compact %}
+    AIE_PREPARE_FOR_POSTPIPELINING
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)  // (compact: one block, 144 B less)
+{% else %}
+    AIE_LOOP_NO_UNROLL
+{% endif %}
+    for (int j = 0; j < 4; j++) {
+        const v16int32 m = broadcast_to_v16int32(0x11111111 << j);  // (h j: [j / 2][g][2 + j % 2])
+        {{ p }}_put8<512>(dh, band(o0, m), band(o1, m), band(o2, m), band(o3, m));
+        {{ p }}_put8<512>(dh + 128, band(u0, m), band(u1, m), band(u2, m), band(u3, m));
+        dh += (j & 1) ? 224 : 32;
+    }
 }
 
 // Pass 2: the table TD = d sc of super-block sb -> tab [g][hl][i][r]; y[g] += hilo(XS sc) 16 d + hilo(XS mn) (-dmin)
@@ -91,6 +123,9 @@ __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, cons
     const int8_t __aie_dm_resource_d *__restrict pn = (const int8_t __aie_dm_resource_d *){{ p }}_nz[0];
     bfloat16 *__restrict pc = c;
     AIE_PREPARE_FOR_POSTPIPELINING
+{% if "Q5_K" in compact %}
+    AIE_LOOP_HINT(enable-aie-hardware-loops, 0)  // (compact: not pipelined, 256 B less, ~110 cycles more)
+{% endif %}
     for (int i = 0; i < 8; i++) {
         const v64bfp16ebs8 N = {{ p }}_np(pn, 0x86);  // (-16 e_i)
         pn += 64;
@@ -119,16 +154,19 @@ __attribute__((noinline)) void {{ p }}_q5k_mm(const uint8_t *__restrict xp, cons
 
 template <int HI>
 __attribute__((noinline)) void {{ p }}_q5k(uint8_t *__restrict a, const uint8_t *__restrict xp,
-                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr)
+                                           const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})
 {
     bfloat16 *__restrict tab = (bfloat16 *)(scr + 4096);  // [g][hl][i][r]
     bfloat16 *__restrict c = (bfloat16 *)(scr + 4608);  // [i][g][32]
     AIE_LOOP_NO_UNROLL
     for (int u = 0; u < 2; u++) {
         const int sb = 2 * HI + u;
+{% if rg %}
+        float *__restrict yu = y + u * ys;  // (row groups: each super-block's rows of their own)
+{% endif %}
         {{ p }}_q5k_tr(a + {{ q5_codes }} + {{ 5 * 32 * R5 }} * sb, scr);
-        {{ p }}_q5k_tab(a, xs + {{ XS_SLOT }} * HI, tab, y, sb);
+        {{ p }}_q5k_tab(a, xs + {{ XS_SLOT }} * HI, tab, {{ "yu" if rg else "y" }}, sb);
         {{ p }}_q5k_mm(xp + {{ 32 * PANEL }} * u, xs + {{ XS_SLOT }} * HI, scr, c, u);
-        {{ p }}_sc(c, tab, y, 128, 8, {{ 2 * L }});
+        {{ p }}_sc(c, tab, {{ "yu" if rg else "y" }}, 128, 8, {{ 2 * L }});
     }
 }

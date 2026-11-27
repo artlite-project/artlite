@@ -33,4 +33,27 @@ void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int3
     }
 }
 
+{% if qt %}
+// (a ``Region.qt`` input) the tail chunk's header unit is its group's tail tile's (hb's rows 0 .. {{ R - 1 }}), whose
+// super-block t is row tile t's: per scale word _hdr_sb reads for super-block 0 (sc lo, mn lo, crumbs: pair 0, word 0;
+// d, -dmin: pair 0's low halves) the pass's rows g = {{ R }} t + r <- row r of row tile t's record (pair t / 2, of
+// the pair's words t % 2), the columns of the four row tiles joined by constant lane shifts (``al::join_rows``; every
+// source read before the stores)
+void {{ p }}_hqt(uint32_t *__restrict hb)
+{
+{% for kt, ii in ((0, -1), (1, -1), (2, -1), (3, 0), (3, 1)) %}
+    {
+        // (kt {{ kt }}{{ ", the pair's word %d: its halves" % ii if ii >= 0 else "" }})
+{% for t in range(tiles) %}
+{% set src = kt * hs + (t // 2) * 2 * nd + (ii if ii >= 0 else t % 2) * nd %}
+        const aie::vector<uint32, 16> s{{ t }} = {{ "aie::downshift(aie::load_v<16>(hb + %d), 16)" % src if ii >= 0 and t % 2 else "aie::load_v<16>(hb + %d)" % src }};
+{% endfor %}
+{% for w in range(nd // 16) %}
+        aie::store_v(hb + {{ kt * hs + (ii if ii >= 0 else 0) * nd + 16 * w }}, al::join_rows<{{ R }}, {{ 16 * w % R }}>(s{{ 16 * w // R }}, s{{ 16 * w // R + 1 }}));
+{% endfor %}
+    }
+{% endfor %}
+}
+
+{% endif %}
 {% include "gemm/q5k_dq" %}

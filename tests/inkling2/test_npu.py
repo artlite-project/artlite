@@ -1,4 +1,5 @@
-"""Inkling 2 on the NPU (``models.inkling2.inkling.NpuInkling``), the whole model:
+"""Inkling 2 on the NPU (``models.inkling2.inkling.NpuInkling``), the whole model (UD-Q4_K_XL; the quality tests and the
+drafts also UD-Q4_K_M):
 
 - teacher-forced decode steps over an essay against llama.cpp's runs of the same GGUF file (logits,
   ``tests/goldens/text.py``): KL of the next-token distributions and argmax agreement against its decode (ubatch 1),
@@ -34,16 +35,20 @@ from ..numerics import kl_rows
 pytestmark = pytest.mark.slow  # whole GGUF models: run with --run-slow
 
 
-def _path() -> str:
-    path = inkling_gguf()
+QUANTS = ["UD-Q4_K_XL", "UD-Q4_K_M"]  # (the files the quality tests take: UD-Q4_K_M's layers 20 .. 23 Q5_K gate / up)
+
+
+def _path(quant: str = "UD-Q4_K_XL") -> str:
+    path = inkling_gguf(quant)
     require(path)
     return path
 
 
-def test_teacher_forced() -> None:
+@pytest.mark.parametrize("quant", QUANTS)
+def test_teacher_forced(quant: str) -> None:
     """(the agreement over the tokens whose top two llama.cpp's decode has at least 1 apart, as Flint's: a mixture of
     experts flips near-tied experts on either side's rounding)"""
-    path = _path()
+    path = _path(quant)
     tokens = llama_tokenize(path, essay("founders.txt"))[:128]
     dec = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=1, logits="f32").logits, np.float32).copy())
     pro = torch.from_numpy(np.asarray(golden(path, tokens, ubatch=0, logits="f32").logits, np.float32).copy())
@@ -77,14 +82,15 @@ def test_prefill() -> None:
     assert kl < 0.01 and out[True][1] == out[False][1]
 
 
+@pytest.mark.parametrize("quant", QUANTS)
 @pytest.mark.parametrize("P", [1024, 2048 + 512])
-def test_prefill_quality(P: int) -> None:
+def test_prefill_quality(P: int, quant: str) -> None:
     """An essay prompt of P tokens through the prefill (its chunks, the last token a decode step), then 64 tokens
     teacher-forced as decode steps, against llama.cpp's decode of the same tokens: KL of the next-token distributions and
     argmax agreement over the sure tokens, next to llama.cpp's own prompt run (a prompt graph over the first P tokens,
     then decode graphs) against its decode: within 2x its KL (P 1024 / 2560: 0.0018 / 0.0025 against 0.0015 / 0.0015;
     our decode steps over the prompt 0.0018 / 0.0020), the same argmax."""
-    path = _path()
+    path = _path(quant)
     Q = 64
     tokens = llama_tokenize(path, essays())[:P + Q]
 
@@ -283,10 +289,11 @@ def test_sequences() -> None:
     assert {2, 3, 4} <= parts_seen, parts_seen
 
 
-def test_drafts() -> None:
+@pytest.mark.parametrize("quant", QUANTS)
+def test_drafts(quant: str) -> None:
     """Greedy text with the context's drafts is the text without them, and the drafts are kept: an essay's first 300
     tokens, then its first 100 again (the model goes on repeating it, as the drafts guess)."""
-    path = _path()
+    path = _path(quant)
     tokens = llama_tokenize(path, essay("founders.txt"))[:300]
     prompt = tokens + tokens[:100]
     model = Inkling(path).load(capacity=1024)
@@ -319,11 +326,12 @@ TEXT_PROMPTS = {
 }
 
 
-def test_text() -> None:
+@pytest.mark.parametrize("quant", QUANTS)
+def test_text(quant: str) -> None:
     """Greedy text of 128 tokens after five prompts (a chat, code, math, a long instruction as chat turns without
     thinking; an essay's first 400 tokens) against llama.cpp's decode of the prompt and our tokens (``goldens.text``,
     teacher-forced on ours): each of our tokens is llama.cpp's top one, or within ``NEAR`` of it (a near tie)."""
-    path = _path()
+    path = _path(quant)
     host = Inkling(path)
     prompts = {k: host.chat(m) for k, m in TEXT_PROMPTS.items()}
     prompts["essay"] = llama_tokenize(path, essay("founders.txt"))[:400]

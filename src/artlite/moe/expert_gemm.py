@@ -34,8 +34,10 @@ their scale workspaces), the planar ones (Q6_K, Q5_K, Q3_K, IQ3_XXS's units: ``f
 
 An expert of other parts (``expert_halves``, a part's bytes ``half_bytes`` apart, the experts ``expert_stride``; Inkling's
 units of 512, 512 and 128 channels): a gate / up of one part over a ``decode.image.Region.qt`` input (the hidden 2304:
-per group of 4 row tiles their 2 full chunks each, then the group's tail tile) in passes of one group (64 rows: a weight
-task of 3 BDs, a K chunk's units over the group's tiles, the tail tile's units, one a row tile), C = situ(gate, up)
+per group of 4 row tiles their 2 full chunks each, then the group's tail tile) in passes of one group (its whole
+[8 gate | 8 up] windows: 64 rows, Q8_0's 32, Q5_K's 48 of 52; a weight task of 3 BDs, a K chunk's units over the group's
+tiles, the tail tile's units, one a row tile; a format with a header unit: the tail tile's, then its super-blocks, whose
+records ``DqKernels.qt`` moves to super-block 0's rows), C = situ(gate, up)
 (``act``), its outputs from column ``col0`` of a wider H (``streams``: units 0 and 1 one design, the expert's first 1024
 columns); a down of 2 super-blocks a slot (G 2, units 0 and 1 as the two halves: per slot and half a BD) or of half a
 super-block a slot (G 8, one half: the units in order, slot j the k-tiles 2 j, 2 j + 1 of unit j / 2). A chunk's drained
@@ -116,18 +118,21 @@ class ExpertGemmOperator(GemmQdOperator):
 
     def __init__(self, *, kind: str, fmt: str, R: int, row_tiles: int, G: int = 1, K: int, tile_bytes: int, kc: int,
                  kc_group: int = 1, cap: int, out: int, expert_halves: int = 2, qt: int = 0, act: str = "silu",
-                 situ_lb: float = 25.0, ablate: tuple[str, ...] = ()):
+                 situ_lb: float = 25.0, a_pitch: int = 0, ablate: tuple[str, ...] = ()):
         """expert_halves: the expert's parts this operator streams (1, 2); qt: a gate / up's ``Region.qt`` tail
-        (super-blocks); act: the gate / up's activation ("silu", "situ" of linear beta ``situ_lb``)."""
+        (super-blocks); act: the gate / up's activation ("silu", "situ" of linear beta ``situ_lb``); a_pitch: (down) the
+        columns of a token's A (its gate / up's H, of whole passes: ``out`` of that operator; default its K)."""
         assert kind in ("gu", "down") and expert_halves in (1, 2) and (not qt or (kind == "gu" and expert_halves == 1))
-        self.kind, self.cap, self.eh = kind, cap, expert_halves
+        assert not a_pitch or kind == "down"
+        self.kind, self.cap, self.eh, self.a_pitch = kind, cap, expert_halves, a_pitch
         self._templates: dict[tuple, tuple[np.ndarray, list]] = {}
         eh = expert_halves
         if kind == "gu":
-            if qt:  # (passes of one tail group's row tiles: 64 rows, Q8_0's 8-row tiles 32)
+            if qt:  # (passes of one tail group's row tiles: their whole [8 gate | 8 up] windows, 64 rows, Q8_0's 8-row
+                # tiles 32, Q5_K's 13-row ones 48)
                 tp = kc // 256 // qt
-                assert planar(fmt, R, kc) and tp * R in (32, 64), (fmt, R)
-                rows = tp * R
+                rows = tp * R // 16 * 16
+                assert planar(fmt, R, kc) and rows in (32, 48, 64), (fmt, R)
             else:
                 tp = gu_tiles(R) if planar(fmt, R, kc) else self.GU_ROWS // R  # (tiles per pass)
                 rows = self.GU_ROWS
@@ -167,7 +172,8 @@ class ExpertGemmOperator(GemmQdOperator):
 
     @classmethod
     def of(cls, kind: str, region: object, *, cap: int, out: int, expert_halves: int = 2, act: str = "silu",
-           situ_lb: float = 25.0, row_tiles: int = 0, ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
+           situ_lb: float = 25.0, row_tiles: int = 0, a_pitch: int = 0,
+           ablate: tuple[str, ...] = ()) -> "ExpertGemmOperator":
         """The operator of a layer's slab region ("exp_gu" / "exp_down"; Inkling's "exp_gu<u>" / "exp_dn<u>";
         ``row_tiles``: a gate / up of the first that many, default all: a unit's in parts)."""
         (b,) = region.blocks
@@ -175,6 +181,8 @@ class ExpertGemmOperator(GemmQdOperator):
         kw = {"act": act, "situ_lb": situ_lb} if act != "silu" else {}  # (the defaults left out: the designs' keys)
         if expert_halves != 2:
             kw["expert_halves"] = expert_halves
+        if a_pitch:
+            kw["a_pitch"] = a_pitch
         if kind == "gu" and region.qt:
             kw["qt"] = region.qt
         return cls(kind=kind, fmt=b.fmt, R=b.R, row_tiles=row_tiles or b.tiles, G=b.G, K=region.K_in if kind == "gu" else region.K,
@@ -196,9 +204,14 @@ class ExpertGemmOperator(GemmQdOperator):
     # ------------------------------------------------------------------
 
     @property
+    def a_width(self) -> int:
+        """Columns of a token's A (``a_pitch``, else KA)."""
+        return self.a_pitch or self.KA
+
+    @property
     def a_slot(self) -> int:
-        """bf16 units of a chunk's A (the 3 rows' tokens: panels of KA columns)."""
-        return CHUNK * self.KA * 9 // 16
+        """bf16 units of a chunk's A (the 3 rows' tokens: panels of ``a_width`` columns)."""
+        return CHUNK * self.a_width * 9 // 16
 
     @property
     def c_slot(self) -> int:
@@ -219,7 +232,7 @@ class ExpertGemmOperator(GemmQdOperator):
     @property
     def a_strip(self) -> int:
         """bf16 units of a MAC row's A strip (its 64 tokens' panels; a chunk slot's group-major rows)."""
-        return M * self.KA * 9 // 16
+        return M * self.a_width * 9 // 16
 
     def get_arg_spec(self) -> list[ArgSpec]:
         return [ArgSpec("in", (COLS * self.cb_words * 2,), bfloat16),
@@ -240,13 +253,15 @@ class ExpertGemmOperator(GemmQdOperator):
         nt, rs, eh = self.tiles, self.rt_stride, self.eh
         half = half_bytes // 2
         if self.kind == "gu":
-            if self.geo.qt:  # (group stride: the group's row tiles' full chunks and its tail tile)
-                qg, nf, tail = self.geo.qg, self.n_full, self.tail
-                assert nt == qg and self.hdr_units == 0
+            if self.geo.qt:  # (group stride: the group's row tiles' full chunks and its tail tile; a header unit: the
+                # tail tile's for tile 0 (the others' slots its next units), then tile t's super-block, unit 1 + t:
+                # ``dataflow.Dataflow._tail_bds``)
+                qg, nf, tail, hu = self.geo.qg, self.n_full, self.tail, self.hdr_units
+                assert nt == qg and (hu == 0 or (hu == 1 and tail == 1))
                 gs = (qg * nf + 1) * tw
-                return [[TensorAccessPattern((1, 1 << 30), h * half + k * tw, [self.ph, self.nsb, qg, sw], [gs, sw, nf * tw, 1])
+                return [[TensorAccessPattern((1, 1 << 30), h * half + k * tw, [self.ph, nsl, qg, sw], [gs, sw, nf * tw, 1])
                          for k in range(nf)] +
-                        [TensorAccessPattern((1, 1 << 30), h * half + qg * nf * tw, [self.ph, tail, qg, sw],
+                        [TensorAccessPattern((1, 1 << 30), h * half + qg * nf * tw, [self.ph, hu + tail, qg, sw],
                                              [gs, sw, tail * sw, 1])] for h in range(eh)]
             g = self.kc_group
             return [[TensorAccessPattern((1, 1 << 30), h * half + k * tw, [self.ph, nsl, nt, sw],
@@ -269,7 +284,7 @@ class ExpertGemmOperator(GemmQdOperator):
         (the memtile's walk lays them out in the MAC's pop order)."""
         aK = self.KA
         return [TensorAccessPattern((1, 1 << 30), r * self.a_strip, [1, aK // KT, M // 8, 8 * 36],
-                                    [0, 8 * 36, aK // 8 * 36, 1]) for r in range(MAC_ROWS)]
+                                    [0, 8 * 36, self.a_width // 8 * 36, 1]) for r in range(MAC_ROWS)]
 
     def drain_taps(self, col0: int = 0) -> tuple[TensorAccessPattern, TensorAccessPattern]:
         """A chunk's C drains (bf16 units from its slot), row 0's and rows 1 and 2's: a BD iterating over the chunk's C
@@ -491,13 +506,13 @@ class ExpertGemmOperator(GemmQdOperator):
                     dfo.release(1)
             bf.release(1)
 
-        kerns = [(n, k) for n, k in (("hdr", dk.hdr), ("dq", dk.dq), ("sb", dk.sb), ("chunk", dk.chunk))
+        kerns = [(n, k) for n, k in (("hdr", dk.hdr), ("dq", dk.dq), ("sb", dk.sb), ("chunk", dk.chunk), ("qt", dk.qt))
                  if k is not None]  # (the Worker's kernel arguments)
         n_ex = int(dk.ex_ty is not None) + 2 * int(dk.tables is not None)
 
         def dq_fn(bf, dfo, prm, *rest):
             named = dict(zip([n for n, _ in kerns], rest))
-            hdr, dq, sbk, chunk = named.get("hdr"), named["dq"], named.get("sb"), named.get("chunk")
+            hdr, dq, sbk, chunk, qtk = named.get("hdr"), named["dq"], named.get("sb"), named.get("chunk"), named.get("qt")
             ex = tuple(rest[len(rest) - n_ex:])
             ws0, hb0, *wb = rest[len(kerns):len(rest) - n_ex]
             ws1, hb1 = wb if two else (None, None)
@@ -521,15 +536,18 @@ class ExpertGemmOperator(GemmQdOperator):
                             dq_unit(bf, dfo, sbk, dq, ws0, hb0, sb, ex)
                         continue
                     if not two:
-                        for _ in range(self.n_kc):
+                        for k in range(self.n_kc):
+                            tail = bool(self.tail) and k == self.n_kc - 1  # (a qt input's tail: its super-blocks)
                             for pl in range(planes):
                                 for kt in range_(4):
                                     b = bf.acquire(1)
                                     hdr(b, hb0 if dk.collect else ws0, *([pl] if dk.unit else []), kt)
                                     bf.release(1)
+                            if tail and qtk is not None:  # (the tail tile's records to super-block 0's rows)
+                                qtk(hb0)
                             if chunk is not None:
                                 chunk(hb0, ws0)
-                            for sb in range_(nsb):
+                            for sb in range_(self.tail if tail else nsb):
                                 if sbk is not None:
                                     sbk(hb0, ws0, sb)
                                 dq_tiles(bf, dfo, dq, ws0, sb, ex)

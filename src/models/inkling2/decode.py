@@ -31,6 +31,9 @@ class InklingDecodeOperator(AttentionDecodeOperator):
     ATTN_A_DEPTH = 1
     PAGES = True  # (the attention cores' ~23 KB of kernels: the conv, clips, the relative bias, sinks, gates)
     STACK = 2304  # (the main core's: ``collect`` over a tail group's gate / up rows through the windows, situ under it)
+    # (Q5_K's page on the main core: 2.6 KB of room beside its resident code, the compact kernels' 2.5 KB; their tiles
+    # stay under the tiles' DMA time)
+    COMPACT = ("Q5_K",)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int, eps: float, attn: Attn | None = None,
                  paged: tuple[str, ...] | None = None, win: str = "", moe: tuple[int, int] | None = None,

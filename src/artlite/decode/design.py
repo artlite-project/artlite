@@ -301,6 +301,7 @@ class DecodeOverlayOperator(ArtcOperator):
     GATE_STATE: ClassVar[tuple[Kind, ...]] = ()  # (gate) the state words (``protocol.STATE``'s kinds) the model's gate code adds
     META_KINDS: ClassVar[tuple[Kind, ...]] = ()  # the kinds of X objects (``protocol.XMETA``) the model's cores add to the design's
     INK_PLAIN = False  # (states) the F_INK steps without the conv: cur += the phase's rows (a DSpark drafter's residual)
+    COMPACT: ClassVar[tuple[str, ...]] = ()  # formats whose GEMV kernels trade cycles for code (``gemv.render(compact=)``)
 
     def __init__(self, *, hidden: int, rows: dict[str, int], tile_bytes: int = 9280, eps: float = 1e-6, nsb: int = 4,
                  act: str = "silu", post: bool = False, pli: bool = False, packed: bool = False, tok: bool = False,
@@ -562,7 +563,7 @@ class DecodeOverlayOperator(ArtcOperator):
         assert not self.xh or self.obj_k * 2 * self.slots // 4 == self.chunk.k
         src = gemv.render(f"{p}m", fmts, tile_bytes=self.tile_bytes, nsb=self.chunk.nsb, paged=self.paged,
                           pg=self._page_spec() if self.paged else None, rg=self.rg, yb=self.yb, slots=self.slots,
-                          tab=self.tab, rg_all=self.qtails)
+                          tab=self.tab, rg_all=self.qtails, compact=self.COMPACT)
         src += self._extra_src(p)
         gv = {"NSB": self.chunk.nsb, "XP_CHUNK": self.chunk.xp, "XS_CHUNK": self.chunk.xs,
               "XS_SLOT": gemv.xs_slot(self.slots),

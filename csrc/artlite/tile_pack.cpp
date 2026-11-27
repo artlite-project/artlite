@@ -947,8 +947,9 @@ void bfp16_f32(uint8_t* t, const uint8_t* const* src, const TileAux& aux, int R,
 
 /// What every tile format is, in the order of ``TileFormat`` (checked below): the name its slot's tensors carry, the
 /// GGUF row bytes per 256 columns (a super-block; BF16 / F16: 512, F32: 1024), whether its scales are those of
-/// super-block pairs (nsb even), whether it is a BFP16 format (R is 8), the bytes a tile of R rows and nsb
-/// super-blocks uses (``~size_t(0)``: an R the format has no tile for), and its packer.
+/// super-block pairs (nsb even; rows of whole pairs but a ``qt`` block's, whose tails are packed alone), whether it is
+/// a BFP16 format (R is 8), the bytes a tile of R rows and nsb super-blocks uses (``~size_t(0)``: an R the format has
+/// no tile for), and its packer.
 struct FormatInfo {
   TileFormat fmt;
   std::string_view name;
@@ -1062,7 +1063,7 @@ void pack_tiles(uint8_t* out, size_t out_size, const std::vector<PackBlock>& blo
     if (b.R <= 0 || b.G <= 0 || b.nsb <= 0 || b.nsb > kMaxNsb || (b.nsb % 2 && pairs) || b.n % tile_rows ||
         tile_rows > 256 || (b.fmt == TileFormat::Q8_0 && b.R % 8) || (bfp && b.R != 8) || b.n_kc <= 0 ||
         b.kc_group <= 0 || b.n_kc % b.kc_group || fi.used_bytes(b.R, b.nsb) > b.S || b.row_sb <= 0 ||
-        b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1) ||
+        b.row_sb > b.n_kc * b.nsb || (b.row_sb % 2 && pairs && b.G == 1 && !b.qt) ||
         (b.G > 1 && (b.n_kc != 1 || size_t(b.nsb) * fi.block_bytes % b.G || (b.k_bytes ? b.k_bytes : row_bytes) > gb ||
                      f32)) ||
         b.col_stride < col_tiles * b.S || b.rt0 < 0 || b.rt0 + b.n / tile_rows > b.n_rt ||

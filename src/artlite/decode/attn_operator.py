@@ -63,6 +63,12 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
         return self.attn is not None and self.PAGES
 
     @property
+    def pg_split(self) -> bool:
+        """(beside the attention cores' pages, a design of 4 slots: the formats' one store, on channel 4, at the top of
+        the even half's BDs, however many, ``pg_store``: Inkling's UD-Q4_K_M takes five)"""
+        return self.slots == 8 if self.attn_pages and self.paged else super().pg_split
+
+    @property
     def pg_channels(self) -> tuple[int, int]:
         """(beside the attention cores' pages on PG_CH: the formats' on channel 4, module docstring)"""
         return (4, 4) if self.attn_pages and self.paged else super().pg_channels
@@ -94,7 +100,8 @@ class AttentionDecodeOperator(DecodeOverlayOperator):
 
     def moe_a_depth(self) -> int:
         """(beside the attention cores' pages: their BDs in the odd half, the formats' in the even half; as many objects
-        as the halves leave, which Inkling's eleven page BDs make fewer than ``A_DEPTH``)"""
+        as the halves leave, which Inkling's eleven page BDs (UD-Q4_K_M's thirteen: 9 objects) make fewer than
+        ``A_DEPTH``)"""
         if not (self.attn_pages and self.paged):
             return super().moe_a_depth()
         d = min(A_DEPTH_MOE, 24 - self.X_DEPTH - max(self.pg_bds, 48 - PG_BD))

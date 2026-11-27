@@ -661,4 +661,18 @@ template <int MIN = 32>
     }
 }
 
+// 16 consecutive rows of a run of tiles of R rows (8 <= R <= 16), each tile's rows in lanes 0 .. R - 1 of a vector:
+// rows A .. R - 1 of x's tile (A < R), then the first rows of y's (the next tile's); constant lane shifts
+template <int R, int A, typename T>
+[[clang::always_inline]] inline aie::vector<T, 16> join_rows(aie::vector<T, 16> x, aie::vector<T, 16> y)
+{
+    static_assert(8 <= R && R <= 16 && 0 <= A && A < R && 16 - (R - A) <= R);
+    if constexpr (R == 16 && A == 0)
+        return x;
+    else if constexpr (R == 16)
+        return aie::shuffle_down_fill(x, y, A);
+    else
+        return aie::shuffle_down_fill(aie::shuffle_up(x, 16 - R), y, A + 16 - R);
+}
+
 }  // namespace al

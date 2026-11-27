@@ -38,6 +38,16 @@ def q8_0(x: Tensor) -> Tensor:
     return (q * (amax / 127.0).half().float()).reshape(x.shape)
 
 
+def q8_k(x: Tensor) -> Tensor:
+    """llama.cpp's Q8_K rounding of x (..., K) on the CPU (quantize_row_q8_K, the activations of K-quant weights): per
+    block of 256 m = the value of the largest |x|, codes min(127, rint(-127 x / m)), d = -m / 127 (fp32); returns d q."""
+    xb = x.reshape(*x.shape[:-1], -1, 256)
+    m = torch.gather(xb, -1, xb.abs().argmax(-1, keepdim=True))
+    iscale = torch.where(m != 0, -127.0 / m, torch.zeros_like(m))
+    q = torch.round(xb * iscale).clamp(max=127)
+    return (q * torch.where(m != 0, 1.0 / iscale, torch.zeros_like(m))).reshape(x.shape)
+
+
 def rms(x: Tensor, eps: float) -> Tensor:
     """ggml_rms_norm: x / sqrt(mean(x^2) + eps) over the last axis (the squares summed in double)."""
     ms = ((x * x).double().sum(-1, keepdim=True) / x.shape[-1]).float()
@@ -98,6 +108,8 @@ class Model:
             return x
         if qtype in ("Q8_0", "NVFP4", "Q4_0", "IQ4_NL"):
             return q8_0(x)
+        if qtype in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"):
+            return q8_k(x)
         if qtype == "BF16":
             return x.bfloat16().float()
         raise NotImplementedError(f"llama.cpp's activations of a {qtype} weight")

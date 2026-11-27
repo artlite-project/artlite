@@ -423,14 +423,20 @@ def test_o(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     assert rel(hist, y[T - 6:].numpy()) < 1e-2
 
 
-@pytest.mark.parametrize("v", [0, 5])
-def test_ffn(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
+@pytest.mark.parametrize(("quant", "v"), [("UD-Q4_K_XL", 0), ("UD-Q4_K_XL", 5), ("UD-Q4_K_M", 44)], ids=str)
+def test_ffn(ink: tuple[GGUFFile, InklingConfig], quant: str, v: int) -> None:
     """A whole visit with its FFN (the MoE: the router on the FFN's mix, the routing by sigmoid + bias, the units' situ
     and downs, the combine and its residual step) over steps of 1, then 4, 4, 3 slots: the visit's output (cur) and the
     next visit's attention-mix partial sums against the reference's ``visit`` from the same states (fp32; the NPU's
     activations bf16), but where the routing's 8th and 9th keys tie within 5e-3 (a near-tie may choose the other
-    expert)."""
-    g, cfg = ink
+    expert). UD-Q4_K_M's visit 44 (layer 20): Q5_K gate / up, 3 windows a tail group."""
+    if quant == "UD-Q4_K_XL":
+        g, cfg = ink
+    else:
+        path = inkling_gguf(quant)
+        require(path)
+        g = GGUFFile(path)
+        cfg = InklingConfig.from_gguf(g)
     ov = InklingOverlay(g, visits=[v], max_positions=1024)
     ov.load()
     ref = Model(g, cfg, q8=False)
@@ -441,8 +447,10 @@ def test_ffn(ink: tuple[GGUFFile, InklingConfig], v: int) -> None:
     tn = torch.from_numpy(np.asarray(g.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1))
     x = rms(torch.from_numpy(g.rows("token_embd.weight", toks)), cfg.rms_norm_eps) * tn
     vis = cfg.visits[v]
-    x2 = rms(torch.from_numpy(g.rows("token_embd.weight", rng.integers(0, cfg.vocab_size, T))), cfg.rms_norm_eps) * tn
-    states = np.stack([x.numpy(), 3 * x2.numpy()])[:ov.n0 + 1]  # (distinct states: the mixes' coefficients matter)
+    more = [rms(torch.from_numpy(g.rows("token_embd.weight", rng.integers(0, cfg.vocab_size, T))), cfg.rms_norm_eps) * tn
+            for _ in range(max(1, ov.n0))]
+    # (distinct states: the mixes' coefficients matter)
+    states = np.stack([x.numpy()] + [(3 + i) * m.numpy() for i, m in enumerate(more)])[:ov.n0 + 1]
     blocks = [torch.from_numpy(b) for b in states[:-1]]
     with torch.no_grad():
         want = ref.visit(vis, torch.from_numpy(states[-1]), blocks, VisitCache(), 0).numpy()

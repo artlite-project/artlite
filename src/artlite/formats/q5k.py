@@ -4,7 +4,9 @@ bf16 x 2 | codes [sb][plane 5][row][32 B]: the nibbles of step s (plane s), then
 high bit of step s). Planes of 32 B per row, as Q6_K's: the prefill's dequantizing core gathers both with one
 memtile pattern.
 
-Prefill: GemmQd's planar gather (``_hcp``, ``_hdr_sb``, ``_expand`` per k-tile into the ``ex`` buffer, ``_dq``)."""
+Prefill: GemmQd's planar gather (``_hcp``, ``_hdr_sb``, ``_expand`` per k-tile into the ``ex`` buffer, ``_dq``); a
+``Region.qt`` input's tail tile holds a super-block of each row tile of its group, their records moved to the rows of
+super-block 0 (``_hqt``)."""
 
 from typing import ClassVar
 
@@ -75,7 +77,10 @@ class Q5KSlot(Slot):
         # (the k-tile's expanded scales: a buffer of the dequantizing core)
         ex_ty = np.ndarray[(self.qd_scratch(op)["ex"][1] // 2,), np.dtype[bfloat16]]
         return DqKernels(hdr=hdr, sb=sb, dq=dq_kernel(op, kernel, B_l1_ty, ws_ty, D_ty, [ex_ty]), collect=True,
-                         unit=False, ex_ty=ex_ty)
+                         unit=False, ex_ty=ex_ty, qt=kernel("hqt", [hb_ty]) if op.qt else None)
+
+    def qd_template_vars(self, op: object) -> dict[str, int]:
+        return {"qt": int(bool(op.qt))}
 
     def mmv_slots(self, fmt: str) -> tuple[int, ...]:
         return (4, 8)
@@ -84,7 +89,7 @@ class Q5KSlot(Slot):
         return nsb == 4  # (two super-blocks per core)
 
     def mmv_parts(self, fmt: str, nsb: int) -> tuple[str, ...]:
-        return ("mmv/trq", f"mmv/{fmt}")
+        return (f"mmv/{fmt}",)
 
     def mmv_vars(self, fmt: str, tile_bytes: int, nsb: int) -> dict[str, int]:
         R5 = self.format(fmt).rows(tile_bytes, nsb)

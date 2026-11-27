@@ -13,9 +13,13 @@ file's (temperature 1, all tokens).
 ```
 $ARTLITE_MODELS_DIR/unsloth/Inkling-2-Mini-GGUF/        unsloth/Inkling-2-Mini-GGUF
     Inkling-2-Mini-UD-Q4_K_XL.gguf                      (NVFP4 and Q8_0 experts, Q8_0 attention, BF16 router, controllers)
+    Inkling-2-Mini-UD-Q4_K_M.gguf                       (the same, the last 4 layers' expert gate / up Q5_K: 1 GB less)
     dspark-Inkling-2-Mini-Q8_0.gguf                     (its DSpark drafter: optional)
     mmproj-F16.gguf                                     (its vision encoder: optional, for images)
 ```
+
+Either layout of a file: the repository's root (`inkling2`) or its `Mainline_Support/` directory (mainline llama.cpp's
+`inkling2_loop`, the `.gguf_file` renamed to `.gguf`).
 
 The drafter is the first `dspark-*.gguf` beside the model file (or in the repository's root, or a `dspark/` directory
 there; Q8_0 first) whose vocabulary and hidden size are the model's; `--spec-type none` runs without it,
@@ -105,8 +109,10 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   steps of one.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
-size: 17.15 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded); nothing is written to disk. A
-decode step streams 1.09 GB of dense weights and the 8 experts of each visit (1.86 GB of expert tiles a token). The
+size: 17.15 GB, UD-Q4_K_M's 16.22 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded but
+UD-Q4_K_M's Q5_K gate / up, 14% over the file's bytes: a quarter chunk's 4 tiles of 13 rows hold 3 windows of 8 gate
+and 8 up rows); nothing is written to disk. A decode step streams 1.09 GB of dense weights and the 8 experts of each
+visit (1.86 GB of expert tiles a token, UD-Q4_K_M's 1.80 GB). The
 sliding-window visits' caches are rings past 16K positions of capacity (16384 positions, two of the prefill's largest
 chunks): they, the full visits' caches and the convs' state take 3.4 GB at 33K positions (each sequence of `-np` its
 own), 6.2 GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last

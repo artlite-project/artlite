@@ -233,7 +233,7 @@ def _path(key: tuple[str, ...]) -> str:
     if key[0] == "flint":
         return flint_gguf()
     if key[0] == "inkling":
-        return inkling_gguf()
+        return inkling_gguf(*key[1:])
     if key[0] in ("occamy", "swift"):
         return occamy_gguf() if key[0] == "occamy" else swift_gguf()
     return gemma_gguf(key[1]) if key[0] == "gemma" else llama_gguf(*key[1:])
@@ -303,6 +303,7 @@ GROUPS = [
     ("BFP16", 9216, 4, ("random",), "BF16"),
     ("Q8_0", 9216, 4, ("inkling",), "blk.0.attn_q.weight"),
     ("NVFP4", 9216, 4, ("inkling",), "blk.0.ffn_gate_up_exps.weight"),
+    ("Q5_K", 9216, 4, ("inkling", "UD-Q4_K_M"), "blk.20.ffn_gate_up_exps.weight"),  # (13 rows)
     ("Q8_0H", 9216, 4, ("inkling",), "output.weight"),
     ("NVFP4", 9216, 8, ("inkling",), "blk.0.ffn_down_exps.weight"),
     ("Q8_0", 9216, 8, ("inkling",), "blk.20.ffn_down_exps.weight"),
@@ -313,7 +314,8 @@ GROUPS = [
 def test_gemv_groups(fmt: str, S_BYTES: int, G: int, key: tuple[str, ...], name: str) -> None:
     """Tiles of G row groups (a tile row: G rows of K 1024 / G, ``decode.image.Block.G``) on a qtails design's kernels:
     each group's rows bit-exact against the plain kernel on a tile of that group's rows alone (zeros outside its K
-    range: exact zero terms), and within 1e-5 of the host model, with 1 and 4 slots."""
+    range: exact zero terms), and within 1e-5 of the host model, with 1 and 4 slots (Q5_K: its compact kernels, as
+    Inkling's design takes them)."""
     if key[0] == "random":
         t = random_tensor(name, 256, 1024, 5)
     else:
@@ -323,7 +325,7 @@ def test_gemv_groups(fmt: str, S_BYTES: int, G: int, key: tuple[str, ...], name:
     qtype = "Q8_0" if fmt == "Q8_0H" else ("BF16" if fmt == "BFP16" else fmt)
     assert t.qtype == qtype, t.qtype
     n_tiles, K = 2, 1024 // G
-    op, op1 = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, G=G), \
+    op, op1 = mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles, tile_bytes=S_BYTES, G=G, compact=fmt == "Q5_K"), \
         mmv.MmvOperator(fmt=fmt, n_tiles=n_tiles * G, tile_bytes=S_BYTES)
     R = op.rows
     raw = np.ascontiguousarray(t.raw[:n_tiles * R * G])

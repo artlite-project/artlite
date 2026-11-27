@@ -107,7 +107,10 @@ class DqKernels:
     then per super-block ``sb(hb, ws, sb)`` and per k-tile ``dq(b, ws, d, sb, kt, [half,] [ex])`` (GemmQ ``hg`` > 1:
     the header unit once per group of K chunks, ``sb(hb, ws, sb, q)`` with the chunk q in the group); ``ex_ty``:
     the type of a buffer of the core that ``dq`` takes last. The optional kernels and the ``ex`` buffer are
-    the Worker's arguments after ``hb``, in this order. ``units`` (``Slot.unit_bytes``): no header kernel (``hdr``
+    the Worker's arguments after ``hb``, in this order. ``qt``: (a ``Region.qt`` input of a format with a header: an
+    MoE's expert gate / up, ``moe.expert_gemm``) after the tail chunk's header unit ``qt(hb)``, which moves each row
+    tile's records of the tail tile to the rows ``sb`` reads for super-block 0. ``units`` (``Slot.unit_bytes``): no
+    header kernel (``hdr``
     None); per unit ``sb(b, ws, hb, sb)`` on the weight object, then ``dq`` per k-tile on the same object. ``tables``:
     (type, words) of a lookup table the core holds twice (buffers "tab", "tabb" of ``Slot.qd_scratch``, in two 16 KB
     regions: IQ3_XXS's grid for the gathers; words (2, n): each copy's own), passed to ``dq`` after ``ex``."""
@@ -118,6 +121,7 @@ class DqKernels:
     unit: bool = True
     sb: object = None
     chunk: object = None
+    qt: object = None
     ex_ty: object = None
     units: bool = False
     tables: tuple[object, np.ndarray] | None = None

@@ -523,11 +523,13 @@ class MmvOperator(ArtcOperator):
     [g][slot][r]; row groups: G blocks of ``y_floats(slots)``, the first core's G / 2, then the second's)."""
 
     def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False,
-                 slots: int = SLOTS, G: int = 1):
+                 slots: int = SLOTS, G: int = 1, compact: bool = False):
         """win: event0 / event1 around each core's half tile (the profiling skill's counters); slots: the design's token
         slots (``decode.gemv``); G: the tiles as row groups of a qtails design (``render(rg_all=)``: 4, B_G4: a
-        super-block's rows their own; 8, B_G8: a half super-block's)."""
+        super-block's rows their own; 8, B_G8: a half super-block's); compact: the format's compact kernels
+        (``render(compact=)``)."""
         self.fmt, self.n_tiles, self.tile_bytes, self.win, self.slots, self.G = fmt, n_tiles, tile_bytes, win, slots, G
+        self.compact = compact
         assert G in (1, 4, 8) and (G == 1 or (slots == 4 and not row_split(fmt, nsb))), (G, fmt)
         self.chunk = Chunk(nsb, slots)
         self.rows = tile_rows_of(fmt, tile_bytes, nsb)
@@ -551,7 +553,7 @@ class MmvOperator(ArtcOperator):
         x1 = 0 if row_split(self.fmt, ch.nsb) else ch.xp // 2  # (the second core's panels)
         rg = self.G > 1
         return render("mmvh", [self.fmt], tile_bytes=self.tile_bytes, nsb=ch.nsb, slots=self.slots, rg=rg, rg_all=rg,
-                      yb=y_floats(self.slots)) + f"""
+                      yb=y_floats(self.slots), compact=(self.fmt,) if self.compact else ()) + f"""
 extern "C" {{
 void mmvh_copy(const uint8_t *__restrict x, uint8_t *__restrict xb)
 {{

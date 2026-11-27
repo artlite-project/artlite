@@ -20,18 +20,18 @@ from ..numerics import rel, rel_max
 _state: dict[str, object] = {}
 
 
-def _image(L: int) -> tuple[GGUFFile, InklingConfig, object, np.ndarray]:
-    """Layer L's image, packed (the last one cached per module)."""
-    if _state.get("L") != L:
+def _image(L: int, quant: str = "UD-Q4_K_XL") -> tuple[GGUFFile, InklingConfig, object, np.ndarray]:
+    """Layer L's image of a file, packed (the last one cached per module)."""
+    if _state.get("L") != (L, quant):
         from models.inkling2.image import InklingImage
 
-        path = inkling_gguf()
+        path = inkling_gguf(quant)
         require(path)
         g = GGUFFile(path)
         img = InklingImage(g, layers=[L], vocab=COLS * 64)
         W = np.zeros(img.nbytes, np.uint8)
         img.pack(W)
-        _state.update(L=L, g=g, cfg=img.cfg, img=img, W=W)
+        _state.update(L=(L, quant), g=g, cfg=img.cfg, img=img, W=W)
     return _state["g"], _state["cfg"], _state["img"], _state["W"]
 
 
@@ -39,12 +39,13 @@ def _situ(g: np.ndarray, u: np.ndarray, lb: float) -> np.ndarray:
     return 4 * np.tanh(g / 4) / (1 + np.exp(-g)) * lb * np.tanh(u / lb)
 
 
-@pytest.mark.parametrize("L", [0, 20])
-def test_expert_gemms(L: int) -> None:
+@pytest.mark.parametrize(("quant", "L"), [("UD-Q4_K_XL", 0), ("UD-Q4_K_XL", 20), ("UD-Q4_K_M", 20)], ids=str)
+def test_expert_gemms(quant: str, L: int) -> None:
     """Inkling's expert GEMMs (``models.inkling2.moe.InkMoE``'s operators and items) in one program (per column a work
     list of 192-token chunks of random experts, rows 64 .. 191 active or not): the units' gate / up (``Region.qt``
-    inputs: passes of a tail group; units 0 and 1 one design into columns 0 and 512 of H01, layer 20's Q8_0 in parts of
-    256 columns), H = situ(gate, up) on the chunk's A panels (scaled by the expert's gate / up scale, as the gathered
+    inputs: passes of a tail group; units 0 and 1 one design into columns 0 and 512 of H01, UD-Q4_K_XL's layer 20 (Q8_0)
+    in parts of 256 columns, UD-Q4_K_M's (Q5_K: 3 windows a group, the tail tile's header records moved) into an H01 of
+    1040 columns), H = situ(gate, up) on the chunk's A panels (scaled by the expert's gate / up scale, as the gathered
     norm does); their downs (units 0 and 1 as two halves: row groups of 2, two super-blocks a slot; unit 2: of 8, half a
     super-block a slot) against the exact product of the NPU's H."""
     from artlite.moe.expert_gemm import CHUNK, N_PARAM, M
@@ -52,7 +53,7 @@ def test_expert_gemms(L: int) -> None:
     from artlite.txn import device_address
     from models.inkling2.moe import InkMoE
 
-    g, cfg, img, W = _image(L)
+    g, cfg, img, W = _image(L, quant)
     H, F, cap, lb = cfg.hidden_size, cfg.expert_ffn, 3, cfg.situ_linear_beta
     moe = InkMoE(img, layers=[L], sizes=(64,), sub=64, eps=cfg.rms_norm_eps)
     cap = min(cap, moe.cap)
@@ -114,7 +115,8 @@ def test_expert_gemms(L: int) -> None:
             aq = bfp16.from_panels(pan[c, k], CHUNK, H).astype(np.float64)[:rows]
             hg, hu = aq @ gu[:F].T, aq @ gu[F:].T
             for name, lo, hi in (("H01", 0, 1024), ("H2", 1024, F)):
-                got = bfp16.from_panels(hv[name][c, k], CHUNK, hi - lo).astype(np.float64)[:rows]
+                width = ops["gu01" if name == "H01" else "gu2"].N  # (H's columns: whole passes)
+                got = bfp16.from_panels(hv[name][c, k], CHUNK, width).astype(np.float64)[:rows, :hi - lo]
                 errs[name].append(rel_max(got, _situ(hg[:, lo:hi], hu[:, lo:hi], lb)))
                 y = yv["Y" + name[1:]][c, k, :rows].astype(np.float64)
                 errs["Y" + name[1:]].append(rel_max(y, got @ dn[:, lo:hi].T))

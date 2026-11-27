@@ -319,7 +319,7 @@ C_PA = CMD.common.word("C_PA")  # (K_INK) the pass's part: its first slot | its 
 # M_BLEND)
 K_BLEND = CMD.common.values("K_BLEND", of="kind", start=18)[0]
 # (qtails, moe) a group of gate / up row tiles' epilogue on the helper (``hqgu``): word 0 the main core's workspace, 1 G |
-# R << 8 | n << 16 (its row tiles, their rows, the outputs staged before it)
+# nw << 4 | R << 8 | n << 16 (its row tiles, its windows of the unit's outputs, their rows, the outputs staged before it)
 K_QGU = CMD.common.values("K_QGU", of="kind", start=19)[0]
 C_BLEND = CMD.common.word("C_BLEND")
 C_NG = CMD.common.word("C_NG")  # (``qtails``, K_SSTRIP) the phase's 128-k groups (its last range: what is left of them)

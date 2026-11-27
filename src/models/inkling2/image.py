@@ -29,8 +29,8 @@ L:
 The BF16 tensors read as two planes (sink, the tap deltas) are substituted by F32 copies of theirs (exact: ``_own``).
 
 The experts (``EXPERT_UNITS``): an expert's h (``expert_ffn`` 1152) in units of 512, 512 and 128 channels; unit u of
-expert e has its gate / up rows ("exp_gu<u>": groups of 64 outputs, 8 x [8 gate | 8 up] each, over K 2304) and its
-down's rows over the unit's K slice ("exp_dn<u>": every hidden row of the expert, ``Block.kslice``, as row groups of
+expert e has its gate / up rows ("exp_gu<u>": [8 gate | 8 up] windows over K 2304, whole windows in a tail group,
+``unit_gu_rows``) and its down's rows over the unit's K slice ("exp_dn<u>": every hidden row of the expert, ``Block.kslice``, as row groups of
 kc / 512 = 2 or kc / 128 = 8 rows: the last unit's of half a super-block each). The six slab regions back to back
 per expert: expert e's units are one run of the image.
 
@@ -46,7 +46,7 @@ from ml_dtypes import bfloat16
 from artlite.decode.image import NormedImage, column_rows, f32_planes, group_rows
 from artlite.decode.protocol import C_LEN, MAX_K
 from artlite.decode.screen import plane, screened
-from artlite.formats import FORMATS, gu_tiles
+from artlite.formats import FORMATS
 from artlite.gguf_model import GGUFFile, QTensor
 from artlite.model_config import InklingConfig
 from artlite.operators.design import COLS
@@ -57,15 +57,16 @@ CTL_RANK = 64  # (the controllers' gate_rank: ``InklingConfig.gate_rank``)
 PLANES = ("sink", "kd", "vd")  # the blocks of BF16 tensors read as two planes
 
 
-def unit_gu_rows(E: int, F: int, h0: int, n: int, R: int) -> np.ndarray:
-    """(E, rows) of ``ffn_gate_up_exps`` (expert e's rows e 2 F .., gate then up) of a unit: its outputs h0 .. h0 + n in
-    groups of 64, each 8 x [8 gate | 8 up] rows in ``gu_tiles(R)`` tiles (-1: padding rows)."""
-    g = n // 64
-    out = np.full((E, g, gu_tiles(R) * R), -1, np.int64)
-    first = 2 * F * np.arange(E)[:, None] + h0 + 64 * np.arange(g)  # (E, g): a group's first gate row
-    out[:, :, :128] = (first[..., None, None, None] + 8 * np.arange(8)[:, None, None] + F * np.arange(2)[:, None]
-                       + np.arange(8)).reshape(E, g, 128)
-    return out.reshape(E, -1)
+def unit_gu_rows(E: int, F: int, h0: int, n: int, R: int, qg: int = KC // 256) -> np.ndarray:
+    """(E, rows) of ``ffn_gate_up_exps`` (expert e's rows e 2 F .., gate then up) of a unit: its outputs h0 .. h0 + n as
+    [8 gate | 8 up] windows of 16 rows in order, in tail groups of qg row tiles of R rows (``Region.qt``) of qg R / 16
+    windows each (NVFP4's 16-row tiles 4, Q8_0's 8-row ones 2, Q5_K's 13-row ones 3: its group's last 4 rows padding,
+    -1); a unit's last group of fewer windows (Q5_K's) ends in padding rows."""
+    W, nw = n // 8, qg * R // 16
+    p = np.arange(qg * R)  # (a group's rows)
+    w = np.arange(-(-W // nw))[:, None] * nw + p // 16  # (groups, qg R): a row's window
+    rows = 2 * F * np.arange(E)[:, None, None] + h0 + 8 * w + p % 8 + F * (p % 16 // 8)
+    return np.where((p < 16 * nw) & (w < W), rows, -1).reshape(E, -1)
 
 
 def unit_k(n: int) -> int:
@@ -97,8 +98,9 @@ class InklingImage(NormedImage):
             self._experts(L)
         self.lm = lm = "output.weight"
         self._norm(-1, "lm")
-        # (the Q8_0 head as its high plane, the logits that matter exactly on the host: ``decode.screen``)
-        self.screen = screened(self.qtype(lm), self.formats(), opt_in=True)
+        # (the Q8_0 head as its high plane, the logits that matter exactly on the host: ``decode.screen``; every format
+        # of the design a code page: UD-Q4_K_M's five fit their slot)
+        self.screen = screened(self.qtype(lm), self.formats(), opt_in=True, max_formats=None)
         rows = column_rows(self.vocab)
         self._add(-1, "lm", [("lm", (lm,), np.where(rows < cfg.vocab_size, rows, -1),
                               *((plane(self.qtype(lm)),) if self.screen else ()))], H)

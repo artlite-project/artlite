@@ -137,7 +137,7 @@ from .decode import InklingDecodeOperator
 from .image import EXPERT_UNITS, InklingImage
 
 KINDS = ("swa", "full")
-FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4", "Q8_0H"})  # (the formats the overlay runs so far)
+FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4", "Q5_K", "Q8_0H"})  # (the formats the overlay runs so far)
 PHASES = ("q", "k", "v", "att", "o")  # (a visit's attention phases)
 FFN_PHASES = ("router", "moe")  # (its FFN's: the router's GEMV, the MoE operator phase)
 RING = 9216  # (a raw ring's bytes: one A object, its first 8 KB the ring)
@@ -268,8 +268,9 @@ class InklingOverlay(AttentionOverlay):
                                         eps=cfg.rms_norm_eps, attn=at, moe=moe,
                                         paged=paged,
                                         situ=(cfg.situ_beta, cfg.situ_linear_beta))
-        # (the experts' gate / up: tail groups of 16-row tiles or of 8-row ones in pairs, whole [8 gate | 8 up] windows)
-        assert all(r.qt and r.qg % 2 == 0 for r in img.slabs if r.name.startswith("exp_gu")) and img.gu_rows() <= {8, 16}
+        # (the experts' gate / up: tail groups of 16-row tiles, of 8-row ones in pairs or of 13-row ones (3 windows), whole
+        # [8 gate | 8 up] windows: ``image.unit_gu_rows``)
+        assert all(r.qt and r.qg % 2 == 0 for r in img.slabs if r.name.startswith("exp_gu")) and img.gu_rows() <= {8, 13, 16}
         self.pg = at.pg[self.hd]
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)
         full = -(-max_positions // self.pg)

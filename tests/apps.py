@@ -5,9 +5,9 @@ Qwen3.8-27B-PARO's (int4: gate and up as two GEMMs; int5) and Gemma 4 E4B PARO's
 inputs, the 27B's also with its base model's DFlash2 drafter; Qwen3.6-35B-A3B (and its PARO checkpoint) also with its
 MTP drafter file, the app's default: the design runs the drafter's formats too; Qwen3.8 27B on its design of 8 slots
 with its MTP block and with its DFlash2 drafter; the dense Qwen3.5 / 3.6 files' models of several sequences (-np8);
-LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter; Inkling 2's whole step), the vision overlay
-(the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py`` builds them,
-``schedule_ledger.py`` reads their builds."""
+LFM3's QAD-Q4_0 and Q4_K_M images; Spark-X2.6-4B with its DSpark drafter; Inkling 2's whole step: UD-Q4_K_XL,
+UD-Q4_K_M), the vision overlay (the Stable Diffusion UNet's and the media encoders' design). ``test_app_designs.py``
+builds them, ``schedule_ledger.py`` reads their builds."""
 
 import os
 from collections.abc import Callable
@@ -245,5 +245,6 @@ APPS: dict[str, tuple[str, Callable[[str], AppBuild]]] = {
     "spark-4B-Q4_K_M": (spark_gguf("4B", "Q4_K_M"), _spark),
     "flint-int4": (flint_gguf(), _flint),
     "inkling2-UD-Q4_K_XL": (inkling_gguf(), _inkling),
+    "inkling2-UD-Q4_K_M": (inkling_gguf("UD-Q4_K_M"), _inkling),
     "sd15": (sd15_dir(), _sd15),
 }
