@@ -100,6 +100,9 @@ class InklingPrefill(ChunkPrefill):
 
     SUB, SMALL, MAX_T, NAME, KV_PAD = SUB, SMALL, SIZES[-1], "inkling_prefill", KV_PAD
     MIN_TOKENS = 3  # (the post convs' windows: the chunk's last 3 valid tokens' inputs)
+    # (an 8192-token chunk's pieces: ~260 MB a parity; assembled while the long pieces run, cached or not: a 24K prompt
+    # 41.8 s, a 1K prompt 2.29 s with the cache emptied before it)
+    PIECES_KEPT = 128 << 20
     CFG_S = CFG_S
 
     def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True,

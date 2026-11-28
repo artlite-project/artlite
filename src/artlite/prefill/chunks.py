@@ -100,6 +100,7 @@ class ChunkPrefill:
     NAME: ClassVar[str]  # the library ELF's
     SHARED_KV_RANGE: ClassVar[bool] = False  # the chunk sizes' attention offsets are one runtime parameter
     KV_PAD: ClassVar[int]  # positions the overlay's KV arguments extend past the caches (its ``KV_PAD``)
+    PIECES_KEPT: ClassVar[int] = Library.PIECES_KEPT  # bytes of its library's assembled pieces kept
     CFG_S: ClassVar[float]  # the time model's constants (``_layer_static``): a ConfigureOp,
     WEIGHT_S: ClassVar[float]  # a byte of a layer's weights per sub-chunk
 
@@ -140,7 +141,8 @@ class ChunkPrefill:
         self.runlists |= {("ring", T): self._runlist_of(T, packed=True, ring=True) for T in self.ring_sizes}
         self.runlists |= self._more_runlists()
         self._sizes()
-        self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl))
+        self.lib = Library(self.NAME, (op for rl in self.runlists.values() for op, *_ in rl),
+                           pieces_kept=self.PIECES_KEPT)
         self.paced = any(getattr(op, "pace", None) is not None for rl in self.runlists.values() for op, *_ in rl)
 
     # ------------------------------------------------------------------
