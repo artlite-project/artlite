@@ -335,8 +335,8 @@ __attribute__((noinline, minsize)) void {{ p }}_m0(int32_t *__restrict ws{% if W
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < {{ SETS }}; set++) {
         float *__restrict ss = AW(float, {{ a.sc }}) + 128 * set;
-        const aie::vector<float, 32> m = al::max8(aie::max(aie::max(aie::load_v<32>(ss), aie::load_v<32>(ss + 32)),
-                                                           aie::max(aie::load_v<32>(ss + 64), aie::load_v<32>(ss + 96))));
+        const aie::vector<float, 32> m = al::max8(al::fmax(al::fmax(aie::load_v<32>(ss), aie::load_v<32>(ss + 32)),
+                                                           al::fmax(aie::load_v<32>(ss + 64), aie::load_v<32>(ss + 96))));
 {% if WINDOW %}
         const uint32_t lw = {{ p }}_late(st, set & 1);
         const aie::mask<32> mk = aie::mask<32>::from_uint32(late ? lw : ~lw);  // (the rows whose reference this is)
@@ -606,12 +606,7 @@ __attribute__((minsize)) void {{ p }}_aend(int32_t *__restrict ws, const int32_t
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < {{ SETS }}; set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + {{ 32 * (ND + 1) }} * set + {{ 32 * ND }};
-        const aie::vector<float, 16> sl = al::sum8(aie::load_v<32>(l));
-        aie::vector<float, 16> il = aie::broadcast<float, 16>(1.0f);  // (one scalar inv per row)
-        AIE_LOOP_UNROLL_FULL
-        for (int q = 0; q < 4; q++)
-            il[q] = aie::inv(sl[q]);
-        aie::store_v(AW(float, {{ a.ml }}) + 64 * set + 32, al::rows4(il));
+        aie::store_v(AW(float, {{ a.ml }}) + 64 * set + 32, al::rows4_inv(al::sum8(aie::load_v<32>(l))));
     }
 }
 

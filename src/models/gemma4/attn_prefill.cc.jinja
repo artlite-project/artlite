@@ -16,7 +16,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
                                                const float *__restrict prm)
 {
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
-    const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
+    const aie::vector<float, 64> mn = al::fmax(m, aie::load_v<64>(prm));
     const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
     al::scale<{{ ND }}>(o, o, a);
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
@@ -263,17 +263,17 @@ void {{ p }}_soft(float *__restrict ws, float *__restrict wo)
 {% endif %}
         }
 {% if RG == 4 %}
-        const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
-                                                  aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+        const aie::vector<float, 64> v = al::fmax(al::fmax(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
+                                                  al::fmax(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
 {% else %}
-        const aie::vector<float, 64> v = aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64));
+        const aie::vector<float, 64> v = al::fmax(aie::load_v<64>(s), aie::load_v<64>(s + 64));
 {% endif %}
         float *__restrict pm = AW(float, {{ w.m }}) + 64 * bq;
         float *__restrict pl = AW(float, {{ w.l }}) + 64 * bq;
         // (each lane against its row's maximum: the rows' group maxima only when one is raised, rarely)
         if (!aie::lt(aie::sub(v, aie::load_v<64>(pm)), aie::broadcast<float, 64>(16.0f)).full()) {
             float *__restrict prm = AW(float, {{ w.rm }});
-            aie::store_v(prm, al::bcast8(al::group8<true>(v)));
+            aie::store_v(prm, al::max8(v));
             {{ p }}_rescale(wo + {{ 64 * ND }} * bq, pl, pm, prm);
         }
         {{ p }}_pexp(s, s, pm, pl);

@@ -32,13 +32,14 @@ which also models the fp32 adder, bf16 rounding, and hi/lo products for precisio
   it falls below `2^-126` (`km.sigmoid`'s error increases below `x = -79`).
 - **Float literals passed to `aie::broadcast<bfloat16>`** are rounded at compile time if they are not exact bf16
   values; write the exact bf16 value instead.
-- **fp32 max** lowers to a bf16 compare plus a select. Float min / max / abs are expensive:
-  - a 64-lane clamp costs ~25 cycles and spills registers;
+- **fp32 max**: `aie::max` is emulated (an accfloat subtraction, its sign as a bf16 compare, a select: ~10 cycles per
+  16 lanes; a 64-lane clamp costs ~25 cycles and spills registers). `al::fmax` is exact from integer compares in 3
+  mv-slot ops (the signed order of fp32 bits, reversed where both are negative). Float min / abs are still emulated:
   - float `aie::neg` / `abs` may fail to legalize (`G_FNEG`): use `min(x, 0 - x)`, or operate on the integer bits
     directly.
 - **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. `aie::inv` / `aie::invsqrt` on an fp32 vector emit one
   scalar `inv` per lane (`aie_api`'s elementary fallback), costing ~3 instructions of program memory per lane; only
-  invert the lanes that matter (4 rows of a set, not 16 lanes). Both are within 1 fp32 ULP of the correctly rounded
+  invert the lanes that matter (4 rows of a set, not 16 lanes: `al::rows4_inv`). Both are within 1 fp32 ULP of the correctly rounded
   result (~88% exact), depending deterministically on the mantissa (and exponent parity for `invsqrt`). `kmath_sim`
   models this using measured NPU outputs over `[1, 4)` (`load_inv`, read by `test_kmath`'s fixture). **Scalar float
   math** falls back to soft-float (`__mulsf3`, `__gtsf2`: function calls, 0.9 KB of program memory). `checks.py` warns

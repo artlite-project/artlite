@@ -37,11 +37,11 @@ __attribute__((noinline)) void {{ p }}_mask(float *__restrict s, int32_t dd, int
 __attribute__((noinline)) void {{ p }}_araise(float *__restrict s, float *__restrict pm, float *__restrict pb,
                                               float *__restrict pa)
 {
-    const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
-                                              aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+    const aie::vector<float, 64> v = al::fmax(al::fmax(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
+                                              al::fmax(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
     const aie::vector<float, 64> b = aie::load_v<64>(pb);
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
-    const aie::vector<float, 64> mn = aie::max(m, aie::sub(al::bcast8(al::group8<true>(v)), b));
+    const aie::vector<float, 64> mn = al::fmax(m, aie::sub(al::max8(v), b));
     aie::store_v(pa, {{ exp2 }}(aie::sub(m, mn)));
     aie::store_v(pm, mn);
     const aie::vector<float, 64> bn = aie::sub(aie::broadcast<float, 64>(192.0f), mn);

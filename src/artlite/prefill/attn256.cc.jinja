@@ -26,7 +26,7 @@ __attribute__((noinline)) void {{ p }}_rescale(float *__restrict o, float *__res
                                                const float *__restrict prm)
 {
     const aie::vector<float, 64> m = aie::load_v<64>(pm);
-    const aie::vector<float, 64> mn = aie::max(m, aie::load_v<64>(prm));
+    const aie::vector<float, 64> mn = al::fmax(m, aie::load_v<64>(prm));
     const aie::vector<float, 64> a = {{ exp2 }}(aie::sub(m, mn));
     al::scale<{{ ND }}>(o, o, a);
     aie::store_v(pl, al::mulff<64>(aie::load_v<64>(pl), a));
@@ -104,10 +104,10 @@ __attribute__((noinline)) void {{ p }}_keys(float *__restrict s, int32_t nk)
 __attribute__((noinline)) void {{ p }}_raise(float *__restrict s, float *__restrict o, float *__restrict pl,
                                              float *__restrict pm, float *__restrict pb, float *__restrict prm)
 {
-    const aie::vector<float, 64> v = aie::max(aie::max(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
-                                              aie::max(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
+    const aie::vector<float, 64> v = al::fmax(al::fmax(aie::load_v<64>(s), aie::load_v<64>(s + 64)),
+                                              al::fmax(aie::load_v<64>(s + 128), aie::load_v<64>(s + 192)));
     const aie::vector<float, 64> b = aie::load_v<64>(pb);
-    aie::store_v(prm, aie::sub(al::bcast8(al::group8<true>(v)), b));
+    aie::store_v(prm, aie::sub(al::max8(v), b));
     {{ p }}_rescale(o, pl, pm, prm);
     const aie::vector<float, 64> bn = aie::sub(aie::broadcast<float, 64>(192.0f), aie::load_v<64>(pm));
     const aie::vector<float, 64> d = aie::sub(bn, b);

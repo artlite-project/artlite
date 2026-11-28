@@ -180,8 +180,8 @@ __attribute__((noinline, minsize)) void {{ p }}_raise(float *__restrict ws, floa
                 v = aie::max(v, aie::load_v<32>(t + 256 * k));
             if (aie::lt(v, aie::broadcast<bfloat16, 32>(208.0f)).full())
                 continue;
-            const aie::vector<float, 32> am = al::max8(aie::accum<accfloat, 32>(v).template to_vector<float>());
-            const aie::vector<float, 32> d = aie::max(aie::sub(am, aie::broadcast<float, 32>(192.0f)), aie::zeros<float, 32>());
+            const aie::vector<float, 32> am = aie::accum<accfloat, 32>(al::max8(v)).template to_vector<float>();
+            const aie::vector<float, 32> d = al::fmax(aie::sub(am, aie::broadcast<float, 32>(192.0f)), aie::zeros<float, 32>());
             const aie::vector<bfloat16, 32> a = aie::mul(al::exp2_acc<32>(aie::accum<accfloat, 32>(
                 aie::sub(aie::broadcast<float, 32>(64.0f), d))), aie::broadcast<bfloat16, 32>(0x1p-64f)).template to_vector<bfloat16>();
             if (!first) {

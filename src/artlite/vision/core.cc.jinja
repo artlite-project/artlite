@@ -745,8 +745,7 @@ static __attribute__((noinline, minsize)) void {{ p }}_attn_raise(const float *_
     aie::vector<bfloat16, 16> v = aie::accum<accfloat, 16>(aie::load_v<16>(ps)).template to_vector<bfloat16>();
     for (int kp = 1; kp < nkp; kp++)
       v = aie::max(v, aie::accum<accfloat, 16>(aie::load_v<16>(ps + 64 * kp)).template to_vector<bfloat16>());
-    const aie::vector<bfloat16, 16> rmb = al::concat(aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(0))),
-                                                     aie::broadcast<bfloat16, 8>(aie::reduce_max(v.template extract<8>(1))));
+    const aie::vector<bfloat16, 16> rmb = al::max8(v);
     const aie::vector<float, 16> rm = aie::accum<accfloat, 16>(rmb).template to_vector<float>();
     const aie::vector<float, 16> mn0 = aie::sub(aie::broadcast<float, 16>(192.0f), rm);
     if (first) {

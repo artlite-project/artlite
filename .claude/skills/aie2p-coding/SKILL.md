@@ -125,6 +125,7 @@ NPUs" (GEMM design and evaluation on XDNA / XDNA2).
   halves, compute, then `concat`. AIE2P has hardware `vtanh` and `vexp2`, both approximate (their errors and the
   LUT-based replacements are covered in `operators/kmath/` (`km.act`, `km.table_pass`) and aie-kernel-perf-optimization
   `reference/numerics.md`).
+- `vshuffle`'s 56 modes (transposes, de- / interleaves, flips) as measured on the NPU: `reference/vshuffle-modes.md`.
 - BFP16 (`bfp16ebs8`): 8 mantissas share one 8-bit exponent, 9 bytes per 8 elements. [ATB]
 - Block vector types of the NPU2 target model: `v8bfp16ebs8` and `v16bfp16ebs16`.
   [mlir-aie `lib/Dialect/AIE/IR/AIETargetModel.cpp`]

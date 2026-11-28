@@ -60,10 +60,11 @@ void {{ p }}_c(float *__restrict ws)
     }
     const aie::vector<float, 16> ir = al::inv_rms<{{ H }}, {{ N }}>(ss, {{ eps }}f);  // (1 / r_b, lanes past N 0)
     aie::vector<float, 16> sc = al::mulff<16>(al::mulff<16>(dt, ir), aie::broadcast<float, 16>({{ SC }}f));
-    float mx = sc[0];
-    for (int b = 1; b < {{ N }}; b++)
-        mx = aie::max(sc, aie::broadcast<float, 16>(mx))[b];
-    aie::vector<float, 16> e = {{ exps }}(aie::sub(sc, aie::broadcast<float, 16>(mx)));
+    // (the maximum over b < N in every lane: the lanes past N below any score)
+    const aie::mask<16> past = aie::mask<16>::from_uint32({{ 65536 - 2 ** N }}u);
+    const aie::vector<float, 16> mx = al::max16<{{ 2 if N <= 2 else 4 if N <= 4 else 8 if N <= 8 else 16 }}>(
+        aie::select(sc, aie::broadcast<float, 16>(-3.0e38f), past));
+    aie::vector<float, 16> e = {{ exps }}(aie::sub(sc, mx));
     aie::vector<float, 16> m = aie::zeros<float, 16>();
     for (int b = 0; b < {{ N }}; b++)
         m[b] = e[b];

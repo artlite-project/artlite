@@ -340,7 +340,7 @@ __attribute__((noinline, minsize)) void {{ p }}_hcoef(const float *__restrict ps
             const aie::vector<float, 16> d = t.template extract<8>(j + 1).template grow<16>();
             aie::vector<float, 16> sc = al::mulff<16>(al::mulff<16>(d, ir), aie::broadcast<float, 16>({{ 1.0 / H ** 0.5 }}f));
             sc = aie::select(aie::broadcast<float, 16>(-1e30f), sc, valid);
-            aie::store_v(e, aie::sub(sc, aie::broadcast<float, 16>(aie::reduce_max(sc))));
+            aie::store_v(e, aie::sub(sc, al::max16<8>(sc)));  // (n <= 8 states)
             {{ p }}_sexp(e);
             const aie::vector<float, 16> ev = aie::select(aie::zeros<float, 16>(), aie::load_v<16>(e), valid);
             aie::store_v(r, aie::broadcast<float, 16>(aie::reduce_add(ev)));
@@ -2588,7 +2588,7 @@ __attribute__((minsize)) void {{ p }}_psq(const bfloat16 *__restrict x, int32_t 
     }
     const aie::vector<float, 16> iv = al::inv_rms<{{ H }}, 8>(al::group8<false>(aie::concat(sq, sq1)).template grow<16>(), {{ eps }}f);
     aie::store_v(WS(float, {{ w_.inv }}), al::rows4(iv));
-    aie::store_v(WS(float, {{ w_.inv }}) + 32, al::rows4(aie::shuffle_down(iv, 4)));
+    aie::store_v(WS(float, {{ w_.inv }}) + 32, al::rows4<1>(iv));
 }
 {% else %}
     aie::vector<float, 32> sq = aie::load_v<32>(q);

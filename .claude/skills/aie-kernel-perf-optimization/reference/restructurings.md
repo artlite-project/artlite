@@ -151,6 +151,13 @@ was only 30 (variant_search's `port` column, `machine-model.md` "Shared ports").
   from 1490 to 974. Avoid it on a memory recurrence: GemmQd's pack loads its carry from the C row that the previous
   iteration stored (which may alias), and the shuffle tree lengthened that circuit (RecMII 30 -> 34, II 35 -> 39).
   Keeping aie_api's shift chain there and using `al::concat` for the other rows gave II 32.
+- **Reduce rows of 8 in the transposed layout** (`al::max8`, `al::sum8`, `al::rows4`, `al::rows4_inv`, `al::bcast8`):
+  rotating a whole register crosses rows, and the maximum or sum then has to be extracted and broadcast row by row
+  (a `vextbcst` + `vsel` each). After `T16_4x8` / `T32_4x8` a row lies on the lanes of one residue mod 4, where
+  rotations reduce it, and `T16_8x4` / `T32_8x4` broadcast back (modes: aie2p-coding `reference/vshuffle-modes.md`).
+  bf16 max8 took 14 -> 8 mv ops (II 22 -> 10, the minimum: 5 permutes + 3 maxima); fp32 max8 68 -> 29 bundles
+  with `fmax`; rows4 23 -> 13; the decode attentions' sum8 -> 1 / sum -> rows (4 scalar inverses broadcast from their
+  registers) 74 -> 44.
 - **Transpose bytes before the arithmetic rather than bf16 results after it**: Q4_K's scale header (`formats/q4k.py`
   `_hdr_q4k`), computed as `[row][group]` nibbles -> bf16 products -> transposes, took 12 shuffles per 128 values.
   Doing one `T8_8x8` shuffle per 8x8 bytes and an even / odd row zip before the math, sharing the crumb words between

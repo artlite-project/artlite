@@ -157,7 +157,8 @@ Pick one based on the symptom; `restructurings.md` has each case study with its 
 - **R6 Per-lane scales of small sub-blocks**: use `broadcast_elem_128` + two 8x8 transposes instead of zips
   (II 44 -> 29), keep scales in the MMUL's lane order, and split a spilling dequantization by fission (750 -> 590
   cycles per 64 rows).
-- **R7 Port-bound loops** (shuffles and panel pushes share `L_RM_PORT`): use broadcast + transpose expansions, build
+- **R7 Port-bound loops** (shuffles and panel pushes share `L_RM_PORT`): reduce rows of 8 in the transposed layout
+  (`al::max8` / `sum8`: 14 -> 8 mv ops), use broadcast + transpose expansions, build
   128-bit repeats with `grow_replicate` (not `concat` chains, which cost a `vshift` each), assemble vectors from
   128-bit pieces with `al::concat` / `al::gather` (not `aie::concat` / `insert`), and transpose bytes before the
   arithmetic (II 46 -> 40; a Q4_K header 2246 -> 920 cycles).

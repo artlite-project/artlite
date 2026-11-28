@@ -1348,7 +1348,7 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
         float *__restrict ml = AW(float, {{ a.m }}) + 32 * set;
         const float *__restrict mw = (const float *)pw + {{ a.m // 4 }} + 32 * set;
         const aie::vector<float, 32> m0 = aie::load_v<32>(ml), m1 = aie::load_v<32>(mw);
-        const aie::vector<float, 32> mx = aie::max(m0, m1);
+        const aie::vector<float, 32> mx = al::fmax(m0, m1);
         const aie::vector<float, 64> a01 = {{ exp2 }}(aie::concat(aie::sub(m0, mx), aie::sub(m1, mx)));
         const aie::vector<float, 32> a0 = a01.template extract<32>(0), a1 = a01.template extract<32>(1);
         aie::store_v(ml, mx);
@@ -1394,20 +1394,17 @@ __attribute__((minsize)) void {{ p }}_aend{{ X }}(int32_t *__restrict ws, const 
     AIE_LOOP_NO_UNROLL
     for (int set = 0; set < (st[{{ A_CEND }}] ? nsets : 0); set++) {
         const float *__restrict l = AW(float, {{ a.y }}) + 32 * (nd + 1) * set + 32 * nd;
-{% if INK %}
-        aie::vector<float, 16> sk4 = aie::zeros<float, 16>();  // (rows 4 set ..: their sink terms)
-        sk4.insert(0, aie::load_v<4>(isk + 4 * set));
-        const aie::vector<float, 32> il = al::rows4(aie::inv(aie::add(al::sum8(aie::load_v<32>(l)), sk4)));
+{% if INK or GATE or SINKS %}
+        // (rows 4 set ..: their sink terms, or 1 + e^-g; in lanes 4 q as sum8's sums: a 4x4 transpose)
+        const v16float t4 = (v16float)aie::load_v<4>({% if INK %}isk{% elif GATE %}AW(float, {{ a.gt }}){% else %}tz{% endif %} + 4 * set).template grow<16>();
+        const aie::vector<float, 16> e4 = ::shuffle(t4, t4, T32_4x4);
+{% endif %}
+{% if INK or (SINKS and not GATE) %}
+        const aie::vector<float, 32> il = al::rows4_inv(aie::add(al::sum8(aie::load_v<32>(l)), e4));
 {% elif GATE %}
-        aie::vector<float, 16> gs = aie::broadcast<float, 16>(1.0f);  // (rows 4 set ..: 1 + e^-g)
-        gs.insert(0, aie::load_v<4>(AW(float, {{ a.gt }}) + 4 * set));
-        const aie::vector<float, 32> il = al::rows4(aie::inv(al::mulff<16>(al::sum8(aie::load_v<32>(l)), gs)));
-{% elif SINKS %}
-        aie::vector<float, 16> sk4 = aie::zeros<float, 16>();  // (rows 4 set ..: their sink terms)
-        sk4.insert(0, aie::load_v<4>(tz + 4 * set));
-        const aie::vector<float, 32> il = al::rows4(aie::inv(aie::add(al::sum8(aie::load_v<32>(l)), sk4)));
+        const aie::vector<float, 32> il = al::rows4_inv(al::mulff<16>(al::sum8(aie::load_v<32>(l)), e4));
 {% else %}
-        const aie::vector<float, 32> il = al::rows4(aie::inv(al::sum8(aie::load_v<32>(l))));
+        const aie::vector<float, 32> il = al::rows4_inv(al::sum8(aie::load_v<32>(l)));
 {% endif %}
         bfloat16 *po[4];
         for (int q = 0; q < 4; q++) {  // row 4 set + q: slot r / nh, head r % nh (a row past the slots: kf, scratch)

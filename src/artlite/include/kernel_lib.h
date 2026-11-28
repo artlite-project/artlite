@@ -311,6 +311,44 @@ template <int K, int E, typename T>
 }
 
 // ---------------------------------------------------------------------------------------------
+// fp32 maximum
+// ---------------------------------------------------------------------------------------------
+
+// aie::max of fp32 vectors is emulated (an accfloat subtraction, its sign as a bf16 compare, a select: per 16 lanes 4
+// mv-slot ops, a vec op, a conversion and ~10 cycles). Exact from integer compares instead: the signed order of fp32
+// bits is the float order unless both are negative, where it is the reverse (max(-0, +0) = +0; no NaNs).
+
+// 3 ops: vmax_lt.32's cmp (a < b), flipped where its maximum is negative (both are), selects
+[[clang::always_inline]] inline v16int32 fmax16(v16int32 a, v16int32 b)
+{
+    unsigned int cmp;
+    const v16int32 hi = ::max_lt(a, b, cmp);
+    return ::sel(a, b, cmp ^ ::lt(hi, ::broadcast_zero_to_v16int32()));
+}
+
+// 4 ops and a cycle shorter (the minimum beside the compare, no scalar xor after it): the steps of a reduction, where
+// the chain is the cost
+[[clang::always_inline]] inline v16int32 fmax16_chain(v16int32 a, v16int32 b)
+{
+    const v16int32 hi = ::max(a, b), lo = ::min(a, b);
+    return ::sel(hi, lo, ::lt(hi, ::broadcast_zero_to_v16int32()));
+}
+
+// elementwise, any N (straight-line halves: minsize code keeps even a 2-trip loop rolled)
+template <unsigned N>
+[[clang::always_inline]] inline aie::vector<float, N> fmax(aie::vector<float, N> a, aie::vector<float, N> b)
+{
+    if constexpr (N <= 16) {
+        const v16int32 x = (v16int32)a.template grow<16>().template cast_to<int32>(),
+                       y = (v16int32)b.template grow<16>().template cast_to<int32>();
+        return aie::vector<int32, 16>(fmax16(x, y)).template cast_to<float>().template extract<N>(0);
+    } else {
+        return aie::concat(fmax<N / 2>(a.template extract<N / 2>(0), b.template extract<N / 2>(0)),
+                           fmax<N / 2>(a.template extract<N / 2>(1), b.template extract<N / 2>(1)));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Lane shuffles
 // ---------------------------------------------------------------------------------------------
 
@@ -363,28 +401,49 @@ template <typename V>
     return aie::concat(u, v).template cast_to<bfloat16>();
 }
 
-// 64 lanes (q, k) = 8 groups of 8: reduce each group (max or sum) -> 8 lanes (q)
+// a reduction step of group8: the maximum (fmax16_chain per 16 lanes) or the sum
+template <bool Max, unsigned N>
+[[clang::always_inline]] inline aie::vector<float, N> max_or_add(aie::vector<float, N> a, aie::vector<float, N> b)
+{
+    if constexpr (!Max) {
+        return aie::add(a, b);
+    } else if constexpr (N <= 16) {
+        const v16int32 x = (v16int32)a.template grow<16>().template cast_to<int32>(),
+                       y = (v16int32)b.template grow<16>().template cast_to<int32>();
+        return aie::vector<int32, 16>(fmax16_chain(x, y)).template cast_to<float>().template extract<N>(0);
+    } else {
+        return aie::concat(max_or_add<Max, N / 2>(a.template extract<N / 2>(0), b.template extract<N / 2>(0)),
+                           max_or_add<Max, N / 2>(a.template extract<N / 2>(1), b.template extract<N / 2>(1)));
+    }
+}
+
+// 64 lanes (q, k) = 8 groups of 8: reduce each group (max or sum) -> 8 lanes (q). Each group's maximum in its 8 lanes:
+// max8 (one transposed chain, not group8 then bcast8)
 template <bool Max>
 [[clang::always_inline]] inline aie::vector<float, 8> group8(aie::vector<float, 64> v)
 {
     auto [e1, o1] = aie::interleave_unzip(v.template extract<32>(0), v.template extract<32>(1), 1);
-    aie::vector<float, 32> r1 = Max ? aie::max(e1, o1) : aie::add(e1, o1);
+    aie::vector<float, 32> r1 = max_or_add<Max>(e1, o1);
     auto [e2, o2] = aie::interleave_unzip(r1.template extract<16>(0), r1.template extract<16>(1), 1);
-    aie::vector<float, 16> r2 = Max ? aie::max(e2, o2) : aie::add(e2, o2);
+    aie::vector<float, 16> r2 = max_or_add<Max>(e2, o2);
     auto [e3, o3] = aie::interleave_unzip(r2.template extract<8>(0), r2.template extract<8>(1), 1);
-    return Max ? aie::max(e3, o3) : aie::add(e3, o3);
+    return max_or_add<Max>(e3, o3);
 }
 
-// 8 lanes -> 64 lanes, lane 8 q + k = v[q]
+// 4 values repeated (lane 4 i + k = value k, as broadcast_elem_128 leaves them) -> rows of 8 (lanes 8 k .. 8 k + 7 =
+// value k): T32_8x4_lo / hi, lane 8 k + i = lane 4 i + k
+[[clang::always_inline]] inline aie::vector<float, 32> spread4(v16int32 x)
+{
+    using V = aie::vector<int32, 16>;
+    return aie::concat(V(shuffle(x, x, T32_8x4_lo)), V(shuffle(x, x, T32_8x4_hi))).template cast_to<float>();
+}
+
+// 8 lanes -> 64 lanes, lane 8 q + k = v[q]: v[0 .. 3] and v[4 .. 7] each as a 128-bit element 4 times (vextbcst),
+// spread (6 ops; three zips took 7 shuffles and more cycles)
 [[clang::always_inline]] inline aie::vector<float, 64> bcast8(aie::vector<float, 8> v)
 {
-    aie::vector<float, 16> a = aie::concat(v, v);
-    auto [b0, b1] = aie::interleave_zip(a, a, 1);  // q0 q0 q1 q1 ...
-    aie::vector<float, 32> b = aie::concat(b0, b1);
-    auto [c0, c1] = aie::interleave_zip(b, b, 2);
-    aie::vector<float, 64> c = aie::concat(c0, c1);
-    auto [d0, d1] = aie::interleave_zip(c, c, 4);
-    return aie::concat(d0, d1).template extract<64>(0);
+    const v16int32 g = (v16int32)(v16float)v.template grow<16>();
+    return aie::concat(spread4(broadcast_elem_128(g, 0)), spread4(broadcast_elem_128(g, 1)));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -461,40 +520,96 @@ using BOut = aie::block_vector_output_buffer_stream<bfp16ebs8, 64, R>;
 // Rows of 8 lanes (4 rows in 32 lanes: attention rows, token slots)
 // ---------------------------------------------------------------------------------------------
 
-// lanes 8 r .. 8 r + 7 = v[r] (r < 4)
+// Rotations of a whole register cross rows, and extracting a lane per row costs a vextbcst and a select each. The
+// transposes do not: T16_4x8 (one register) and T32_4x8_lo / hi (a pair) put row r, column c in lane 4 c + r, so a row
+// lies on the lanes = r mod 4 and rotations by multiples of 4 lanes reduce rows without mixing them; T16_8x4 / T32_8x4
+// (lane 8 k + i = lane 4 i + k) bring 4 values, each in the lanes of its residue, back to rows of 8. No vshuffle mode
+// keeps a 16-bit lane in its row of 8 and moves every lane to another pair, so bf16 needs at least 5 permutes and 3
+// maxima (max8 takes 8 mv-slot ops; the extraction form took 14).
+
+// lanes 8 r .. 8 r + 7 = v[4 E + r] (r < 4): those 4 values as a 128-bit element 4 times (vextbcst), spread
+template <int E = 0>
 [[clang::always_inline]] inline aie::vector<float, 32> rows4(aie::vector<float, 16> v)
 {
-    aie::vector<float, 32> r = aie::broadcast<float, 32>(v[0]);
-    r = aie::select(r, aie::broadcast<float, 32>(v[1]), aie::mask<32>::from_uint32(0x0000FF00u));
-    r = aie::select(r, aie::broadcast<float, 32>(v[2]), aie::mask<32>::from_uint32(0x00FF0000u));
-    return aie::select(r, aie::broadcast<float, 32>(v[3]), aie::mask<32>::from_uint32(0xFF000000u));
+    return spread4(broadcast_elem_128((v16int32)(v16float)v, E));
 }
 
-// per row r < 4 (lanes 8 r ..): the maximum of its 8 lanes, in all 8
-template <typename T>
-[[clang::always_inline]] inline aie::vector<T, 32> max8(aie::vector<T, 32> v)
+// per row r (lanes 8 r .. 8 r + 7): the maximum of its 8 lanes, in all 8. bf16, N = 16 or 32 (one register):
+// rotations by 16, 8, 4 lanes of the transpose. fp32, N = 32: the maximum of a pair's two transposes (columns 0 .. 3,
+// 4 .. 7), then rotations by 8 and 4. N = 64: two such pairs' maxima, columns c and c + 2 of both by T256_2x2_lo / hi
+// (lanes 0 .. 7 / 8 .. 15 of each), c and c + 1 by a rotation of 4 lanes (rows 0 .. 3 in lanes 0 .. 3, rows 4 .. 7 in
+// lanes 8 .. 11)
+template <typename T, unsigned N>
+[[clang::always_inline]] inline aie::vector<T, N> max8(aie::vector<T, N> v)
 {
-    v = aie::max(v, aie::shuffle_down_rotate(v, 1));
-    v = aie::max(v, aie::shuffle_down_rotate(v, 2));
-    v = aie::max(v, aie::shuffle_down_rotate(v, 4));  // lane 8 r: the max of lanes 8 r .. 8 r + 7
-    aie::vector<T, 32> r = aie::broadcast<T, 32>(v[0]);
-    r = aie::select(r, aie::broadcast<T, 32>(v[8]), aie::mask<32>::from_uint32(0x0000FF00u));
-    r = aie::select(r, aie::broadcast<T, 32>(v[16]), aie::mask<32>::from_uint32(0x00FF0000u));
-    return aie::select(r, aie::broadcast<T, 32>(v[24]), aie::mask<32>::from_uint32(0xFF000000u));
+    if constexpr (std::is_same_v<T, bfloat16>) {
+        static_assert(N == 16 || N == 32);
+        v32bfloat16 x = shuffle((v32bfloat16)v.template grow<32>(), T16_4x8);
+        x = ::max(x, shift_bytes(x, x, 32));
+        x = ::max(x, shift_bytes(x, x, 16));
+        x = ::max(x, shift_bytes(x, x, 8));
+        return aie::vector<bfloat16, 32>(shuffle(x, T16_8x4)).template extract<N>(0);
+    } else if constexpr (N == 32) {
+        const aie::vector<int32, 32> i = v.template cast_to<int32>();
+        const v16int32 a = i.template extract<16>(0), b = i.template extract<16>(1);
+        v16int32 x = fmax16_chain(shuffle(a, b, T32_4x8_lo), shuffle(a, b, T32_4x8_hi));
+        x = fmax16_chain(x, shift_bytes(x, x, 32));
+        return spread4(fmax16_chain(x, shift_bytes(x, x, 16)));
+    } else {
+        static_assert(N == 64);
+        const aie::vector<int32, 64> i = v.template cast_to<int32>();
+        const v16int32 r0 = i.template extract<16>(0), r1 = i.template extract<16>(1), r2 = i.template extract<16>(2),
+                       r3 = i.template extract<16>(3);
+        const v16int32 s01 = fmax16_chain(shuffle(r0, r1, T32_4x8_lo), shuffle(r0, r1, T32_4x8_hi));
+        const v16int32 s23 = fmax16_chain(shuffle(r2, r3, T32_4x8_lo), shuffle(r2, r3, T32_4x8_hi));
+        const v16int32 t = fmax16_chain(shuffle(s01, s23, T256_2x2_lo), shuffle(s01, s23, T256_2x2_hi));
+        const v16int32 m = fmax16_chain(t, shift_bytes(t, t, 16));
+        return aie::concat(spread4(broadcast_elem_128(m, 0)), spread4(broadcast_elem_128(m, 2)));
+    }
 }
 
-// per row r < 4 (lanes 8 r ..): the sum of its 8 lanes (lanes 0 .. 3 of the result; the others 1)
+// per row r < 4 (lanes 8 r ..): the sum of its 8 lanes in lane 4 r (rows4_inv's layout; the other lanes partial sums),
+// added as ((0 + 1) + (2 + 3)) + ((4 + 5) + (6 + 7)): the even and odd lanes of the pair (T32_16x2: lane 4 r + m holds
+// row r's pair m), then rotations by 1 and 2 lanes within each row's 4
 [[clang::always_inline]] inline aie::vector<float, 16> sum8(aie::vector<float, 32> v)
 {
-    v = aie::add(v, aie::shuffle_down_rotate(v, 1));
-    v = aie::add(v, aie::shuffle_down_rotate(v, 2));
-    v = aie::add(v, aie::shuffle_down_rotate(v, 4));  // lane 8 r: the sum of lanes 8 r .. 8 r + 7
-    aie::vector<float, 16> s = aie::broadcast<float, 16>(1.0f);
-    s[0] = v[0];
-    s[1] = v[8];
-    s[2] = v[16];
-    s[3] = v[24];
-    return s;
+    using V = aie::vector<float, 16>;
+    const v16float a = v.template extract<16>(0), b = v.template extract<16>(1);
+    V s = aie::add(V(shuffle(a, b, T32_16x2_lo)), V(shuffle(a, b, T32_16x2_hi)));
+    s = aie::add(s, V(shift_bytes((v16float)s, (v16float)s, 4)));
+    return aie::add(s, V(shift_bytes((v16float)s, (v16float)s, 8)));
+}
+
+// lanes 8 r .. 8 r + 7 = 1 / v[4 r] (r < 4, sum8's layout): 4 scalar inverses (aie::inv of a vector takes one per lane),
+// each broadcast from its register, two rows a register by a select
+[[clang::always_inline]] inline aie::vector<float, 32> rows4_inv(aie::vector<float, 16> v)
+{
+    const auto pair = [&](int r) __attribute__((always_inline)) {
+        const aie::vector<float, 16> lo = aie::broadcast<float, 16>(aie::inv(v[4 * r])),
+                                     hi = aie::broadcast<float, 16>(aie::inv(v[4 * r + 4]));
+        return aie::select(lo, hi, aie::mask<16>::from_uint32(0xFF00u));
+    };
+    return aie::concat(pair(0), pair(2));
+}
+
+// the maximum of lanes 0 .. K - 1 of 16 fp32 lanes (K a power of 2), in all 16: rotations by K / 2 .. 1 leave it in
+// lane 0 (in every lane for K = 16), then a broadcast
+template <unsigned K = 16>
+[[clang::always_inline]] inline aie::vector<float, 16> max16(aie::vector<float, 16> v)
+{
+    static_assert(K >= 2 && K <= 16 && (K & (K - 1)) == 0);
+    v16int32 x = (v16int32)v.template cast_to<int32>();
+    if constexpr (K == 16)
+        x = fmax16_chain(x, shift_bytes(x, x, 32));
+    if constexpr (K >= 8)
+        x = fmax16_chain(x, shift_bytes(x, x, 16));
+    if constexpr (K >= 4)
+        x = fmax16_chain(x, shift_bytes(x, x, 8));
+    const aie::vector<float, 16> m = aie::vector<int32, 16>(fmax16_chain(x, shift_bytes(x, x, 4))).template cast_to<float>();
+    if constexpr (K == 16)
+        return m;
+    else
+        return aie::broadcast<float, 16>(m[0]);
 }
 
 
