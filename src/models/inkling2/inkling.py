@@ -69,12 +69,13 @@ class NpuInkling(OverlayModel):
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
     last_step = True  # (the prefill has no LM head)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn", "dspark", "chain")
-    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist", "_round_s")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist", "_round_s", "_catch_up")
     # (the drafter's rows and drafts (``__init__``); the lanes of several sequences, which have no drafter, read these)
     _pend: Mapping[int, np.ndarray] = MappingProxyType({})
     _shadow: list[tuple[int, list[int], list[float]]] | tuple[()] = ()
     _hist: Mapping[int, int] = MappingProxyType({})
     _round_s = 1  # (the last round's step: its tokens, ``_mtp``'s guess of the next one's)
+    _catch_up = 0.0  # (the last round's injections of earlier rows: ``_drafter_once``)
     STEP_COST = (1.0, 1.35, 1.61, 1.79)  # (steps of S on essay tokens: each slot's own experts)
     PLANNER = {"ewma_rate": 0.2}  # noqa: RUF012  (the drafter's edge is small: ``drafts.Planner``)
 
@@ -218,6 +219,9 @@ class NpuInkling(OverlayModel):
     def _calibrate(self, kept: int) -> None:
         """(a round's: from its drafts before ``_keep`` cut them, as the tokens come, ``_kept``)"""
 
+    def _drafter_once(self) -> float:
+        return self._catch_up
+
     def _inject(self, end: int | None = None) -> None:
         """The waiting rows before ``end`` (default: the position) into the drafter's caches (dispatches of up to 4
         positions from its next one; the last row stays for f_rnn)."""
@@ -244,8 +248,9 @@ class NpuInkling(OverlayModel):
         Markov chain's drafts (up to k)."""
         t0 = time.perf_counter()
         d, P = self.dspark, self.position
-        if P - d.next > SLOTS:
+        if P - d.next > SLOTS:  # (the rows of steps that ran without the drafter: not the round's rate, ``_drafter_once``)
             self._inject(P - SLOTS)
+        self._catch_up = time.perf_counter() - t0
         q = d.next
         last = self._pend.get(P - 1)
         if last is None or not 0 <= P - q <= SLOTS or any(i not in self._pend for i in range(q, P)):
@@ -275,7 +280,7 @@ class NpuInkling(OverlayModel):
         out = out[:next((i for i in range(len(out)) if not self._keep(chains[i], i)), len(out))]
         self._chains = tuple(chains[:len(out)])
         self._round_s = 1 + len(out)
-        self._row_time(time.perf_counter() - t0)
+        self._row_time(time.perf_counter() - t0 - self._catch_up)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)
         self.blocks += 1

@@ -142,11 +142,13 @@ A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (
 a step (drafts, or other requests with `-np`) adds the experts it routes to. Drafts (the DSpark drafter's, the
 context's) keep the text the same as the model writes alone.
 
-With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the prefill, against steps of one): code
-12.1 -> 14.8 tokens/s, an essay's continuation 1.19x, JSON 1.07x, math 1.02x, the other prompts (chat, SQL, a story,
-explanations) 0.98 - 1.01x, where the planner leaves the drafter out after its first rounds; a 32K essay summary 9.8
--> 9.7 tokens/s. The drafter's work a round ~18 - 25 ms (its block, the head's plane, its Markov head on the host); a
-prompt's drafter records ~1% of its time (pp8192 636 against 644 tokens/s; at 1K within the noise). Its drafts
+With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the prefill, one after another in one
+process, against steps of one at 12.1 tokens/s): math 1.43x (17.3 tokens/s), an essay's continuation 1.25x, SQL 1.17x,
+code 1.09x, an instruction 1.08x, a story 1.06x, the others (chat, JSON, explanations, another code prompt) 0.99 -
+1.02x, where the planner leaves the drafter out after its first rounds; a 32K essay summary 9.8 -> 10.2 tokens/s. The
+planner starts from the earlier prompts' rounds: the code prompt as a process's first, 16.3 - 16.8 tokens/s (1.35x).
+The drafter's work a round ~16 ms (one dispatch of its injections and block, the head's plane; its Markov head on the
+host); a prompt's drafter records ~1% of its time (pp8192 636 against 644 tokens/s; at 1K within the noise). Its drafts
 accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies): code 1.8, math 2.0, prose 2.2, chat
 1.0.
 

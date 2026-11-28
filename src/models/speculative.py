@@ -168,6 +168,11 @@ class SpeculativeMixin:
         sequence's alone (its dispatch ran other sequences' slots too)."""
         return self.overlay.once_s
 
+    def _drafter_once(self) -> float:
+        """The seconds of the last round's drafter work that are not its rate (``_mtp``'s: the rows of the steps that ran
+        without it, injected before its block)."""
+        return 0.0
+
     def _kept(self, p: int, tokens: list[int], m: int, mtp: bool, won: int = 0) -> None:
         """After a round's step of ``tokens`` at p: its first m tokens are the sequence's (the rejected drafts'
         positions are forgotten: later steps overwrite their cache records); ``won``: so are the first won tokens of its
@@ -299,7 +304,7 @@ class SpeculativeMixin:
                         self.accepted_ctx += max(kept - len(f), 0)
                 elif mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
                     if once is not None:
-                        plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
+                        plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once - self._drafter_once())
                     self._calibrate(len(new) - 1)
                 elif d:
                     plan.accepted(m, len(d), len(new) - 1, agree=agree)
