@@ -9,8 +9,8 @@ Components:
 - **artlite.operators** - Python AIE runtime compiler (JIT compilation, HIP RTC style)
 - **artlite**'s subsystems - what the models share: tile formats, GEMMs, the decode overlay, the prefill, MoE layers,
   the vision overlay
-- **models** - the models on the NPU (Llama 3.x, Gemma 4, Qwen3.5 / 3.6 / 3.8, MiniCPM-V 4.7, Stable Diffusion 1.5)
-  and the tools `artlite-cli`, `artlite-server`, `artlite-bench`
+- **models** - the models on the NPU ([Models](models/README.md)) and the tools `artlite-cli`, `artlite-server`,
+  `artlite-bench`
 
 Building: [Installation](install.md); tests and kernel tools: [Development](development.md).
 
@@ -228,6 +228,11 @@ tested without an NPU with the host DMA model ``tests/dma_model.py`` (``tests/ge
 ---
 
 ## Kernel compilation pipeline
+
+Kernels are compiled at run time, as with NVRTC and HIPRTC, from sources generated for the task: each operator renders
+C++ specialized for its shapes, data formats and place on the array, plus an IRON design of the array's data movement.
+oneDNN generates such kernels (brgemm, fused graph partitions) as machine code with xbyak; Artlite generates C++ and
+lets Peano optimize it, steered by hints chosen per loop.
 
 `ArtcOperator.compile()` (`src/artlite/operators/build.py`) builds two
 artifacts that Artlite loads directly, cached per content hash in

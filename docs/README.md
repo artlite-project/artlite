@@ -4,7 +4,7 @@
 |---|---|
 | [Installation](install.md) | hardware, driver, build, models directory, troubleshooting |
 | [artlite-cli](cli.md) | text, images and transcriptions from the command line |
-| [artlite-server](server.md) | the OpenAI-compatible server and web chat; a backend for coding agents |
+| [artlite-server](server.md) | the OpenAI- and Anthropic-compatible server and web chat; a backend for coding agents |
 | [artlite-bench](bench.md) | prompt and generation speeds, as llama-bench |
 | [artlite-probe](probe.md) | the NPU's clock, dispatch round trip and DRAM rates, next to Strix Halo's |
 | [artlite-cache](install.md#build-cache) | the build cache's toolchain directories, sizes and cleaning |

@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <b>AI Engine RunTime, lite</b>: language models and image generation on the NPU of AMD Ryzen AI processors
+  <b>The fastest inference engine for the NPU of AMD Ryzen AI processors</b>
 </p>
 
 <p align="center">
@@ -16,71 +16,22 @@
   <img alt="NPU: XDNA 2 (AIE2P)" src="https://img.shields.io/badge/NPU-XDNA%202%20(AIE2P)-2a78d6">
 </p>
 
-Artlite runs LLMs and Stable Diffusion on the XDNA 2 NPU (an AIE2P AI Engine array) of AMD's Strix Point, Krackan
-Point and Strix Halo processors. Its runtime is a small C++ library that talks to the `amdxdna` driver directly, in
-place of XRT; on Windows 11 the same library runs through XRT.
+Artlite runs language, vision and speech models and Stable Diffusion on the XDNA 2 NPU of AMD Strix Point, Krackan
+Point and Strix Halo processors, and serves them to apps and coding agents.
 
-Its kernels are compiled at run time, as with NVRTC and HIPRTC, from sources generated for the task: each operator
-renders C++ specialized for its shapes, data formats and place on the array, plus an IRON design of the array's data
-movement. oneDNN generates such kernels (brgemm, fused graph partitions) as machine code with xbyak; Artlite generates
-C++ and lets Peano, LLVM for AI Engine, optimize it, steered by hints chosen per loop. Everything is tuned for this one
-device rather than for portability.
-
-- **GGUF files as they are.** No conversion step, no extra copy of the weights.
-- **ParoQuant checkpoints too.** PARO int4 / int5 checkpoint directories (Llama 3.1, Qwen3, Qwen3.5 / 3.6 / 3.8, Gemma 4)
-  run from their safetensors at their quantization's size, each linear's input rotated on the NPU
-  ([Models](docs/models/README.md)).
-- **Prompt and generation on the NPU.**
-- **Tools in llama.cpp's style.** `artlite-cli`, `artlite-server` (an OpenAI-compatible API and llama.cpp's web chat,
-  for one model or with a model picker over all of yours) and `artlite-bench`, with llama.cpp's option names where
-  they apply.
-- **A local model for coding agents.** Claude Code, Codex and opencode work against `artlite-server`, with tool calls
-  and a prompt cache, so each turn reads only what is new ([Agents](docs/server.md#agents)).
-- **Requests that meet run together.** With `-np`, Llama 3.x, Qwen3, Gemma 4, Flint, Inkling 2, LFM3, Spark-X, the 9B / 27B
-  Qwen models and MiniCPM-V answer several requests at a time: four get about 3x one request's tokens per second in all, 1.8x where one request already runs with a
-  drafter, 1.4x on Flint ([Several requests at a time](docs/server.md#several-requests-at-a-time)).
-- **Answers that parse.** JSON schemas, grammars and tool calls hold what the model writes, in every API's spelling
-  (OpenAI's, Anthropic's, llama-server's, vLLM's), about as fast as free text ([Structured
-  output](docs/server.md#structured-output)).
-- **Speech in and out.** LFM3-Audio transcribes audio files and live audio (`/v1/audio/transcriptions`, OpenAI's
-  realtime transcription) with llama.cpp's accuracy, at two thirds of the iGPU's energy and a third of the CPU's,
-  live with the NPU busy a sixth of the time; it speaks text (`/tts`, `/v1/audio/speech`) and answers in voice
-  (a chat's audio output, realtime conversations) at ~2.5x real time, as intelligibly as llama.cpp's
-  ([LFM3-Audio](docs/models/lfm3.md#lfm3-audio-2b-speech)).
-- **Who said what, and when.** MOSS-Transcribe-Diarize writes a recording's transcript with timestamps and speaker
-  tags, a recording of any length in one prompt: 30 s in 2.3 s, 10 minutes in 103 s, at the official model's
-  word error rate ([MOSS-Transcribe-Diarize](docs/models/moss.md)).
-- **Pictures, videos and voice in one model.** LFM3-Omni answers about pictures, videos with their sound and spoken
-  questions, in text or in its own voice, realtime conversations included: a 30 s 720p video's first token in ~4 s,
-  3x sooner than llama.cpp on the iGPU, with under a third of its energy
-  ([LFM3-Omni](docs/models/lfm3.md#lfm3-omni-2b-images-videos-speech)).
-- **Embeddings, rerank and decisions.** `artlite-server` answers llama-server's `/v1/embeddings`, `/v1/rerank` and
-  `/v1/systemone` for embedding, reranker and decision models, also beside a chat model, with 2-5x less energy than the
-  iGPU and the GPU left free ([Embeddings and rerank](docs/server.md#embeddings-and-rerank),
-  [Decisions](docs/server.md#decisions), [against the iGPU](docs/npu-vs-igpu.md#prefill-only-work-decisions-embeddings-rerank)).
-
-> [!NOTE]
-> Artlite is mostly research into how far this hardware can be pushed, and where the NPU is the right device for the
-> work. The CPU, the iGPU and the NPU share one power budget and one LPDDR5X bus. The iGPU reads that bus at its full
-> width; the NPU computes at about 8 W.
->
-> The NPU's limit is memory bandwidth: ~57 GB/s on Strix Halo, where the iGPU reads ~244 GB/s of the 256 GB/s bus.
-> Decode, which reads every weight once per token, is therefore ~3.6x faster on the iGPU there, with Artlite's decode
-> already close to the NPU's limit; on a Krackan Point laptop, whose NPU reads ~98 GB/s of its 120 GB/s bus, the
-> iGPU's lead is 1.25-1.44x.
-> Compute-bound work such as prefill runs on par with llama.cpp on the iGPU, at a fraction of its power, and leaves the
-> iGPU free.
-> Which workloads belong on the NPU is not fully explored yet: [Where the NPU fits](docs/npu-vs-igpu.md) has the
-> measurements and the candidates.
->
-> Planned: more vision models, model formats besides GGUF (Stable Diffusion already loads diffusers safetensors), and the
-> iGPU of the same processors for memory-bound work.
+- **Fast prompts and generation.** Artlite processes prompts 1.7-11x faster than FastFlowLM, the next fastest engine,
+  and generates text 1.1-2.3x faster ([Performance](#performance)).
+- **A local server for apps and agents.** OpenAI- and Anthropic-compatible APIs with tool calls, structured output, a
+  prompt cache and several requests at a time. Claude Code, Codex and opencode work with it.
+- **Text, images, video and speech.** Chat, questions about images and videos, transcripts with speakers, text to
+  speech, voice conversations, embeddings and image generation.
+- **Built for XDNA 2.** Artlite's own JIT toolchain generates every NPU kernel for the model's shapes and weight
+  formats and compiles it at run time.
 
 ## Quick start
 
-Requirements: a Ryzen AI processor with an XDNA 2 NPU, Linux with the `amdxdna` driver, libdrm, CMake, a C++23
-compiler and [uv](https://docs.astral.sh/uv/). Details: [Installation](docs/install.md) (Windows 11: [through
-XRT](docs/install.md#windows); NixOS: [a development shell](docs/install.md#nixos)).
+You need a Ryzen AI processor with an XDNA 2 NPU, Linux with the `amdxdna` driver, libdrm, CMake, a C++23 compiler and
+[uv](https://docs.astral.sh/uv/). Windows 11, NixOS and the details are in [Installation](docs/install.md).
 
 ```bash
 git clone https://github.com/artlite-project/artlite && cd artlite
@@ -88,17 +39,16 @@ uv venv && source .venv/bin/activate
 uv sync --no-dev
 ```
 
-Models are found by path, or relative to `ARTLITE_MODELS_DIR` (default `~/.artlite/models`) as
-`<account>/<repository>/<file>`, the way Hugging Face names them:
+Download a model into the models directory (`~/.artlite/models`, laid out as on Hugging Face) and run it:
 
 ```bash
 uvx --from huggingface_hub hf download ggml-org/gemma-4-E4B-it-GGUF \
     gemma-4-E4B-it-Q4_0.gguf mtp-gemma-4-E4B-it-Q4_0.gguf --local-dir ~/.artlite/models/ggml-org/gemma-4-E4B-it-GGUF
 
 M=ggml-org/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_0.gguf
-artlite-cli -m $M -p "Factorize x^2 + x - 6"     # the answer streams to stdout
-artlite-server -m $M -rea on                     # an OpenAI-compatible API and a web chat on http://127.0.0.1:8080
-artlite-server                                   # the same for every model of the models directory (a model picker)
+artlite-cli -m $M -p "Factorize x^2 + x - 6"     # answer in the terminal
+artlite-server -m $M -rea on                     # API and web chat on http://127.0.0.1:8080
+artlite-server                                   # every downloaded model, with a model picker
 artlite-bench -m $M -p 1024,8192 -n 128          # prompt and generation speeds, as llama-bench
 ```
 
@@ -107,25 +57,38 @@ artlite-bench -m $M -p 1024,8192 -n 128          # prompt and generation speeds,
   <img alt="The web chat on Gemma 4 E4B: a question, its collapsed reasoning, the answer and its speed" src="docs/images/server.png" width="640">
 </picture>
 
-Every option: [artlite-cli](docs/cli.md) (text and images), [artlite-server](docs/server.md),
-[artlite-bench](docs/bench.md).
+## Documentation
+
+| | |
+|---|---|
+| [Installation](docs/install.md) | hardware, driver, build on Linux, Windows 11 and NixOS, troubleshooting |
+| [artlite-cli](docs/cli.md) | text, images and transcripts from the command line |
+| [artlite-server](docs/server.md) | the API server and web chat, [coding agents](docs/server.md#agents) |
+| [artlite-bench](docs/bench.md), [artlite-probe](docs/probe.md) | prompt and generation speeds; the NPU's clock and memory rates |
+| [Models](docs/models/README.md) | supported models and files, how each model runs on the NPU |
+| [Benchmark methodology](docs/methodology.md) | how the charts are measured |
+| [Where the NPU fits](docs/npu-vs-igpu.md) | the NPU vs. the iGPU: memory bandwidth, power, workloads |
+| [Design](docs/design.md), [Development](docs/development.md) | how Artlite works; tests, operators and kernel tools |
+
+All pages: [docs/](docs/README.md).
 
 ## Models
 
-| model | weights | on the NPU |
-|---|---|---|
-| [Llama 3.2 1B, 3B, Llama 3.1 8B Instruct](docs/models/llama3.md) | GGUF Q2_K to Q6_K, Q4_0, Q4_1, BF16; PARO int4 | prefill, decode |
-| [Qwen3 0.6B, Qwen3-Embedding 0.6B / 4B, Qwen3-Reranker 0.6B / 4B, Decision-2.0-Kai 0.6B](docs/models/qwen3.md) | GGUF Q4_1, Q8_0, Q4_K_M; PARO int4 | prefill, decode; embeddings, rerank, decisions |
-| [Gemma 4 E4B it](docs/models/gemma4.md) | GGUF Q4_0; PARO int4 | prefill, decode with its MTP drafter |
-| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B (also as Occamy 1.0), MiniCPM-V 4.7 1B; the decision models d3-lite, d3-nano, Kev-4B](docs/models/qwen35.md) | GGUF Q4_K_M, Q8_0; Occamy's IQ3_XXS / Q3_K mix; PARO int4, int5 | prefill, decode; Qwen3.8 27B and the 35B-A3B models with their drafters; images through their vision encoders (Qwen3-VL's, MiniCPM-V's); decisions, also about images |
-| [LFM3-1.7B, LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B; the decision models d1-2B, d1-Omni-2B](docs/models/lfm3.md) | GGUF QAD-Q4_0, Q4_K_M, Q8_0; d1-2B Q4_0, Q4_K_M, Q8_0; LFM3-Audio, LFM3-Omni Q4_K_M, Q4_0; d1-Omni Q8_0 | prefill, decode (short-convolution, sliding-window and full-attention layers); images and videos through LFM3-VL's vision encoder; speech through LFM3-Audio's encoder (transcription, live transcription) and its generator (text to speech, spoken replies); all of them in one model (LFM3-Omni: videos with their sound, realtime conversations); decisions, also about images, videos and audio |
-| [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | GGUF Q4_K_M, Q8_0; bartowski Q4_K_M, Q4_0 | prefill, decode with its DSpark drafter (3.4-3.7x on code and math); tool calls, thinking levels |
-| [Flint](docs/models/flint.md) | GGUF int4 (Recursive's official file) | prefill, decode (a 40B mixture of experts, ~2.5B active: 31 tokens/s at 1K); tool calls, thinking |
-| [Inkling 2 Mini](docs/models/inkling2.md) | GGUF UD-Q4_K_XL, UD-Q4_K_M (unsloth) | decode and a prefill (a 26B mixture of experts whose middle layers loop 3 times: 11.5 tokens/s at 1K, a 1K prompt in 2.2 s, 8K in 12.8 s), its DSpark drafter (up to 1.2x on code); images through its vision encoder; thinking, several requests at a time |
-| [MOSS-Transcribe-Diarize 0.9B](docs/models/moss.md) | OpenMOSS's checkpoint directory (BF16); transcribe.cpp's GGUF files (Q4_K_M, Q8_0, ...) | transcription with timestamps and speaker tags: its Whisper encoder, prefill, decode |
-| [Stable Diffusion 1.5](docs/models/sd15.md) | diffusers safetensors | the UNet and the VAE decoder |
+| model | what it does |
+|---|---|
+| [Llama 3.2 1B, 3B, Llama 3.1 8B](docs/models/llama3.md) | text |
+| [Qwen3 0.6B, Qwen3-Embedding, Qwen3-Reranker](docs/models/qwen3.md) | text, embeddings, rerank, decisions |
+| [Gemma 4 E4B](docs/models/gemma4.md) | text |
+| [Qwen3.5 9B, Qwen3.6 27B, Qwen3.8 27B, Qwen3.6 35B-A3B, MiniCPM-V 4.7](docs/models/qwen35.md) | text, images, decisions |
+| [LFM3 1.7B, LFM3-VL, LFM3-Audio, LFM3-Omni](docs/models/lfm3.md) | text, images, video, speech in and out, decisions |
+| [Spark-X2.6 4B, 1.7B](docs/models/spark.md) | text |
+| [Flint](docs/models/flint.md) | text |
+| [Inkling 2 Mini](docs/models/inkling2.md) | text, images |
+| [MOSS-Transcribe-Diarize](docs/models/moss.md) | transcripts with timestamps and speakers |
+| [Stable Diffusion 1.5](docs/models/sd15.md) | image generation |
 
-Each model's tested files and the planned models: [Models](docs/models/README.md).
+Artlite loads GGUF files, Hugging Face checkpoints and ParoQuant checkpoints. The tested files of each model and the
+planned models are listed in [Models](docs/models/README.md).
 
 ## Performance
 
@@ -158,31 +121,9 @@ How these are measured: [Benchmark methodology](docs/methodology.md).
   <img alt="The host builds each operator's design once (C++ and an IRON design per shape, compiled by Peano and aiecc into an ELF that configures the NPU), packs a GGUF file's weights once into a weight image in DRAM, and dispatches a transaction every step through the runtime and the amdxdna driver; the NPU's 8 columns stream the weights and the KV cache from DRAM through one 32-byte-per-cycle port, about 57 GB/s" src="docs/images/how-it-works.svg">
 </picture>
 
-Each operator is a Python class that renders a C++ kernel and an IRON design for its shapes; Peano and aiecc compile
-them once into the ELF that configures the array, cached by content hash. A GGUF file's weights are re-laid-out at
-load into one buffer in DRAM, at their quantization's size. Every step the host builds a transaction (a decode step
-on an overlay design, whose cores read what to do from it, or a prefill chunk program assembled from a library ELF)
-and dispatches it; the array's columns then stream the weights and the KV cache from DRAM through the NPU's one port.
+Each operator renders a C++ kernel and an IRON design of the array's data movement for its shapes. Peano (LLVM for AI
+Engine) and aiecc compile them once into the ELF that configures the array, and the build cache keeps the result. At
+load, the weights are packed into one buffer in DRAM. For every step the host builds a transaction and dispatches it to the
+NPU through the `amdxdna` driver (through XRT on Windows). A decode step runs on an overlay design whose cores read
+their work from that transaction, and a prompt runs as chunk programs assembled from a library of compiled designs.
 Details: [Design](docs/design.md).
-
-## Documentation
-
-| | |
-|---|---|
-| [Installation](docs/install.md) | hardware, driver, build, models directory, troubleshooting |
-| [artlite-cli](docs/cli.md), [artlite-server](docs/server.md), [artlite-bench](docs/bench.md), [artlite-probe](docs/probe.md) | the tools and every option |
-| [Models](docs/models/README.md) | tested files, plans, how each model runs on the NPU |
-| [Benchmark methodology](docs/methodology.md) | how the charts are measured: test system, files, other runtimes |
-| [Where the NPU fits](docs/npu-vs-igpu.md) | bandwidth and power against the iGPU, workloads to explore |
-| [Design](docs/design.md) | runtime layers, C++ and Python API, kernel compilation, driver behaviour |
-| [Development](docs/development.md) | tests, environment variables, kernel tools |
-
-## License
-
-Copyright (C) 2025-2026 Artlite contributors
-
-Artlite is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public
-License as published by the Free Software Foundation, either version 2.1 of the License, or (at your option) any later
-version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
-warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License
-([LICENSE](LICENSE)) for more details.

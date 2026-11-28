@@ -1,13 +1,15 @@
 # Artlite
 
-Artlite is a lightweight, fully open replacement for XRT on AMD Ryzen AI NPUs. A small C++ shim (`csrc/`) talks to
-the `amdxdna` driver directly: no xclbin, no plugin layers, zero-copy buffers. Operators are compiled at runtime
-("RTC") from Jinja2 C++ templates specialized per shape, plus an IRON (`aie.iron`) array design lowered through
-MLIR-AIE. Python packages: `artlite` (nanobind bindings `artlite._native`, the operator framework
-`artlite.operators`, the subsystems the models share) and `models` (`src/models/`: each model on the NPU and its host
-side, the commands `artlite-cli`, `artlite-bench`, `artlite-server`), built with scikit-build-core. On Windows 11 the
-same runtime goes through XRT (the XRT backend, `csrc/shim_xrt/`; on Linux too where XRT is installed:
-`ARTLITE_BACKEND=xrt`; setup and differences: `docs/install.md`, Windows).
+Artlite is an inference engine for the NPU of AMD Ryzen AI processors, the fastest one for it. It runs language,
+vision and speech models and Stable Diffusion on the NPU and serves them through `artlite-cli`, `artlite-bench` and
+`artlite-server` (OpenAI-, Anthropic- and llama-server-compatible APIs, a web chat, a backend for coding agents). Its
+kernels come from its own JIT toolchain: each operator renders Jinja2 C++ templates specialized for its shapes plus an
+IRON (`aie.iron`) array design, which Peano and MLIR-AIE compile at run time ("RTC"). Python packages: `artlite` (the
+nanobind bindings `artlite._native`, the operator framework `artlite.operators`, the subsystems the models share) and
+`models` (`src/models/`: each model on the NPU and its host side, the commands), built with scikit-build-core. The C++
+runtime (`csrc/`) talks to the `amdxdna` driver directly (no xclbin). On Windows 11 it goes through XRT (the XRT
+backend, `csrc/shim_xrt/`; on Linux too where XRT is installed: `ARTLITE_BACKEND=xrt`; setup and differences:
+`docs/install.md`, Windows).
 
 Target: AIE2P (NPU2) only, i.e. AMD Strix Point, Strix Halo and Krackan. All these CPUs are znver5, so `csrc/` may
 use any modern SIMD (AVX-512 included).
