@@ -315,12 +315,13 @@ class Library(FusedElf):
                 asm.parity = held[1]
                 wait(_Flight(submit, items, 0, len(items), cached.item_ops if cached is not None else None), 0)
                 return 1
-        k, starts = 0, []
+        k, starts, total_bytes = 0, [], 0
         last, end = None, 0.0  # (the piece dispatched last; the end of the one before it)
         for k, (a, b) in enumerate(itertools.pairwise(bounds)):
             starts.append(asm.parity)
             slot = asm.parity if key is not None else k % 2
             piece, asm.parity, item_ops = self._piece(items, a, b, asm.parity)[1:]
+            total_bytes += piece.nbytes
             if piece.nbytes > limit:
                 raise ValueError(f"{self.name}: items {a}..{b} take {piece.nbytes} bytes of control code, more than "
                                  f"a piece BO's {limit}")
@@ -347,8 +348,11 @@ class Library(FusedElf):
             last = _Flight(max(submit, end), items, a, b, item_ops)
         if key is not None and asm.parity != slot:
             self._ahead(items, key, asm)
-        elif asm.parity != starts[0]:  # (the next run's pieces start at the other parities: assembled while this one ends)
+        elif asm.parity != starts[0] and 2 * total_bytes <= self._cache.limit:
+            # (the next run's pieces start at the other parities: pre-assemble while this run finishes if cache fits)
             for (a, b), p in zip(itertools.pairwise(bounds), starts):
+                if kern.dispatch_poll():
+                    break
                 self._piece(items, a, b, p ^ 1)
         wait(last, 0)
         return k + 1

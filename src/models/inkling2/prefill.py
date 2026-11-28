@@ -37,17 +37,20 @@ from types import SimpleNamespace
 import numpy as np
 from ml_dtypes import bfloat16
 
+from artlite.gguf_model import tensor_f32
 from artlite.model_config import InklingConfig
 from artlite.moe.expert_gemm import CHUNK
 from artlite.operators.design import COLS
-from artlite.operators.util import arg_bytes
+from artlite.operators.util import arg_bytes, rup
 from artlite.prefill import attn as PA
 from artlite.prefill import gemm as PG
 from artlite.prefill.attn.ink import RING_BYTES, InkPrepOperator, ink_shape
+from artlite.prefill.attn.shape import P_CS, P_KV, P_KVR
 from artlite.prefill.chunks import ChunkPrefill
 from artlite.prefill.ink_stream import InkBlendOperator, InkGateOperator, InkMixOperator, InkResidOperator
 from artlite.prefill.norm import PrefillNormOperator
 
+from .dspark import DSparkOverlay
 from .moe import InkMoE
 from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
@@ -79,14 +82,18 @@ class InklingPrefill(ChunkPrefill):
     CFG_S = CFG_S
 
     def __init__(self, overlay: InklingOverlay, *, sizes: tuple[int, ...] = SIZES, ffn: bool = True,
-                 taps: tuple[int, ...] = ()):
+                 taps: tuple[int, ...] = (), dspark: DSparkOverlay | None = None):
         ov = overlay
         assert not ffn or ov.ffn, "the overlay's FFNs"
+        if dspark is not None:
+            assert not taps or tuple(taps) == tuple(dspark.cfg.taps[:-1]), (taps, dspark.cfg.taps)
+            taps = dspark.cfg.taps[:-1]
         assert not taps or (ffn and ov.layers == list(range(len(overlay.cfg.visits)))), "taps: the whole model"
         super().__init__(overlay, tuple(t for t in sizes if t % ov.pg == 0))
         cfg = self.cfg
-        self.ffn, self.taps = ffn, tuple(taps)
-        self.taps_out: np.ndarray | None = None  # (the last chunk's: module docstring)
+        self.ffn, self.taps, self.dspark = ffn, tuple(taps), dspark
+        self.taps_out: np.ndarray | None = None  # (the last chunk's when dspark is None: module docstring)
+        self.last_tap: np.ndarray | None = None  # (last valid token's (taps + 1, H) fp32 when dspark runs)
         self.layers = list(ov.layers)  # (the visits: ``ChunkPrefill``'s layers)
         self.kv_layers = list(self.layers)
         self.vis = {v: cfg.visits[v] for v in self.layers}
@@ -99,6 +106,7 @@ class InklingPrefill(ChunkPrefill):
         self._gemms: dict = {}
         self._starts: dict[int, list[int]] = {}
         self._marks: dict[int, list[tuple[int, int, str]]] = {}  # (per size: (visit, the item its host step precedes, XF))
+        self._ds_marks: dict[int, int] = {}  # (per size when dspark runs: item index where _prep_dspark runs)
         self.moe = InkMoE(self.img, layers=sorted({self.vis[v].layer for v in self.layers}), sizes=self.sizes, sub=SUB,
                           eps=cfg.rms_norm_eps) if ffn else None
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
@@ -114,8 +122,55 @@ class InklingPrefill(ChunkPrefill):
         # (the FFN's: its delta DL as rows)
         self.fresid = {T: InkResidOperator(T=T, block=False, y_pitch=self.H, y_col=self.H // COLS, hist_rows=HIST_ROWS)
                        for T in self.sizes} if ffn else {}
+        self._ds_init()
         self._rows()
         self._library()
+
+    def _library(self) -> None:
+        super()._library()
+        self.lib._cache.limit = 128 << 20
+
+    def _ds_init(self) -> None:
+        """DSpark prefill operators, KV prep designs and k_ctx_norm weights when ``self.dspark`` is given."""
+        ds = self.dspark
+        if ds is None:
+            self.ds_sz, self.ds_preps, self._ds_kn = {}, {}, {}
+            return
+        dc, ds_img = ds.cfg, ds.image
+        self.ds_shape = s = PA.Shape(hd=ds.hd, qh=2, kp=ds.kp, a_bytes=ds.T, qp=1, pp=1, per=1)
+        assert s.pg == self.shape.pg and s.group == self.shape.group
+        ds_wrap = ds.kinds[0].wrap
+        assert not (self.wrap and ds_wrap and self.wrap != ds_wrap), (self.wrap, ds_wrap)
+        assert (self.sizes[-1] - self._t(self.sizes[-1])) // s.pg * s.group <= ds.pad + ds.rings[1], (
+            "DSparkOverlay needs kv_pad >= MAX_T - SUB for InklingPrefill")
+        self._ds_kn = {L: tensor_f32(ds.gguf, f"blk.{L}.attn_k_ctx_norm.weight") for L in ds.layers}
+        self.ds_sz = {}
+        self.ds_preps = {}
+        for t in self.sz:
+            cols = 4 if t < SUB else COLS
+            plans = {L: PG.plan_phase(ds_img, ds_img.region(L, "ikv"), t, ops=self._gemms) for L in ds.layers}
+            self.ds_sz[t] = SimpleNamespace(
+                norm=PrefillNormOperator(T=t, add=False, E=self.H, eps=dc.rms_norm_eps, cols=cols),
+                plans=plans)
+            for L in ds.layers:
+                local = dc.local[L]
+                if (t, local) in self.ds_preps:
+                    continue
+                lay = plans[L].layout
+                self.ds_preps[(t, local)] = PA.PrepOperator(
+                    T=t, shape=s, layout=PG.Layout(pitch=lay.pitch, off={"q": 0, "k": lay.off["k"], "v": lay.off["v"]}),
+                    kv_bytes=ds.kv_bytes(L), cs_positions=t, kv_pad=0, norm=True, eps=dc.rms_norm_eps,
+                    kv0=ds.kinds[0].guard * s.group if local else 0, wrap=ds_wrap if local else 0)
+
+    def _external(self) -> set[str]:
+        return {"DW", "DKV"} if self.dspark is not None else set()
+
+    def _buffers(self) -> dict[str, object]:
+        bufs = super()._buffers()
+        ds = self.dspark
+        if ds is not None:
+            bufs |= {"DW": ds.dev.buffers["W"], "DKV": ds.dev.buffers[ds.dev.alias.get("KV", "KV")]}
+        return bufs
 
     # ------------------------------------------------------------------
     # The visits' states
@@ -141,13 +196,25 @@ class InklingPrefill(ChunkPrefill):
                 bank = [f"M{(x.loop - 1) % 2}", f"X{(x.loop - 1) % 2}"]
             new = None
             if x.block:
-                new = "P" if x.layer == 0 else f"M{x.loop % 2}" if x.layer == cfg.core_start else \
-                    f"X{x.loop % 2}" if x.layer == mid else "CD"
+                if x.layer == 0:
+                    new = "P"
+                elif x.layer == cfg.core_start:
+                    new = f"M{x.loop % 2}"
+                elif x.layer == mid:
+                    new = f"X{x.loop % 2}"
+                else:
+                    tapped = {out[tv].cur for tv in self.taps if tv in out}
+                    new = next(s for s in (f"M{cfg.passes % 2}", f"X{cfg.passes % 2}", "CD")
+                               if s not in tapped) if cfg.passes else "CD"
             out[v] = SimpleNamespace(blocks=list(blocks), cur=cur, new=new, bank=bank)
             if x.block:
                 blocks.append(cur)
                 cur = new
         self.final = blocks + [cur]  # (the output's mix: the last visit's states)
+        # taps are the residual entering visit v; visits modify cur in place (attention / FFN), so save pre-visit taps before overwrite
+        self._early_taps = tuple(j for j, v in enumerate(self.taps)
+                                 if any(out[v].cur in (out[u].cur, out[u].new)
+                                        for u in self.layers if u >= v and (self.ffn or not cfg.visits[u].block or u > v)))
         return out
 
     # ------------------------------------------------------------------
@@ -243,9 +310,10 @@ class InklingPrefill(ChunkPrefill):
         lq = next(p.layout for (_, n), p in o.plans.items() if n == "q")
         lk = max((p.layout for (_, n), p in o.plans.items() if n == "k"), key=lambda lay: lay.N)
         lv = max((p.layout for (_, n), p in o.plans.items() if n == "v"), key=lambda lay: lay.N)
-        self.rb = {s: 4 * H for s in ("E", "P", "M0", "X0", "M1", "X1", "CD")}
-        self.rb |= {"EB": 2 * H, "XM0": 2 * H, "XM1": 2 * H, "XM2": 2 * H, "MS": 2 * H, "XC0": 2 * H, "XC1": 2 * H,
-                    "XC2": 2 * H, "XN0": 9 * H // 8, "XN1": 9 * H // 8, "XN2": 9 * H // 8, "DP": 9 * H // 8,
+        self.rb = {s: 4 * H for s in ("E", "P", "M0", "X0", "M1", "X1")}
+        if any("CD" in (w.cur, w.new) for w in self.walk.values()) or "CD" in self.final:
+            self.rb["CD"] = 4 * H
+        self.rb |= {"EB": 2 * H, "XM0": 2 * H, "MS": 2 * H, "XC0": 2 * H, "XN0": 9 * H // 8, "DP": 9 * H // 8,
                     "GQ": 2 * lq.N, "GK": 2 * lk.N, "GV": 2 * lv.N, "A": 9 * COLS * 3 * 128 // 8,
                     "Y": 2 * COLS * o.d_pitch, "QS": COLS * self.shape.tgu // 8}
         dl = next((p.layout for (_, n), p in o.plans.items() if n == "dqa"), None)
@@ -255,6 +323,40 @@ class InklingPrefill(ChunkPrefill):
             self.rb |= self.moe.rows(t)
         if self.taps:
             self.rb["XF"] = 2 * H
+        if self.dspark is not None:
+            self.rb["DXN"] = 9 * H // 8
+        # Pool strictly disjoint scratch buffers with Y01/Y2 inside MOE_Y:
+        # group A (Y01, Y2), group B (attention/controller/router + XF), group C (DSpark prefill) never overlap in time.
+        self._pool: dict[str, tuple[str, int]] = {}
+        pad_rows = self.sizes[-1] + 64
+        moe_fixed = self.moe.fixed() if self.moe is not None else {}
+
+        def pack_group(items: list[tuple[str, int]]) -> int:
+            pos = 0
+            for name, nbytes in items:
+                if nbytes <= 0:
+                    continue
+                self._pool[name] = ("MOE_Y", pos)
+                pos = rup(pos + nbytes, 4096)
+            return pos
+
+        end_a = pack_group([(n, moe_fixed[n]) for n in ("Y01", "Y2") if n in moe_fixed])
+        grp_b = [(n, pad_rows * self.rb[n])
+                 for n in ("EB", "MS", "XC0", "XN0", "DP", "GA", "GB", "GQ", "GK", "GV", "A", "Y", "XR", "XF")
+                 if n in self.rb]
+        end_b = pack_group(grp_b)
+        end_c = 0
+        if self.dspark is not None:
+            ds = self.dspark
+            max_fg = max(p.layout.N for d_o in self.ds_sz.values() for p in d_o.plans.values())
+            max_dqs = max(arg_bytes(op, 2) for op in self.ds_preps.values())
+            grp_c = [("FMX", len(ds.layers) * pad_rows * 2 * H),
+                     ("DXN", pad_rows * self.rb["DXN"]),
+                     ("FG", pad_rows * 2 * max_fg),
+                     ("FCS", self.sizes[-1] * 4 * ds.hd),
+                     ("DQS", max_dqs)]
+            end_c = pack_group(grp_c)
+        self._moe_y_bytes = rup(max(end_a, end_b, end_c), 4096)
         # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ones, ffn] x H bf16), its queries (QR: the
         # attention's 3 rows (one used by a sliding-window layer), the FFN's, the 4 messages' x H fp32), its prep's PRM,
         # its E table (EB), its post convs' taps (TP: [2][COLS][4][C] bf16); TAU per position
@@ -264,6 +366,9 @@ class InklingPrefill(ChunkPrefill):
         self.np_w, self.qr_w, self.prm_w = 5 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
         self.e_w = {k: 2 * self._attns(k, self.sizes[-1])[0].n_e for k in self.kinds}
         self.tp_w = 2 * 2 * COLS * 4 * (H // COLS)
+        if self.dspark is not None:
+            ds_prep = next(iter(self.ds_preps.values()))
+            self.ds_nw_w = ds_prep.nw_bytes(self.dspark.hd)
 
     def _np(self, L: int, j: int) -> str:
         o = self.phys[L] * self.np_w + j * 2 * self.H
@@ -285,6 +390,10 @@ class InklingPrefill(ChunkPrefill):
         o = self.phys[L] * self.tp_w + i * self.tp_w // 2
         return f"TP[{o}:{o + arg_bytes(op, 2 if op.block else 3)}]"
 
+    def _sl(self, buf: str, off: int, op: object, *, i: int) -> str:
+        buf, base = self._pool.get(buf, (buf, 0))
+        return super()._sl(buf, base + off, op, i=i)
+
     def _runlist(self, S: int) -> list[tuple]:
         return self._runlist_of(S * SUB)
 
@@ -305,27 +414,44 @@ class InklingPrefill(ChunkPrefill):
             L = x.layer
             full = x.kind == "full"
             states = w.blocks + [w.cur]
-            inputs = []  # (per stream: its rows' buffer, its norm weight's index)
-            if not x.queries:  # (layer 0: the normed embedding itself)
-                inputs = [("EB", 0)]
-            else:
-                for j in range(3 if full else 1):
-                    mx = o.mixes[len(states)]
-                    rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, j),
-                            tok(f"XM{j}", jj, mx, i=len(states) + 1)) for jj in range(S)]
-                    inputs.append((f"XM{j}", j if full else 0))
-            if x.messages:  # (per stream its message, the controller's down halves, the blend)
-                inputs = [(self._control(rl, o, S, tok, v, s, inputs[si if full else 0][0], f"XC{si}"), si if full else 0)
-                          for si, s in enumerate(CTL)]
             nm = o.norm
-            for j, (src, ni) in enumerate(inputs):
-                rl += [(nm, tok(src, jj, nm, i=0), self._np(L, ni), tok(f"XN{j}", jj, nm, i=2)) for jj in range(S)]
             gr = {}  # (per GEMM output its rows' bytes: the visit's own layout)
-            for n, g_buf in (("q", "GQ"), ("k", "GK"), ("v", "GV")):
-                xn = f"XN{min('qkv'.index(n), len(inputs) - 1)}"
-                gr[g_buf] = 2 * o.plans[(L, n)].layout.N
-                rl += [(g.op, tok(xn, jj, g.op, i=0), self._w(g), tok(g_buf, jj, g.op, i=2, row=gr[g_buf]))
-                       for g in o.plans[(L, n)].gemms for jj in range(S)]
+            if full:
+                for j, (s, n, g_buf) in enumerate(zip(CTL, ("q", "k", "v"), ("GQ", "GK", "GV"))):
+                    if not x.queries:
+                        src = "EB"
+                    else:
+                        mx = o.mixes[len(states)]
+                        rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, j),
+                                tok("XM0", jj, mx, i=len(states) + 1)) for jj in range(S)]
+                        src = "XM0"
+                    if x.messages:
+                        src = self._control(rl, o, S, tok, v, s, src, "XC0")
+                    rl += [(nm, tok(src, jj, nm, i=0), self._np(L, j), tok("XN0", jj, nm, i=2)) for jj in range(S)]
+                    gr[g_buf] = 2 * o.plans[(L, n)].layout.N
+                    rl += [(g.op, tok("XN0", jj, g.op, i=0), self._w(g), tok(g_buf, jj, g.op, i=2, row=gr[g_buf]))
+                           for g in o.plans[(L, n)].gemms for jj in range(S)]
+            else:
+                if not x.queries:
+                    src = "EB"
+                else:
+                    mx = o.mixes[len(states)]
+                    rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(states)), self._qr(L, 0),
+                            tok("XM0", jj, mx, i=len(states) + 1)) for jj in range(S)]
+                    src = "XM0"
+                if x.messages:
+                    for s, n, g_buf in zip(CTL, ("q", "k", "v"), ("GQ", "GK", "GV")):
+                        xc = self._control(rl, o, S, tok, v, s, src, "XC0")
+                        rl += [(nm, tok(xc, jj, nm, i=0), self._np(L, 0), tok("XN0", jj, nm, i=2)) for jj in range(S)]
+                        gr[g_buf] = 2 * o.plans[(L, n)].layout.N
+                        rl += [(g.op, tok("XN0", jj, g.op, i=0), self._w(g), tok(g_buf, jj, g.op, i=2, row=gr[g_buf]))
+                               for g in o.plans[(L, n)].gemms for jj in range(S)]
+                else:
+                    rl += [(nm, tok(src, jj, nm, i=0), self._np(L, 0), tok("XN0", jj, nm, i=2)) for jj in range(S)]
+                    for n, g_buf in (("q", "GQ"), ("k", "GK"), ("v", "GV")):
+                        gr[g_buf] = 2 * o.plans[(L, n)].layout.N
+                        rl += [(g.op, tok("XN0", jj, g.op, i=0), self._w(g), tok(g_buf, jj, g.op, i=2, row=gr[g_buf]))
+                               for g in o.plans[(L, n)].gemms for jj in range(S)]
             ring = f"KV[{ov.raw[v]}:{ov.raw[v] + COLS * RING_BYTES}]"
             for b, prep in enumerate(self.preps[(x.kind, T)]):  # (its parts in order: each reads the ring before it)
                 pt = prep.T
@@ -351,6 +477,30 @@ class InklingPrefill(ChunkPrefill):
             mx = o.mixes[len(self.final)]
             rl += [(mx, *(tok(s_, jj, mx, i=i) for i, s_ in enumerate(self.final)), f"QO[0:{4 * self.H}]",
                     tok("XF", jj, mx, i=len(self.final) + 1)) for jj in range(S)]
+        if self.dspark is not None:
+            self._ds_marks[T] = len(rl)
+            ds = self.dspark
+            d_o = self.ds_sz[t]
+            ds_pg, ds_grp = self.ds_shape.pg, self.ds_shape.group
+            hd = ds.hd
+            for L in ds.layers:
+                fm_off = L * T * 2 * self.H
+                dp = d_o.plans[L]
+                fg_row = 2 * dp.layout.N
+                pr = self.ds_preps[(t, ds.cfg.local[L])]
+                nw_off = L * self.ds_nw_w
+                rl += [(d_o.norm, sl("FMX", fm_off + jj * t * 2 * self.H, d_o.norm, i=0),
+                        f"DNP[{L * 2 * self.H}:{(L + 1) * 2 * self.H}]",
+                        tok("DXN", jj, d_o.norm, i=2)) for jj in range(S)]
+                rl += [(g.op, tok("DXN", jj, g.op, i=0), f"DW[{g.w_off}:{g.w_off + g.op.w_bytes}]",
+                        tok("FG", jj, g.op, i=2, row=fg_row)) for g in dp.gemms for jj in range(S)]
+                for jj in range(S):
+                    kv_off = ds.kv_off[L] + jj * (t // ds_pg) * ds_grp
+                    rl.append((pr, tok("FG", jj, pr, i=0, row=fg_row),
+                               sl("FCS", jj * 4 * t * hd, pr, i=1),
+                               sl("DQS", 0, pr, i=2),
+                               f"DKV[{kv_off}:{kv_off + arg_bytes(pr, 3)}]",
+                               f"DNW[{nw_off}:{nw_off + arg_bytes(pr, 4)}]"))
         self._starts[T] = [*starts, len(rl)]
         self._marks[T] = marks
         return rl
@@ -417,6 +567,8 @@ class InklingPrefill(ChunkPrefill):
         for name, r in self.rb.items():  # (the GEMMs' padding rows past the last sub-chunk)
             if name in own:
                 own[name] = max(own[name], (self.sizes[-1] + 64) * r)
+        if self._moe_y_bytes:
+            own["MOE_Y"] = max(own.get("MOE_Y", 0), self._moe_y_bytes)
         n = len(self.phys)
         own["NP"] = max(own.get("NP", 0), n * self.np_w)
         own["QR"] = max(own.get("QR", 0), n * self.qr_w)
@@ -425,8 +577,13 @@ class InklingPrefill(ChunkPrefill):
         own["TP"] = max(own.get("TP", 0), n * self.tp_w)
         if self.taps:
             own["QO"] = max(own.get("QO", 0), 4 * self.H)
+        if self.dspark is not None:
+            nd = len(self.dspark.layers)
+            own["DNP"] = max(own.get("DNP", 0), nd * 2 * self.H)
+            own["DNW"] = max(own.get("DNW", 0), nd * self.ds_nw_w)
         for name, b in (self.moe.fixed() if self.moe else {}).items():
-            own[name] = max(own.get(name, 0), b)
+            if name not in self._pool:
+                own[name] = max(own.get(name, 0), b)
 
     def _bind(self) -> None:
         """The norm weights (NP), queries (QR), the preps' constants (PRM), the E tables (EB), the post convs' taps (TP),
@@ -476,6 +633,17 @@ class InklingPrefill(ChunkPrefill):
             dev.view("QO")[:4 * H] = vec("output_res_query.weight").view(np.uint8)
             dev.flush("QO")
             self._w_out = vec("output_norm.weight")
+        if self.dspark is not None:
+            ds = self.dspark
+            dnp, dnw = dev.view("DNP"), dev.view("DNW")
+            ones = np.ones(ds.hd, np.float32)
+            for L in ds.layers:
+                dnp[L * 2 * H:(L + 1) * 2 * H] = ds.mix_norms[L].astype(bfloat16).view(np.uint8)
+                nw = dnw[L * self.ds_nw_w:(L + 1) * self.ds_nw_w]
+                nw[:] = 0
+                nw[:8 * ds.hd] = np.concatenate([ones, self._ds_kn[L]]).view(np.uint8)
+            dev.flush("DNP")
+            dev.flush("DNW")
         tau = cfg.tau(np.arange(self.own["TAU"] // 4)).astype(np.float32)
         dev.view("TAU")[:tau.nbytes] = tau.view(np.uint8)
         for name in ("NP", "QR", "PRM", "ET", "TP", "TAU"):
@@ -499,10 +667,9 @@ class InklingPrefill(ChunkPrefill):
     @staticmethod
     def ring(max_positions: int) -> int:
         """The sliding-window caches' ring (groups; 0: linear) of an overlay of ``max_positions`` that a prefill runs on:
-        two of the largest chunk (chunks of it start at its multiples, each within one turn: ``fits``), linear where the
-        capacity holds no more (33K positions: 3.4 GB of caches and conv state against 5.8 GB linear; 132K: 6.2 GB against
-        22.6)."""
-        w = 2 * SIZES[-1] // CG
+        one of the largest chunk (chunks start at its multiples, each within one turn: ``fits``), linear where the
+        capacity holds no more."""
+        w = SIZES[-1] // CG
         return w if -(-max_positions // CG) > w else 0
 
     def params(self, T: int, p0: int, n: int) -> dict[str, int]:
@@ -513,6 +680,19 @@ class InklingPrefill(ChunkPrefill):
                 out |= prep.params(p0, n)
             for j, at in enumerate(self._attns(k, T)):
                 out |= at.params(p0 + j * at.T)
+        if self.dspark is not None:
+            ds = self.dspark
+            s = self.ds_shape
+            g = p0 // s.pg
+            out[P_CS] = 0
+            if any(ds.cfg.local[L] for L in ds.layers):
+                ds_wrap = ds.kinds[0].wrap
+                if ds_wrap:
+                    out[P_KVR] = s.group // 2 * (g % ds_wrap)
+                else:
+                    out[P_KV] = s.group // 2 * g
+            if any(not ds.cfg.local[L] for L in ds.layers):
+                out[P_KV] = s.group // 2 * g
         a = p0 - 3 - self.ov._hbase[self.ov.seq]  # (the conv histories' first row in the windows)
         out |= self.resid[(T, False)].params(n, a)
         return out
@@ -524,36 +704,99 @@ class InklingPrefill(ChunkPrefill):
         ov, dev = self.ov, self.ov.dev
         n = e.shape[0]
         T = self._size(n, p0, T)
+        assert not self.wrap or T - n < (self.wrap - self.guard) * self.shape.pg, (T, n, self.wrap, self.guard)
         H = self.H
         if "E" in self.own:  # (the mixes' state 0; a slice of visit 0 alone reads only EB)
             ev = dev.view("E")[:4 * T * H].view(np.float32).reshape(T, H)
             ev[:n], ev[n:] = e, 0
             dev.flush("E", 0, 4 * T * H)
-        eb = dev.view("EB")[:2 * T * H].view(bfloat16).reshape(T, H)
+        eb_buf, eb_off = self._pool.get("EB", ("EB", 0))
+        eb = dev.view(eb_buf)[eb_off:eb_off + 2 * T * H].view(bfloat16).reshape(T, H)
         eb[:n], eb[n:] = e.astype(bfloat16), 0
-        dev.flush("EB", 0, 2 * T * H)
+        dev.flush(eb_buf, eb_off, 2 * T * H)
         ov.mirror(p0)  # (a ring's window before the chunk across its wrap: the guard)
+        if self.dspark is not None:
+            self.dspark.mirror(p0)
+        buf_of = lambda name: self._pool.get(name, (name, 0))
         hooks = {i: functools.partial(self.moe.host_route, self.vis[v].layer, n=n, T=T, t=self._t(T), xf=xf, dev=dev,
-                                      lib=self.lib) for v, i, xf in self._marks.get(T, ())}
+                                      lib=self.lib, buf_of=buf_of) for v, i, xf in self._marks.get(T, ())}
         if self.taps:  # (cur when a tap visit starts: after the piece before it)
-            self.taps_out = np.empty((n, len(self.taps) + 1, H), np.float32)
-            for j, v in enumerate(self.taps):
-                i = self._starts[T][v]
-                assert i not in hooks, (v, i)
-                hooks[i] = functools.partial(self._tap, self.walk[v].cur, j, n)
+            if self.dspark is None:
+                self.taps_out = np.empty((n, len(self.taps) + 1, H), np.float32)
+                for j, v in enumerate(self.taps):
+                    i = self._starts[T][v]
+                    assert i not in hooks, (v, i)
+                    hooks[i] = functools.partial(self._tap, self.walk[v].cur, j, n)
+            else:
+                self._early_buf = {}
+                for j in self._early_taps:
+                    v = self.taps[j]
+                    i = self._starts[T][v]
+                    assert i not in hooks, (v, i)
+                    hooks[i] = functools.partial(self._tap_save, self.walk[v].cur, j, n)
+                dm = self._ds_marks[T]
+                assert dm not in hooks, dm
+                hooks[dm] = functools.partial(self._prep_dspark, T, n, p0)
         # (the host's routing reads the router's logits: after the piece that ends with the router)
         self._launch(T, p0, self.params(T, p0, n), hooks or None, synced=tuple(hooks))
         dev.stale = True  # (the chunk's configurations replaced the attention cores' code pages)
         ov._hbase[ov.seq] = p0 + n - 3  # (the windows' rows 0 .. 2: the chunk's last 3 valid tokens')
-        if self.taps:
-            dev.fetch("XF", 0, 2 * n * H)
-            x = dev.view("XF")[:2 * n * H].view(bfloat16).reshape(n, H).astype(np.float64)
+        if self.dspark is not None:
+            self.dspark.next = p0 + n
+            self.dspark.dev.stale = True
+            self.dspark.vring.from_prefill.update(self.dspark.layers)
+        elif self.taps:
+            xf_buf, xf_off = self._pool.get("XF", ("XF", 0))
+            dev.fetch(xf_buf, xf_off, 2 * n * H)
+            x = dev.view(xf_buf)[xf_off:xf_off + 2 * n * H].view(bfloat16).reshape(n, H).astype(np.float64)
             r = 1 / np.sqrt((x * x).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
             self.taps_out[:, -1] = (x * r * self._w_out).astype(np.float32)
 
     def _tap(self, name: str, j: int, n: int) -> None:
         """(a host step) tap j's rows: the chunk's n valid rows of state ``name``."""
         self.taps_out[:, j] = self.state(name, 0, n)
+
+    def _tap_save(self, name: str, j: int, n: int) -> None:
+        self._early_buf[j] = self.state(name, 0, n)
+
+    def _prep_dspark(self, T: int, n: int, p0: int) -> None:
+        """(a host step before DSpark's layers) mix taps per layer as bf16 into FMX, write cos/sin into FCS, and save the
+        chunk's last valid tap row for `_pend`."""
+        ds, dev, H = self.dspark, self.ov.dev, self.H
+        xf_buf, xf_off = self._pool.get("XF", ("XF", 0))
+        dev.fetch(xf_buf, xf_off, 2 * n * H)
+        xf = dev.view(xf_buf)[xf_off:xf_off + 2 * n * H].view(bfloat16).reshape(n, H).astype(np.float64)
+        r = 1 / np.sqrt((xf * xf).mean(-1, keepdims=True) + self.cfg.rms_norm_eps)
+        xf_norm = (xf * r * self._w_out).astype(np.float32)
+        taps = []
+        fetched: dict[str, np.ndarray] = {}
+        for j, v in enumerate(self.taps):
+            if j in self._early_buf:
+                taps.append(self._early_buf[j])
+            else:
+                name = self.walk[v].cur
+                if name not in fetched:
+                    fetched[name] = self.state(name, 0, n)
+                taps.append(fetched[name])
+        taps.append(xf_norm)
+        self.last_tap = np.stack([t[n - 1] for t in taps]).copy()
+        fm_buf, fm_off = self._pool["FMX"]
+        fm_all = dev.view(fm_buf)[fm_off:fm_off + len(ds.layers) * T * 2 * H].view(bfloat16).reshape(len(ds.layers), T, H)
+        # process in sub-chunk slices so mixed fp32 intermediates fit in CPU L3 cache
+        for a in range(0, n, SUB):
+            b = min(n, a + SUB)
+            blk = np.stack([t[a:b] for t in taps], axis=1)  # (b - a, ntaps, H)
+            for L in ds.layers:
+                fm_all[L, a:b] = np.einsum("t,sth->sh", ds.alpha[L], blk).astype(bfloat16)
+        if n < T:
+            fm_all[:, n:T] = 0
+        dev.flush(fm_buf, fm_off, len(ds.layers) * T * 2 * H)
+        cs_buf, cs_off = self._pool["FCS"]
+        cs = dev.view(cs_buf)[cs_off:cs_off + T * 4 * ds.hd].view(bfloat16).reshape(T, 2 * ds.hd)
+        cs[:n] = PA.cs_rows(ds.inv_freq, np.arange(p0, p0 + n)).astype(np.float32).view(bfloat16).reshape(n, 2 * ds.hd)
+        if n < T:
+            cs[n:] = 0
+        dev.flush(cs_buf, cs_off, T * 4 * ds.hd)
 
     def state(self, name: str, i: int, n: int) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of a state buffer the last chunk left."""

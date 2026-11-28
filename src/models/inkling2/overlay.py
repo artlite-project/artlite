@@ -62,7 +62,7 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 from artlite import txn
-from artlite.decode import kv
+from artlite.decode import gemv, kv
 from artlite.decode import phases as mp
 from artlite.decode.attn import (
     INK_ED0,
@@ -137,7 +137,6 @@ from .decode import InklingDecodeOperator
 from .image import EXPERT_UNITS, InklingImage
 
 KINDS = ("swa", "full")
-FORMATS = frozenset({"Q8_0", "BFP16", "NVFP4", "Q5_K", "Q8_0H"})  # (the formats the overlay runs so far)
 PHASES = ("q", "k", "v", "att", "o")  # (a visit's attention phases)
 FFN_PHASES = ("router", "moe")  # (its FFN's: the router's GEMV, the MoE operator phase)
 RING = 9216  # (a raw ring's bytes: one A object, its first 8 KB the ring)
@@ -224,7 +223,7 @@ class InklingOverlay(AttentionOverlay):
     DSpark drafter's visits whose input residual the steps copy out (module docstring)."""
 
     CONFIG, IMAGE = InklingConfig, InklingImage
-    AHEAD = True  # (the next step patched while one runs: ~1.2 ms a step off the host's path)
+    AHEAD = False  # (single step buffer: DSpark's meanwhile=patch_ahead patches b=0; no b=1 build stall or extra RAM)
     CHAIN = 1
     SEQ = ("KV",)  # (a sequence's caches, raw rings, history windows and open records)
     OPS = ("att", "moe")
@@ -248,8 +247,14 @@ class InklingOverlay(AttentionOverlay):
         self.lm_ok = ffn and self.after == len(cfg.visits)
         layers = {x.layer for x in self.vis.values()} | \
             ({cfg.visits[self.after].layer} if ffn and not self.lm_ok else set())
-        image = None if weights is not None else InklingImage(gguf, cfg, layers=sorted(layers), vocab=vocab)
-        super().__init__(gguf, layers=vs, vocab=vocab, kv_k=kv_k, weights=weights, image=image, sequences=sequences)
+        phys = sorted(layers)
+        if weights is not None:
+            assert weights.image.layers == phys and vocab in (None, weights.image.vocab)
+            image = weights.image
+        else:
+            image = InklingImage(gguf, cfg, layers=phys, vocab=vocab)
+        super().__init__(gguf, layers=vs, vocab=vocab, kv_k=kv_k, weights=None, image=image, sequences=sequences)
+        self.weights = weights
         img = self.image
         regions = ("q", "k", "v", "o") + (("router",) if ffn else ())
         fmts = {b.fmt for L in img.layers for name in regions for b in img.region(L, name).blocks}
@@ -257,8 +262,9 @@ class InklingOverlay(AttentionOverlay):
             fmts |= {f for r in img.slabs for b in r.blocks for f in b.formats}
         if self.lm_ok:
             fmts |= set(img.region(-1, "lm").blocks[0].formats)
-        if fmts - FORMATS:
-            raise NotImplementedError(f"{', '.join(sorted(fmts - FORMATS))} tiles")
+        unsupported = {f for f in fmts if not gemv.supported(f, 4)}
+        if unsupported:
+            raise NotImplementedError(f"{', '.join(sorted(unsupported))} tiles")
         self.hd, self.q_heads = cfg.head_dim, cfg.q_per_kv
         moe = (cfg.n_experts, cfg.n_experts_used) if ffn else None
         self.at = at = Attn(hds=(self.hd,), rot=(0,), chain=1, heads=self.q_heads, kp=self.kp, v_norm=True,
@@ -270,7 +276,19 @@ class InklingOverlay(AttentionOverlay):
                                         situ=(cfg.situ_beta, cfg.situ_linear_beta))
         # (the experts' gate / up: tail groups of 16-row tiles, of 8-row ones in pairs or of 13-row ones (3 windows), whole
         # [8 gate | 8 up] windows: ``image.unit_gu_rows``)
-        assert all(r.qt and r.qg % 2 == 0 for r in img.slabs if r.name.startswith("exp_gu")) and img.gu_rows() <= {8, 13, 16}
+        if ffn:
+            if not (all(r.qt and r.qg % 2 == 0 for r in img.slabs if r.name.startswith("exp_gu"))
+                    and img.gu_rows() <= {8, 13, 16}):
+                raise NotImplementedError(f"expert gate/up tile rows {sorted(img.gu_rows())} (supported: 8, 13, 16)")
+            for r in img.slabs:
+                if not r.name.startswith("exp_dn"):
+                    continue
+                for b in r.blocks:
+                    for f in b.formats:
+                        if b.G == 8 and f not in gemv.G8_FORMATS:
+                            raise NotImplementedError(f"expert down G=8 tiles for {f}")
+                        if b.G > 1 and f not in (*gemv.RG_FORMATS, *gemv.RG_ALL):
+                            raise NotImplementedError(f"expert down row-group tiles for {f}")
         self.pg = at.pg[self.hd]
         self.guard = -(-(cfg.sliding_window - 1) // self.pg)
         full = -(-max_positions // self.pg)
@@ -292,6 +310,8 @@ class InklingOverlay(AttentionOverlay):
         self._hbase = [-3] * sequences  # (per sequence: its history windows' first position)
         self._sa_sp = 0  # (the packed slots of the state array's layout whose padding is zero: ``write_states``)
         self._eskip: dict[tuple[int, int], tuple] = {}  # ((visit, slot) -> its raw K / V objects' EGRP words: ``_set_parts``)
+        self._q_out = (np.asarray(gguf.tensor("output_res_query.weight").dequantize(), np.float64).reshape(-1)
+                       if self.lm_ok else None)
         if self.lm_ok and img.screen:  # (the screened head's host side: the exact logits of its candidates)
             norm = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
             self.screen = Screen(gguf, img.lm, norm, cfg.rms_norm_eps, min(self.vocab, cfg.vocab_size))
@@ -900,7 +920,7 @@ class InklingOverlay(AttentionOverlay):
                    if self._eskip.get((v, s)) != skips.get((self.uses[v].kind, s), (0, 0))]
         if ahead and changed:
             return False
-        if not super()._set_parts(st, parts, ahead):
+        if not super()._set_parts(st, parts, ahead, flush=False):
             return False
         act = self.dev.view("ACT")
         for v, s in changed:
@@ -911,30 +931,41 @@ class InklingOverlay(AttentionOverlay):
                 m[M_EGRP], m[M_EGA], m[M_ETAIL] = ne, self.G, nt
                 self.dev.flush("ACT", off, 4 * META)
             self._eskip[(v, s)] = (ne, nt)
-        at, addr, nb = [], [], []
-        rows = []  # (per part: its sequence's KV and the window's rows of positions p - 3 ..)
-        for q in parts:
-            a = q.position - 3 - self._hbase[q.seq]
-            assert 0 <= a <= HIST_ROWS - 4, (q, self._hbase[q.seq])
-            rows.append((self.seq_name("KV", q.seq), a))
-        for x, v, i, c, q in st.__dict__.get("hfills", ()):
-            at.append(x)
-            buf, a = rows[q]
-            addr.append(self.dev.address(buf, self.hist[(v, i)] + c * self.HIST + a * 4 * self.h8, own=True) - (XB - XPAY))
-            nb.append(XB)
-        for x, L, u in st.__dict__.get("efills", ()):
-            use = self.uses[L]
-            a, n = self._kind_subs(st.subs, use.kind)[u]
-            p = pos[a]
-            g0, ng, ne = counts[(use.kind, a, n)]
-            ge = g0 + ng - ne  # (the first group with an E object)
-            j0 = (INK_ED0 - (p + n - 1 - self.pg * ge)) & ~1  # (its window's first entry of E_rev: even, word-aligned)
-            at.append(x)
-            addr.append(self.dev.address("ACT", self.rel[self.layer(L)]) + 2 * j0)
-            nb.append(ne * XB)
-        if at:
-            self._bd_words(st.tr.words, np.array(at, np.int64), np.array(addr, np.int64), np.array(nb, np.int64))
-            st.tr.flush()
+        if "_patch_ink" not in st.__dict__:
+            hf = st.__dict__.get("hfills", ())
+            ef = st.__dict__.get("efills", ())
+            h_at = np.array([x for x, *_ in hf], np.int64)
+            h_base = np.array([self.hist[(v, i)] + c * self.HIST - (XB - XPAY) for _, v, i, c, _ in hf], np.int64)
+            h_q = np.array([q for *_, q in hf], np.int64)
+            e_at = np.array([x for x, *_ in ef], np.int64)
+            e_act = np.array([self.dev.address("ACT", self.rel[self.layer(L)]) for _, L, _ in ef], np.int64)
+            e_kind = np.array([self.uses[L].kind for _, L, _ in ef], np.int64)
+            e_u = np.array([u for *_, u in ef], np.int64)
+            t = st.patch
+            all_at = np.concatenate([t.fills.at, t.parts.at, t.tails.at, t.recs.at, h_at, e_at])
+            lines = np.unique((np.stack([all_at, all_at + 2]) << 2) & ~63) if all_at.size else np.empty(0, np.int64)
+            st._patch_ink = (h_at, h_base, h_q, e_at, e_act, e_kind, e_u, lines)
+        h_at, h_base, h_q, e_at, e_act, e_kind, e_u, lines = st._patch_ink
+        if h_at.size:
+            kv_addr = np.array([self.dev.address(self.seq_name("KV", q.seq), own=True) for q in parts], np.int64)
+            a_arr = np.array([q.position - 3 - self._hbase[q.seq] for q in parts], np.int64)
+            for q in parts:
+                assert 0 <= q.position - 3 - self._hbase[q.seq] <= HIST_ROWS - 4, (q, self._hbase[q.seq])
+            self._bd_words(st.tr.words, h_at, kv_addr[h_q] + h_base + a_arr[h_q] * (4 * self.h8),
+                           np.full(h_at.size, XB, np.int64))
+        if e_at.size:
+            K = len(self.kinds)
+            j0_tab = np.zeros((K, SLOTS), np.int64)
+            ne_tab = np.zeros((K, SLOTS), np.int64)
+            for k in range(K):
+                for u, (a, n) in enumerate(self._kind_subs(st.subs, k)):
+                    g0, ng, ne = counts[(k, a, n)]
+                    ge = g0 + ng - ne
+                    j0_tab[k, u] = (INK_ED0 - (pos[a] + n - 1 - self.pg * ge)) & ~1
+                    ne_tab[k, u] = ne
+            self._bd_words(st.tr.words, e_at, e_act + 2 * j0_tab[e_kind, e_u], ne_tab[e_kind, e_u] * XB)
+        if lines.size:
+            st.tr.flush_lines(lines)
         return True
 
     def _token_words(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
@@ -1035,10 +1066,13 @@ class InklingOverlay(AttentionOverlay):
         """(the screened head's input: the output's mix of the last visit's states, from the state array; the head norms
         it, ``Screen.input``)"""
         n = self._mix(-1, "lm")[3][2]
-        x = np.stack([self.state(b, S) for b in range(n)]).astype(np.float64)  # (n, S, H)
-        q = np.asarray(self.gguf.tensor("output_res_query.weight").dequantize(), np.float64).reshape(-1)
+        sp, ST = packed_slots(S), self.state_bytes(packed_slots(S))
+        self.dev.fetch("ACT", self.sa, n * ST)
+        x = (self.dev.view("ACT")[self.sa:self.sa + n * ST].view(np.float32)
+             .reshape(n, self.state_k(sp) // 8, sp, 8)[:, :self.H // 8, :S]
+             .transpose(0, 2, 1, 3).reshape(n, S, self.H).astype(np.float64))
         xs = x / np.sqrt((x * x).mean(-1, keepdims=True) + InklingConfig.MIX_EPS)
-        sc = xs @ q / np.sqrt(self.H)
+        sc = xs @ self._q_out / np.sqrt(self.H)
         w = np.exp(sc - sc.max(0))
         return np.einsum("ns,nsh->sh", w / w.sum(0), xs).astype(np.float32)
 
@@ -1051,13 +1085,16 @@ class InklingOverlay(AttentionOverlay):
 
     def tap_rows(self, S: int) -> np.ndarray:
         """The taps of the last step's slots (S, taps, hidden) fp32 (``taps``: the residual entering each tap visit)."""
+        if not self.taps:
+            return np.empty((S, 0, self.H), np.float32)
         sp, ST = packed_slots(S), self.state_bytes(SLOTS)
         n = self.state_bytes(sp)
+        self.dev.fetch("ACT", self.tap_off, (len(self.taps) - 1) * ST + n)
+        act = self.dev.view("ACT")
         out = np.empty((S, len(self.taps), self.H), np.float32)
         for t in range(len(self.taps)):
             off = self.tap_off + t * ST
-            self.dev.fetch("ACT", off, n)
-            x = self.dev.view("ACT")[off:off + n].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
+            x = act[off:off + n].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
             out[:, t] = x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H)
         return out
 

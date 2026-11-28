@@ -572,12 +572,13 @@ class AttentionOverlay(ModelOverlay):
         kind and sub-step its first position, slots and sequence); ``kv0``: per sequence the address of its KV.
         ``ahead``: False when M_ATREC changes (the running step reads those objects)."""
         tt, T, pu = st.patch.tails, self.T, words.pu
+        tset = set(tt.layers)
         seq, _, head = slots_of(parts)
         modes = {q.seq: self._ring_modes(q.seq) for q in parts}
         seq += [seq[-1]] * (SLOTS - len(seq))  # (a slot past the step's: as the last part's)
         head += [False] * (SLOTS - len(head))
         wanted = [(L, a, m if head[a] or self.uses[L].source != L else 0)
-                  for a in range(SLOTS) for L, (m, _) in modes[seq[a]].items()]
+                  for a in range(SLOTS) for L, (m, _) in modes[seq[a]].items() if L in tset]
         changes = [(L, a, ma) for L, a, ma in wanted if self._trec.get((L, a), 0) != ma]
         if ahead and changes:
             return False
@@ -594,7 +595,7 @@ class AttentionOverlay(ModelOverlay):
         self._bd_words(st.tr.words, tt.at, address, np.full(len(rec), T, np.int64))
         for q in parts:
             for L, (m, before) in modes[q.seq].items():
-                if not m and not before:  # (from the ring: the rows before p, or those of the step's positions too)
+                if L in tset and not m and not before:  # (from the ring: the rows before p, or those of the step's positions too)
                     use = self.uses[L]
                     self._vrings[q.seq].check(use.ring, q.position, q.position if use.source == L else q.position + q.n)
         act = self.dev.view("ACT")
@@ -617,7 +618,7 @@ class AttentionOverlay(ModelOverlay):
         assert st.subs == self.subs(p, st.S), (p, st.S, st.subs)
         return self._set_parts(st, (Part(self.seq, p, st.S),), ahead)
 
-    def _set_parts(self, st: StepPlan, parts: tuple[Part, ...], ahead: bool = False) -> bool:
+    def _set_parts(self, st: StepPlan, parts: tuple[Part, ...], ahead: bool = False, *, flush: bool = True) -> bool:
         """The token objects (per cache kind and sub-step: its positions, the columns' ranges, the step's RoPE tables; st's
         copy) and the step's cache transfers, each sub-step's in its sequence's KV; a part's transfers of its sequence's
         own objects (``StepPlan.part_bds``) in its KV."""
@@ -644,7 +645,8 @@ class AttentionOverlay(ModelOverlay):
         r = words.ro[t.recs.kind, t.recs.sub, t.recs.i]
         base = np.take_along_axis(t.recs.base, r[:, :1], 1)[:, 0]
         self._bd_words(st.tr.words, t.recs.at, kv0[words.su[t.recs.kind, t.recs.sub]] + base + r[:, 1], r[:, 2])
-        st.tr.flush()
+        if flush:
+            st.tr.flush()
         return True
 
     # ------------------------------------------------------------------

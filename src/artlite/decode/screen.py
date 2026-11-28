@@ -49,6 +49,7 @@ Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
 K = 64  # the largest logits that are exact when a row is taken as an array (a sampler's own k: ``ScreenedRow.top``)
 WINDOW = 10.0  # ... down to this far below the largest (e^-10: 5e-5 of its probability at temperature 1)
 SEEDS = 16  # step 1's rows
+SEED_MAX = 128  # step 1's rows at most (step 3 pulls every row within M - WINDOW)
 ROWS = 2048  # the rows of step 2, of step 3 at most
 IDS = 16384  # the rows a native pass collects (past them: numpy's)
 FILE_FORMATS = 3  # a screened head: in files of this many tile formats at most (``screened``)
@@ -164,7 +165,7 @@ class Screen:
         ``mask``: of the tokens a vocabulary bitmask allows (``models.sampling.Mask.bits``): every step among them, the
         k largest of those as exact as an unmasked choice's."""
         bits, gnorm = screened.view(np.uint16), float(np.linalg.norm(g))
-        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), self.n), mask=mask)[1]
+        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), SEED_MAX, self.n), mask=mask)[1]
         e = self.exact(ids, g)
         if not len(e):
             return ids, e

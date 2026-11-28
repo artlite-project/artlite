@@ -99,26 +99,28 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   step (the LM head's). The experts stream their weights once per chunk: long prompts run in chunks of 8192.
 
 - The DSpark drafter (`dspark.py`, `dspark_image.py`) runs in a separate design and hardware context, with 4 token slots
-  of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step and prompt
-  chunk leaves the model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state),
-  which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other two
-  to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
-  model's screened LM head, its Markov head on the host over each row's candidates (their logits exact from the file's
-  rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.35,
-  1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to different experts), so drafting pays off only when
-  the drafter guesses well: the rounds' planner leaves the drafter out when its rounds give fewer tokens per second than
-  steps of one.
+  of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Prompt chunks mix and
+  normalize the drafter's taps (`prefill.py`), projecting and writing its K / V records directly into its 3 layers'
+  caches on the NPU (layer 1 attends to every position, the other two to the last 1024); each decode step leaves the
+  model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state). A round runs
+  pending injections and the 4-row block (the token, 3 mask rows) in one combined dispatch through its layers and the
+  model's screened LM head while patching the target model's next step ahead, runs its Markov head on the host over
+  each row's candidates (their logits exact from the file's rows), and then dispatches the model's step of the token
+  and accepted drafts. A step of S tokens costs ~1.35, 1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes
+  to different experts), so drafting pays off only when the drafter guesses well: the rounds' planner leaves the
+  drafter out when its rounds give fewer tokens per second than steps of one.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size: 17.15 GB, UD-Q4_K_M's 16.22 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded but
 UD-Q4_K_M's Q5_K gate / up, 14% over the file's bytes: a quarter chunk's 4 tiles of 13 rows hold 3 windows of 8 gate
 and 8 up rows); nothing is written to disk. A decode step streams 1.09 GB of dense weights and the 8 experts of each
 visit (1.86 GB of expert tiles a token, UD-Q4_K_M's 1.80 GB). The
-sliding-window visits' caches are rings past 16K positions of capacity (16384 positions, two of the prefill's largest
-chunks): they, the full visits' caches and the convs' state take 3.4 GB at 33K positions (each sequence of `-np` its
-own), 6.2 GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last
-positions only, so a conversation goes back only to a checkpoint (artlite-server takes them). The drafter: 0.30 GB of
-weights, 36 MB of caches at 4K positions (~140 MB at 33K). With `-np` above 1 the drafter is not loaded.
+sliding-window visits' caches are rings past 8K positions of capacity (8192 positions, the prefill's largest chunk):
+they, the full visits' caches and the convs' state take ~2.3 GB at 33K positions and ~4.9 GB at 132K (each sequence of
+`-np` its own); the prefill's MoE and attention temporaries share a pooled arena (`MOE_Y`). Without the prefill the
+rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last positions only, so a conversation goes back
+only to a checkpoint (artlite-server takes them). The drafter: 0.30 GB of weights, and matches the target's SWA ring
+size when prefill is enabled (~140 MB of records at 65K). With `-np` above 1 the drafter is not loaded.
 
 ## Speed and accuracy (Strix Halo)
 

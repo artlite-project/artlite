@@ -58,19 +58,20 @@ struct Kernel::Impl {
   }
 
   // The NPU reaches only the XRT buffers its command lists, at most kMaxBuffers, even where the transaction holds the
-  // addresses. Up to kMaxBuffers data buffers are the arguments themselves, in order (an insts.bin's DDR patches take
-  // the k-th one's address); more, or `resolved` (the transaction has every address and no DDR patch), are their
-  // regions, each once, and then the process's other regions while the command has room, the largest first: on
-  // Windows a buffer that only one of a model's contexts lists costs at every turn of the contexts (its decode steps
-  // and its drafter's: Qwen3.8 27B with its DFlash2 drafter and a KV cache of 4.6 GB, 131072 positions, on Krackan
-  // Point: steps of ~365 ms, 264 once each context listed the other's large buffers).
+  // addresses. Buffers for transactions with DDR patches (aiecc's, up to kMaxBuffers) are passed as arguments in order;
+  // resolved transactions (every address in the control code, no DDR patch) or >kMaxBuffers pass their backing regions
+  // once each, and then the process's other regions while the command has room, the largest first: on Windows a buffer
+  // that only one of a model's contexts lists costs at every turn of the contexts (its decode steps and its drafter's:
+  // Qwen3.8 27B with its DFlash2 drafter and a KV cache of 4.6 GB, 131072 positions, on Krackan Point: steps of ~365 ms,
+  // 264 once each context listed the other's large buffers).
   // instr_bytes: the transaction's length (0: the whole BO).
   void submit_cu(bo& ctrl_code, std::span<const std::reference_wrapper<bo>> data_bufs, size_t instr_bytes = 0,
                  bool resolved = false) {
     if (instr_bytes > ctrl_code.size())
       throw DispatchError(std::format("{} bytes of control code in a BO of {}", instr_bytes, ctrl_code.size()));
-    const bool regions = resolved || data_bufs.size() > kMaxBuffers;
-    if (regions && !resolved && ctrl_code.ddr_patched())
+    const bool patched = !resolved && ctrl_code.ddr_patched();
+    const bool regions = !patched || data_bufs.size() > kMaxBuffers;
+    if (regions && patched)
       throw DispatchError(std::format("a transaction with DDR patches (aiecc's) takes at most {} buffers on XRT, not {}",
                                       kMaxBuffers, data_bufs.size()));
     try {

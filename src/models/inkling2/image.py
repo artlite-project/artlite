@@ -178,9 +178,13 @@ class InklingImage(NormedImage):
         gu, dn = b + "ffn_gate_up_exps.weight", b + "ffn_down_exps.weight"
         down = H * np.arange(E)[:, None] + np.arange(H)[None]  # (E, H): expert e's rows of the down
         for u, (h0, n) in enumerate(EXPERT_UNITS):
-            self._add_slab(L, f"exp_gu{u}", [("gu", (gu,), unit_gu_rows(E, F, h0, n, self.R[self.fmt(gu)]))], H)
-            K, R = unit_k(n), self.R[self.fmt(dn)]
-            self._add_slab(L, f"exp_dn{u}", [("down", (dn,), group_rows(down, R, KC // K))], K, G=KC // K)
+            gu_fmt = self.fmt(gu)
+            self._add_slab(L, f"exp_gu{u}", [("gu", (gu,), unit_gu_rows(E, F, h0, n, self.R[gu_fmt]))], H)
+            dn_fmt = self.fmt(dn)
+            K, R, G = unit_k(n), self.R[dn_fmt], KC // unit_k(n)
+            if R % G:
+                raise NotImplementedError(f"expert down format {dn_fmt} ({R} rows/tile) does not divide {G} row groups")
+            self._add_slab(L, f"exp_dn{u}", [("down", (dn,), group_rows(down, R, G))], K, G=G)
             r = self.slabs[-1]
             r.blocks[0] = replace(r.blocks[0], kslice=(h0, n))
 

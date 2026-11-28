@@ -299,7 +299,7 @@ class SpeculativeMixin:
                         self.accepted_ctx += max(kept - len(f), 0)
                 elif mtp:  # (the round's time less that work too: a transaction's first run is not the drafter's rate)
                     if once is not None:
-                        plan.drafted(m, len(new), t2 - t0 - (w2 - w0) - once)
+                        plan.drafted(m, len(new), max(0.0, t2 - t0 - (w2 - w0) - once - getattr(self.drafter, "once_s", 0.0)))
                     self._calibrate(len(new) - 1)
                 elif d:
                     plan.accepted(m, len(d), len(new) - 1, agree=agree)

@@ -781,12 +781,16 @@ class ModelOverlay:
             st = self._transaction(key)
             patch(st, position)
         self._ahead = None
-        # (one-time: the work before the step, and its patch's: all of it at the transaction's first run)
-        self.once_s = before + (time.perf_counter() - t if key not in self._ran_keys else self._once_t - before)
+        # (one-time: the work before the step, its patch's, and first-use XRT instruction BO setup inside submit())
+        first = key not in self._ran_keys
+        self.once_s = before + (time.perf_counter() - t if first else self._once_t - before)
         self._once_t = 0.0
         self._ran_keys.add(key)
         self.ready()
+        t_sub = time.perf_counter()
         self.dev.submit(st.tr)
+        if first:
+            self.once_s += time.perf_counter() - t_sub
         try:
             if parts is None:
                 self._ran(position, S)

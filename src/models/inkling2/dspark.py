@@ -36,6 +36,8 @@ and the top 64 of them plus ``head . b_ho`` (a static bias per token, ``static_b
 same drafts as the whole vocabulary's (2.18 vs 2.20 accepted of 7)."""
 
 import math
+import time
+from collections.abc import Callable
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -65,12 +67,12 @@ from artlite.decode.protocol import (
     region_bytes,
 )
 from artlite.decode.screen import Screen
-from artlite.decode.step import Fill, Rec, StepPlan, Tail
+from artlite.decode.step import Fill, Part, Rec, StepPlan, Tail
 from artlite.decode.vring import tails
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import InklingDSparkConfig
 from artlite.operators.design import COLS
-from artlite.overlay import OverlayDevice, Sequence
+from artlite.overlay import OverlayDevice, Sequence, Transaction
 
 from .dspark_image import DOWN_K, DSparkDecodeOperator, DSparkImage
 
@@ -94,7 +96,7 @@ class DSparkOverlay(AttentionOverlay):
     upto = 0  # (tests: a block's first phases only)
     _injecting = False  # (an injection's step: ``ranges``)
 
-    def __init__(self, target: object, gguf: GGUFFile, *, wrap: int | None = None):
+    def __init__(self, target: object, gguf: GGUFFile, *, wrap: int | None = None, kv_pad: int = 0):
         cfg = InklingDSparkConfig.from_gguf(gguf)
         tc = target.cfg
         if ((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim) != (tc.hidden_size, tc.num_attention_heads,
@@ -104,6 +106,7 @@ class DSparkOverlay(AttentionOverlay):
         image = DSparkImage(gguf, cfg, tile_bytes=target.T)
         image.vocab = target.vocab
         self.target = target
+        self.kv_pad = kv_pad
         super().__init__(gguf, layers=list(range(cfg.layers)), vocab=None, kv_k="hilo", weights=None, image=image,
                          sequences=target.sequences)
         target.followers.append(self)
@@ -136,17 +139,21 @@ class DSparkOverlay(AttentionOverlay):
                                   [tensor_f32(gguf, "dspark_norm.weight")])
         self.mask = tensor_f32(gguf, "mask_embd.weight")
         self.w_out = tensor_f32(gguf, "output_norm.weight")
-        self.screen: Screen | None = None
-        if target.screen is not None:  # (the head's exact rows: the model's, against the drafter's output norm)
-            self.screen = target.screen
+        self.screen: Screen | None = target.screen if target.screen is not None else None
+        self._ikv_s = 0
+        self._blk_s = 0
+        self._ikv_cache: dict[int, list[tuple[int, np.ndarray]]] = {}
+        self._blk_cache: dict[int, list[tuple[int, np.ndarray]]] = {}
         self._plan()
 
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
-    def phases(self, lm: bool = True) -> list[tuple[int, str]]:
-        """A block's phases (``lm``), an injection's (without)."""
+    def phases(self, lm: bool = True, *, inj: bool = False) -> list[tuple[int, str]]:
+        """A block's phases (``lm``), an injection's (without), or injection + block (``inj`` and ``lm``)."""
+        if inj and lm:
+            return self.phases(False) + self.phases(True)
         if not lm:
             return [(L + INJ, n) for L in self.layers for n in ("ikv", "att")]
         out = [(L, n) for L in self.layers for n in BLOCK] + [(-1, "jh"), (-1, "lm")]
@@ -168,7 +175,7 @@ class DSparkOverlay(AttentionOverlay):
         """Byte offsets in ACT and KV."""
         self._layout = dict.fromkeys(("ACT", "KV"), 0)
         take = self._take
-        self.toks = (take("ACT", len(self.kinds) * SLOTS * XB),)
+        self.toks = tuple(take("ACT", len(self.kinds) * SLOTS * XB) for _ in range(2))
         self.loadr = take("ACT", COLS * SLOTS * XB)
         self.sa = take("ACT", XB + STATES * self.state_bytes(SLOTS)) + XB  # ([state][k block][slot sp][8] fp32)
         self.meta = {}
@@ -187,7 +194,8 @@ class DSparkOverlay(AttentionOverlay):
         self.zero = take("ACT", XB)  # (an F_INK step's history object: plain, unread)
         self.junk = take("ACT", (3 + SLOTS) * 4 * self.H // COLS + 512)  # (its window's and partial sums' drains)
         self.jh = take("ACT", COLS * SLOTS * 2 * 2 * C_LEN)  # ([column][C object 2][slot] of C_LEN bf16)
-        self._plan_caches(self.layers, pad=0)
+        self.pad = self.kv_pad // self.pg * (self.kp + 1) * self.T
+        self._plan_caches(self.layers, pad=self.pad)
         self._sizes()
 
     def state_bytes(self, sp: int) -> int:
@@ -242,6 +250,7 @@ class DSparkOverlay(AttentionOverlay):
             AttentionOverlay.select(self, s)
             self.reset()
         AttentionOverlay.select(self, tgt.seq)
+        self._ikv_s = self._blk_s = 0
         self.static_bias()
 
     def _load(self) -> None:
@@ -268,11 +277,28 @@ class DSparkOverlay(AttentionOverlay):
     # The transaction of a step
     # ------------------------------------------------------------------
 
-    def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
-        """(the GEMV phases on states: one state, coefficient 1; o, down's: F_INK, plain)"""
+    def _ikv_meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
+        """The injection phases' metadata objects (``ikv``)."""
         out = []
         ranges = self.state_bytes(packed_slots(S)) // XPAY
         for (L, name), off in self.meta.items():
+            if name != "ikv":
+                continue
+            gr = self._groups(L, name, S)
+            assert len(gr) == 1, (L, name)
+            m = gr[0].meta.copy()
+            m[0] |= F_STATES
+            m[M_NR], m[M_NX], m[M_CSET] = 1, ranges, -1
+            out.append((off, m.view(np.uint8)))
+        return out
+
+    def _blk_meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
+        """The block phases' metadata objects (states, o and down)."""
+        out = []
+        ranges = self.state_bytes(packed_slots(S)) // XPAY
+        for (L, name), off in self.meta.items():
+            if name == "ikv":
+                continue
             gr = self._groups(L, name, S)
             assert len(gr) == 1, (L, name)
             m = gr[0].meta.copy()
@@ -288,6 +314,35 @@ class DSparkOverlay(AttentionOverlay):
                 m[M_INKN] = 1 << 12  # (cur: state 0; one queries object)
                 out.append((rg.off, m.view(np.uint8)))
         return out
+
+    def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
+        """(the GEMV phases on states: one state, coefficient 1; o, down's: F_INK, plain)"""
+        return self._ikv_meta_writes(S) + self._blk_meta_writes(S)
+
+    def _ensure_ikv_meta(self, S: int) -> None:
+        if self._ikv_s == S:
+            return
+        writes = self._ikv_cache.setdefault(S, self._ikv_meta_writes(S))
+        act = self.dev.view("ACT")
+        for off, b in writes:
+            act[off:off + len(b)] = b
+            self.dev.flush("ACT", off, len(b))
+        self._ikv_s = S
+
+    def _ensure_blk_meta(self, S: int) -> None:
+        if self._blk_s == S:
+            return
+        writes = self._blk_cache.setdefault(S, self._blk_meta_writes(S))
+        act = self.dev.view("ACT")
+        for off, b in writes:
+            act[off:off + len(b)] = b
+            self.dev.flush("ACT", off, len(b))
+        self._blk_s = S
+
+    def _metas(self, S: int) -> None:
+        self._ensure_ikv_meta(S)
+        self._ensure_blk_meta(S)
+        self._metas_s = (S, self.start)
 
     def _build(self, S: int, lm: bool, subs: tuple, b: int) -> StepPlan:
         self._lm = lm
@@ -337,10 +392,11 @@ class DSparkOverlay(AttentionOverlay):
         ST = self.state_bytes(sp)
         seq.sync()
         if phase in self.meta:
-            first = 1 + L - INJ if name == "ikv" else 0
+            ST4 = self.state_bytes(SLOTS)
+            sa = (self.sa + ST4 + (L - INJ) * ST) if name == "ikv" else self.sa
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", self.meta[phase]), XB)
-                seq.fill("X", c, dev.address("ACT", self.sa + first * ST - (XB - XPAY)), XB, (XB // 8, 2, XB // 8, ST // 4),
+                seq.fill("X", c, dev.address("ACT", sa - (XB - XPAY)), XB, (XB // 8, 2, XB // 8, ST // 4),
                          repeat=ST // XPAY, iteration=(XPAY // 4, ST // XPAY))
         else:
             self._inputs(seq, self.inp[phase][0], S)
@@ -430,25 +486,60 @@ class DSparkOverlay(AttentionOverlay):
 
     def write_states(self, x: np.ndarray, first: int) -> None:
         """States first .. first + n - 1 of the state array (n, S, hidden) fp32 (zero past the hidden); state 0 (a
-        block's rows) also as the helpers' F_LOADR objects."""
+        block's rows, at ``self.sa``) also as the helpers' F_LOADR objects; states 1..3 packed past state 0."""
         n, S, H = x.shape
         sp, act = packed_slots(S), self.dev.view("ACT")
-        ST = self.state_bytes(sp)
+        ST, ST4 = self.state_bytes(sp), self.state_bytes(SLOTS)
         for b in range(n):
             xs = np.zeros((ST // (4 * 8 * sp), sp, 8), np.float32)
             xs[:H // 8, :S] = x[b].reshape(S, H // 8, 8).transpose(1, 0, 2)
-            o = self.sa + (first + b) * ST
+            idx = first + b
+            o = self.sa if idx == 0 else self.sa + ST4 + (idx - 1) * ST
             act[o:o + ST] = xs.reshape(-1).view(np.uint8)
             self.dev.flush("ACT", o, ST)
         if first == 0:
             self._write_loadr(x[0])
 
+    def _build_step(self, S_inj: int) -> tuple[StepPlan, StepPlan]:
+        """Build one combined transaction for an injection of ``S_inj`` slots followed by a 4-slot block."""
+        dev = self.dev
+        seq = Sequence(self.op, inputs=("X",))
+        self._begin(seq)
+        inj_ph = self.phases(False)
+        blk_ph = self.phases(True)
+        ph = inj_ph + blk_ph
+        st_inj = StepPlan(S_inj, ((0, S_inj),), tok=self.toks[0])
+        st_blk = StepPlan(SLOTS, ((0, SLOTS),), tok=self.toks[1])
+
+        def run(i: int) -> list[tuple[int, str]]:
+            return ph[i:next((k for k in range(i, len(ph)) if ph[k][1] in self.OPS), len(ph))]
+
+        for c in range(COLS):
+            seq.fill("X", c, dev.address("ACT", st_inj.tok), self._tok_bytes)
+        n_inj = len(inj_ph)
+        for i, (L, name) in enumerate(ph):
+            st = st_inj if i < n_inj else st_blk
+            if i == n_inj:
+                seq.sync()
+                for c in range(COLS):
+                    seq.fill("X", c, dev.address("ACT", st_blk.tok), self._tok_bytes)
+                super()._fill_loadr(seq, SLOTS)
+            if name in self.OPS:
+                self._operator(seq, st, L, name, run(i + 1))
+                continue
+            if i == 0:
+                self._weight_run(seq, run(0))
+            self._gemv(seq, st, (L, name))
+        seq.sync(fills=True)
+        tr = Transaction(dev, seq.words())
+        st_inj.tr = st_blk.tr = tr
+        return st_inj, st_blk
+
     def inject(self, taps: np.ndarray, q: int) -> None:
         """The positions q .. q + S - 1 of the selected sequence from their taps (S, taps, hidden) fp32 (S <= 4)."""
         S = taps.shape[0]
         assert 1 <= S <= SLOTS and q == self.next, (S, q, self.next)
-        if self._metas_s != (S, self.start):
-            self._metas(S)
+        self._ensure_ikv_meta(S)
         self.write_states(self.mixes(taps)[:len(self.layers)], 1)
         self._injecting = True
         try:
@@ -457,13 +548,94 @@ class DSparkOverlay(AttentionOverlay):
             self._injecting = False
         self.next = q + S
 
-    def block(self, anchor: np.ndarray, P: int) -> None:
-        """A block at P (the anchor's normed embedding (hidden,) fp32, then the mask rows): its logits and jh."""
+    def prepare_steps(self) -> None:
+        """Pre-build combined step and standalone block transactions."""
+        for S_inj in range(1, SLOTS + 1):
+            key = ("step", S_inj)
+            if key not in self._steps:
+                self._ran_keys.discard(key)
+                self._steps[key] = self._build_step(S_inj)
+        self.prepare(SLOTS, logits=True)
+
+    def block(self, anchor: np.ndarray, P: int, *, meanwhile: Callable[[], None] | None = None) -> None:
+        """A block at P (the anchor's normed embedding (hidden,) fp32, then the mask rows): its logits and jh.
+        ``meanwhile``: host work overlapping the NPU dispatch (e.g. ``patch_ahead`` on the target model)."""
         x = np.stack([anchor, *[self.mask] * (SLOTS - 1)]).astype(np.float32)
-        if self._metas_s != (SLOTS, self.start):
-            self._metas(SLOTS)
+        self._ensure_blk_meta(SLOTS)
         self.write_states(x[None], 0)
-        self._run(SLOTS, P, True)
+        if meanwhile is None:
+            self._run(SLOTS, P, True)
+            return
+        self._clear_pads(self._sp(SLOTS))
+        key = self._key(SLOTS, True, self.subs(P, SLOTS))
+        before, t = self._once_t, time.perf_counter()
+        st = self._transaction(key)
+        self._set_position(st, P)
+        first = key not in self._ran_keys
+        self.once_s = before + (time.perf_counter() - t if first else self._once_t - before)
+        self._once_t = 0.0
+        self._ran_keys.add(key)
+        self.ready()
+        t_sub = time.perf_counter()
+        self.dev.submit(st.tr)
+        if first:
+            self.once_s += time.perf_counter() - t_sub
+        try:
+            self._ran(P, SLOTS)
+            meanwhile()
+        finally:
+            self.dev.wait()
+        self._last_s = SLOTS
+
+    def step(self, taps: np.ndarray, q: int, anchor: np.ndarray, P: int, *,
+             meanwhile: Callable[[], None] | None = None) -> None:
+        """Inject ``taps`` at ``q .. q + S_inj - 1`` and run a 4-slot block at ``P`` in one NPU dispatch."""
+        S_inj = taps.shape[0]
+        assert 1 <= S_inj <= SLOTS and q == self.next and P == q + S_inj, (S_inj, q, self.next, P)
+        self._ensure_ikv_meta(S_inj)
+        self._ensure_blk_meta(SLOTS)
+        self._clear_pads(SLOTS)
+        key = ("step", S_inj)
+        before, t = self._once_t, time.perf_counter()
+        if key not in self._steps:
+            self._ran_keys.discard(key)
+            self._steps[key] = self._build_step(S_inj)
+        st_inj, st_blk = self._steps[key]
+        tr = st_blk.tr
+        self.write_states(self.mixes(taps)[:len(self.layers)], 1)
+        x = np.stack([anchor, *[self.mask] * (SLOTS - 1)]).astype(np.float32)
+        self.write_states(x[None], 0)
+        self._injecting = True
+        try:
+            self._set_parts(st_inj, (Part(self.seq, q, S_inj),), flush=False)
+        finally:
+            self._injecting = False
+        self._ran(q, S_inj)
+        self._set_parts(st_blk, (Part(self.seq, P, SLOTS),), flush=False)
+        if "_step_lines" not in st_blk.__dict__:
+            ti, tb = st_inj.patch, st_blk.patch
+            all_at = np.concatenate([ti.fills.at, ti.parts.at, ti.tails.at, ti.recs.at,
+                                     tb.fills.at, tb.parts.at, tb.tails.at, tb.recs.at])
+            st_blk._step_lines = np.unique((np.stack([all_at, all_at + 2]) << 2) & ~63) if all_at.size else np.empty(0, np.int64)
+        if st_blk._step_lines.size:
+            tr.flush_lines(st_blk._step_lines)
+        first = key not in self._ran_keys
+        self.once_s = before + (time.perf_counter() - t if first else self._once_t - before)
+        self._once_t = 0.0
+        self._ran_keys.add(key)
+        self.ready()
+        t_sub = time.perf_counter()
+        self.dev.submit(tr)
+        if first:
+            self.once_s += time.perf_counter() - t_sub
+        try:
+            self._ran(P, SLOTS)
+            if meanwhile is not None:
+                meanwhile()
+        finally:
+            self.dev.wait()
+        self.next = P
+        self._last_s = SLOTS
 
     def mixes(self, taps: np.ndarray) -> np.ndarray:
         """The taps' mixes (layers + 1, S, hidden) fp32: per layer its injection's input (unnormed: its phase norms it),
@@ -523,6 +695,8 @@ class MarkovChain:
         self.who = np.asarray(t.raw).view(bfloat16).reshape(t.rows, t.cols).astype(np.float32)
         self.bho = tensor_f32(gguf, "dspark_hidden_out.bias")
         self.gguf, self.cfg, self.screen, self.fb = gguf, cfg, screen, fb
+        self._est = np.empty(len(fb), np.float32)
+        self._est_fb = np.empty(len(fb), np.float32)
         self.chains: list[float] = []  # (``walk``: per draft its chain's probability)
 
     def resident(self) -> None:
@@ -545,8 +719,9 @@ class MarkovChain:
             gate = 1 / (1 + np.exp(-raw[:R]))
             state = (gate * state + (1 - gate) * np.tanh(raw[R:2 * R])).astype(np.float32)
             g = (h[i + 1] + self.who @ np.tanh(raw[2 * R:]) + self.bho).astype(np.float32)
-            est = screened[i + 1, :nv].astype(np.float32) * sc.scale[:nv]
-            c = np.union1d(_native.top_logits(est, self.CAND)[1], _native.top_logits(est + self.fb, self.CAND)[1])
+            _native.screen_dense(screened[i + 1, :nv].view(np.uint16), sc.scale, math.inf, self._est)
+            np.add(self._est, self.fb, out=self._est_fb)
+            c = np.union1d(_native.top_logits(self._est, self.CAND)[1], _native.top_logits(self._est_fb, self.CAND)[1])
             col = sc.exact(c.astype(np.int64), g)
             if cap:
                 col = np.tanh(col / cap) * cap
