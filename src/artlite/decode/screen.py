@@ -14,8 +14,9 @@ rho_i): its bounds (of a generation's 200 K largest logits the furthest lay 4.7 
 logits lie 4 - 6 sigma low). The rows computed exactly for the k largest logits (``Screen.candidates``; the passes
 over the vocabulary: ``_native.screen_*``, which read the logits and the rows' numbers and write nothing):
 
-1. the ``SEEDS`` largest screened ones (2 k where that is more): the largest of their exact logits, m, is a lower
-   bound of the largest logit, their k-th largest one of the k-th;
+1. the ``SEEDS`` largest screened ones (2 k where that is more, ``SEED_MAX`` at most: a sampler of all tokens' k of
+   1000 took 2000 rows, 2.5 ms a token on Inkling 2, against 0.4 ms; step 3 still takes the window's): the largest of
+   their exact logits, m, is a lower bound of the largest logit, their k-th largest one of the k-th;
 2. those whose upper bound reaches m (and the largest lower bound): the largest logit M is among them (an argmax: a
    few rows more);
 3. for k > 1, those whose upper bound reaches both M - ``WINDOW`` (a logit further below the largest weighs e^-WINDOW
@@ -49,6 +50,7 @@ Z = 6.0  # a logit's bounds: Z sigma_i around its estimate
 K = 64  # the largest logits that are exact when a row is taken as an array (a sampler's own k: ``ScreenedRow.top``)
 WINDOW = 10.0  # ... down to this far below the largest (e^-10: 5e-5 of its probability at temperature 1)
 SEEDS = 16  # step 1's rows
+SEED_MAX = 128  # step 1's rows at most
 ROWS = 2048  # the rows of step 2, of step 3 at most
 IDS = 16384  # the rows a native pass collects (past them: numpy's)
 FILE_FORMATS = 3  # a screened head: in files of this many tile formats at most (``screened``)
@@ -164,7 +166,7 @@ class Screen:
         ``mask``: of the tokens a vocabulary bitmask allows (``models.sampling.Mask.bits``): every step among them, the
         k largest of those as exact as an unmasked choice's."""
         bits, gnorm = screened.view(np.uint16), float(np.linalg.norm(g))
-        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), self.n), mask=mask)[1]
+        ids = _native.top_logits(bits, min(max(SEEDS, 2 * k), SEED_MAX, self.n), mask=mask)[1]
         e = self.exact(ids, g)
         if not len(e):
             return ids, e
