@@ -61,10 +61,10 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     Each lane is driven by one thread at a time. Its generation's rounds share their dispatches with the other lanes'
     (``_joined``); a lane's other calls on the device (a prompt, the state copies, single steps) hold it alone
     (``lanes.alone``): a prompt lets the others in between its chunks, and the lanes' round between a chunk's pieces
-    (the prefill's ``guest``). A model whose round starts with dispatches of its own (a drafter's steps on the
-    sequence's caches) runs them inside ``_before``, gives a joint step its per-slot keywords (``_step_kw``) and takes
-    what else it reads of a step through ``_tapped`` / ``_took``. After a failed dispatch a lane's calls raise
-    ``lanes.DeviceFailed`` until its ``recover``."""
+    (the prefill's ``guest``). A model whose round starts with dispatches that only its sequence needs (a drafter's
+    steps on the sequence's caches) runs them inside ``_before``, gives a joint step its per-slot keywords
+    (``_step_kw``) and takes what else it reads of a step through ``_tapped`` / ``_took``. After a failed dispatch a
+    lane's calls raise ``lanes.DeviceFailed`` until its ``recover``."""
 
     overlay: Any
     _w_out: np.ndarray  # the output norm's weights (hidden,) fp32 (a readout's norm: ``outputs``)
@@ -223,13 +223,14 @@ class OverlayModel(SpeculativeMixin, NpuModel):
         self.idle()
 
     def recover(self) -> None:
-        """(a lane: its own sequence, its calls run again; the other lanes' once they recover)"""
+        """(a lane recovers only its sequence, and its calls run again; the other lanes' calls run again once they
+        recover)"""
         if self._rounds is not None:
             self._rounds.recover(self.seq)
         self.reset()
 
     def _also(self) -> dict[str, int]:
-        """The buffers on the overlay's device besides its own, allocated with them (``ModelOverlay.load``): the
+        """The buffers on the overlay's device other than the overlay's, allocated with them (``ModelOverlay.load``): the
         prefill's."""
         return dict(self.prefill.own) if self.prefill is not None else {}
 

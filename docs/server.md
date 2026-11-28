@@ -57,21 +57,22 @@ data URIs; videos (LFM3-VL-2B, LFM3-Omni-2B: [the models](models/lfm3.md#videos)
 the server's PATH) as `input_video` or `video_url` parts (`{"data": ...}` or `{"url": ...}`: a data URL or base64), as
 llama-server takes them (`/props`' `modalities.video`); and a chat's `modalities` with `"audio"` gets a spoken reply.
 
-A thought's budget, as llama-server's: a chat request's `reasoning_budget_tokens` (or `thinking_budget_tokens`, the
-web UI's; an Anthropic request's `thinking.budget_tokens`; else its effort's, below; default `--reasoning-budget`) caps
-its thought's tokens, then `reasoning_budget_message` (default `--reasoning-budget-message`) and the thought's end as
-the chat template writes it (Qwen's `\n</think>\n\n`: the next request, which renders the thought again, continues
-the cache) are written for the model (0: at once; where the template renders an empty thought as its prompt without
-one, that prompt), and its answer follows; with `reasoning_control: true` the control route ends the thought on demand
-(the web UI's button). A request's effort (chat's `reasoning_effort`, Responses' `reasoning.effort`, Anthropic's
-`output_config.effort`) sets the budget where the chat template renders no effort levels of its own (Qwen3.5 / 3.6,
-Gemma 4, LFM3, MiniCPM-V; Qwen3.8, Spark-X and Inkling 2 render theirs): `none` no thought, `minimal` 0, `low` 1024,
-`medium` 4096, `high` and above the server's. Inkling 2 writes a short thought even at its effort `none` (its
-template's 0). `continue_final_message` (`true`, `"content"` or `"reasoning_content"`)
-continues the last message, an assistant's, from where its content (or its thought) ends, as the chat template renders
-it (the web UI's Continue), and the answer is the new text; a conversation that ends with an assistant's message is
-continued the same way (`--prefill-assistant`, on by default: Anthropic's prefill).
-Not provided: infill, `/metrics`, LoRA, model downloads; their routes answer 501.
+Thought budgets work as in llama-server. A chat request's `reasoning_budget_tokens` caps the tokens of its thought; the
+web UI's `thinking_budget_tokens`, an Anthropic request's `thinking.budget_tokens` or the request's effort (below) can
+set it instead, and `--reasoning-budget` sets the default. When the budget runs out, the server writes
+`reasoning_budget_message` (default `--reasoning-budget-message`) and the end of the thought, as the chat template
+writes it, for the model, and the answer follows. Qwen's end is `\n</think>\n\n`, so the next request, which renders the
+thought again, continues the cache. A budget of 0 ends the thought at once; where the template renders an empty thought
+as its prompt without a thought, the server uses that prompt. With `reasoning_control: true`, the control route ends the
+thought on demand (the web UI's button). A request's effort (chat's `reasoning_effort`, Responses' `reasoning.effort`,
+Anthropic's `output_config.effort`) sets the budget when the chat template renders no effort levels itself (Qwen3.5 /
+3.6, Gemma 4, LFM3, MiniCPM-V; Qwen3.8, Spark-X and Inkling 2 render their own): `none` disables the thought, `minimal`
+gives 0 tokens, `low` 1024, `medium` 4096, and `high` and above the server's budget. Inkling 2 writes a short thought
+even at effort `none` (its template's budget is 0). `continue_final_message` (`true`, `"content"` or
+`"reasoning_content"`) continues the last message, an assistant's, from where its content (or its thought) ends, as the
+chat template renders it (the web UI's Continue), and the answer is the new text; a conversation that ends with an
+assistant's message is continued the same way (`--prefill-assistant`, on by default: Anthropic's prefill). Not provided:
+infill, `/metrics`, LoRA, model downloads; their routes answer 501.
 
 Tool calls (OpenAI's function calling): a request's `tools` go to the model's chat template, and the calls the model
 writes come back as `message.tool_calls` (streamed: `delta.tool_calls`, a call's id and name first, then its arguments)
@@ -112,9 +113,10 @@ off).
 | `text.format` (`json_schema`, `json_object`) | OpenAI's Responses API |
 | `output_config.format` (`json_schema`; its deprecated spelling `output_format`) | Anthropic's Messages API |
 
-`--grammar`, `--grammar-file`, `-j` / `--json-schema` and `-jf` / `--json-schema-file` hold every answer whose request
-asks for no constraint of its own, as llama-server's options do ([artlite-cli](cli.md#text) takes them too); beside a
-request's tools a JSON schema is the answer that is no call, and a grammar does not apply (logged once). The
+`--grammar`, `--grammar-file`, `-j` / `--json-schema` and `-jf` / `--json-schema-file` constrain every answer whose
+request sets no constraint itself, as llama-server's options do ([artlite-cli](cli.md#text) takes them too). When a
+request has tools, a JSON schema constrains only an answer that is not a call, and a grammar does not apply (the server
+logs this once). The
 openai SDK's `chat.completions.parse` and `responses.parse` and the anthropic SDK's `messages.parse` work with their
 pydantic models.
 
@@ -172,8 +174,8 @@ most likely option as JSON in the schema's shape, and `logprobs.content[0].top_l
 to 1), as Halogen's
 decisions read them. An option's probability is that of its text as the model's next tokens, then the end of the turn:
 the prompt runs, then a decode step from a checkpoint for each token several options share (the opening quote, a
-common first word); nothing is generated. A model whose template opened a thought or that writes its own (Inkling 2,
-at any effort), and a request with tools, generate as any request.
+common first word); nothing is generated. A model whose template opens a thought, or that writes a thought anyway
+(Inkling 2, at any effort), and a request with tools generate text like any other request.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{"messages": [{"role": "user",
@@ -216,11 +218,11 @@ codex -m qwen3.6-35b-a3b -c model_provider=artlite \
     -c 'model_providers.artlite={name="artlite", base_url="http://127.0.0.1:8080/v1", wire_api="responses"}'
 ```
 
-Codex needs a model name it does not know (`-m`; a server started with `-m` answers to any name): for its own models
-it sends a JavaScript tool of its own instead of functions, which the server refuses. opencode takes the server as a
-provider in `~/.config/opencode/opencode.json`, without a timeout (its default ends a request after 5 minutes, and a
-turn that thinks can take longer), and with a title model that does not think: opencode asks its `small_model` for
-each session's title before the first turn, and a thinking model spends 0.5-2K tokens on a title of 50 characters
+Codex needs a model name it does not recognize (`-m`; a server started with `-m` answers to any name): for OpenAI's
+models it sends a built-in JavaScript tool instead of functions, which the server refuses. opencode takes the server as
+a provider in `~/.config/opencode/opencode.json`, without a timeout (its default ends a request after 5 minutes, and a
+turn that thinks can take longer), and with a title model that does not think: opencode asks its `small_model` for each
+session's title before the first turn, and a thinking model spends 0.5-2K tokens on a title of 50 characters
 (Qwen3.5-9B: 235 s of a 249 s question):
 
 ```json
@@ -298,8 +300,8 @@ normalized again) and `/embeddings` (llama-server's own: `content`). An embeddin
 model's final norm, pooled by `--pooling` (else the model file's `pooling_type`): `mean` over the tokens, `cls` the
 first token's, `last` the last token's, `none` every token's (`/embeddings` only), normalized by `embd_normalize`
 (Euclidean by default: `--embd-normalize`). An embedding model's file sets its pooling and whether a text ends with its
-end token (Qwen3-Embedding: `last`, appended); a generative model (Llama 3.x, Qwen3, Qwen3.5 / 3.6 / 3.8, MiniCPM-V
-4.7) has no pooling of its own: give one. Gemma 4 has no embeddings (501).
+end token (Qwen3-Embedding: `last`, appended). A generative model (Llama 3.x, Qwen3, Qwen3.5 / 3.6 / 3.8, MiniCPM-V
+4.7) defines no pooling, so pass one. Gemma 4 has no embeddings (501).
 
 ```bash
 artlite-server -m Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf --embedding
@@ -307,8 +309,8 @@ curl http://127.0.0.1:8080/v1/embeddings -H "Content-Type: application/json" -d 
 ```
 
 A request's texts run entirely as prefill chunks (no decode steps, no LM head). Several texts in one request run
-packed: several of them in one chunk (up to 4096 tokens; 2048 on Qwen3.5's path), each with its own positions,
-attention and Gated DeltaNet state, so they share the chunk's fixed cost. The server plans a request by the prefill's
+packed into one chunk (up to 4096 tokens; 2048 on Qwen3.5's path), each with separate positions, attention and Gated
+DeltaNet state, so they share the chunk's fixed cost. The server plans a request by the prefill's
 estimates and runs a text alone where packing would not be faster (on Qwen3's path, any text longer than 512 tokens).
 A prefix the texts share (a rerank query's prompt before its documents) runs once, through the prompt cache, and every
 text after it sees it (on Qwen3's path a new prefix of one cache group, 64 tokens, runs inside the first packed chunk). Qwen3-Embedding-0.6B: a 30-token query in 26 ms, a 430-token passage in 55 ms (HTTP included),
@@ -381,13 +383,13 @@ reads them (d1-Omni-2B Q8_0: 8 of 9 answers about a clip, a picture with a spoke
 the other a near tie; the probabilities within 0.042). Without the encoder they take, pictures, video and audio
 answer 501, as do audio and video for the other types.
 
-A d1 model reads a request's questions as its own runner does (its `set` attention): the state once, then up to 16
-questions after it in one sequence, each answered at its last token; the state's tokens see every token, a question's
-tokens the state and their own question. A request's `"set_size"` (an Artlite field) sets how many questions share a
+A d1 model reads a request's questions the way d1's own runner does (its `set` attention): the state once, then up to 16
+questions after it in one sequence, each answered at its last token. The state's tokens see every token; a question's
+tokens see the state and that question. A request's `"set_size"` (an Artlite field) sets how many questions share a
 sequence: `1` reads each question alone, as llama-server does (its answers then match llama-server's; with several
-questions in a sequence they match the runner's, which differ from each question alone by up to ~0.25 in a
-probability). A sequence is one prefill chunk of at most 4096 tokens (a question that would take it further starts
-the next one). A choice's `confidence` is its probability and a score is the median level (d1's API).
+questions in a sequence they match the runner's, which differ from each question alone by up to ~0.25 in a probability).
+A sequence is one prefill chunk of at most 4096 tokens (a question that would take it further starts the next one). A
+choice's `confidence` is its probability and a score is the median level (d1's API).
 
 ## Speech
 
@@ -507,26 +509,27 @@ queue:
 | Qwen3.8-27B Q4_K_M, with its MTP layer as the drafter | 8.9 | 13.5 | 18.0 |
 
 (`artlite-server -np 4` on Strix Halo: chat requests with prompts of ~950 tokens, temperature 0, through HTTP; the
-tokens of all requests while all of them generate.) Each answer is the one its request gets alone: a token does not
-depend on what shares its step, and a request's `seed` draws for that request alone. A model with a drafter gains less
-over one request, whose spare slots its drafts already fill (Gemma 4: two tokens a step alone). Flint gains least:
-each slot of a step routes its own experts (a step of 4 requests takes 2.2x a step of one). Its DFlash2 drafter
-drafts for a request that generates alone (37.4 tokens per second; 38.2 with `-np 1`) and stands back where
-requests share the steps: its records are one request's at a time, and moving them between two requests every step
-costs more than their drafts gain. Spark-X's steps have 8 slots: with `-np 8` (its most), 8 requests at a time get 189 (1.7B) and 93 (4B) tokens
-per second in all. Its DSpark drafter drafts for a request while its block pays: one dispatch whatever number of its
-guesses find a slot, about half a step of the model, so it runs for a request alone and stands back where requests
-share the steps (a block for each of four cost 30% of their tokens per second). The 9B and 27B Qwen models' steps have 8 slots too
-(`-np` up to 8: 8 requests at a time get 54 tokens per second in all on Qwen3.5-9B, 19 on Qwen3.6-27B), each
-sequence with its own Gated DeltaNet states (0.1 and 0.3 GB) beside its KV cache. Qwen3.5-9B, Qwen3.6-27B and
-MiniCPM-V's language model run another design then than with `-np 1` (8 tokens per dispatch instead of 4, every
-format's kernels code pages): one request alone gets 12.3 tokens per second instead of 12.6 on the 9B and 119 instead
-of 122 on MiniCPM-V, whose short steps leave the host's work between them the larger part (8 requests at a time: 166
-tokens per second in all). Qwen3.8-27B drafts with its MTP layer then, for each request
-ahead of the step the requests share (as Gemma 4's drafter; `--spec-type none`: 3.3 / 6.4 / 11.7 tokens per second);
-its DFlash2 drafter, whose records follow one sequence, does not load with `-np` above 1 (one request alone: 8.9
-tokens per second instead of 10.7). Deep in a context the gain is smaller, as every sequence reads its own KV cache in each step: four
-sequences at 16K positions give 1.9x one's tokens per second on Llama 3.2 3B.
+tokens of all requests while all of them generate.) Each request gets the same answer it would get alone: a token does
+not depend on what shares its step, and a request's `seed` draws only for that request. A model with a drafter gains
+less over one request, because its drafts already fill a single request's spare slots (Gemma 4: two tokens per step
+alone). Flint gains least, because each slot of a step routes to different experts (a step of 4 requests takes 2.2x as
+long as a step of one). Its DFlash2 drafter drafts only for a request that generates alone (37.4 tokens per second;
+38.2 with `-np 1`) and stands back when requests share the steps: its records hold one request at a time, and moving
+them between two requests every step costs more than the drafts gain. Spark-X's steps have 8 slots: with `-np 8` (its
+maximum), 8 concurrent requests get 189 (1.7B) and 93 (4B) tokens per second in total. Its DSpark drafter drafts for a
+request only while its block pays off: a block costs one dispatch, about half a model step, however many of its
+guesses find a slot, so the drafter runs for a request alone and stands back when requests share the steps (a block
+for each of four requests cost 30% of their tokens per second). The 9B and 27B Qwen models' steps also have 8 slots
+(`-np` up to 8: 8 concurrent requests get 54 tokens per second in total on Qwen3.5-9B and 19 on Qwen3.6-27B), and each
+sequence keeps separate Gated DeltaNet states (0.1 and 0.3 GB) beside its KV cache. With `-np` above 1, Qwen3.5-9B,
+Qwen3.6-27B and MiniCPM-V's language model run a different design than with `-np 1` (8 tokens per dispatch instead of
+4, with every format's kernels on code pages): one request alone gets 12.3 tokens per second instead of 12.6 on the 9B,
+and 119 instead of 122 on MiniCPM-V, whose short steps make the host's work between them the larger part (8 concurrent
+requests: 166 tokens per second in total). In that mode, Qwen3.8-27B drafts with its MTP layer for each request ahead
+of the shared step (like Gemma 4's drafter; `--spec-type none`: 3.3 / 6.4 / 11.7 tokens per second). Its DFlash2
+drafter, whose records follow one sequence, does not load with `-np` above 1 (one request alone: 8.9 tokens per second
+instead of 10.7). Deep in a context the gain is smaller, because every sequence reads a separate KV cache in each step:
+four sequences at 16K positions give 1.9x the tokens per second of one on Llama 3.2 3B.
 
 - A request takes the sequence it names (`id_slot`, as llama-server's), else an idle one whose prompt cache holds at
   least half of its prompt (a conversation's next turn continues where it is), else the least recently used; more
@@ -562,16 +565,16 @@ artlite-server --models-dir DIR --models-max 2   # another directory, two models
   (`lmstudio-community/Llama-3.2-1B-Instruct-GGUF:Q4_0`); its path in the directory, as `-m` takes it, names it too.
   A Hugging Face checkpoint directory ([Models](models/README.md)) is named by its path, `<account>/<repository>`.
   Files Artlite does not run (another architecture, tensor types without kernels) are skipped with a log line that
-  says why. Drafters (`mtp-`, `<name>-mtp-`, the `-DFlash2-GGUF` repositories) and vision encoders are not models of their own: Gemma 4 and the
-  qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters (Qwen3.8 27B: the DFlash2 repository's, else the MTP layer in its own file;
-  Flint: its DFlash2 repository's;
-  a preset's `spec-type` and `spec-draft-model` choose another), and a model gets the `mmproj` file of its directory
-  that it takes, of its width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V 4.7: its own, `mmproj-model-f16.gguf`
-  before the 4x one; Inkling 2: its own, `mmproj-F16.gguf`; LFM3-Audio-2B: its speech encoder, `/v1/models` lists the
-  model's `audio` input).
+  says why. Drafters (`mtp-`, `<name>-mtp-`, the `-DFlash2-GGUF` repositories) and vision encoders are not listed as
+  separate models. Gemma 4 and the qwen35moe models (Qwen3.6 35B-A3B, Occamy 1.0) find their drafters automatically
+  (Qwen3.8 27B uses the DFlash2 repository's drafter, else the MTP layer in a separate file; Flint uses its DFlash2
+  repository's drafter; a preset's `spec-type` and `spec-draft-model` choose another). A model gets the `mmproj` file
+  in its directory that matches its type and width (Qwen3.5 / 3.6 / 3.8: Qwen3-VL's; LFM3-VL-2B: its own; MiniCPM-V
+  4.7: its own, `mmproj-model-f16.gguf`, preferred over the 4x one; Inkling 2: its own, `mmproj-F16.gguf`;
+  LFM3-Audio-2B: its speech encoder, and `/v1/models` lists the model's `audio` input).
 - **Loading.** A request for a model that is not loaded loads it and waits. `--models-max` models (default 1) are
   loaded at a time: a load first unloads the least recently used model that has no request running, or waits for
-  one, so a model is never unloaded under a request. Each model runs in a server process of its own, with the
+  one, so a model is never unloaded under a request. Each model runs in a separate server process, with the
   command line's model options (`-c`, `-rea`, `--temp`, `--kv-k`, ...); unloading ends that process, which gives all
   its memory back. One process is kept started ahead, so a load does not wait for Python to start (~1.5 s). Loaded
   models take turns on the NPU: one process's dispatches run while no other's do (a side model beside a chat model:
@@ -596,7 +599,7 @@ max-slices = 36
 load-on-startup = true
 chat-template-file = templates/qwen-chatml.jinja
 
-[my-llama]                                 ; a model of its own, from anywhere
+[my-llama]                                 ; a separate model, from anywhere
 model = /path/to/Llama-3.2-3B-Instruct-Q4_K_M.gguf
 alias = llama
 ```
@@ -610,8 +613,8 @@ line, else its section, else `[*]`.
 
 ### A side model beside a chat model
 
-An embedding, rerank or decision model serves beside a chat model in a process of its own: a preset that loads both
-when the server starts, and `--models-max 2`.
+An embedding, rerank or decision model can serve beside a chat model in a separate process: use a preset that loads
+both when the server starts, and `--models-max 2`.
 
 ```ini
 [chat]
@@ -643,13 +646,13 @@ Qwen3-Embedding-0.6B):
 | d3-lite, a 99-token question | 32-35 ms | 52 / 67 ms | 91 / 115 ms |
 | Qwen3-Embedding-0.6B, a 30-token query | 25-27 ms | 43 / 60 ms | 62 / 115 ms |
 
-A longer side request (a 430-token passage, a batch of texts) runs in pieces too, the chat's dispatches between them.
-One side request per chat turn (a decision or a retrieval query per user message) leaves the chat's decode speed and
-its 32K TTFT (18.2 s) as they are alone; side requests back to back halve its decode speed while they last (and take
-about twice their time alone). Each process holds its own weights, caches and prompt cache (Llama 3.2 3B Q3_K_M at
-32768 positions ~7 GB with its prompt cache in use, the 0.6B ~2.5 GB, d3-lite ~2 GB, the process kept started ahead
-0.4 GB); in router mode the default prompt cache of each is its part of the RAM (`--cache-ram`: over
-`--models-max`), and a non-causal decision model's (d3) holds nothing.
+A longer side request (a 430-token passage, a batch of texts) also runs in pieces, with the chat's dispatches between
+them. One side request per chat turn (a decision or a retrieval query per user message) leaves the chat's decode speed
+and its 32K TTFT (18.2 s) unchanged from running alone; back-to-back side requests halve its decode speed while they
+last (and take about twice as long as alone). Each process holds separate weights, caches and prompt cache (Llama 3.2
+3B Q3_K_M at 32768 positions takes ~7 GB with its prompt cache in use, the 0.6B ~2.5 GB, d3-lite ~2 GB, and the process
+kept started ahead 0.4 GB). In router mode, each process's default prompt cache gets its share of the RAM (the
+`--cache-ram` default divided by `--models-max`), and a non-causal decision model's (d3) holds nothing.
 
 ## Options
 
@@ -707,7 +710,7 @@ Generation:
 | `--chat-template-kwargs JSON` | chat template variables, under each request's own: `enable_thinking`, `preserve_reasoning`, and any other the template reads (`reasoning_effort`, Llama 3.1's `tools_in_user_message`, ...) |
 | `--chat-template JINJA_TEMPLATE`, `--chat-template-file FILE` | a Jinja chat template, or a file holding one, in place of the model file's (`tokenizer.chat_template`), [below](#chat-template) |
 | `--jinja` | accepted: chat templates always render with Jinja (llama-server's switch to them) |
-| `--grammar GRAMMAR`, `--grammar-file FILE` | a GBNF grammar (Lark after `%llguidance`) that the answers follow where a request asks for no constraint of its own and has no tools ([Structured output](#structured-output)) |
+| `--grammar GRAMMAR`, `--grammar-file FILE` | a GBNF grammar (Lark after `%llguidance`) that the answers follow when a request sets no constraint itself and has no tools ([Structured output](#structured-output)) |
 | `-j SCHEMA`, `--json-schema`; `-jf FILE`, `--json-schema-file` | a JSON schema the same (`{}`: any JSON object); beside a request's tools, the answer that is no call |
 
 NPU:

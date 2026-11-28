@@ -157,8 +157,8 @@ __attribute__((noinline)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bf
 {% set VENC_ATTRS = "noinline" %}
 {% include "artlite/decode/attn256.venc.cc.jinja" %}
 
-// The rows of a set whose positions past their own are in record r (scores masked): lanes of row q (q < 4: query row 4
-// set + q, slot (4 set + q) / QR at position p + slot) at positions 8 r + j > p + slot
+// The rows of a set that see positions of record r past the row's own position, where the scores are masked: lanes of
+// row q (q < 4: query row 4 set + q, slot (4 set + q) / QR at position p + slot) at positions 8 r + j > p + slot
 __attribute__((noinline, minsize)) uint32_t {{ p }}_mask(int set, int r, int p, int S, int QR)
 {
     uint32_t m = 0;

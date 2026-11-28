@@ -27,8 +27,8 @@ output-normed) on the host:
   level; the texts of the control tokens are broken in the input (``d1_break``). Questions about a state share one
   sequence as the model's runner reads them (its ``set`` attention, up to ``D1_SET_SIZE`` a sequence; the request's
   ``set_size``, 1: each question alone as llama-server reads them): the state, then each question after "QUESTION:\n"
-  (``Decisions.prompts``); on the full-attention layers the state's tokens see every token, a question's the state
-  and its own (``Prompt.sets``, ``NpuModel.outputs``' ``sets``).
+  (``Decisions.prompts``); on the full-attention layers the state's tokens see every token, a question's tokens see the
+  state and the question itself (``Prompt.sets``, ``NpuModel.outputs``' ``sets``).
 
 Images (``files``, ``images``: data URLs; a chat state's ``image_url`` parts; at most ``MAX_IMAGES``) for lfm3-d1 and
 vllm-d3 (``IMAGE_TYPES``) on a server with the model's vision encoder: each runs the encoder once

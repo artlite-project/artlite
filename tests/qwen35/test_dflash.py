@@ -164,7 +164,7 @@ def _bf16(b: np.ndarray) -> np.ndarray:
 
 def _attention_errors(d: DFlashOverlay, rf: dflash_ref.DFlash, L: int, p: int) -> np.ndarray:
     """The block at p just ran: per column, slot and query head the relative error of the attention core's o (aout's x) against the
-    attention of its own operands (the rows' raw q, K, V in ACT, the ring, the open object; K and Q as the core's panels)."""
+    attention of the core's own operands (the rows' raw q, K, V in ACT, the ring, the open object; K and Q as the core's panels)."""
     d.dev.fetch("ACT")
     d.dev.fetch("KV")
     act, kv, T, G, W, cfg = d.dev.view("ACT"), d.dev.view("KV"), d.T, d.shape.ring, d.shape.window, d.cfg
@@ -248,7 +248,7 @@ def test_injection(npu: _Npu) -> None:
 
 @pytest.mark.parametrize("P", [2292, 2600])
 def test_attention_core(npu: _Npu, P: int) -> None:
-    """The attention core against the attention of its own operands, at every layer, on random taps (random S, junk rows, past the ring's
+    """The attention core against the attention computed from its operands, at every layer, on random taps (random S, junk rows, past the ring's
     wrap): their logits are no check, a broad softmax over random keys follows K's 8-bit mantissas (5-60% from fp32, reproduced by those
     panels alone), but each layer's o stays within its panels' rounding."""
     _, path = _files()
@@ -348,7 +348,7 @@ def test_prefill(n: int) -> None:
     """The records of a prompt's chunks (``prefill.dflash``) are the injections' of the same rows, within the two paths' rounding (the
     model's rows differ between a chunk and decode steps: K ~2%, V ~4%, and by far more at its unstable tokens, 1 in 300 of this text, up to 3%
     of others: tokens the layers from 20 on reshape, whose rows part ways between any two graphs, llama.cpp's own too, ' colloquial' 26-29%,
-    with the GDN and attention cores within their rounding of their own operands there); a chunk's last record's rows open."""
+    with the GDN and attention cores within their rounding of the cores' operands there); a chunk's last record's rows open."""
     model, path = _files()
     g = GGUFFile(model)
     ids = _tokens(model, n)

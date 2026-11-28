@@ -31,11 +31,11 @@ records (16 positions: P V adds records 2 k, 2 k + 1 of a group together), at mo
 group alone (``decode.kv.ranges``: even shares, a sliding-window cache from the window's guard on). So a slot's
 attention - which column reads which groups, which partials merge, which records add together in which order - is
 the same in every step it can be part of, and its numbers too: a step of S slots gives each the logits of a step of
-one. Softmax with a running maximum per row (masked positions add exactly nothing; a row's numbers depend on its own
-scores only); at the end each column merges the partial (m, l, y) of its west neighbour in the chain (shared memory,
-ordered by token ObjectFifos) into its own, so the chain's last column holds the whole and emits o = y / l on D into
-the sub-step's slots of the O projection's packed input ([k block][slot SP][8] bf16, heads in a row:
-``decode.protocol.packed_slots``). The last column holds the newest group: of a layer with its own cache it inserts the
+one. The softmax keeps a running maximum per row: masked positions add exactly nothing, and a row's numbers depend only
+on that row's scores. At the end, each column merges its west neighbour's partial (m, l, y) into its own partial
+(through shared memory, ordered by token ObjectFifos), so the chain's last column holds the complete result and emits
+o = y / l on D into the sub-step's slots of the O projection's packed input ([k block][slot SP][8] bf16, heads in a row:
+``decode.protocol.packed_slots``). The last column holds the newest group: in a layer that owns its cache, it inserts the
 sub-step's K (rotated, normed if ``qk_norm``; bfp16 blocks, kp per 8 dims) into their records as they pass and its V
 rows into the open records' rows at the tail objects, and emits the K records of the sub-step's first and last
 positions as the K objects come, then per open record its V panels and its ring slot (``decode.kv.emit_order``) on D
@@ -58,7 +58,7 @@ the token objects (``F_TOK``, t = SLOTS kind + a per layer kind and slot a: of t
 position and slot, its slots, the columns' ranges and A objects, and the step's cos / sin of the rotated pairs per
 slot, fp32; for the main cores the A objects of the sub-step that ends at a, ``M_TOK_NG``), then per attention layer
 and sub-step the KV head's q objects of its slots ([head nh][hd] bf16; the first one's metadata words: the ``F_ATT``
-object - head_dim, kind, own cache, the score constant, its token) and, for a layer with its own cache, their raw K / V
+object - head_dim, kind, own cache, the score constant, its token) and, for a layer that owns its cache, their raw K / V
 objects ([K hd | V hd] bf16): the main cores skip them one at a time and after the last the cache's objects (its
 M_NASKIP: the token of its slot). On A (broadcast with the main core's) its range of the cache (and the chain's end
 its tail objects).
@@ -139,9 +139,9 @@ M_AFULL, M_AEXT = ATT_INK.words("M_AFULL M_AEXT", at=34)
 # (ink) a q object's payload (bf16 elements): q of the 3 heads, their gates, r (16 per head), the sinks (3 fp32 as bf16
 # pairs); the F_ATT object's static constants after them: the q clip scales [head][128], the r clip scales [head][16]
 INK_Q, INK_G, INK_R, INK_SK, INK_QC, INK_RC = 0, 384, 768, 816, 832, 1216
-# (ink) a raw K / V object's payload (fp32): K, its taps' deltas (full layers; a C object of their own), V, its deltas: the
-# k and v phases' outputs, one drain each; the layer's static taps after them (bf16 [tap 4][128] of K, then of V, at byte
-# INK_TAPS)
+# (ink) a raw K / V object's payload (fp32): K, its taps' deltas (full layers only, in a separate C object), V, and its
+# deltas. These are the k and v phases' outputs, one drain each; the layer's static taps after them (bf16 [tap 4][128]
+# of K, then of V, at byte INK_TAPS)
 INK_K, INK_KD, INK_V, INK_VD, INK_TAPS = 0, 128, 160, 288, 1280
 INK_EW = 128  # (ink) an E object's window: [rel 16][128] bf16 of E's reversed rows (``ink_rel``)
 INK_ED0 = 1151  # (ink) E_rev[r][j] = E[r][INK_ED0 - j] (zero past E's distances: ``ink_rel``)
@@ -158,9 +158,10 @@ assert not set(WINS.values()) & set(DESIGN_WINS.values()), "event windows of the
 
 
 def consts(ink: bool = False, states: bool = False) -> dict[str, int]:
-    """The words, flags and ids the attention cores' kernels take: their own, and of the protocol the phase objects they
-    skip (``PHASE``) and the token objects (``TOKEN``); ``ink``: Inkling's (``Attn(ink=True)``); ``states``: a states
-    design's (``Attn(states=True)``, the phases' fp32 state objects and F_INK steps to skip)."""
+    """The words, flags and ids that the attention cores' kernels take: the cores' own constants, plus the protocol's
+    constants for the phase objects they skip (``PHASE``) and for the token objects (``TOKEN``); ``ink``: Inkling's
+    (``Attn(ink=True)``); ``states``: a states design's (``Attn(states=True)``, the phases' fp32 state objects and F_INK
+    steps to skip)."""
     states = states or ink
     return XMETA.consts(PHASE, ATT, TOKEN_ATT, *([ATT_INK] if ink else []), *([INK] if states else [])) | \
         STATE.consts(*([INK_STATE] if ink else []), *([STATES_STATE] if states else [])) | {"A_WORDS": A_WORDS}
@@ -219,8 +220,8 @@ class Attn:
     (``AttentionDecodeOperator.ACC_AT``: the workspace is at least that long; what persists over a step lies before y).
     ``states``: the cores of a states design (``decode.design``'s ``states``: they skip its phases' fp32 state objects and
     F_INK steps; ``ink`` implies it). ``block``: every step is a block (a DSpark drafter's): each row sees all of the
-    step's positions and the window's (``M_AWIN``) positions before its first, not a causal window of its own (one head
-    dim)."""
+    step's positions and the window's (``M_AWIN``) positions before the step's first one, rather than a causal window
+    per row (one head dim)."""
 
     def __init__(self, *, hds: tuple[int, ...], rot: tuple[int, ...], chain: int, heads: int, a_bytes: int, kp: int = 2,
                  qk_norm: bool = False, qk_weights: bool = False, v_norm: bool = False, eps: float = 1e-6,
@@ -361,7 +362,7 @@ class Attn:
         shared streams ``s`` (``decode.design._Streams``; kernel prefix s.p, object names from ``prefix``); ``a_depth``:
         their A objects in L1 (2: the next cache object arrives while the core works on one); ``extra``: per column
         buffers of the core that its kernels reach through their addresses (the pager's state words); ``aws``: the
-        columns' workspaces (default: buffers of their own; an MoE design's main cores hold acc in them)."""
+        columns' workspaces (default: separate buffers; an MoE design's main cores hold acc in them)."""
         p, P, chain = s.p, prefix, self.chain
         bf, i32 = np.dtype[bfloat16], np.dtype[np.int32]
         x_ty, a_ty = s.x_ty, s.a_ty

@@ -1,5 +1,5 @@
-"""The GPT-2 BPE tokenizer and the chat template of a GGUF file, from its own metadata: the qwen35 architecture's files
-(Qwen3.5 on), the llama package's qwen3 ones (Qwen3, its embedding, reranker and decision models), LFM3's,
+"""The GPT-2 BPE tokenizer and the chat template of a GGUF file, from the file's metadata: the qwen35 architecture's
+files (Qwen3.5 on), the llama package's qwen3 ones (Qwen3, its embedding, reranker and decision models), LFM3's,
 Spark-X's, Flint's and Inkling 2's.
 
 ``tokenizer.ggml.model == "gpt2"``: GPT-2 byte-level BPE, run by gigatoken (its native API) from a tokenizer.json built
@@ -13,8 +13,8 @@ cases one class; ``inkling2``: GPT-4o's one regex as llama.cpp runs it, only the
 ``ignore_merges``) encodes natively: the special tokens cut out, the rest split as llama.cpp's regexes split it
 (``_native.pretokenize_spark2_5`` / ``_flint`` / ``_gpt4o`` over the text's codepoints and their classes,
 ``unicode_classes``: the categories the regexes collapse a codepoint to) and each piece merged
-(``_native.BpeEncoder``: gigatoken always splits with a scheme of its own); gigatoken still decodes. No BOS (the chat
-templates write their own). Checked against ``llama-tokenize`` (tests/test_tokenizer.py).
+(``_native.BpeEncoder``: gigatoken always splits with a different scheme); gigatoken still decodes. No BOS (the chat
+templates write it). Checked against ``llama-tokenize`` (tests/test_tokenizer.py).
 """
 
 import functools

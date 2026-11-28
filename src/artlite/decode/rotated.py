@@ -167,7 +167,7 @@ class RotatedOverlay:
 
     def fills_and_drains(self, seq: Sequence, st: StepPlan, phase: tuple[int, str], fills: list[list[int | Fill]],
                          a_fills: dict[tuple[int, int], int | list[Fill]] | None = None) -> None:
-        """A phase's X fills (``fills``: per column, in order; an ACT offset: XB bytes, a ``Fill``: a task of its own) and
+        """A phase's X fills (``fills``: per column, in order; an ACT offset: XB bytes, a ``Fill``: a separate task) and
         its outputs: the fills in rounds of one a column (a column's tasks in a row put the last column's first ~2 us
         behind), up to the 4 a column's queue holds (empty after the phase's sync), then the drains, then the rest (past
         4 queued fills a column's next fill waits for its oldest, whose room the cores make only while their outputs

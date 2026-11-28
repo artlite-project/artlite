@@ -30,7 +30,7 @@ from .cpu import GemmaCpu, gelu
 
 
 class GemmaNpuRef(GemmaCpu):
-    """The layers ``layers`` of a Gemma GGUF file (as a model of their own: the overlay's ``layers``) and the first
+    """The layers ``layers`` of a Gemma GGUF file (as a standalone model: the overlay's ``layers``) and the first
     ``vocab`` LM rows with the overlay's rounding points. ``run`` takes the tokens from position 0 and returns the raw
     logits (T, vocab) (before the soft cap), with sub-layer results in ``trace``."""
 

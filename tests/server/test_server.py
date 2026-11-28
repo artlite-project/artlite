@@ -193,7 +193,7 @@ def test_reasoning_template_decides() -> None:
 
 
 def test_reasoning_budget() -> None:
-    """llama-server's reasoning budget: after its tokens the thought's end (its message on a paragraph of its own and
+    """llama-server's reasoning budget: after its tokens the thought's end (its message in a separate paragraph, then
     the close marker) is forced and the answer follows; a budget of 0 ends the thought the prompt opened at once;
     Gemma's thought, which the model opens, is counted from its opener."""
     _model, npu, engine = make(reasoning=QWEN)
@@ -274,7 +274,7 @@ def test_reasoning_budget_end() -> None:
 def test_effort_budget() -> None:
     """A request's reasoning_effort sets its thought's budget where the template renders no levels (minimal: 0, low,
     medium; high and above, or none given: the server's); an explicit budget comes first; Responses' and Anthropic's
-    efforts are the chat's; a template with levels of its own (Qwen3.8's) takes the level and no budget."""
+    efforts are the chat's; a template that defines its own levels (Qwen3.8's) takes the level and no budget."""
     model, npu, engine = make(reasoning=QWEN, capacity=8192)
     words = [f" w{i}" for i in range(1500)]
 
@@ -376,7 +376,8 @@ def test_continue_final_message() -> None:
 
 def test_effort_levels() -> None:
     """/props' reasoning_effort_levels: the levels the template renders distinctly, aliases under the highest name,
-    none too where it renders one of its own (Inkling's effort 0, as llama-server lists it); a level the template
+    'none' too where the template
+    renders a distinct level for it (Inkling's effort 0, as llama-server lists it); a level the template
     refuses or renders as an unknown one is not offered."""
     _model, _npu, engine = make()
     template = ("{% if reasoning_effort == 'xhigh' %}{{ raise_exception('effort') }}{% endif %}"
@@ -621,7 +622,8 @@ def test_tool_calls_parallel(tooled: tuple) -> None:
 def test_tool_choice(tooled: tuple) -> None:
     """none: the call's opener is never sampled (no call text in the content); required and a named function: the
     call's opener is forced at the answer's start, or the call grammar holds the answer to the call after the thought
-    (a model that would write text writes the call: greedy, the lowest allowed token where none of its own is)."""
+    (a model that would write text writes the call: greedy, the lowest allowed token when none of
+    the model's preferred tokens is allowed)."""
     model, npu, engine, client = tooled
     npu.replies = [call_pieces("get_time")]
     msg = chat(client, "Q", tools=[TIME], tool_choice="none").json()["choices"][0]["message"]

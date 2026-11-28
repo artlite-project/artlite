@@ -75,9 +75,9 @@ __attribute__((noinline)) void {{ p }}_q80(uint8_t *__restrict a, const uint8_t 
     {{ p }}_q80_d<{{ unit }}>(u, tab);
     {{ p }}_q80_mm<2, {{ unit - 2048 }}>(xp, u, c);
     AIE_LOOP_NO_UNROLL
-    for (int sb = 0; sb < 2; sb++){{ "  // (super-block 2 H + 1's rows into y + ys: row groups of 4, rows of their own)" if rg and R80 == 8 else "" }}
+    for (int sb = 0; sb < 2; sb++){{ "  // (row groups of 4: super-block 2 H + 1's rows are separate output rows at y + ys)" if rg and R80 == 8 else "" }}
 {% if rg and rg_all and R80 == 8 %}
-        if (ys < 0) {  // (B_G8: each half's 4 groups rows of their own, -ys apart)
+        if (ys < 0) {  // (B_G8: each half's 4 groups are separate output rows, -ys apart)
             {{ p }}_q80_sc4(c + {{ 8 * L }} * sb, tab + 64 * sb, y - 2 * ys * sb);
             {{ p }}_q80_sc4(c + {{ 8 * L }} * sb + {{ 4 * L }}, tab + 64 * sb + 32, y - 2 * ys * sb - ys);
         } else

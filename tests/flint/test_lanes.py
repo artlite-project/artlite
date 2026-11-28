@@ -1,6 +1,6 @@
 """Flint's lanes on the NPU (``NpuFlint(sequences=)``; models/lanes.py): three conversations on one model object, each
-on a thread of its own, against each one alone: greedy replies token for token, without drafts and with the DFlash2
-drafter's (one drafter, its records one lane's sequence's at a time: ``models.dflash``' ``own``; a lane's rows of
+on a separate thread, against each one alone: greedy replies token for token, without drafts and with the DFlash2
+drafter's (one drafter whose records hold one lane's sequence at a time: ``models.dflash``' ``own``; a lane's rows of
 the shared steps injected from the staging region), the lanes' decode rounds in joint steps; after the rounds the
 lanes shared, each lane's drafter gives the block (bf16 bits of its logits) it gives after the conversation alone."""
 

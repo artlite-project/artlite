@@ -1,6 +1,6 @@
 """LFM3-Audio's speech on the NPU for the lfm3 language models (``NpuAudio``): a clip's samples (``models.audio.load_audio``), its
 log-mel spectrogram (``host.log_mel``), its rows' embeddings (``models.lfm3a.encoder.Encoder``: on the vision overlay in
-a hardware context of its own, band by band; with LFM3-Omni's mmproj on the one its vision tower shares,
+a separate hardware context, band by band; with LFM3-Omni's mmproj on the one its vision tower shares,
 ``artlite.vision.shell.shared_device``) and its tokens (``host.clip_sequence``); and, where the mmproj holds the speech
 generator (projector ``lfm3a_gen``), its depthformer (``models.lfm3a.depth.Depth``) and codec decoder
 (``models.lfm3a.codec.Codec``) on the same device (``models.lfm3a.speech``: the frames' loop).

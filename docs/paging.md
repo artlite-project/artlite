@@ -71,20 +71,20 @@ roles' code. The roles are attention of heads of 80 and 160 (`a`), attention of 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/paging-paths-dark.svg">
-  <img alt="Left: the host waits until the row's operations are complete, sends control packets from shim 1 to each core's TileControl port, and polls each core; the row idles. Right: the host puts the page into the row's B stream before the operation; each core streams it from its slots into its own TileControl" src="images/paging-paths.svg">
+  <img alt="Left: the host waits until the row's operations are complete, sends control packets from shim 1 to each core's TileControl port, and polls each core; the row idles. Right: the host puts the page into the row's B stream before the operation; each core streams it from its slots into the tile's TileControl" src="images/paging-paths.svg">
 </picture>
 
 Every tile has a **TileControl** port: a stream port that accepts control packets, each a write of 1 to 4 words to
 any address of the tile, program memory included. Program memory can therefore be rewritten while the design runs.
 Who sends the packets matters.
 
-- **The host writes the code.** The packets come from a shim tile on a route of their own. A program-memory write
+- **The host writes the code.** The packets come from a shim tile on a dedicated route. A program-memory write
   fails while the core fetches from it, so the host must first wait until the row has finished its queued
   operations. It then sends the packets and polls each core until they arrived. The array drains, and the command
   processor waits at every switch.
 - **The core loads its page.** The page travels in the row's B stream like any command, ahead of the operation that
   needs it. The host only decides where the page goes in the stream; it never waits for it. Each core receives it in
-  its B slots and forwards it into its own TileControl.
+  its B slots and forwards it into the tile's TileControl.
 
 ## A page load, step by step
 
@@ -115,11 +115,11 @@ one table slot per core.
   <img alt="A page as control packets: each packet is a stream header, a control header and up to 4 words; slot b0 holds the first 240 packets of code, slot b1 the rest of the code, the state words, filler packets and last the wake-lock packet; each slot ends with TLAST" src="images/paging-packets.svg">
 </picture>
 
-The page in the stream is control packets of at most 6 words: a stream header (packet id 7), a control header (a
-write, 1-4 words, an address) and the words. A B slot's BD ends the stream's packet at the slot's end (TLAST), so
-the packets are packed whole into each slot. Filler packets pad the last slot by rewriting the state words with
-their own values, and the packet that sets the wake lock comes last. Whatever the page's size, the core streams two
-slots: 11.5 KB in about 4800 cycles (~2.7 µs).
+The page in the stream is control packets of at most 6 words: a stream header (packet id 7), a control header (a write,
+1-4 words, an address) and the words. A B slot's BD ends the stream's packet at the slot's end (TLAST), so the packets
+are packed whole into each slot. Filler packets pad the last slot by rewriting the state words with the values they
+already hold, and the packet that sets the wake lock comes last. Whatever the page's size, the core streams two slots:
+11.5 KB in about 4800 cycles (~2.7 µs).
 
 ## How a page is built
 
@@ -133,7 +133,7 @@ Pages come from the same C++ source and object file as the rest of the core's pr
 3. It checks the result against aiecc's:
    - the resident code and data come out byte for byte the same, on every core that shares the pages;
    - every page fits between the slot and 16 KB;
-   - no page needs data of its own: constant tables or jump tables are refused, or kept resident;
+   - no page needs separate data: constant tables or jump tables are refused, or kept resident;
    - no page reaches the pager;
    - the deepest call, through the page entries, fits the stack.
 
@@ -147,12 +147,12 @@ The link runs once per design and is cached next to it.
 | An acquire in a jump's delay slots | The core fetches the jump's target before the acquire completes, so it runs stale code | The wake lock is acquired only in the pager, which has no jumps (`check_pager`); page code is entered after the pager returns |
 | Code overwritten while it runs | A page replaces a function still on the stack | Pages lie above the resident code, and no page reaches the pager (`link`'s call graph) |
 | Writes past 16 KB | They land in the tile's other registers and break the core | `link` refuses a page that does not fit |
-| Page data | Data memory holds only the resident ELF's data | `link` refuses a page that needs data of its own; a page's own words go into a buffer the design placed (`Pager.data`) |
+| Page data | Data memory holds only the resident ELF's data | `link` refuses a page that needs separate data; a page's own words go into a buffer the design placed (`Pager.data`) |
 | A stale page after a configuration | A PDI load rewrites the slot's start but keeps the state words | The state words are cleared after one (memory tile transport), or a dispatch always sends its first page (self-DMA) |
 | A packet across slots | A slot's BD ends with TLAST and cuts the packet | `Pager.slots` packs whole packets per slot |
 | A dispatch ending with tasks queued | The next dispatch rewrites the BDs, and the queued task streams its data: a page twice or out of place | the vision overlay waits for the last push of every B stream at the end |
 | A full task queue (memory tile transport) | A push to a full queue is dropped | One channel serves at most 4 cores, with one request in flight each |
-| A queue shared with waiting tasks (memory tile transport) | A task that waits for the cores blocks the page the cores wait for | Pages have a channel of their own |
+| A queue shared with waiting tasks (memory tile transport) | A task that waits for the cores blocks the page the cores wait for | Pages have a dedicated channel |
 
 ## The memory tile transport (decode)
 
@@ -172,7 +172,7 @@ TileControl.
 
 A request costs 86 cycles plus about 0.39 µs per KB of code. The store and its BDs are not part of the design's
 configuration. The host writes them (0.32 ms) before a dispatch when they are stale: after the configuration, after
-a prefill dispatch, which configures the array for its own designs, and after a pause of a second or more, as the
+a prefill dispatch, which configures the array for the prefill's designs, and after a pause of a second or more, as the
 system powers an idle NPU down (Linux's driver suspends it 5 s after its last job) and the array comes back with its
 configuration alone.
 

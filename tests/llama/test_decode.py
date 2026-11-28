@@ -166,7 +166,7 @@ def test_llama_decode_tails(pairs: bool) -> None:
 @pytest.mark.parametrize(("case", "kv_k"), [("1B_Q4_K_M", "single"), ("3B_Q4_K_M", "hilo"), ("qwen3_0.6B_Q4_1", "hilo")],
                          ids=lambda v: v)
 def test_llama_decode_sequences(case: str, kv_k: str) -> None:
-    """Three sequences on one device (``LlamaOverlay(sequences=3)``: texts of their own, at positions of their own)
+    """Three sequences on one device (``LlamaOverlay(sequences=3)``: separate texts at separate positions)
     give, slot by slot, the logits and LM-head inputs of each sequence alone in steps of one, bit for bit:
 
     - alternated (``select``: a step of 1 .. 4 slots of one, then of the next: no copies between them);
@@ -243,7 +243,7 @@ def test_llama_decode_sequences(case: str, kv_k: str) -> None:
         end = max(pos) >= N - 8  # (the end: one slot each in order, the same parts until a sequence is through)
         if not end:
             spare = SLOTS - len(take)
-            for t in take:  # (a second slot of its own)
+            for t in take:  # (a second slot for the same sequence)
                 if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
                     t[1] += 1
                     spare -= 1

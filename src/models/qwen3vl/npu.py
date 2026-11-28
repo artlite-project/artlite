@@ -1,6 +1,6 @@
 """Qwen3-VL's images on the NPU for the qwen35 / qwen35moe language models (``NpuVision``): an image at its encoder
 size (``host.image_pixels``: between ``min_tokens`` and ``max_tokens`` merged tokens), its embeddings
-(``models.qwen3vl.encoder.Encoder``: on the vision overlay in a hardware context of its own) and its tokens
+(``models.qwen3vl.encoder.Encoder``: on the vision overlay in a separate hardware context) and its tokens
 (``host.Grid.sequence``).
 
 Every load packs the weights from the mmproj file (BF16 / F16 / Q8_0 -> BFP16: ``artlite.vision.weights``, the

@@ -1,6 +1,6 @@
 """LFM3's short convolution in the decode overlay: a job of the attention cores (``decode.attn.Attn(conv=)``: the
 operator core (c, 5) of every column runs a conv layer's step between two attention layers; its D stream is the
-column's only output besides the main core's C, so the conv cannot have a core of its own).
+column's only output besides the main core's C, so the conv cannot have a dedicated core).
 
 Per conv layer and column c (its 256 channels 256 c ..: ``image.CH``), a step of S <= 4 slots:
 

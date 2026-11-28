@@ -23,7 +23,7 @@ calls page code only through the entry words, from resident code. Hazards and th
   pager (``link``: the call graph), so no page is on the stack while another one is written. Program memory ends at
   16 KB: a page past it writes the tile's other registers and breaks the core;
 - page data: the core's data memory is the resident ELF's: ``link`` refuses a page whose functions need data the
-  resident code does not have (constant or jump tables); a page may write words of its own into data memory (``Pager.data``:
+  resident code does not have (constant or jump tables); a page may write its own words into data memory (``Pager.data``:
   a table in a buffer the design placed for it, which the page's code reads);
 - the stack: the deepest call of the core, page entries called from their resident callers, fits its stack_size;
 - a stale page: a configuration (a PDI load) rewrites the slot's start with the startup code and leaves the state
@@ -39,7 +39,7 @@ Transports, how the packets reach the TileControl:
   The TileControl takes ~1.9-2.4 B / cycle: two slots of 5760 B in ~4830 cycles, whatever the code in them;
 - memtile: the core's request (``pg_request`` with ``request``'s words: a control packet from its stream port to its
   memtile's TileControl, ``request_flow``) pushes a BD of the page's stream, stored in the memtile (``Store``), on a
-  memtile MM2S channel of its own (``page_flow``): 86 cycles + ~0.39 us per KB of code. A queue drops a push when full:
+  dedicated memtile MM2S channel (``page_flow``): 86 cycles + ~0.39 us per KB of code. A queue drops a push when full:
   a channel serves at most 4 cores, one request in flight each; a queue shared with tasks that wait for the cores
   deadlocks. The store and its BDs are host-written (``Store.load``) after the design's configuration: again after
   another hardware context ran (its configuration resets the BDs and may use the memtile).
@@ -351,7 +351,7 @@ def _data(obj: ObjectFile, name: str) -> bytes:
 
 
 def _same_kernels(ref: ObjectFile, other: ObjectFile, end: int, where: str) -> None:
-    """Two cores' resident code agrees below ``end`` but for their own control code (``core_<c>_<r>``), and their data."""
+    """Two cores' resident code agrees below ``end``, except for each core's own control code (``core_<c>_<r>``) and their data."""
     def funcs(e: ObjectFile) -> dict[str, tuple[int, int]]:
         return {s.name: (s.value, s.size) for s in e.symbols if s.is_function and s.section_index and s.name}
     fa, fb = funcs(ref), funcs(other)

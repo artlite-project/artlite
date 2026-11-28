@@ -26,8 +26,8 @@ rounded up to ``seg_unit`` tokens; a chunk's fixed cost, its ConfigureOps and ev
 the plan of the least estimated time (``packed_seconds``) against each input run alone (``chunk_seconds`` of its
 ``plan``): an input longer than ``span``, a chunk that would not be faster than its inputs alone, run alone.
 
-A model's prefill supplies its runlist per sub-chunk count (``_runlist``, built with ``_sl`` / ``_tok``; chunk sizes below
-SUB, ``SMALL``: one sub-chunk of operators of their own size, ``_runlist_of``), the bytes per token of its own buffers
+A model's prefill supplies its runlist per sub-chunk count (``_runlist``, built with ``_sl`` / ``_tok``; for the chunk sizes
+below SUB in ``SMALL``, one sub-chunk of operators built for that size, ``_runlist_of``), the bytes per token of its own buffers
 (``rb``), their static contents (``_bind``), its time model (``layer_seconds``, ``layer_configs``, ``layer_entries`` or
 its own ``_layer_starts``;
 ``_fits_budget``; the sub-chunks S a fraction for a small size) and the layers whose caches a chunk writes
@@ -60,7 +60,7 @@ PEER_PIECE_S = 0.05  # the same while another process uses the NPU: its requests
 # and two processes that both keep the NPU busy get about half of it each (Qwen3-Embedding-0.6B's batches against Llama
 # 3.2 3B's decode: 1.9x / 2.1x their time alone; at 0.1 s 1.5x / 2.8x)
 CONFIG_S = 0.12e-3  # a ConfigureOp (~30-40 us alone: no array reset but at a piece's first, ``fused.program``; the
-# cores' programs by control packets: Llama's fitted 0.111 ms, Qwen's 0.085 ms in their own models; Gemma's model
+# cores' programs by control packets: Llama's fitted 0.111 ms, Qwen's 0.085 ms, each in its model's fit; Gemma's model
 # 1.5-1.6x its chunks)
 GROUP = 32  # positions a chunk starts at a multiple of (whole cache groups; a model's default ``group``)
 
@@ -94,7 +94,7 @@ class ChunkPrefill:
     into chunks, the model's ``run`` runs one."""
 
     SUB: ClassVar[int]  # tokens per sub-chunk (the operators' T)
-    SMALL: ClassVar[tuple[int, ...]] = ()  # chunk sizes below SUB (one sub-chunk of operators of their own T)
+    SMALL: ClassVar[tuple[int, ...]] = ()  # chunk sizes below SUB (one sub-chunk of operators built for that T)
     MAX_T: ClassVar[int]  # the largest chunk
     MIN_TOKENS: ClassVar[int] = 1  # valid tokens of a chunk at least
     NAME: ClassVar[str]  # the library ELF's

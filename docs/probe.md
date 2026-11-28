@@ -58,32 +58,33 @@ lines on Strix Halo and 79% below on Krackan Point (15.6 instead of 73.2 GB/s): 
 which LPDDR5 runs as a read-modify-write inside the DRAM, at 4x a write's command spacing (tCCDMW). Artlite's prefill
 writes whole lines (`?`: not measured on that machine).
 
-Each row on a page of its own costs the NPU an address translation. Artlite's host buffers have 2 MB pages on Linux
-(transparent huge pages, `madvise` or `always`; the `host buffers` line says so); Windows maps system memory for the
-NPU in 4 KB pages, and there the skewed gather and the write rows run at 14-16 and 5-6 GB/s (Strix Point and a Krackan
-Point laptop on Windows: some 50 million rows a second at most, whatever their size), as on Strix Halo with huge
+Each row that sits on a separate page costs the NPU an address translation. Artlite's host buffers have 2 MB pages on
+Linux (transparent huge pages, `madvise` or `always`; the `host buffers` line says so); Windows maps system memory for
+the NPU in 4 KB pages, and there the skewed gather and the write rows run at 14-16 and 5-6 GB/s (Strix Point and a
+Krackan Point laptop on Windows: some 50 million rows a second at most, whatever their size), as on Strix Halo with huge
 pages off (29.3 and 12.2); what that costs the prefill: [Page-local bricks](page-local-bricks.md). The dispatch round
 trip through Windows and XRT is 94 us (58 in the `turbo` power mode).
 
-The first lines name the machine, the kernel, which `amdxdna` runs (`amdxdna_accel_driver` 0.6 / 0.8 / 0.10 are Linux
-7.0 / 7.1 / 7.2's own), the NPU firmware, the platform profile and the power adapter, the NPU's power mode, the CPU
-that takes the NPU's interrupts, and whether the device heap can grow (Linux before 7.2: one 64 MB heap per process).
-On Windows: the NPU driver, firmware and power mode as `xrt-smi` tells them.
+The first lines name the machine, the kernel, which `amdxdna` runs (`amdxdna_accel_driver` 0.6 / 0.8 / 0.10 ship with
+Linux 7.0 / 7.1 / 7.2), the NPU firmware, the platform profile and the power adapter, the NPU's power mode, the CPU that
+takes the NPU's interrupts, and whether the device heap can grow (Linux before 7.2: one 64 MB heap per process). On
+Windows: the NPU driver, firmware and power mode as `xrt-smi` tells them.
 
 ## Pages: `--pages`
 
-`artlite-probe --pages` prints a second table instead (a minute and a half): what the NPU's address translation costs
-rows on pages of their own. On Windows it runs in the `performance` power mode (from `default`, which runs a Krackan
-Point's array at 1.4 GHz; `default` again after). Millions of rows a second, read / write; unless a row says
-otherwise, rows of 256 B, each on a page of its own, a channel's pages 4 KB apart (the rows 4 KB + 256 B, so that they
-spread over the DRAM channels) and visited in turn. The reference columns are Strix Halo with 2 MB pages (no
-translations: the DMA's own rates for each pattern) and with 4 KB pages (transparent huge pages `never`).
+`artlite-probe --pages` prints a second table instead (it takes a minute and a half): what the NPU's address
+translation costs when each row sits on a separate page. On Windows it switches to the `performance` power mode
+(`default` runs a Krackan Point's array at 1.4 GHz) and switches back to `default` afterwards. The numbers are millions
+of rows per second, read / write. Unless a row says otherwise, rows are 256 B, each on a separate page, with a
+channel's pages 4 KB apart (rows start 4 KB + 256 B apart, so that they spread over the DRAM channels) and visited in
+turn. The reference columns are Strix Halo with 2 MB pages (no translations, so they show the DMA's raw rate for each
+pattern) and with 4 KB pages (transparent huge pages `never`).
 
-A line before the table names the pages of the rows' buffers and whether the NPU reaches them at their host addresses
-(Linux: the IOMMU walks the process's page tables, so their pages are its translations) or at addresses of their own (a
-mapping the driver or the OS builds, which chooses the page size). On Windows they have 4 KB pages; with
-`ARTLITE_LARGE_PAGES=1` 2 MB pages where the account holds the "Lock pages in memory" right (secpol.msc, User Rights
-Assignment; effective from the next sign-in).
+A line before the table names the page size of the rows' buffers and whether the NPU reaches them at their host
+addresses or at separate device addresses. On Linux, the IOMMU walks the process's page tables, so the process's pages
+are the NPU's translations; otherwise the driver or the OS builds a mapping and chooses the page size. On Windows the
+buffers have 4 KB pages, or 2 MB pages with `ARTLITE_LARGE_PAGES=1` when the account holds the "Lock pages in memory"
+right (secpol.msc, User Rights Assignment; effective from the next sign-in).
 
 | rows | what they tell | Strix Halo, 4 KB pages |
 |---|---|---|
@@ -114,8 +115,8 @@ load). It measures:
   write, a small DMA task and its wait), a dispatch, NOP dispatches back to back; the array clock under load, also
   with a busy CPU;
 - Llama 3.2 1B Q4_K_M's 1024-token prompt in variants, two rounds: host buffers of 2 MB or 4 KB pages, the prefill's
-  output rows in whole 64-byte lines or not, and with one CPU kept busy; for the first two the chunk's time per
-  operator kind (each kind looped alone after an idle pause, with its own telemetry: which kinds the platform
+  output rows in whole 64-byte lines or not, and with one CPU kept busy; for the first two the chunk's time per operator
+  kind (each kind looped alone after an idle pause, with separate telemetry that shows which kinds the platform
   throttles) and a design switch's cost; the largest dense GEMM at each pace level (below), the calibration of the
   paces, and the prompt at the calibrated paces; the host's embedding lookups; the huge pages the process got;
 - the power path: the supplies online (a USB-C source's PD contract), the battery's state and charge thresholds,
@@ -136,10 +137,10 @@ lowest clocks (the CPUs at ~500 MHz). `gpu_metrics` counts the time it is held (
 `artlite-bench` and `artlite-probe` warn when it was held for 5% or more of a measurement, and the diagnosis
 reports its share of the prompts, of each operator kind run alone and of each pace level.
 
-Measured on a Krackan Point laptop (Lenovo Yoga Slim 7 14AKP10; through a USB-C dock, on its own adapter and on
-battery alike): held for 84-86% of every 1024-token prompt at SoC temperatures of 45-58 °C, never under 32 cores of
-MMULs alone, the DMA rows alone or a 46 W CPU load; its Q4_K GEMMs ran 2.2-2.5x slower than on Strix Halo, its other
-operator kinds at Strix Halo's speed. Each Q4_K GEMM sets it off within about a millisecond and it lets go a few
+Measured on a Krackan Point laptop (Lenovo Yoga Slim 7 14AKP10), alike through a USB-C dock, on the laptop's own adapter
+and on battery: PROCHOT was held for 84-86% of every 1024-token prompt at SoC temperatures of 45-58 °C, never under 32
+cores of MMULs alone, the DMA rows alone or a 46 W CPU load; its Q4_K GEMMs ran 2.2-2.5x slower than on Strix Halo, its
+other operator kinds at Strix Halo's speed. Each Q4_K GEMM sets it off within about a millisecond and it lets go a few
 milliseconds after, so pauses between dispatches do not avoid it. Ryzen Master's "Disable PROCHOT" and the SMU's
 overclocking commands exist only for overclockable processors.
 

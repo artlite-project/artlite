@@ -258,8 +258,8 @@ def test_stats(head: tuple) -> None:
 
 
 def test_screened_counts_file_formats() -> None:
-    """A head is screened in a file of up to FILE_FORMATS tile formats, its own type counting (not its plane's): a Q4_K_M
-    file's Q4_K, Q5_K, Q6_K (Qwen3.6-35B-A3B) keeps its Q6_K head screened; a fourth format does not."""
+    """A head is screened in a file of up to FILE_FORMATS tile formats, counting the head's type (not its plane's): a
+    Q4_K_M file's Q4_K, Q5_K, Q6_K (Qwen3.6-35B-A3B) keeps its Q6_K head screened; a fourth format does not."""
     assert SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q6_K"})
     assert not SC.screened("Q6_K", {"Q4_K", "Q5_K", "Q8_0"})
     assert SC.screened("F16", {"P4_128"}) and not SC.screened("Q8_0", {"Q4_K"})
@@ -269,8 +269,8 @@ def test_screened_counts_file_formats() -> None:
 def test_inkling_head() -> None:
     """Inkling's Q8_0 head (its vocabulary's 200058 rows; the Q8_0H plane 53% of the bytes) on llama.cpp's head inputs
     (``result_norm``) of 512 essay tokens: the estimates of the 1000 largest logits of every token within their bounds (over 5120 tokens:
-    4.0 of the 6 sigma), each token's 20 largest logits the exact ones, the argmax llama.cpp's where its own (fp16)
-    logits' best two are apart."""
+    4.0 of the 6 sigma), each token's 20 largest logits the exact ones, and the argmax matches llama.cpp's wherever
+    llama.cpp's two best (fp16) logits are not near-tied."""
     import torch
 
     from artlite.gguf_model import GGUFFile

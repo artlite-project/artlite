@@ -100,7 +100,7 @@ __attribute__((noinline)) void {{ p }}_q6k(uint8_t *__restrict a, const uint8_t 
     for (int u = 0; u < 2; u++) {
         const int sb = 2 * HI + u;
 {% if rg %}
-        float *__restrict yu = y + u * ys;  // (row groups: each super-block's rows of their own)
+        float *__restrict yu = y + u * ys;  // (row groups: each super-block's rows are separate output rows)
 {% endif %}
         {{ p }}_q6k_tr(a + {{ q6_codes }} + {{ 2 * 3 * 32 * R6 }} * sb, scr);
         {{ p }}_q6k_tab(a, tab, sb);

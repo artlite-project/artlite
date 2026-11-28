@@ -79,7 +79,7 @@ is `single`: its q / k norm weights stay below 2.5, and at 32K `single` costs a 
 a third less of the cache.
 
 Generation runs in steps of up to 4 tokens (Qwen3.8 27B: 8): the next token and draft tokens after it, which a step checks at a
-fraction of the cost of their own steps (the weights stream once). The drafts come from the prompt where the text so
+fraction of what separate steps would cost (the weights stream once). The drafts come from the prompt where the text so
 far repeats a part of it (prompt lookup: an edit's old text, a file rewritten, a list of names again), or from a
 model's drafter (multi-token prediction: Gemma 4's `mtp-` file, Qwen3.8 27B's DFlash2 file, else its own MTP layer,
 Flint's DFlash2 file, Qwen3.6 35B-A3B's and Occamy's `mtp` files); each step takes the ones that pay at the model's measured step times, none where

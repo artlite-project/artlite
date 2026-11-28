@@ -1,7 +1,7 @@
 """The drafters' bookkeeping of a qwen35 model on the NPU (``qwen.NpuQwen``): what each drafter has seen of the model's
 sequence and what it still owes the model's steps.
 
-``MtpDrafting``: the multi-token-prediction drafter (``draft.QwenDraft``) runs a step of its own per draft. Its row at position
+``MtpDrafting``: the multi-token-prediction drafter (``draft.QwenDraft``) runs a separate step per draft. Its row at position
 q takes token q and the model's output-normed hidden state of q - 1, writes its cache record at q and guesses token q + 1.
 Its records follow the model's positions: a prompt chunk writes its rows' (``QwenPrefill(draft=)``); after the model's steps
 their rows wait in ``pend`` (records from ``dpos`` on, at most SLOTS - 1 of them) until a drafter step runs them with the next
@@ -43,7 +43,7 @@ class MtpDrafting:
         self.dpos = 0
         self.h = np.zeros(self.model.cfg.hidden_size, np.float32)  # (zeros before position 0)
         self.carry_at = 0  # (the position after the last chunk: the prefill's carry is its)
-        self.carry: np.ndarray | None = None  # (that carry: another lane's chunk leaves the prefill its own)
+        self.carry: np.ndarray | None = None  # (a copy of that carry: another lane's chunk leaves its own in the prefill)
         self.ran = True  # (the last round's drafter step ran: ``draft``)
 
     def state(self) -> dict[str, object]:

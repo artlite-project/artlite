@@ -1,7 +1,7 @@
-"""Decode GEMV on the MMUL for several token slots (the decode overlays' main and helper cores, ``decode.design``):
-the tiles of the weight image (``formats``) against bfp16 panels of up to 4 slots' x, with exact integer weight panels
-(BFP16 tiles: their own panels). Two cores share a tile: the super-block split (every format's tiles of 1024
-columns: one core takes super-blocks 0, 1 (``{p}_mmv<0>``), the other 2, 3 (``{p}_mmv<1>``)) or the row split
+"""Decode GEMV on the MMUL for several token slots (the decode overlays' main and helper cores, ``decode.design``): the
+tiles of the weight image (``formats``) against bfp16 panels of up to 4 slots' x, with exact integer weight panels
+(BFP16 tiles: the tiles serve as their own panels). Two cores share a tile: the super-block split (every format's tiles
+of 1024 columns: one core takes super-blocks 0, 1 (``{p}_mmv<0>``), the other 2, 3 (``{p}_mmv<1>``)) or the row split
 (Gemma's 512-column Q4_0 / Q8_0 tiles: each core its half of the rows of every super-block, ``row_split``). A paged
 format's kernels (``render(paged=)``) are code pages (``paging``, the memtile transport): a core loads the format's
 page for its half before a tile of it unless the page is in, and calls the page's entry (``{p}_pgf<H>_<format>``).
@@ -143,11 +143,12 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     B_G4 tiles of the
     ``RG_FORMATS`` (row groups of 4, an MoE's expert downs: ``decode.image.Block.G``) put super-block 2 H + 1's rows
     ``yb`` floats after 2 H's instead of adding them; ``rg_all``: and those of ``RG_ALL`` (a design whose every format's
-    tiles may be row groups: the tail tiles of ``decode.image.Region.qt`` regions), and B_G8 tiles of ``G8_FORMATS`` (row
-    groups of half super-blocks: each super-block's halves rows of their own, ``yb`` apart: ys -yb). ``slots``: the design's token slots
-    (module docstring). ``tab``: the gather tables' two copies per core half (default ``formats.TAB``). ``compact``:
-    formats whose kernels trade cycles for program memory (a design's code pages of little room: their loops of the
-    fewest cycles a byte unpipelined; Q5_K: 608 B less, ~20% more cycles a half tile)."""
+    tiles may be row groups: the tail tiles of ``decode.image.Region.qt`` regions), and B_G8 tiles of ``G8_FORMATS``
+    (row groups of half super-blocks: each super-block's halves are separate rows, ``yb`` apart: ys -yb). ``slots``: the
+    design's token slots (module docstring). ``tab``: the gather tables' two copies per core half (default
+    ``formats.TAB``). ``compact``: formats whose kernels trade cycles for program memory (a design's code pages of
+    little room: their loops of the fewest cycles a byte unpipelined; Q5_K: 608 B less, ~20% more cycles a half
+    tile)."""
     assert all(supported(f, nsb, slots) for f in fmts), (fmts, nsb, slots)
     assert all(f in fmts and not row_split(f, nsb) for f in paged) and (pg is not None or not paged), (paged, fmts)
     pages = pages or tuple((f,) for f in paged)
@@ -167,7 +168,7 @@ def render(p: str, fmts: list[str], *, tile_bytes: int = 9280, nsb: int = 4, pag
     # (keep: every format paged, the inline tables of kernel_lib its pages read kept by resident code, or a screened
     # head's pages: with Q6_KH every format but the largest pages whatever their number (``decode.model.paged_formats``),
     # and a page may read a table that the resident format's kernels do not (Q4_1's al::neg_eye next to Q4_0);
-    # keep_nz: a paged format reads the -z e_i panels and no resident one does: a page writes no data of its own)
+    # keep_nz: a paged format reads the -z e_i panels and no resident one does: a page writes no data itself)
     nz = [f for f in fmts if f in NZ_FORMATS]
     return _TEMPLATE.render(p=p, fmts=sorted(fmts), paged=list(paged), pages=[list(g) for g in pages], pg=pg,
                             shared=any(len(g) > 1 for g in pages), pager=pager, parts=parts,

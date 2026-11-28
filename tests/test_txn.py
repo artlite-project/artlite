@@ -262,8 +262,9 @@ def _hang(idx: int) -> _native.DispatchError:
 
 
 def test_dispatch_notes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failure of the main transaction is noted as its own; of the prologue's dispatch (the code pages) as the
-    prologue's only; the firmware's sentinel as no operation index; a note that cannot be made adds a plain one."""
+    """A failure of the main transaction is noted as the main transaction's; a failure of the prologue's dispatch (the
+    code pages) as the prologue's only; the firmware's sentinel as no operation index; a note that cannot be made adds a
+    plain one."""
     class Kernel:
         def __init__(self, fail: dict[int, int]):
             self.fail, self.runs = fail, []

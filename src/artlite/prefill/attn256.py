@@ -31,12 +31,12 @@ the MMUL (Q hi + lo against K, two products: one loop over a pair of records' pa
 row's maximum is raised, rescaling o and l, only when the group's exceeds it by 2^16: the per-dimension norm weights
 leave scores unbounded), P = 2^(s - m) by the vexp2 exp2 (vexp2 builds an exact 2^n; 0.59 ULP) as bfp16 panels (hi + lo
 with ``pp`` 2: the readout models'), o += P V; at the pass's end o / l sigmoid(gate) as the attn_out GEMM's bfp16 A
-panels. Within 0.7% of the exact attention of its own operands (hi + lo P: its output's own rounding, against 1.5-3x of
-it), ~1% rms of llama.cpp's attn_gated.
+panels. Within 0.7% of the exact attention on the same operands (with hi + lo P the error equals the output's own rounding,
+vs. 1.5-3x of it with single P), ~1% rms of llama.cpp's attn_gated.
 
-Two streams: a row panel's o in a 16 KB region of its own (P V loads and stores each o in place: in one region they
+Two streams: a row panel's o in a dedicated 16 KB region (P V loads and stores each o in place: in one region they
 conflicted, 532 cycles per group against 305 scheduled), the softmax in two passes over both row panels' 512 scores
-(pass 1's P and f in a buffer of their own), and the row sums l on the MMUL: P V adds P E^T (E a panel of 1 / 8), the
+(pass 1's P and f in a separate buffer), and the row sums l on the MMUL: P V adds P E^T (E a panel of 1 / 8), the
 sum of the bfp16 P that o takes.
 
 Time (T = 512, per layer alone, at p0 = 0 / 4K / 16K): the 27B 1.38 / 6.89 / 22.1 ms (its compute compiled out at
@@ -442,14 +442,14 @@ class PrefillAttnOperator(ArtcOperator):
     (each KV head's column: shim -> memtile -> shim, its free channels; the ring's two pieces ``QA_HA`` ..), last the
     chunk's groups from S into the ring (``QA_CA`` ..): a runtime sequence reads at most 32 parameters, so the
     passes' windows (a ring's pieces per pass) read S at static offsets. Every pass streams NW = WG + QG groups ending at
-    its last (the window of its first query and its own); the keys before each row's window masked (in the group WG
+    its last (its first query's window plus its own groups); the keys before each row's window masked (in the group WG
     before its diagonal one the complement of the causal triangle, before it whole) and the groups before position 0
     (junk from the ring's end) whole.
 
     Packed (``pack``: several inputs, segments, in a chunk): each row sees the history (the positions before p0: a
     prefix every segment continues; causal only) and its segment's keys from its first up to itself (causal) or to its
-    last (non-causal, at position 0), the others masked (-16384: P 0 against any of its own; a row's groups before its
-    segment, all masked, rescaled to 0 by its first own one); the SEG argument (``seg``) per pass, an object after the Q
+    last (non-causal, at position 0), the others masked (-16384 gives P 0 vs. any of the row's own scores; a row's groups before
+    its segment are fully masked and rescaled to 0 by the segment's first group); the SEG argument (``seg``) per pass, an object after the Q
     slots (two streams: a pair), holds the rows' first and last keys and the history's groups."""
 
     STACK = 3072
@@ -495,7 +495,7 @@ class PrefillAttnOperator(ArtcOperator):
         R = self.R
         pk = [("lh", 96 * self.qg), ("lv", 256 * self.qg), ("jl", 128)] if self.pack else []
         if self.two:  # (regions 2 and 3, ``l1_layout``: o of row panel 0, the Q slots, the scores ..., o of row panel 1
-            # in the last 8 KB: PV loads and stores each panel's o in a region of its own)
+            # in the last 8 KB: PV loads and stores each panel's o in a separate region)
             w = regions([("o", 8192), ("q", R * SLOT), ("sc", R * 1024), ("m", R * 256), ("b", R * 256),
                          ("l", R * 256), *pk])
             assert R == 2 and w["size"] <= 3 * REGION // 2, w

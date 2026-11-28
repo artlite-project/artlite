@@ -264,9 +264,9 @@ __attribute__((noinline)) void {{ p }}_kopen(uint8_t *rec, int32_t *__restrict w
     }
 }
 
-// Records r, r + 1 from the first open one on: the scores of each row's positions past its own -16384 (P 0: the host's masks,
-// A_MK), of a record past the step's all of them, but for a record that keeps the scores of the first group's open one
-// (``aobj``)
+// Records r, r + 1 from the first open one on: each row's scores at positions past the row's own position become -16384
+// (P 0: the host's masks, A_MK), of a record past the step's all of them, but for a record that keeps the scores of the
+// first group's open one (``aobj``)
 __attribute__((noinline, minsize)) void {{ p }}_kmask(int32_t *__restrict ws, int r)
 {
     const int32_t *__restrict st = AW(int32_t, {{ a.st }});

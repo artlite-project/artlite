@@ -1,6 +1,6 @@
 """LFM3-Audio-2B with a clip on the NPU (models.lfm with LFM3-Audio's mmproj: a ``Sequence`` prompt): the ASR prompt of
 a LibriSpeech clip, teacher-forced over its transcript, against llama.cpp's own encoder and language model on the CPU
-(``ref.golden``). With llama.cpp's embeddings the clip's rows are tested on their own, as decode steps; the app's path
+(``ref.golden``). With llama.cpp's embeddings the clip's rows are tested alone, as decode steps; the app's path
 (``Lfm(mmproj=)``) adds the NPU encoder and the prefill; its greedy transcript is the reference's."""
 
 import numpy as np

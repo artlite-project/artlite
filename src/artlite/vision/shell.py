@@ -163,7 +163,7 @@ class MediaEncoder(ABC):
         """The built state to cache (``accept``'s and ``build``'s)."""
 
     def load(self) -> VisionDevice:
-        """The networks on a device of their own (``shared_device``)."""
+        """The networks on a separate device (``shared_device``)."""
         return shared_device(self.KIND, self.path, {"net": self})
 
 

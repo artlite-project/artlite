@@ -47,7 +47,7 @@ __attribute__((noinline)) void {{ p }}_q40(uint8_t *__restrict a, const uint8_t 
     {{ p }}_dtab<2, 2>((const bfloat16 *)a + 16 * H, tab);
     {{ p }}_q40_mm<2, 1024>(xp, xs + {{ XS_SLOT }} * H, scr, c);
     AIE_LOOP_NO_UNROLL
-    for (int u = 0; u < 2; u++)  // (rg: super-block 2 H + 1's rows into y + ys, rows of their own)
+    for (int u = 0; u < 2; u++)  // (rg: super-block 2 H + 1's rows are separate output rows at y + ys)
         {{ p }}_sc1<2>(c + {{ 16 * L }} * u, tab + 128 * u, y{{ " + u * ys" if rg else "" }});
 }
 {% endif %}

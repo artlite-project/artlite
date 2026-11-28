@@ -46,7 +46,7 @@ tokens writes them instead; a prefill chunk's projection is a GEMM at its start)
   model's own choice at its position is that draft. Where the prompt promises more (a reply that copies
   it), or without the drafter, the drafts are the prompt's (`models/drafts.py`).
 - Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches, and a dispatch's 4
-  slots are tokens of the requests that generate, each in its own cache (`models/lanes.py`); the slots they leave
+  slots are tokens of the requests that generate, each with a separate cache (`models/lanes.py`); the slots they leave
   free take drafts, the drafter guessing for one request at a time on that request's caches. 4 requests: 57
   tokens per second in all, where one gets 32 with the drafter and 18 without
   ([artlite-server](../server.md#several-requests-at-a-time)).

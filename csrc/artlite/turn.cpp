@@ -127,7 +127,7 @@ struct State {
   int64_t slot = kSlots;  // (its byte kSlot0 + slot; kSlots: none free)
 
   // The lock file of this process: opened at the first call, and again in a forked child (which would share the
-  // parent's locks), with a holder id and a slot of its own.
+  // parent's locks), with a holder id and a dedicated slot.
   void own() {
     const long p = process_id();
     if (p == pid) return;

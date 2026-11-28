@@ -83,7 +83,7 @@ P_HEAD = 4096  # P: ssm_norm (fp32) first
 
 
 def ab_f32(layout: Layout) -> bool:
-    """gdn_in's alpha as fp32 (an F32 ``ssm_alpha``: its own block of plane pairs, ``prefill.gemm``), else bf16."""
+    """gdn_in's alpha as fp32 (an F32 ``ssm_alpha`` gets a separate block of plane pairs, ``prefill.gemm``), else bf16."""
     return "alpha" in layout.off
 
 

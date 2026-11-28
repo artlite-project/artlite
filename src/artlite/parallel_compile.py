@@ -179,7 +179,7 @@ class BuildQueue:
         self.failed = 0
 
     def submit(self, spec: BuildSpec) -> None:
-        """(a spec this process does not build as rendered is left to its own: ``buildable``)"""
+        """(a spec this process does not build as rendered is left to the process that rendered it: ``buildable``)"""
         if not buildable(spec):
             return
         with self._lock:
@@ -304,7 +304,7 @@ class Precompiler:
         self._accepter.start()
 
     def _accept(self) -> None:
-        """A reader per planning process that connects, until ``_stop`` (its own connection ends the wait)."""
+        """A reader per planning process that connects, until ``_stop`` (which connects once to end the wait)."""
         while True:
             try:
                 conn = self._listener.accept()
@@ -329,8 +329,8 @@ class Precompiler:
                 self.queue.submit(spec)
 
     def _stop(self) -> None:
-        """No more connections (one of its own ends the listener's wait); wait for the readers (their processes
-        ended)."""
+        """Stop accepting connections (this method connects once to end the listener's wait), then wait for the readers
+        (their processes have ended)."""
         if self._stopping:
             return
         self._stopping = True

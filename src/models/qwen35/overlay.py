@@ -42,9 +42,9 @@ region-major one per phase and K group (the norm-weight objects from NORM).
 
 Several sequences (``sequences``; a dense model on the design of 8 slots, which a model of several takes wherever
 its formats run on one: the 9B's too): each has its KV caches and its GDN layers'
-objects, states and conv states in buffers of its own (``SEQ``; ``ModelOverlay.select``), its lazy commit's cursor and
-its ``rope``. A step's slots may be several sequences' (``decode.step.Part``), with no kernel of its own: each attention
-runs a pass per sequence (``decode.attn256_steps``' "Several sequences") and each GDN layer a chain per sequence
+objects, states and conv states in separate buffers (``SEQ``; ``ModelOverlay.select``), its lazy commit's cursor and
+its ``rope``. A step's slots may belong to several sequences (``decode.step.Part``) without a dedicated kernel: each
+attention runs a pass per sequence (``decode.attn256_steps``' "Several sequences") and each GDN layer a chain per sequence
 (``gdn_steps``' "Several sequences": its words in its header object, its rows drained into its objects, its outputs
 into its slots of gdn_out's staged x; a PARO checkpoint's: rot_g's, and the attention's passes write rot_o's), and every
 slot's numbers are those of a step of its sequence alone.
@@ -158,12 +158,13 @@ class QwenOverlay(ParoSteps, ModelOverlay):
 
     CONFIG, IMAGE = QwenConfig, QwenImage
     NORMED = frozenset(NORMS)
-    # a design of 4 slots patches the next step's position while a step runs (``ModelOverlay.AHEAD``: the attention layers'
-    # words, angles and transfers, 0.37 ms of the 35B-A3B's 36 ms step that the NPU otherwise waits for): each transaction
-    # buffer reads F_ATT objects of its own (``fatt2``), the second buffer's transactions are copies of the first's, made
-    # at their first use (``_transaction``). Not after a step that ``patch_ahead`` patched (a drafter's round: the next
-    # step is the next round's, of other slots); a drafter's own steps (``draft``) follow none of their own; a design of
-    # 8 slots writes its steps' branch words between them.
+    # A design of 4 slots patches the next step's position while a step runs (``ModelOverlay.AHEAD``: the attention
+    # layers' words, angles and transfers, which take 0.37 ms of the 35B-A3B's 36 ms step that the NPU would otherwise
+    # wait for). Each transaction buffer reads a separate set of F_ATT objects (``fatt2``), and the second buffer's
+    # transactions are copies of the first's, made at their first use (``_transaction``). Nothing is patched ahead after
+    # a step that ``patch_ahead`` patched (a drafter's round, whose next step belongs to the next round and uses other
+    # slots), and the drafter's own steps (``draft``) patch no step ahead. A design of 8 slots writes its steps' branch
+    # words between steps.
     STEPS_AHEAD = True
     AHEAD_PREPARED = False
     KV_PAD = KV_PAD  # (``decode.dflash.overlay.DFlashTarget``)
@@ -174,7 +175,7 @@ class QwenOverlay(ParoSteps, ModelOverlay):
                  image: QwenImage | None = None, slots: int | None = None, gu: frozenset[int] = frozenset(),
                  drafts: bool | None = None, sequences: int = 1, taps: tuple[int, ...] = ()):
         """slots: a step's token slots at most (default ``slots_of``, ``drafts``: whether a drafter's steps of several
-        tokens run, default: the file has an MTP layer of its own); taps: a DFlash2 drafter's (a PARO checkpoint's: the
+        tokens run, default: whether the file has its own MTP layer); taps: a DFlash2 drafter's (a PARO checkpoint's: the
         layers whose input goes out as a plain copy too, ``paro_steps``; the image's ``taps``)."""
         super().__init__(gguf, layers=layers, vocab=vocab, weights=weights, image=image, sequences=sequences)
         cfg, img = self.cfg, self.image
@@ -185,7 +186,7 @@ class QwenOverlay(ParoSteps, ModelOverlay):
             raise ValueError("a PARO checkpoint: a design of 4 slots (a dense model's: 8)")
         fmts = img.formats() | set(formats)
         gu_rows = img.gu_rows() | gu  # (``decode.design``'s gate / up windows: tiles of gate / up phases of other rows; a
-        # PARO checkpoint has none, its gate and up phases of their own)
+        # PARO checkpoint has none, since its gate and up run as separate phases)
         gu_win = bool(gu_rows) and gu_rows != {16} or img.split
         # (several sequences: the design of 8 slots where the file's formats run on one)
         # (a PARO checkpoint: as a model with drafts, its design of 8 slots no slower at S 1: the 27B int5's 3.52 tok/s
@@ -712,7 +713,7 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         if self.ash is not None:
             rope = np.concatenate([self._ropes[q.seq][q.position:q.position + q.n] for q in parts])
             self.attn_steps.set_parts(st, parts, np.concatenate(attn.rope_cs(self.cfg, rope), 1))
-        self._branch = None  # (the F_ATT objects' step words are the passes': ``_set_branch`` writes its own again)
+        self._branch = None  # (the F_ATT objects' step words are the passes': ``_set_branch`` rewrites the branch's)
         return True
 
     @property
@@ -771,8 +772,8 @@ class QwenOverlay(ParoSteps, ModelOverlay):
         ``commit``, which then only says that all S are accepted: ``gdn``'s "Chunkwise"). ``branch`` (parent, L) (``can_branch``, a step of 8): its last L slots follow slot parent instead of slot 7 - L,
         at position + parent + 1 .. inside the 8 positions of slot parent's (position % 8 + parent + L <= 7: its attention
         records and GDN block; a tree of two branches: ``_set_branch``); None: a chain. Several sequences' slots:
-        ``position`` their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next
-        positions; no state is committed: each sequence's accepted tokens through ``accept(n, seq)``). Returns the
+        ``position`` their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's rows at that
+        sequence's next positions; no state is committed: each sequence's accepted tokens through ``accept(n, seq)``). Returns the
         slots' logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without ``logits``
         None."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)

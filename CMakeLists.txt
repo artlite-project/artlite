@@ -77,7 +77,7 @@ find_package(nanobind CONFIG REQUIRED)
 
 # The hash of the modules' sources (_native.source_hash(): backend.stale_native compares it with the checkout's, a
 # module built before a git pull): SHA-256 of "<path> <SHA-256>\n" per file, sorted. The files are configure
-# dependencies (an edit re-runs this at the next build); the hash is a translation unit of its own (only it recompiles).
+# dependencies (an edit re-runs this at the next build); the hash is a separate translation unit (only it recompiles).
 file(GLOB_RECURSE ARTLITE_SOURCES RELATIVE "${CMAKE_SOURCE_DIR}" CONFIGURE_DEPENDS
      csrc/*.cpp csrc/*.h csrc/*.hpp csrc/CMakeLists.txt)
 list(APPEND ARTLITE_SOURCES CMakeLists.txt)

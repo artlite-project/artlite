@@ -100,7 +100,7 @@ def test_checkpoint_linears(case: str) -> None:
 
 def test_experts() -> None:
     """An MoE layer's PARO experts stacked (``ParoExperts``: rows E N, the shared rotation): each expert's rows and
-    blocks those of its own linear, with the stack's channel order."""
+    blocks match those of its standalone linear, with the stack's channel order."""
     require(checkpoint("qwen3.6-35B-A3B-paro"))
     hf = HfModel(checkpoint("qwen3.6-35B-A3B-paro"))
     for n, proj, rot in (("blk.3.ffn_up_exps.weight", "up_proj", "gate_up"), ("blk.3.ffn_down_exps.weight", "down_proj",

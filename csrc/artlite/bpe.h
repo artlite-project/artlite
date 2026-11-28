@@ -1,6 +1,7 @@
-// Byte-level BPE (GPT-2's) where gigatoken has no scanner for a vocabulary's pre-tokenizer (it always splits with one of
-// its own): the pieces llama.cpp's regexes leave (src/llama-vocab.cpp, src/unicode.cpp's unicode_regex_split: each
-// regex splits the previous one's pieces into its matches and the gaps between them), then the merges of each piece
+// Byte-level BPE (GPT-2's) where gigatoken has no scanner for a vocabulary's pre-tokenizer (gigatoken always splits
+// with one of its built-in scanners): the pieces llama.cpp's regexes leave (src/llama-vocab.cpp, src/unicode.cpp's
+// unicode_regex_split: each regex splits the previous one's pieces into its matches and the gaps between them), then
+// the merges of each piece
 // (llm_tokenizer_bpe_session: the lowest rank first, the leftmost of equal ranks).
 #pragma once
 

@@ -844,8 +844,8 @@ class _Qwen35Moe(_Qwen35):
 
 class _Gemma4(_Adapter):
     """Gemma4ForConditionalGeneration (Gemma3Model, Gemma4Model; its text model: the towers are not read here): the
-    per-layer inputs, KV-shared layers (a PARO checkpoint has no K / V projections there), sliding-window layers of
-    their own head dim and RoPE base, the double-wide MLP of the KV-shared layers, the full layers' proportional RoPE as
+    per-layer inputs, KV-shared layers (a PARO checkpoint has no K / V projections there), sliding-window layers with
+    a separate head dim and RoPE base, the double-wide MLP of the KV-shared layers, the full layers' proportional RoPE as
     ``rope_freqs`` (1e30 past the rotated pairs); norms as stored (no offset); the vocabulary of gguf-py's LlamaHfVocab
     (byte-fallback BPE: tokenizer.json's tokens, scored -1000, special ones CONTROL but those the chat parser reads,
     byte tokens BYTE)."""

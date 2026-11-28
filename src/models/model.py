@@ -37,7 +37,7 @@ def check_tower(mmproj: str, config: Any, supported: tuple[str, ...], *, what: s
 class Blocks:
     """A turn the model writes as blocks (Inkling's; ``Model.blocks``): each ``header``, a kind, its text, ``end``.
     The kinds: ``thought`` (a thought), ``text`` (the answer's text), any other (a tool call's: ``header`` NAME
-    ``call`` JSON ``end``); the template opens no block for the reply, the model writes its own. The markers are control
+    ``call`` JSON ``end``); the template opens no block for the reply, so the model writes it. The markers are control
     tokens that the generation's text keeps (llama.cpp's preserved tokens: ``tokens``)."""
 
     header: str
@@ -88,7 +88,7 @@ class Model:
     generates = True  # False: a readout model's file (``readouts.readout_model``): no LM head on the NPU, no text
     parallel = False  # ``load`` takes ``sequences``: the NPU holds several sequences, a lane each (``NpuModel.lanes``)
     transcript_tokens = (64, 8)  # a transcription's tokens at most by default: this many, and these per second of audio
-    media: tuple[str, ...] = ()  # what the file takes with no mmproj (a tower of its own: "audio"), for a server's listing
+    media: tuple[str, ...] = ()  # what the file takes with no mmproj (a built-in tower: "audio"), for a server's listing
     gguf: GGUFFile  # the model file
     cfg: Any  # its configuration (``artlite.model_config``)
     tokenizer: Tokenizer

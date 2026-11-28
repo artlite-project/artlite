@@ -243,7 +243,7 @@ def _llama(path: str, kv_k: str) -> Callable[[Callable[[object], _Log]], None]:
 
 def _run_sequences(ov: object, log: _Log, step: Callable[..., object]) -> None:
     """Three sequences on the device: alternated steps (``select``), then joint steps (parts of 1 .. 2 slots at
-    positions of their own, every split of the slots), one starting over in between; ``step(x, position, logits)``."""
+    separate positions, every split of the slots), one starting over in between; ``step(x, position, logits)``."""
     from artlite.decode.step import Part
 
     rng = np.random.default_rng(0)

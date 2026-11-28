@@ -102,7 +102,7 @@ def test_prefill_paro(case: str) -> None:
     decode steps continuing from the state the prefill left, against llama.cpp and against the overlay running every
     position as a decode step. Qwen3.8-27B-PARO-int5: its P5_128 gate and up as rows (``prefill.gemm.plan_gate_up_rows``,
     down's rotation in ``rows`` mode), against llama.cpp on its first layers (F16); Qwen3.8-27B-PARO (int4): its P4_128
-    gate and up in GEMMs of their own at both sub-chunk sizes (both copies' A strip of 2 x 5120 columns stays in the
+    gate and up in separate GEMMs at both sub-chunk sizes (both copies' A strip of 2 x 5120 columns stays in the
     memtile at 128 tokens, not at 256: ``plan_gate_up_pair``'s ``dual_T``); Qwen3.6-35B-A3B-PARO: its MoE layers
     (``moe.prefill``'s PARO path: the experts' h rotated in their slots, ``moe.slot_rot``). (Measured: 0.8B prefill mean
     1.7%, max 12.3% (one token: its GDN gates' a / b rows, folded into gin_z's copy, through exp; 7.1% with the fold

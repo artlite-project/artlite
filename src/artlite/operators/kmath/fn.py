@@ -2,7 +2,7 @@
 
 The templates are files of this package (``<module>.<part>.cc.jinja``), rendered once by ``make`` with the function's
 ``name`` and ``attr`` as ordinary variables beside the contract's. ``kmath`` is the ``km`` global of ``JINJA_ENV``
-(``templating``), so this package loads its files with an environment of its own (``JINJA_ENV``'s options) and never
+(``templating``), so this package loads its files with a separate environment (``JINJA_ENV``'s options) and never
 imports ``templating``.
 """
 
@@ -57,7 +57,7 @@ def make(local: str, template: str, *, variables: dict[str, object], inline: boo
          minsize: bool = False, **meta: object) -> Fn:
     """An Fn named ``km_<local>`` from the package's template file ``template``, rendered with ``variables`` and its
     ``name`` and ``attr`` (inlined, or one out-of-line copy per core; ``minsize``: compiled for size, as the loops of a
-    ``minsize`` caller are: an inlined callee's loops are optimized before the inlining, by its own attributes);
+    ``minsize`` caller are: an inlined callee's loops are optimized with the callee's attributes before inlining);
     ``deps``: the functions it calls."""
     name = f"{KM}_{local}"
     attr = "[[clang::always_inline]] inline" if inline else "__attribute__((noinline))"

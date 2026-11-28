@@ -41,10 +41,10 @@ objects (A: the ring slots of the sub-step's open records, or after a prefill th
 the record drains of column 2 h + 1 (D: address, length) and a conv pass's region fills and history drains (address:
 its sequence's). A column's weights between two operator steps are one run of the (column-major) image: one A task.
 
-Several sequences (``sequences``: each one's caches, rings and conv regions in a KV buffer of its own,
-``ModelOverlay.select``): a step's slots may be several sequences' (``decode.step.Part``): a sequence's slots are
-attention sub-steps and a conv pass of their own (``_join``). Every slot's logits are those of a step of one of its
-sequence, bit for bit.
+Several sequences (``sequences``: each one's caches, rings and conv regions in a separate KV buffer,
+``ModelOverlay.select``): a step's slots may belong to several sequences (``decode.step.Part``), and each sequence's
+slots run as separate attention sub-steps and a separate conv pass (``_join``). Every slot's logits are those of a step
+of one of its sequence, bit for bit.
 """
 
 import numpy as np
@@ -385,8 +385,8 @@ class LfmOverlay(AttentionOverlay):
 
     def _cshift(self, p: int, seq: int | None = None) -> int:
         """The conv shift of a step at p of sequence ``seq`` (None: the selected one): its last step's tokens before p (a
-        step continues from the last one's positions, at most its own back, as a generation loop's rejected drafts
-        do)."""
+        step continues from the last one's positions, going back at most as many positions as that step had, as a
+        generation loop's rejected drafts do)."""
         p0, s0 = self._convs[self.seq if seq is None else seq]
         sh = p - p0
         assert 0 <= sh <= s0 or (sh == 0 and s0 == 0), f"a step at {p} after the conv histories of a step at {p0} ({s0} slots)"
@@ -409,9 +409,9 @@ class LfmOverlay(AttentionOverlay):
     def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
         - 1 of the selected sequence (the positions before are cached), or of several sequences' slots: ``position``
-        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next positions).
-        Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without
-        ``logits`` None (only the caches and histories are updated)."""
+        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's rows at that sequence's next
+        positions). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or
+        without ``logits`` None (only the caches and histories are updated)."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS

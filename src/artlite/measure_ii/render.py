@@ -25,7 +25,7 @@ def _resources_text(loop: LoopReport) -> str:
 def _cost_text(report: KernelReport, loop: LoopReport, costs: CostModel) -> str:
     """Cycles per entry into the loop: P + iters*(iteration) + E; a branch loop: iters*(iteration).
 
-    An iteration: the II (a branch loop: its own bundles on all paths), its inner
+    An iteration: the II (for a branch loop, the bundles of all its paths), its inner
     loops and its calls (excluded when a callee's cost is unknown)."""
     tags = []
     terms, iteration = costs.terms(loop, calls=True)

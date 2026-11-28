@@ -1,4 +1,4 @@
-"""The ring variant's memory tiles (``AttnOperator(ring=)``): buffers and tasks of their own in place of the forwards of
+"""The ring variant's memory tiles (``AttnOperator(ring=)``): dedicated buffers and tasks that replace the forwards of
 streams A and B, written into the design's module after ``pin_l1_buffers``."""
 
 from typing import TYPE_CHECKING
@@ -33,7 +33,7 @@ def ring_groups(shape: Shape, window: int, qb: int) -> int:
 
 def ring_memtiles(attn: "AttnOperator", module: ir.Module) -> None:
     """The ring variant's memory tiles (``pin_l1_buffers``' split module): per column the forwards of streams A and B
-    replaced by buffers of their own (the held history and a ring of win + 1 groups after it, the pass's Q units
+    replaced by dedicated buffers (the held history and a ring of win + 1 groups after it, the pass's Q units
     and SEG) and tasks the runtime sequence starts once per dispatch (a runtime BD: three dimensions and its
     iteration). A writes the history, then each pass's group into slot b % R (a group's K records only: the fills
     leave out the padding); it sends the history and the whole ring every pass (the cores skip the slots outside

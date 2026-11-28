@@ -3,7 +3,7 @@ lane alone for everything else (``alone``), a failure for all of them (``DeviceF
 
 A model whose overlay holds N sequences (``artlite.decode.model.ModelOverlay(sequences=)``) has N lanes
 (``OverlayModel.lanes``: the model object and N - 1 shallow copies of it, each with its sequence, position, counters
-and planner), each driven by a thread of its own. A lane's generation round asks for its step here (``Rounds.join``)
+and planner), each driven by a separate thread. A lane's generation round asks for its step here (``Rounds.join``)
 instead of dispatching it: the requests of the lanes that generate become one step of several sequences' slots
 (``artlite.decode.step.Part``), so the weights stream once for all of them, and each lane gets its rows. A slot's
 numbers do not depend on what shares its step: which requests meet in a round changes times, never tokens.
@@ -41,7 +41,7 @@ round between a chunk's pieces (``lend``, ``waiting``: the chunk then runs in sh
 ``artlite.prefill.chunks.PEER_PIECE_S``) once the holder has had the device for as long as the round's step takes, so
 a prompt and the lanes that generate beside it take turns of about the same time.
 
-A round's own dispatches. A lane whose round starts with dispatches of its own on its sequence (a drafter's steps on
+A round's own dispatches. A lane whose round starts with dispatches that only its sequence needs (a drafter's steps on
 the caches) takes the device for them with ``before``: it goes ahead of the round that waits, and the round waits
 for the lane's request after them as after its rows, so the lanes that draft still meet in one step. Not while another
 lane has the device alone or waits for it (a prompt lends the device to a round's step only): the lane's round then

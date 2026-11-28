@@ -43,8 +43,9 @@ __attribute__((noinline)) void {{ p }}_cblock(int32_t *__restrict ws, const bflo
     {{ p }}_silu(yc + {{ 4 * D }}, tt, y + {{ 4 * D }}, st);
 }
 
-// A branching step's branch at its lanes (its conv windows: the 3 rows before it, then its own): the rows r3 (its first one's
-// 3 rows before) and rb (its own) into the scratch, ``cblock`` -> y (zb's other lanes as they are)
+// Convolves a branching step's branch at the branch's lanes, whose conv windows are the 3 rows before the branch followed
+// by the branch's rows: copies r3 (the 3 rows before the branch's first row) and rb (the branch's rows) into the scratch,
+// then runs ``cblock`` into y (zb's other lanes stay as they are)
 __attribute__((noinline, minsize)) void {{ p }}_bconv(int32_t *__restrict ws, const bfloat16 *__restrict r3, const bfloat16 *__restrict rb,
                                                     const bfloat16 *__restrict w, float *__restrict y)
 {
@@ -89,7 +90,8 @@ __attribute__((minsize)) void {{ p }}_gbegin(const bfloat16 *__restrict x, int32
         st[{{ G_TA }}] = 0x{{ "%x" % TAB[0] }};
         st[{{ G_TA + 1 }}] = 0x{{ "%x" % TAB[1] }};
         {{ p }}_ggates(pay + {{ H_AB // 4 }}, ws);
-        if (const int nb = st[{{ G_BN }}]) {  // (the branch chunk's gates at dn's lanes 16 ..: the chain's to its parent, its own)
+        // (the branch chunk's gates at dn's lanes 16 ..: the chain's up to the branch's parent, then the branch's)
+        if (const int nb = st[{{ G_BN }}]) {
             const int L = st[{{ G_BR }}] >> 8;
             float *__restrict dn = GW(float, {{ g.dn }});
             {{ p }}_cp4k(dn + 256, dn, nb - L);
@@ -159,9 +161,9 @@ void {{ p }}_gconv(const bfloat16 *__restrict x, int32_t *__restrict ws)
 }
 
 // A k head's K object (the step's k rows as [half 2][slot 8][64]): its block over the block's lanes from vh ([the 3 rows
-// before the block | its lanes' rows], the step's at lane t0), K's panels; a branching step's branch K's (the block's lanes to
-// its parent, the conv outputs in zb, then its own: the same panels of those lanes); past the block's end in the step, the
-// next block's lanes' K panels; then the helper's Gram blocks (``hgdn``)
+// before the block | its lanes' rows], the step's at lane t0), K's panels; for a branching step, the branch's K (the
+// block's lanes up to the branch's parent with their conv outputs in zb, then the branch's lanes, in the same panels);
+// past the block's end in the step, the next block's lanes' K panels; then the helper's Gram blocks (``hgdn``)
 void {{ p }}_gk(const bfloat16 *__restrict x, int32_t *__restrict ws)
 {
     int32_t *__restrict st = GW(int32_t, {{ g.st }});
@@ -195,7 +197,8 @@ void {{ p }}_gvr(const bfloat16 *__restrict x, int32_t *__restrict ws)
     {{ p }}_rows(ws, h + {{ D }} * (3 + t0), r);
     {{ p }}_cp4k(GW(bfloat16, {{ g.zr }}), r + {{ 8 * D }}, {{ 16 * D // 64 }});
     {{ p }}_cblock(ws, h, GW(bfloat16, {{ g.cw }}), e < 8 ? e : 8, 0, GW(float, {{ g.vt }}));
-    if (const int nb = st[{{ G_BN }}])  // (the branch's V: zb's chain lanes, its own at its lanes: SiLU into vb)
+    // (the branch's V: the chain lanes from zb, then the branch's rows at its lanes, SiLU into vb)
+    if (const int nb = st[{{ G_BN }}])
         {{ p }}_bconv(ws, h + {{ D }} * (nb - (st[{{ G_BR }}] >> 8)), h + {{ D }} * (3 + e), GW(bfloat16, {{ g.cw }}),
                       (float *)GW(uint8_t, {{ HS_OFF + HB_V }}));
     if (e > 8)  // (the next block's lanes)

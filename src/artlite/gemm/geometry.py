@@ -373,7 +373,7 @@ class Geometry:
         assert not spec.ptail or (tail and spec.blocks and all(cnt % 2 == 0 for _, cnt in spec.blocks)), "ptail: pairs"
         # (one parity of ``ptail``'s pairs: a GEMM of plain C, its passes the pairs' even or odd row tiles)
         assert spec.ptail_part < 0 or (tail and spec.blocks and not spec.ptail and not silu and spec.ptail_part in (0, 1))
-        # (pass pairs over two regions of one shape, each part on its half of A: gate and up of their own inputs)
+        # (pass pairs over two regions of one shape, each part on its half of A: gate and up with separate inputs)
         dual = spec.dual
         assert not dual or ((spec.ptail_part >= 0 or not tail) and not spec.ptail and not dq_core and not is_planar
                             and spec.c_panels and spec.k_rep == 1 and groups == 1

@@ -125,7 +125,7 @@ def test_draft_steps(setup: tuple, request: pytest.FixtureRequest) -> None:
 
 
 def test_table(setup: tuple) -> None:
-    """The head's table (``HeadTable.see``), on a drafter of its own (a model's own block: the module's, whose table has
+    """The head's table (``HeadTable.see``), on a separate drafter (a model's own block: the module's, whose table has
     seen nothing yet; its rows are the model's buffer): the special tokens are fixed rows; after a
     sequence of more tokens past the fixed rows than the table holds, the table holds the ``TABLE_ROWS`` seen last (by
     their last occurrence), and the sequence seen again rewrites nothing; a step's logits of the table's tokens within
@@ -170,9 +170,9 @@ def test_interleaved(setup: tuple) -> None:
 
 def test_draft_sequences() -> None:
     """The model's own block as the drafter of a model of three sequences (the 27B's ``QwenDraft`` on
-    ``QwenOverlay(sequences=3)``: a cache of each, selected with the model's): each sequence's drafter steps (rows of
-    its own, some written again as after rejected drafts), between the model's steps of one sequence and of several
-    on the same hardware context, give the logits (bf16 bits) of a drafter of a model of one sequence."""
+    ``QwenOverlay(sequences=3)``: a cache of each, selected with the model's): each sequence's drafter steps (separate
+    rows per sequence, some written again as after rejected drafts), between the model's steps of one sequence and of
+    several on the same hardware context, give the logits (bf16 bits) of a drafter of a model of one sequence."""
     from artlite.decode.step import Part
 
     model, mtp = _files("3.8-27B")

@@ -234,7 +234,7 @@ def _aiecc_cmd(spec: BuildSpec, *, aiecc_jobs: int | None, work_dir: str, mlir_p
 
 def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = True) -> str:
     """Build ``spec`` into its cache directory (skipped when cached) and return the directory.
-    aiecc_jobs: aiecc's compile threads (default: its own choice);
+    aiecc_jobs: aiecc's compile threads (default: aiecc chooses);
     measure: print the ARTLITE_MEASURE_II report."""
     ignore_cache = settings.IGNORE_CACHE.get()
     clang_cmd = spec.clang_cmd

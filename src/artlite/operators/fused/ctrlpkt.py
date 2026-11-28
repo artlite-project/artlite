@@ -12,8 +12,8 @@ start before the stream switches are configured: every task waits for a lock or 
 cores run and the program's shim tasks.
 
 The loader routes, per column with packets, the shim's MM2S channel 0 (its mux South 3) up the column: circuit through
-the shim (North 0), at each tile on the way a split in packet mode (its own packets, its controller id as mlir-aie
-assigns them, to its TileControl port, the rest North 0; the memtile in circuit mode when it takes none). Each tile's
+the shim (North 0), at each tile on the way a split in packet mode (the tile's own packets, by the controller id mlir-aie
+assigns, go to its TileControl port and the rest to North 0; the memtile in circuit mode when it takes none). Each tile's
 packets are a BD of one chained shim task per column (TLAST between tiles), the column's last tile's end with a write of
 ``MARK_VALUE`` to a memory word (cleared before) the transaction polls: a stream delivers its packets in order, so all
 of the column's writes are done before anything else of the configuration runs. The configuration's own stream switch
@@ -217,7 +217,7 @@ class Loader:
     def routes(self) -> list[tuple[int, list[int], str]]:
         """The loader's writes (absolute address, words, kind: "mux", "ports", "slots"): per column the shim mux and
         the circuit through the shim; at each tile up to the column's top one with packets its slave South 0 in packet
-        mode, slots (its own id to arbiter 0, the ids above to arbiter 1: ``_north``) and masters (TileControl on arbiter 0, North
+        mode, slots (the tile's id to arbiter 0, the ids of the tiles above to arbiter 1: ``_north``) and masters (TileControl on arbiter 0, North
         0 on arbiter 1; the ports between them 0, as after the reset; ``reused``: the tile's whole master range), the
         memtile in circuit mode without packets."""
         a, out = txn.tile_address, []

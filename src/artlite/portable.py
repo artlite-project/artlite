@@ -59,7 +59,7 @@ def file_lock(path: str) -> Iterator[None]:
 
 
 def group_options() -> dict[str, Any]:
-    """``subprocess.Popen`` options of a child that leads a process group of its own (``kill_group``)."""
+    """``subprocess.Popen`` options of a child that leads a new process group (``kill_group``)."""
     return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
 
 

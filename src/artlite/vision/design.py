@@ -9,9 +9,10 @@ Array roles (column c, core row r):
 - A: memtile c MM2S r -> core (c, r) S2MM 0 (the memtile tensors, ``A_OBJ`` objects);
 - O: core (c, r) MM2S 0 -> memtile c S2MM r (``OCH`` chunks);
 - DDR: shim c MM2S 0 -> memtile c S2MM 4 (fills), memtile c MM2S 4 -> shim c S2MM 0 (drains);
-- the gate: memtile c MM2S 5 -> its own S2MM 5 (a static landing chain): the op handover's lock task (``seq``);
-- pages: core (c, r) MM2S 1 -> its own TileControl (``paging.loop_flow``): a static chain over the two B slots streams
-  a page that came in the B stream into the core's program memory (``core``'s roles).
+- the gate: memtile c MM2S 5 -> the same memtile's S2MM 5 (a static landing chain): the op handover's lock task
+  (``seq``);
+- pages: core (c, r) MM2S 1 -> the same core's TileControl (``paging.loop_flow``): a static chain over the two B slots
+  streams a page that came in the B stream into the core's program memory (``core``'s roles).
 Memtile channels and shim channels run host tasks only; the cores' channels are static chains (``layout``).
 
 Core L1 (pinned, ``L1``): the stack, the activation table, the C tile (m tokens x 80 channels, 8 x 8 sub-blocks

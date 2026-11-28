@@ -1,6 +1,6 @@
 """LFM3-VL's images on the NPU for the lfm3 language models (``NpuVision``): an image at its encoder size
 (``host.image_pixels``: between ``min_tokens`` and ``max_tokens`` merged tokens), its embeddings
-(``models.lfm3vl.encoder.Encoder``: on the vision overlay in a hardware context of its own; with LFM3-Omni's mmproj on
+(``models.lfm3vl.encoder.Encoder``: on the vision overlay in a separate hardware context; with LFM3-Omni's mmproj on
 the one its speech networks share, ``artlite.vision.shell.shared_device``) and its tokens
 (``host.Grid.sequence``).
 

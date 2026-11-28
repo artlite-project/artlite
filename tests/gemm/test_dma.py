@@ -545,7 +545,7 @@ def test_gemm_half_plans(name: str, pairs: bool) -> None:
     """The prefill's GEMMs of a file's half regions (``decode.image.Region.half``; Qwen3-Embedding-4B's qkv: Q4_K and a
     planar Q6_K v, gate_up; Kev-4B's gdn_in and attn_in: planar Q8_0, gate_up; ``pairs``: gate / up in pass pairs;
     MiniCPM-V 1B's and d3-lite's down of 3584: Q4_K / Q6_K, planar Q8_0) as ``prefill.gemm.plan_phase`` plans them at
-    256 tokens, each region on its own (region-major: the tile indices the image's), against the walks of its
+    256 tokens, each region separately (region-major, with the image's tile indices), against the walks of its
     ``Region.tile`` and ``tail_half``."""
     fn, key, layers = HALF_FILES[name]
     path = fn(key) if key else fn()

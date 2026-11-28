@@ -10,10 +10,10 @@ file and samples from the logits.
 A prompt is token ids or a ``sequence.Sequence`` (token ids and embedding rows with M-RoPE positions: images, MiniCPM-V's
 or Qwen3-VL's): each cache slot's position (``QwenOverlay.rope``) comes from it, the text after it from its ``next`` on.
 
-With a DFlash2 drafter (``dflash``, a file of its own, ``model_config.qwen_dflash_of``) a round's drafts come from one dispatch of a design of
-its own: its block of 8 positions over its cache of the model's last 2048 positions, up to 7 drafts for ~30 ms where an MTP chain takes
-11 ms a draft: it takes the place of the file's MTP block, whose regions the image then leaves out, wherever the drafter's file exists
-(``Qwen``). Its rates by text: docs/models/qwen35.md.
+With a DFlash2 drafter (``dflash``, a separate file, ``model_config.qwen_dflash_of``), a round's drafts come from one
+dispatch of a dedicated design: the drafter runs its block of 8 positions over its cache of the model's last 2048 positions
+and produces up to 7 drafts in ~30 ms, vs. 11 ms per draft for an MTP chain. Wherever the drafter's file exists (``Qwen``),
+it replaces the file's MTP block, whose regions the image then leaves out. Its rates by text: docs/models/qwen35.md.
 
 A prompt runs in chunks of up to 2048 tokens through the prefill (``models.qwen35.prefill.QwenPrefill``:
 layer-major, control code assembled per chunk from one library ELF; the GEMMs read the same weight image, the chunk's K /
@@ -156,7 +156,7 @@ class NpuQwen(OverlayModel):
         self._open_lanes()
 
     def _load_drafters(self, threads: int) -> None:
-        """(a drafter's file of its own gives its pages back once its image is packed)"""
+        """(a drafter in a separate file gives its pages back once its image is packed)"""
         if self.drafter is not None:
             self.drafter.load(threads=threads)
             self.drafter.gguf.release()

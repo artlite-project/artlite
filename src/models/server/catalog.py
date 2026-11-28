@@ -11,7 +11,7 @@ and its file name (when no other file has it) resolve to it too.
 A file is served when Artlite has its architecture (``models.ARCHITECTURES``) and a tile format for the type of each
 of its matrices (``formats.has_tile_format``); a file Artlite cannot run is skipped with a log line that says why.
 Drafters (``mtp-``, ``dspark-``, ``dflash-``, ``eagle3-``: their models find them themselves) and vision or speech
-encoders (architecture ``clip``) are not models of their own; split files are not read. An encoder goes with a model of
+encoders (architecture ``clip``) are not separate models; split files are not read. An encoder goes with a model of
 its directory whose class takes its projector type (``Model.projectors``) and its width; of several, the one of the
 shortest name (``mmproj-model-f16.gguf``, not ``mmproj-model-f16-4x.gguf``); a checkpoint directory with a vision tower
 (``hf_model.has_vision_tower``) is its own. Reading a header takes ~0.1 s (its
@@ -19,7 +19,7 @@ vocabulary's strings are skipped one by one): the headers are cached in ``<cache
 and modification time, with each model's last load time (the web UI's loading bar).
 
 The preset file is llama-server's (``--models-preset``): an INI file whose ``[*]`` section holds options of every
-model, a section named by a model's id or alias the options of that model, and any other section a model of its own,
+model, a section named by a model's id or alias the options of that model, and any other section a separate model,
 named by the section, whose ``model`` key is its file (absolute, else relative to the working directory or the models
 directory). Keys are the options' long names without the dashes (``ctx-size``), their short ones (``c``) or their
 environment variables (``ARTLITE_ARG_CTX_SIZE``), with ``true`` / ``false`` for switches; ``mmproj`` chooses the vision
@@ -374,7 +374,7 @@ class Catalog:
                 entry.mmproj = entry.path  # (its own tower)
             else:
                 entry.mmproj = self._encoder(entry, encoders.get(os.path.dirname(entry.path), []))
-            # (an encoder file's, else what the model's own files take: a tower of its own)
+            # (an encoder file's, else what the model's own files take, such as a built-in tower)
             entry.media = self._media(entry.mmproj) if entry.mmproj else self._own_media(entry)
             entry.options = opts
             entry.load_s = float(self._cache.get(os.path.realpath(entry.path), {}).get("load_s", 0.0))

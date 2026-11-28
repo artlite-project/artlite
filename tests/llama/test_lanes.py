@@ -1,5 +1,5 @@
 """Llama's and Qwen3's lanes on the NPU (``NpuLlama(sequences=)``; models/lanes.py): three conversations on one model
-object, each on a thread of its own, against each one alone on the same object: greedy replies token for token, with
+object, each on a separate thread, against each one alone on the same object: greedy replies token for token, with
 the context's drafts and without, the lanes' decode rounds in joint steps; one conversation's prompt arrives while the
 others decode (its chunks and steps with the device alone, then its rounds with theirs)."""
 

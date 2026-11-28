@@ -4,7 +4,7 @@ teacher-forced over a description of the image, against llama.cpp's language mod
 positions (``ref.seq_golden``): the prompt through the prefill in chunks of 256 (two boundaries inside the
 image, then a chunk of text alone at its shifted positions) or as decode steps. The logits barely tell the image's
 positions apart (llama.cpp's own answer moves by a KL of 0.005 with the image's H and W set to T), so the prefill's K
-cache is checked against the decode's too: the image's slots (rotated by their own cos / sin rows) as close as the
+cache is checked against the decode's too: the image's slots (rotated by the image's cos / sin rows) as close as the
 text's."""
 
 
@@ -89,8 +89,8 @@ def test_image_prompt(case: tuple) -> None:
         got = [model.forward(seq[:K])]
         caches[prefill] = _k_cache(model, K - K % 32)
         got.append(model.step(int(seq.ids[K])))
-        # (the first decode step after the prompt's chunks runs at its own position, 191 before its cache slot's, and
-        # the prompt's positions stay the overlay's)
+        # (the first decode step after the prompt's chunks runs at the token's position, 191 before its cache slot's,
+        # and the prompt's positions stay the overlay's)
         assert seq.pos[K, 0] < K - 100 and np.array_equal(model.overlay.rope[:K + 1], seq.pos[:K + 1])
         got = torch.from_numpy(np.stack(got + [model.step(int(t)) for t in seq.ids[K + 1:-1]]))
         kl, agree = kl_report("prefill" if prefill else "steps", want, got, where=" at the official positions")

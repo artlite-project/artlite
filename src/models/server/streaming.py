@@ -55,7 +55,7 @@ async def opened(j: Job, events: Events, ping: float) -> AsyncIterator[tuple[str
 
 async def collect(j: Job, events: Events, request: Request) -> tuple[Blocks, dict[str, Any]]:
     """A job's output (a response without streaming) as the blocks of its message, and its last event (its
-    ``probs``: every delta's and its own); the client going away cancels it."""
+    ``probs``: every delta's, then the last event's); the client going away cancels it."""
     blocks, probs = Blocks(), []
     loop = asyncio.get_running_loop()
     check = loop.time()

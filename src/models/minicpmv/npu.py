@@ -1,6 +1,6 @@
 """MiniCPM-V 4.7's images on the NPU for its language model (``NpuVision``): an image's entries (``host.slice_image``:
 the overview and the slices), their embeddings (``models.minicpmv.encoder.Encoder``: the whole encoder per
-dispatch of a pair of entries or a lone one, on the vision overlay in a hardware context of its own) and its tokens
+dispatch of a pair of entries or a lone one, on the vision overlay in a separate hardware context) and its tokens
 (``host.Grid.sequence``: the embeddings and the mmproj's separator rows at the official positions).
 
 Every load packs the weights from the mmproj file (F16 / BF16 -> BFP16: ``artlite.vision.weights``, the native

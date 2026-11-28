@@ -239,7 +239,7 @@ class ThoughtBudget:
     """llama-server's reasoning budget over a generation's text, a token's at a time (``feed``): the tokens a thought
     may take (``budget``; < 0: any) and its end on demand (``asked``: the control route's ``reasoning_end``). ``due``:
     the thought is open and its end goes next (where the thought is: ``split``'s, a ``ReasoningSplitter`` or a
-    ``BlockSplitter`` of its own); a thought that opens later gets a budget of its own, and an end asked outside a
+    dedicated ``BlockSplitter``); a thought that opens later gets a separate budget, and an end asked outside a
     thought lapses."""
 
     def __init__(self, split: ReasoningSplitter | BlockSplitter, *, budget: int):

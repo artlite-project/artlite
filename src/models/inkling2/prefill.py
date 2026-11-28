@@ -16,8 +16,8 @@ tokens where the operator works row by row:
   without weights -> DP panels, the GEMMs d<s>a / d<s>b -> GA / GB), the blend (``InkBlendOperator``) -> XC rows;
 - the norms (the layer's attention norms; ``PrefillNormOperator``) -> XN panels, the q / k / v GEMMs -> GQ / GK / GV;
 - the prep (``prefill.attn.ink.InkPrepOperator``: QS, the visit's records, its raw ring; in parts of up to 512 tokens), the
-  attention (``AttnOperator(ink=True)``; a chunk past 2048 tokens in items of 2048 at their own positions, after every
-  prep part) -> A, the gate (``InkGateOperator``), o -> Y;
+  attention (``AttnOperator(ink=True)``; a chunk past 2048 tokens runs in items of 2048, each at its position,
+  after every prep part) -> A, the gate (``InkGateOperator``), o -> Y;
 - the post conv and the residual (``InkResidOperator``: the chunk's rows at once, the visit's history window 0);
 - the FFN: the FFN mix (its states and cur after the attention; a loop visit's controller of the stream "ffn") -> XM0
   (XC0), its norm -> XR (hi + lo panels: the router's x), the MoE (``moe.InkMoE``: the router, then a piece from the
@@ -52,7 +52,7 @@ from .moe import InkMoE
 from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
 SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
-SMALL = (64, 128)  # chunk sizes of operators of their own
+SMALL = (64, 128)  # chunk sizes with dedicated operators
 ATTN_T = 2048  # an attention item's tokens at most (its 64 passes of 32 queries; a larger chunk's in parts)
 # chunk sizes (the experts' weights once per chunk: a chunk of 8192 tokens moves 0.61 of a 2048-token one's expert chunks
 # per token, its experts' rows 82% valid)
@@ -104,7 +104,7 @@ class InklingPrefill(ChunkPrefill):
         self.sz = {t: self._size_ops(t) for t in sorted({self._t(T) for T in self.sizes})}
         self.kinds = sorted({x.kind for x in self.vis.values()})
         self.attn = {(k, T): self._attn(k, T) for k in self.kinds for T in self.sizes if T <= ATTN_T}
-        # (a larger chunk's parts: part 0 the ATTN_T design, the others with parameters of their own)
+        # (a larger chunk's parts: part 0 uses the ATTN_T design, the others separate parameters)
         self.parts = {(k, j): self.attn[(k, ATTN_T)] if j == 0 else self._attn(k, ATTN_T, j)
                       for k in self.kinds for j in range(self.sizes[-1] // ATTN_T) if self.sizes[-1] > ATTN_T}
         self.preps = {(k, T): self._preps(k, T) for k in self.kinds for T in self.sizes}
@@ -159,9 +159,9 @@ class InklingPrefill(ChunkPrefill):
         return min(T, SUB)
 
     def _attn(self, kind: str, T: int, part: int = 0) -> PA.AttnOperator:
-        """The attention of a kind over T tokens (``part``: a larger chunk's, at its own position): sliding-window caches
-        after their guard; full ones read 16 groups before group 0 (the near part's, skipped there: the argument starts
-        that far before the cache)."""
+        """The attention of a kind over T tokens (``part``: a part of a larger chunk, at that part's position):
+        sliding-window caches after their guard; full ones read 16 groups before group 0 (the near part's, skipped
+        there: the argument starts that far before the cache)."""
         s, ov = self.shape, self.ov
         kv0 = self.guard * s.group
         first = next(v for v in self.layers if self.vis[v].kind == kind)

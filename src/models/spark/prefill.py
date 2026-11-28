@@ -4,10 +4,11 @@ that the decode continues from the caches the chunk leaves; the prompt's last to
 the chunk's last output row (``SparkOverlay.logits_of``).
 
 A chunk of T tokens (``SIZES``: ``SMALL``, multiples of ``SUB`` up to 2048: the rings hold a window and a chunk,
-``overlay.ring_groups``) runs layer-major in sub-chunks of ``SUB`` tokens (a ``SMALL`` size: one of its own): each
-operator of a layer runs over the sub-chunks back to back on buffer slices a sub-chunk apart. The residual stream x is
-fp32 (PX, ``prefill.norm.ResidualNormOperator``: N0 measured a bf16 one 66% worse on the 4B's chats), its panels in rows
-of the GEMMs' K (``kmax``: the hidden size, or an image padded to whole chunks: ``out_pitch``). Per layer L:
+``overlay.ring_groups``) runs layer-major in sub-chunks of ``SUB`` tokens (a ``SMALL`` chunk is a single sub-chunk of
+that size): each operator of a layer runs over the sub-chunks back to back on buffer slices a sub-chunk apart. The
+residual stream x is fp32 (PX, ``prefill.norm.ResidualNormOperator``: N0 measured a bf16 one 66% worse on the 4B's
+chats), its panels in rows of the GEMMs' K (``kmax``: the hidden size, or an image padded to whole chunks:
+``out_pitch``). Per layer L:
 
 - attn_in GEMMs of xn -> G (per column [q | k part | v part | gate rows], ``plan_gemm``); the attention prep of the
   layer's kind per sub-chunk (``prefill.attn256.AttnPrepOperator``: Q slots with the gates into QS; a full layer's
@@ -16,7 +17,7 @@ of the GEMMs' K (``kmax``: the hidden size, or an image padded to whole chunks: 
   the chunk's records into the ring last) -> A; attn_out GEMMs -> Y;
 - norm ``add``: x += Y, xn = norm(x) ffn_norm; gate_up GEMMs with GELU's erf form -> HP; down GEMMs in two K parts -> F;
   norm ``add``: x += F's parts, xn = norm(x) of the next layer's attn_norm (the last layer: output_norm, unused: the LM
-  head norms its own input).
+  head norms its input itself).
 
 The first layer's input norm (``in``) starts the chunk. The control code is assembled on the host from one library ELF
 and runs in pieces of whole layers (``prefill.chunks.ChunkPrefill``).
@@ -45,7 +46,7 @@ from .overlay import CHUNK, SparkOverlay
 DOWN_PARTS = 2  # (the down projection's K parts: each part's bf16 C tile sums half the k-tiles, the residual add sums
 # the parts in fp32: the 4B's 160 k-tiles as 2 x 80; ``prefill.norm.ResidualNormOperator`` sums 1, 2 or 4)
 SUB = 256  # tokens per sub-chunk (the operators' T)
-SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts)
+SMALL = (64, 128)  # chunk sizes with dedicated operators (short prompts)
 SIZES = SMALL + tuple(range(SUB, CHUNK + 1, SUB))
 MAX_T = SIZES[-1]
 # the time model's constants (``layer_seconds``; to fit to measured chunks): a ConfigureOp, per sub-chunk a byte of a

@@ -1,6 +1,7 @@
 """artlite-server with several sequences on the NPU (``-np``: Llama 3.2 1B, Gemma 4 E4B with its drafter, Flint, LFM3,
-Spark-X 1.7B, Qwen3.5-9B and Qwen3.8-27B with its MTP layer as the drafter, Inkling 2, on three lanes): requests that meet give each one's answer alone - greedy ones, and a sampled one with a seed, whose
-draws are its own -, their decode steps shared; a conversation's next turn continues on its lane."""
+Spark-X 1.7B, Qwen3.5-9B and Qwen3.8-27B with its MTP layer as the drafter, Inkling 2, on three lanes): requests that
+meet give each one's answer alone (greedy ones, and a sampled one with a seed whose draws stay its own) while sharing
+their decode steps; a conversation's next turn continues on its lane."""
 
 import threading
 import time

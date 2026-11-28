@@ -2,7 +2,7 @@
 (c, 5) of every column, the KV cache through A (broadcast with the main core's), outputs relayed by the main core
 (shared-memory FIFO R) to C, the main core applying the gates where the shape says so (``AttnShape.main_gates``); a KV
 head's chain of cores passes its partials west to east through shared memory, a token ObjectFifo per neighbour pair (one
-pass, a design of 8 slots: each core emits its own rows, no tokens). A model's design subclasses it with its own cores
+pass, a design of 8 slots: each core emits its own rows, no tokens). A model's design subclasses it to add the model's cores
 (qwen35's GDN cores: ``models.qwen35.decode``)."""
 
 from typing import ClassVar
@@ -175,7 +175,7 @@ class Attn256DecodeOperator(DecodeOverlayOperator):
     def ACC_AT(self) -> int:
         """(moe) acc in the attention workspace past its state words: its regions are scratch that the attention core
         writes before it reads them in each sub-step, idle in the MoE phases (the attention core only skips their objects,
-        on its state words); without an attention core, a buffer of its own on its tile."""
+        on its state words); without an attention core, acc is a separate buffer on its tile."""
         if not self.moe or self.attn is None:
             return 0
         aw = self.attn.workspace()

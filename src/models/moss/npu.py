@@ -1,6 +1,6 @@
 """MOSS-Transcribe-Diarize's speech on the NPU for its language model (``NpuAudio``): a recording's samples
 (``models.audio.load_audio``), its chunks' log-mel spectrograms (``host.log_mel``) and its tokens' rows
-(``models.moss.encoder.Encoder``: on the vision overlay in a hardware context of its own, a dispatch a chunk).
+(``models.moss.encoder.Encoder``: on the vision overlay in a separate hardware context, a dispatch a chunk).
 
 Every load packs the weights from the model's files (BF16 / F16 / F32 / Q8_0 -> BFP16: ``artlite.vision.weights``, the
 native packer; a transcribe.cpp file's K-quant matrices dequantized on the host first: 4 to 6 bits a weight in the
@@ -58,8 +58,8 @@ class NpuAudio(MediaEncoder):
         return self.encoder.state()
 
     def embeddings(self, samples: np.ndarray) -> np.ndarray:
-        """A recording's samples (16 kHz mono float32) -> its tokens' rows (tokens, projection_dim): its chunks' in
-        order, each its own tokens (``host.tokens``)."""
+        """A recording's samples (16 kHz mono float32) -> its tokens' rows (tokens, projection_dim): its chunks' rows in
+        order, each chunk contributing its tokens (``host.tokens``)."""
         x = np.ascontiguousarray(samples, np.float32).reshape(-1)
         counts = [host.tokens(min(host.CHUNK, len(x) - i)) for i in range(0, len(x), host.CHUNK)]
         run = lambda: np.concatenate(list(self.encoder.stream(zip(host.chunks(x), counts, strict=True), host.log_mel)))

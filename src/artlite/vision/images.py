@@ -13,7 +13,7 @@ from ..overlay import OverlayDevice
 class ImageStore:
     """DDR images by name (``alloc`` / ``write`` / ``read`` / ``address``) in the host buffers of ``dev``, ``CHUNK``
     bytes each (a dispatch lists every buffer, and the driver's command holds some 500; an image larger than a chunk gets
-    a buffer of its own)."""
+    a separate buffer)."""
 
     CHUNK = 64 << 20
 
@@ -40,7 +40,7 @@ class ImageStore:
         nbytes = -(-nbytes // 4096) * 4096
         if name in self._images and self._images[name][2] >= nbytes:
             return self._view(name)
-        if nbytes > self.CHUNK:  # (a buffer of its own)
+        if nbytes > self.CHUNK:  # (a separate buffer)
             chunk = f"_big{len(self.dev.buffers)}"
             self.dev.alloc(chunk, nbytes)
             self._images[name] = (chunk, 0, nbytes)

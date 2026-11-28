@@ -2,9 +2,9 @@
 their log-mel spectrograms, its audio span in a prompt, the transcription instruction and a transcript's segments.
 
 Chunks (``chunks``): a recording (16 kHz mono samples: ``models.audio.load_audio``) in pieces of 30 s, the last one
-zero-padded; the encoder runs each on its own, always the padded chunk (Whisper's), and the adaptor makes a token of
-every 4 encoder rows: ``tokens(n)`` = (n - 1) // 1280 + 1 of a chunk's n samples (12.5 a second, 375 a full chunk), read
-from the chunk's first rows.
+zero-padded; the encoder runs each chunk separately, always the padded chunk (Whisper's), and the adaptor makes a token
+of every 4 encoder rows: ``tokens(n)`` = (n - 1) // 1280 + 1 of a chunk's n samples (12.5 a second, 375 a full chunk),
+read from the chunk's first rows.
 
 Mel (``log_mel``, transformers' ``WhisperFeatureExtractor``): a chunk reflect-padded by 200 samples at both ends, frames
 of 400 samples every 160 under a periodic Hann window, the power spectrum of each, 80 Slaney mel filters, log10
@@ -162,7 +162,8 @@ class Marks:
 
 class Drafts(Lookup):
     """A transcript's context drafts (module docstring): after ``][`` the end time's tokens again, ``]`` and the last
-    speaker tag, as far as the tokens since agree with them (a start time of its own: the tag after its ``]``); else the
+    speaker tag, as far as the tokens since agree with them (where the model wrote a different start time, the tag after
+    that time's ``]``); else the
     context's (``drafts.Lookup``)."""
 
     WINDOW = 24  # (tokens back the last ``][`` is looked for: two times and a tag)
@@ -188,7 +189,7 @@ class Drafts(Lookup):
                 tag = tag[:tag.index(mk.close) + 1] if mk.close in tag else []
                 want = seq[i:j].tolist() + [mk.close] + tag
                 if mk.close in got and all(mk.number[t] for t in got[:got.index(mk.close)]):
-                    want = got[:got.index(mk.close) + 1] + tag  # (a start time of its own, complete)
+                    want = got[:got.index(mk.close) + 1] + tag  # (a different start time, complete)
                 if tag and len(got) < len(want) and got == want[:len(got)]:
                     return NMAX, ALL, want[len(got):len(got) + k]
         return super().draft(k)

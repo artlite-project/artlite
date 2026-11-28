@@ -1,6 +1,6 @@
 """Inkling 2's images on the NPU for its language model (``NpuVision``): an image at its encoder size
 (``host.image_pixels``: as it is, at most ``max_tokens`` merged tokens once padded), its embeddings
-(``models.inkling2v.encoder.Encoder``: on the vision overlay in a hardware context of its own) and its tokens
+(``models.inkling2v.encoder.Encoder``: on the vision overlay in a separate hardware context) and its tokens
 (``host.grid``'s ``Grid.sequence``).
 
 Every load packs the weights from the mmproj file (F16 / BF16 / F32 -> BFP16: ``artlite.vision.weights``, the native

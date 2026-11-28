@@ -69,7 +69,7 @@ class VRing:
 
     def check(self, layer: int, p: int, end: int) -> None:
         """A step at p reads the rows of record p >> 3 up to ``end`` (exclusive) from the ring of ``layer``: the ring
-        holds them (a step continues from the last one's positions, at most its own back, as a generation loop's
+        holds them (a step continues from the previous step's positions, at most its own length back, as a generation loop's
         rejected drafts do)."""
         if p % 8 == 0 and end <= p:
             return

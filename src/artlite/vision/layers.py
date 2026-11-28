@@ -157,7 +157,7 @@ class DTensor:
 
     def store(self, bd: Builder, b: int, t: Tensor, *, defer: bool = True, c0: int = 0) -> None:
         """Band b (C tiles: its channels from c0) from the memtile tensor t (drained with the next op, t's bytes released
-        after it; defer False: an op of its own, t freed); its records."""
+        after it; defer False: drained with a separate op, t freed); its records."""
         off = self.lv.ct(c0) if c0 else 0
         cols = bd.drain(self.band(b), self.nbytes, mem=t.addr, nbytes=t.nbytes, off=off)
         if defer:

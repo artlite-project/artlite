@@ -150,8 +150,8 @@ def moss_gguf(quant: str = "Q4_K_M") -> str:
 
 
 def lfm3a_gguf(quant: str = "Q4_K_M") -> str:
-    """A language model file of LiquidAI's LFM3-Audio-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes,
-    weights of its own): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
+    """A language model file of LiquidAI's LFM3-Audio-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes
+    with separate weights): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Audio-2B-GGUF", f"LFM3-Audio-2B-{quant}.gguf")
 
 
@@ -162,8 +162,8 @@ def lfm3a_mmproj(quant: str = "Q8_0") -> str:
 
 
 def lfm3omni_gguf(quant: str = "Q4_K_M") -> str:
-    """A language model file of LiquidAI's LFM3-Omni-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes,
-    weights of its own): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
+    """A language model file of LiquidAI's LFM3-Omni-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes
+    with separate weights): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-Omni-2B-GGUF", f"LFM3-Omni-2B-{quant}.gguf")
 
 
@@ -219,9 +219,10 @@ MTP_QUANTS = ("Q4_0", "Q4_K_M", "Q8_0")  # (a qwen35 drafter file by preference:
 
 def qwen_mtp_of(model: str, quant: str = "") -> str | None:
     """The multi-token-prediction drafter (``mtp-*.gguf``, or an uploader's ``<name>-mtp-*.gguf``) of a qwen35 /
-    qwen35moe model file without a block of its own: next to it, else in another organization's repository of the same name beside its own (ggml-org publishes
-    the drafters apart from other uploaders' models; a PARO checkpoint directory's: its base model's ``<base>-GGUF``
-    repositories); of several, the first of ``MTP_QUANTS`` (``quant``: that quantization's only). None: there is none."""
+    qwen35moe model file that has no MTP block itself: next to the file, else in another organization's repository of
+    the same name next to the file's repository (ggml-org publishes the drafters separately from other uploaders'
+    models; for a PARO checkpoint directory, they are in its base model's ``<base>-GGUF`` repositories); of several,
+    the first of ``MTP_QUANTS`` (``quant``: that quantization's only). None: there is none."""
     d = os.path.dirname(os.path.abspath(model))
     if os.path.isdir(model):  # (a checkpoint directory, a PARO one <base>-PARO[-variant]: its base model's GGUF repositories)
         d = os.path.abspath(model)
@@ -886,7 +887,7 @@ class FlintConfig:
 @dataclass(frozen=True)
 class Visit:
     """One of a token's visits of a physical layer of Inkling 2 (``InklingConfig.visits``, in the order a token runs
-    them): its own KV cache and convolution histories, the layer's weights."""
+    them): each visit has its own KV cache and convolution histories and uses the layer's weights."""
 
     index: int  # v, 0 .. visits - 1 (a DSpark drafter's ``target_layers`` count these: the residual entering visit v;
     # ``visits``: the final state, after the output's depth mix and norm)
@@ -1411,7 +1412,7 @@ class ClipConfig:
     (patches per output token per side: MiniCPM-V's ``projector.scale_factor``, 4 or 2; Qwen3-VL's
     ``spatial_merge_size``, 2), ``max_slices`` and the layer after which the ViT merger runs (``merger_layer``:
     ``wa_layer_indexes``, -1 without one) of MiniCPM-V; Qwen3-VL's ``deepstack``: its layers whose outputs feed
-    projectors of their own (``is_deepstack_layers``); ``kv_heads`` (grouped-query attention: LFM3-VL's), an image's
+    separate projectors (``is_deepstack_layers``); ``kv_heads`` (grouped-query attention: LFM3-VL's), an image's
     pixels between ``min_pixels`` and ``max_pixels`` and the resampling filter ``resize`` (0, "": the projector's
     defaults). The projector type is ``clip.projector_type`` or (LFM3-VL's files) ``clip.vision.projector_type``."""
 

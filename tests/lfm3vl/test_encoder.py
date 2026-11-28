@@ -1,5 +1,5 @@
 """LFM3-VL's vision encoder on the vision overlay (models.lfm3vl.encoder) against the float64 encoder (ref.Encoder):
-each layer alone from the float64 input (its error a small part of its own contribution), the edge masks of the
+each layer alone from the float64 input (its error is a small part of the layer's contribution), the edge masks of the
 depthwise conv, pieces of layers against one dispatch (bit for bit), whole images of 1 and 9 bands per merged
 token."""
 

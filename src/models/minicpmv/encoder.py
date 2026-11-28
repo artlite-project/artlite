@@ -197,7 +197,7 @@ def layer_weights(get: Callable[[str], np.ndarray], il: int) -> dict[str, np.nda
 
 
 HILO = ("v.patch_embd.weight", "mm.up.weight", "mm.down.weight")  # (the mmproj's weights of the hi + lo GEMMs)
-PIX, ONE = 588, 592  # (a patch's inputs (c, ky, kx) of 3 x 14 x 14; the constant input 1, a bfp16 block of its own)
+PIX, ONE = 588, 592  # (a patch's inputs (c, ky, kx) of 3 x 14 x 14; the constant input 1 in a dedicated bfp16 block)
 
 
 def pixel_map(mean: tuple[float, ...], std: tuple[float, ...]) -> tuple[np.ndarray, np.ndarray]:

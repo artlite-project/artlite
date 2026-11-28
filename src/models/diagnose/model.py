@@ -1,10 +1,11 @@
 """The diagnosis' model part: Llama 3.2 1B's prompt of 1024 tokens in variants - host buffers of 2 MB pages (user BOs
 from 2 MB on) or of 4 KB pages (the driver's BOs below 64 MB), packed C drains in whole 64-byte lines or not
 (``prefill.gemm.LINES``), a busy CPU, the dense GEMMs paced as ``prefill.pace`` calibrates them on this machine - in
-two rounds, with each run's state: the chunk's time per operator kind (each kind alone, in a telemetry step of its own:
-which kinds the platform throttles), the largest kind at each pace level, the calibration, a design switch's cost inside
-its program, the host's row lookups, the huge pages the process got, how much of the file the page cache holds. V0-V4
-run unpaced (the library's pace set to none for the whole diagnosis: comparable with Strix Halo's reference)."""
+two rounds, with each run's state: the chunk's time per operator kind (each kind runs alone in a separate telemetry
+step, to show which kinds the platform throttles), the largest kind at each pace level, the calibration, a design
+switch's cost inside its program, the host's row lookups, the huge pages the process got, how much of the file the page
+cache holds. V0-V4 run unpaced (the library's pace set to none for the whole diagnosis: comparable with Strix Halo's
+reference)."""
 
 from __future__ import annotations
 
@@ -171,10 +172,10 @@ def _loop_ms(pf: object, prog: list, seconds: float) -> float:
 
 def kinds(npu: object, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
           T: int = 1024) -> dict[str, object]:
-    """The chunk program's ms as a whole and per operator kind (each kind's items run as a program of their own:
-    wrong results, a configuration per design change), with the items and configurations of each. Each runs for
-    KIND_SECONDS after IDLE_SECONDS idle, in a telemetry step of its own (``{tag}: kinds: {kind}``): which kinds the
-    platform throttles when they run alone."""
+    """The chunk program's ms as a whole and per operator kind, with the items and configurations of each. Each
+    kind's items run as a separate program (with wrong results and a configuration per design change) for KIND_SECONDS
+    after IDLE_SECONDS idle, in a separate telemetry step (``{tag}: kinds: {kind}``), to show which kinds the platform
+    throttles when they run alone."""
     pf = npu.prefill
     T = min(s for s in pf.sizes if s >= T)
     items = pf._program(T)
@@ -205,7 +206,7 @@ def kinds(npu: object, *, step: Callable[[str], None], end: Callable[[str], None
 
 def pace_sweep(npu: object, kind: str, *, step: Callable[[str], None], end: Callable[[str], None], tag: str,
                T: int = 1024) -> dict[str, object]:
-    """The items of one operator kind of the chunk (a paced GEMM's) as a program of their own at each pace level
+    """The items of one operator kind of the chunk (a paced GEMM's) as a separate program at each pace level
     (``pacing.PACE_IDLE``), each for KIND_SECONDS after IDLE_SECONDS idle (telemetry steps ``{tag}: pace {level}``): the
     level from which the platform lets the kind run unthrottled, and its time there."""
     pf = npu.prefill

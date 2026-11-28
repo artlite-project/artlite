@@ -2,12 +2,12 @@
 
 A ``Wt`` is a weight matrix of parts of sources (``Source``: a tensor of a GGUF or safetensors file, read in place from
 the file's memory map; a small matrix the host computes at every load, ``computed``; the identity, ``eye``): per part
-the source row of each of its rows, the source column of each of its columns (-1: zero), a scale and per row a scale
-of its own (``Part.rscale``: None, 1). The networks' weight transforms (heads and channels padded, the RoPE heads'
+the source row of each of its rows, the source column of each of its columns (-1: zero), a scale, and a separate
+scale per row (``Part.rscale``: None, 1). The networks' weight transforms (heads and channels padded, the RoPE heads'
 rows, the queries' scale, a layer scale folded into the rows of the GEMM before it, a GEGLU's halves, a conv's input
 slices, a sum of column blocks) are index maps and scales on them (``take``, ``cat``, ``Wt.__getitem__``, ``*``,
 ``scale_rows``), so a weight is never materialized on the host. Torch tensors take the same helpers (the tests' weights): ``Builder.gemm``
-takes either, a tensor as a source of memory of its own.
+takes either, a tensor as an in-memory source.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ KINDS = ("F32", "F16", "BF16", "Q8_0", "EYE")
 class Source:
     """A matrix of rows x cols elements of ``kind`` ("F32", "F16", "BF16", "Q8_0" (blocks of 32: fp16 d, 32 int8), or
     "EYE": the identity, no data): ``raw`` (rows, row bytes) uint8; ``file``: the file's path and its whole mapping
-    (None: memory of its own). ``name``: unique among a model's sources (a cached build's jobs refer to it)."""
+    (None: in-memory data). ``name``: unique among a model's sources (a cached build's jobs refer to it)."""
 
     name: str
     kind: str
@@ -235,7 +235,7 @@ def _merge(parts: list[Part]) -> tuple[Part, ...]:
 
 
 def memory(x: np.ndarray, name: str | None = None) -> Wt:
-    """A matrix of memory of its own (float32 values; name: a computed weight's, unique among the model's sources;
+    """A matrix held in memory (float32 values; name: a computed weight's, unique among the model's sources;
     None: by the values' digest, for tests: not resolvable in a cached build)."""
     a = np.ascontiguousarray(x, np.float32)
     shape = a.shape if a.ndim > 1 else (1, a.size)
@@ -299,7 +299,7 @@ def take(x: Wt | np.ndarray, idx: np.ndarray, dim: int = 0) -> Wt | np.ndarray:
 
 
 def cat(xs: list[Wt | np.ndarray], dim: int = 0) -> Wt | np.ndarray:
-    """The concatenation of arrays; matrices of which any is a Wt as one Wt (arrays as memory of their own)."""
+    """The concatenation of arrays; matrices of which any is a Wt as one Wt (arrays as in-memory sources)."""
     if not any(isinstance(x, Wt) for x in xs):
         return np.concatenate([np.asarray(x) for x in xs], dim)
     return Wt.cat([as_wt(x) for x in xs], dim)

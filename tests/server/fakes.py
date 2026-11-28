@@ -55,7 +55,7 @@ BLOCKS_TEMPLATE = (  # (Inkling's turn of blocks: its tool-call syntax, its thou
     "{{ {'low': 'L', 'high': 'H'}.get(reasoning_effort, '') }}")
 
 
-CHARS = "\t\n\r" + "".join(map(chr, range(32, 127)))  # (``chars``: pieces of their own from the start)
+CHARS = "\t\n\r" + "".join(map(chr, range(32, 127)))  # (``chars``: separate pieces from the start)
 
 
 class FakeTokenizer:
@@ -262,7 +262,7 @@ class FakeNpu(NpuModel):
     keep multiples of it; ``exact``: all positions or none (Qwen: recurrent); ``chunk``: prompt tokens per dispatch;
     ``delay``: seconds per dispatch. A checkpoint is the tokens before its position, the records the tokens of their
     positions: a restore checks that the device holds the checkpoint's tokens. ``lanes``: the sequences it holds, each
-    a fake of its own (their replies, calls and positions theirs)."""
+    a separate fake (with its own replies, calls and positions)."""
 
     def __init__(self, model: FakeModel, *, capacity: int = 512, group: int = 4, exact: bool = False, chunk: int = 8,
                  delay: float = 0.0, drafts: int = 0, lanes: int = 1):

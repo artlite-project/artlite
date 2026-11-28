@@ -43,7 +43,7 @@ def _walk(tree: ast.AST) -> Iterator[ast.AST]:
 @functools.cache
 def imports(name: str) -> frozenset[str]:
     """The modules of ``ROOTS`` that module ``name``'s source imports (``from p import m``: ``p.m`` where that is a
-    module, and ``p`` itself where ``m`` is a name of its own)."""
+    module, and ``p`` itself where ``m`` is a name defined in ``p``)."""
     path = module_path(name)
     assert path is not None, name
     with open(path, "rb") as f:

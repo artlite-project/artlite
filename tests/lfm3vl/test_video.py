@@ -93,9 +93,9 @@ def test_npu_pairs(request: pytest.FixtureRequest, mmproj: str) -> None:
 
 @pytest.mark.parametrize("size", [(224, 256), (384, 448)])
 def test_packed_pairs(vision: object, monkeypatch: pytest.MonkeyPatch, size: tuple[int, int]) -> None:
-    """Two pairs in one run (``Layout.two``: one a half, their own keys and conv neighbours) give each pair's embeddings
-    bit for bit as a run each (``Encoder.packs``: pairs of 56 tokens, a band for two; of 168, 3 bands for two; 100
-    tokens do not pack), with an odd frame and a lone last pair (run with itself)."""
+    """Two pairs in one run (``Layout.two``: one a half, each pair with separate keys and conv neighbours) give each
+    pair's embeddings bit for bit as a run each (``Encoder.packs``: pairs of 56 tokens, a band for two; of 168, 3 bands
+    for two; 100 tokens do not pack), with an odd frame and a lone last pair (run with itself)."""
     v = vision
     enc = v.encoder
     frames = np.random.default_rng(0).integers(0, 256, (7, *size, 3), np.uint8)  # (3 pairs and an odd frame)

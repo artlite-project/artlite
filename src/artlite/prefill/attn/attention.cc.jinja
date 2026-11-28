@@ -141,7 +141,7 @@ __attribute__((noinline)) void {{ p }}_masklo(float *__restrict sc, const int16_
 alignas(16) static const int16_t {{ p }}_lane8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
 
 // A chunk's masks (non-causal: key kc + 8 k + i of record k, lane 8 q + i): row q sees the keys below the state's end S
-// and its own, lo .. hi - 1 (``seg``: lh); the others -1e30 (``vfm``)
+// and its own keys lo .. hi - 1 (``seg``: lh); the others -1e30 (``vfm``)
 __attribute__((noinline)) void {{ p }}_maskset(float *__restrict sc, const float *__restrict ws, int32_t kc)
 {
     const int16_t *__restrict lh = AW(const int16_t, {{ w.lh }});

@@ -1,5 +1,5 @@
 """Qwen3.8-27B's lanes with its MTP drafter (``NpuQwen(sequences=)``, ``drafting.MtpDrafting`` per lane; the DFlash2
-drafter's place too): three conversations on one model object, each on a thread of its own, against each one alone:
+drafter's place too): three conversations on one model object, each on a separate thread, against each one alone:
 greedy replies token for token, the drafter's guesses kept; and after the rounds the lanes shared, each lane's drafter
 gives the logits (bf16 bits) it gives after the conversation alone: its cache of the sequence, the hidden state and
 the pending rows are those."""

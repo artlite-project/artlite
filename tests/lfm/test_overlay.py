@@ -109,7 +109,7 @@ def test_lfm_overlay_steps() -> None:
 
 
 def test_lfm_overlay_sequences() -> None:
-    """Three sequences on one device (``LfmOverlay(sequences=3)``: texts of their own, at positions of their own, each
+    """Three sequences on one device (``LfmOverlay(sequences=3)``: separate texts at separate positions, each
     with its conv histories and caches) give, slot by slot, the logits of each sequence alone in steps of one, bit for
     bit: alternated (``select``: a step of 1 .. 4 slots of one, then of the next) and in joint steps (``step``'s parts:
     slots dealt at random, a sequence's drafts too, some of them rejected - the next step continues at the accepted
@@ -166,7 +166,7 @@ def test_lfm_overlay_sequences() -> None:
     while any(pos[s] < lengths[s] for s in range(nseq)):
         take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
         spare = SLOTS - len(take)
-        for t in take:  # (more slots of its own: drafts, the last one's step alone of one slot)
+        for t in take:  # (more slots for the same sequence: drafts, the last one's step alone of one slot)
             while spare and rng.random() < 0.4 and pos[t[0]] + t[1] < lengths[t[0]] - 1:
                 t[1] += 1
                 spare -= 1

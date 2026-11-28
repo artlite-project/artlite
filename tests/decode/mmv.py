@@ -525,8 +525,8 @@ class MmvOperator(ArtcOperator):
     def __init__(self, *, fmt: str = "Q4_K", n_tiles: int = 4, tile_bytes: int = 9280, nsb: int = 4, win: bool = False,
                  slots: int = SLOTS, G: int = 1, compact: bool = False):
         """win: event0 / event1 around each core's half tile (the profiling skill's counters); slots: the design's token
-        slots (``decode.gemv``); G: the tiles as row groups of a qtails design (``render(rg_all=)``: 4, B_G4: a
-        super-block's rows their own; 8, B_G8: a half super-block's); compact: the format's compact kernels
+        slots (``decode.gemv``); G: the tiles as row groups of a qtails design (``render(rg_all=)``: 4, B_G4, gives each
+        super-block's rows a separate group; 8, B_G8, each half super-block's); compact: the format's compact kernels
         (``render(compact=)``)."""
         self.fmt, self.n_tiles, self.tile_bytes, self.win, self.slots, self.G = fmt, n_tiles, tile_bytes, win, slots, G
         self.compact = compact

@@ -1,7 +1,7 @@
 // ---- BFP16 (8 rows): the panels [k8 {{ 32 * NSB }}][row 8][exp, 8 int8] (a bfp16 block per row and 8 k, formats/bf16.py);
 // core H: super-blocks {{ NSB // 2 }} H .. (k8 {{ 16 * NSB }} H ..). y[g 0] += the hi and lo rows' sums of X W^T (8 slots: its
 // rows), in fp32 (two chains: even and odd k8){{ "; rg_all: ys > 0, super-block 2 H + 1's rows into y + ys (row groups of
-// 4: rows of their own), each super-block's two chains apart" if rg and rg_all else "" }}
+// 4: separate output rows), with each super-block's two chains kept separate" if rg and rg_all else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_bfp(uint8_t *__restrict a, const uint8_t *__restrict xp,
                                            const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg and rg_all else "" }})

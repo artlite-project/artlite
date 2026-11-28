@@ -71,7 +71,7 @@ def load_tokenizer(model_path: str, tokenizer_path: str | None = None) -> Tokeni
     Sources, first found: ``tokenizer_path`` or the ``tokenizer.json`` (Hugging Face) next to the model (in it: a
     checkpoint directory);
     the vocabulary of a GGUF file (``model_path``). For Llama 3 both give the same ids."""
-    if tokenizer_path is None:  # (a checkpoint directory: its own)
+    if tokenizer_path is None:  # (a checkpoint directory holds its tokenizer)
         model_dir = model_path if os.path.isdir(model_path) else os.path.dirname(os.path.abspath(model_path))
         path = os.path.join(model_dir, "tokenizer.json")
         tokenizer_path = path if os.path.exists(path) else None

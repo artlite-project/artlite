@@ -12,7 +12,7 @@ rounds 3 KB; the caller initializes u = x w' (fp32) and its bf16 copy in b0 (``c
 
 Schedule (measure_ii, a round of one group): II 17 per 16 channels, 179 cycles a round, ~1550 per group of 8 rounds
 (both state widths), the stores binding (the copy's 4-channel groups written twice: 8 32-byte stores and 4 of u per 16
-channels). A round is a call of its own: llvm-aie gives a gather a memory operand only when each base of its address
+channels). Each round is a separate call: llvm-aie gives a gather a memory operand only when each base of its address
 vector is a pointer parameter used for nothing else (``kmath.gather``; then it takes the gathers as reads of a read-only
 table, so the call orders a round's gathers after the stores of the round before). Rejected: rounds inline with their
 gathers issued blocks ahead (II 16-29: the copies of the prefetched registers bind the move slot), several groups per

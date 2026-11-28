@@ -129,8 +129,8 @@ def run_npu(
     compile_timeout: float = 1800,
 ) -> None:
     """Time each variant on the NPU and read its event-window counters per region (the operator's win_param set
-    to the region name), filling VariantResult.npu. Every build compiles first in its own process (in parallel,
-    with a timeout: no NPU context yet), then runs in its own process, one at a time, without a timeout (a
+    to the region name), filling VariantResult.npu. Every build compiles first in a separate process (in parallel,
+    with a timeout: no NPU context yet), then runs in a separate process, one at a time, without a timeout (a
     process that holds an NPU context must not be killed)."""
     path = _importable(result.factory)
     if isinstance(result.factory(**result.kwargs), str):
@@ -182,7 +182,7 @@ def run_npu(
             build.error = "compile failed: " + (process.stderr.strip().splitlines() or ["?"])[-1]
 
     parallel_compile.parallel_map(compile_one, builds, limit=jobs)
-    for build in builds:  # one NPU job at a time, each in its own process
+    for build in builds:  # one NPU job at a time, each in a separate process
         npu = build.result.npu
         assert npu is not None
         report = build.result.report

@@ -58,7 +58,7 @@ PLE_Q8 = "per_layer_model_proj.weight/Q8_0"  # (the per-layer projection's copy:
 
 
 def kv_quarters(hd: int) -> np.ndarray:
-    """(COLS, hd / 4) rows of K (or V: 2 KV heads, 2 hd rows) of the columns (PARO: k and v phases of their own): column
+    """(COLS, hd / 4) rows of K (or V: 2 KV heads, 2 hd rows) of the columns (PARO: separate k and v phases): column
     4 h + j's are KV head h's quarter j."""
     c = np.arange(COLS)[:, None]
     return (c // 4) * hd + (c % 4) * (hd // 4) + np.arange(hd // 4)[None]
@@ -197,7 +197,8 @@ class GemmaImage(RotatedImage, NormedImage):
 
     def fmt(self, name: str) -> str:
         f = super().fmt(name)
-        if f not in FORMATS and not self.paro:  # (a PARO image's: ``formats``, its head's plane not its own)
+        # (a PARO image's come from ``formats``: its head's tiles are a plane, not the tensor's format)
+        if f not in FORMATS and not self.paro:
             raise NotImplementedError(f"{name}: {f} tiles (the Gemma decode reads {', '.join(FORMATS)} of {KC} columns)")
         return f
 

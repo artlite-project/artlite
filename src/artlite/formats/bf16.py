@@ -1,5 +1,5 @@
 """BFP16 tiles (288 bytes per row and super-block) of a BF16 or F16 tensor, its values rounded once to bfp16ebs8: 8 rows
-= 32 MMUL panels per super-block [k8][row][exp, 8 int8]. (BF16 and F16 tensors have no tile format of their own:
+= 32 MMUL panels per super-block [k8][row][exp, 8 int8]. (BF16 and F16 tensors have no dedicated tile format:
 ``tile_format``.) Of an F32 tensor (an MoE router's rows), two planes per row: hi = bfp16(w) and lo = bfp16(w - hi)
 (``decode.image.Block``), whose sum is w to ~3e-5.
 

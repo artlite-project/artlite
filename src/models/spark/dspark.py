@@ -1,7 +1,7 @@
 """The DSpark block drafter of a Spark-X model (``artlite.model_config.DSparkConfig``; XHToken's llama.cpp fork's
 ``src/models/dflash.cpp``) on the model's decode overlay: the model's design and hardware context (``SparkOverlay.op``,
-which runs the drafter's BFP16 tiles and gate / up rows: ``needs``), buffers of its own, its weights in a buffer of their
-own (``dspark_image.DSparkImage``), its head the first rows of each column of the model's LM head, read in place
+which runs the drafter's BFP16 tiles and gate / up rows: ``needs``), separate buffers, its weights in a separate buffer
+(``dspark_image.DSparkImage``), its head the first rows of each column of the model's LM head, read in place
 (``decode.head``: the model's image laid out with them, ``SparkOverlay(head=True)``). One dispatch a round (``run``):
 
 - the injection of the model's last step's rows: their taps (the residual entering the layers ``taps``: the x of
@@ -16,7 +16,7 @@ own (``dspark_image.DSparkImage``), its head the first rows of each column of th
 
 An injection writes the records of all S slots of the model's step; those past the kept rows are the next block's
 positions, which it writes again. The caches: per layer and KV head a ring of ``nr`` groups (group g at g % nr: the
-block's window and its own groups; ``decode.attn256_steps``' "ra" / "rb" fills), the open records' rings
+block's window and the block's groups; ``decode.attn256_steps``' "ra" / "rb" fills), the open records' rings
 (``decode.vring``); a sequence's state (``snapshot``) holds the window's groups before a position, as the model's
 sliding-window layers'. Transactions per (injected slots, block) are built at their first use and patched per round: the
 two parts' F_ATT objects are the two buffers of ``AttentionSteps`` (b 0: the injection's, 1: the block's).

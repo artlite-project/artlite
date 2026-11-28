@@ -1,6 +1,6 @@
 """Spark-X's lanes on the NPU (``NpuSpark(sequences=)``; models/lanes.py): a conversation alone on lane 1 against lane
-0 (its prompt's chunks into its own caches), then three conversations on one model object, each on a thread of its
-own, against each one alone: greedy replies token for token, without drafts and with the DSpark drafter's (its rings
+0 (its prompt's chunks go into lane 1's caches), then three conversations on one model object, each on a separate
+thread, against each one alone: greedy replies token for token, without drafts and with the DSpark drafter's (its rings
 per sequence, a lane's rows of the shared steps injected from the staging region), the lanes' decode rounds in joint
 steps of up to 8 slots (an attention pass per sequence over its own caches); after the rounds the lanes shared, each
 lane's drafter gives the block (bf16 bits of its logits) it gives after the conversation alone."""

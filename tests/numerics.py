@@ -1,5 +1,5 @@
 """The comparators and roundings the tests share: relative errors (each tolerance is calibrated against one of
-them, so each is a function of its own), KL divergences of logits, bf16 rounding and bf16 bits, the GELUs of the
+them, so each is a separate function), KL divergences of logits, bf16 rounding and bf16 bits, the GELUs of the
 CPU references, and the elementwise tolerance check of the stream operators.
 
 Arguments are numpy arrays (``ml_dtypes.bfloat16`` too) or torch tensors, in any mix."""
@@ -86,7 +86,7 @@ def bf16_round(x: object) -> np.ndarray | torch.Tensor:
 
 
 def bf16_like(x: torch.Tensor) -> torch.Tensor:
-    """The values of a tensor rounded to bf16, in its own dtype."""
+    """The values of a tensor rounded to bf16, in the tensor's dtype."""
     return x.to(torch.bfloat16).to(x.dtype)
 
 

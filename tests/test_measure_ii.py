@@ -121,7 +121,7 @@ __attribute__((noinline)) void caller(const float *__restrict x, float *__restri
         rows(x + 64 * p, y + 64 * p);
 }
 
-// kernel_lib.h's loops inlined into an if-chain: their own code comes from deeper headers (aie_api), the statement
+// kernel_lib.h's loops inlined into an if-chain: the loops' code comes from deeper headers (aie_api), the statement
 // and the call site from the inlining chains of the .loc directives
 __attribute__((noinline)) void init(float *__restrict y, const float *__restrict x, int k)
 {
@@ -256,7 +256,7 @@ def test_early_exit_and_calls(measured: tuple[KernelReport, str]) -> None:
 
 
 def test_merged_location(measured: tuple[KernelReport, str]) -> None:
-    """Both loops of inv report the inner loop's location: the outer one gets its own statement."""
+    """Both loops of inv report the inner loop's location: the outer one gets a separate statement."""
     report, printed = measured
     loops = {loop.kernel_line: loop for loop in _loops(report, "inv")}
     outer, inner = loops[_line("loop sg")], loops[_line("loop j")]

@@ -61,7 +61,7 @@ from . import attn as AT
 
 OBJ = 9216  # a cache object
 QH = AT.QH  # query heads per KV head
-WINDOW_GROUPS = 17  # groups a sliding-window pass streams (the window's 16 before it, its own)
+WINDOW_GROUPS = 17  # groups a sliding-window pass streams (the window's 16 before the pass's group, then that group)
 # scratchpad parameters
 QA_CS = {256: "g4_cs_s", 512: "g4_cs_f"}  # bf16 offset of the chunk's rows in the cos / sin table
 QA_KV = {256: "g4_kv_s", 512: "g4_kv_f"}  # bf16 offset of the chunk's first cache group (a sliding-window cache: after
@@ -157,7 +157,7 @@ class GemmaPrepOperator(ArtcOperator):
         """``kp``: the cache's K panels per record (2: hi + lo, 1: single)."""
         assert cfg.num_attention_heads == COLS and all(k == COLS // QH for k in cfg.kv_heads)
         self.kind = kind_of(cfg, hd, kp)
-        # (a PARO checkpoint's layout: k and v of their own, each column a quarter of its KV head's K and V)
+        # (a PARO checkpoint's layout: separate k and v, each column a quarter of its KV head's K and V)
         assert T % 32 == 0 and T // 8 <= MAX_BD_ITER and ({"q", "kv"} <= set(layout.off) or {"q", "k", "v"} <= set(layout.off))
         self.T, self.cfg, self.layout, self.kv_bytes, self.cs_positions = T, cfg, layout, kv_bytes, cs_positions
         super().__init__()
@@ -447,7 +447,8 @@ class GemmaAttnOperator(ArtcOperator):
                                                    [0, COLS * qw, 1152, 1]), group=tg)
                 oh[c].drain(A, TensorAccessPattern((n_a,), c * nd * 36, [n_pass, 4 * qb, nd, 36],
                                                    [4 * qb * COLS * nd * 36, COLS * nd * 36, 36, 1]), group=tg, wait=True)
-            # per pass the window's 16 groups before it and its own (one BD iterated per pass): their units' halves
+            # per pass, the window's 16 groups before the pass's group, then that group (one BD iterated per pass):
+            # their units' halves
             for h in range(n_kv_heads):
                 kvh[h].fill(KV, TensorAccessPattern((n_kv,), h * hb, [n_pass, 1, wg * k.group // k.unit, uw],
                                                     [qb * g2, 0, uw, 1]), offset_parameter=p_sw, group=tg)
@@ -463,12 +464,12 @@ class GemmaAttnOperator(ArtcOperator):
         """Head_dim 512: a core's two input channels each carry half of the KV head's cache stream, as a fused attention
         whose tiles take Q + K on one inbound path and V on the other (arXiv 2609.21264), balanced: stream s of a KV
         head carries d-blocks 32 s .. 32 s + 31 of every cache object (a K record's hi and lo panels, a V object's two
-        records), from its own shim through its own memtile (which interleaves the two parts per d-block),
+        records), from a dedicated shim through a dedicated memtile (which interleaves the two parts per d-block),
         broadcast to the head's 16 cores; the kernels run a loop per stream object. With one stream of
         whole objects, each core's 8 B / cycle input channel bounds the layer (every position's 1728 bytes to each core
         once per 32-query pass). A pass's 16 Q objects ([token group of the pass][column of the head], the prep's
         pass-major QS, per half [hi | lo] panels) ride ahead of its cache objects, their halves on the two streams;
-        each core copies its own."""
+        each core copies its own Q object."""
         p, k = self.pfx, self.kind
         nd, hd = k.nd, k.hd
         bf, f32 = np.dtype[bfloat16], np.dtype[np.float32]

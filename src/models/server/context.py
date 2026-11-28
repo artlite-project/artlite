@@ -53,7 +53,7 @@ class ApiContext:
     """The state of one model's server that its routes share: ``engine``, ``options``, ``info``, the template's
     properties (``syntax``: its tool calls, None: it takes no tools; ``typed``: content as text parts; ``first``: a
     system message only first; ``efforts``: the ``reasoning_effort`` levels it renders distinctly (``none`` among them
-    where it renders one of its own: Inkling's effort 0); ``thought_end``: what
+    where it renders a dedicated one: Inkling's effort 0); ``thought_end``: what
     it writes after a thought, ``templating.thought_end``), ``store`` (the Responses API's, for
     ``previous_response_id``), ``replies`` (the spoken replies: their audio ids in later turns)."""
 
@@ -268,7 +268,7 @@ class ApiContext:
         ``reasoning_budget_tokens``, else ``thinking_budget_tokens``, the web UI's and Anthropic's; -1 or none: its
         ``reasoning_effort``'s, ``EFFORT_BUDGETS``, where the template renders no levels of its own - Qwen3.8's and
         Spark-X's keep theirs -, else ``--reasoning-budget``; < 0: any), the message that ends it early (``reasoning_budget_message``, else ``--reasoning-budget-message``;
-        ``Job.thought_end``: on a paragraph of its own), the template's own end of a thought after it (``thought_end``:
+        ``Job.thought_end``: in a separate paragraph), the template's own end of a thought after it (``thought_end``:
         Qwen's ``"\\n</think>\\n\\n"``, so that the next request, which renders the cut thought again, continues
         the cached tokens; llama-server forces the message and the close marker alone) and whether the control route
         may end it (``reasoning_control``)."""

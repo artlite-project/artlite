@@ -1,6 +1,6 @@
 """LFM3's lanes on the NPU (``NpuLfm(sequences=)``; models/lanes.py): a conversation alone on lane 1 against lane 0 (its
-prompt's chunks into its own caches and conv histories), then three conversations on one model object, each on a
-thread of its own, against each one alone: greedy replies token for token, with the context's drafts and without, the
+prompt's chunks go into lane 1's caches and conv histories), then three conversations on one model object, each on a
+separate thread, against each one alone: greedy replies token for token, with the context's drafts and without, the
 lanes' decode rounds in joint steps (a conv pass per sequence)."""
 
 import time

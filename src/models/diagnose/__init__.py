@@ -96,7 +96,7 @@ def run(*, model_file: str, seconds: float, out_dir: str) -> str:
         data["root"] = system.root_readings()  # (a root login: still root)
     data["identity"] = system.identity()
     data["code"] = system.code_state()
-    sensors = artlite.Device()  # (the sampler's: a DRM client of its own)
+    sensors = artlite.Device()  # (the sampler's device: a separate DRM client)
     data["npu_info"] = system.npu_info(sensors)
     cpu = irq_cpu()
     data["irq_cpu"] = cpu

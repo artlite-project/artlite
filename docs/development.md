@@ -26,8 +26,8 @@ a new llama.cpp build or reference source replaces an entry's older version. An 
 until deleted; a read marks it used, so
 `find tests/refs -mindepth 2 -maxdepth 2 -mtime +30 -exec rm -rf {} +` removes those unused for 30 days.
 
-The C++ runtime's tests (gtest: `tests/csrc/npu_test.cpp` on the NPU, the other files host-only) build in their own tree, with the venv active (`build/` belongs
-to the editable install):
+The C++ runtime's tests (gtest: `tests/csrc/npu_test.cpp` on the NPU, the other files host-only) build in a separate
+tree, with the venv active (`build/` belongs to the editable install):
 
 ```bash
 cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON
@@ -73,7 +73,7 @@ How they compile and load: [Design](design.md#kernel-compilation-pipeline); wher
 - Builds are cached per content hash in `~/.cache/artlite/rtc_<hash>/` (inspect the artifacts there;
   `ARTLITE_CACHE_DIR` moves it, `ARTLITE_IGNORE_CACHE=1` rebuilds). A render manifest (`render_cache.py`, keyed by
   class, constructor arguments and the sources' hash) skips rendering cached designs; a module global changed at
-  runtime is not in that key, so a monkeypatched test needs its own operator names.
+  runtime is not in that key, so a monkeypatched test needs distinct operator names.
 - First use (`op.device` or the first dispatch) opens a HW context and uploads the program. `dispatch(*buffers)`
   submits in sequence order and waits, without host <-> device syncs; `run(*tensors)` is the one-shot wrapper;
   `artlite.from_numpy` / `artlite.empty(..., device=)` give device buffers (`Tensor.numpy()`: a zero-copy view); `compile(device=)` chains operators

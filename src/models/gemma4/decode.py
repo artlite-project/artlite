@@ -3,14 +3,14 @@ their GEMV phases on the image's Q4_0 / Q8_0 tiles, ``gemma4.image``) with Gemma
 
 - the GEMV tiles split by rows between the main and helper cores (``decode.gemv.row_split``);
 - gate / up: gelu(bf16(gate)) up; the per-layer input gate: gelu(bf16(y)) pli (``F_PLI``: pli from the per-layer
-  projection's rows, a phase of its own, and the host's per-layer token rows);
+  projection's rows in a separate phase, and the host's per-layer token rows);
 - post-norm residual updates (``F_POST`` headers, ``F_VOUT`` outputs: the residual stays fp32 in the main cores);
 - packed inputs (``packed_slots``: the step's slots only);
 - the attention cores (c, 5) (``decode.attn``, Gemma's shapes ``gemma4/attn.py``): per KV head a chain of 4 columns
   over the cache, o and the KV records out on D (shim S2MM 1), no relay through the main core.
 
 A PARO checkpoint's design (``paro``): P4_128 tiles of 1024 columns (the super-block split; the LM head's Q4_0 plane, the
-per-layer projection's Q8_0 copy), the hidden's inputs as half regions, gate / up as phases of their own, proj's K 256 as
+per-layer projection's Q8_0 copy), the hidden's inputs as half regions, gate / up as separate phases, proj's K 256 as
 row-group tiles; rotated inputs (``decode.design``'s "Rotated inputs") with the post-norm updates of R phases instead of
 headers (``gemma4.paro_steps``).
 

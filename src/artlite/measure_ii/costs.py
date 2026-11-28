@@ -19,8 +19,8 @@ class _Cycles:
 class CostModel:
     """Cycle estimates (a bundle is a cycle) of loops and of calls to the kernel's functions.
 
-    One iteration of a loop: its II (its own bundles on all paths for a branch
-    loop), all iterations of its inner loops (their prologue and epilogue blocks
+    One iteration of a loop: its II (for a branch loop, the bundles of all its
+    paths), all iterations of its inner loops (their prologue and epilogue blocks
     are the enclosing loop's own blocks) and its calls. A call: the function's
     code outside loops, its loops and its calls. None when a trip count or a
     callee (outside the kernel, recursion) is unknown."""

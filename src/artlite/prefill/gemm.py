@@ -11,8 +11,8 @@ the image) and the layout of their output (``Layout``):
   column's quarter of [K; V], gate; LFM3's in: B | C | x, qkv: q | k half | v half | gate): C rows of ``COLS`` column slices of ``pitch`` columns, block b of column c from
   c pitch + off[b] (its valid rows contiguous, the tile and pass padding after them): the attention (and GDN) cores
   of column c read their column's slice. A block of F32 rows as plane pairs (``Block.pairs``: Occamy's GDN alpha) runs
-  as GemmQ with ``c_pairs`` (fp32 sums, two bf16 units each); the next block follows its values directly (its own GEMM
-  after it overwrites the pass's other outputs: qwen35's [alpha | beta] slot);
+  as GemmQ with ``c_pairs`` (fp32 sums, two bf16 units each); the next block follows its values directly (the next block's
+  GEMM runs after it and overwrites the pass's other outputs: qwen35's [alpha | beta] slot);
 - output projections (``OUT``: into the residual stream): column c's rows (hidden / 8) at c d_pitch (``d_pitch``: one
   pitch for every layer, the residual add reads it);
 - gate_up: act(gate) up as bfp16 panels (the down projection's A; ``act``: silu, or a GELU form: Gemma's gelu, Spark-X's
@@ -180,7 +180,7 @@ def _plan(region: Region, run: list[int], T: int, K: int, few: bool) -> object:
 
 def _qt_plan(region: Region, run: list[int]) -> PlanarPlan:
     """The passes of a ``Region.qt`` region's planar run: a group of row tiles each (``Region.qg``: they share their tail
-    tile), a block's partial last group a block of its own (its tail tile closer: the weight fills' group stride
+    tile), a block's partial last group becomes a separate block (its tail tile is closer: the weight fills' group stride
     changes there, ``geometry.Geometry.qt``)."""
     b0 = region.blocks[run[0]]
     t, R = region.qg, b0.R
@@ -370,7 +370,7 @@ def joined_layout(regions: list[Region], T: int, pitch: int = 0) -> Layout:
 
 def plan_gate_up_pair(image: TileImage, gate: Region, up: Region, T: int, ops: dict[tuple, GemmQOperator] | None,
                       a_width: int = 0, *, act: str = "", dual_T: int = 0) -> PhasePlan:
-    """Gate and up as regions of their own (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
+    """Gate and up as separate regions (a PARO checkpoint's: their inputs differ, the GEMMs read their A arguments
     from the caller's slices, panels ``a_width`` columns wide: ``plan_phase``'s): one GEMM design for both (a pass of
     tile-major 16-row tiles: 64 outputs), its C as bf16
     panels into GU, [T / 8][ffn / 8][gate 64 | up 64] (``c_panels``; up's C argument 64 elements in), which down's
@@ -487,8 +487,8 @@ def plan_gate_up_rows(image: TileImage, gate: Region, up: Region, T: int, ops: d
 def plan_phase(image: TileImage, region: Region, T: int, *, pitch: int = 0, ops: dict[tuple, GemmQOperator] | None = None,
                act: str = "silu", k_part: int = 0, layout_T: int = 0, layout: Layout | None = None,
                a_width: int = 0) -> PhasePlan:
-    """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; the output
-    projections' is required, an input projection's at least its own). ``ops``: the GEMM objects of earlier plans,
+    """The GEMMs of a region for T tokens (``pitch``: the output column pitch, ``phase_pitch``; required for the output
+    projections; for an input projection, at least its own output width). ``ops``: the GEMM objects of earlier plans,
     reused for identical GEMMs (and extended). ``act``: gate_up's activation (silu, gelu, gelu_erf). ``k_part``: an output
     projection in K parts of that many chunks (dividing a chunk group: each part's A strip may stay in the memtile, and
     each accumulates fewer k-tiles in its bf16 C tile; the parts' sum in the residual add). ``layout_T``: an input

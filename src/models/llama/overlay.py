@@ -17,10 +17,10 @@ padding rows' logits are cut off, ``ModelOverlay._logits``).
 
 A PARO checkpoint (``llama.image``'s regions; the decode design's "Rotated inputs"): the step starts with rot_in (the
 embeddings' rotated copies for the first layer's q, k, v, each with the columns' partial sums of squares), then per layer
-q, k, v (F_PSQ: each on its own rotated input), att (o into rot_o's input), rot_o (each column rotates o of its heads into
-o's input), o (its residual's copies for gate and up), gate and up (F_PSQ; their rows into rot_down's input, [gate SP |
-up SP] per k block), rot_down (each column's act(gate) up, rotated, into down's input), down (the next layer's q, k, v
-copies; the last layer's residual as it is, for the LM head).
+q, k, v (F_PSQ: each on a separate rotated input), att (o into rot_o's input), rot_o (each column rotates o of its heads
+into o's input), o (its residual's copies for gate and up), gate and up (F_PSQ; their rows into rot_down's input, [gate
+SP | up SP] per k block), rot_down (each column's act(gate) up, rotated, into down's input), down (the next layer's q,
+k, v copies; the last layer's residual as it is, for the LM head).
 
 The KV caches (KV): per layer and KV head linear groups of kp + 1 objects of the tile size T (``decode.kv``: kp K
 objects, the V object; kp = 2, K as bfp16 hi + lo, or 1, single bfp16: ``kv_k``), 128 positions per group at
@@ -41,11 +41,12 @@ ring slots of the sub-step's open records, or after a prefill the V panels of th
 drains (D: address, length). A column's weights between two attentions are one run of the (column-major) image: one A
 task.
 
-Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
-step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own. Every slot's logits are
-those of a step of one of its sequence, bit for bit. Four sequences of one token take 15.0 / 39.5 / 86.7 ms where a
-step of one takes 12.6 / 34.1 / 79.5 (Llama 3.2 1B / 3B, 3.1 8B at 1K positions): 3.4x - 3.7x the tokens per second;
-at 16K positions 35.1 / 110.7 ms against 17.7 / 51.8 (1B / 3B: 2.0x / 1.9x), each sequence's own pass over its caches.
+Several sequences (``sequences``: each one's caches and rings in a separate KV buffer, ``ModelOverlay.select``): a
+step's slots may belong to several of them (``step``'s parts), with each sequence's slots in a separate sub-step.
+Every slot's logits are those of a step of one of its sequence, bit for bit. Four sequences of one token take 15.0 /
+39.5 / 86.7 ms where a step of one takes 12.6 / 34.1 / 79.5 (Llama 3.2 1B / 3B, 3.1 8B at 1K positions): 3.4x - 3.7x
+the tokens per second. At 16K positions they take 35.1 / 110.7 ms vs. 17.7 / 51.8 (1B / 3B: 2.0x / 1.9x), because each
+sequence makes a separate pass over its caches.
 """
 
 import math
@@ -136,7 +137,7 @@ class LlamaOverlay(RotatedOverlay, AttentionOverlay):
         gu = {R for L in self.layers for b in img.region(L, "gate_up").blocks for R in (b.R, b.R2) if R} \
             if not img.paro else {16}
         self.paro = img.paro
-        if self.paro:  # (gate and up: phases of their own)
+        if self.paro:  # (gate and up run as separate phases)
             assert self.H % 1024 == 0 and self.H // COLS % ROT_GROUP == 0, \
                 f"a PARO checkpoint of hidden size {self.H}: whole K chunks and rotation groups per column"
         self.op = LlamaDecodeOperator(hidden=self.H, rows={f: img.R[f] for f in sorted(fmts)}, tile_bytes=self.T,
@@ -315,9 +316,9 @@ class LlamaOverlay(RotatedOverlay, AttentionOverlay):
     def step(self, x: np.ndarray, position: int | tuple[Part, ...], *, logits: bool = True) -> np.ndarray | None:
         """One step of S = len(x) <= 4 token slots: x (S, hidden) the embeddings at positions position .. position + S
         - 1 of the selected sequence (the positions before are cached), or of several sequences' slots: ``position``
-        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's at its own next positions).
-        Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or without
-        ``logits`` None (only the caches are updated)."""
+        their parts (``decode.step.Part``: x's rows in the parts' order, each sequence's rows at that sequence's next
+        positions). Returns the logits (S, vocab) bf16 (a view of the NPU's buffer, valid until the next step), or
+        without ``logits`` None (only the caches are updated)."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= SLOTS

@@ -12,7 +12,7 @@ prompt's time to first token also with llama.cpp on the iGPU:
 | image TTFT | MiniCPM-V 4.7 1B's time to first token with an image, four images, its 16x and 4x vision encoders |
 
 Each Artlite bar is one GGUF file ([below](#measured-files)). FastFlowLM's and OpenFlowLM's bars stand under the
-Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF's numerics in their own tiles.
+Artlite file with comparable weights: their q4nx files hold a Q4_1 or Q4_K GGUF's numerics in a different tile layout.
 
 ## Test system
 
@@ -135,7 +135,7 @@ superscript, and the charts' legend names its build.
 | | Qwen3.8 27B | `qwen3.8-mtp:27b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw); lm_head and embedding Q8_0; its MTP layer (7 drafts per step; its DFlash 2 drafter, `qwen3.8-dflash2:27b`, decodes these prompts no faster); at most 16377 positions | Q4_K_M |
 | | Qwen3.6 35B-A3B | `qwen3.6-moe:35b-a3b` | Q4_K numerics re-fit to FastFlowLM's Q4_K (4.625 bpw) | Q4_K_M |
 | | MiniCPM-V 4.7 1B | `minicpm-v-4.7:1b` | FastFlowLM's own Q4_K quantization (560 MB per token, the lm_head Q8_0), not openbmb's GGUF files; text prompts | Q4_K_M |
-| | LFM3 1.7B | `lfm3:1.7b` | its own file (1.61 GB) of LiquidAI's quantization-aware-distilled Q4_0 weights | QAD-Q4_0 |
+| | LFM3 1.7B | `lfm3:1.7b` | a dedicated file (1.61 GB) of LiquidAI's quantization-aware-distilled Q4_0 weights | QAD-Q4_0 |
 | OpenFlowLM | Qwen3 0.6B | `qwen3:0.6b` | FastFlowLM's container | Q4_1 |
 | | Llama 3.2 1B Instruct | `llama3.2:1b` | FastFlowLM's container of the same Q4_1 | Q4_1 |
 | | Llama 3.2 3B Instruct | `llama3.2:3b` | imatrix Q4_1 GGUF (FastFlowLM's container) | Q4_K_M |

@@ -475,7 +475,7 @@ def responses_chat(body: dict[str, Any], history: list[dict[str, Any]], note: No
         kind = choice.get("type")
         if kind in ("function", "custom"):
             out["tool_choice"] = named(choice)
-        elif kind == "allowed_tools":  # (the chat API's spelling: its list in an object of its own)
+        elif kind == "allowed_tools":  # (the chat API's spelling: its list in a separate object)
             out["tool_choice"] = {"type": "allowed_tools", "allowed_tools": {
                 "mode": choice.get("mode", "auto"), "tools": [named(t) for t in choice.get("tools") or []]}}
         else:

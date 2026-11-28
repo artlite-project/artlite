@@ -6,10 +6,10 @@ Strix Halo hides. Both concern the rows the NPU's DMA reads and writes in DRAM:
 
 - **Writes of part of a 64-byte line.** On Krackan Point such a write costs 4.7x a whole line's. Artlite's prefill
   writes whole lines.
-- **Rows on pages of their own.** The NPU translates the address of every memory page a DMA row touches. With 2 MB
+- **Rows on separate pages.** The NPU translates the address of every memory page a DMA row touches. With 2 MB
   pages (Linux) that is nearly free; with 4 KB pages, the only size Windows gives the NPU, the translations cap the
-  NPU at 45-80 million page visits a second. The prefill's many short rows pay it: this is most of the prefill's
-  gap on Windows.
+  NPU at 45-80 million page visits a second. The prefill's many short rows pay this cost, which accounts for most of
+  the prefill's gap on Windows.
 
 The second cost needs a change of the prefill's data layouts: **page-local bricks**, a proposal described in the last
 sections. It is not implemented yet.
@@ -52,8 +52,8 @@ and end). Their sources and what Artlite does:
 
 - **Planar GEMM passes** (Q6_K tiles of 11 rows: passes of 66 columns, pass p at column 66 p). Each pass writes a window
   of whole lines from the line boundary at or before its first column: the previous pass's last columns first (the
-  core keeps them in its output buffer and moves its own columns behind them), its own columns, then columns that the
-  next pass rewrites. The output layouts leave room for the last window.
+  core keeps them in its output buffer and places the pass's columns behind them), then the pass's columns, then
+  columns that the next pass rewrites. The output layouts leave room for the last window.
 - **gate/up's output** (bfp16 panels, 32 outputs per pass: 288-byte rows, half of them ending inside a line). Two
   passes, or a pass's two halves, share one output buffer, drained as 576-byte rows: whole lines.
 - **The output projections' column pitch** is a whole number of lines.
@@ -68,7 +68,7 @@ On Linux, Artlite's host buffers of 2 MB or more are the process's own memory wi
 `madvise` or `always`; `artlite-probe` prints `host buffers: 2 MB pages`), weights and activations alike. Windows maps
 system memory for the NPU in 4 KB pages: the probe rows on both Windows laptops behave as Strix Halo's with 4 KB pages,
 at about half its rate. Buffers on the process's own large pages (`MEM_LARGE_PAGES`: `ARTLITE_LARGE_PAGES=1`, where
-the account holds the "Lock pages in memory" right) change nothing: the NPU reaches them at addresses of its own,
+the account holds the "Lock pages in memory" right) change nothing: the NPU reaches them at separate device addresses,
 through a mapping of 4 KB entries (Krackan Point: every probe row and the 1B's prefill as on 4 KB pages).
 
 What a page visit costs, measured on Strix Halo with 4 KB and with 2 MB pages (16 channels unless noted; 256-byte rows,

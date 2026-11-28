@@ -59,9 +59,9 @@ def _attention(size: str, p: int, S: int, split: int, rec: bool, far: float = 1.
     KV head's columns (9B / 27B 2, 1B 4) divides the cache's groups, the partials merged west to east, the last column
     emitting o of the chain's heads (35B-A3B: chains of 4 columns of 2 heads, split sub-steps of up to two slots; split 2:
     of 3 or 4 in two rounds, one per KV head, both chains on its cache, each with half its heads, on the first chain's
-    streams shared with the columns 4 away; its own chain's records). The
-    3.8-27B on a design of 8 slots (one pass): each core over the whole cache with its own heads, on its chain's first
-    column's stream, a step across a cache group too; o an octet's 8 rows."""
+    streams shared with the columns 4 away, while each chain keeps its heads' records). On the 3.8-27B with a design of
+    8 slots (one pass), each core covers the whole cache for its heads, reading its chain's first column's stream, a
+    step across a cache group too; o an octet's 8 rows."""
     path = size_gguf(size)
     require(path)
     cfg = QwenConfig.from_gguf(GGUFFile(path))

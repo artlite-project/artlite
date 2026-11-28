@@ -1,6 +1,6 @@
 """The multi-token-prediction drafter of a Gemma 4 model (a ``gemma4-assistant`` GGUF file; llama.cpp's
 ``src/models/gemma4-assistant.cpp``) on the model's decode overlay (``gemma4/decode.py``): a draft step is one dispatch
-of the same design, with the drafter's weights in a buffer of their own and its layers attending to the model's caches.
+of the same design, with the drafter's weights in a separate buffer and its layers attending to the model's caches.
 
 A draft step predicts the token after a token t at position p from t's embedding (the model's, scaled) and a hidden
 state h (the model's output-normed hidden state of position p - 1, or the one the previous draft step left): pre =
@@ -307,7 +307,8 @@ class GemmaDraft:
 
     def load(self, *, threads: int = 0) -> None:
         """Pack the drafter's weights into a buffer of the overlay's device (``sizes``: the overlay's load allocated
-        them with its own, else here), write the static objects, build the transaction."""
+        them together with the overlay's own; otherwise they are allocated here), write the static objects, and build
+        the transaction."""
         dev = self.ov.dev
         assert dev is not None, "load the overlay first"
         dev.alloc_all(self.sizes)

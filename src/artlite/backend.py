@@ -6,9 +6,9 @@
   (``csrc/shim_xrt``). A context opens from an xclbin of the program's PDI, built in memory. A command reaches only the
   XRT buffers it lists, at most 5 (aiecc's kernel): data buffers are ranges of regions (an XRT buffer each) and a
   command lists theirs. Buffers allocated together (``Device.alloc_host_buffers``; an overlay's:
-  ``OverlayDevice.alloc_all``) are one region of exactly their size; a buffer allocated alone shares a region of 1 GB,
-  pinned whole, or has its own from 256 MB. A buffer's device address exists only once a context does (an instruction
-  buffer's differs between contexts), so programs open their context before they resolve addresses
+  ``OverlayDevice.alloc_all``) are one region of exactly their size; a buffer allocated alone shares a 1 GB region that
+  is pinned whole, or gets a dedicated region from 256 MB on. A buffer's device address exists only once a context does
+  (an instruction buffer's differs between contexts), so programs open their context before they resolve addresses
   (``ADDRESSES_NEED_CONTEXT``). A fused ELF's control program runs as a transaction without its DDR patches
   (``txn.without_ddr_patches``). No profiler register reads, clocks, busy time or firmware error queries.
 

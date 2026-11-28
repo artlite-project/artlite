@@ -204,7 +204,7 @@ def _file_pages() -> int | None:
 
 
 def test_pack_reads_own_views(tmp_path: Path) -> None:
-    """``_native.pack_tiles`` reads a file's tensors through views of its own: the tiles are those of the tensor's
+    """``_native.pack_tiles`` reads a file's tensors through separate views: the tiles are those of the tensor's
     copy in memory, the process holds no more of the file after it than before (the caller's mapping untouched, the
     views unmapped), and a tensor outside the files' mappings is read as the memory it is."""
     rows, cols, R, nsb = 4096, 4096, 16, 4  # (9.2 MB of Q4_0 rows)

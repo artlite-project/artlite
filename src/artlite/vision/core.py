@@ -10,8 +10,8 @@ masks and LFM3's output gate (its codec's window attention); together they do no
 pager's state words (the ext buffer: page id, entry; "ln": the GEMM's GEGLU second, its GELU third; "d": SwiGLU second,
 the product third: a GEMM's command picks the code by the page its op loads). A page arrives in the B stream
 (``device.VisionDevice``: two B slots of control packets, the first in slot 0, its first word ``paging.header()``): the
-core holds both slots, its MM2S 1 streams them into its own program memory while it sleeps in ``sd15_pg_self``, then it
-gives them back.
+core holds both slots, its MM2S 1 streams them into the core's program memory while it sleeps in ``sd15_pg_self``,
+then it gives them back.
 
 A command is one B slot: the header words ``C_*`` and, from word ``C_BIAS``, the op's biases (bf16 [pass][80]); the
 core copies it into its workspace and releases the slot. Kinds:
@@ -57,7 +57,7 @@ core copies it into its workspace and releases the slot. Kinds:
   out: O / l as panels [query panel][d-block]. A group whose keys are all masked (C_KMASK) is streamed and skipped
   (the first group computed sets the reference max). C_DENSE (any number of groups): the first C_NLIVE groups live,
   their last one's masks C_KMASK's words 0, 1 (words 2, 3: -1, every key; 4, 5: 0, the dead groups'). C_QMASK (d
-  160): per query its own masks, from the unit's query object's second half ([group][key panel][2] words: bit 8 q + k
+  160): separate masks per query, from the unit's query object's second half ([group][key panel][2] words: bit 8 q + k
   of word h, query 4 h + q, key 8 kp + k), a group without a key kept skipped.
 
 Statistics records (``REC`` bytes, an output chunk): GroupNorm [image 2][S1, S2][16 groups] fp32 of groups of C_GSIZE
@@ -75,7 +75,7 @@ from ..operators.kernel_source import kernel_prefix
 from ..operators.words import WordMap
 
 # The command's words (the core copies the first ``CMD_WORDS`` into its workspace): the header ``C_*`` words, then per kind of
-# command the regions it uses; the kinds are objects of their own, whose regions reuse one another's words
+# command the regions it uses; each kind is a separate object, whose regions reuse one another's words
 # (``operators.words``: a kind overlaps nothing it extends)
 CMD_WORDS = 64 + 16 * 40 + 96  # the header, up to 16 passes' biases (bf16 [pass][80]), the attention's key masks
 CMD = WordMap("vision command", CMD_WORDS, objects=True)

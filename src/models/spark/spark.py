@@ -48,12 +48,12 @@ class NpuSpark(OverlayModel):
 
     The drafter's records follow the model's: a prompt's chunks write them (``SparkPrefill(dspark=)``), after each
     committed step its rows wait (``_inj``: the step's slots and first position; their taps in the model's ACT) until the
-    drafter's next dispatch, the round's block's or one of their own before the model's next dispatch. A round's step of
-    the token and 7 drafts injects all 8 rows; the kept ones are the sequence's, the next block writes over the others.
-    Several lanes: the model's next step is another lane's too, so a lane's rows are copied out of each step
-    (``_rows_at`` on: the taps of the positions from ``_rows_from``, the sequence's up to its position) and injected
-    from the drafter's staging region (``DSparkOverlay.run``'s ``rows``), 8 a dispatch, the last ones with the block;
-    a lane that drafts nothing for long (no slot left for a draft) keeps the rows a block's window reaches."""
+    drafter's next dispatch: the round's block, or a separate injection dispatch before the model's next dispatch. A
+    round's step of the token and 7 drafts injects all 8 rows; the kept ones are the sequence's, the next block writes
+    over the others. Several lanes: the model's next step is another lane's too, so a lane's rows are copied out of each
+    step (``_rows_at`` on: the taps of the positions from ``_rows_from``, the sequence's up to its position) and
+    injected from the drafter's staging region (``DSparkOverlay.run``'s ``rows``), 8 a dispatch, the last ones with the
+    block; a lane that drafts nothing for long (no slot left for a draft) keeps the rows a block's window reaches."""
 
     recurrent = True  # (the sliding-window layers' rings and the drafter's hold a window: a position comes back from a
     # checkpoint, ``SparkOverlay.snapshot``)

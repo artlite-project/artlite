@@ -35,7 +35,7 @@ decode overlay of 4 token slots (`artlite.decode`) with the attention cores of G
 (`decode/attn.py`) in Flint's configuration and the MoE layers of Qwen3.6 35B-A3B (`artlite.moe`).
 
 - A dispatch runs up to 4 token slots through every layer and the LM head, streaming the weights once for all of them
-  (`overlay.py`, `FlintOverlay`): the projections on each column's main and helper cores; the attention on its own
+  (`overlay.py`, `FlintOverlay`): the projections on each column's main and helper cores; the attention on dedicated
   cores, two columns per KV head with its 8 query heads, the sinks added to the softmax's sum; each MoE layer's router
   on the helper cores, which push their columns' experts' weights themselves, so the host never sees the routing.
 - The prompt runs on a prefill (`prefill.py`, `FlintPrefill`): chunks of up to 8192 tokens as matrix products on the same
@@ -53,23 +53,23 @@ conversation goes back only to a checkpoint (artlite-server takes them: the ring
 ## Drafting
 
 Generation drafts with incoai's DFlash2 block drafter where its file is in the models directory (`--spec-type none`:
-without it; `artlite/decode/dflash/`). One dispatch of the drafter's own design, in a hardware context of its own,
+without it; `artlite/decode/dflash/`). One dispatch of the drafter's design, in a separate hardware context,
 guesses a block of tokens after the next one from the model's rows at five layers of its last step (the drafter's
 taps); the model's next step checks the first 3 of them with the token (steps of up to 4 slots) and keeps the ones it
 agrees with, so the text is the one the model writes alone. The drafter's head is the first 33280 rows of the model's
-LM head, laid out for it at load (the head's rows reordered, no weight copied). Each slot of a step routes its own
+LM head, laid out for it at load (the head's rows reordered, no weight copied). Each slot of a step routes to different
 experts (~+33% of a one-token step), so a round's step takes only the drafts whose probability (the drafter's, as the
 rounds calibrate it) pays for their slots at the measured step times, and the generation runs the drafter's rounds
 while they beat steps of one token. Short chat prompts, 400 tokens greedy, against ~32.4 tokens/s without it: math
 1.31x, code 1.24x, prose 1.13x, JSON 1.07x; the drafter takes 0.19 GB.
 
 Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches, and a decode step's 4 slots
-are tokens of the requests that generate, each in its own cache (`models/lanes.py`). The dense weights stream once for
-all of them, and an MoE layer runs the union of their experts: a step of 2 / 3 / 4 requests takes 1.37x / 1.84x / 2.24x
-a step of one, so 4 requests get 1.4x one request's tokens per second in all. The DFlash2 drafter drafts for a
+are tokens of the requests that generate, each with a separate cache (`models/lanes.py`). The dense weights stream once
+for all of them, and an MoE layer runs the union of their experts: a step of 2 / 3 / 4 requests takes 1.37x / 1.84x /
+2.24x a step of one, so 4 requests get 1.4x one request's tokens per second in all. The DFlash2 drafter drafts for a
 request that generates alone (37.4 tokens per second on a server with `-np 4`); its records are one sequence's at a
-time, saved and brought back as the requests change (11 MB at 1K positions), so where requests share the steps it
-stands back and their rows wait for it: [artlite-server](../server.md#several-requests-at-a-time).
+time, saved and brought back as the requests change (11 MB at 1K positions), so where requests share the steps it stands
+back and their rows wait for it: [artlite-server](../server.md#several-requests-at-a-time).
 
 ## Speed and accuracy (Strix Halo)
 

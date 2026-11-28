@@ -6,8 +6,8 @@ input) or panels (bfp16 [kb][token panel]: a GEMM's / conv's input); in the memt
 in DDR as the columns' images of that memtile region (``Builder.drain`` / ``fill``: one contiguous transfer per column).
 
 GroupNorm records (``Records``): a producer op's per-core records ([core][OCH] in the memtile) drained to DDR [col][core]
-[256 B]; an apply's core sums those of the producer rows whose 16-group window is its own (``ops.gn_window``), read from
-DDR by its B stream (a shim gather of every column's).
+[256 B]; an apply's core sums those of the producer rows whose 16-group window matches its window (``ops.gn_window``),
+read from DDR by its B stream (a shim gather of every column's).
 
 A GEMM's weights go into its DDR image as jobs (``weights.Slots``), packed by the native packer when the dispatch is
 finished; what the host wrote besides them (commands, norm parameters, tables) is ``Built.writes``: a model's cached
@@ -163,7 +163,7 @@ class Builder:
             zc = {c: ColOps(fills=[MemTask([{"addr": self.zero, "nwords": ZERO_BYTES // 4}], ddr=(z + ZERO_BYTES * c, ZERO_BYTES, None))])
                   for c in range(COLS)}
             self.s.op(zc, {})
-        if self._tab_runs:  # (tables first: their K_TABLE commands before the op's; an op of their own where a row's
+        if self._tab_runs:  # (tables first: their K_TABLE commands before the op's; a separate op where a row's
             # B chain would not take one more run, a parity NOP included)
             tabs = {r: RowOps(runs=[run], b_objects=2, parity=False) for r, run in self._tab_runs.items()}
             self._tab_runs = {}
@@ -195,7 +195,7 @@ class Builder:
         self._drains.append((cols, list(release), False))
 
     def flush(self) -> None:
-        """The drains pending (``defer``) pushed with an op of their own, their memtile bytes released."""
+        """The drains pending (``defer``) pushed with a separate op, their memtile bytes released."""
         if self._drains:
             self.op({}, {})
 
@@ -210,7 +210,7 @@ class Builder:
 
     def reading(self, name: str) -> None:
         """A fill of DDR image ``name`` follows: if a drain wrote it since the last sync, that drain pushed (pending
-        deferred drains with an op of their own) and DDR synced (a fill's shim read is not ordered after a drain's
+        deferred drains with a separate op) and DDR synced (a fill's shim read is not ordered after a drain's
         writes)."""
         if name in self._dirty:
             if self._drains:

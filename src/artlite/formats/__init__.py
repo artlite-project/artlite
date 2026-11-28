@@ -70,8 +70,9 @@ def tile_format(qtype: str) -> str:
 
 
 def packs_from(fmt: str, qtype: str) -> bool:
-    """Whether tiles of ``fmt`` are packed from tensors of the GGUF type ``qtype``: its own format (``tile_format``), or
-    one derived from it (``DERIVED``: Q6_KH of Q6_K tensors, ``q6h``; Q8_0H of Q8_0 tensors, ``q8h``; Q4_1_64 of Q4_1 tensors in group-64 pairs, ``q4``)."""
+    """Whether tiles of ``fmt`` are packed from tensors of the GGUF type ``qtype``: either the type's native format
+    (``tile_format``) or one derived from it (``DERIVED``: Q6_KH of Q6_K tensors, ``q6h``; Q8_0H of Q8_0 tensors,
+    ``q8h``; Q4_1_64 of Q4_1 tensors in group-64 pairs, ``q4``)."""
     if fmt in DERIVED:
         return qtype == DERIVED[fmt]
     return fmt == "BFP16" if qtype == "F32" else has_tile_format(qtype) and tile_format(qtype) == fmt

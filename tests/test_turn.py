@@ -47,7 +47,7 @@ sys.stdin.read()
 
 def test_waited() -> None:
     """A process waiting for another's turn: a waiter (``turn_contended`` in the holder), the wait counted
-    (``turn_waited``: what timings of its own work subtract), the turn then a foreign one."""
+    (``turn_waited``, which a process subtracts when timing its own work), the turn then a foreign one."""
     p = subprocess.Popen([sys.executable, "-c", HOLDER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert p.stdout.readline().strip() == "holding"

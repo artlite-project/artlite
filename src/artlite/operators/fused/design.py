@@ -10,7 +10,7 @@ With expanded PDI loads (every library; a FusedOperator's default) main ends wit
 nothing (``CLOSING``: an array reset): aiecc proves a design's shim inputs consumed by its outputs counting on a clean
 start, and refuses a sequence that leaves a device loaded whose last run moves more through an input than that proof
 covers (an attention's V rows, which its cores take as far as the position asks), though with expanded loads every
-dispatch starts with a reset of its own. A library is never dispatched whole: the programs assembled from it
+dispatch resets the array first. A library is never dispatched whole: the programs assembled from it
 (``program``) drop the closing configuration.
 """
 

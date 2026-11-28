@@ -140,7 +140,7 @@ class GemmaCpu(GemmaHost):
 
     def qkv(self, layer: int, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """The projections of the normed input xn (T, hidden): Q (T, heads * head_dim) and, for a
-        layer with its own cache, K, V (T, kv heads * head_dim)."""
+        layer that keeps a separate cache, K, V (T, kv heads * head_dim)."""
         pfx = f"blk.{layer}."
         q = self.mm(pfx + "attn_q.weight", xn)
         if self.cfg.kv_source(layer) != layer:
@@ -237,7 +237,7 @@ class GemmaAssistant:
 
     A draft step takes a token and a hidden state h (the target's output-normed hidden state of the
     position before the token, or the h the previous draft step returned) and predicts the token
-    after it. Its layers have no K / V of their own: they attend to the target's caches of its last
+    after it. Its layers have no K / V: they attend to the target's caches of its last
     sliding-window and its last full-attention layer with K / V projections."""
 
     def __init__(self, gguf: GGUFFile, target: GemmaCpu):

@@ -17,7 +17,7 @@ class File;
 namespace artlite::pack {
 
 /// Bytes the items read: a tensor of a file (``file``: an index into the packing's files; ``data``: where the caller
-/// maps it, and from ``Views`` on where the packer does) or of memory of its own (-1).
+/// maps it, and from ``Views`` on where the packer does) or a block of memory outside the files (-1).
 struct Tensor {
   const uint8_t* data;
   size_t bytes;

@@ -37,8 +37,8 @@ its own Q units). A unit is 144 ND bytes: a hi + lo K record (two single ones), 
   the chunk's maximum exceeds it by 2^16 (qwen35's ``attn_prefill``: m is only the reference of 2^(s - m)); masks only
   on a diagonal chunk; P = 2^(s - m) times 2^64 (o / l cancels it) as 2^(v - 128) 2^f (km.exp2's steps), clamped at
   2^-63 of that (masked lanes v 129, f -1/2), as single bfp16 panels (half the P V MMULs of hi + lo), or hi + lo
-  (``Shape.pp`` 2: the output then within its own bfp16 rounding, against 1.13-1.39x of it; LFM3's and the readout
-  models'). Known error, cause open: the keys below a row's reference weigh ~0.4% too much
+  (``Shape.pp`` 2: the output's error then equals its own bfp16 rounding, vs. 1.13-1.39x of it with single P; used by
+  LFM3 and the readout models). Known error, cause open: the keys below a row's reference weigh ~0.4% too much
   (test_llama_npu_teacher_forced[Q3_K_L-1B-hilo] fails);
 - o += P V per pair of row blocks (each V panel popped once for both: two MMUL chains; both panel streams on load slot B,
   o's accumulator loads on A: MMUL-bound), and the row sums l += P J on the MMUL (J a ones panel: no accumulator in the

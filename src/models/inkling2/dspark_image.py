@@ -104,7 +104,7 @@ class DSparkImage(NormedImage):
         self._add_data(L, name, self.tile_bytes)
 
     def _h_cols(self) -> str:
-        """``joint_proj``'s h columns (3 rank, hidden) as a BF16 tensor of their own (``_own``)."""
+        """``joint_proj``'s h columns (3 rank, hidden) as a separate BF16 tensor (``_own``)."""
         name, cfg = "joint_proj.weight", self.cfg
         key = f"{name}[h]"
         if key not in self._own:

@@ -10,8 +10,8 @@ The fp32 adder (accumulator add / sub, fp32 vector add / sub, a MAC's sum) is no
 to the larger's exponent with 23 fractional bits (AM027), rounding it there to nearest even, adds exactly and rounds
 to nearest even on a carry, so after a cancellation the sum keeps only the larger operand's grid (probed on the NPU:
 every pair of a random set, ties included). A bf16 x bf16 product is exact in fp32. A result below 2^-126 is flushed
-to zero, judged by its exact value: a product (``aie::mul``), a sum before its rounding (a MAC's: of the exact,
-unflushed product), a bf16 conversion; a zero's sign is not modelled.
+to zero based on its exact value; this applies to a product (``aie::mul``), a sum before its rounding (for a MAC, the
+sum with the exact, unflushed product), and a bf16 conversion. A zero's sign is not modelled.
 """
 
 import numpy as np
@@ -53,9 +53,9 @@ def mul(a: object, b: object) -> np.ndarray:
 
 
 def mac(acc: object, a: object, b: object) -> np.ndarray:
-    """acc + a b (a, b bf16). A product larger than acc takes acc onto a grid 3 bits finer than its own (or the sum's,
-    if larger), rounded to nearest even, then the sum rounded (probed: 99.9% of single MACs with cancellation, the rest
-    1 ULP apart; a smaller product: ``add``, exact)."""
+    """acc + a b (a, b bf16). When the product is larger than acc, acc is rounded (nearest even) onto a grid 3 bits
+    finer than the product's (or the sum's, if larger), and then the sum is rounded (probed: matches 99.9% of single
+    MACs with cancellation, within 1 ULP on the rest; a smaller product: ``add``, exact)."""
     acc, p = np.broadcast_arrays(np.asarray(acc, np.float64), np.asarray(a, np.float64) * np.asarray(b, np.float64))
     big = np.abs(p) > np.abs(acc)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):

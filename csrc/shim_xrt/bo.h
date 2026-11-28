@@ -52,7 +52,7 @@ large_pages_state large_pages();
 // address. (A buffer of the group kernel.group_id gives belongs to that context's xclbin slot: every context would pin
 // the memory again, on Windows another allocation of its size in the NPU's share of memory.) A data buffer is a range
 // of a region: the buffers allocated together have one of exactly their size (device::alloc_bos), a buffer allocated
-// alone lies in a shared one or, when large, in its own (device::take).
+// alone lies in a shared region or, when large, in a dedicated one (device::take).
 struct region {
   explicit region(size_t size);
   ~region();

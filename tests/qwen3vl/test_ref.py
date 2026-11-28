@@ -1,7 +1,7 @@
 """Qwen3-VL's image sizes and pixels (models/qwen3vl/host.py) and the torch encoder (tests/qwen3vl/ref.py) against
 llama.cpp's libmtmd (no NPU): the encoder input's size and pixels identical (a JPEG's within its decoders'
-differences), the image chunk's tokens and positions; the encoder's embeddings within its own sensitivity across 27
-layers (llama.cpp's activations bf16 against float64: ~1.5%)."""
+differences), the image chunk's tokens and positions; the encoder's embeddings within the encoder's sensitivity to
+rounding across 27 layers (llama.cpp's activations bf16 against float64: ~1.5%)."""
 
 import os
 

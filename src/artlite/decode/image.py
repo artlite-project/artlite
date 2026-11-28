@@ -122,7 +122,7 @@ class Block:
 
     def parts(self, ffn: int = 0) -> list[tuple[str, int, int, tuple[str, ...], np.ndarray]]:
         """The block's runs of row tiles of one format: (format, R, first row tile, tensors, rows (cols, n)); a split
-        block's per group and part, each of its own tensor (ffn: the gate's rows, the up rows' index past them)."""
+        block's per group and part, each from a separate tensor (ffn: the gate's rows, the up rows' index past them)."""
         if not self.fmt2:
             return [(self.fmt, self.R, 0, self.tensors, self.rows)]
         ga, gb = self.na * self.R, self.nb * self.R2
@@ -155,7 +155,7 @@ class Region:
     hidden 2304, qt 1; one K group): every block's row tiles in groups of ``qg`` = nsb / qt (a block's last group: what
     is left), a group's tiles its row tiles' full chunks (n_kc - 1 each, row tile after row tile), then its tail tile,
     whose super-blocks j qt .. are the group's row tile j's tail (a group of fewer row tiles: zero super-blocks past
-    theirs). The decode runs the tail tile as row groups (B_G4: each super-block's rows their own), a group's rows the
+    theirs). The decode runs the tail tile as row groups (B_G4: each super-block's rows are separate rows), a group's rows the
     outputs of one step of its row tiles (``decode.design``'s B_QT)."""
 
     layer: int  # -1: the LM head
@@ -537,8 +537,8 @@ class TileImage:
 
     def pack(self, out: np.ndarray, *, threads: int = 0) -> bool:
         """Pack every region into ``out`` (uint8, nbytes; the PAD bytes are left as they are): the C++ packer
-        (``_native.pack_tiles``: threads over items of 2048 rows, non-temporal stores; the file's tensors through views
-        of its own, read ahead and unmapped tensor by tensor: the process never holds more of the file than the packer's
+        (``_native.pack_tiles``: threads over items of 2048 rows, non-temporal stores; the file's tensors through dedicated
+        views, read ahead and unmapped tensor by tensor: the process never holds more of the file than the packer's
         window), then the data regions. Returns whether bytes went through the CPU caches (the data regions: flush a
         device buffer)."""
         assert out.dtype == np.uint8 and out.size >= self.nbytes

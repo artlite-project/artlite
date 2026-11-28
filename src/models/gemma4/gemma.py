@@ -14,7 +14,7 @@ Multi-token prediction (``OverlayModel.generate``, with the model's ``gemma4-ass
 next to it: ``models.gemma4.draft.GemmaDraft``): a dispatch streams the weights once for up to four tokens, so the
 sampled token takes three draft tokens along - the drafter's guesses of what follows, a dispatch of the same design each
 (~1 ms), or the context's (``models.drafts``) - and every draft that the model's own choice at its position confirms is
-a token without a dispatch of its own. The text is the model's: a draft is only kept where the token sampled from the
+a token that costs no separate dispatch. The text is the model's: a draft is only kept where the token sampled from the
 model's logits is that draft.
 
 Several sequences (``NpuGemma(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for

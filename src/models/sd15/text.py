@@ -1,7 +1,7 @@
 """Stable Diffusion 1.5's CLIP text encoder (transformers' ``CLIPTextModel``) on the host in fp32 numpy: 12 pre-norm
 transformer layers (768 wide, 12 heads, causal, quick-GELU MLP of 3072) over token and position embeddings, then the
-final layer norm. A prompt's GEMMs on one OpenBLAS thread (77 tokens: ~90 ms), prompts on threads of their own (the
-GIL released in them); an image's negative prompt (most often the empty one) repeats, so the last encodings are kept,
+final layer norm. A prompt's GEMMs on one OpenBLAS thread (77 tokens: ~90 ms), prompts on separate threads (the GIL
+released in them); an image's negative prompt (most often the empty one) repeats, so the last encodings are kept,
 and ``prepare`` starts one ahead (the pipeline: the empty prompt's while the NPU loads).
 """
 

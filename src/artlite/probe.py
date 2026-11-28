@@ -37,7 +37,7 @@ class ClockProbeOperator(ArtcOperator):
     """One core (column 0, row 2) spinning for ``n[0]`` cycles of its cycle counter; ``out[0]``: the cycles it
     counted. ``load``: every core of the array (4 rows x 8 columns, ``n`` broadcast in each column) runs MMULs on random
     data meanwhile (II 5 for 4 MMULs: about half the MMUL peak, a prefill GEMM's MAC duty, without its weight streams),
-    until its own counter has advanced as far: the clock under compute alone."""
+    until each core's counter has advanced as far: the clock under compute alone."""
 
     WORDS = 16
 
@@ -119,7 +119,7 @@ class DmaProbeOperator(ArtcOperator):
                 lines.append(f"    %{nm}_{c} = aie.buffer(%m{c}) {{sym_name = \"{nm}_{c}\"}} : {mt}")
             lines.append(f"    %md{c} = aie.memtile_dma(%m{c}) {{")
             chans = [("S2MM", 0, "snk0"), ("S2MM", 1, "snk1"), ("MM2S", 0, "src0"), ("MM2S", 1, "src1")]
-            for j, (d, k, nm) in enumerate(chans):  # (each BD its own successor, no locks: free-running)
+            for j, (d, k, nm) in enumerate(chans):  # (each BD chains to itself without locks: free-running)
                 nxt = f"^s{j + 1}" if j + 1 < len(chans) else "^end"
                 lines += [f"      %d{j} = aie.dma_start({d}, {k}, ^b{j}, {nxt})", f"    ^b{j}:",
                           f"      aie.dma_bd(%{nm}_{c} : {mt})", f"      aie.next_bd ^b{j}", f"    {nxt}:"]
@@ -180,7 +180,7 @@ def dma_transaction(*, reads: list[tuple[int, int]], writes: list[tuple[int, int
                     nbytes: int, repeat: int, rows: Rows | None = None, region: int = 0, skew: int = 0,
                     iteration: tuple[int, int] | None = None) -> tuple[np.ndarray, int]:
     """A transaction in which each (column, channel) of ``reads`` (MM2S) and ``writes`` (S2MM) moves ``nbytes`` from
-    / to its own region of the buffers at device addresses ``src`` / ``dst``, ``repeat`` times (over 256: up to
+    / to a separate region of the buffers at device addresses ``src`` / ``dst``, ``repeat`` times (over 256: up to
     ``txn.QUEUE_DEPTH`` queued tasks). The regions are ``region`` bytes apart (0: ``nbytes``), the i-th channel's
     (i * ``skew``) mod 4 KB further: at another offset in its pages, on other DRAM channels. ``rows``: as rows at a
     stride (the region then spans ``rows.span(nbytes)``); ``iteration`` = (bytes, count): repeat j starts (j mod

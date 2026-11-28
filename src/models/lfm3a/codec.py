@@ -18,7 +18,7 @@ head r // 2), the output's 1282 in 1600. The latents' GEMM takes hi + lo panels 
 Layout: a band of 128 positions in tiles of 16 (``vit_level(1, 16)``), column c's token panel j holding positions
 64 j + 8 c .. + 8 (``ops.WinAttention``: the columns share the windows: window pair j is panel j of each column). The
 codec runs a stream band by band (``Codec``): one band program for every band; what a band leaves the next one (the
-state: each conv layer's last 6 rows of B x, each attention layer's last key group) is carried by a dispatch of its own
+state: each conv layer's last 6 rows of B x, each attention layer's last key group) is carried by a separate dispatch
 after a complete band (``carry``). As frames arrive the band in progress runs again with more of its rows (every layer
 is causal: the earlier rows are the band's; a dispatch of whole 4-frame blocks ends at a multiple of 8 positions, the
 V^T blocks never cut). A band's position is its first row's (the RoPE tables, written per band; the first band's masks

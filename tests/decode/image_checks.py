@@ -13,7 +13,7 @@ from artlite.operators.design import COLS
 
 
 def tail_tensor(t: QTensor) -> QTensor:
-    """A tensor's last 512 columns as a tensor of their own (contiguous rows)."""
+    """A tensor's last 512 columns as a separate tensor (contiguous rows)."""
     raw = t.raw if t.raw.dtype == np.uint8 else t.raw.view(np.uint8)
     per = raw.shape[1] // (t.cols // 256)  # (bytes per super-block of a row)
     return QTensor(name=t.name, qtype=t.qtype, rows=t.rows, cols=512,

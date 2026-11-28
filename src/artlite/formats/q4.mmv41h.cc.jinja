@@ -62,7 +62,7 @@ __attribute__((noinline)) void {{ p }}_q41h_off(const uint8_t *__restrict a, con
     for (int g = 0; g < 2; g++) {
 {% if rg %}
         AIE_LOOP_UNROLL_FULL
-        for (int u = 0; u < 2; u++) {  // (super-block 2 H + u: its own rows at y + u ys)
+        for (int u = 0; u < 2; u++) {  // (super-block 2 H + u writes its rows at y + u ys)
             aie::vector<bfloat16, 64> D, M;
             {{ p }}_q41h_dm(al::gather<8, 8>((const bfloat16 *)a + 256 * g + 16 * H + 8 * u, 32), D, M);
             al::BV hi, lo;

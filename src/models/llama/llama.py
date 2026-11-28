@@ -20,7 +20,7 @@ for 1B / 3B / 8B) or as hi + lo blocks ("hilo": +50% of the caches' bytes, and o
 Several sequences (``NpuLlama(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for
 each (``OverlayModel.lanes``); the lanes that generate share their decode steps, a step's slots dealt to them
 (``models.lanes``: one stream of the weights for all of them; 4 lanes give 3.1x a lane's tokens per second on the 1B
-at 1K positions, 3.6x on the 8B, and less at depth, where each sequence reads its own cache).
+at 1K positions, 3.6x on the 8B, and less at depth, where each sequence reads a separate cache).
 
 Memory: the weights the NPU streams are re-laid-out into a device buffer at load (packed by the C++ packer in a thread
 while the tokenizer and the designs load), at their quantization's size; nothing is written to disk.

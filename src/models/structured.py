@@ -230,7 +230,7 @@ def _all_of_members(schema: object) -> list[object]:
 
 
 def _refs(member: object) -> list[str]:
-    """The local references an ``allOf`` member makes for its own instance (its ``$ref``, its combinators')."""
+    """The local references an ``allOf`` member makes for the instance it applies to (its ``$ref``, its combinators')."""
     if not isinstance(member, dict):
         return []
     out = [member["$ref"]] if isinstance(member.get("$ref"), str) else []
@@ -613,7 +613,7 @@ class GrammarMask:
 
     def fork(self) -> "GrammarMask":
         """An independent copy (a drafter's: its guesses follow the grammar, this one does not move). Inside a thought
-        it shares the matcher, which neither moves there, and takes a copy of its own where its thought ends (a
+        it shares the matcher, which neither moves there, and takes a separate copy where its thought ends (a
         drafter's guesses go on past the end marker into the answer: Spark-X's DSpark chains, Gemma's MTP)."""
         out = copy.copy(self)
         out._shared = self.phase not in ("answer", "maybe")

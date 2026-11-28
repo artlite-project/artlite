@@ -197,7 +197,7 @@ class Dataflow:
                     out.append(TensorAccessPattern(w_dims, base + geo.tile(p0, 0, k) * tw + geo.tail_unit(p0, 0) * sw,
                                                    [np_, geo.tail, geo.tiles, sw], [it, sw, geo.tail * sw, 1]))
                 assert all(geo.tile(p0 + q, 0, k) - geo.tile(p0, 0, k) == q * it // tw for q in range(np_)), \
-                    "qt: a block's passes at one group stride (a partial last group: a block of its own)"
+                    "qt: a block's passes at one group stride (a partial last group is a separate block)"
             return out
         for i, e in enumerate((0, 1) if geo.ptail else (pt, pt) if geo.dual else (pt,)):
             p = p0 + i

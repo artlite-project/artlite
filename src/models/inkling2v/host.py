@@ -32,8 +32,8 @@ PAD = -1  # (the padding pixels' value on the 0 .. 255 scale)
 
 
 def target_size(width: int, height: int, *, max_tokens: int = MAX_TOKENS) -> tuple[int, int]:
-    """(width, height) the image is taken at: its own unless its padded grid has more than ``max_tokens`` merged
-    tokens, else llama.cpp's ``calc_size_preserved_ratio`` (module docstring; multiples of ``TOKEN_PX``)."""
+    """(width, height) the image is taken at: its original size unless its padded grid has more than ``max_tokens``
+    merged tokens, else llama.cpp's ``calc_size_preserved_ratio`` (module docstring; multiples of ``TOKEN_PX``)."""
     f = TOKEN_PX
     if -(-width // f) * -(-height // f) <= max_tokens:
         return width, height

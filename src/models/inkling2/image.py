@@ -193,7 +193,7 @@ class InklingImage(NormedImage):
         return name
 
     def _f32_cols(self, name: str, c0: int, n: int) -> str:
-        """Columns c0 .. c0 + n of an F32 tensor as a tensor of their own (``_own``)."""
+        """Columns c0 .. c0 + n of an F32 tensor as a separate tensor (``_own``)."""
         key = f"{name}[{c0}:{c0 + n}]"
         if key not in self._own:
             t = self.gguf.tensor(name)

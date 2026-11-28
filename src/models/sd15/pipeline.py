@@ -2,7 +2,7 @@
 the text encoder, the sampler's steps on the UNet with classifier-free guidance, the final latents through the VAE
 decoder.
 
-A ``Backend`` runs the three networks. Each part is a callable of its own protocol, so that the NPU's parts can
+A ``Backend`` runs the three networks. Each part is a callable with a separate protocol, so that the NPU's parts can
 replace the CPU's one at a time:
 - ``TextEncoder``: token ids (2, 77) int64 -> the last hidden states (2, 77, 768) fp32 (after the final layer norm);
 - ``NoisePredictor``: latents (2, 4, 64, 64) fp32 already scaled by 1 / sqrt(sigma^2 + 1), a fractional timestep

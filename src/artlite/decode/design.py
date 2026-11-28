@@ -25,7 +25,7 @@ MoE (``moe``: an MoE model's FFN; its transaction: ``qwen35.overlay``): the X st
 its shim channel also carrying control packets into the shim's own TileControl (``moe.route``); the decode's K groups
 stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side chunk. Per layer:
 
-- the input phase (F_NORM) has blocks of their own kinds (the block word's B_*): the shared expert's gate / up (B_GU),
+- the input phase (F_NORM) has dedicated block kinds (the block word's B_*): the shared expert's gate / up (B_GU),
   the router's [hi, lo] rows (B_PAIR: their sums go out, fp32), the shared expert's gate (B_PAIR, B_KEEP: its logit
   stays in the state, S_SG);
 - the route object (F_ROUTE: the 8 columns' logits as its payload): the helper routes (``moe.route``), the main core
@@ -36,7 +36,7 @@ stop at ``max_k`` (2048), and the x / sum panels have one chunk more, the side c
   the helper from the plan's templates, ``hsub``): per item and half, gate / up on the input phase's panels and 1 / rms
   (F_HOUT: its h as [h | h] strips in the hold buffer; rotated experts: the half's rotation object after its tiles, its
   last "tile", on which the helper rotates h in place, ``hrot``), down on two strips of the hold buffer in the side
-  chunk (G 4 row groups: a tile's 4 blocks of R rows are rows of their own; F_WS: the item's weights; F_ACCUM: into acc,
+  chunk (G 4 row groups: a tile's 4 blocks of R rows are separate rows; F_WS: the item's weights; F_ACCUM: into acc,
   fp32 [slot][hidden] in a model core's scratch, ``_acc``; F_ACC0 stores; F_EMITA: acc out, per 128 rows and slot);
 - the combine (F_COMB): its input objects are, per slot and half of the column's residual slice, the 8 columns'
   partials of it, which the helper sums and adds into the residual (K_ACC); the residual then goes out (rotated
@@ -60,18 +60,19 @@ holds a second X object, so that the next object comes in while the helper conve
 block the objects double). With gather tables (paged formats, tiles
 of more than 16 rows, gate / up windows) every byte counts: the cores' buffers pinned (``l1_8``), one X object, one activation
 copy, smaller stacks (``STACK8``: the pages' frames counted, ``operators.checks``), the residual's pitch 16 past a row.
-Their memtiles' channels leave a side 14 BDs: each core half's pages have a channel of their own (``pg_split``). No moe,
+Their memtiles' channels leave a side 14 BDs: each core half's pages have a dedicated channel (``pg_split``). No moe,
 post, packed designs.
 
-Shared A objects (``a_bcast``): a fill on column c's A stream with a pair's packet id reaches the memtile of column c and of
-the pair's other column, whose cores take the objects as their own, one read of DDR for both. A stream's shim -> memtile
-segment is packet-switched for it (so that a memtile input takes two sources), the memtile's A channel pinned (``A_MT``); past
-the memtiles nothing changes, and every other fill stays on its column (the stream's own id). Two sources keep no order
-between them: a shared fill follows a sync that drained what the columns' objects before it fed, the columns' next
-fills wait for it (``Sequence.wait_fills``): the flows never meet, which the router cannot see (it refuses flows that share
-receivers: ``--allow-deadlock-prone-routing``). On a shim's switch the packet flows through it take arbiters and msels from 0
-up (5 arbiters where several pass), so the MoE control route's msel stays above them (``moe.route.check_route`` refuses a
-configuration where a stream uses its arbiter and msel: that stream's words would reach the shim's TileControl).
+Shared A objects (``a_bcast``): a fill on column c's A stream with a pair's packet id reaches the memtile of column c
+and of the pair's other column, whose cores consume the objects as if their own shim had read them: one read of DDR
+serves both. A stream's shim -> memtile segment is packet-switched for it (so that a memtile input takes two sources),
+the memtile's A channel pinned (``A_MT``); past the memtiles nothing changes, and every other fill stays on its column
+(the stream's own id). Two sources keep no order between them: a shared fill follows a sync that drained what the
+columns' objects before it fed, the columns' next fills wait for it (``Sequence.wait_fills``): the flows never meet,
+which the router cannot see (it refuses flows that share receivers: ``--allow-deadlock-prone-routing``). On a shim's
+switch the packet flows through it take arbiters and msels from 0 up (5 arbiters where several pass), so the MoE control
+route's msel stays above them (``moe.route.check_route`` refuses a configuration where a stream uses its arbiter and
+msel: that stream's words would reach the shim's TileControl).
 
 Broadcast inputs (``bcast``): a phase's [metadata object | x] are the same bytes for every column, and the cores of a column
 take the same objects, so one shim (``BC_COL``) reads them once for all (a fill with the packet id ``BC_ID``): a packet flow to
@@ -103,7 +104,7 @@ time of a step (a build without them, ``ablate`` "rot", runs as long): they run 
 
 A rotated post design (``rot`` and ``post``: a PARO Gemma, whose residual slices are no whole groups) has R phases instead
 of headers (``protocol.RPOST``, ``gemma4.paro_steps``): F_ROTX phases whose slice is [v | r] of a post-norm update's
-region (each column its contiguous groups, its metadata of its own), rotated n = (r + v w_post / rms(v)) scale; an
+region (each column holds its contiguous groups and its own metadata), rotated n = (r + v w_post / rms(v)) scale; an
 update's first R phase reads the producer's partial sums object (1 / rms(v), kept) and updates the residual slice exactly
 before its first group (``wpupd``: w_post of the slice in its first rotation object's spare bytes, res out as the next
 update's r), each emits its copy's partial sums of res^2 (emit src 7) for its F_PSQ consumer. Its inputs of the hidden are
@@ -391,8 +392,8 @@ class DecodeOverlayOperator(ArtcOperator):
         self.act, self.post, self.pli, self.packed, self.tok, self.gu_win = act, post, pli, packed, tok or post, gu_win
         self.paged = tuple(sorted(paged))
         assert set(self.paged) <= set(rows), (paged, rows)
-        # (the code pages of the paged formats in page-id order: a group of PAGE_GROUPS whose formats are all paged one,
-        # every other format its own)
+        # (the code pages of the paged formats in page-id order: a group of PAGE_GROUPS whose formats are all paged
+        # shares one page, and every other format gets a separate page)
         groups = [tuple(sorted(g)) for g in self.PAGE_GROUPS if set(g) <= set(self.paged)]
         self.pages = tuple(sorted(groups + [(f,) for f in self.paged if not any(f in g for g in groups)]))
         # (the formats with a gather table: one table slot per core, TAB; a resident format's table resident, else every
@@ -638,7 +639,7 @@ class DecodeOverlayOperator(ArtcOperator):
 
     @property
     def pg_split(self) -> bool:
-        """Whether each core half's pages have a memtile channel of their own (``pg_channels``): a design of 8 slots, whose
+        """Whether each core half's pages have a dedicated memtile channel (``pg_channels``): a design of 8 slots, whose
         memtile channels take BDs 0-9 and 24-33, leaves no side room for the BDs of both halves; an MoE design of more
         than 4 paged formats, whose page BDs then take both halves of the memtile's BDs alike and leave the A stream's
         FIFO the more (``moe_a_depth``)."""
@@ -719,7 +720,7 @@ class DecodeOverlayOperator(ArtcOperator):
         for h, (row, stack) in enumerate(zip((self.MAIN_ROW, self.HELPER_ROW), self.stacks)):
             pg = pager(h, row, stack)
             data = {f: tuple((a - 0x70000, t) for a, t in zip(self.tab[h], table_copies(slot(f).mmv_table(f))))
-                    for f in self.paged if f in self.tables}  # (a format of a table: a page of its own)
+                    for f in self.paged if f in self.tables}  # (a format with a table gets a separate page)
             pagers.append(dataclasses.replace(pg, data=data) if data else pg)
         halves = self.pg_halves()
         groups = [tuple(pagers)] if len(halves) == 1 else [(pg,) for pg in pagers]
@@ -968,7 +969,7 @@ class DecodeOverlayOperator(ArtcOperator):
                                 answer()
                         emits()  # (after the last tile: the phase's last outputs too)
 
-                if self.moe:  # (the object's passes: its own, or an expert object's sub-phases, which the helper sets up)
+                if self.moe:  # (the object's own passes, or an expert object's sub-phases, which the helper sets up)
                     for _ in range_(ws[i_st + S_NSUB]):
                         for _ in range_(ws[i_st + S_NSUBC]):
                             command(lambda c: sub(ws, c))

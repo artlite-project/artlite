@@ -128,7 +128,7 @@ class Seq:
                     self.t.mem_token_controller(c, d, ch)
                 for ch in range(2):
                     self.t.token_controller(c, d, ch)
-            for lk in range(LOCK_X, LOCK_G0 + R_LOCKS):  # (the handover locks: not the design's, no reset of their own)
+            for lk in range(LOCK_X, LOCK_G0 + R_LOCKS):  # (the design does not reset these handover locks)
                 self.t.lock_set(c, 1, lk, 0)
 
     # -- completion

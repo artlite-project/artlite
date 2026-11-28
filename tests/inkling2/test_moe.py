@@ -121,8 +121,8 @@ def test_expert_gemms(quant: str, L: int) -> None:
                 y = yv["Y" + name[1:]][c, k, :rows].astype(np.float64)
                 errs["Y" + name[1:]].append(rel_max(y, got @ dn[:, lo:hi].T))
     print(f"chunks {ns.tolist()}; " + ", ".join(f"{n} err max {max(v):.2e}" for n, v in errs.items()))
-    # (Q8_0's weights lose more in bfp16 blocks than NVFP4's: H up to 3.8e-2 with the epilogue's bf16 situ, 0.8% rms of
-    # its own; the downs up to 1.8e-2)
+    # (Q8_0's weights lose more in bfp16 blocks than NVFP4's: H up to 3.8e-2 with the epilogue's bf16 situ, whose own
+    # rms error is 0.8%; the downs up to 1.8e-2)
     assert max(errs["H01"] + errs["H2"]) < 4e-2 and max(errs["Y01"] + errs["Y2"]) < 2e-2
 
 

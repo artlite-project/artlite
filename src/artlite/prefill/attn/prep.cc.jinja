@@ -71,7 +71,7 @@ void {{ p }}_prm(const bfloat16 *__restrict n, float *__restrict ws)
 
 {% endif %}
 {% for i in range(2) %}
-// the Q core {{ i }}'s (its own buffer sizes)
+// Q core {{ i }}'s function, specialized to that core's buffer sizes
 void {{ p }}_q{{ i }}(const bfloat16 *__restrict q, const bfloat16 *__restrict cs, float *__restrict ws, bfloat16 *__restrict out,
                 int32_t h, int32_t nq)
 {

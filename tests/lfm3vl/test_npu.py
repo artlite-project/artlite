@@ -1,7 +1,7 @@
 """LFM3-VL-2B with an image on the NPU (models.lfm with LFM3-VL's mmproj: a ``Sequence`` prompt): an essay paragraph,
 the astronaut, more essay and a question, teacher-forced over a description of the image, against llama.cpp's own
 encoder and language model on the CPU (``ref.golden``). With llama.cpp's embeddings the prompt's tokens (1-D
-positions) are tested on their own, as decode steps; the app's path (``Lfm(mmproj=)``) adds the NPU encoder and the
+positions) are tested alone, as decode steps; the app's path (``Lfm(mmproj=)``) adds the NPU encoder and the
 prefill."""
 
 import numpy as np

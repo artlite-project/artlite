@@ -554,7 +554,7 @@ class GGUFFile:
     @property
     def files(self) -> list[tuple[str, np.ndarray]]:
         """The model's files and their mappings (``_native.pack_tiles``: the packer reads the tensors of these mappings
-        through views of its own)."""
+        through separate views)."""
         return [(self.path, self.data)]
 
     def _mapped(self, name: str) -> tuple[np.ndarray, int, int] | None:
@@ -585,7 +585,7 @@ class GGUFFile:
         converts on the host): they leave this process, stay in the system's file cache while it has room, and come
         back on the next access. (A weight image's tensors come through these mappings only where Python converts them,
         ``decode.image``'s PARO linears: ``name``, that tensor's pages, once packed; the packers read the others through
-        views of their own, ``_native.pack_tiles``.)"""
+        separate views, ``_native.pack_tiles``.)"""
         for data, off, nbytes in self._sources(name) if name else ((d, 0, d.size) for _, d in self.files):
             _hint(data, "dontneed", off, nbytes)
 

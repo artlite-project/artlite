@@ -8,7 +8,7 @@ not a system one; tools as one JSON line in a ``tool_declare`` block, calls ``<|
 <|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>``; an image part as
 ``<|content_image|><|unused_200054|>`` (with the mmproj: the placeholder becomes the image's tokens,
 ``models.inkling2v``; their rows enter the first visit as they are, a text token's RMS-normed).
-The template opens no turn for the reply: the model writes its own blocks (``Model.blocks``: a thought
+The template opens no turn for the reply: the model writes the blocks itself (``Model.blocks``: a thought
 ``<|message_model|><|content_thinking|>`` .. ``<|end_message|>``, the answer's text ``<|message_model|><|content_text|>``
 .., its calls), a thought first even at effort none, and its turn ends at ``<|content_model_end_sampling|>``. The
 blocks' markers are control tokens that its text keeps (``BpeTokenizer``'s ``preserved``).
@@ -229,7 +229,7 @@ class NpuInkling(OverlayModel):
         self.stale()
         out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
         chains = list(self.chain.chains)  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``;
-        # an MoE's slots route to experts of their own)
+        # an MoE's slots each route to different experts)
         if out:
             self._shadow.append((P + 1, list(out), chains))
         out = out[:next((i for i in range(len(out)) if not self._keep(chains[i], i)), len(out))]

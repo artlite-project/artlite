@@ -111,7 +111,8 @@ class DFlashDrafting:
             d.owner = None
 
     def found(self) -> None:
-        """After a prompt chunk of the lane (the drafter its own): the chunk wrote its records, the next rows follow."""
+        """After a prompt chunk of the lane, which holds the drafter: the chunk wrote its records, and the next rows
+        follow them."""
         self.rows, self.rows_from, self.lost = (), self.model.dflash.next, False
 
     def _run(self, x: np.ndarray | None, p: int) -> None:
@@ -163,8 +164,8 @@ class DFlashDrafting:
         self.inj = Injection(n, n, p)
 
     def inject(self) -> None:
-        """The drafter's rows of the model's last step, while its taps are in place (several lanes: the lane's rows
-        that wait, the drafter its own first)."""
+        """Injects the drafter's rows of the model's last step while its taps are in place. With several lanes, it
+        injects the lane's waiting rows instead, after the lane takes the drafter (``own``)."""
         m = self.model
         if m._rounds is not None:
             if self.rows and not self.lost:

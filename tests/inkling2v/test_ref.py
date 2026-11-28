@@ -2,8 +2,8 @@
 (tests/inkling2v/ref.py) against llama.cpp's libmtmd (no NPU): the encoder input's size and pixels identical (the
 padding -1 on the 0 .. 255 scale; a JPEG's within its decoders' differences), the image chunk's tokens and positions;
 the position rows, the padding pixels' corrections, the RoPE rows; the encoder: a layer fed llama.cpp's input gives
-llama.cpp's output, the whole within its own sensitivity across 23 layers (llama.cpp's im2col rounds the pixels to
-fp16: ~3e-3 at pre_ln, ~4% at the end)."""
+llama.cpp's output, and the whole encoder stays within its sensitivity to rounding across 23 layers (llama.cpp's
+im2col rounds the pixels to fp16: ~3e-3 at pre_ln, ~4% at the end)."""
 
 import os
 

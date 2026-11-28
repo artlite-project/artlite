@@ -37,7 +37,7 @@ NAMES = ("attn_norm|linear_attn_qkv_mixed|z|alpha|beta|final_output|attn_residua
 
 
 class _PlainImage(QwenImage):
-    """An image whose LM head keeps its own format (no screened head's high plane, a page with tiles of 27 rows): a
+    """An image whose LM head keeps the file's format (no screened head's high plane, a page with tiles of 27 rows): a
     harness that runs no LM phase, a design of 8 slots (which no model screens its head in)."""
 
     SCREEN = False
@@ -641,8 +641,8 @@ def test_gdn_steps_27b() -> None:
 
 @pytest.mark.parametrize("size", ["1B", "9B", "3.8-27B", "0.8B-paro", "27B-paro"])
 def test_overlay_sequences(size: str) -> None:
-    """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; tokens of their own, at
-    positions of their own) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay
+    """Three sequences on one device (``QwenOverlay(sequences=3)``: the design of 8 slots; separate tokens at
+    separate positions) give, slot by slot, the logits (bf16 bits) of each sequence in steps of one on an overlay
     of one sequence: alternated (``select``: a round of 1 .. 8 slots of one, some of them kept, then of the next) and
     in joint steps (``step``'s parts: a GDN chain and an attention pass per sequence; slots dealt at random, drafts
     kept or not, one sequence joining later, chains across their blocks' ends); the first layers up to the first
@@ -716,7 +716,7 @@ def test_overlay_sequences(size: str) -> None:
     while any(pos[s] < lengths[s] for s in range(nseq)):
         take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 10)]
         spare = ov.SLOTS - len(take)
-        for t in take:  # (more slots of its own: drafts)
+        for t in take:  # (more slots for the same sequence: drafts)
             while spare and rng.random() < 0.5 and pos[t[0]] + t[1] < lengths[t[0]]:
                 t[1] += 1
                 spare -= 1
@@ -1131,8 +1131,8 @@ def test_screened(size: str) -> None:
 
 @pytest.mark.parametrize(("size", "L"), [("35B-A3B", 0), ("occamy", 0), ("occamy", 10)])
 def test_moe_layer(size: str, L: int) -> None:
-    """A layer L (GDN, then its MoE) of Qwen3.6-35B-A3B or Occamy (layer 0: Q3_K experts, 10: IQ3_XXS) as a slice of
-    its own in a step of S = 1 .. 4 slots (from position 0 after ``reset``, on one loaded overlay): on the NPU's own
+    """A layer L (GDN, then its MoE) of Qwen3.6-35B-A3B or Occamy (layer 0: Q3_K experts, 10: IQ3_XXS) as a separate
+    slice in a step of S = 1 .. 4 slots (from position 0 after ``reset``, on one loaded overlay): on the NPU's own
     input to the MoE (moe_in's x), the router's logits (the route object's payload) within 3e-5 of fp32 math (the
     norm weight's bf16 rounding corrected in the router's rows: ``image.QwenImage.pack``), the slots' top 8 the
     oracle's (``moe_route``); every column's control packets and expert object as the host's routing of the NPU's

@@ -1,20 +1,20 @@
 """The multi-token-prediction drafter of a qwen35 / qwen35moe model on the model's decode overlay (llama.cpp's
 ``graph_mtp`` in ``src/models/qwen35moe.cpp`` / ``qwen35.cpp``): a draft step is one dispatch of the model's design and
-hardware context, with the drafter's inputs and KV cache in buffers of its own. Its block comes from an MTP file
+hardware context, with the drafter's inputs and KV cache in separate buffers. Its block comes either from an MTP file
 (``model_config.qwen_mtp_of``: Qwen3.6-35B-A3B's; the design runs the file's formats too, ``QwenOverlay(formats=)``),
-its weights in a buffer of their own, or from the model file itself (Qwen3.8-27B: ``QwenImage``'s MTP block, which
+with its weights in a separate buffer, or from the model file itself (Qwen3.8-27B: ``QwenImage``'s MTP block, which
 the drafter streams from the model's buffer, its head the first rows of the model's: ``QwenImage.mtp_view``).
 
 The block (layer L = the model's layer count): x0 = eh_proj [enorm(emb(t_q)) | hnorm(h_{q-1})], then a full-attention
-layer on its own cache and an FFN (an MoE layer, or a dense one), both as the model's (``QwenOverlay``'s phases on the
-drafter's image: attn_in, the attention, attn_out, then moe_in, the routing, sdown, the experts, the combine; or
+layer with a separate KV cache and an FFN (an MoE layer, or a dense one), both as the model's (``QwenOverlay``'s phases
+on the drafter's image: attn_in, the attention, attn_out, then moe_in, the routing, sdown, the experts, the combine; or
 gate_up, down), then the head over the residual normed by ``nextn.shared_head_norm``: rows of the file's
 ``output.weight``, ``HeadTable.ids`` the token of each logit. ``HEAD_ROWS`` fixed rows: the special tokens (``head_tokens``: the turn's end, tool calls, a thought's end) and
 the first ids (the tokenizer's BPE merges, a frequency order: 98.6% of essay tokens, 97.9% of agents' generated ones);
 then a table of ``TABLE_ROWS`` of the sequence's own tokens past them (``HeadTable.see``: the most recently seen;
 identifiers of the code an agent reads leave 0.2% of its tokens out of the head, against 2.1% without; text in other
 scripts, CJK or Cyrillic, keeps 6-17% out: tokens it had not used before). The row at position q (token t_q, the model's
-output-normed hidden state of q - 1) writes its cache record at q and predicts t_{q+1}; the next draft's h is its own
+output-normed hidden state of q - 1) writes its cache record at q and predicts t_{q+1}; the next draft's h is this row's
 residual normed by shared_head_norm (``hidden_state``).
 
 Per step of S slots (``step``): the host writes the eh phase's input [enorm(emb) | hnorm(h)] (K 2 hidden: two K
@@ -42,8 +42,8 @@ from .overlay import QwenOverlay
 
 
 def mtp_config(gguf: GGUFFile) -> QwenConfig:
-    """The config of a file with one MTP block (an MTP file, or a model's own) with its block as a layer of its own:
-    layer ``num_hidden_layers`` (an attention layer) after the trunk's."""
+    """The config of a file with one MTP block (an MTP file, or a model file that holds its own block), with that block
+    as a separate layer: layer ``num_hidden_layers`` (an attention layer) after the trunk's layers."""
     cfg = QwenConfig.from_gguf(gguf)
     if cfg.nextn_layers != 1:
         raise NotImplementedError(f"{gguf.path}: a file with one MTP block, not {cfg.nextn_layers}")

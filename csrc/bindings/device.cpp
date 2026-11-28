@@ -76,8 +76,8 @@ void bind_device(nb::module_& m) {
         "The turns this process took after another process's: a change means another process's hardware context "
         "may have run on the NPU since.");
   m.def("turn_waited", &artlite::turn::waited,
-        "Seconds this process waited for another process's NPU turn to end (in its lifetime): a timing of its own "
-        "work subtracts it.");
+        "Seconds this process has waited, over its lifetime, for another process's NPU turn to end; subtract it when "
+        "timing this process's own work.");
   m.def("turn_contended", &artlite::turn::contended, "Whether another process waits for the NPU's turn.");
   m.def("turn_peers", &artlite::turn::peers,
         "Whether another process uses the NPU (any of these functions called, the process not ended): its turns may "
@@ -155,8 +155,8 @@ void bind_device(nb::module_& m) {
       .def(
           "paddr_in", [](shim_xdna::bo& self, const shim_xdna::hw_ctx& ctx) -> uint64_t { return self.paddr_in(ctx); },
           "ctx"_a,
-          "The device address in a hardware context (on XRT an instruction buffer is made in each context's memory group: "
-          "its own address in each).");
+          "The device address in a hardware context (on XRT an instruction buffer is made in each context's memory "
+          "group, with a separate address in each).");
 
   // --- HwContext (wraps shim_xdna::hw_ctx directly) ---
   nb::class_<shim_xdna::hw_ctx>(m, "HwContext")
@@ -224,8 +224,8 @@ void bind_device(nb::module_& m) {
           },
           "size"_a, nb::keep_alive<0, 1>(),
           "A zeroed host buffer the NPU reads and writes; from 2 MB on (set_user_bo_bytes) in this process's "
-          "memory, as alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows on pages of their own run at a "
-          "fraction of the rate: on Strix Halo 12 instead of 57 GB/s for 128-byte rows).")
+          "memory, as alloc_user_buffer (the driver's own BOs have 4 KB pages, and DMA rows that each sit on a separate "
+          "page run at a fraction of the rate: on Strix Halo 12 instead of 57 GB/s for 128-byte rows).")
       .def(
           "alloc_host_buffers",
           [](nb::handle self, std::vector<size_t> sizes) {

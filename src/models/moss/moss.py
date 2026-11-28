@@ -38,7 +38,7 @@ HOTWORDS = "热词提示："  # (the model card's hotword hint, after the instru
 class Moss(Qwen3):
     """A MOSS-Transcribe-Diarize file (a checkpoint directory, a transcribe.cpp GGUF file): its language model
     (``Qwen3``: the weight image, the tokenizer, the chat template) and its audio tower on the NPU (``NpuAudio``,
-    loaded here: a hardware context of its own)."""
+    loaded here in a separate hardware context)."""
 
     name = "MOSS-Transcribe-Diarize"
     thinks = False

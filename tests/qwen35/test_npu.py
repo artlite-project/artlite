@@ -132,9 +132,10 @@ def test_mtp(size: str) -> None:
 def test_mtp_prefill(size: str) -> None:
     """The drafter after prompts through the prefill drafts as after the same prompts as decode steps
     (``common.draft_gate``: teacher-forced over the model's greedy replies): the prefill writes the drafter's records of
-    the prompt's rows from its own hidden states (``qwen35.draft_prefill``), which the model's KL does not see. Tokens
-    per round 1.825 vs 1.823; a prompt's differ by up to ~2%, their first guesses the argmax by up to ~7% (the decode's
-    residual is fp32, its sums of a slot's experts exact, ``decode.design``'s "MoE"; the prefill's residual bf16)."""
+    the prompt's rows from the model's hidden states (``qwen35.draft_prefill``), which the model's KL does not see.
+    Tokens per round 1.825 vs 1.823; a prompt's differ by up to ~2%, their first guesses the argmax by up to ~7% (the
+    decode's residual is fp32, its sums of a slot's experts exact, ``decode.design``'s "MoE"; the prefill's residual
+    bf16)."""
     from models.qwen35.qwen import Qwen
 
     path = _path(size)

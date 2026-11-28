@@ -84,7 +84,7 @@ __attribute__((noinline)) void {{ p }}_q4k_tab(const uint8_t *__restrict a, cons
                            aie::mul(D, aie::broadcast<bfloat16, 64>(8.0f)).template to_vector<bfloat16>(), Y);
             Y = {{ p }}_mo(mac_8x8_8x8T(X, 1, Mc, 0, mul_8x8_8x8T(X, 1, Ml, 0)), m8.template grow_replicate<64>(), Y);
 {% if rg %}
-            {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (per super-block: its rows of their own with ys)
+            {{ p }}_yadd(y + 32 * g + u * ys, Y);  // (each super-block's rows are separate output rows, ys apart)
             Y = aie::zeros<accfloat, 64>();
 {% endif %}
         }

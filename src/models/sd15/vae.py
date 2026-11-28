@@ -286,7 +286,7 @@ def write(bd: Builder, img: VImage, x: np.ndarray) -> None:
 
 def fetch(bd: Builder, x: DTensor, b: int) -> tuple[Tensor, dict]:
     """Band b of x in the memtile (allocated after the pending drains of an image written since the last sync are
-    pushed): the tensor and its fills (per column), for an op of their own or merged into the op before its use."""
+    pushed): the tensor and its fills (per column), for a separate op or merged into the op before its use."""
     bd.reading(x.band(b))
     t = alloc(bd, x.lv, x.C, x.kind)
     base = bd.npu.address(x.band(b))

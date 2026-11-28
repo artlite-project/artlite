@@ -281,7 +281,7 @@ class NpuEncoder(Encoder):
         x = torch.as_tensor(np.asarray(pixels), dtype=self.dtype)
         ph, pw = x.shape[1] // P, x.shape[2] // P
         # (the patches' inputs (c, ky, kx) as the integers q = p - 128 of the 8-bit pixels p (exact panels); the
-        # normalization x = a q + o folded into the weights, the offset sum_k w_k o_k on a constant input of its own)
+        # normalization x = a q + o folded into the weights, the offset sum_k w_k o_k on a separate constant input)
         mean, std = (torch.tensor(v, dtype=self.dtype) for v in (self.cfg.mean, self.cfg.std))
         q = torch.round((x * std[:, None, None] + mean[:, None, None]) * 255) - 128
         cols = q.reshape(3, ph, P, pw, P).permute(1, 3, 0, 2, 4).reshape(ph * pw, 3 * P * P)

@@ -73,13 +73,13 @@ struct device {
   static const hw_ctx* any_context(const device* preferred = nullptr);
 
   // `bytes` (4 KB pages) for a data buffer allocated alone: in the process's current shared region (`offset`), a new
-  // one when it is full, a region of its own from kSharedMax. (A command lists at most xrt_abi::kMaxBuffers XRT buffers
-  // (abi.h): a program's many buffers reach the NPU through a few regions. A shared region is pinned whole, used or
-  // not: what knows its buffers' sizes beforehand allocates them together, alloc_bos.)
+  // one when it is full, or a dedicated region from kSharedMax on. (A command lists at most xrt_abi::kMaxBuffers XRT
+  // buffers (abi.h): a program's many buffers reach the NPU through a few regions. A shared region is pinned whole,
+  // used or not: what knows its buffers' sizes beforehand allocates them together, alloc_bos.)
   static std::shared_ptr<region> take(size_t bytes, size_t& offset);
 
-  // The process's regions that have an XRT buffer, the largest first (kernel_xrt.cpp: a command lists the ones it has
-  // room for besides its own).
+  // The process's regions that have an XRT buffer, the largest first (kernel_xrt.cpp: a command lists as many as it has
+  // room for besides the regions of its own buffers).
   static std::vector<std::shared_ptr<region>> regions();
   // Counts the regions freed (a region's destructor calls region_gone): a kernel drops the runs it keeps for reuse
   // when it changed, as they hold the XRT buffers of the last command they ran.

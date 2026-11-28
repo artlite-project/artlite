@@ -10,7 +10,7 @@ packet.
 
 The lock ids come from the cores' code: aiecc leaves each core's object in the build directory
 (``design.mlir.prj/objects_op<entry>_<class>_core_<col>_<row>/``), and its acquires name their lock by an immediate (a
-core tile's 0-15 the south module's, 16-31 the west's, 32-47 the north's, 48-63 its own: mlir-aie's
+core tile's 0-15 the south module's, 16-31 the west's, 32-47 the north's, 48-63 the tile's own: mlir-aie's
 ``getLockLocalBaseIndex``).
 """
 

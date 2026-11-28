@@ -208,7 +208,7 @@ def test_dspark_sequences() -> None:
     dg = GGUFFile(spark_dspark_of(ref.path(size)))
     taps = DSparkConfig.from_gguf(dg).taps
     rng = np.random.default_rng(11)
-    sizes = rng.integers(1, 9, (nseq, rounds))  # (a sequence's slots of each round's step: 1 .. 8 of its own step,
+    sizes = rng.integers(1, 9, (nseq, rounds))  # (a sequence's slots of each round's step: 1 .. 8 in a separate step,
     sizes[:, 1::2] = rng.integers(1, 3, (nseq, rounds // 2))  # 1 .. 2 of a step of the three)
     ids = [ref.corpus_ids(200 + 40 * s, size)[40 * s:] for s in range(nseq)]
     emb = [g.rows("token_embd.weight", t) for t in ids]

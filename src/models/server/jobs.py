@@ -124,8 +124,8 @@ class Job:
     keeps: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def thought_end(self, *, empty: bool) -> str:
-        """The text that ends a thought early: the message on a paragraph of its own after the thought's text (``empty``:
-        it has none: the message alone), then the template's end of a thought."""
+        """The text that ends a thought early: the message in a separate paragraph after the thought's text
+        (``empty``: the thought has no text, so the message stands alone), then the template's end of a thought."""
         m = self.budget_message
         return (m if empty else "\n\n" + m) + self.budget_end if m else self.budget_end
 

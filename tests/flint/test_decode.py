@@ -121,7 +121,7 @@ def test_flint_overlay_steps(flint: tuple[GGUFFile, FlintConfig]) -> None:
                          ids=["linear", "ring"])
 def test_flint_overlay_sequences(flint: tuple[GGUFFile, FlintConfig], layers: list[int], wrap: int,
                                  lengths: tuple[int, ...]) -> None:
-    """Three sequences on one device (``FlintOverlay(sequences=3)``: texts of their own, at positions of their own) give,
+    """Three sequences on one device (``FlintOverlay(sequences=3)``: separate texts at separate positions) give,
     slot by slot, the logits of each sequence alone in steps of one, bit for bit: alternated (``select``: a step of 1 ..
     4 slots of one, then of the next) and in joint steps (``step``'s parts: slots dealt at random, a sequence's second
     slot too, one sequence joining later; an MoE layer runs the union of the slots' experts). "ring": the
@@ -168,7 +168,7 @@ def test_flint_overlay_sequences(flint: tuple[GGUFFile, FlintConfig], layers: li
     while any(pos[s] < lengths[s] for s in range(nseq)):
         take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
         spare = SLOTS - len(take)
-        for t in take:  # (more slots of its own)
+        for t in take:  # (more slots for the same sequence)
             while spare and rng.random() < 0.4 and pos[t[0]] + t[1] < lengths[t[0]]:
                 t[1] += 1
                 spare -= 1

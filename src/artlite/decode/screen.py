@@ -144,7 +144,7 @@ class Screen:
 
     def _above(self, bits: np.ndarray, gnorm: float, thr: float, mask: np.ndarray | None = None) -> np.ndarray:
         """The rows whose upper bound reaches thr (``mask``: of the allowed ones), ascending (int32; a copy)."""
-        ids = np.empty(IDS, np.int32)  # (the call's own: several sequences' choices run on threads of their own)
+        ids = np.empty(IDS, np.int32)  # (the call's own buffer: several sequences' choices run on separate threads)
         n = _native.screen_above(bits, self.scale, self.bound, gnorm, thr, ids, mask)
         if n <= len(ids):
             return ids[:n].copy()

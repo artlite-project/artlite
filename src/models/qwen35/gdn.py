@@ -34,10 +34,10 @@ the delta rule in its WY / UT form (the prefill's ``gdn_prefill``: its docstring
 (position mod 8: the block's lanes), a step about one pass per panel whatever its S, each lane's numbers the same whatever the
 steps that run it (a draft rejected or accepted, a step of one or of eight: the outputs of steps of S slots are those of steps
 of one, bit for bit). The state is materialized only at a block's end: a step reads its block's base state and recomputes every lane of the
-block up to its own (the lanes before it from the k / v histories and the gates of the block, [the 3 rows before the block
-| its lanes' rows], which run on in the objects, read from row M_KSHIFT: 8 after a block's end); a lane's U by forward
+block through its own lanes (the lanes before it from the k / v histories and the gates of the block, [the 3 rows before
+the block | its lanes' rows], which run on in the objects, read from row M_KSHIFT: 8 after a block's end); a lane's U by forward
 substitution in lane order (``solve``), O from it and Y; the products along the lanes are per lane in fp32 (bfp16 blocks run
-along i, a lane's own), so no lane's rounding depends on another's. The states are double-buffered (``GdnCursor.half``:
+along i, within one lane), so no lane's rounding depends on another's. The states are double-buffered (``GdnCursor.half``:
 the half a position's block starts from): a step reads its block's half and writes the other, the block's update
 (S + dc S + U'^T K^T over its 8 lanes) when it reaches the block's end, else nothing (no D object, no drain: the other
 half is read only after a block's end wrote it); a step past the block's end then runs
@@ -79,10 +79,11 @@ core) computes per k head the Gram blocks and K^T's panels (after its K object; 
 per v head its chunks' constants (``vhead``, after its R object; the panels wait for them).
 
 Branch (8 slots, ``QwenOverlay.step``'s branch; ``M_BRANCH`` in gdn_in's metadata): the step's last L slots follow slot c
-instead of the chain's last, at positions inside slot c's block. The chain is the step's other slots (S counts them), the
-branch a third chunk from the block's base over the lanes through its last: the chain's to slot c and its own (its conv
-windows: slot c's rows, then its own; its K and Q panels: the chain's with its lanes', its gates after the chain's in dn's
-lanes 16 ..), each lane as in a step of one at its position. Its regions lie in the helper's scratch (``HS8_AT``, pinned:
+instead of the chain's last, at positions inside slot c's block. The chain is the step's other slots (S counts them). The
+branch is a third chunk that runs from the block's base over the lanes through the branch's last: the chain's lanes up to
+slot c, then the branch's lanes. Its conv windows are slot c's rows followed by the branch's rows, its K and Q panels are
+the chain's together with the branch lanes' panels, and its gates follow the chain's in dn's lanes 16 ... Each lane
+computes as in a step of one at its position. Its regions lie in the helper's scratch (``HS8_AT``, pinned:
 idle while the helper waits in ``hgdn``, which the step's last v head releases only after its panels: the helper's next phase
 starts as the first heads' outputs come in), its outputs' lanes go into o's lanes past the chain's, where its slots' outputs
 read them.
@@ -138,8 +139,8 @@ L_HRDY, L_HDONE = 12, 13
 SILU_TAB = (0x739C0, 0x7F9C0)
 # (8 slots) the helper's scratch on the GDN tile (local address, pinned: the helper waits in ``hgdn`` until the step's end; the
 # cores address it from the workspace, the helper's view of the tile differs from the GDN core's):
-# a branching step's branch there, V and O ([panel 16][lane 8][8] fp32) at HB_V, K and Q panels at HB_K, HB_Q, its rows'
-# scratch (the 3 rows before it, its own) at HB_R
+# a branching step's branch there, V and O ([panel 16][lane 8][8] fp32) at HB_V, K and Q panels at HB_K, HB_Q, and the
+# scratch for its rows (the 3 rows before the branch, then the branch's rows) at HB_R
 GWS_AT = REGION  # (chunkwise) the GDN workspace's local address (pinned: regions 1 .. 3, below the helper's scratch (8 slots)
 # and a SiLU table copy)
 HS8_AT = 0xD1C0

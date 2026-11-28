@@ -18,12 +18,13 @@ reaches every core of a KV head's chain. Per step a core gets
 - from the A stream (broadcast from the main core's, whose objects it skips; two buffers: an object streams in while
   the core works on the last one): the cache up to the group of the step's last position, then the two tail objects.
 
-The slots' K rows (normed, rotated) wait as one panel per d-block by position & 7, a step's at most 8 positions apart there
-(``kr``, ``kn``); each open record takes its rows as its K object passes (``kmerge``: lanes of the popped panels, in the core's
-copy, the last core's and the first's own), and a K object scores both pairs of records against the octets, each K panel
-popped once (``qk1``). Each row's positions past its own are masked (the host's masks of the step's first two records,
-``M_AMASK``). A branching step (``M_BRANCH``, ``QwenOverlay.step``'s branch: its last slots follow an earlier slot c, inside
-the 8 positions of c's record) scores that record again with the branch's K at its positions' lanes for the branch rows
+The slots' K rows (normed, rotated) wait as one panel per d-block by position & 7, a step's at most 8 positions apart
+there (``kr``, ``kn``); each open record takes its rows as its K object passes (``kmerge``: lanes of the popped panels,
+in the core's copy, the last core's and the first's own), and a K object scores both pairs of records against the
+octets, each K panel popped once (``qk1``). For each row, positions past the row's own position are masked (the host's
+masks of the step's first two records, ``M_AMASK``). A branching step (``M_BRANCH``, ``QwenOverlay.step``'s branch: its
+last slots follow an earlier slot c, inside the 8 positions of c's record) scores that record again with the branch's K
+at its positions' lanes for the branch rows
 (``bqk``), and puts the branch's V rows there for its slots' P V (``tobj``): a branch row sees its record as a step of one at
 its position does. P = 2^(s - m), m the row's maximum in the first group,
 held for the whole pass (scores span less than P's 2^63.5: no rescale; QK starts from the baseline 192 - m), y += P V over the V object's records. A step may cross a group: the first group's open record keeps its scores in ``sc`` past the
@@ -39,11 +40,12 @@ core its merged K records of the step's first and last positions, its last core 
 twice when one holds both). The two emit at once: neither waits for an object of the other.
 
 Several passes (a step of several sequences' slots, ``decode.step.Part``: ``AttnShape(passes=)``, ``attn256_steps``): a pass
-per sequence, each an F_ATT object of its own with the sequence's slots as its rows 0 .. n - 1 (their q and raw K, V
+per sequence, each in a separate F_ATT object with the sequence's slots as its rows 0 .. n - 1 (their q and raw K, V
 objects, its position's words, its cache on A): the cores run it as a step of that sequence alone, o's octets as they
 lie. The host puts each pass's rows at its slots: attn_out's x is staged (``decode.protocol.staged_region_bytes``: a k
 block's [slot 8][8] in a cell of twice its bytes), a pass's octets are drained into the cells from its first slot on,
-so its rows past its own land on the later passes' slots, which those write after it, or past the slots.
+so the rows past the pass's own slots land on the later passes' slots, which those passes write afterwards, or past
+the slots.
 
 L1: 3 octets take 25 KB of y and l, 3 KB of scores, 7 KB of Q panels; what the core reads rarely lies in the main core's
 memory (``AttnShape.ext``), which the core reads through shared memory: the main core's workspace past its residual (``EXT_W8`` bytes:
@@ -57,9 +59,10 @@ sub-step's cos, sin], q and raw K, V objects as above, and from A the cache of i
 attends to that group) the tail objects of its records.
 
 It inserts the slots' K into their records (in its copy), scores every record against each octet's two sets at once (log2 units:
-Q x log2(e) / 16; per d-block the pair's K panels and the octet's Q panels each popped once), masks each row's positions past
-its own, softmax with a running maximum per row (masked positions add exactly nothing; y and l rescaled once per group, a
-row's m where it rises: a chat's first keys are no reference for the later ones), y += P V over octets (single bfp16 P, a V object's four records
+Q x log2(e) / 16; per d-block the pair's K panels and the octet's Q panels each popped once), masks each row's positions
+past the row's own position, runs a softmax with a running maximum per row (masked positions add exactly nothing; y and l
+are rescaled once per group, for a row whose m rises, because a chat's first keys are no reference for the later ones),
+and accumulates y += P V over octets (single bfp16 P, a V object's four records
 in one read and write of y: ``pv4``). A group's softmax runs after its K object (``asoft``). The open records' values come from the ring of
 the layer's KV head (``decode.vring``; after a prefill the host decodes the record's V panels into it) as the tail objects,
 after the cache; the core puts the slots' V in and per slot encodes the record up to the slot's position and adds the P V
@@ -77,9 +80,9 @@ A sub-step from 4 groups on (``AttnShape.splits``: the same for every position o
 once per chain instead of once per column: every core of a chain takes the chain's NPH QC heads (the chain's q objects
 in column order on X) and a run of the groups (``AttnShape.bounds``): the first core the groups 0 .. ``M_GATT`` - 1
 (then the sub-step group's K and V objects from ``M_GJ`` on only for its K records), the last one the groups up to the
-sub-step's. The partials (m, l, y) merge west to east: a core's partial stays in its workspace until its east
-neighbour (shared memory) has merged it into its own, and the last core emits o for the chain's heads (a token
-ObjectFifo orders each neighbour pair).
+sub-step's. The partials (m, l, y) merge west to east: a core's partial stays in its workspace until its east neighbour
+has merged it into the neighbour's partial through shared memory, and the last core emits o for the chain's heads (a
+token ObjectFifo orders each neighbour pair).
 
 A sub-step of more slots than a chain of 4 holds (``AttnShape.rounds``: the 35B-A3B's 3 and 4 slots, 32 rows at most against
 a core's 16) runs in two rounds, one per KV head (``SPLIT_ROUND``): in round r both chains take KV head r, the first the
@@ -133,13 +136,15 @@ class AttnConfig(Protocol):
 
 # X metadata (``decode.protocol.XMETA``) of the attention core's objects. An F_ATT object's words (``ATT``) past the
 # protocol's M_NS (slots), M_SKIP (X objects after it), M_NASKIP (the cache's A objects and the tail objects), M_NREL (R
-# objects to relay): the sub-step's first position; split: the KV head's chain divides the cache's groups (1); the core's
-# first group, the end of its attention groups, the first group past them (a chain's first core's: the sub-step's group,
-# for its records only); its first slot's row of angles (M_SA: 0, each sub-step's object holds its own slots'); the tail
-# objects; (one pass) the core's A objects through its held ones, the rows' masks of the step's first two records and the
-# slots' K lanes. A step whose last slots branch off an earlier one: the word ``M_BRANCH`` (its parent slot + 1 | its
-# slots << 8, or 0), a kind of its own that a model's objects of the step may extend too (qwen35's gdn_in).
-FLAGS = XMETA.kind("attn256 flags")  # (a kind of its own: a model's other attention cores take the flag, qwen35's DFlash2)
+# objects to relay): the sub-step's first position; split: the KV head's chain divides the cache's groups (1); the
+# core's first group, the end of its attention groups, the first group past them (a chain's first core's: the sub-step's
+# group, for its records only); its first slot's row of angles (M_SA: 0, since each sub-step's object holds its own
+# slots' angles); the tail objects; (one pass) the core's A objects through its held ones, the rows' masks of the step's
+# first two records and the slots' K lanes. A step whose last slots branch off an earlier one: the word ``M_BRANCH``
+# (its parent slot + 1 | its slots << 8, or 0), in a separate kind that a model's other objects of the step may also
+# extend (qwen35's gdn_in).
+# (a separate kind: a model's other attention cores take the flag too, as qwen35's DFlash2 does)
+FLAGS = XMETA.kind("attn256 flags")
 F_ATT = FLAGS.flag("F_ATT", 10)  # M_FLAGS of an attention core's object
 BRANCH = XMETA.kind("attn256 branch")
 M_BRANCH = BRANCH.word("M_BRANCH", at=37)
@@ -153,7 +158,7 @@ M_ALANE = ATT.word("M_ALANE", at=42)  # (one pass) the slots' K lanes (A_LN)
 # the next (per record rows 0 .. 3, 4 .. 7: a row's lanes before its window, A_WM), the rows whose window starts past
 # the stream's first group (per set of rows 0 .. 3, 4 .. 7 their lanes, A_WL: ``window_words``), whether the step's
 # rows see its records whole (a drafter's block: every slot P V over a record's V encoded from all the step's rows, A_WH;
-# 0: each slot's from the rows up to its own, ``attn256.one``'s ``tobj``)
+# 0: each slot's P V over V encoded from the rows up to the slot's own row, ``attn256.one``'s ``tobj``)
 M_KIND, M_WREC = ATT.words("M_KIND M_WREC", at=43)
 M_WMASK = ATT.block("M_WMASK", 4, at=45)
 M_WLATE = ATT.block("M_WLATE", 2, at=49)
@@ -463,12 +468,12 @@ class AttnShape:
 
 def step_words(p: int, S: int, branch: tuple[int, int] | None = None, *, block: bool = False
                ) -> tuple[int, np.ndarray, int]:
-    """(one pass) A step's F_ATT words that follow its slots' positions (p, S slots; ``branch``: its last L slots follow slot c,
-    at p + c + 1 .., inside the 8 positions of c's record): the branch word (``M_BRANCH``: its first lane in its record | L << 8
-    | its record past the step's first << 12, or 0), the rows' masks of the step's first two records (``M_AMASK``: per
-    record rows 0 .. 3, 4 .. 7, a row's lanes past its position: slot s's p + s, a branch slot's its own; ``block``: every
-    row's past the last slot's, a drafter's block that sees itself whole), the slots' K lanes (``M_ALANE``: their positions'
-    lanes, 3 bits each)."""
+    """(one pass) A step's F_ATT words that follow its slots' positions (p, S slots; ``branch``: its last L slots follow
+    slot c, at p + c + 1 .., inside the 8 positions of c's record): the branch word (``M_BRANCH``: its first lane in its
+    record | L << 8 | its record past the step's first << 12, or 0), the rows' masks of the step's first two records
+    (``M_AMASK``: per record rows 0 .. 3, 4 .. 7, a row's lanes past its position, which is p + s for slot s and the
+    branch slot's own position for a branch slot; ``block``: every row's past the last slot's, a drafter's block that
+    sees itself whole), the slots' K lanes (``M_ALANE``: their positions' lanes, 3 bits each)."""
     c, L = branch or (-1, 0)
     sc = S - L
     q = p % 8 + c + 1  # (the branch's first position, from the step's first record's)

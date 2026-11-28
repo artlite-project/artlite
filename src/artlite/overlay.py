@@ -130,7 +130,7 @@ class Sequence:
         """Read ``nbytes`` at the device address into a column's A or X stream (``dims``: gathered,
         see ``txn.Txn.shim_bd``), ``repeat`` times in a row (``iteration``: each from a further address). On a
         packet-switched stream (``PACKET``) the fill gets the stream's packet header unless ``packet``
-        is False (words that carry their own headers: control packets) or another packet id (a route of its own);
+        is False (words that carry their own headers: control packets) or another packet id (a separate route);
         acquire (shim lock, value): the task waits for the lock."""
         assert self.op.ENDPOINTS[stream][0] == txn.MM2S, stream
         pid = self._packet.get(stream) if packet is True else None if packet is False else packet
@@ -170,7 +170,7 @@ class Sequence:
         direction, channel = self.op.ENDPOINTS[stream]
         queued = self._queued.setdefault((col, stream), [])
         while not ok(queued):
-            i = next(i for i, e in enumerate(queued) if e is not None)  # (the array's tasks: no token of their own)
+            i = next(i for i, e in enumerate(queued) if e is not None)  # (the array's tasks carry no token)
             self.txn.set_token(queued[i])
             del queued[:i + 1]
             self.txn.sync(col=col, direction=direction, channel=channel)
@@ -305,7 +305,7 @@ class OverlayDevice:
         """Zeroed host buffers by name (as ``alloc``), those of ``sizes`` the device lacks, allocated together. On the
         XRT backend buffers allocated together are one XRT buffer of exactly their size, and a command lists at most 5
         (``backend``): an overlay's buffers and those of its prefill cost a command one, whatever their sizes, where a
-        buffer allocated alone lies in a shared region of 1 GB that is pinned whole, or in its own from 256 MB."""
+        buffer allocated alone lies in a shared 1 GB region that is pinned whole, or in a dedicated one from 256 MB on."""
         new = {name: n for name, n in sizes.items() if name not in self.buffers}
         assert all(n % 4 == 0 for n in new.values()), new
         assert all(self.buffers[name].size >= n for name, n in sizes.items() if name not in new), sizes
@@ -318,7 +318,7 @@ class OverlayDevice:
         return buffer.map()
 
     def named(self, name: str) -> object:
-        """The buffer a name stands for (``alias``: another one's, else its own)."""
+        """The buffer a name stands for (another name's buffer where ``alias`` maps it, else the name's own)."""
         return self.buffers[self.alias.get(name, name)]
 
     def view(self, name: str, *, own: bool = False) -> np.ndarray:
@@ -353,7 +353,7 @@ class OverlayDevice:
         """Run a transaction; blocking. The DispatchError of a transaction the driver's hang detection stopped names
         the operations where the firmware was."""
         with npu_turn():
-            self._fresh()  # (a failure of the prologue is noted as its own)
+            self._fresh()  # (_fresh reports a prologue failure under the prologue's name)
             try:
                 t0 = time.perf_counter()
                 self._prog._kernel().dispatch(transaction.buffer, list(self.buffers.values()),
@@ -423,7 +423,7 @@ _native.set_heap_reclaim(_reclaim)
 
 class Transactions:
     """What an owner keeps to run again, by key (a model's steps: per kind of step the object that holds its
-    ``Transaction`` and what patches it): each transaction lies in a device-heap buffer of its own, and a model's
+    ``Transaction`` and what patches it): each transaction lies in a separate device-heap buffer, and a model's
     kinds of steps together take tens of MB (Qwen3.6 35B-A3B with its drafter: 52 of 0.9 MB). Where the device heap is
     full and cannot grow, the process gives them up one by one, the least recently used of all owners' first
     (``_reclaim``): a key that is no longer here is built again by its owner. Reading a key marks it used."""
@@ -463,7 +463,7 @@ class Transactions:
 
 
 class Transaction:
-    """A transaction in an instruction buffer of its own: ``words`` is the buffer's uint32 view
+    """A transaction in a dedicated instruction buffer: ``words`` is the buffer's uint32 view
     (rewrite BD words there, then ``flush``); ``durations``: its last dispatches' (s)."""
 
     def __init__(self, dev: OverlayDevice, words: np.ndarray):

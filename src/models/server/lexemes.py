@@ -87,8 +87,8 @@ Node = tuple  # a rule's expression: ("sym", lexeme), ("ref", rule), ("seq", [..
 
 @dataclass(frozen=True)
 class _Order:
-    """A grammar's lexemes in their rules' order, each place a rule names one its own position (``label``: the lexeme
-    as the grammar writes it): their patterns, the ones that may start and end the input, the ones that may follow
+    """A grammar's lexemes in their rules' order, each place where a rule names one a separate position (``label``: the
+    lexeme as the grammar writes it): their patterns, the ones that may start and end the input, the ones that may follow
     each, the ignored ones, whether the input may be empty."""
 
     patterns: dict[str, str]
@@ -240,7 +240,7 @@ def _goes_on(d: "_Dfa", end: str, newline: bool, ending_ok: set[int] | None = No
 
 
 class _Walk:
-    """The lexemes of a grammar as one NFA, each its own start and end, walked over a text in the rules' order."""
+    """The lexemes of a grammar as one NFA, each with its own start and end, walked over a text in the rules' order."""
 
     def __init__(self, o: _Order):
         self.o, self.nfa = o, _Nfa()
@@ -358,7 +358,7 @@ def _order(lark: str) -> _Order:
     done: dict[str, str] = {}
 
     def lexeme(k: str, text: str) -> str:
-        """A new position of a lexeme (each place a rule names it: its own FOLLOW, Glushkov's construction)."""
+        """A new position of a lexeme (each place where a rule names it, with a separate FOLLOW: Glushkov's construction)."""
         if text not in regexes:
             regexes[text] = _regex(text, terminals, done) if k == "n" else _literal(text) if k == "r" else \
                 _string(text)

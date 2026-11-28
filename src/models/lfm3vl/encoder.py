@@ -27,14 +27,14 @@ A layer on nb bands (``layer``), two passes over the bands (its operator needs e
 - the feed-forward: LN2 (x parked in DDR meanwhile), gate / up as SwiGLU (``Gemm(act="silu")``: panels), x back, down + x.
 The patch embedding: the pixels' exact 8-bit integers (q = p - 128, the normalization folded into its weights; hi +
 lo weights), RMSNorm into panels, an identity GEMM back to C tiles (x0, with its records). A video's pair of frames
-(``host.VideoPlan``): the two temporal kernels on their own frames, the pair's 2 x 768 inputs and the constant (KP 1600:
-``patch_weights(pair=True)``); its other ops the image's.
+(``host.VideoPlan``) runs the two temporal kernels, one per frame, on the pair's 2 x 768 inputs and the constant (KP
+1600: ``patch_weights(pair=True)``); its other ops are the image's.
 
-Precision: each layer alone is within 1.2-1.9% of its own contribution (the bfp16 operands of its GEMMs; every token
-within ~3.5%); the embeddings per merged token ~3.5% from the float64 encoder (median; p90 ~9%), a few tokens up to ~0.8
-of their norm: patches whose final residual cancels to a fraction of their neighbours' (the projector's LayerNorm divides
-by it). The language model's KL against llama.cpp's run is 0.0007 (with llama.cpp's own embeddings 0.0005:
-``tests/lfm3vl``).
+Precision: each layer alone is within 1.2-1.9% of the layer's contribution (from the bfp16 operands of its GEMMs; every
+token is within ~3.5%); the embeddings per merged token are ~3.5% from the float64 encoder (median; p90 ~9%), a few
+tokens up to ~0.8 of their norm: patches whose final residual cancels to a fraction of their neighbours' (the
+projector's LayerNorm divides by it). The language model's KL against llama.cpp's run is 0.0007 (with llama.cpp's own
+embeddings 0.0005: ``tests/lfm3vl``).
 """
 
 import math

@@ -210,8 +210,8 @@ class Program:
         try:
             self._ctx = dev.create_context(self._exe)
         except RuntimeError:
-            # (the device has 16 hardware contexts for all processes, and a dropped program keeps its own until the
-            # cycle collector runs: its operator's design objects are reference cycles)
+            # (the device has 16 hardware contexts for all processes, and a dropped program keeps its context until
+            # the cycle collector runs, because its operator's design objects are reference cycles)
             gc.collect()
             self._ctx = dev.create_context(self._exe)
         self._kern = _native.Kernel(dev, self._ctx)

@@ -21,7 +21,7 @@ from .sequence import MEDIA, token_ids
 
 # a vocabulary's logits: bf16 (``ml_dtypes.bfloat16``: an overlay's) or fp32, or a screened head's row (``taken``)
 LogitsLike = np.ndarray | ScreenedRow
-_rng = random.Random()  # (the draws of a ``Sampling`` without a generator of its own: ``seed``)
+_rng = random.Random()  # (the draws of a ``Sampling`` without a separate generator: ``seed``)
 
 
 def seed(n: int | None = None) -> None:
@@ -94,7 +94,7 @@ def top_logits(logits: LogitsLike, k: int, cap: float = 0.0, *, rows: np.ndarray
                ) -> tuple[np.ndarray, np.ndarray]:
     """The k largest of a vocabulary's logits after a soft cap (``cap`` > 0: cap tanh(l / cap)), fp32, descending
     (equal ones: the lower index first), and their token ids (int32; ``rows``: the token of each logit, else its index):
-    one pass over the logits (``_native.top_logits``); a screened head's row: its own (``ScreenedRow.top``)."""
+    one pass over the logits (``_native.top_logits``); a screened head's row goes through ``ScreenedRow.top``."""
     if isinstance(logits, ScreenedRow) and rows is None:
         values, ids = logits.top(k)
         return _capped(values, cap), ids

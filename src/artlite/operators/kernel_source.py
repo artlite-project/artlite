@@ -207,7 +207,7 @@ def split(text: str) -> list[Item]:
                              (len(words) == 2 and words[0] == "namespace")):
                 if len(words) == 2 and words[0] == "namespace":
                     raise KernelSourceError(f"named namespace {words[1]}: kernel sources use prefixed names")
-                if text[start:head[0].start].strip():  # (comments before the block: an item of their own)
+                if text[start:head[0].start].strip():  # (comments before the block form a separate item)
                     items.append(Item(text=text[start:head[0].start], wrapper=wrappers[-1] if wrappers else "",
                                       defines=(), refs=frozenset()))
                 wrappers.append("namespace" if words[0] == "namespace" else "C")

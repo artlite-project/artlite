@@ -1,6 +1,6 @@
 // ---- Q8_0H ({{ R8H }} rows: Q8_0's high plane, formats/q8h.py): Q4_0's tile, d' [row][sb][i] bf16 | codes (mmv/q4s),
 // centered at 7.5. y[g][32] (rows 8 g ..) += the rows of super-blocks 2 H, 2 H + 1 against xp (their 64 panels){{ "; rg_all:
-// super-block 2 H + 1's rows into y + ys (row groups of 4: rows of their own)" if rg and rg_all else "" }}
+// super-block 2 H + 1's rows into y + ys (row groups of 4: separate output rows)" if rg and rg_all else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_q80h(uint8_t *__restrict a, const uint8_t *__restrict xp,
                                             const uint8_t *__restrict xs, float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg and rg_all else "" }})

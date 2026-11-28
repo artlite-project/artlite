@@ -21,8 +21,8 @@ the token objects, each column's range of each layer's cache per sub-step (A: ad
 objects (A: the ring slots of the sub-step's open records, or after a prefill the V panels of the first: record mode,
 ``_ring_modes``) and the record drains (D: address, length): ``decode.step``.
 
-Several sequences in a step (``decode.step.Part``; a model with ``SEQ``): a sequence's slots are sub-steps of their
-own (``_join``), each with its sequence's caches and rings (their buffers' addresses), its own positions (the token
+Several sequences in a step (``decode.step.Part``; a model with ``SEQ``): a sequence's slots form separate
+sub-steps (``_join``), each with its sequence's caches and rings (their buffers' addresses), its own positions (the token
 object's, the slots' RoPE rows) and its sequence's record mode; the cores run a sub-step as in a step of that sequence
 alone, so every slot's numbers are those of a step of one, and the step's time is the weights' stream once plus a pass
 over each sequence's caches.
@@ -30,7 +30,7 @@ over each sequence's caches.
 What a model supplies: its ``phases`` and their flags (``_flags``), the layout of its buffers (``_plan``: with
 ``_plan_caches`` and, for post-norm models, ``_plan_headers``), its GEMV outputs (``_outputs``), what the attention
 objects hold (``_attention_scale``, ``_qk_weights``, ``_load_layer`` for other layers), the sub-steps (``subs``,
-``_kind_subs``), the RoPE tables of a kind (``_rope``) and the words of its own in the token objects
+``_kind_subs``), the RoPE tables of a kind (``_rope``) and the overlay's own words in the token objects
 (``_token_words``).
 """
 
@@ -288,7 +288,7 @@ class AttentionOverlay(ModelOverlay):
 
     def _load_attention(self, L: int) -> None:
         """The metadata words of layer L's KV heads' q and K / V objects: q object a's the F_ATT object of the sub-step from a
-        on (static but M_ATREC: ``_tails``); a K / V object's (a layer with its own cache) M_NASKIP = -1 - its token t: after
+        on (static but M_ATREC: ``_tails``); a K / V object's (a layer that owns its cache) M_NASKIP = -1 - its token t: after
         it the main cores skip the cache objects of the sub-step that ends at slot a. A layer without its own cache has no
         K / V objects: its q object's M_NASKIP is that."""
         act, use = self.dev.view("ACT"), self.uses[L]
@@ -365,11 +365,11 @@ class AttentionOverlay(ModelOverlay):
         return subs
 
     def _attention(self, seq: Sequence, st: StepPlan, L: int, weights: list[tuple[int, str]]) -> None:
-        """The attention of layer L, per sub-step (a layer with its own cache: each after the last one's records are in
-        DDR): per column its cache range (A, patched) and a chain end's tail objects, the F_ATT object and the sub-step's q
-        and K / V objects (X), the records (D, patched) and o (D, into the sub-step's slots of o's input). The weights of
-        the GEMV phases after it go before the sync of its inputs (their first layout block: ``_weight_run``): the A stream
-        keeps streaming them while the attention waits for them."""
+        """The attention of layer L, per sub-step (in a layer that owns its cache, each sub-step runs after the previous
+        one's records are in DDR): per column its cache range (A, patched) and a chain end's tail objects, the F_ATT
+        object and the sub-step's q and K / V objects (X), the records (D, patched) and o (D, into the sub-step's slots
+        of o's input). The weights of the GEMV phases after it go before the sync of its inputs (their first layout
+        block: ``_weight_run``): the A stream keeps streaming them while the attention waits for them."""
         dev, T, chain = self.dev, self.T, self.CHAIN
         use = self.uses[L]
         kind, src = self.kinds[use.kind], use.source

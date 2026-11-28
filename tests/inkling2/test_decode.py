@@ -146,8 +146,8 @@ def test_qkv_states(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
 def test_mix(ink: tuple[GGUFFile, InklingConfig], S: int) -> None:
     """A full layer's (5) attention inputs as depth mixes of 3 states (read as 4: the fourth's coefficient 0): the q
     phase's partial sums object (F_COEF) gives the helper the three queries' coefficient sets, the q, k and v phases mix
-    the states by sets 0, 1, 2 (F_STATES), each normed by its own ``attn_*_inp_norm``: the outputs against numpy's mixes
-    (``InklingConfig``'s depth mix) and products."""
+    the states by sets 0, 1, 2 (F_STATES), each normed by a separate ``attn_*_inp_norm``: the outputs against numpy's
+    mixes (``InklingConfig``'s depth mix) and products."""
     g, cfg = ink
     H, eps, L = cfg.hidden_size, cfg.rms_norm_eps, 5
     img = InklingImage(g, cfg, layers=[L], vocab=COLS * 64)

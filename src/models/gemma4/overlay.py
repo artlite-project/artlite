@@ -40,11 +40,11 @@ image: one A task.
 
 Each own-cache layer keeps per KV head a ring of two slots (``ring``, after the caches) with the exact V values of its
 open records (``attn``); the host tracks which records they hold (``decode.vring.VRing``: a step continues from the
-last one's positions, at most its own back, as the generation loop's rejected drafts do).
+last step's positions, at most that step's length back, as the generation loop's rejected drafts do).
 
-Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
-step's slots may be theirs (``step``'s parts), a sequence's slots sub-steps of their own in both cache kinds
-(``_join``). Every slot's logits and residual are those of a step of one of its sequence, bit for bit.
+Several sequences (``sequences``: each keeps its caches and rings in a separate KV buffer, ``ModelOverlay.select``): a
+step's slots may belong to several sequences (``step``'s parts), and each sequence's slots run as separate sub-steps in
+both cache kinds (``_join``). Every slot's logits and residual are those of a step of one of its sequence, bit for bit.
 
 A PARO checkpoint (``image``'s PARO layout): the phases of ``paro_steps`` (R phases instead of headers), the tied F16
 head screened (``decode.screen``).
@@ -304,7 +304,7 @@ class GemmaOverlay(GemmaParo, AttentionOverlay):
 
     def _weights_first(self, seq: Sequence, ph: list[tuple[int, str]], i: int,
                        run: Callable[[int], list[tuple[int, str]]]) -> None:
-        if ph[i] == PLE_PHASE:  # (a run of its own: a step from a later layer on skips the layers between)
+        if ph[i] == PLE_PHASE:  # (a separate run: a step that starts at a later layer skips the layers in between)
             self._weight_run(seq, [PLE_PHASE])
         elif i == 0 or ph[i - 1] == PLE_PHASE:
             self._weight_run(seq, run(i))
@@ -359,7 +359,7 @@ class GemmaOverlay(GemmaParo, AttentionOverlay):
         the model's per-layer token rows times sqrt(per_layer_dim / 2) (``GemmaHost.layer_rows``; E2B / E4B), at positions
         position .. position + S - 1 of the selected sequence (the positions before are cached), or of several
         sequences' slots: ``position`` their parts (``decode.step.Part``: the rows in the parts' order, each sequence's
-        at its own next positions; from the first layer). Returns the raw logits (S, vocab) bf16 (before
+        rows at that sequence's next positions; from the first layer). Returns the raw logits (S, vocab) bf16 (before
         the soft cap; a view of the NPU's buffer, valid until the next step), or without ``logits`` None (only the
         caches are updated). ``start``: the step from that layer on, x its input (e.g. a prompt's last token after a
         prefill chunk: ``GemmaPrefill.residual``; ``emb``: the scaled embeddings, the per-layer projection's input):

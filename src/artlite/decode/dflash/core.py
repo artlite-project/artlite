@@ -1,5 +1,5 @@
-"""The DFlash2 block drafter's cores (``decode.dflash.overlay``): a design of its own on the shared decode overlay
-(``decode.design``, 8 slots: the main and helper cores as every model's), in a hardware context of its own, with
+"""The DFlash2 block drafter's cores (``decode.dflash.overlay``): a separate design on the shared decode overlay
+(``decode.design``, 8 slots: the main and helper cores as in every model), in a dedicated hardware context, with
 
 - the conv core (c, 2), which holds the block's residual: res [k block XK][slot 8][8] fp32 of the column's H8 = hidden / COLS
   channels (``DFlashShape``: Qwen3.8 27B's drafter 640, Flint's 256). It

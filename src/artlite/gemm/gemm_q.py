@@ -164,7 +164,7 @@ class GemmQOperator(ArtcOperator):
         memory read and merge that line: on a machine without a cache in front of DRAM, Krackan Point, 15.6 instead of
         73.2 GB/s, ``artlite-probe``). Packed passes (``line_carry``): each pass writes ``win`` columns from the line
         boundary at or before its first column, the previous pass's last columns (kept in the C object, whose rows the
-        memtile reads ``win`` columns of, into the next row) first, stale columns after its own (the next pass's, or
+        memtile reads ``win`` columns of, into the next row) first, stale columns after its own columns (the next pass's, or
         padding: the caller leaves room for the last window, ``line_window``). Gate/up (``c_parts``): C objects of two
         32-output parts, drained as 576-byte rows;
         ``a_cols`` = (k0, width): A is the columns k0 .. k0 + K of panels ``width`` columns wide (a projection split

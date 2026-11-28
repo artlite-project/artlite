@@ -133,8 +133,8 @@ def _mel_bands(n_mel: int) -> list[tuple[int, int, np.ndarray]]:
 
 
 def mel_spectrum(power: np.ndarray, n_mel: int) -> np.ndarray:
-    """A power spectrogram (frames, N_FFT / 2 + 1) through the mel filters: (n_mel, frames) in power's dtype (each
-    filter over its own bins: ``mel_filters(n_mel) @ power.T`` without the bank's zeros)."""
+    """A power spectrogram (frames, N_FFT / 2 + 1) through the mel filters: (n_mel, frames) in power's dtype. Each
+    filter sums only the bins it covers, which equals ``mel_filters(n_mel) @ power.T`` without the bank's zeros."""
     out = np.empty((n_mel, len(power)), power.dtype)
     for i, (lo, hi, w) in enumerate(_mel_bands(n_mel)):
         out[i] = power[:, lo:hi] @ w.astype(power.dtype)

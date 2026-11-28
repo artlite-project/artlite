@@ -85,7 +85,8 @@ def test_mel_hf() -> None:
 
 
 def test_mel_llama() -> None:
-    """log_mel against llama.cpp's (the encoder's inp_raw): within float32 rounding (its own FFT, float32 throughout)."""
+    """log_mel against llama.cpp's (the encoder's inp_raw): within float32 rounding (a separate FFT, float32
+    throughout)."""
     path = clip()
     g = golden(path)
     mel = A.log_mel(load_audio(path))

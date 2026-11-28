@@ -10,7 +10,7 @@ they are made:
 - a flag bit or value is declared once per field (``of``: "flags" by default) within a kind, and ``consts`` refuses a
   composition in which two kinds spell one name differently or one bit twice.
 
-Which kinds meet is the map's mode. ``objects=True``: each kind is an object of its own (the metadata of a phase, of a
+Which kinds meet is the map's mode. ``objects=True``: each kind is a separate object (the metadata of a phase, of a
 token object, of an attention object: their words may reuse one another's offsets) and meets only the kinds it
 ``extends`` (a model's words in a phase object: the model's kind extends the phase's, whose words it may not take).
 ``objects=False``: the kinds are features of one array (the state words of the main core: those of the post-norm

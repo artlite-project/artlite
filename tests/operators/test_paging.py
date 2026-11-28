@@ -269,7 +269,7 @@ def test_link(probe: PagingProbe) -> None:
 @pytest.mark.parametrize("variant, message", [("reach", "reaches the pager"), ("data", "needs data"),
                                               ("acq", "wake lock 4 acquired in")])
 def test_link_refuses(variant: str, message: str) -> None:
-    """The linker refuses a page that calls the pager, a page with data of its own, a wake lock acquired outside the
+    """The linker refuses a page that calls the pager, a page that needs data, a wake lock acquired outside the
     pager (compile only: a one-column design)."""
     op = _compiled(PagingProbe(cols=1, variant=variant, chain=4))
     with pytest.raises(paging.PagingError, match=message):

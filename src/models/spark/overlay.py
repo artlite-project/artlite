@@ -2,19 +2,19 @@
 token slots, the step.
 
 ``SparkOverlay`` lays out the weight image (``image.SparkImage``, packed at ``load``), the norm weights (NORM:
-contiguous bf16; a region-major image's phases read them as overlapping A objects, a column-major one's from its own
-data regions), every phase's input (ACT: per K group [metadata object | x slot-interleaved], ``decode.protocol``; a
-producer drains its outputs straight into its consumer's x), the residual-slice objects (F_LOADR), the attention layers'
-objects (per column its F_ATT object, then per column its q objects; the raw K / V objects) and KV caches (KV,
-``decode.kv``'s d-block-major layout in groups of 32 positions: a full layer's per KV head linear up to
-``max_positions``, a sliding-window layer's a ring of ``ring_groups`` groups, group g at slot g % NR, which holds its
-window and a prefill chunk; then per layer and KV head a ring of the open V records' values, ``decode.vring``), and the
-logits ([slot][vocab] bf16).
+contiguous bf16; a region-major image's phases read them as overlapping A objects, a column-major one's phases read them
+from separate data regions), every phase's input (ACT: per K group [metadata object | x slot-interleaved],
+``decode.protocol``; a producer drains its outputs straight into its consumer's x), the residual-slice objects
+(F_LOADR), the attention layers' objects (per column its F_ATT object, then per column its q objects; the raw K / V
+objects) and KV caches (KV, ``decode.kv``'s d-block-major layout in groups of 32 positions: a full layer's per KV head
+linear up to ``max_positions``, a sliding-window layer's a ring of ``ring_groups`` groups, group g at slot g % NR, which
+holds its window and a prefill chunk; then per layer and KV head a ring of the open V records' values,
+``decode.vring``), and the logits ([slot][vocab] bf16).
 
 A step is one dispatch of the transaction of its slot count (built at its first use), patched per step with its
 position (``decode.attn256_steps``: the F_ATT objects' words, a sliding-window layer's window and masks, the angles of
 each kind; the cache and ring reads, a ring's window in two fills; the record drains). While a step runs the host patches
-the next one (S slots at the next position) into a second transaction buffer that reads F_ATT objects of its own
+the next one (S slots at the next position) into a second transaction buffer that reads separate F_ATT objects
 (``ModelOverlay.AHEAD``: 0.7 / 1.0 ms of the 1.7B's / 4B's step at 1K that the NPU otherwise waits for; ``fatt2``, the
 second buffer's transactions copies of the first's, made at their first use: ``_transaction``). Per step the columns
 load the slots' residual slices (F_LOADR), then per layer
@@ -27,7 +27,7 @@ load the slots' residual slices (F_LOADR), then per layer
 and the LM head (normed: ``output_norm``) -> LOGITS. A column-major image (the 4B) streams a column's weights between two
 attentions as one run (``ModelOverlay._weight_run``), a region-major one (the 1.7B) per phase and K group.
 
-Several sequences (``sequences``: each one's caches and rings in a KV buffer of its own, ``ModelOverlay.select``): a
+Several sequences (``sequences``: each one's caches and rings in a separate KV buffer, ``ModelOverlay.select``): a
 step's slots may be several sequences' (``decode.step.Part``): each attention then runs a pass per sequence over that
 sequence's cache, its rows drained into the sequence's slots of attn_out's staged x (``decode.attn256_steps``' "Several
 sequences"), and every slot's logits are those of a step of one of its sequence, bit for bit.
@@ -359,8 +359,8 @@ class SparkOverlay(ModelOverlay):
         """One step of S = len(x) <= 8 token slots: x (S, hidden) the first layer's inputs (embeddings) at positions
         position .. position + S - 1 of the selected sequence (the positions before are in the caches), or of several
         sequences' slots: ``position`` their parts (``decode.step.Part``: x's rows in the parts' order, each
-        sequence's at its own next positions). Returns the slots' logits (S, vocab) bf16 (a view of the NPU's buffer,
-        valid until the next step), or without ``logits`` None."""
+        sequence's rows at that sequence's next positions). Returns the slots' logits (S, vocab) bf16 (a view of the
+        NPU's buffer, valid until the next step), or without ``logits`` None."""
         x = np.asarray(x, np.float32).reshape(-1, self.H)
         S = x.shape[0]
         assert 1 <= S <= self.SLOTS

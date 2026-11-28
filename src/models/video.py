@@ -144,8 +144,8 @@ class Frames:
         w, h = self.size = size
         self.idx = [int(i) for i in indices]
         self.keep = sorted(set(self.idx)) if info.regular else list(range(self.idx[-1] + 1))  # (ffmpeg's output frames)
-        vf = [_select(self.keep) + ",setpts=N/FRAME_RATE/TB"] if info.regular else []  # (the picked frames, in slots
-        # of their own: the constant-rate output passes each once)
+        vf = [_select(self.keep) + ",setpts=N/FRAME_RATE/TB"] if info.regular else []  # (the picked frames, each in
+        # a separate slot: the constant-rate output passes each once)
         if (w, h) != (info.width, info.height):
             vf.append(f"format=rgb24,scale={w}:{h}:flags=bicubic+accurate_rnd+full_chroma_int:param0=0:param1=0.5")
         cmd = [_tool("ffmpeg"), "-nostdin", *INPUT, *(["-vf", ",".join(vf)] if vf else []), "-frames:v",

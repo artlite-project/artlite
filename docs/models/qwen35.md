@@ -50,7 +50,7 @@ the Q4_K_M file of a `<repository>-DFlash2-GGUF` of any account; a PARO checkpoi
 design runs 8 tokens and the file has its MTP layer (the DFlash2 drafter's head), or the model is a PARO checkpoint (no MTP
 tensors), else its file's own MTP layer (unsloth's UD-IQ1_M has none: no drafter); a qwen35moe
 model's (`model_config.qwen_mtp_of`): an `mtp-*.gguf` (or an uploader's `<name>-mtp-*.gguf`) next to the model, else in
-another account's repository of the same name (ggml-org publishes its drafters apart from the models; a PARO
+another account's repository of the same name (ggml-org publishes its drafters separately from the models; a PARO
 checkpoint's: in its base model's `<base>-GGUF` repositories); of several, Q4_0, then Q4_K_M, then Q8_0.
 `--spec-draft-model FILE` takes another file, `--spec-type none` none ([artlite-cli](../cli.md)).
 
@@ -66,9 +66,12 @@ cores read what to do from their input streams. Per column:
   reads and writes back to DDR every token (in a design of 8 tokens and on the MoE models chunkwise, one pass over the state
   for a step's tokens, as the prefill, the state written back only by the step that ends a block of 8 positions; in a design
   of 8 tokens the main core's helper, idle then, computes the heads' constants);
-- the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes
-  the position into the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads)
-  share its cache from 96 positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens one stream of the cache reaches both cores, each attending with its own heads: one pass over the cache per step; on the 35B-A3B and Occamy steps of 3 and 4 tokens split a chain of 4 into two halves on shared streams, also one pass).
+- the attention core runs the full attention (head_dim 256, partial RoPE, the sigmoid gate) and writes the position into
+  the KV cache. The columns of a KV head (2 for the 9B and 27B, 4 for MiniCPM-V's 2 KV heads) share its cache from 96
+  positions on: each core reads a part, and the parts' results merge from core to core (in a design of 8 tokens, one
+  stream of the cache reaches both cores and each core attends with a different set of heads, so a step makes one pass
+  over the cache; on the 35B-A3B and Occamy, steps of 3 and 4 tokens split a chain of 4 into two halves on shared
+  streams, also in one pass).
 
 The LM head is screened where it is Q6_K and the design has room for its tiles (`artlite/decode/screen.py`; not the 27B
 models with an MTP layer: their design of 8 tokens has none, and their drafters read the head's rows in place): the NPU
@@ -88,20 +91,21 @@ driver's hang detection. The prompt's last logits come from the LM head alone. T
 (inside a 32-position cache group, e.g. after a generated reply), and a prompt's last 4 or fewer, run as decode steps.
 
 Several requests at a time (`artlite-server -np N`, up to 8; MiniCPM-V's language model, Qwen3.5-9B, Qwen3.6-27B,
-Qwen3.8-27B and Swift 1.5: the dense files and PARO checkpoints, on the design of 8 tokens per dispatch): the NPU holds N sequences' KV caches and Gated DeltaNet states (0.1 GB a sequence on the 9B, 0.3 GB on the 27B), and a decode
-step's 8 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them,
-each attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per
-sequence on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.06x / 1.13x / 1.40x a step of one
-(the 27B; the 9B: 1.07x / 1.17x / 1.55x), and through `artlite-server` 4 requests get 3.1x and 8 get 4.6x one
-request's tokens per second in all (the 9B: 3.1x and 4.4x). The LM head stays screened, as for one request, and a file
-of more than two formats, the head's plane among them (the 9B's four, the 27B's and MiniCPM-V's three), loads each
-format's kernels as a code page (a main core of that design holds two): one request alone gets 12.3 tokens per second
-there instead of 12.6 on the 9B (MiniCPM-V, whose own design is of 4 tokens too: 119 instead of 122, and 148 / 165 /
-166 for 2 / 4 / 8 requests).
-A file's MTP layer (Qwen3.8-27B's, Swift 1.5's) drafts for every request (a cache of its own per sequence, its guesses for a request ahead
-of the step the requests share, for that request's share of the step's slots: 8.9 / 13.5 / 18.0 tokens per second
-for 1 / 2 / 4 requests); the DFlash2 drafter, whose records follow one sequence, does not load then:
-[artlite-server](../server.md#several-requests-at-a-time). The mixture-of-experts models serve `-np N` one request at a time.
+Qwen3.8-27B and Swift 1.5: the dense files and PARO checkpoints, on the design of 8 tokens per dispatch): the NPU holds
+N sequences' KV caches and Gated DeltaNet states (0.1 GB a sequence on the 9B, 0.3 GB on the 27B), and a decode step's 8
+slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of them, each
+attention layer runs a pass per sequence over that sequence's cache and each Gated DeltaNet layer a chain per sequence
+on its state (`qwen35/gdn_steps.py`). A step of 2 / 4 / 8 requests takes 1.06x / 1.13x / 1.40x a step of one (the 27B;
+the 9B: 1.07x / 1.17x / 1.55x), and through `artlite-server` 4 requests get 3.1x and 8 get 4.6x one request's tokens per
+second in all (the 9B: 3.1x and 4.4x). The LM head stays screened, as for one request, and a file of more than two
+formats, the head's plane among them (the 9B's four, the 27B's and MiniCPM-V's three), loads each format's kernels as a
+code page (a main core of that design holds two): one request alone gets 12.3 tokens per second there instead of 12.6 on
+the 9B (MiniCPM-V, whose single-request design also has 4 tokens: 119 instead of 122, and 148 / 165 / 166 for 2 / 4 / 8
+requests). A file's MTP layer (Qwen3.8-27B's, Swift 1.5's) drafts for every request (with a separate cache per sequence;
+it guesses for each request ahead of the step the requests share, filling that request's share of the step's slots: 8.9
+/ 13.5 / 18.0 tokens per second for 1 / 2 / 4 requests); the DFlash2 drafter, whose records follow one sequence, does
+not load then: [artlite-server](../server.md#several-requests-at-a-time). The mixture-of-experts models serve `-np N`
+one request at a time.
 
 Memory: the weights the NPU streams (15.95 GB of a 27B's file, and 0.27 GB of Qwen3.8's MTP layer; 4.60 GB of the
 9B's, 0.41 GB of MiniCPM-V's, 20.77 GB of the 35B-A3B's, and 0.56 GB of its drafter's; 15.82 GB of Occamy's, and
@@ -164,7 +168,7 @@ Occamy's file (APEX-I-MiniPlus) keeps the experts of the first and last ten laye
 twenty in IQ3_XXS, the shared experts in Q5_K, the GDN z in Q8_0 and alpha in F32. Its 9280-byte tiles hold 21 Q3_K
 rows or 23 IQ3_XXS rows (the 35B-A3B's at most 16), and its design loads each format's kernel as a code page when a tile
 needs it. IQ3_XXS stores indices into a 256-entry grid of 4 values each: the cores look them up by gathers from copies
-of the grid in their own memory (`formats/iq3.py`): in a decode step per 8 x 8 weight panel, in a prompt's GEMMs per
+of the grid in their local memory (`formats/iq3.py`): in a decode step per 8 x 8 weight panel, in a prompt's GEMMs per
 super-block of the rows a pass dequantizes. Alpha runs as two BFP16 planes (hi + lo) summed in fp32.
 
 Swift 1.5's file (APEX-I-MiniPlus V3, a Qwen3.8-27B fine-tune) keeps the FFN downs in IQ4_XS and the gate / up of the
@@ -193,48 +197,52 @@ proportionally faster: without a drafter a step of UD-IQ4_XS (14.4 GB of weights
 
 ## Multi-token prediction (Qwen3.8-27B, Qwen3.6-35B-A3B, Occamy 1.0)
 
-With its drafter (the model's MTP layer: an attention layer and an FFN of its own - Qwen3.8-27B's dense, in its model
-file; the 35B-A3B's an MoE layer, in a file of its own, with its own LM head), a generation step takes up to three draft
-tokens along (Qwen3.8-27B and Swift 1.5 up to seven; `qwen35/draft.py`, `OverlayModel.generate`): the drafter's guesses of what
-follows, one dispatch of the model's design each on the drafter's weights and KV cache (2.4-3.4 ms for 1-4 rows with
-ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's: 14 ms at 32K), as long as their
-chain's probability pays for what they cost: a draft's slot in the step and the drafter's step for the next one, against
-the tokens per second the model's rounds give (`OverlayModel._worth`; a dense model's slot costs ~1.5% of its step, so
-its chains go on down to a probability of ~0.1, an MoE's slots route to more experts: ~0.4-0.5). The step runs the token
-and its drafts, and a draft is kept where the model's own token at its position is that draft; the GDN states stay
-uncommitted until the next step, which replays the accepted tokens. The drafter's head is about 66048 rows of its LM
-head: the special tokens (the turn's end, tool calls, a thought's end), the first ids (the most frequent tokens) and 512
-of the sequence's own tokens past them, the most recently seen (an agent's turns repeat the identifiers of the code it
-reads: 0.2% of their tokens are outside the head, 2.7% outside the first 65536 ids). Qwen3.8-27B's MTP layer shares the
-model's LM head: the model's head rows put those first in each column (67584 rows: whole tiles), so the drafter streams
-the first rows of the model's own head, and the model's logits are gathered back into token order. Its row at a position
-takes that position's token and the model's hidden state of the position before, so its KV cache follows the model's: a
-prompt chunk also writes the drafter's records of its rows (its eh_proj, attn_norm and K / V after the model's last
-layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run with the next draft. The design runs the drafter's
-formats as code pages.
+With its drafter (the model's MTP layer: a separate attention layer and FFN; Qwen3.8-27B's FFN is dense and lives in its
+model file, while the 35B-A3B's is an MoE layer in a separate file with a separate LM head), a generation step takes up
+to three draft tokens along (Qwen3.8-27B and Swift 1.5 up to seven; `qwen35/draft.py`, `OverlayModel.generate`): the
+drafter's guesses of what follows, one dispatch of the model's design each on the drafter's weights and KV cache
+(2.4-3.4 ms for 1-4 rows with ggml-org's Q4_0 drafter, 3.2-4.7 ms with Occamy's Q4_K_M one, ~11 ms with Qwen3.8-27B's:
+14 ms at 32K), as long as their chain's probability pays for what they cost: a draft's slot in the step and the
+drafter's step for the next one, against the tokens per second the model's rounds give (`OverlayModel._worth`; a dense
+model's slot costs ~1.5% of its step, so its chains go on down to a probability of ~0.1, an MoE's slots route to more
+experts: ~0.4-0.5). The step runs the token and its drafts, and a draft is kept where the model's own token at its
+position is that draft; the GDN states stay uncommitted until the next step, which replays the accepted tokens. The
+drafter's head is about 66048 rows of its LM head: the special tokens (the turn's end, tool calls, a thought's end), the
+first ids (the most frequent tokens) and 512 of the sequence's own tokens past them, the most recently seen (an agent's
+turns repeat the identifiers of the code it reads: 0.2% of their tokens are outside the head, 2.7% outside the first
+65536 ids). Qwen3.8-27B's MTP layer shares the model's LM head: the model's head rows put those first in each column
+(67584 rows: whole tiles), so the drafter streams the first rows of the model's own head, and the model's logits are
+gathered back into token order. Its row at a position takes that position's token and the model's hidden state of the
+position before, so its KV cache follows the model's: a prompt chunk also writes the drafter's records of its rows (its
+eh_proj, attn_norm and K / V after the model's last layer: `qwen35/draft_prefill.py`), and the accepted tokens' rows run
+with the next draft. The design runs the drafter's formats as code pages.
 
 On the 35B-A3B models a step of several tokens sums the experts' outputs in another order than a step of one, so
 greedy text with drafts can differ from greedy text without where the top two logits are within ~0.1 of each other; the
 dense models' steps give the numbers of steps of one, so their greedy text is the same with drafts or without.
 
-Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory (`--spec-type draft-mtp`: with its MTP layer, whose
-263 MB the image otherwise leaves out, as with `--spec-type none`; the drafter takes 1.07 GB; `artlite/decode/dflash/`). Instead of a chain of drafts, one dispatch guesses a whole
-block of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a design of its own, which adds under 1 s to a load and no visible time
-to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the last 2048 positions, from each step and prompt
-chunk; its head is the first 84480 rows of the model's LM head (the special tokens, the first ids and 512 of the sequence's own tokens: a few
-rows' cost, for the rare tokens that end a chain), and a selector on the host picks the block's path among each position's 16 best logits.
-Where the selector's first guess is uncertain (its second candidate over twice as likely as the whole chain) and the branch fits in the 8
-positions that hold the round's token (its attention record and GDN block), the round's step gives the chain's last two slots to a branch:
-the second candidate and its successor, after the round's token (the attention and GDN cores compute each branch slot as a step of one at
-its position would, without the chain's later drafts: `QwenOverlay.step`'s branch; greedy text is the same with and without drafts). When the first draft is wrong and the branch right, the round keeps
-the branch's tokens and the one after them, from the branch's own logits. On prose a quarter to a third of the first drafts are wrong:
-on the same texts branches save 5% of the rounds (32K prompts, the sampler held to each prompt's text: 6.73 to 7.05 tokens/s; essays
-+5%, general text +4%, JSON +4%), while code, math and thinking rarely branch. A block's cost pays on 256 greedy tokens after short
-prompts: 1.4x the MTP layer's rate on code (23.5 tokens/s) and thinking, 1.6x on math, 1.3x on JSON, 1.2x on general text, 1.04x on
-essays without branches. On long prose it is ahead of the MTP layer (32K-token prompts: 6.73 against 6.64 tokens/s on three prompts) and
-slightly ahead on recorded agent sessions (11.8 against 11.6), whose text reaches back past its window. It takes no drafts from the context:
-wherever the context could guess, the block already does. A prompt cache's checkpoints hold its cache (27 MB each). A model with images
-(an mmproj file) drafts without it: its positions in an image are not the drafter's.
+Qwen3.8-27B drafts with z-lab's DFlash2 block drafter where its file is in the models directory
+(`--spec-type draft-mtp`: with its MTP layer, whose 263 MB the image otherwise leaves out, as with `--spec-type none`;
+the drafter takes 1.07 GB; `artlite/decode/dflash/`). Instead of a chain of drafts, one dispatch guesses a whole block
+of 7 tokens at once for ~31 ms (~11 ms per draft for the MTP layer), on a separate design, which adds under 1 s to a
+load and no visible time to a prompt. Its cache takes the model's hidden states at layers 6, 20, 34, 48 and 62 of the
+last 2048 positions, from each step and prompt chunk; its head is the first 84480 rows of the model's LM head (the
+special tokens, the first ids and 512 of the sequence's own tokens: a few rows' cost, for the rare tokens that end a
+chain), and a selector on the host picks the block's path among each position's 16 best logits. Where the selector's
+first guess is uncertain (its second candidate over twice as likely as the whole chain) and the branch fits in the 8
+positions that hold the round's token (its attention record and GDN block), the round's step gives the chain's last two
+slots to a branch: the second candidate and its successor, after the round's token (the attention and GDN cores compute
+each branch slot as a step of one at its position would, without the chain's later drafts: `QwenOverlay.step`'s branch;
+greedy text is the same with and without drafts). When the first draft is wrong and the branch right, the round keeps
+the branch's tokens and the one after them, from the branch's own logits. On prose a quarter to a third of the first
+drafts are wrong: on the same texts branches save 5% of the rounds (32K prompts, the sampler held to each prompt's text:
+6.73 to 7.05 tokens/s; essays +5%, general text +4%, JSON +4%), while code, math and thinking rarely branch. A block's
+cost pays on 256 greedy tokens after short prompts: 1.4x the MTP layer's rate on code (23.5 tokens/s) and thinking, 1.6x
+on math, 1.3x on JSON, 1.2x on general text, 1.04x on essays without branches. On long prose it is ahead of the MTP
+layer (32K-token prompts: 6.73 against 6.64 tokens/s on three prompts) and slightly ahead on recorded agent sessions
+(11.8 against 11.6), whose text reaches back past its window. It takes no drafts from the context: wherever the context
+could guess, the block already does. A prompt cache's checkpoints hold its cache (27 MB each). A model with images (an
+mmproj file) drafts without it: its positions in an image are not the drafter's.
 
 Every qwen35 model, with a drafter or not, also takes draft tokens from the prompt where the text repeats it
 (`models/drafts.py`, [artlite-cli](../cli.md#text)); a step of them leaves the GDN states uncommitted as a drafter's
@@ -252,13 +260,13 @@ lmstudio-community's BF16 files of Qwen3.6-35B-A3B, Qwen3.6-27B and Qwen3.8-27B,
 ggml-org's Q8_0 for d3-lite and d3-nano: the one of the model's repository, whose width is the model's;
 [artlite-server](../server.md)'s router mode pairs it with the model by itself), or a checkpoint directory's vision tower
 (`--mmproj` the directory, read as llama.cpp's converter makes its mmproj: z-lab's PARO checkpoints of Qwen3.5-0.8B and
-Qwen3.6-35B-A3B, their towers F16; the router pairs a directory with its own). An image is resized whole, as
+Qwen3.6-35B-A3B, their towers F16; the router pairs a directory with the tower inside it). An image is resized whole, as
 transformers' processor and llama.cpp resize it: its sides to multiples of 32 pixels at its aspect, between
 `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (default the mmproj's limits where it has them,
 d3's 64 and 1600, else llama.cpp's 8 and 4096; a 1024 x 768 photo is 768 tokens, a phone's 12-megapixel photo 4015). Its tokens take the
 official M-RoPE positions (rows and columns from the position after `<|vision_start|>`; llama.cpp's are the same).
 
-The encoder (`qwen3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 27 layers of
+The encoder (`qwen3vl/encoder.py`) runs on the vision overlay (in a separate hardware context): 27 layers of
 attention over all of the image's 16 x 16 patches (a 2-D RoPE in each head; Qwen3.5-0.8B's and 2B's smaller towers, d3's:
 12 layers of 768 and 24 of 1024), then each 2 x 2 window merged into one token by an MLP. Its time grows with the
 patches and, through the attention, with their square (d3-lite's tower 0.023 s at 512 x 512, d3-nano's 0.057 s):
@@ -293,7 +301,7 @@ the model card uses 36), each entry 64 tokens or a few more (the 4x file: 256). 
 positions (transformers' `get_rope_index`; llama.cpp numbers the markers like text, its PR #30510).
 
 The encoder (`minicpmv/encoder.py`) runs on the vision overlay, Stable Diffusion's static design (`vision/`, in a
-hardware context of its own): one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final
+separate hardware context): one dispatch runs the whole encoder (27 layers, the ViT merger after layer 6, the final
 merger) on two entries, or on one larger than 64 tokens alone, in about 60 ms: about 30 ms per entry (llama.cpp on the
 CPU: ~0.2 s per entry). The 4x file has no ViT merger, so its 27 layers all run on 1024 tokens per entry: about 65 ms
 per entry. Its weights are converted to bfp16 at every load (the most sensitive ones, the patch embedding's and the

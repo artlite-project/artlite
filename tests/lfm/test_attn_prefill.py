@@ -131,7 +131,7 @@ def _run(kp: int, T: int, p0: int, win: int, rot: int, sets: tuple[int, ...] | N
     want = np.zeros((T, COLS * QH, HD))
     kpos, qpos = np.arange(p0 + T)[None], np.arange(p0, p0 + T)[:, None]
     masked = (kpos > qpos) | ((qpos - kpos >= win) if win else False)
-    if sets is not None:  # (a row sees the keys below the state's end and its own: the state's and the padding's 0 .. n)
+    if sets is not None:  # (a row sees the keys below the state's end and its set's: the state's, the padding's 0 .. n)
         n = sets[-1]
         lo, hi = np.zeros(T, int), np.full(T, n)
         for a, b in itertools.pairwise(sets):

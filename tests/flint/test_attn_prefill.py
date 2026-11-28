@@ -3,7 +3,7 @@ one broadcast stream (each column four query heads, the KV head's K and V from b
 RMS-normed with weights per dim, learned sinks (the SK argument), full layers without positional encoding (every pair's
 cos 1, sin 0) and sliding-window layers of 513 positions (keys p - 512 .. p, the cache after a guard of 8 groups), on
 random projections of a chunk at p0 after a cache the host filled: the Q units and the K / V records against their fp64
-model (single panels: within their own bfp16 rounding), the output panels against the exact attention with sinks of
+model (single panels: within the panels' bfp16 rounding), the output panels against the exact attention with sinks of
 the cores' own operands. Flint's planes (K hi + lo, single Q and P: ``FlintPrefill``'s; its K panels interleaved per d-block
 by the memtile, ``AttnOperator.kilv``) and single K."""
 

@@ -28,11 +28,11 @@ The main core's program, per X object (``_begin``):
   bf16(act(bf16(gate))) up (``kmath.act``'s SiLU table), else the rows (bf16; ``B_F32``: fp32 as two bf16); ``F_EMITR``:
   after the tiles the residual goes out (bf16; ``F_ROTE``: as rotated copies, ``decode.design``'s "Rotated inputs").
 
-Metadata words (``XMETA``): the words from 0 to ``M_MODEL`` are every object's header. The kinds of object own the words
-past it, each its own (``objects``: one kind's words may reuse another's offsets): a phase's metadata object (``PHASE``),
-a token object (``TOKEN``), the MoE routing's objects (``MOE``); the attention cores' (``decode.attn``) and the models'
-kinds extend or sit beside them (a model's words in a phase's object: its kind extends ``PHASE``). The flag bits of the
-cores' objects in M_FLAGS are one space: a design's kinds (``XMETA.consts``) take each bit once.
+Metadata words (``XMETA``): the words from 0 to ``M_MODEL`` are every object's header. Each kind of object owns a
+separate set of words past it (``objects``: one kind's words may reuse another's offsets): a phase's metadata object
+(``PHASE``), a token object (``TOKEN``), the MoE routing's objects (``MOE``); the attention cores' (``decode.attn``) and
+the models' kinds extend or sit beside them (a model's words in a phase's object: its kind extends ``PHASE``). The flag
+bits of the cores' objects in M_FLAGS are one space: a design's kinds (``XMETA.consts``) take each bit once.
 
 State words (``STATE``): those of the main core's workspace; the first ones are trip counts of the core program, and
 the words of the post-norm designs, the token objects and the MoE layers are features of one array (``POST_STATE``,
@@ -129,7 +129,7 @@ F_HOUT = PHASE.flag("F_HOUT", 23)  # (an expert's gate / up sub-phase) the outpu
 F_ACCUM = PHASE.flag("F_ACCUM", 24)  # (a down sub-phase) the rows add into acc ([slot][hidden] bf16; F_ACC0: stored), F_EMITA: then out
 F_ACC0 = PHASE.flag("F_ACC0", 25)
 F_EMITA = PHASE.flag("F_EMITA", 26)
-# (``rot`` and ``post`` designs, a PARO Gemma's R phases, ``gemma4.paro_steps``: a kind of its own, whose bits other
+# (``rot`` and ``post`` designs, a PARO Gemma's R phases, ``gemma4.paro_steps``: a separate kind, whose bits other
 # designs' kinds take) an F_ROTX phase's slice is [v | r] per k block of a post-norm update's region: rotated is n = (r +
 # v w_post / rms(v)) scale (w_post of its groups in their rotation objects' spare bytes, ``gemma4.image``); F_RPS its
 # first sub-phase: before the first group the column's partial sums of res^2 go out; F_RUPD (with F_RPS: an update's
@@ -147,7 +147,7 @@ B_KEEP = PHASE.flag("B_KEEP", 11, of="format")  # (B_PAIR) the block's first val
 B_G2 = PHASE.flag("B_G2", 12, of="format")  # its tiles hold row groups of 2 / 4 rows (``decode.image.Block.G``)
 B_G4 = PHASE.flag("B_G4", 13, of="format")
 # a split gate / up block (``decode.image.Block.fmt2``: a SiLU group's gate rows in tiles of the format at bits 0 .. 7, then its
-# up rows in tiles of the format at bits 16 .. 23, B_NA and B_NB tiles: F_GU of its own, ``gusplit``)
+# up rows in tiles of the format at bits 16 .. 23, B_NA and B_NB tiles: a separate F_GU, ``gusplit``)
 B_SPLIT = PHASE.flag("B_SPLIT", 14, of="format")
 # its row tiles in pairs sharing the tile of their last chunk (``decode.image.Block.pt``): a pair's tiles are the first
 # row tile's full chunks, the tail tile (its first half: that row tile's, the second: the next one's), the next one's full
@@ -396,18 +396,18 @@ def staged_cell(slots: int = SLOTS) -> int:
 def staged_region_bytes(K: int, slots: int = SLOTS) -> int:
     """Bytes of a phase's input in DDR whose x is staged: [metadata object | STAGE_PAD bytes | x: [k block K / 8]
     [cell]], a cell [slot ``slots``][8] bf16 and as many bytes past it. Several producers each write whole k blocks'
-    [slot][8] into the cells from a slot of their own on (the attention's passes of a step of several sequences,
-    ``decode.attn256``): what they write past their own slots lands on the later producers' slots, which those write
-    after it, or past the slots. The X fill reads the cells' first halves (``staged_fill``); x's first cell is
+    [slot][8] into the cells from their own first slot on (the attention's passes of a step of several sequences,
+    ``decode.attn256``): what they write past their own slots lands on the later producers' slots, which those producers
+    write afterwards, or past the slots. The X fill reads the cells' first halves (``staged_fill``); x's first cell is
     ``STAGED_X`` bytes into the region."""
     return STAGED_X + staged_cell(slots) * (K // 8)
 
 
 def staged_fill(K: int, slots: int = SLOTS) -> tuple[int, tuple[int, int, int, int]]:
     """(bytes, shim BD dims) of the X fill of a staged x's input objects, from XB bytes into its region on (after the
-    metadata object, a fill of its own): object i the XB bytes that end with x's i-th XPAY bytes, read as strips of a k
-    block's bytes a cell apart (its first strips, the header: whatever the cells before hold, STAGE_PAD bytes of them
-    before x), the objects XPAY of x apart."""
+    metadata object, which has a separate fill): object i the XB bytes that end with x's i-th XPAY bytes, read as strips
+    of a k block's bytes a cell apart (its first strips, the header: whatever the cells before hold, STAGE_PAD bytes of
+    them before x), the objects XPAY of x apart."""
     kb = staged_cell(slots) // 2
     assert XB % kb == 0 and XPAY % kb == 0, (slots, kb)
     return n_inputs(K, slots) * XB, (kb // 4, XB // kb, 2 * kb // 4, XPAY // kb * 2 * kb // 4)

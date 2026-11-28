@@ -63,7 +63,7 @@ class AttnOperator(ArtcOperator):
 
     Non-causal (``causal`` False: LFM3's d1 decision models' full-attention layers, a prompt in one chunk at position 0):
     every pass streams the prompt's cache groups (the causal design's history part, from group 0: ``set_params``);
-    row q sees the keys below the state's end S (``P_HK``) and its own, lo .. hi - 1 (the SEG argument, ``set_seg``: an
+    row q sees the keys below the state's end S (``P_HK``) and its own keys lo .. hi - 1 (the SEG argument, ``set_seg``: an
     object per pass after the GATE object, per row lo then hi, int16): the state's rows and the padding's every key of
     the prompt, a question's rows the state's and their question's. Key chunks no row of a core sees are skipped, those
     some row sees in part masked (-1e30).
@@ -84,7 +84,7 @@ class AttnOperator(ArtcOperator):
         cores' performance counters (``CTRL``; "memstall": memory instead of lock stalls in counter 1). ``window``: the
         packed variant's window of cache groups; ``ring``: its history's groups held in the memory tiles (class
         docstring); ``swa``: a sliding window of that many positions (whole cache groups: each pass streams the window's
-        groups before its own and its own, from ``kv0`` bytes of a KV head's cache, its guard, before group 0); ``bcast``
+        groups before its own groups, then its own groups, from ``kv0`` bytes of a KV head's cache, its guard, before group 0); ``bcast``
         (two columns per KV head, ``Shape.per``): the KV head's streams read once, by column 2 h's shim, and broadcast by
         its memtile to the cores of both columns (each taking its column's Q units and gates of both), else each column
         reads them (twice the cache's bytes: a reference); ``causal`` False: the non-causal design (class docstring);
@@ -312,7 +312,7 @@ class AttnOperator(ArtcOperator):
 
     def params(self, p0: int, lead: int = 0) -> dict[str, int]:
         """The scratchpad parameters of a chunk at p0 (packed: ``lead``, its first keys every row sees: 0 or a cache
-        group, a prompt every segment continues; its rows a segment of their own)."""
+        group, a prompt every segment continues; its rows form a separate segment)."""
         out = self._params(p0, lead)  # (a part: its fills' parameters; the cores read the chunk's)
         return {self._pn(k): v for k, v in out.items() if not self.part or self._pn(k) != k}
 
@@ -620,7 +620,7 @@ class AttnOperator(ArtcOperator):
                 for i, c in enumerate(scols):
                     h = c // s.per  # (the column's KV head)
                     k0, v0 = h * hb + self.kv0 // 2, h * hb + self.kv0 // 2 + s.kp * o2
-                    if self.swa:  # (the window's groups before the pass's and its own, from the guard on)
+                    if self.swa:  # (the window's groups before the pass's groups, then the pass's own, from the guard on)
                         w0 = (ng - wg) * g2
                         parts = [ChainPart(KV, TensorAccessPattern((n_kv,), k0 + w0, [1, wg + 1, *k_tap[0][2:]],
                                                                    [0, *k_tap[1][1:]]), offset_parameter=p_sw)]

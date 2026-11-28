@@ -1,6 +1,7 @@
 """MOSS-Transcribe-Diarize's audio tower on the NPU (models/moss/encoder.py, npu.py) against the float64 tower
 (tests/moss/ref.py) on LibriSpeech speech: per token the relative L2 distance of its row for a full 30 s chunk and for
-a recording of two chunks (each its own tokens); the same recording again gives the same bytes, also after another one.
+a recording of two chunks (each with separate tokens); the same recording again gives the same bytes, also after
+another one.
 
 The distances: ~1.5% (median; the bfp16 operands of the GEMMs and the residual's bf16 over 24 layers: the model's own
 dtype, torch bf16, is 0.7% from float64), and a few tokens much further: the encoder's layer 7 writes a massive

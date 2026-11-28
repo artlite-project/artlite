@@ -59,12 +59,12 @@ def table_pass(table: ActTable, *, table_arg: bool = False, walk: tuple[int, int
                f32: bool = False, copies: int = 2, small: bool = False) -> Fn:
     """The table pass of ``table`` (an ActTable): a noinline template ``<N>(x, t_, t2_, y[, tab_ab, tab_cd])``, y = the
     table's quadratic of t (t_, t2_: t = min(|x|, t_max) as bf16, or x clamped for a full table; may be y) plus relu(x)
-    (``f32``: y fp32, not rounded to bf16; t_, t2_ then buffers of their own).
+    (``f32``: y is fp32, not rounded to bf16, and t_, t2_ must then be separate buffers).
     The table's two copies in two 16 KB regions: static, in the linker's sections of banks 0 and 1 (one section per
     table: a core links only the tables it reads), or (``table_arg``)
     the core's buffers ``tab_ab``, ``tab_cd`` (``table_words`` each; two parameters: llvm-aie gives the gathers a memory
-    operand only when each base of their address vector is a pointer of its own: from one pointer and an offset of it,
-    each gather orders against every load and store, and the loop does not pipeline). ``walk``: x in groups of
+    operand only when each base of their address vector is a separate pointer; with one pointer and an offset from it,
+    each gather is ordered against every load and store, and the loop does not pipeline). ``walk``: x in groups of
     ``walk[0]`` vectors of 32 values, ``walk[1]`` apart (a GEMM's gate/up C tile [gate 64 | up 64]: (2, 128)). ``n``: a plain function of n values (a multiple of 32), not a template (a kernel of a
     program-memory-patched design must be emitted where it is defined). ``copies`` 1: one static copy (bank 0), for a
     core short of L1 (every gather then waits a cycle for its bank: ~1.3x the pass's cycles). ``small``: the loop

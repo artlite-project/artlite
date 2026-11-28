@@ -4,8 +4,8 @@ straight into the column's core, one 4 KB row an object).
 
 - ``GatherNormOperator`` (the experts' inputs, XP): column c's chunks' rows of the residual x (bf16, its tokens per
   ``plan.Plan``) as RMSNorm(x) w panels, chunk k into the column's slot k: the post-attention norm's arithmetic
-  (``prefill.norm``: bf16 x, 1 / rms as bf16 hi + lo) on each gathered token group of 8, so the panels equal its own
-  (the router's and the shared expert's) for the same token. Only a chunk's groups of valid rows (the last one padded
+  (``prefill.norm``: bf16 x, 1 / rms as bf16 hi + lo) on each gathered token group of 8, so the panels match the
+  norm's own panels (those of the router and the shared expert) for the same token. Only a chunk's groups of valid rows (the last one padded
   with the chunk's first token) are gathered and drained: the rest of its slot keeps finite panels of earlier layers,
   whose outputs are never read. ``scales`` (Inkling's NVFP4 experts): each row group's panels times its chunk's
   expert's gate / up scale (``group_scales``: per column a table after the norm weight in the weight object, which the
@@ -16,10 +16,10 @@ straight into the column's core, one 4 KB row an object).
   ds; the weights fp32, as bf16 hi + lo products into an fp32 sum, rounded once), for the residual norm that adds it.
   A row of Y is read as the runs of its chunk slot's pass-major layout (``expert_gemm.ExpertGemmOperator.y_layout``),
   through the column's memtile, which sends it on in output order. ``y2``: a second down's outputs per slot (Inkling's
-  unit 2: its own Y and layout, of the same row length), summed with the same weight: per token a block of the first
+  unit 2, which has a separate Y and layout with the same row length), summed with the same weight: per token a block of the first
   Y's rows, then one of the second's (each block rewriting its row BDs whole); the first layout in output order as it
   arrives, the second's runs (pass, C object, tile; of 32 or 16 values) added at their output offsets by the core.
-  A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_k-1, 0 .., w_s at ``SHARED_W``, 0 ..]: 64 bytes, a cache line of their own
+  A token's ds row ends in its weights (``WT_ROW`` fp32 [w_0 .. w_k-1, 0 .., w_s at ``SHARED_W``, 0 ..]: 64 bytes, a dedicated cache line
   past the GEMM's outputs, which the host writes per layer): a column's input is one strided transfer.
 
 Both read their per-layer lists from the host (``plan``): the gather norm the column's row groups (bits 8 .. of the

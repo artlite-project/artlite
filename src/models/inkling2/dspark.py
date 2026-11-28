@@ -1,8 +1,8 @@
 """Inkling 2's DSpark drafter (``artlite.model_config.InklingDSparkConfig``; unsloth's ``dspark-*.gguf``, vLLM's
-``models/inkling2/nvidia/dspark.py``; the reference: ``tests/inkling2/dspark_ref.py``) on the NPU: a design and hardware
-context of its own (``dspark_image.DSparkDecodeOperator``: 4 slots on fp32 states, the model's tile size), its weights in
-a buffer of its own (``dspark_image.DSparkImage``), its head the model's LM head plane read in place (the model's
-weight buffer, adopted as "MW"), its caches per sequence of the model's.
+``models/inkling2/nvidia/dspark.py``; the reference: ``tests/inkling2/dspark_ref.py``) on the NPU. It has a separate
+design and hardware context (``dspark_image.DSparkDecodeOperator``: 4 slots on fp32 states, the model's tile size) and
+keeps its weights in a separate buffer (``dspark_image.DSparkImage``). Its head is the model's LM head plane, read in
+place from the model's weight buffer (adopted as "MW"), and it keeps caches for each of the model's sequences.
 
 A step of the drafter's overlay (``DSparkOverlay``) is one of two kinds:
 
@@ -26,9 +26,9 @@ chat).
 
 The caches: per layer and KV head linear groups (``decode.kv``), the local layers' a ring of ``WRAP`` groups past that
 many groups of capacity (``CacheKind.wrap``), the full layer's the capacity. An injection's attention reads and writes
-its layer's cache under a layer index of its own (L + ``INJ``: its K / V objects carry ``attn_k_ctx_norm``), the same
-buffers and ring of open records (``kv_base``, ``ring``). Every step is one sub-step (``subs``: the block mask needs all
-its rows at once; its cache range to the last position's group, ``ranges``).
+its layer's cache under a separate layer index (L + ``INJ``: its K / V objects carry ``attn_k_ctx_norm``), using the
+same buffers and ring of open records (``kv_base``, ``ring``). Every step is one sub-step (``subs``: the block mask
+needs all its rows at once; its cache range to the last position's group, ``ranges``).
 
 The Markov chain (``MarkovChain``) runs on the host over each row's candidates: the top 64 of the block's screened logits
 and the top 64 of them plus ``head . b_ho`` (a static bias per token, ``static_bias``), each candidate's logit exact
@@ -218,7 +218,7 @@ class DSparkOverlay(AttentionOverlay):
     # ------------------------------------------------------------------
 
     def load(self, *, threads: int = 0) -> None:
-        """The design in its own hardware context on the model's device, the image packed, the model's weight buffer
+        """The design in a separate hardware context on the model's device, the image packed, the model's weight buffer
         adopted ("MW"), the static objects written."""
         img, tgt = self.image, self.target
         self.dev = dev = OverlayDevice(self.op, device=tgt.dev.device)

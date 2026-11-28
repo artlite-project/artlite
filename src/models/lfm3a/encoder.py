@@ -20,7 +20,7 @@ attention's K / V reach every column on the B streams, so the columns share wind
 column). The encoder runs a clip band by band (``Encoder``): one band program (a dispatch) for every band, the
 residual resident in the memtile from the downsampler through the layers to the projector; what a band leaves the next
 one (the state: each conv layer's last 2 rows of B x, each attention layer's last key group, the downsampler stages'
-last rows) is carried by a dispatch of its own between bands (``carry``). A stream's position is the band's first row
+last rows) is carried by a separate dispatch between bands (``carry``). A stream's position is the band's first row
 (the RoPE tables, written per band; the first band's masks keep no key before the stream).
 
 The downsampler on a band (its 4096 frames): stage 1 as a GEMM of the host's im2col panels (per pixel its 9 taps in a
@@ -57,7 +57,7 @@ EPS = 1e-5
 THETA = 1e6
 WINDOW = 32
 QSCALE = 1.4426950408889634 / math.sqrt(HD)  # (the queries' scale: the softmax in log2 units)
-ISOLATED, KR = 9, 832  # (the residual's channels in bfp16 blocks of their own; the norm panels' K: 104 blocks)
+ISOLATED, KR = 9, 832  # (the residual's channels in dedicated bfp16 blocks; the norm panels' K: 104 blocks)
 ROWS_BAND = 512  # (rows of a band)
 FRAMES_BAND = 8 * ROWS_BAND
 DCH, DPAD = 256, 320  # (the downsampler's channels, padded)
@@ -110,11 +110,11 @@ def rope2_tables(pos: np.ndarray) -> np.ndarray:
 
 
 def residual_order(get: Callable[[str], Wt | np.ndarray], kinds: tuple[str, ...]) -> np.ndarray:
-    """The residual's channel order (C entries: HF's channel, -1 a pad): the ``ISOLATED`` largest channels each in a bfp16
-    block of its own after the others (the RMSNorms' panels: a block's 8 channels share an exponent, and the residual
-    has a few channels 10 - 30x the rest, ~20 after the final norm: in a shared block they leave the others ~5 bits).
-    The largest by the weights, the same for every input: alternately those the layers write most (the residual writers'
-    row norms, summed) and those the final norm weights most."""
+    """The residual's channel order (C entries: HF's channel, -1 a pad): the ``ISOLATED`` largest channels, each in a
+    dedicated bfp16 block after the others (the RMSNorms' panels: a block's 8 channels share an exponent, and the
+    residual has a few channels 10 - 30x the rest, ~20 after the final norm: in a shared block they leave the others ~5
+    bits). The largest by the weights, the same for every input: alternately those the layers write most (the residual
+    writers' row norms, summed) and those the final norm weights most."""
     wr = np.zeros(H)
     for il, kd in enumerate(kinds):
         for t in ("ffn_down", "conv_pw2" if kd == "conv" else "attn_out"):
@@ -388,8 +388,8 @@ class Net:
         bd.gemm(Gemm(m=64, ntile=1, K=KR, N=2 * C, x=n.addr, y=g, out="prod", x_np=n.np), w["bx"], None, name=name + ".bx")
         free(bd, n)
         bd.written(gname)
-        # (row block j = panel j's 8 rows 64 j + 8 c ..: per token its 24 passes' 5 x 8 channels -> G row 2 + the row; an
-        # op of its own: g's memory)
+        # (row block j = panel j's 8 rows 64 j + 8 c ..: per token its 24 passes' 5 x 8 channels -> G row 2 + the row; a
+        # separate op, since it drains g's memory)
         bd.defer({col: ColOps(drains=[MemTask([{"addr": g, "nwords": 8 * 480, "dims": [(4, 1), (5, 32), (24, 1440), (0, 4)],
                                                 "iteration": (160, 8)}], repeat=8,
                                               ddr=(ga + (2 + 8 * col) * G_ROW, 8 * G_ROW, (960, 4, 960, 1), (64 * G_ROW // 4, 8)))])
@@ -614,7 +614,7 @@ class Encoder:
         self.proj = w["proj"]
         self.band = 0
         self._carry = False  # (the last band ran complete: the carry program before the next)
-        self._t1 = None  # (stage 1's times of the band in progress in the mel image; None: none of its own yet)
+        self._t1 = None  # (stage 1's times of the band in progress in the mel image; None: the band has not run yet)
         self.owner: object | None = None  # (the stream that ran the encoder last; None: a clip)
 
     def state(self) -> dict:

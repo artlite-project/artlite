@@ -25,7 +25,7 @@ void note_region(const std::shared_ptr<region>& r) {
   g_regions.push_back(r);
 }
 
-// A region of its own (its memory populated here: without g_mutex).
+// A dedicated region (its memory is populated here, without holding g_mutex).
 std::shared_ptr<region> make_region(size_t bytes) {
   auto r = std::make_shared<region>(bytes);
   std::lock_guard lock(g_mutex);

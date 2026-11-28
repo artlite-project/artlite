@@ -216,7 +216,7 @@ class FusedElf:
         return self._kern
 
     def _open_context(self) -> None:
-        """The hardware context, configured by the first PDI (the Kernel refers to it). A dropped ELF keeps its own until
+        """The hardware context, configured by the first PDI (the Kernel refers to it). A dropped ELF keeps its context until
         the cycle collector runs (its operators' design objects are reference cycles): a refused one is retried after a
         collection, as ``artlite.Program``'s."""
         try:

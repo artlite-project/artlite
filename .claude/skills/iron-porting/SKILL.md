@@ -14,9 +14,9 @@ description: Port an IRON operator (XRT / xclbin, several files - op.py, design.
 | build | `XclbinArtifact`, `KernelObjectArtifact`, `SourceArtifact` | `compile()`: Peano `kernel.cc` -> `kernel.o`, aiecc -> PDI + insts (a single operator) or one ELF (fused operators, libraries) |
 | runtime | XRT via `aie.utils.NPUKernel` | artlite (`Device`, `Program`, buffers) |
 
-docs/development.md "Operators" is the contract (render and build, the shared helpers, tests without compile
-plumbing, exports). Never import IRON components: only the `aie.iron` Python API, the `aie_api` C++ headers and the
-artlite runtime.
+`docs/development.md` "Operators" defines the contract (rendering and building, the shared helpers, tests without
+compile plumbing, exports). Never import IRON components; use only the `aie.iron` Python API, the `aie_api` C++ headers
+and the artlite runtime.
 
 ## 1. The operator class
 
@@ -49,17 +49,19 @@ class MyOperator(ArtcOperator):
         return Program(NPU2(), rt).resolve_program()
 ```
 
-A standalone 1-D elementwise operator is a test harness, not an Artlite operator: subclass `StreamOperator` in
-`tests/operators/elementwise.py` (validation, arg spec and the whole design; the subclass supplies `kernel_name` and
-`get_kernel_src()`: `SiluOperator`, `GeluOperator`; two inputs: `AddOperator` in `tests/operators/test_fused.py`).
+A standalone 1-D elementwise operator is a test harness, not an Artlite operator. Subclass `StreamOperator` in
+`tests/operators/elementwise.py`, which provides validation, the arg spec and the whole design; the subclass supplies
+only `kernel_name` and `get_kernel_src()` (examples: `SiluOperator`, `GeluOperator`; with two inputs, `AddOperator` in
+`tests/operators/test_fused.py`).
 
 ## 2. The kernel
 
-Write the kernel as a template file next to the operator's module (`my_op.py`: `my_op.cc.jinja`), build it from the shared helpers of `kernel_lib.h` (namespace `al`: `inv_rms`,
-bfp16 panels, lane shuffles, `al::div_small`) and the math functions of `kmath/` (`km` in every template: exp2, recip,
-SiLU, GELU per contract, `{% set e = km.exp2(32) %}{{ e.src }}` then `{{ e }}(x)`), or copy IRON's kernel and turn
-its runtime sizes into template parameters. Shapes, trip counts and strides rendered as constants let Peano fold, unroll and pipeline (zero
-overhead loops, no runtime trip counts); use `constexpr` for derived values.
+Write the kernel as a template file next to the operator's module (`my_op.cc.jinja` for `my_op.py`). Build it from
+the shared helpers in `kernel_lib.h` (namespace `al`: `inv_rms`, bfp16 panels, lane shuffles, `al::div_small`) and the
+math functions in `kmath/` (available as `km` in every template: exp2, recip, SiLU and GELU per contract; write
+`{% set e = km.exp2(32) %}{{ e.src }}`, then call `{{ e }}(x)`). Alternatively, copy IRON's kernel and turn its
+runtime sizes into template parameters. Rendering shapes, trip counts and strides as constants lets Peano fold, unroll
+and pipeline the loops (zero-overhead loops with no runtime trip counts); use `constexpr` for derived values.
 
 ```cpp
 {# my_op.cc.jinja #}
@@ -79,32 +81,32 @@ from ..templating import load
 _KERNEL = load("artlite/<subsystem>/my_op.cc.jinja")  # StrictUndefined: a misspelled variable is an error, not ""
 ```
 
-- `operators.h` (and with it `kernel_lib.h`) is prepended to every kernel: no includes.
-- Every namespace-scope name is `{{ p }}_<name>`, helpers too, with `p = kernel_prefix("<stem>")` (a class attribute;
-  the stem names the operator in `kernel.cc`), and the design declares the kernels the same way
-  (`Kernel(f"{self.p}_gelu", "kernel.o", ...)`): the build names each definition by its code, so a fused ELF or library
-  (one translation unit) holds equal code once and never mixes up two configurations (AGENTS.md "Rules").
-- The speed rules (512-bit vectors, bank qualifiers, `__restrict` parameters, no division / branches in loop bodies):
-  aie-kernel-perf-optimization section 2.
+- `operators.h` (and with it `kernel_lib.h`) is prepended to every kernel, so write no includes.
+- Every namespace-scope name, helpers included, is `{{ p }}_<name>` with `p = kernel_prefix("<stem>")` (a class
+  attribute; the stem names the operator in `kernel.cc`), and the design declares the kernels under the same names
+  (`Kernel(f"{self.p}_gelu", "kernel.o", ...)`). The build names each definition by its code, so a fused ELF or library
+  (one translation unit) holds identical code only once and never mixes up two configurations (AGENTS.md "Rules").
+- The speed rules (512-bit vectors, bank qualifiers, `__restrict` parameters, no division or branches in loop bodies)
+  are in aie-kernel-perf-optimization section 2.
 
 ## 3. The design
 
 - Copy the ObjectFifo, Worker, Kernel and Runtime logic from IRON's `design.py`, including the
   `TensorAccessPattern`s of a multi-column distribution (`from aie.helpers.taplib import TensorAccessPattern`).
-- Device `NPU2()` (not `npu1_1col` or `npu2_1col`: Artlite targets AIE2P only); `Program(...).resolve_program()`
-  without a placer.
-- Worker loops: IRON's `range_()` (`aie.iron.controlflow`; an i32 loop on the core for a constant bound or one read
-  from a buffer), `design.range32()` for a body that computes with the i32 induction variable, `forever_()` with
-  `Worker(while_true=False)` for a core's infinite loop (aie-kernel-perf-optimization section 7). Shared design pieces
-  (`COLS`, `ROWS`, `range32`, `linear_tap`, `stream_walk`): `operators/design.py`.
-- All kernel functions compile into one `kernel.o`: every `Kernel` names it.
+- Use the device `NPU2()`, not `npu1_1col` or `npu2_1col` (Artlite targets AIE2P only), and call
+  `Program(...).resolve_program()` without a placer.
+- Worker loops: use IRON's `range_()` (`aie.iron.controlflow`; an i32 loop on the core, with a constant bound or one
+  read from a buffer), `design.range32()` for a body that computes with the i32 induction variable, and `forever_()`
+  with `Worker(while_true=False)` for a core's infinite loop (aie-kernel-perf-optimization section 7). Shared design
+  pieces (`COLS`, `ROWS`, `range32`, `linear_tap`, `stream_walk`) live in `operators/design.py`.
+- All kernel functions compile into one `kernel.o`, which every `Kernel` names.
 
 ```python
 matvec = Kernel(f"my_op_matvec_bf16_{params}", "kernel.o", [np.int32, np.int32, L1_A_ty, L1_B_ty, np.int32])
 silu_mul = Kernel(f"my_op_silu_mul_bf16_{params}", "kernel.o", [L1_C_ty, np.int32])
 ```
 
-- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `kmath/` (`km.act`): drop IRON's `lut_based_ops.o`.
+- AIE2P has hardware `vtanh` / `vexp2` and the gather LUTs of `kmath/` (`km.act`), so drop IRON's `lut_based_ops.o`.
 
 ## 4. The test
 
@@ -124,28 +126,29 @@ def test_my_op(size: int, tile_size: int):
     verify_close(op.run(to_numpy(x)), reference(x), rel_tol=0.04, abs_tol=1e-6)
 ```
 
-- The runtime takes and returns numpy arrays (bf16: `ml_dtypes.bfloat16`); a torch reference crosses over with
-  `tests/common.py`'s `to_numpy` / `to_torch`.
-- Parametrize over the sizes and tile sizes IRON tests (edge cases included); `torch.equal` for bit-identical
-  results, `tests/numerics.py`'s `verify_close` for floating point. Keep the body before `compile()` cheap: the planning
-  pass runs it up to the first use of the NPU.
+- The runtime takes and returns numpy arrays (bf16 as `ml_dtypes.bfloat16`); convert to and from a torch reference
+  with `to_numpy` / `to_torch` from `tests/common.py`.
+- Parametrize over the sizes and tile sizes that IRON tests, edge cases included. Use `torch.equal` for bit-identical
+  results and `verify_close` from `tests/numerics.py` for floating point. Keep the test body before `compile()` cheap:
+  the planning pass runs it up to the first use of the NPU.
 
 ## Patterns
 
-- **Elementwise** (GELU, SiLU, add, mul): fuse it into the kernel that produces or consumes the data (GemmQ / GemmQd's
-  gate/up epilogue, the decode overlay's `F_PLI` epilogue), with the activations of `kmath/`;
-  accuracy over the bf16 domain through a `StreamOperator` harness (`tests/operators/elementwise.py`).
+- **Elementwise** (GELU, SiLU, add, mul): fuse it, using the activations of `kmath/`, into the kernel that produces
+  or consumes the data (GemmQ / GemmQd's gate/up epilogue, the decode overlay's `F_PLI` epilogue). Test accuracy over
+  the bf16 domain with a `StreamOperator` harness (`tests/operators/elementwise.py`).
 - **GEMV / GEMM** on the GGUF tile formats (`formats/`, one slot per format): the decode overlay's GEMV kernels
-  (`decode/gemv.py`, harness `MmvOperator` in `tests/decode/mmv.py`), the prefill GEMMs `GemmQOperator` /
-  `GemmQdOperator` (MAC loop `gemm/mac.py`).
+  (`decode/gemv.py`, with the harness `MmvOperator` in `tests/decode/mmv.py`) and the prefill GEMMs `GemmQOperator` /
+  `GemmQdOperator` (MAC loop in `gemm/mac.py`).
 - **Several operators in one dispatch**: `FusedOperator` (a runlist in one ELF) or `fused.Library` (programs assembled
-  on the host), `operators/fused/`.
+  on the host), both in `operators/fused/`.
 
 ## Constraints
 
-- `num_columns` 1-8; a shim tile has 2 MM2S + 2 S2MM channels.
-- 32 bf16 lanes (512 bits) per vector op; other widths only after checking the loop's II (the **measure-ii** skill).
-- Elementwise tile sizes in multiples of 32; operators may add constraints.
-- Toolchain: Peano `clang++` is `artlite.operators.toolchain.clangpp()` (target `aie2p-none-unknown-elf`); aiecc runs inside
-  `ArtcOperator.compile` / `FusedOperator` (single operators `--get-pdi --get-npu-insts`, fused ones `--get-full-elf`
-  plus `--expand-load-pdis` unless `expand_load_pdis=False`).
+- `num_columns` is 1-8; a shim tile has 2 MM2S + 2 S2MM channels.
+- Use 32 bf16 lanes (512 bits) per vector op; choose other widths only after checking the loop's II (the
+  **measure-ii** skill).
+- Elementwise tile sizes are multiples of 32; operators may add further constraints.
+- Toolchain: Peano's `clang++` is `artlite.operators.toolchain.clangpp()` (target `aie2p-none-unknown-elf`). aiecc
+  runs inside `ArtcOperator.compile` / `FusedOperator`: single operators use `--get-pdi --get-npu-insts`, fused ones
+  `--get-full-elf` plus `--expand-load-pdis` unless `expand_load_pdis=False`.

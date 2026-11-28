@@ -77,7 +77,7 @@ __attribute__((noinline)) void {{ p }}_nv_x(const uint8_t *__restrict xp, const 
 
 // y[g] += sum over the 16 groups j of c (j, g) sct[j][g][r] for the 2 row groups (c (j, g): bf16 at c + 128 j + 32 g, 8
 // slots: slots 4 .. 7 at + 64; y [g][slot][r]; fp32 sums, the products exact){{ "; h > 0 (B_G8): groups 8 .. 15 (half a
-// super-block) rows of their own, into y + h" if rg and rg_all else "" }}
+// super-block) are separate output rows, at y + h" if rg and rg_all else "" }}
 __attribute__((noinline)) void {{ p }}_nv_sc(const bfloat16 *__restrict c, const bfloat16 *__restrict sct,
                                              float *__restrict y{{ ", int h" if rg and rg_all else "" }})
 {
@@ -112,8 +112,8 @@ __attribute__((noinline)) void {{ p }}_nv_sc(const bfloat16 *__restrict c, const
 }
 
 // super-blocks 2 H, 2 H + 1 of an NVFP4 tile: y[g][{{ L }}] (rows 8 g ..) += their rows against xp (their 64 panels){{ "; rg:
-// super-block 2 H + 1's rows into y + ys (row groups of 4: rows of their own)" if rg else "" }}{{ "; ys < 0 (B_G8): each
-// super-block's halves rows of their own, -ys apart" if rg and rg_all else "" }}
+// super-block 2 H + 1's rows into y + ys (row groups of 4: separate output rows)" if rg else "" }}{{ "; ys < 0 (B_G8): each
+// super-block's halves are separate output rows, -ys apart" if rg and rg_all else "" }}
 template <int H>
 __attribute__((noinline)) void {{ p }}_nvfp4(uint8_t *__restrict a, const uint8_t *__restrict xp, const uint8_t *__restrict xs,
                                              float *__restrict y, uint8_t *__restrict scr{{ ", int ys" if rg else "" }})

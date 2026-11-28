@@ -6,9 +6,9 @@ rows as stored: NeoX pairs), the graph of llama.cpp's ``src/models/lfm3.cpp`` (c
 the conv layers' histories) and returns their output-normed last hidden rows; ``logits(seq, rows)`` runs a sequence
 from position 0 in chunks and returns the logits of the positions ``rows``. A non-causal file (d1's decision models)
 reads a prompt whole from position 0: its full layers see it both ways, as a state and questions after it (``sets``:
-the bounds S, e1, .., en; the state's tokens see every token, a question's the state's and their own: d1's ``set``
-attention), the sliding-window and conv layers stay causal. The arithmetic's steps are methods
-(``mm``, ``conv``, ``attend``, ``store_kv``, ``q_rows``, ``residual``) so that models of other rounding can
+the bounds S, e1, .., en; the state's tokens see every token, and a question's tokens see the state's and the
+question's own: d1's ``set`` attention), the sliding-window and conv layers stay causal. The arithmetic's steps are
+methods (``mm``, ``conv``, ``attend``, ``store_kv``, ``q_rows``, ``residual``) so that models of other rounding can
 override them (N0's simulations, the NPU's host models)."""
 
 import itertools
@@ -159,7 +159,7 @@ class LfmCpu:
         mask = kpos <= pos[:, None] if cfg.causal or kind == "swa" else torch.ones(T, p0 + T, dtype=torch.bool)
         if kind == "swa":
             mask = mask & (pos[:, None] - kpos < cfg.sliding_window)
-        elif not cfg.causal and state.sets is not None:  # (a question's rows: the state's keys and their own)
+        elif not cfg.causal and state.sets is not None:  # (a question's rows see the state's keys and the question's)
             assert p0 == 0 and state.sets[-1] == T, (p0, state.sets, T)
             lo, hi = torch.zeros(T, dtype=torch.long), torch.full((T,), T)
             for a, b in itertools.pairwise(state.sets):

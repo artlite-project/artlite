@@ -9,8 +9,8 @@ input), rot_down (act(gate) up of each column's slice of down's input: the ffn i
 past it), down (the next layer's copies; the last layer's residual into the LM head's input). The first layer's copies
 come from rot_in (the residual slices the columns load; an MTP drafter's, ``draft.QwenDraft``: from its eh phase,
 eh_proj over the host's [enorm(emb) | hnorm(h)], its layer's linears plain with identity rotations), the LM head's from
-the last layer's down (an identity copy over the output norm, ``image``); a DFlash2 drafter's taps (``taps``) an identity copy more each (no norm weight: the
-residual), in a region of its own (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
+the last layer's down (an identity copy over the output norm, ``image``); each DFlash2 drafter tap (``taps``) takes one more identity copy (no norm
+weight: the raw residual) in a separate region (``tap_x``). An MoE layer instead of gate .. down: moe_in (F_PSQ on its copy) and sdown, the route,
 expert and combine objects of ``moe.steps`` (``MoeRot``: ``moe_in_fill``, the combine's metadata per layer and its
 copies). Phases whose inputs came with an earlier phase's (gin_z, attn_k, attn_v, up) take no sync. A design of 4 slots
 (the 4-lane rounds, ``kmath.rotate``) or a dense model's of 8 (the rounds per half of 4 slots; several sequences:
@@ -101,7 +101,7 @@ class ParoSteps(RotatedOverlay):
 
     def copies_of(self: "QwenOverlay", L: int) -> list[tuple[int, str]]:
         """The phases that take layer L's input: its rotated copies (L = -1: the LM head's, the output norm's weights
-        without a rotation); a DFlash2 drafter's tap (``taps``): a plain copy after them, in a region of its own."""
+        without a rotation); a DFlash2 drafter's tap (``taps``): a plain copy after them, in a separate region."""
         if L < 0:
             return [(-1, "lm")]
         out = [(L, n) for n in (("attn_q", "attn_k", "attn_v") if self.cfg.attention[L] else ("gin_q", "gin_z"))]

@@ -23,20 +23,20 @@ $ARTLITE_MODELS_DIR/
       MOSS-Transcribe-Diarize-Q4_K_M.gguf             (transcribe.cpp's files: Q4_K_M, Q5_K_M, Q8_0, BF16, ...)
 ```
 
-Either is the whole model in one place: the checkpoint directory opens as llama.cpp-style files (`artlite.hf_model`:
-its language model as architecture `moss`, its tower as an mmproj of gguf-py's Whisper names), a
-[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) GGUF file likewise (`artlite.transcribe_cpp`).
-A quantized file's language model reads its own tiles (Q4_K_M: Q4_K, Q8_0 and a screened Q6_K head, 0.34 GB a token
-against the checkpoint's 0.59); the tower takes 9-bit operands either way (a K-quant matrix dequantized at load).
+Either is the whole model in one place: the checkpoint directory opens as llama.cpp-style files (`artlite.hf_model`: its
+language model as architecture `moss`, its tower as an mmproj of gguf-py's Whisper names), a
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) GGUF file likewise (`artlite.transcribe_cpp`). A
+quantized file's language model reads the file's quantized tiles (Q4_K_M: Q4_K, Q8_0 and a screened Q6_K head, 0.34 GB a
+token against the checkpoint's 0.59); the tower takes 9-bit operands either way (a K-quant matrix dequantized at load).
 
 ## How it runs
 
 - **The recording** (`models/moss/host.py`, the checkpoint's processor): 16 kHz mono (`models.audio.load_audio`: WAV,
   MP3, FLAC, Ogg Vorbis, any rate), cut into chunks of 30 s, the last zero-padded; each chunk's log-mel spectrogram (80
-  bins, 3000 frames; Whisper's, numpy on the host). A chunk gives a token per 80 ms of its own samples (375 for a full
-  chunk), and the prompt takes all of the recording's tokens at once, the elapsed seconds as digit tokens every 5 s
-  (the checkpoint's `processor_config.json`), as the model was trained: a recording of any length is one prompt and
-  its speakers keep their tags through it (the model card: up to 90 minutes, 762 positions a minute).
+  bins, 3000 frames; Whisper's, numpy on the host). A chunk gives a token per 80 ms of the chunk's samples (375 for a
+  full chunk), and the prompt takes all of the recording's tokens at once, the elapsed seconds as digit tokens every 5 s
+  (the checkpoint's `processor_config.json`), as the model was trained: a recording of any length is one prompt and its
+  speakers keep their tags through it (the model card: up to 90 minutes, 762 positions a minute).
 - **The tower** (`models/moss/encoder.py`) runs on the vision overlay, a dispatch per chunk (~88 ms): conv1 and conv2
   as GEMMs of the host's panels (conv1 at the three frames each conv2 row reads), the position rows, 24 layers of
   attention over the chunk's 1500 rows (a token's 4 rows in one window of the overlay's window layout, so that the

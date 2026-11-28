@@ -13,14 +13,15 @@ which leaves the caches the decode continues from. The host reads the tokens' em
 samples from the logits.
 
 With the DFlash2 drafter (incoai's Flint-DFlash2, ``model_config.flint_dflash_of``; ``artlite.decode.dflash``) a
-round's drafts come from one dispatch of the drafter's design in a hardware context of its own: it takes the model's last
-step's rows from the taps at layers 6, 16, 27, 37, 47 and guesses a block, whose first 3 drafts the model's next step
-verifies with the token (steps of 4 slots; each slot routes its own experts, ~+33% of a step: a round verifies the drafts
-that pay for their slots, ``models.dflash``, and the rounds run while they beat steps of one, ``models.drafts.Planner``).
+round's drafts come from one dispatch of the drafter's design in a separate hardware context: it takes the rows of the
+model's last step from the taps at layers 6, 16, 27, 37, 47 and guesses a block, whose first 3 drafts the model's next
+step verifies with the token. Steps have 4 slots, and each slot routes to different experts, adding ~33% to a step per
+slot: a round verifies only the drafts that pay for their slots (``models.dflash``), and rounds run while they beat steps
+of one (``models.drafts.Planner``).
 Its head is the first 33280 rows of the model's LM head (the LM rows laid out with it: ``FlintImage(head=)``).
 
 The chat template (the file's): GLM-style turns ``<|system|>``, ``<|user|>``, ``<|assistant|>``, ``<|observation|>`` (tool
-results); the model opens its own ``<think>`` (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's
+results); the model opens ``<think>`` itself (the prompt never does); tools as JSON in ``<tools>``, calls in GLM-4.5's
 syntax (``server.tools``). A generation ends at ``<|end_of_text|>``, ``<|user|>`` or ``<|observation|>``.
 
 Several sequences (``NpuFlint(sequences=N)``): the device holds a KV cache per sequence and the model has a lane for
@@ -72,7 +73,7 @@ class NpuFlint(OverlayModel):
     that runs alone: ``models.dflash``)."""
 
     STEP_COST = (1.0, 1.32, 1.65, 1.98)  # (steps of 1 .. 4 slots at 1K: 31.4 ms for one slot; each slot's experts)
-    BLOCK_MARGIN = 1.0  # (a block drafter's: the DFlash2 drafter's blocks by a rule of their own, ``_block_pays``)
+    BLOCK_MARGIN = 1.0  # (a block drafter's; DFlash2 decides its blocks by a separate rule: ``_block_pays``)
     drafter = None
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "dflash", "_mask")
     LANE_OWN = (*OverlayModel.LANE_OWN, "flash")

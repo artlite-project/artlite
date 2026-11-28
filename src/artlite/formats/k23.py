@@ -1,4 +1,4 @@
-"""Shared parts of the Q2_K and Q3_K tile formats (``q2k``, ``q3k``; this slot has no formats of its own).
+"""Shared parts of the Q2_K and Q3_K tile formats (``q2k``, ``q3k``; this slot defines no formats itself).
 
 Tiles of up to 32 rows, stored word-major ([word][row][4 B]: a row group's word is one 32-byte load), the header words
 first, then each super-block's code words. Sub-block j = 8 h + s of a super-block (half h, slot s) is k = 16 j + 8 a +

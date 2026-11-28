@@ -51,11 +51,11 @@ objects.
 - The conv histories hold the whole sequence: a position is kept only where a checkpoint was taken (`artlite-server`'s
   prompt cache: a checkpoint is 2.8 MB, copied in under a millisecond).
 - Several requests at a time (`artlite-server -np N`): the NPU holds N sequences' KV caches and conv histories, and a
-  decode step's 4 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for
-  all of them, each sequence's attention reads its own cache and its conv runs as a pass of its own on its own
-  history. A step of 2 / 3 / 4 requests takes 1.06x / 1.11x / 1.15x a step of one, so 4 requests get 2.7x one
-  request's tokens per second in all ([artlite-server](../server.md#several-requests-at-a-time)). The media
-  encoders, speech output and live transcription run one at a time, between the requests' steps.
+  decode step's 4 slots are tokens of the requests that generate (`models/lanes.py`): the weights stream once for all of
+  them, each sequence's attention reads that sequence's cache, and its conv runs as a separate pass over that sequence's
+  history. A step of 2 / 3 / 4 requests takes 1.06x / 1.11x / 1.15x a step of one, so 4 requests get 2.7x one request's
+  tokens per second in all ([artlite-server](../server.md#several-requests-at-a-time)). The media encoders, speech
+  output and live transcription run one at a time, between the requests' steps.
 
 Memory:
 - The weights the NPU streams (QAD-Q4_0: 1.07 GB; Q4_K_M: 1.12 GB; the LM head is the token embedding, Q6_K) are
@@ -82,8 +82,8 @@ text with the context's drafts is the text without them.
 
 Against FastFlowLM 1.0.13 on the same NPU (its file of the same QAD Q4_0 weights): the first token 7.8x sooner at 1K
 tokens (1.19 s there), 4.6x at 32K (27.3 s); generation 1.2x / 1.7x as fast after 1K / 32K (41.8 / 24.5 tokens/s). Its
-documentation reports 81.3% on the first 150 GSM8K questions (its own requests) against its CPU engine's 87.3%, the
-difference its NPU attention's.
+documentation reports 81.3% on the first 150 GSM8K questions (with FastFlowLM's own requests) vs. 87.3% for its CPU
+engine, and attributes the difference to its NPU attention.
 
 Against llama.cpp's Vulkan backend on the iGPU (the same QAD-Q4_0 file): a prompt runs 1.16x as fast at 1K tokens and
 1.9x at 32K, with ~3.3x less energy; generation runs at ~30% of its speed (168.8 / 122.5 tokens/s after 1K / 32K):
@@ -98,7 +98,7 @@ artlite-cli -m LiquidAI/LFM3-VL-2B-GGUF/LFM3-VL-2B-QAD-Q4_0.gguf \
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/LFM3-VL-2B-GGUF/    LiquidAI/LFM3-VL-2B-GGUF
-    LFM3-VL-2B-QAD-Q4_0.gguf                     (its language model: LFM3-1.7B's shapes, its own weights)
+    LFM3-VL-2B-QAD-Q4_0.gguf                     (its language model: LFM3-1.7B's shapes, separate weights)
     mmproj-LFM3-VL-2B-BF16.gguf                  (its vision encoder; Q8_0 too)
 ```
 
@@ -109,8 +109,8 @@ encoder. An image is resized whole, as transformers' processor and llama.cpp res
 pixels at its aspect, between `--image-min-tokens` and `--image-max-tokens` tokens of 32 x 32 pixels (defaults 64 and
 4096, llama.cpp's; a 1024 x 768 photo is 768 tokens).
 
-The encoder (`lfm3vl/encoder.py`) runs on the vision overlay (in a hardware context of its own): 14 layers over the
-image's 16 x 16 patches, 8 of them a gated depthwise 3 x 3 convolution over the patch grid (its own op on the cores:
+The encoder (`lfm3vl/encoder.py`) runs on the vision overlay (in a separate hardware context): 14 layers over the
+image's 16 x 16 patches, 8 of them a gated depthwise 3 x 3 convolution over the patch grid (a dedicated op on the cores:
 each patch's 8 neighbours read in strips of their 2 x 2 windows, `vision/windows.py`) and 6 attention over all of
 the image's patches (16 query heads sharing 8 key / value heads, a 2-D RoPE), each with a SwiGLU feed-forward; then
 each 2 x 2 window merged into one token by an MLP.
@@ -153,18 +153,18 @@ artlite-cli -m LiquidAI/LFM3-VL-2B-GGUF/LFM3-VL-2B-QAD-Q4_0.gguf \
 ```
 
 A video (`--video`, artlite-server's `input_video` / `video_url` parts) needs FFmpeg's `ffmpeg` and `ffprobe` on PATH,
-which read its frames and its soundtrack with llama.cpp's commands, so that a prompt is llama-server's for the same
-file (its frames bit for bit, its token ids). As transformers' and llama.cpp's processors sample a video: 2 frames a
-second, at least 4 and at most 768 (LFM3-Omni-2B, which hears the soundtrack: 384), all at one size whose pixels over
-every frame stay under ~25 Mpx (a 30 s 720p video's frames are 832 x 480); consecutive frames in pairs, each pair one
-"image" whose two frames the encoder's patch embedding takes together, after a timestamp (`<0.5 seconds>`). LFM3-Omni
-hears the soundtrack too: it is encoded as one clip and its rows go after the pair they belong to. A pair runs on the
-vision overlay as an image of its size does (a 640 x 360 video's pairs: 35 ms each; 960 x 540: 70 ms), two in one run
-where that takes fewer bands (pairs of up to 64 tokens, a video of over ~3 minutes: a band of 128 windows for two; each
-pair's embeddings bit for bit its own run's); a frame over the encoder's largest image (4096 tokens: a 4K video under
-3 s) takes an image's size, which llama.cpp does not cap. The pairs encode while FFmpeg decodes the video, and a video
-whose frames keep to its frame rate (the usual file) has only its sampled frames converted (the same pixels as
-llama.cpp's command, which converts every frame).
+which read its frames and its soundtrack with llama.cpp's commands, so that a prompt is llama-server's for the same file
+(its frames bit for bit, its token ids). As transformers' and llama.cpp's processors sample a video: 2 frames a second,
+at least 4 and at most 768 (LFM3-Omni-2B, which hears the soundtrack: 384), all at one size whose pixels over every
+frame stay under ~25 Mpx (a 30 s 720p video's frames are 832 x 480); consecutive frames in pairs, each pair one "image"
+whose two frames the encoder's patch embedding takes together, after a timestamp (`<0.5 seconds>`). LFM3-Omni hears the
+soundtrack too: it is encoded as one clip and its rows go after the pair they belong to. A pair runs on the vision
+overlay as an image of its size does (a 640 x 360 video's pairs: 35 ms each; 960 x 540: 70 ms), two in one run where
+that takes fewer bands (pairs of up to 64 tokens, a video of over ~3 minutes: a band of 128 windows for two; each pair's
+embeddings match a separate run of that pair bit for bit); a frame over the encoder's largest image (4096 tokens: a 4K
+video under 3 s) takes an image's size, which llama.cpp does not cap. The pairs encode while FFmpeg decodes the video,
+and a video whose frames keep to its frame rate (the usual file) has only its sampled frames converted (the same pixels
+as llama.cpp's command, which converts every frame).
 
 ## LFM3-Audio-2B (speech)
 
@@ -179,7 +179,7 @@ artlite-server -m $M/LFM3-Audio-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Audio-2B-
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/LFM3-Audio-2B-GGUF/   LiquidAI/LFM3-Audio-2B-GGUF
-    LFM3-Audio-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, its own weights; Q4_0 too)
+    LFM3-Audio-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, separate weights; Q4_0 too)
     mmproj-LFM3-Audio-2B-Q8_0.gguf                 (its speech encoder and its speech generator)
 ```
 
@@ -198,7 +198,7 @@ through the `miniaudio` package (llama.cpp decodes with the same library), as 16
   token), restarting on a new line after at most 30 s, so any length works.
 - With a prompt, the audio goes into the user message as images do: questions about a clip.
 
-The encoder (`lfm3a/encoder.py`) runs on the vision overlay, in a hardware context of its own: the clip's log-mel
+The encoder (`lfm3a/encoder.py`) runs on the vision overlay, in a separate hardware context: the clip's log-mel
 spectrogram (128 bins, 100 frames a second, numpy on the host) through a downsampler of three stride-2 convolutions
 (a row per 8 frames), 17 layers (10 short convolutions, 7 attention layers over a causal window of 32 rows) and the
 projector, in bands of 512 rows (41 s of audio), one dispatch a band (~18 ms), the layers' state carried from band to
@@ -295,19 +295,19 @@ artlite-server -m $M/LFM3-Omni-2B-Q4_K_M.gguf --mmproj $M/mmproj-LFM3-Omni-2B-Q8
 
 ```
 $ARTLITE_MODELS_DIR/LiquidAI/LFM3-Omni-2B-GGUF/   LiquidAI/LFM3-Omni-2B-GGUF
-    LFM3-Omni-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, its own weights; Q4_0 too)
+    LFM3-Omni-2B-Q4_K_M.gguf                      (its language model: LFM3-1.7B's shapes, separate weights; Q4_0 too)
     mmproj-LFM3-Omni-2B-Q8_0.gguf                 (its vision encoder, speech encoder and speech generator; BF16, F16 too)
 ```
 
-LiquidAI's LFM3-Omni-2B is LFM3's trunk with all three media networks in one mmproj: LFM3-VL's vision encoder (its own
-weights), LFM3-Audio's speech encoder and speech generator. Everything the sections above describe runs on it:
-pictures (64 to 2048 tokens: the mmproj's bounds), videos with their soundtrack ([Videos](#videos): at most 384
-frames), audio clips, transcription (the offline ASR prompt; live transcription is LFM3-Audio's), text to speech,
-spoken replies and realtime conversations ([artlite-server](../server.md#speech)), the template's tool calls. The three
-networks share one vision overlay, so an image and a clip run back to back without switching hardware contexts (the
-process holds three: the media's, the language model's decode overlay and its prefill library). Its mmproj must be
-Q8_0, BF16 or F16: the vision overlay's GEMMs read bfp16, so a 4-bit mmproj would grow to twice its size at every
-load (it is refused, naming Q8_0).
+LiquidAI's LFM3-Omni-2B is LFM3's trunk with all three media networks in one mmproj: LFM3-VL's vision encoder (with
+separate weights), LFM3-Audio's speech encoder and speech generator. Everything the sections above describe runs on it:
+pictures (64 to 2048 tokens: the mmproj's bounds), videos with their soundtrack ([Videos](#videos): at most 384 frames),
+audio clips, transcription (the offline ASR prompt; live transcription is LFM3-Audio's), text to speech, spoken replies
+and realtime conversations ([artlite-server](../server.md#speech)), the template's tool calls. The three networks share
+one vision overlay, so an image and a clip run back to back without switching hardware contexts (the process holds
+three: the media's, the language model's decode overlay and its prefill library). Its mmproj must be Q8_0, BF16 or F16:
+the vision overlay's GEMMs read bfp16, so a 4-bit mmproj would grow to twice its size at every load (it is refused,
+naming Q8_0).
 
 Accuracy, teacher-forced over llama.cpp's answers (KL of the next-token distributions against llama.cpp's language
 model on exact (float64) media embeddings; llama.cpp's CPU encoders on the Q8_0 mmproj are themselves 3-4% from them):
@@ -396,15 +396,15 @@ with a spoken question (2) or a 4 s video's frames (3): 157 / 183 / 203 ms, 0.4 
 its questions in one sequence); llama-server on the iGPU 362 / 317 / 701 ms, 3.3 / 4.9 / 6.7 J; on the CPU 595 /
 846 / 1287 ms, 7.8 / 21 / 21 J.
 
-How it runs: its full-attention layers are non-causal, so a request is read as d1's own runner reads it, the state
-once and up to 16 questions after it in one sequence (a request's `set_size`: [Decisions](../server.md#decisions)),
-in one prefill chunk from position 0 (at most 4096 tokens). The chunk's full layers use the prefill attention's
-non-causal design (`prefill/attn/`): every pass streams the sequence's cache groups, the state's tokens see every
-token, a question's tokens the state and their own question (per row its own keys, in an object per pass; the chunks
-no row of a core sees skipped). The sliding-window and conv layers stay causal, the conv from zero histories. The
-answers come from each question's last row and its options' label tokens' rows of the LM head, on the host. A
-request's pictures run through the vision encoder first (LFM3-VL-2B's: [above](#lfm3-vl-2b-images)), once each; their
-tokens are the state's.
+How it runs: its full-attention layers are non-causal, so a request is read the way d1's own runner reads it, the state
+once and up to 16 questions after it in one sequence (a request's `set_size`: [Decisions](../server.md#decisions)), in
+one prefill chunk from position 0 (at most 4096 tokens). The chunk's full layers use the prefill attention's non-causal
+design (`prefill/attn/`): every pass streams the sequence's cache groups, the state's tokens see every token, and a
+question's tokens see the state and that question (each row gets its key range in an object per pass, and chunks that no
+row of a core sees are skipped). The sliding-window and conv layers stay causal, the conv from zero histories. The
+answers come from each question's last row and its options' label tokens' rows of the LM head, on the host. A request's
+pictures run through the vision encoder first (LFM3-VL-2B's: [above](#lfm3-vl-2b-images)), once each; their tokens are
+the state's.
 
 Speed (Strix Halo, through the servers, HTTP included, warm; energy per question above a ~20 W idle):
 

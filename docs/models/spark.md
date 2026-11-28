@@ -41,7 +41,7 @@ decode overlay of 8 token slots (`artlite.decode`) with the head_dim-256 attenti
   weights, fp32 residual norms and the attention of each layer kind, writing the caches and rings the decode
   continues from.
 - DSpark (`dspark.py`, `DSparkOverlay`): the drafter's 5 layers run on the model's design and hardware context, its
-  weights as BFP16 tiles in a buffer of their own, its head the first 64K rows (and 512 rows of the conversation's own
+  weights as BFP16 tiles in a separate buffer, its head the first 64K rows (and 512 rows of the conversation's own
   tokens) of each column of the model's LM head, read in place. One dispatch a round takes the rows the model's last
   step kept (their layers' inputs read in place from the model's buffers) into the drafter's caches and runs the block
   of 7 rows that guesses the next 7 tokens; the host walks the block's Markov chain (`src/models/dspark.py`). One

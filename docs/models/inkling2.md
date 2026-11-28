@@ -55,10 +55,10 @@ the effort level before it, which an agent's sessions share).
 
 With its vision encoder (`--mmproj unsloth/Inkling-2-Mini-GGUF/mmproj-F16.gguf`; artlite-server's router pairs the
 mmproj of the model's directory), a prompt takes images: [artlite-cli](../cli.md)'s `--image`, `image_url` parts through
-[artlite-server](../server.md). An image goes in at its own size, padded at the bottom and the right to multiples of 40
-pixels: a token per 40 x 40 pixels (2 x 2 patches of 20), 520 tokens for a 1024 x 768 image; one of more than 4096
+[artlite-server](../server.md). An image goes in at its original size, padded at the bottom and the right to multiples
+of 40 pixels: a token per 40 x 40 pixels (2 x 2 patches of 20), 520 tokens for a 1024 x 768 image; one of more than 4096
 tokens (`--image-max-tokens`) is resized under that first, as llama.cpp does. The encoder (23 layers 1024 wide over the
-image's patches and a class token) runs on the NPU in a hardware context of its own (the vision overlay:
+image's patches and a class token) runs on the NPU in a separate hardware context (the vision overlay:
 `src/models/inkling2v/`), then the image's tokens go through the prefill as text does; a conversation's image runs the
 encoder once.
 
@@ -98,15 +98,15 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   hi + lo, the routing on the host, the experts' work lists on `artlite.moe`); the prompt's last token runs as a decode
   step (the LM head's). The experts stream their weights once per chunk: long prompts run in chunks of 8192.
 
-- The DSpark drafter (`dspark.py`, `dspark_image.py`) runs in a design and hardware context of its own: 4 token slots
+- The DSpark drafter (`dspark.py`, `dspark_image.py`) runs in a separate design and hardware context, with 4 token slots
   of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step and prompt
   chunk leaves the model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state),
-  which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other
-  two to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
+  which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other two
+  to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
   model's screened LM head, its Markov head on the host over each row's candidates (their logits exact from the file's
   rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.35,
-  1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to its own experts), so a draft pays only where the
-  drafter guesses well: the rounds' planner leaves the drafter out where its rounds give fewer tokens per second than
+  1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to different experts), so drafting pays off only when
+  the drafter guesses well: the rounds' planner leaves the drafter out when its rounds give fewer tokens per second than
   steps of one.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
@@ -133,8 +133,8 @@ UD-Q4_K_M: generation 11.7 tokens/s at 1K (a step 0.4 ms shorter than UD-Q4_K_XL
 0.0025; greedy text 629 of 640 tokens llama.cpp's top one, the others near ties).
 
 A step of a token streams 1.09 GB of dense weights and its 8 experts per visit (1.86 GB of tiles); each further token of
-a step (drafts, or other requests with `-np`) adds its own experts. Drafts (the DSpark drafter's, the context's) keep
-the text the model writes alone.
+a step (drafts, or other requests with `-np`) adds the experts it routes to. Drafts (the DSpark drafter's, the
+context's) keep the text the same as the model writes alone.
 
 With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the prefill, against steps of one): code
 12.1 -> 14.8 tokens/s, an essay's continuation 1.19x, JSON 1.07x, math 1.02x, the other prompts (chat, SQL, a story,

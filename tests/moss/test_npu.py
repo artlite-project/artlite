@@ -2,7 +2,7 @@
 model on Llama's path) transcribing a LibriSpeech clip with the model's instruction, against the checkpoint computed
 on the CPU: the float64 tower (tests/moss/ref.py) and the fp32 language model (tests/llama/cpu.py), teacher-forced over
 the official model's transcript (transformers on the checkpoint's own code, greedy). With the reference's rows the
-language model is tested on its own, as decode steps; the app's path adds the NPU tower and the prefill, and its greedy
+language model is tested alone, as decode steps; the app's path adds the NPU tower and the prefill, and its greedy
 transcript is the official one; transcribe.cpp's Q4_K_M file gives the same words."""
 
 import numpy as np

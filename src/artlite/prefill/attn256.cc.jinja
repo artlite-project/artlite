@@ -3,7 +3,7 @@
 // token group QG r + i % QG of the pass) sc [panel][record 4][8 x 8] fp32 (A = s + 192 - m: the scores s in log2
 // units against the row's maximum; after the softmax its first 288 B the P panels{{ ", the lo panels from byte 320 on" if PP == 2 else "" }}), m, b, l [panel][64] (lane 8 q + k:
 // query q's running maximum, 192 - m, the partial sums), o [panel][db 32][8 x 8] fp32{{ ", ob its second copy (P V
-// reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, its own buffer): P [8][32],
+// reads one and writes the other: o after a group)" if OB }}; pw (the softmax's scratch, a separate buffer): P [8][32],
 // f [8][32] bf16 (or a rescale's row maxima [64] fp32){% if PACK %}; lh [token group QG][lo 8 | hi 8 | the largest lo, the least hi |
 // the history's keys | 5] int32 (per row of the core's token groups its segment's first and last keys), lv [token group
 // QG][lo | hi][64 lanes] int16 (lane 8 q + j: row q's), jl [64] int16 (lane 8 q + j: j){% endif +%}

@@ -1,6 +1,6 @@
 """Functions on a head's row (templates: ``rows.*.cc.jinja``): ``rms_norm`` (a bf16 row times 1 / rms into an fp32
 row, optionally times an fp32 weight) and ``rope`` (rotations of pairs of an fp32 row's dims, in place), the attention
-preps' and cores' query and key rows. A caller composes them in a function of its own:
+preps' and cores' query and key rows. A caller composes them in a function it defines:
 
     {% set nrm, rope = km.rms_norm(HD, eps=eps, weight=True), km.rope(HD // 2) %}
     {{ nrm.src }}
@@ -20,9 +20,9 @@ Extents known only at run time (a function shared by two kinds of layer, in a ``
 ``rms_norm``'s ``n`` and ``rope``'s ``rot`` and ``dist`` take a tuple of their values instead of a number, and then are
 arguments of the function (after the others, in the order n | rot, dist). Their loops count at run time (a norm's sum
 too: ``mac_square`` in a loop, 1 / n selected among the values' constants), and take the loop pragma
-``AIE_LOOP_NO_UNROLL``. A number of its own is a compile-time extent: the sum written out and the trip counts constant
+``AIE_LOOP_NO_UNROLL``. A plain number gives a compile-time extent: the sum is written out and the trip counts are constant
 (n = 128 with a weight: 80 B less than the run-time form's). A ``minsize`` caller passes ``minsize=True``: the inlined
-function's loops are compiled by its own attributes before the inlining (rotated and pipelined: the head's norm and
+function's loops are compiled with that function's attributes before inlining (rotated and pipelined: the head's norm and
 rotation of the attention cores 112 B larger)."""
 
 from __future__ import annotations

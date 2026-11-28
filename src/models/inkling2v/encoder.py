@@ -74,8 +74,8 @@ from artlite.vision.windows import Layout, Names, out_width
 
 from .host import PATCH, TOKEN_PX
 
-PIX, ONE, KP = 3 * PATCH * PATCH, 3 * PATCH * PATCH, 1216  # (a patch's inputs (c, ky, kx); the constant input 1, a bfp16
-# block of its own; the panels' K: whole k-tiles)
+PIX, ONE, KP = 3 * PATCH * PATCH, 3 * PATCH * PATCH, 1216  # (a patch's inputs (c, ky, kx); the constant input 1 in a
+# dedicated bfp16 block; the panels' K: whole k-tiles)
 FOLD_A = 1 / 127.5  # (the pixels' scale in the folded patch weights: ``vit.folded_patch``)
 UPC, DNC = 960, 640  # (the MLP's output chunks: mm.1's (3 passes a row), mm.2's (2))
 PIECE_COST = (1.6, 0.15)  # (a layer ~1.6 nb + 0.15 nb^2 ms: ``windows.piece_layers``)

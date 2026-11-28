@@ -9,7 +9,7 @@ full-attention layers -, ``new_state``, ``final_output``, ``Qcur_full``, ``Kcur.
 ``src/models/qwen35moe.cpp``: ``attn_post_norm`` - its input -, ``ffn_moe_logits``, ``ffn_moe_probs``, ``ffn_moe_topk``
 - the experts' ids, int32 -, ``ffn_moe_weights_norm``, ``ffn_moe_gate`` / ``_up`` / ``_down`` (tokens, k, ...),
 ``ffn_moe_weighted``, ``ffn_moe_out``, ``ffn_shexp``, ``shared_expert_gate``, ``ffn_out``), and the logits of every
-position; with an MTP block (``mtp``: an MTP file, or a model file with a block of its own: Qwen3.8) its block over
+position; with an MTP block (``mtp``: an MTP file, or a model file that embeds the block: Qwen3.8) its block over
 the same positions (``src/models/qwen35moe.cpp``'s / ``qwen35.cpp``'s ``graph_mtp``:
 ``mtp_eh_proj``, ``mtp_attn_out``, ``mtp_attn_residual``, ``mtp_ffn_out``, ``mtp_post_ffn``, ``h_nextn``, its logits:
 ``g.mtp(name, layer)``, ``g.mtp_logits``), each row fed the model's ``h_nextn`` of the row before. They are cached under

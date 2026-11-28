@@ -20,7 +20,7 @@
 // OUTDIR/logits.npy: (tokens - F, vocab) of positions F .. tokens - 1 (--logits-from F, default 0: every position).
 // OUTDIR/meta.json: what ran.
 //
-// --mtp: then the model's multi-token-prediction block (an MTP file, or MODEL again when it holds a block of its own:
+// --mtp: then the model's multi-token-prediction block (an MTP file, or MODEL again when it embeds the block:
 // Qwen3.8; llama.cpp's LLAMA_CONTEXT_TYPE_MTP context) over the same tokens, positions and ubatches, as llama.cpp's draft-mtp keeps its cache: the row at position
 // p takes token p and the model's output-normed hidden state h_nextn of row p - 1 (zeros for p = 0); its tensors of
 // LAYERS / REGEX (the MTP layer's index, "g") as OUTDIR/mtp.<name>-<il>.npy, its logits as OUTDIR/mtp.logits.npy.

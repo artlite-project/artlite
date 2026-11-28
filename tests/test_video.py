@@ -38,8 +38,8 @@ def _ours(path: str, heard: bool) -> list[dict]:
     return out
 
 
-# LFM3-Omni on the videos but the astronaut's variants of another size or without audio; LFM3-VL (frames only: its own
-# mmproj and scaling) where its plan differs: an odd last pair, the pixel bound, a long video
+# LFM3-Omni on the videos but the astronaut's variants of another size or without audio; LFM3-VL (frames only, with a
+# separate mmproj and scaling) where its plan differs: an odd last pair, the pixel bound, a long video
 ITEMS = [("omni", n) for n in ("odd-25fps", "ntsc-start", "short", "big-1080p", "silent", "astronaut")] + \
     [("vl", n) for n in ("odd-25fps", "big-1080p", "astronaut")]
 

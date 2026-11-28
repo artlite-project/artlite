@@ -70,7 +70,7 @@ def head_region(lm: Region, cols: int) -> Region:
     """The drafter head of an LM region: its first ``cols`` rows of each column, in place."""
     b = lm.block("lm")
     assert lm.kc_group == lm.n_kc, "a row tile's K chunks consecutive: the head's rows a prefix of each column"
-    assert not lm.qt, "row tiles of their own tail tiles"
+    assert not lm.qt, "row tiles with separate tail tiles"
     assert not b.pt or cols % (2 * b.R * b.G) == 0, "whole pairs of row tiles (their shared tail tiles)"
     return Region(-1, "lm", [Block(b.name, b.tensors, b.rows[:, :cols], b.fmt, b.R, b.G, pt=b.pt)], lm.n_kc, lm.kc_group,
                   lm.tile_bytes, lm.kc, offset=lm.offset, col_stride=lm.col_stride, half=lm.half)
@@ -113,7 +113,7 @@ class HeadTable:
         self._fixed[view.fixed] = True
         idle = sorted(zip(self.ids[self.rows].tolist(), self.rows.tolist()), reverse=True)
         self._lru = OrderedDict(idle)  # token -> its logit, least recently seen first (idle: the last ids first)
-        self._lock = threading.Lock()  # (``see`` of a model's lanes: each on a thread of its own)
+        self._lock = threading.Lock()  # (``see`` of a model's lanes: each on a separate thread)
 
     def see(self, ids: Iterable[int]) -> None:
         """Tokens of the sequence in order (an image's rows, negative: none): the table holds the ``TABLE_ROWS`` most
@@ -157,7 +157,7 @@ class HeadTable:
 
 class LogitsOrder:
     """A model's logits in id order from LM rows in the order ``order`` (the LM row of each token id: ``lm_order``),
-    copied by runs of consecutive rows into a buffer of its own (valid until the next copy)."""
+    copied by runs of consecutive rows into a dedicated buffer (valid until the next copy)."""
 
     def __init__(self, order: np.ndarray, slots: int):
         cuts = [0, *(np.flatnonzero(np.diff(order) != 1) + 1).tolist(), len(order)]

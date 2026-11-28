@@ -30,7 +30,7 @@ SlotSource slot_source(std::string_view name);
 size_t slot_row_bytes(SlotSource type, int64_t cols);
 
 /// A source matrix of rows x cols elements, row r at data + r row_bytes; file: its mapping in pack_slots' files (-1:
-/// memory of its own).
+/// memory outside the files).
 struct SlotTensor {
   SlotSource type;
   const uint8_t* data;

@@ -20,7 +20,7 @@ An MoE layer (``qwen35moe``: ``QwenConfig.moe``) has instead of gate_up and down
 (normed by ``post_attention_norm``: the shared expert's gate / up, the router's BFP16 planes, the shared expert's gate
 row "sgate"), "sdown" (its K 512 as row groups of 2 per tile row) and the expert slabs "exp_gu", "exp_down".
 
-A file with a multi-token-prediction block of its own (Qwen3.8: ``QwenConfig.nextn_layers``, the block at layer
+A file that holds its own multi-token-prediction block (Qwen3.8: ``QwenConfig.nextn_layers``, the block at layer
 ``num_hidden_layers``) holds it after the LM head: "eh" (``nextn.eh_proj``, rows hidden / 8 c .. over K 2 hidden), then
 the block's attention layer and its FFN as a layer's regions; only its drafter's steps stream them
 (``draft.QwenDraft``). Its drafter's head is the first ``draft_cols`` rows of each column of the model's "lm" region
@@ -34,7 +34,7 @@ tiles, data region "<name>_norm") when every region's decode K groups are whole 
 else region-major (the 27B: its output projections' 6 chunks run as 3 + 3, its down's 17 chunk-major in groups of 5).
 
 PARO: a checkpoint whose linears are PARO tensors (``artlite.paro``; the decode's ``paro_steps``) takes each
-projection's input as its own rotated copy: the GDN layers' gdn_in in two regions, "gin_q" (attn_qkv's rows) and "gin_z"
+projection's input as a separate rotated copy: the GDN layers' gdn_in in two regions, "gin_q" (attn_qkv's rows) and "gin_z"
 (attn_gate's, then block "ab": ssm_alpha's and ssm_beta's rows folded into attn_gate's rotation, F32 substitutes as
 BFP16 planes, ``_ab_folded``), the attention layers' attn_in in "attn_q", "attn_k", "attn_v", gate_up in "gate", "up"; the rotation
 objects of each column in data regions (``decode.rotated.RotatedImage``): "rot_in" (the first layer's copies), "rot_g" (the
@@ -149,7 +149,7 @@ class QwenImage(RotatedImage, MoeImage, TileImage):
         self.taps = tuple(dflash) if self.paro and dflash else ()
         self._rot_init()
         if self.paro:
-            mtp = False  # (the drafters of a PARO checkpoint: GGUF files of their own)
+            mtp = False  # (a PARO checkpoint's drafters are separate GGUF files)
         # (the overlay's objects: ``OBJ_BYTES`` whatever the file's formats; a file of Q8_0 alone would choose 9792)
         super().__init__(gguf, kc=KC, payload=payload(H, cfg.moe), tile_bytes=tile_bytes or OBJ_BYTES, vocab=vocab,
                          tails=TAILS if tails and not cfg.moe else frozenset())
@@ -435,7 +435,7 @@ class MtpView:
     order = None
     column_major = False
     screen = False  # (the drafter reads its head's rows as they are: a PARO checkpoint's DFlash2 drafter its plane's)
-    paro = False  # (a PARO checkpoint's drafters: GGUF files of their own)
+    paro = False  # (a PARO checkpoint's drafters are separate GGUF files)
     taps: tuple[int, ...] = ()
 
     def __init__(self, image: QwenImage, cfg: QwenConfig):

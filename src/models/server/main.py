@@ -1,7 +1,7 @@
 """artlite-server: the command line, the engine and uvicorn, the shutdown. The options follow llama.cpp's
 ``llama-server`` where it has an equivalent; each also reads ``ARTLITE_ARG_<NAME>`` (the long option's name in upper
 case, dashes as underscores: ``ARTLITE_ARG_CTX_SIZE``), which the command line overrides. With ``-m`` the server
-serves that model; without, the models of a directory, each in a server of its own (``router``):
+serves that model; without, the models of a directory, each in a separate server (``router``):
 
     artlite-server -m lmstudio-community/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf
     artlite-server --models-dir ~/models

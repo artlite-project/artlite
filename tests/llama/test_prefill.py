@@ -5,7 +5,7 @@ prefill/test_norm.py):
   at p0 after a cache the host filled, in both K formats and the models' head layouts (Qwen3's: q / k norms);
 - the prefill program on 4-layer slices against the decode path (slow): the caches, the last token's output row and
   logits (Llama; Qwen3 0.6B Q4_1 and Qwen3-Embedding-4B: q / k norms, a hidden size of 2560 in padded K chunks;
-  Qwen3-0.6B-PARO: rotated inputs; Llama-3.1-8B-PARO: gate and up in GEMMs of their own at every sub-chunk size),
+  Qwen3-0.6B-PARO: rotated inputs; Llama-3.1-8B-PARO: gate and up in separate GEMMs at every sub-chunk size),
   and packed chunks on Qwen3-Embedding-0.6B Q8_0 (all-Q8_0 GEMMs).
 """
 
@@ -155,8 +155,8 @@ LEAD = {len(PACKED) - 2, len(PACKED) - 1}  # (the cases whose first segment is a
                               f"{'-lead' if i in LEAD else ''}" for i, (a, b, c, d, e, f, g, h, _) in enumerate(PACKED)])
 def test_attn_packed(hd: int, qh: int, kp: int, norm: bool, T: int, p0: int, win: int, ring: int,
                      segs: list[tuple[int, int]], lead: int) -> None:
-    """A packed chunk (``AttnOperator(window=)``: segments of the chunk, each its own rows' attention over the history
-    and its keys up to the row; rotary positions from p0 per segment, the prep's cos / sin rows written past the
+    """A packed chunk (``AttnOperator(window=)``: segments of the chunk, each computing its rows' attention over the
+    history and its keys up to the row; rotary positions from p0 per segment, the prep's cos / sin rows written past the
     table's) against the exact attention of the cores' own operands, as ``test_attn``; a segment that starts at a
     32-token chunk of keys bit-identical to the same tokens run alone (the unpacked design at p0: the history, the
     segment's keys in the same chunks, the skipped ones adding nothing) up to its last whole V record. A segment too
@@ -345,7 +345,7 @@ def test_prefill_caches(quant: str, size: str, kv_k: str, n: int, p0: int) -> No
 
 @pytest.mark.slow
 def test_prefill_sequences() -> None:
-    """Two sequences on one device, each prefilled into caches of its own (``select``: prompts that end inside a record,
+    """Two sequences on one device, each prefilled into separate caches (``select``: prompts that end inside a record,
     so the next step reads the open record's V panels: record mode), then decode steps: one sequence alone at first
     (from its ring by then), then both in joint steps (the other's first one still in record mode), some with a second
     slot: every slot's logits and LM-head input, and each sequence's caches at the end, are those of the sequence alone

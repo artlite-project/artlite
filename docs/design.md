@@ -112,7 +112,7 @@ auto* out_span = static_cast<int32_t*>(buf_out->map());
   `Device.alloc_user_buffer`) is a host-only BO in the process's own memory: 2 MB pages faulted in and
   flushed by several threads, then pinned by the driver (a userptr BO); 16 GB in ~0.3 s, where the driver
   allocates a SHMEM BO's pages in one thread (1.7 s). Python's `Device.alloc_host_buffer` uses it from 2 MB on: a
-  SHMEM BO has 4 KB pages, and the NPU translates each page a DMA row touches (rows on pages of their own write at a
+  SHMEM BO has 4 KB pages, and the NPU translates each page a DMA row touches (rows on separate pages are written at a
   fifth of the rate, `docs/probe.md`). `artlite::read_file` (Python
   `Buffer.read_file`) loads a file range into a BO: parallel preads through cache-resident
   bounce buffers and non-temporal AVX-512 stores (a page-cached 2 GB weight image: ~34 ms,
@@ -131,17 +131,17 @@ auto* out_span = static_cast<int32_t*>(buf_out->map());
   returns at once (several may be pending), then `dispatch_poll` (no syscall) /
   `dispatch_wait`. The caller keeps a pending dispatch's buffers alive (the driver does not;
   the Python binding holds references until the wait).
-- **`turn`** - The NPU's turn between processes (`artlite/turn.h`): a process holds it while any of its
-  commands is pending (a `Kernel`'s submit takes it, the wait that retires the command gives it back), so another
-  process's commands never run between two of its own; `turn::foreign()` counts the turns other processes took in
-  between (Python: `artlite.overlay.npu_turn`, `_native.turn_foreign`). A switch to another process's hardware
-  context loses what a design keeps on the array beyond its configuration: an overlay with code pages loads its page
-  store again after one. A pipelined run of pieces (`Library.run`) lets a waiting process in between its pieces;
-  while another process uses the NPU (`turn::peers()`: each process holds a slot byte of the file) it queues no piece
-  ahead and a prefill's pieces are shorter (`prefill.chunks.PEER_PIECE_S`), so a waiter waits for one piece at most.
-  `turn::waited()` counts the time a process waited for another's turn: timings of its own work subtract it (the
-  drafts' planner, the pace calibration). A lock file every user's processes share (`/dev/shm/artlite-npu.lock`;
-  Windows: the temp directory).
+- **`turn`** - The NPU's turn between processes (`artlite/turn.h`): a process holds it while any of its commands is
+  pending (a `Kernel`'s submit takes it, the wait that retires the command gives it back), so another process's commands
+  never run between two of its commands; `turn::foreign()` counts the turns other processes took in between (Python:
+  `artlite.overlay.npu_turn`, `_native.turn_foreign`). A switch to another process's hardware context loses what a
+  design keeps on the array beyond its configuration: an overlay with code pages loads its page store again after one. A
+  pipelined run of pieces (`Library.run`) lets a waiting process in between its pieces; while another process uses the
+  NPU (`turn::peers()`: each process holds a slot byte of the file) it queues no piece ahead and a prefill's pieces are
+  shorter (`prefill.chunks.PEER_PIECE_S`), so a waiter waits for one piece at most. `turn::waited()` counts the time a
+  process waited for another's turn, and code that times the process's own work subtracts it (the drafts' planner, the
+  pace calibration). A lock file every user's processes share (`/dev/shm/artlite-npu.lock`; Windows: the temp
+  directory).
 
 ---
 
@@ -280,7 +280,7 @@ errno) with descriptive messages.
 In Python, these map to `artlite.Error`, `artlite.ExecutableError`, and `artlite.DispatchError`
 (attributes `state`, `state_name`, `health`: a dict or None). The runtimes of the overlays, fused ELFs and
 libraries add a note: the transaction's operations at `txn_op_idx` and the last sync before them (a library: the
-item and operator that hold it; the code pages' prologue is noted as its own); `0xFFFFFFFF` means the firmware
+item and operator that hold it; the code pages' prologue gets a separate note); `0xFFFFFFFF` means the firmware
 reports no operation. `HwContext.status()` and
 `Device.last_async_error()` query the firmware through the management mailbox: use them after
 a clean failure, never while a job may be hung (a mailbox timeout destroys the channel).

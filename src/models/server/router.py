@@ -1,5 +1,5 @@
 """artlite-server's router mode (no ``-m``), as llama-server's: the models of a directory (``catalog``), each served,
-once a request or the web UI asks for it, by a server process of its own (``main``'s, through ``child``) that the
+once a request or the web UI asks for it, by a separate server process (``main``'s, through ``child``) that the
 router starts, proxies to and stops. The web UI shows them in its model picker (``/props`` says ``role: router``).
 
 Why a process per model: the router never opens the NPU, and a model's process leaving gives its memory, buffers and
@@ -28,7 +28,7 @@ generation. The realtime websocket (``/v1/realtime?model=``: the web UI's voice 
 server message by message (``Router.relay``); a model that cannot be had is an error event. The UI's Stop (``DELETE
 /v1/stream?conv_id=``) goes to the server of the conversation's last request (``X-Conversation-Id``), or cancels the
 request still waiting for its model.
-Each model's server listens on 127.0.0.1 with an API key of its own (``ARTLITE_ARG_API_KEY``) that the router sends,
+Each model's server listens on 127.0.0.1 with a dedicated API key (``ARTLITE_ARG_API_KEY``) that the router sends,
 and with --models-max above 1 its default prompt cache takes its part of the RAM (``settings.ROUTER_MODELS``).
 Models loaded together take turns on the NPU (``csrc/artlite/turn.h``: a long prompt's pieces are shorter while another process uses
 the NPU, and none is queued ahead of its requests: ``prefill.chunks.PEER_PIECE_S``, ``Library.run``)."""
@@ -98,7 +98,7 @@ class LoadError(Exception):
 
 
 class Child:
-    """A model server's process (``python -m models.server.child``, in a process group of its own: a terminal's
+    """A model server's process (``python -m models.server.child``, in a separate process group: a terminal's
     signals go to the router alone): ``start`` gives it its command line, ``stop`` closes its stdin. Threads read its
     messages (``on_message``, on the event loop), its log (into the router's, under ``name``) and its exit
     (``on_exit``, on the event loop); ``key``: its API key."""

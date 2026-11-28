@@ -24,7 +24,7 @@ the rest); where those units are partly on, a small input error becomes a large 
 the patch by the sigma x514 sets. llama.cpp errs on the same tokens (Qwen3-VL: ~6x less), and which tokens depends on
 the last bits of anything (float64 itself moves one by 67% between two JPEG decoders' pixels). Taking them to
 llama.cpp's level needs bf16-level operands throughout (hi + lo inputs and weights, an fp32-level residual, Q / K: an
-estimated ~2x the encoder's time); moving the largest units or channels into bfp16 blocks of their own (the pads) does
+estimated ~2x the encoder's time); moving the largest units or channels into separate bfp16 blocks (the pads) does
 not help.
 """
 
@@ -168,7 +168,7 @@ FOLD_O = 128 * FOLD_A - 1
 
 def folded_patch(kernels: list[np.ndarray], *, c: int, kp: int, one: int) -> np.ndarray:
     """The patch embedding's operand (c, kp) float32 for integer panels (q = p - 128) of pixels normalized by 0.5 / 0.5:
-    ``kernels`` (float64 (rows, inputs): the temporal kernels, each on its own frame's inputs) at their inputs times
+    ``kernels`` (float64 (rows, inputs): the temporal kernels, each applied to its frame's inputs) at their inputs times
     ``FOLD_A``, and at input ``one`` (the constant 1) the sum of the kernels' rows times ``FOLD_O``."""
     total = kernels[0]
     for k in kernels[1:]:

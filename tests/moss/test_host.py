@@ -119,8 +119,8 @@ def test_marks() -> None:
 
 
 def test_drafts() -> None:
-    """After an end time's ``][``: the same time, ``]`` and the last speaker's tag, as far as the tokens since agree; a
-    start time of its own: the tag after its ``]``; elsewhere the context's drafts."""
+    """After an end time's ``][``: the same time, ``]`` and the last speaker's tag, as far as the tokens since agree;
+    after a new start time: the tag after its ``]``; elsewhere the context's drafts."""
     head = [OPEN, 0, DOT, 1, 9, CLOSE, TAG, 0, 1, CLOSE, WORD, WORD + 1]  # ([0.19][S01] w w)
     end = [DOT_OPEN, 4, DOT, 8, 5, JOIN]  # (.[4.85][)
     want = [4, DOT, 8, 5, CLOSE, TAG, 0, 1, CLOSE]
@@ -130,7 +130,7 @@ def test_drafts() -> None:
     assert d.draft(3) == (NMAX, ALL, want[5:8])
     d.extend(want[5:])
     assert d.draft(3)[0] != NMAX  # (the tag is written: the context's drafts, if any)
-    own = H.Drafts(MARKS, head + end + [1, 2])  # ([4.85][12: a start time of its own)
+    own = H.Drafts(MARKS, head + end + [1, 2])  # ([4.85][12: a new start time)
     assert own.draft(3)[0] != NMAX
     own.extend([DOT, 2, 6, CLOSE])
     assert own.draft(8) == (NMAX, ALL, [TAG, 0, 1, CLOSE])

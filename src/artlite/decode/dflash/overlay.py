@@ -1,5 +1,5 @@
 """The DFlash2 block drafter of a model (GGUF architecture ``dflash``, llama.cpp's ``src/models/dflash.cpp`` and
-``common/speculative.cpp``'s draft-dflash; Qwen3.8 27B's, Flint's) on a decode overlay of its own (``decode.dflash.core``): one
+``common/speculative.cpp``'s draft-dflash; Qwen3.8 27B's, Flint's) on a dedicated decode overlay (``decode.dflash.core``): one
 dispatch per round, in its own hardware context, the model's verify between two of them (the model's overlay: ``DFlashTarget``).
 A dispatch after another hardware context costs ~1.9 ms, a verify too: ~3.7 ms a round, against 10 ms of each of Qwen3.8 27B's
 MTP drafts.
@@ -25,7 +25,7 @@ rounds also a sibling branch where the first draft is uncertain: two tokens from
 round's step runs in its last two slots, branching off the round's token (the model's rounds: ``models.dflash``).
 
 The main cores' residual is a scratch here: aout's, down's and fc's K groups sum into it (zero-loaded objects first) and go out
-as whole x; the phases need no kernel of their own.
+as whole x; the phases need no dedicated kernel.
 
 A sequence's state (``snapshot``, ``restore``) holds the ring itself, and the KV records of the prompt cache none of the drafter's: the
 ring keeps a window and a chunk's padding, so a position a few hundred back is already losing its window, while a restore in place, the
@@ -104,7 +104,7 @@ from .image import DFlashImage
 FLAGS = {"fc": F_RESID | F_EMITR, "ikv": F_NORM, "ain": F_NORM, "aqkv": 0, "aout": F_RESID | F_EMITR, "fin": F_NORM, "gu": F_GU,
          "down": F_RESID | F_EMITR, "gate": F_NORM, "lm": F_NORM}
 SCATTER = (18, ND, 36, 36 * ND)  # a record's drain into its pair (words): ND panels 144 B apart
-SLOTS_OF = 8  # the model's steps' slots at most (the drafter's injections read their x in place: packed as its own, or an
+SLOTS_OF = 8  # the model's steps' slots at most (the drafter's injections read their x in place: packed like its own x, or an
 # unpacked target's all slots, ``step``)
 
 

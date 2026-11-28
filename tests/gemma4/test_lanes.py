@@ -1,5 +1,5 @@
 """Gemma 4's lanes on the NPU (``NpuGemma(sequences=)``; models/lanes.py): three conversations on one model object,
-each on a thread of its own, against each one alone on the same object: greedy replies token for token, without
+each on a separate thread, against each one alone on the same object: greedy replies token for token, without
 drafts and with them (the drafter's guesses for a lane before the lanes' joint step, the context's), the lanes'
 decode rounds in joint steps; the drafter's steps on a lane's caches are those on the same text alone, bit for bit."""
 

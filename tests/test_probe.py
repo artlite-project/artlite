@@ -16,7 +16,7 @@ BUFFER = 16 * probe.CHANNEL_BYTES
 
 def test_page_cases() -> None:
     """``--pages``' rows do what their names say (the decoded BDs, no NPU): the pages a channel's task visits, rows per
-    page, rows within their pages, channels on pages of their own and inside the probe's buffers."""
+    page, rows within their pages, channels on separate pages and inside the probe's buffers."""
     src, dst = 1 << 32, 2 << 32  # (page-aligned stand-ins of the buffers' device addresses)
     names = [case.name for case in probe.PAGE_CASES]
     assert len(set(names)) == len(names)

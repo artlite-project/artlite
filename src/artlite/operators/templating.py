@@ -7,7 +7,7 @@ in Python and in ``{% include %}`` alike:
 - ``load(name)``: the file's template (Jinja drops a template's last newline);
 - ``source(name)``: the file's text, for a template composed in Python (``JINJA_ENV.from_string(a + b)``: pieces that
   share ``{% set %}`` names) or rendered by another environment (the format slots' fragments, ``formats.kernel_template``);
-- ``{% include "<name>" %}`` on a line of its own splices the file's lines whole, as concatenating its text would (the
+- ``{% include "<name>" %}`` on a line by itself splices the file's lines whole, as concatenating its text would (the
   loader serves a file with one newline more: the one Jinja drops; the newline after the tag goes with trim_blocks).
 
 ``JINJA_ENV``: trim_blocks removes the newline after a block tag, lstrip_blocks the whitespace before one that starts a

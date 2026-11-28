@@ -163,7 +163,7 @@ STEPS = (1, 4, 3, 2, 4, 4, 1, 3, 3, 2, 1, 4)  # (step sizes, repeated: every ali
 
 @pytest.mark.parametrize("layers", [[0, 5], [22, 23, 24, 29]], ids=["swa+full", "shared-kv"])
 def test_gemma_overlay_sequences(layers: list[int]) -> None:
-    """Four sequences on one device (``GemmaOverlay(sequences=4)``: texts of their own, at positions of their own)
+    """Four sequences on one device (``GemmaOverlay(sequences=4)``: separate texts at separate positions)
     give, slot by slot, the logits and the residual of each sequence alone in steps of one, bit for bit:
 
     - alternated (``select``: a step of 1 .. 4 slots of one, then of the next: no copies between them);
@@ -240,7 +240,7 @@ def test_gemma_overlay_sequences(layers: list[int]) -> None:
     while min(pos) < N:
         take = [[s, 1] for s in range(NSEQ) if pos[s] < N and not (s == 1 and steps < 5) and not (s == 2 and steps < 12)]
         spare = NB - len(take)
-        for t in take:  # (a second slot of its own)
+        for t in take:  # (a second slot for the same sequence)
             if spare and rng.random() < 0.4 and pos[t[0]] + t[1] < N:
                 t[1] += 1
                 spare -= 1

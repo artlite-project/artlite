@@ -14,8 +14,8 @@ split where they wrap the ring, else before the last object (the transaction's t
 Each kind's F_ATT objects take their words (a sliding-window layer's window and masks) and their angles (``cs`` per kind)
 per step; the step's masks and K lanes too (``attn256.step_words``: no branches).
 
-Several sequences in a step (one pass; ``decode.step.Part``, ``set_parts``): a pass per part, in order - an F_ATT object
-of its own (``AttnShape.u`` of them per layer and column), whose words are those of a step of the part's slots alone at
+Several sequences in a step (one pass; ``decode.step.Part``, ``set_parts``): a pass per part, in order - a separate F_ATT
+object (``AttnShape.u`` of them per layer and column), whose words are those of a step of the part's slots alone at
 its position, the part's q and raw K, V objects (from its first slot on), its sequence's cache, ring and records (the
 patches take each pass's KV buffer) -, its o's octets drained into the staged x of the output phase from the pass's
 first slot on (``attn256``'s "Several passes"; an overlay of several sequences stages that x for every step). A step of
@@ -95,8 +95,8 @@ def pass_subs(k: int) -> tuple[tuple[int, int, int], ...]:
     return tuple((u, 1, 0) for u in range(k))
 
 
-# how a windowed spec's sliding-window layers attend in a step (``AttnStep.mode``): "step" (row s at p + s: its window and
-# the slots up to its own), "block" (a drafter's block: every row the window before the first slot's and the step's slots
+# how a windowed spec's sliding-window layers attend in a step (``AttnStep.mode``): "step" (row s at p + s sees its window
+# and the slots up to slot s), "block" (a drafter's block: every row the window before the first slot's and the step's slots
 # whole), "insert" (records only: the step's first group streamed, no window, the rows' outputs for a sink)
 MODES = ("step", "block", "insert")
 
@@ -449,7 +449,7 @@ class AttentionSteps:
 
     def set_parts(self, st: AttnStep, parts: tuple[Part, ...], cs: np.ndarray | dict[str, np.ndarray]) -> None:
         """(one pass) ``set_position`` of a step of several sequences' slots, a pass per part (``st.subs``: each
-        part's first slot and its slots): its F_ATT objects by its own position, its cache, ring and record transfers
+        part's first slot and its slots): its F_ATT objects at the part's position, its cache, ring and record transfers
         in its sequence's KV. ``cs``: the angles of the step's slots, in the parts' order."""
         ov = self.ov
         assert ov.ash.one and st.mode == "step" and len(parts) == len(st.subs), (parts, st.subs)

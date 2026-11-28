@@ -65,7 +65,7 @@ def language_model(g: GGUFFile) -> GGUFFile:
     m = lambda k: g.meta[f"stt.moss.{k}"]
     d = lambda k: m(f"decoder.{k}")
     if not d("tie_word_embeddings"):
-        raise NotImplementedError(f"{g.path}: an output weight of its own")
+        raise NotImplementedError(f"{g.path}: an untied output weight")
     v = _view(g, "moss", {
         "moss.block_count": int(d("n_layers")), "moss.context_length": int(d("max_position_embeddings")),
         "moss.embedding_length": int(d("hidden_size")), "moss.feed_forward_length": int(d("intermediate_size")),

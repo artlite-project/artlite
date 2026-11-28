@@ -46,8 +46,8 @@ states), the next pass's messages its mixes.
 The state array's slots (``SA_SLOTS``): 0 .. 4 the states, 5 .. 7 the blended inputs, 8 .. 11 the banks.
 
 A DSpark drafter's taps (``taps``: the visits whose input residual feeds its cache): the combine of the visit before a
-tap emits cur a second time (``protocol.M_INKN``'s bank copy, into a bank that no pass reads before its own visits
-write it again: ``_tap_bank``), drained into TAPS ([tap][k block][slot sp][8] fp32, ``tap_rows``).
+tap emits cur a second time (``protocol.M_INKN``'s bank copy, into a bank that every pass writes again before reading
+it: ``_tap_bank``), drained into TAPS ([tap][k block][slot sp][8] fp32, ``tap_rows``).
 
 The host writes the first visit's input states and, a loop visit's, the bank its messages read (``write_states``: the
 state array, the F_LOADR objects, the partial sums of its mixes); the later visits' come from the steps of the ones
@@ -240,7 +240,7 @@ class InklingOverlay(AttentionOverlay):
         self.ffn = ffn
         self.taps = tuple(taps)
         assert not taps or ffn, "taps: the combines' copies"
-        for t in self.taps:  # (the combine of the visit before: no bank copy of its own)
+        for t in self.taps:  # (the combine of the visit before must not already write a bank)
             assert t - 1 in self.vis and self.bank_of(t - 1, cfg) is None, t
         # (the FFN's combine reads the next visit's queries: its layer's "inkq", the output's after the last visit)
         self.after = vs[-1] + 1
@@ -805,8 +805,8 @@ class InklingOverlay(AttentionOverlay):
         return (vis.loop % 2, 0) if vis.layer == mid else (vis.loop % 2, 1) if vis.layer == cfg.core_end - 1 else None
 
     def _tap_bank(self, v: int) -> tuple[int, int]:
-        """(bank, state) the combine of visit v, before a tap, copies cur into: one that no pass reads before its own
-        visits write it again (a pass before the last: the bank it writes, the state its next bank visit writes; the
+        """(bank, state) the combine of visit v, before a tap, copies cur into: one that every pass writes again before
+        reading it (a pass before the last: the bank it writes, the state its next bank visit writes; the
         last pass: the bank it does not read; the prelude and coda: any, the passes write both before they read them)."""
         vis, cfg = self.cfg.visits[v], self.cfg
         if 0 <= vis.loop < cfg.passes - 1:

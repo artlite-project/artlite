@@ -69,7 +69,7 @@ class Engine:
     saved in RAM) and runs the rest, in parts for a recurrent model's checkpoints (``PromptCache.marks``), with a
     checkpoint at its end; ``cached``: the tokens whose K / V the caches hold (the last sampled token never ran).
     ``on_ready``: called on the worker once the model is loaded (after the warmup); ``on_exit``: when the worker ends
-    on its own (the load failed)."""
+    without being stopped (the load failed)."""
 
     def __init__(self, load: Callable[[], tuple[Model, NpuModel]], *, warmup: bool = True,
                  on_ready: Callable[[], None] | None = None, on_exit: Callable[[], None] | None = None,
@@ -192,7 +192,7 @@ class Engine:
         t0, ran = time.perf_counter(), 0
         try:
             self.begin()
-            if sets is not None:  # (a non-causal model's sequences of their own attention: each whole, from position 0)
+            if sets is not None:  # (a non-causal model's sequences, each attending within itself, whole from position 0)
                 assert not npu.causal
                 cache.prepare([], enabled=False)
                 out = npu.readouts(inputs, rows, sets=sets)

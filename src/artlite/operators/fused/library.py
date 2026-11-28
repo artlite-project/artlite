@@ -2,7 +2,7 @@
 programs assembled on the host (``program.Assembler``), each item an operator with its arguments at any device
 addresses (``items``), in pieces of one hardware context (``run``).
 
-Every argument of an operator is its own slot in the ELF's scratch (a BD's address tells its argument); no data BOs
+Every argument of an operator gets a separate slot in the ELF's scratch (a BD's address tells its argument); no data BOs
 are allocated: the items address the caller's buffers.
 """
 

@@ -8,7 +8,7 @@ panels of the first after a prefill), the record drains (D: address, length) and
 own objects (``PartBD``: address).
 
 A step's slots may be several sequences' (``Part``: the device holds each one's caches, ``ModelOverlay.select``): a
-sequence's slots are sub-steps of their own, so a sub-step's patches take its sequence's buffers and its own position,
+sequence's slots form separate sub-steps, so a sub-step's patches take its sequence's buffers and its own position,
 and the transaction is the one a single sequence builds for the same pattern of sub-steps.
 """
 

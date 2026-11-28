@@ -3,7 +3,8 @@ drafts also UD-Q4_K_M):
 
 - teacher-forced decode steps over an essay against llama.cpp's runs of the same GGUF file (logits,
   ``tests/goldens/text.py``): KL of the next-token distributions and argmax agreement against its decode (ubatch 1),
-  next to its own prompt run against it (its graphs differ: Q8_0 activations, and the routing of near-tied experts);
+  next to llama.cpp's prompt run against that decode (the graphs differ: Q8_0 activations, and the routing of
+  near-tied experts);
 - a checkpoint: the steps after a restore give the logits they gave before it, bit for bit (the convs' state and the
   sliding-window caches back with it);
 - steps of S tokens against steps of one, a rollback of rejected drafts, greedy text with the context's drafts: bit for

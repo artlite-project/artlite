@@ -1,6 +1,6 @@
 """Several lanes of one model (models/lanes.py: ``Rounds``; ``OverlayModel``'s lanes) on a stub overlay whose step
 gives each slot the row of its sequence and position, in a buffer the next step overwrites and with two dispatches at
-once refused: the lanes' attributes; generations on threads of their own against each alone (their rounds' parts and
+once refused: the lanes' attributes; generations on separate threads against each alone (their rounds' parts and
 slots); a reader that stops, a lane that is always late, rows read late; a prompt between the rounds, and the rounds
 between a prompt's chunks; more lanes than slots; failed dispatches; lanes with a drafter (its dispatches before a
 round's step, a step's per-slot keyword, what else a lane reads of a step). No NPU."""
@@ -97,7 +97,7 @@ class Overlay:
 
 class Prefill:
     """A prefill of chunks of 16 tokens (from a multiple of 8 on) on the stub overlay: a chunk is two pieces, each a
-    dispatch of its own, in the overlay's ``ran`` as the selected sequence's part of 16 slots; between them the
+    separate dispatch, in the overlay's ``ran`` as the selected sequence's part of 16 slots; between them the
     chunk lets its ``guest`` in (``artlite.operators.fused.library.Guest``: the lanes' round), if it waits."""
 
     group, dispatches, guest = 8, 2, None
@@ -214,7 +214,7 @@ class Drafting(Lanes):
 
 
 def texts(n: int, length: int = 72, *, copy: bool = False) -> list[list[int]]:
-    """n texts of ``length`` tokens that end with the end token; ``copy``: each repeats a span of its own again and
+    """n texts of ``length`` tokens that end with the end token; ``copy``: each repeats one of its spans again and
     again (the context's drafts are right)."""
     rng = np.random.default_rng(n)
     out = []
@@ -227,7 +227,7 @@ def texts(n: int, length: int = 72, *, copy: bool = False) -> list[list[int]]:
 
 
 def run(*jobs: Callable[[], object]) -> list[object]:
-    """Each job on a thread of its own: their results (an exception: the job's, in its place)."""
+    """Each job on a separate thread: their results (an exception: the job's, in its place)."""
     def job(fn: Callable[[], object]) -> object:
         try:
             return fn()
@@ -238,8 +238,8 @@ def run(*jobs: Callable[[], object]) -> list[object]:
 
 
 def test_lanes() -> None:
-    """A lane per sequence: the model itself and copies of it that share the device's side and have a sequence,
-    position, counters and planner of their own; an attribute that is neither is refused; a model of one sequence is
+    """A lane per sequence: the model itself and copies of it that share the device's side but each have a separate
+    sequence, position, counters and planner; an attribute that is neither is refused; a model of one sequence is
     its only lane and nothing joins its steps."""
     m = Lanes(texts(3))
     a, b, c = m.lanes
@@ -489,7 +489,7 @@ def test_drafter(n: int, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_drafter_wrong(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Lanes with a drafter, one's guesses wrong: every text is its own, whatever shares its steps."""
+    """Lanes with a drafter, one's guesses wrong: each lane's text stays the same whatever shares its steps."""
     monkeypatch.setattr(lanes, "WAIT", 5.0)
     for n in (2, 3):
         m = Drafting(texts(n, 100), delay=0.002)

@@ -115,8 +115,8 @@ def catalog_of(models_dir: str, tmp_path: object, **kw: object) -> Catalog:
 
 
 def test_catalog_qwen3vl(tmp_path: object) -> None:
-    """A Qwen model's directory: its vision encoder is the Qwen3-VL mmproj of its width (another model's, wider, and
-    MiniCPM-V's are not its own)."""
+    """A Qwen model's directory: its vision encoder is the Qwen3-VL mmproj of its width (neither another model's wider
+    mmproj nor MiniCPM-V's matches it)."""
     d = str(tmp_path / "models")
     write_gguf(f"{d}/org/q-GGUF/q-35B-A3B-Q4_K_M.gguf", arch="qwen35moe", n_embd=128)
     write_gguf(f"{d}/org/q-GGUF/mmproj-q-BF16.gguf", arch="clip", n_embd=128, projector="qwen3vl_merger")
@@ -169,7 +169,7 @@ def test_catalog_checkpoint(tmp_path: object) -> None:
 
 
 def test_catalog_checkpoint_tower(tmp_path: object) -> None:
-    """A checkpoint directory with a Qwen3-VL vision tower (z-lab's Qwen3.5-0.8B-PARO): its own encoder."""
+    """A checkpoint directory with a Qwen3-VL vision tower (z-lab's Qwen3.5-0.8B-PARO) as its encoder."""
     src = checkpoint("qwen3.5-0.8B-paro")
     require(src)
     d = tmp_path / "models"
@@ -517,7 +517,7 @@ def test_router_several(models_dir: str, tmp_path: object) -> None:
             return reply(r)
 
         assert ask_(A) == "a-Q4_0" and ask_(B) == "a-Q8_0" and sorted(router.instances) == [A, B]
-        # (each model server's default prompt cache: half of its own)
+        # (each model server's default prompt cache is half of what it would have alone)
         assert router.env[settings.ROUTER_MODELS.name] == "2"
         port = router.instances[A].port
         assert httpx.get(f"http://127.0.0.1:{port}/props", headers=auth).status_code == 401  # (its own key)

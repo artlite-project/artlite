@@ -131,8 +131,9 @@ class SpeculativeMixin:
 
     def _kappa(self, d: int) -> float:
         """The drafts the model keeps at depth d (0: a round's first draft) per their chains' probability (the
-        drafter's calibration: its guesses after its own guesses are overconfident, Qwen3.8-27B's on prose 1.0 at
-        depth 0 to 0.24 at depth 6; a depth not drafted yet takes the deepest one's; 1 before its rounds)."""
+        drafter's calibration, since guesses that follow its earlier guesses are overconfident: Qwen3.8-27B's on prose
+        goes from 1.0 at depth 0 to 0.24 at depth 6; a depth not drafted yet takes the deepest one's; 1 before its
+        rounds)."""
         d = min(d, len(self._chain_at) - 1)
         return self._kept_at[d] / self._chain_at[d] if d >= 0 else 1.0
 
@@ -175,7 +176,7 @@ class SpeculativeMixin:
 
     def _sibling(self) -> list[int] | None:
         """The round's sibling branch: tokens from one the drafter ranks second after the round's token on, which its step
-        runs in slots of their own after the drafts (``_verify``), branching off them; the drafts gave them their last
+        runs in separate slots after the drafts (``_verify``), branching off them; the drafts gave them their last
         slots. None: a chain of drafts."""
         return None
 
@@ -210,8 +211,8 @@ class SpeculativeMixin:
         token = choose(logits)
         n = 1
         yield token
-        # (a grammar's mask: its forced tokens drafts of their own, the others cut where it refuses them, its masks
-        # computed while the step runs)
+        # (a grammar's mask: its forced tokens serve as drafts, the others are cut where it refuses them, and its masks
+        # are computed while the step runs)
         forced, valid, ahead = (getattr(mask, k, None) for k in ("forced", "valid_prefix", "prefetch"))
         ctx = self.context(token_ids(prompt)) if self.lookup and most > 0 else None
         if ctx is not None:
@@ -273,7 +274,7 @@ class SpeculativeMixin:
                     new.append(choose(raw[c + i], self.softcap))
                     if i == len(d) or new[i] != d[i] or new[i] in self.eos_token_ids:
                         break
-                won = 0  # (the sibling branch's tokens kept: their own logits, the token after each)
+                won = 0  # (the sibling branch's kept tokens; their logits give the token after each)
                 if sib is not None and new == [sib[0]] and sib[0] not in self.eos_token_ids:
                     won = 1
                     while True:

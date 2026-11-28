@@ -126,7 +126,7 @@ def attention_gqa(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, scale: float, 
 def mtp_block(gguf: object, cfg: QwenConfig, emb: np.ndarray, h: np.ndarray, pos: np.ndarray, *,
               head: np.ndarray | None = None, swap: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """An MTP block (llama.cpp's ``graph_mtp``, the block at index ``cfg.num_hidden_layers`` of an MTP file, or of a
-    model file with a block of its own) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the
+    model file that embeds the block) over rows of consecutive positions ``pos`` from 0 (T,), each the cache of the
     rows after it: emb (T, H) the rows' token embeddings, h (T, H) the model's output-normed hidden state of the
     position before each (zeros at 0). Its FFN: a ``qwen35moe`` file's MoE, a ``qwen35`` file's dense SwiGLU.
     Returns its tensors by llama.cpp's names (``mtp_eh_proj``: the layer's input x0, ``mtp_attn_residual``,

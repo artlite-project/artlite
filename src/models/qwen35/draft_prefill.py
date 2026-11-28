@@ -44,7 +44,7 @@ class DraftPrefill(DrafterPrefill):
         cfg, img, H = draft.cfg, draft.image, draft.H
         self.L, self.H, self.eps = draft.L, H, cfg.rms_norm_eps
         self.R0 = max(prefill.sizes) + 64  # (rows of each of DY's regions: a chunk, its GEMMs' padding, the carry)
-        # (a PARO checkpoint's drafter, ``QwenDraft``'s rotated image: q, k, v regions of their own into one layout)
+        # (a PARO checkpoint's drafter, from ``QwenDraft``'s rotated image: separate q, k and v regions in one layout)
         self.qkv = [img.region(self.L, n) for n in ("attn_q", "attn_k", "attn_v")] if img.paro else None
         self.pitch = (PG.joined_layout(self.qkv, prefill.SUB).pitch if self.qkv else
                       PG.phase_pitch(img, "attn_in", prefill.SUB))

@@ -611,7 +611,7 @@ class TestFusedLifecycle:
             f.compile().load()._kernel()
             ctxs.append(f.load()._ctx)
         assert ctxs[0] is not ctxs[1]
-        buf = artlite.Device().alloc_user_buffer(256 << 20)  # (on XRT: a region of its own)
+        buf = artlite.Device().alloc_user_buffer(256 << 20)  # (on XRT: a separate region)
         linux = os.path.exists("/proc/self/status")
         pinned = _vm_pin() if linux else 0
         assert buf.paddr_in(ctxs[0]) == buf.paddr_in(ctxs[1])
@@ -619,7 +619,7 @@ class TestFusedLifecycle:
             assert _vm_pin() - pinned <= buf.size  # (amdxdna: 0, pinned at its allocation; XRT: once)
 
     def test_buffers_together(self):
-        """Buffers allocated together (``Device.alloc_host_buffers``) are zeroed memory of their own, pinned at their
+        """Buffers allocated together (``Device.alloc_host_buffers``) are separate zeroed memory, pinned at their
         size: on XRT ranges of one XRT buffer (device addresses their whole pages apart), not of a shared region of 1 GB
         that would be pinned whole."""
         f = _add_chain("t_pin_a").compile()

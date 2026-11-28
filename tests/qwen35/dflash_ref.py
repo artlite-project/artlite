@@ -72,8 +72,8 @@ class DFlash:
         return g
 
     def attention(self, L: int, q: np.ndarray, k: np.ndarray, v: np.ndarray, p: int) -> np.ndarray:
-        """Layer L's attention of a block at p: rows q (T, heads, d), its own K and V (T, KV heads, d) over the cached
-        positions before p: non-causal in the block, a row at r past the positions of r - window and before."""
+        """Layer L's attention of a block at p: rows q (T, heads, d), the block's K and V (T, KV heads, d) over the
+        cached positions before p: non-causal in the block, a row at r past the positions of r - window and before."""
         cfg = self.cfg
         T = q.shape[0]
         ws = max(0, p - cfg.window + 1)

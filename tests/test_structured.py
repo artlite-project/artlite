@@ -371,7 +371,7 @@ class TextModel:
 
 def test_forced_drafts() -> None:
     """A model that writes a JSON answer, greedy: the same tokens with and without drafts, with and without the
-    grammar; with it, the tokens the grammar forces (a fixed schema's keys) are drafts of their own, kept by
+    grammar; with it, the tokens the grammar forces (a fixed schema's keys) become separate drafts, kept by
     construction, and the answer takes fewer steps than tokens; the context's drafts the grammar refuses are cut."""
     schema = {"type": "object", "properties": {"name": {"type": "string"}, "kind": {"type": "string",
                                                                                     "enum": ["alpha", "beta"]},

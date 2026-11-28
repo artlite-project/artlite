@@ -17,7 +17,7 @@ where they disagree, the latest one's token is right less often, after 4 tokens 
 0.22 where at most half do, and agent sessions replayed offline run 1-5% faster than with a1 by m alone, most where
 slots are dear), against the time of a step of k + 1 tokens at the round's position (an average per S and span of
 positions as the steps run, ``SPAN``, before, the model's ``STEP_COST`` ratios to a measured
-one; a step across a KV cache group adds a second attention pass, a measure of its own: the position decides, and
+one; a step across a KV cache group adds a second attention pass and is measured separately: the position decides, and
 neither a crossing step's time nor a long context's must stand for S's at another position, or S looks dear and never
 runs again to correct it; the time another process's turn on the NPU took is not the step's); a drafter's rounds
 (multi-token prediction) by their measured tokens per second after matches of the same length (where the text repeats

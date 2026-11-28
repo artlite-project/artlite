@@ -25,15 +25,15 @@ from the file a window at a time, and the tools' load line ends with both figure
 `uv sync` installs the AIE toolchains (mlir-aie, Peano) into the venv; XRT and Vitis are not needed. llguidance
 (structured output) comes as a wheel for Linux and Windows: no Rust toolchain.
 
-If `ulimit -l` prints a number, not `unlimited`, raise the limit (Artlite raises its own up to the hard limit, which
-only root can raise), then log in again:
+If `ulimit -l` prints a number, not `unlimited`, raise the limit (Artlite raises its soft limit up to the hard limit,
+which only root can raise), then log in again:
 
 ```bash
 printf '* soft memlock unlimited\n* hard memlock unlimited\n' | sudo tee /etc/security/limits.d/99-memlock.conf
 ```
 
-A shell or tmux server started before keeps the old limit. A systemd service (`artlite-server` as one) takes its own:
-`LimitMEMLOCK=infinity` in its unit.
+A shell or tmux server started before keeps the old limit. A systemd service (such as `artlite-server`) sets a separate
+limit: put `LimitMEMLOCK=infinity` in its unit.
 
 Optional: the driver's `turbo` power mode turns the array's clock gating off (more power while the NPU works). Only
 root can set it, and Artlite keeps the driver's `default`; where XRT is installed, `sudo xrt-smi configure --pmode
@@ -121,10 +121,11 @@ Remove-Item Env:XILINX_XRT
   ("regions") they lie in. Buffers allocated together are one region of exactly their size: a model's buffers on its
   overlay with its prefill's, a drafter's, a fused operator's (`Device.alloc_host_buffers`), so a model costs a command
   a region for its weights and one for the rest, whatever their sizes and the context length. A buffer allocated alone
-  shares a 1 GB region of the process when it is under 256 MB (pinned whole, used or not) and has its own from there.
-  A command also lists the process's other regions while it has room: while a model's context and its drafter's
-  each listed only their own buffers, the model's steps ran a third slower on Windows (Krackan Point, Qwen3.8 27B with
-  DFlash2 and 131072 positions). Instruction buffers (control code, PDIs, the scratchpad) need not be listed.
+  shares a 1 GB region of the process when it is under 256 MB (pinned whole, used or not); from 256 MB on, it gets a
+  separate region. A command also lists the process's other regions while it has room: when a model's context and its
+  drafter's context each listed only their own buffers, the model's steps ran a third slower on Windows (Krackan Point,
+  Qwen3.8 27B with DFlash2 and 131072 positions). Instruction buffers (control code, PDIs, the scratchpad) need not be
+  listed.
 - A data buffer's region is one XRT buffer of the device, at one device address in every context, made once a
   context exists in the process (XRT's rule): a program opens its context before it resolves addresses. Instruction
   buffers are made in the memory group of the context that runs them (`Buffer.paddr_in`).
@@ -197,7 +198,8 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fclk-hold.service
 ```
 
 The NPU's own work runs FCLK at its top level, so the hold costs power when the NPU is idle: on the ROG Flow Z13
-measured, an idle desktop drew ~2 W more with it (package power 9.9-11.5 W, held 11.5-13.9 W, on mains power).
+measured, an idle desktop drew ~2 W more with it (package power 9.9-11.5 W without the hold vs. 11.5-13.9 W with it, on
+mains power).
 
 On some other boards the hold was not enough ([ROCm/TheRock#8709](https://github.com/ROCm/TheRock/issues/8709)):
 there the BIOS's "Eco Mode" disabled, or no NPU work while the iGPU computes, stopped the resets. AMD names a BIOS

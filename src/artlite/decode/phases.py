@@ -3,7 +3,7 @@ metadata and weight reads.
 
 A phase is one region of the image (``image.Region``) against the inputs of S <= ``slots`` (the design's) slots. Its K
 chunks run in groups of at most ``protocol.MAX_K`` elements (the x panels of a group live in the helper core's memory):
-each group is an input of its own (a metadata object and the slots' x interleaved: ``protocol.input_fill``) followed by
+each group is a separate input (a metadata object and the slots' x interleaved: ``protocol.input_fill``) followed by
 its tiles, a row tile's chunks of the group in a row.
 """
 

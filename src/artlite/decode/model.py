@@ -13,7 +13,7 @@ state copies work on), and a step's slots may be several sequences' (``decode.st
 parts, of a model whose overlay joins them, ``_join``): one stream of the weights for all of them.
 
 A model's overlay supplies its config and image classes (``CONFIG``, ``IMAGE``), its design (``op``), its phases and
-their flags (``_flags``; the metadata words of its own: ``_meta``), its static objects (``_load``), the layout of its
+their flags (``_flags``; its own metadata words: ``_meta``), its static objects (``_load``), the layout of its
 buffers (``_plan``: ``_layout``'s buffers, ``loadr``, the phases' input regions, its attention's; then ``_sizes``), a
 step's transaction (``_build``), its sub-steps (``subs``, repeating every ``period`` positions), per-step patches
 (``_set_position``: with ``AHEAD`` it takes ``ahead`` and returns whether the step was patched) and ring bookkeeping
@@ -221,7 +221,7 @@ class ModelOverlay:
     # the phases whose input the helper norms (a hidden size of part of a K chunk: their inputs' padding k kept zero,
     # ``_clear_pads``)
     NORMED: ClassVar[frozenset[str]] = frozenset()
-    # the buffers each sequence has its own of (``sequences``: sequence s > 0's as ``seq_name``); (): the model's
+    # the buffers that each sequence has a separate copy of (``sequences``: sequence s > 0's as ``seq_name``); (): the model's
     # overlay holds one sequence
     SEQ: ClassVar[tuple[str, ...]] = ()
     rings = (0, 0)  # (byte offset, bytes) in KV of the attention layers' rings (``vring``), set by ``_plan``
@@ -260,7 +260,7 @@ class ModelOverlay:
         self._meta_bytes: dict[tuple[int, int], tuple] = {}  # (S, start) -> the objects' ACT bytes (``_metas``)
         self._last_s = 1
         self.screen: Screen | None = None  # (a screened LM head's host side: ``_logits``)
-        self._lm_runs = 0  # (dispatches of logits so far: a ``Screened`` reads the buffers of its own)
+        self._lm_runs = 0  # (dispatches of logits so far: a ``Screened`` head reads its own buffers)
         self._tr_lm: Transaction | None = None
         self._ahead: AheadStep | None = None  # (the next step, patched while one runs)
         # the host seconds of the last step's one-time work: its transaction's first build and patch tables, a prompt's states
@@ -278,8 +278,8 @@ class ModelOverlay:
         return self.op.slots
 
     def _tap(self, L: int) -> tuple[int, str]:
-        """The input region whose x is layer L's tap (``tap_x``): its first phase's (a rotated overlay's: a plain copy of
-        its own, ``decode.rotated``)."""
+        """The input region whose x is layer L's tap (``tap_x``): its first phase's (for a rotated overlay, a separate plain
+        copy: ``decode.rotated``)."""
         return self._input(L)
 
     def tap_x(self, L: int) -> int:
@@ -290,7 +290,7 @@ class ModelOverlay:
 
     def tap_rows(self, taps: tuple[int, ...], n: int) -> np.ndarray:
         """The x of the layers ``taps``' first phase (``tap_x``) of the last step's first n slots: (n, taps, K) bf16
-        bits, copies (a block drafter's injection of a sequence's rows from a staging region of its own: a model of
+        bits, copies (a block drafter's injection of a sequence's rows from a dedicated staging region: a model of
         several sequences, whose next step is another's too)."""
         out = []
         for L in taps:
@@ -393,7 +393,7 @@ class ModelOverlay:
 
     def reset(self) -> None:
         """A new sequence (the selected one starts over). The KV caches keep their bytes: a step or chunk reads only the
-        positions before its own, written by then (zeroing them would flush the whole cache: milliseconds)."""
+        positions before its own, which are written by then (zeroing them would flush the whole cache: milliseconds)."""
         self.vring.clear()
 
     def _alias(self) -> dict[str, str]:
@@ -561,7 +561,7 @@ class ModelOverlay:
     def _joint_subs(self, S: int) -> set[tuple]:
         """The sub-step patterns (``_join``) of every step of S slots of two or more sequences: each way to deal the
         slots to them, each part at each kind of position (``subs`` over ``period``)."""
-        at: dict[int, dict[tuple, int]] = {}  # (per part size: a position per pattern of its own sub-steps)
+        at: dict[int, dict[tuple, int]] = {}  # (per part size: a position per pattern of the part's sub-steps)
         for n in range(1, S):
             for p in range(self.period):
                 at.setdefault(n, {}).setdefault(self.subs(p, n), p)

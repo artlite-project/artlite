@@ -39,7 +39,7 @@ class Store(ImageStore):
 
 
 def test_alloc_and_layout_restore() -> None:
-    """Images land in chunks (a larger one in a buffer of its own); the layout rebuilds the same buffers and images on
+    """Images land in chunks (a larger one in a separate buffer); the layout rebuilds the same buffers and images on
     another device."""
     a = Store(FakeDevice())
     for name, n in (("a", 5000), ("b", 40000), ("c", 30000), ("big", 200000), ("a", 100)):

@@ -77,7 +77,7 @@ BIG = 1024  # the sub-chunk of the chunks made of them (the GEMMs but qkv once p
 # qkv's items stay SUB: a 1024-token GemmQd is slower, a GemmQ no faster)
 PREP_SIZES = (1024, 512)  # tokens per attention prep item where a chunk is made of them
 NORM_SIZES = (2048, 1024, 512)  # tokens per norm item where a chunk holds them (its fill and drain once per item)
-SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
+SMALL = (64, 128)  # chunk sizes with dedicated operators (short prompts: fewer passes)
 PACK_SIZES = (64, 128, 256, 512, 1024, 2048, 3072, 4096)  # packed chunks' sizes (``run_packed``)
 PACK_SPAN = 512  # a packed chunk's longest segment (its attention's window: PACK_SPAN / pg + 1 cache groups)
 RING_HOLD = 1  # the history's cache groups the ring attention's memory tiles hold (a rerank query's prompt)
@@ -319,7 +319,7 @@ class LlamaPrefill(ChunkPrefill):
         return self._runlist_of(S * SUB)
 
     def _runlist_of(self, T: int, *, packed: bool = False, ring: bool = False) -> list[tuple]:
-        """(the sub-chunks of ``_t``: a size below SUB one of its own operators)"""
+        """(the sub-chunks of ``_t``, where a size below SUB runs on dedicated operators)"""
         t = self._t(T)
         return self._ops_runlist(T // t, self.ops[t], packed, ring)
 
@@ -481,15 +481,15 @@ class LlamaPrefill(ChunkPrefill):
         embeddings back to back, ``pos`` (n,) their rotary positions, ``lo`` (n,) per token its segment's first (an index
         into x); every row sees the caches' positions before p0 (a shared prefix) and its segment's tokens up to itself
         (segments of up to ``PACK_SPAN`` tokens). ``lead`` (0 or ``self.lead``): x's first rows a prompt at p0 that every
-        segment after it sees too (their own segment; the caches then hold it as a sequence). Leaves the last layer's
-        output rows in PX (``hidden``); the caches hold no sequence after p0 + lead."""
+        segment after it sees too (the lead forms a separate segment; the caches then hold it as a sequence). Leaves the
+        last layer's output rows in PX (``hidden``); the caches hold no sequence after p0 + lead."""
         n, dev, hd = x.shape[0], self.ov.dev, self.shape.hd
         T = T or next(t for t in self.pack_sizes if t >= n)
         self._size(n, p0, T)
         assert ((np.arange(n) - lo) < PACK_SPAN).all() and (lo <= np.arange(n)).all(), "segments of PACK_SPAN tokens"
         assert lead in (0, self.lead) and (lo[:lead] == 0).all() and (lo[lead:] >= lead).all(), "a lead of a group"
         self._stage_px(x, T, bfloat16)
-        R = self.ov.max_positions  # (the chunk's cos / sin rows past the text positions'; padding: a row of its own)
+        R = self.ov.max_positions  # (the chunk's cos / sin rows past the text positions'; padding rows: separate ones)
         rows = PA.cs_rows(self.cfg.rope_inv_freq(), np.concatenate([pos, p0 + np.arange(n, T)]))
         dev.view("CS")[4 * hd * R:4 * hd * (R + T)] = rows.view(np.uint8).reshape(-1)
         dev.flush("CS", 4 * hd * R, 4 * hd * T)

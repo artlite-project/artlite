@@ -689,13 +689,13 @@ __attribute__((noinline)) void {{ p }}_pslot(const float *__restrict sc, const f
 }
 
 // Tail object t of the chain's end, after its range: the open record r = (t ? p + S - 1 : p) >> 3 as rows ([d-block
-// nd][position 8][8] bf16): t = 0 its ring slot (in place), or (A_TREC) its V panels as rows in qa; t = 1 (a second open
-// record) its ring slot, or none before the step's at a layer with its own cache (in place: the object's bytes as the
-// rows). Such a layer's step V rows in (the rows past the step's last position: as they were, read by no one). Per slot
-// that reaches the record: the record's V panels from its rows up to the slot's position (into kb: what that position
-// sees of the record, whatever the step), y += P V of the slot's rows. The chain's end: the last panels (the rows up to
-// the step's last position) emitted with the rows (the ring slot); t = 1 of a step of several slots in one record: both
-// again (the object: the slot as before the step, its rows put in again).
+// nd][position 8][8] bf16): t = 0 its ring slot (in place), or (A_TREC) its V panels as rows in qa; t = 1 (a second
+// open record) its ring slot, or, at a layer that owns its cache, none before the step's (in place: the object's bytes
+// as the rows). Such a layer's step V rows in (the rows past the step's last position: as they were, read by no one).
+// Per slot that reaches the record: the record's V panels from its rows up to the slot's position (into kb: what that
+// position sees of the record, whatever the step), y += P V of the slot's rows. The chain's end: the last panels (the
+// rows up to the step's last position) emitted with the rows (the ring slot); t = 1 of a step of several slots in one
+// record: both again (the object: the slot as before the step, its rows put in again).
 __attribute__((noinline, minsize)) void {{ p }}_tobj(uint8_t *__restrict a, int32_t *__restrict ws, int t)
 {
     {{ p }}_AWin<{{ WINS['tobj'] }}> win_;

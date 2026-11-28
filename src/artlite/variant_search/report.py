@@ -190,7 +190,7 @@ def _fmt(value: float | None, digits: int = 0) -> str:
 
 def _print_npu(result: SearchResult) -> None:
     items = [item for item in result.variants if item.npu is not None]
-    print("\nNPU: one dispatch, each variant in its own process (median, p10 over the reps)")
+    print("\nNPU: one dispatch, each variant in a separate process (median, p10 over the reps)")
     rows = [[item.variant.name, _fmt(item.npu.median_us, 1), _fmt(item.npu.p10_us, 1), item.npu.error or ""]  # type: ignore[union-attr]
             for item in sorted(items, key=lambda item: (item.npu.median_us is None, item.npu.median_us or 0))]  # type: ignore[union-attr]
     for line in _table(["variant", "median us", "p10 us", ""], rows):

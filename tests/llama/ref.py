@@ -31,7 +31,7 @@ from ..numerics import bf16_round as bf
 
 
 class LlamaNpuRef:
-    """The layers ``layers`` of a Llama GGUF file (as a model of their own: the overlay's ``layers``) and the first
+    """The layers ``layers`` of a Llama GGUF file (as a standalone model: the overlay's ``layers``) and the first
     ``vocab`` LM rows with the overlay's rounding points; ``kp``: the caches' K panels per record. ``run`` takes tokens
     after the cached positions (``caches``: per layer an ``AttentionRef``) and returns the logits (T, vocab), with
     sub-layer results in ``trace``."""

@@ -10,7 +10,7 @@ kernel's text, comments included, renames it and what reaches it). ``--alpha`` c
 (renamed FIFOs); ``--rename`` rewrites AFTER's sources and MLIR (a renamed kernel prefix; an operator class moved
 to another module: ``--rename '(// ==== \\w+ \\()old/module.py=\\1new/module.py'``: the section label of its
 ``kernel.cc`` is the module's path, so its hashes change with the label; pairs whose sources are equal after the
-rename are counted apart); ``--asm`` compiles both sources of every source-only pair and compares the sets of
+rename are counted separately); ``--asm`` compiles both sources of every source-only pair and compares the sets of
 distinct function bodies (labels and symbol operands
 normalized, names ignored: a function moved to another name, or two copies merged, compares equal).
 

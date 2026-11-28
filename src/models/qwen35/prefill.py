@@ -5,7 +5,7 @@ the decode continues from the state the chunk leaves.
 A chunk of T tokens (``SIZES``: ``SMALL``, multiples of 256; ``SPLIT_T`` where the split attention applies:
 ``attn256_split``, a chat model's prefill with a q head per column and two KV heads, its AttnPreps per ``SPLIT_PREP``
 tokens) runs layer-major in S = T / ``SUB`` sub-chunks (a ``SMALL``
-size: one sub-chunk of operators of its own size, for short prompts): each operator of a layer runs over the
+size runs as one sub-chunk on operators built for that size, for short prompts): each operator of a layer runs over the
 sub-chunks back to back on buffer slices a sub-chunk apart (consecutive runs of one operator share its configuration:
 the ConfigureOps, ~75 ms of the 27B's chunk, are paid per chunk instead of per sub-chunk), the flash attention once over
 the whole chunk. Per layer (the decode's order): the input norm (x += the last
@@ -61,7 +61,7 @@ shared expert, their rows folded into it) and as rows (PXR: the experts' gathere
 slots.
 
 A readout model's prefill also runs packed chunks (``pack``, ``run_packed``): several inputs (segments) back to back in
-a chunk at position 0, each from a state of its own. The operators that keep them apart: GdnPrep / GdnScan's packed
+a chunk at position 0, each starting from a separate state. The operators that keep them apart: GdnPrep / GdnScan's packed
 variants (the mask PM per token: 1 + its distance from its segment's first token; the state reset there exactly, a
 segment's first three tokens' convs from its first token on), the packed attention (each row its segment's keys: up to
 itself, or all of them non-causal; ``SEG``); every other operator works row by row. Each token's rotary position counts
@@ -108,7 +108,7 @@ from .paro_steps import gdn_in_rows
 SUB = 256  # tokens per sub-chunk (the operators' T)
 # (a PARO checkpoint) a layer's input projections, each on its rotated copy of the norm's panels (``image``'s PARO)
 PARO_IN = {True: ("attn_q", "attn_k", "attn_v"), False: ("gin_q", "gin_z")}
-SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
+SMALL = (64, 128)  # chunk sizes with dedicated operators (fewer passes for short prompts)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB))  # chunk sizes (a flash attention design each)
 MOE_SIZES = SIZES + (4096,)  # an MoE model's (its experts' weights stream once per chunk)
 SPLIT_T = 2304  # a chunk size of the split attention (``SPA.SplitAttnOperator``: 24 passes of 96, 9 sub-chunks)
@@ -433,8 +433,8 @@ class QwenPrefill(ChunkPrefill):
         return self._starts[T]
 
     def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False, fresh: bool = False) -> list[tuple]:
-        """(sub-chunks of ``_t`` tokens: a ``SMALL`` size one of its own operators; the layers' first items in
-        ``_starts``; ``packed``, ``tree``: the packed or tree GDN operators and the packed attention, the segments in
+        """(sub-chunks of ``_t`` tokens, a single one on dedicated operators for a ``SMALL`` size; the layers' first
+        items in ``_starts``; ``packed``, ``tree``: the packed or tree GDN operators and the packed attention, the segments in
         SEG; ``fresh``: the packed GDN operators and the unpacked attention)"""
         ov, cfg, sl = self.ov, self.cfg, self._sl
         t = self._t(T)

@@ -27,8 +27,9 @@ and runs in pieces of whole layers (``prefill.chunks.ChunkPrefill``).
 
 A non-causal model (``LfmConfig.causal`` False: d1's decision models) reads a prompt in one chunk from position 0: its
 full layers' attention sees the prompt both ways as a state and questions after it (``run``'s ``sets``: the state's
-tokens every token, a question's the state's and its own; ``prefill.attn.AttnOperator(causal=False)``, the bounds in
-SEG), its sliding-window and conv layers stay causal, the conv from zero histories.
+tokens see every state token, and a question's tokens see the state's and that question's;
+``prefill.attn.AttnOperator(causal=False)``, the bounds in SEG), its sliding-window and conv layers stay causal, the
+conv from zero histories.
 
 Chunks start at a cache group (64 positions) and hold at least ``MIN_TOKENS`` valid tokens (the conv history's 6 rows).
 Before a chunk the host moves each conv region's history to its base (the 6 rows before the chunk: ``LfmOverlay.conv_base``);
@@ -62,7 +63,7 @@ NORM_SIZES = (1024, 512)  # tokens per norm item where a chunk holds them (its f
 # down parts lie within D_STRIDE)
 D_STRIDE = 2 * MAX_BD_STEP_WORDS  # bf16 between a norm block's down parts at most (a shim BD dimension's step;
 # ``ResidualNormOperator`` refuses more)
-SMALL = (64, 128)  # chunk sizes of operators of their own (short prompts: fewer passes)
+SMALL = (64, 128)  # chunk sizes with dedicated operators (short prompts: fewer passes)
 SIZES = SMALL + tuple(range(SUB, 2049, SUB)) + (3072, 4096)
 MAX_T = SIZES[-1]
 DOWN_CHUNKS = 4  # K chunks per down part (2 parts of 4 of the ffn's 8: each part's A strip stays in the memtile, each
@@ -229,8 +230,8 @@ class LfmPrefill(ChunkPrefill):
         return self._runlist_of(S * SUB)
 
     def _runlist_of(self, T: int, *, packed: bool = False, tree: bool = False) -> list[tuple]:
-        """(the sub-chunks of ``_t``: a size below SUB one of its own operators; the input projections in items of
-        ``qt`` tokens, the preps in blocks of ``_pt``, the norms in blocks of ``norm_blocks``)"""
+        """(the sub-chunks of ``_t``, where a size below SUB runs on dedicated operators; the input projections in
+        items of ``qt`` tokens, the preps in blocks of ``_pt``, the norms in blocks of ``norm_blocks``)"""
         assert not packed and not tree, "LFM3: no packed chunks yet"
         t = self._t(T)
         o, S, qt, pt = self.ops[t], T // t, self.ops[t].qt, self._pt(T)

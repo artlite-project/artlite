@@ -590,7 +590,7 @@ __attribute__((noinline)) void {{ p }}_hrows(const bfloat16 *__restrict ab, cons
     }
 }
 
-// (htanh) The passes of a tanh of H8 fp32, 32 lanes a step, each a loop of its own between the scratch arrays (distinct
+// (htanh) The passes of a tanh of H8 fp32, 32 lanes a step, each a separate loop between the scratch arrays (distinct
 // parameters; in place where every value is read before it is written): sign (1 - e) / (1 + e) of x, e = e^-2|x| as
 // ``sexp``'s (exp2 of x log2 e: n = round, 2^f by its Taylor polynomial of degree 6 in fp32 products), 1 / (1 + e) as
 // ``srcp``'s (the mantissa's reciprocal: a linear guess, 3 Newton steps): the same operations per lane. An fp32 chain is
@@ -1133,9 +1133,10 @@ __attribute__((noinline)) void {{ p }}_rows(int32_t *__restrict ws, int flags{{ 
 
 {% endif %}
 {% if qtails and not moe %}
-// A dense gate / up group of G row tiles of R rows (a B_QT group's, after its tail tile and ``_rows``): its [8 gate | 8 up]
-// windows (a 16-row tile's block, or a pair of 8-row tiles' blocks: the second's rows the up rows) -> {{ act }}(bf16(gate))
-// up into the first 32 floats of blocks 0 .. nw - 1 (in order: a window's blocks are at or past its own); returns nw
+// A dense gate / up group of G row tiles of R rows (a B_QT group's, after its tail tile and ``_rows``): its [8 gate | 8
+// up] windows (a 16-row tile's block, or a pair of 8-row tiles' blocks: the second's rows the up rows) ->
+// {{ act }}(bf16(gate)) up into the first 32 floats of blocks 0 .. nw - 1 (in order: a window's blocks are at or past
+// the window's own block); returns nw
 __attribute__((noinline)) int {{ p }}_qguw(int32_t *__restrict ws, int G, int R)
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
@@ -2086,7 +2087,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
         return;
 {% endif %}
 {% if qtails %}
-    // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks, or its group's; else its
+    // (row groups: the helper's rows are separate rows after ours: its two groups' blocks, or its group's; else its
     // partial sums of our block, at yt + S_QY: a B_QT group's row tile's. Added: a group's blocks hold its row tiles' sums
     // of their chunks before the tail tile's)
     const int fm = st[{{ S_FMT }}], qy = st[{{ S_QY }}];
@@ -2103,7 +2104,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     }
 {% elif moe %}
     const int fm = st[{{ S_FMT }}];
-    if (fm & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
+    if (fm & {{ B_G4 }})  // (row groups: the helper's rows are separate rows after ours: its two groups' blocks)
         al::copy<{{ 2 * YB }}, 32>(yt + {{ 2 * YB }}, r);
     else if (fm & {{ B_G2 }})  // (its group's block)
 {% if not wide %}
@@ -2126,7 +2127,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     // before)
     const int pf = st[{{ S_PT }}] & 1;
 {% if rg %}
-    if (st[{{ S_FMT }}] & {{ B_G4 }})  // (row groups: the helper's rows are rows of their own, after ours: its two groups' blocks)
+    if (st[{{ S_FMT }}] & {{ B_G4 }})  // (row groups: the helper's rows are separate rows after ours: its two groups' blocks)
         al::copy<{{ 2 * YB }}, 32>(yt + {{ 2 * YB }}, r);
     else
 {% endif %}
@@ -2176,7 +2177,7 @@ void {{ p }}_collect(const float *__restrict r, int32_t *__restrict ws{{ ", int3
     }
 {% endif %}
 {% if qtails %}
-    {{ p }}_cend(ws{{ ", aw" if moe else "" }}, tl);  // (the rest in a function of its own: no register saves above)
+    {{ p }}_cend(ws{{ ", aw" if moe else "" }}, tl);  // (the rest in a separate function: no register saves above)
 }
 
 // A row tile (a group, a down tile) is through: ``collect``'s epilogue; tl the phase's tiles left

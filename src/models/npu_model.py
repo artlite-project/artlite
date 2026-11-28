@@ -121,7 +121,7 @@ class NpuModel:
         stream): a readout's rows (embeddings, a classifier's or the LM head's rows on the host: ``models.readouts``).
         ``sets`` (a non-causal model whose prefill reads sets: LFM3's d1): the prompt as a state and questions after it,
         bounds (S, e1, .., en): the state's tokens 0 .. S - 1 see every token on the non-causal layers, question k's
-        (e(k-1) .. ek - 1, e0 = S) the state's and their own; None: every token sees every token."""
+        (e(k-1) .. ek - 1, e0 = S) see the state's and question k's; None: every token sees every token."""
         raise NotImplementedError(f"{type(self).__name__} has no readouts")
 
     packs = False  # whether ``readouts`` packs inputs into prefill chunks (a readout model's prefill)

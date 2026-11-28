@@ -1,7 +1,8 @@
 """LFM3-VL's image sizes and pixels (models/lfm3vl/host.py) and the torch encoder (tests/lfm3vl/ref.py) against
 llama.cpp's libmtmd (no NPU): the encoder input's size and pixels (llama.cpp resizes with torchvision's int16
-weights, Pillow with its own: a level apart at most; a JPEG's within its decoders' differences), the image chunk's
-tokens and 1-D positions; the encoder's embeddings within llama.cpp's own distance from float64 (~1%)."""
+weights, Pillow with different ones: at most one level of difference; a JPEG's within its decoders' differences),
+the image chunk's tokens and 1-D positions; the encoder's embeddings within llama.cpp's own distance from float64
+(~1%)."""
 
 import os
 

@@ -171,7 +171,7 @@ def test_spark_npu_teacher_forced(name: str) -> None:
 
 @pytest.mark.parametrize("name", ["1.7B", "4B"])
 def test_spark_overlay_sequences(name: str) -> None:
-    """Three sequences on one device (``SparkOverlay(sequences=3)``: texts of their own, at positions of their own,
+    """Three sequences on one device (``SparkOverlay(sequences=3)``: separate texts at separate positions,
     the first past its sliding window) give, slot by slot, the logits of each sequence alone in steps of one, bit for
     bit: alternated (``select``: a step of 1 .. 8 slots of one, then of the next) and in joint steps (``step``'s parts:
     an attention pass per sequence, its rows of o alone; slots dealt at random, a sequence's drafts too, some of them
@@ -220,7 +220,7 @@ def test_spark_overlay_sequences(name: str) -> None:
     while any(pos[s] < lengths[s] for s in range(nseq)):
         take = [[s, 1] for s in range(nseq) if pos[s] < lengths[s] and not (s == nseq - 1 and steps < 12)]
         spare = ov.SLOTS - len(take)
-        for t in take:  # (more slots of its own: drafts)
+        for t in take:  # (more slots for the same sequence: drafts)
             while spare and rng.random() < 0.5 and pos[t[0]] + t[1] < lengths[t[0]]:
                 t[1] += 1
                 spare -= 1

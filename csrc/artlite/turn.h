@@ -3,12 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 
-// The NPU's turn between processes. Hardware contexts of different processes share the array: the firmware runs their
-// commands in an order of its own, and a switch to another context loses what a design keeps on the array beyond its
+// The NPU's turn between processes. Hardware contexts of different processes share the array: the firmware chooses the
+// order of their commands, and a switch to another context loses what a design keeps on the array beyond its
 // configuration (code pages' stores: artlite.overlay.OverlayDevice.set_prologue). A process holds the turn while any
 // of its commands is pending (Kernel's submits take it, the waits that retire them give it back) and while a caller
-// holds it (enter / leave: a check of foreign() and the submits it decides), so no other process's command runs
-// between two of its own meanwhile; foreign() counts the turns this process took after another process had one.
+// holds it (enter / leave: a check of foreign() and the submits it decides), so meanwhile no other process's command
+// runs between two of this process's commands; foreign() counts the turns this process took after another process had
+// one.
 //
 // A lock file every user's processes open (Linux: /dev/shm, else the temp directory; Windows: the temp directory):
 // byte 0 is the turn, a process waiting for it holds byte 1 shared (contended), bytes 8-15 hold the last holder's id,

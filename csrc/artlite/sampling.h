@@ -69,8 +69,8 @@ size_t mask_ids(const uint32_t* mask, size_t n, int32_t* ids, size_t max);
 void screen_dense(const uint16_t* x, const float* scale, size_t n, float floor, float* a);
 
 /// The exact logits out[j] = w[ids[j]] . g of m rows of a Q6_K matrix (raw: its GGUF rows, row_bytes apart; cols a
-/// multiple of 256, g (cols) fp32): w = d sc (q - 32) summed in fp32, a sub-block's 16 products in lanes of their own,
-/// the row's blocks one after the other.
+/// multiple of 256, g (cols) fp32): w = d sc (q - 32) summed in fp32, each of a sub-block's 16 products in a separate
+/// lane, the row's blocks one after the other.
 void screen_exact(const uint8_t* raw, size_t row_bytes, const int32_t* ids, size_t m, const float* g, size_t cols,
                   float* out);
 

@@ -93,7 +93,7 @@ def test_sequence() -> None:
 
 def test_sequence_inputs() -> None:
     """Sequence(inputs=("X",)): a sync first waits for the X fills (one wait per run of columns), so the
-    next phase's X fills follow the drain wait without waits of their own; the queue and token rules still hold."""
+    next phase's X fills follow the drain wait without separate waits; the queue and token rules still hold."""
     op = types.SimpleNamespace(ENDPOINTS={"A": (txn.MM2S, 0), "X": (txn.MM2S, 1), "C": (txn.S2MM, 0)},
                                BD_BASE={"A": 0, "X": 4, "C": 8})
     seq = Sequence(op, inputs=("X",))

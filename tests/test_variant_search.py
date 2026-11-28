@@ -108,7 +108,7 @@ def test_isa_tables_current() -> None:
 
 
 def test_compiler_drift() -> None:
-    """The wheel's commit is in its --version; its own compiler does not drift from itself."""
+    """The wheel's commit is in its --version; the wheel's compiler does not drift from itself."""
     commit = gen_isa_tables.clang_commit(clangpp())
     assert commit is not None and len(commit) == 40
     assert compiler_drift(clangpp()) is None
@@ -387,7 +387,7 @@ class _Flagged:
 def test_search_report(tmp_path: Path) -> None:
     """Variants of a kernel compiled in parallel: one row per variant in the loop's table, ranked by cycles; a
     variant whose source and compiler flags equal an earlier one's is measured once, one with other flags is compiled
-    on its own."""
+    separately."""
     variants = [Variant("base"), Variant("post", pragma=POST), Variant("none", pragma=""),
                 Variant("sub", subs=[("aie::add(", "aie::sub(")]), Variant("same", params={"flags": ()}),
                 Variant("flag", params={"flags": ("-mllvm", "--enable-aie-zol-without-minitercount=false")})]

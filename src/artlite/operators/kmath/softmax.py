@@ -1,5 +1,5 @@
 """A softmax's P = 2^(s - m) in two passes over a bias-192 exp2's parts (``exp2(32, bias=192)``: ``reduce``, A -> P, f;
-``poly``, P, f -> 2^x), each its own pipelined loop (as one loop the exp's constants spill; the decode's octets: II 8
+``poly``, P, f -> 2^x), each in a separate pipelined loop (in one loop the exp's constants spill; the decode's octets: II 8
 + 10, the prefill's 308 cycles per group): ``p_pass1`` stores P and f, ``p_pass2`` turns pairs of 32-lane records of
 them into the MMUL's P panels (bfp16, or hi and lo panels: the exact split) and their row sums. Templates:
 ``softmax.*.cc.jinja``."""
@@ -17,7 +17,7 @@ def _e192(e192: Fn) -> None:
 def p_pass1(e192: Fn, *, layout: str = "split", track: bool = False, inline: bool = False) -> Fn:
     """Pass 1 of N steps of 32 scores A = s - m + 192 (fp32): ``e192``'s reduce, its P and f stored as bf16. A
     template ``<N>``: ``layout`` "split" ``(sl, pP, pF)``, P and f to two arrays of 32 N; "inplace" ``(s)``, a step's
-    [P 32 | f 32] over its own 32 fp32 (stored P first). ``track``: returns whether every bf16(A) < 209 (s < m + 16:
+    [P 32 | f 32] written over the step's 32 fp32 scores (P stored first). ``track``: returns whether every bf16(A) < 209 (s < m + 16:
     the row maxima need no raise)."""
     _e192(e192)
     check("layout", layout, ("split", "inplace"))

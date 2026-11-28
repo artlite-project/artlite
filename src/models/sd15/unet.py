@@ -179,7 +179,7 @@ def resnet_bands(bd: Builder, w: dict, p: str, x: DTensor, *, cout: int, time_bi
     """``resnet`` on a banded level (x and the output in DDR): GN1 + SiLU of each band into the whole column's panels
     (the convs' halo rows), conv1 (+ the time bias) per band with GN2's records (parked in DDR, the last band's kept),
     GN2 + SiLU of each band (the last first), conv2 + x (or its 1x1 shortcut) per band -> the output's band (records
-    for ``stats``). A band's C tiles are a third of the memtile: an earlier band's output drained in an op of its own,
+    for ``stats``). A band's C tiles are a third of the memtile: an earlier band's output is drained in a separate op
     before the next band's convs (barriers: those reuse its bytes)."""
     lv, nb = x.lv, x.lv.nb
     npw = lv.np * nb  # (a whole column's token panels)
@@ -366,7 +366,7 @@ def make_skip(bd: Builder, x: Tensor, *, name: str, st: tuple[int, int], norm: t
     """The C tiles x (kept in the memtile) as a skip: st = (group size, channel offset) of its concatenation. norm =
     (gamma, beta, eps) of the concatenation's channels of the skip: a resident skip (``Skip.pb``). Else parked in DDR:
     x's C tiles drained with the copy, its panels with the next op (defer: at the heap's top, so that their release
-    leaves no hole between the next ops' tensors; else an op of their own: the next op's outputs need their bytes)."""
+    leaves no hole between the next ops' tensors; else in a separate op: the next op's outputs need their bytes)."""
     pn = alloc(bd, x.lv, x.C, "pn", top=norm is None and defer)
     rec = copy_stats(bd, x, name=name + ".st", st=st, panels=pn,
                      extra=bd.spill(name + ".ct", x.addr, x.nbytes) if norm is None else None)

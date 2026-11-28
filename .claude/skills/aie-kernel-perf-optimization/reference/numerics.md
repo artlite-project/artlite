@@ -1,10 +1,10 @@
 # Numerics on AIE2P: fast and accurate enough
 
-What the vector unit does natively, how to get fp32-level results from bf16 operations, and the
-accuracy traps met in Artlite's models. The helpers live in `include/kernel_lib.h`
+What the vector unit supports natively, how to get fp32-level accuracy from bf16 operations, and the
+numerical traps encountered in Artlite's models. Helpers live in `include/kernel_lib.h`
 (namespace `al`: exact building blocks) and `operators/kmath/` (`km.exp2`, `km.recip`, `km.sigmoid`, ...: generated per
-contract, each variant tested on the NPU bit-exact against its numpy model, `tests/operators/kmath_sim.py`, which also
-models the fp32 adder, bf16 rounding and the hi / lo products for precision studies).
+contract, with every variant tested bit-exact on the NPU against its numpy model in `tests/operators/kmath_sim.py`,
+which also models the fp32 adder, bf16 rounding, and hi/lo products for precision studies).
 
 ## Contents
 - What is native
@@ -18,283 +18,297 @@ models the fp32 adder, bf16 rounding and the hi / lo products for precision stud
 
 ## What is native
 
-- **bf16 x bf16 -> fp32 multiply / MAC** (`vmul.f`, `vmac.f`): the result lands at +6 cycles.
-  Dependent MACs on one accumulator run every 3 cycles (machine-model.md).
-- **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op. Not IEEE: the smaller operand
-  is rounded (to nearest even) onto the larger's grid of 23 fractional bits before the add (AM027),
-  so a cancellation keeps only that grid: x - round(x) loses x's last bit where round(x) is a power
-  of two above x. A MAC's sum (accumulator + exact bf16 product) is the same adder while the product is the smaller;
-  a larger product takes the accumulator onto a grid ~3 bits finer (of the larger of the product's and the sum's
-  exponents), then rounds the sum: 99.9% of single MACs with cancellation (kmath_sim's ``mac``), the rest 1 ULP off,
-  so a chain with cancellations (``al::rot2``) matches the model ~99.5%, within 2 ULP.
-- **Denormals are flushed to zero**, judged by the exact result: a product, a MAC's sum (of the exact product, not
-  flushed itself) before its rounding, a conversion. So x hi / lo splits lose the lo part where it falls below 2^-126
-  (`km.sigmoid`'s error rises below x = -79).
-- **A bf16 constant written as a float literal** that is no bf16 value is rounded at compile time
-  (`aie::broadcast<bfloat16>`): write the exact bf16 value.
+- **bf16 x bf16 -> fp32 multiply / MAC** (`vmul.f`, `vmac.f`): 6-cycle latency.
+  Dependent MACs on the same accumulator can issue every 3 cycles (`machine-model.md`).
+- **fp32 add / sub**, on the 2048-bit accumulators: 64 lanes per op. Not IEEE-compliant: before adding, the smaller
+  operand is rounded (nearest-even) onto the larger operand's 23-bit mantissa grid (AM027). During cancellation,
+  precision is limited to that grid—for example, `x - round(x)` drops the LSB of `x` whenever `round(x)` steps up to
+  the next power of two. A MAC (accumulator + exact bf16 product) uses the same adder when the product is smaller.
+  When the product is larger, the accumulator shifts onto a grid ~3 bits finer (matching the larger exponent) before
+  rounding the sum. This matches `kmath_sim`'s `mac` on 99.9% of single MACs with cancellation (within 1 ULP on the
+  rest), and chains like `al::rot2` match ~99.5% of the time (within 2 ULP).
+- **Denormals are flushed to zero** based on the exact (pre-rounding) result of a product, conversion, or MAC sum (the
+  MAC's intermediate product is not flushed before adding). Because of this, hi/lo splits of `x` lose the lo part when
+  it falls below `2^-126` (`km.sigmoid`'s error increases below `x = -79`).
+- **Float literals passed to `aie::broadcast<bfloat16>`** are rounded at compile time if they are not exact bf16
+  values; write the exact bf16 value instead.
 - **fp32 max** lowers to a bf16 compare plus a select. Float min / max / abs are expensive:
-  - a 64-lane clamp cost ~25 cycles and spilled;
-  - float `aie::neg` / `abs` may not legalize (G_FNEG): use `min(x, 0 - x)`, or integer ops on
-    the bits.
-- **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. `aie::inv` / `aie::invsqrt` of an fp32 vector is one
-  scalar `inv` per lane (aie_api's elementary fallback): ~3 instructions a lane of program memory; invert only the lanes
-  that matter (4 rows of a set, not 16 lanes). Both are within 1 fp32 ULP of the rounded result, ~88% exact, a
-  function of the mantissa (invsqrt: and the exponent's parity): kmath_sim models them by the NPU's results over [1, 4)
-  (``load_inv``, read by test_kmath's fixture). **Scalar float math** is
-  soft-float (`__mulsf3`, `__gtsf2`: calls, 0.9 KB of program memory). `checks.py` warns about
-  both.
-- **The bfp16 8x8x8 MMUL** (`mac_8x8_8x8T`) is the only hardware matrix path; bf16 `aie::mmul`
-  is emulated.
+  - a 64-lane clamp costs ~25 cycles and spills registers;
+  - float `aie::neg` / `abs` may fail to legalize (`G_FNEG`): use `min(x, 0 - x)`, or operate on the integer bits
+    directly.
+- **No fp32 multiply**: `aie::mul` on fp32 vectors is emulated. `aie::inv` / `aie::invsqrt` on an fp32 vector emit one
+  scalar `inv` per lane (`aie_api`'s elementary fallback), costing ~3 instructions of program memory per lane; only
+  invert the lanes that matter (4 rows of a set, not 16 lanes). Both are within 1 fp32 ULP of the correctly rounded
+  result (~88% exact), depending deterministically on the mantissa (and exponent parity for `invsqrt`). `kmath_sim`
+  models this using measured NPU outputs over `[1, 4)` (`load_inv`, read by `test_kmath`'s fixture). **Scalar float
+  math** falls back to soft-float (`__mulsf3`, `__gtsf2`: function calls, 0.9 KB of program memory). `checks.py` warns
+  about both.
+- **The bfp16 8x8x8 MMUL** (`mac_8x8_8x8T`) is the only hardware matrix path; bf16 `aie::mmul` is emulated.
 
 ## fp32 through bf16 splits
 
-x = hi + lo with hi = bf16(x), lo = bf16(x - hi): about 16 bits.
+`x = hi + lo` with `hi = bf16(x)`, `lo = bf16(x - hi)`: about 16 bits of precision.
 
 | helper | computes | products | error |
 |---|---|---|---|
-| `al::mulc<N>(x, c)` | fp32 x times an exact bf16 constant c | 2 | ~2^-16 rel. |
-| `al::mul_hilo<N, Hi, Lo>(x)` | fp32 x times an fp32 constant Hi + Lo | 3 | ~2^-16 rel. |
+| `al::mulc<N>(x, c)` | fp32 `x` times an exact bf16 constant `c` | 2 | ~2^-16 rel. |
+| `al::mul_hilo<N, Hi, Lo>(x)` | fp32 `x` times an fp32 constant `Hi + Lo` | 3 | ~2^-16 rel. |
 | `al::mulff<N>(a, b)` | fp32 x fp32 | 3 | ~2^-16 rel. |
 | `al::bf16_hilo` | a scale as bf16 hi + lo for a vector-wide multiply | | |
 
-- Each split costs 2 conversions and a subtraction. A chain of them is 20-30 cycles of latency.
-- x² of a bf16 x is exact in fp32: one `aie::mul(x, x)`.
+- Each split costs 2 conversions and a subtraction. A chain of splits adds 20-30 cycles of latency.
+- `x²` for a bf16 `x` is exact in fp32 with a single `aie::mul(x, x)`.
 
 ## LUTs and their errors
 
 | op | lanes per instruction | slot | error |
 |---|---|---|---|
-| `vexp2` | 16 | mv | the chord 2^n (1 + f) between integer powers: up to +6% on bf16 inputs, 15% on fp32 |
-| `vtanh` | 16 | mv | coarse (max 8.5% rel.); returns its argument below |x| = 0.5; bf16 saturation near 1 |
+| `vexp2` | 16 | mv | the chord `2^n (1 + f)` between integer powers: up to +6% on bf16 inputs, 15% on fp32 |
+| `vtanh` | 16 | mv | coarse (max 8.5% rel.); returns its argument below `|x| = 0.5`; bf16 saturation near 1 |
 | gather (`load_4x64_lo / hi`) | 4 per instruction | ldb | exact: 64-bit table entries (`km.act`, `kmath/`) |
 
-- vexp2 is Schraudolph's exp bit for bit (probed over every bf16 and fp32 accumulators): bits = floor(128 y) +
-  16256, for y < 0 16255 - trunc(128 |y|) (one's complement), y the argument truncated to bf16 (steps of 1/4 from
-  |y| = 32: up to 19%). Exact at non-negative integers (an exact 2^n: the exp2 recipe below); at negative integers
-  2^n (1 - 2^-8). Its error depends on the fraction only: a correction needs the fraction, i.e. the range split
-  anyway. Where a softmax's scale-free P suffices, two chords (`km.exp2(bias=0, prec="chord2")`: vexp2(x) +
-  vexp2(x + 1/2) / sqrt 2, two vexp2, an add, two products) are within 1.2% of 2.068 2^x for |x| <= 2 (1 / sqrt 2:
-  the chords' errors cancel; weights minimax for |x| <= 2 gave SD's UNet more error).
-- The gather: lane k of an instruction reads table ab (k % 4 < 2) or cd, its odd lanes 32 bytes further; offset bits
-  5:4 select the entry of a 64-byte group, bits 3:0 are ignored. So a table is 4 copies: groups of 4 entries stored
-  twice, in ab and cd, the two copies in two 16 KB regions (bank-conflicts.md). Each base of the address vector must
-  be a global or a pointer parameter of its own, or the reads carry no memory operand (compiler-feedback.md).
-
-- Both take the argument truncated to bf16. They share the mv slot with compares, selects and
-  min / max.
-- A 32-lane activation with 2 LUT calls, a compare and a select already needs 5+ mv ops per 32
-  lanes.
+- `vexp2` matches Schraudolph's algorithm bit-for-bit (verified across all bf16 and fp32 accumulator values):
+  `bits = floor(128 y) + 16256`, or `16255 - trunc(128 |y|)` (one's complement) for `y < 0`, where `y` is truncated to
+  bf16 (producing 1/4-step quantization and up to 19% error for `|y| >= 32`). It is exact at non-negative integers
+  (exact `2^n`, used by the `exp2` recipe below) and `2^n (1 - 2^-8)` at negative integers. Because the error depends
+  only on the fractional part, fixing it requires a range split anyway. When softmax only needs an unscaled `P`,
+  combining two offset chords (`km.exp2(bias=0, prec="chord2")`: `vexp2(x) + vexp2(x + 1/2) / sqrt 2` — two `vexp2`
+  calls, an add, and two products) cancels the chord error to within 1.2% of `2.068 * 2^x` for `|x| <= 2` (minimax
+  weights over `|x| <= 2` gave higher error on SD's UNet).
+- The gather: lane `k` of an instruction reads table `ab` (`k % 4 < 2`) or `cd`, with odd lanes 32 bytes further;
+  offset bits `5:4` select the entry in a 64-byte group and bits `3:0` are ignored. Each table is therefore stored in
+  4 copies: groups of 4 entries duplicated in `ab` and `cd`, placed in two 16 KB regions (`bank-conflicts.md`). Each
+  base in the address vector must be a separate global or pointer parameter; otherwise the reads lose their memory
+  operands (`compiler-feedback.md`).
+- Both take the argument truncated to bf16 and share the `mv` slot with compares, selects, and min / max.
+- A 32-lane activation with 2 LUT calls, a compare, and a select already needs 5+ `mv` ops per 32 lanes.
 
 ## Recipes
 
 ### exp2 of fp32 x to 0.4 bf16 ULP (`km.exp2(N)`)
 
-1. n = round(x): add 1.5·2^23, read the float's bits, subtract 0x4B400000.
-2. f = x - n, with |f| ≤ 0.5.
-3. 2^f by a polynomial (degree 2 with its bf16 rounding points fitted: c1 = 0.6996, c2 = 0.236;
-   or `km.exp2`'s cubic).
-4. Shift n into the exponent field (`upshift(n, 23)`) and add it to the polynomial's bits. The
-   range: x clamped at -126 in fp32 first (a masked score of -1e30 becomes 2^-126, or exactly 0
-   from -127 on: `below="zero"`), or n clamped **as an integer** (`below="int"`: no fp32 max,
-   arguments above -2^22).
+1. `n = round(x)`: add `1.5 * 2^23`, read the float's bits, subtract `0x4B400000`.
+2. `f = x - n`, with `|f| <= 0.5`.
+3. Compute `2^f` with a polynomial whose coefficients are fitted with bf16 rounding points (degree 2: `c1 = 0.6996`,
+   `c2 = 0.236`; or `km.exp2`'s cubic).
+4. Shift `n` into the exponent field (`upshift(n, 23)`) and add it to the polynomial's bits. Range handling: either
+   clamp `x` at `-126` in fp32 first (a masked score of `-1e30` becomes `2^-126`, or exact `0` from `-127` downward
+   with `below="zero"`), or clamp `n` **as an integer** (`below="int"`: avoids fp32 max for inputs above `-2^22`).
 
-No branches, no -inf handling. 64 lanes per step, about
-55 cycles per 64 lanes; it does not software-pipeline, so batch the work.
+No branches, no `-inf` handling. Processes 64 lanes per step at ~55 cycles per 64 lanes; does not software-pipeline,
+so batch the work.
 
 ### exp2 without a table or fp32 vectors
 
-1. A = y + 192 in an accumulator (a caller's MAC chain adds it as its init constant); v = bf16(A) = 192 + round(y)
-   for |y| < 64; f = bf16(A - v), |f| <= 1/2 (exact for bf16 y; an fp32 y loses f's low bits: +0.17 ULP).
-2. P = vexp2(v - 128) = 2^(n + 64) exactly (non-negative arguments only, above); the 2^-64 goes into the constants.
-3. y = bf16(P 2^-64 + bf16(P f) c1' + bf16(P f^2) hi'), hi' = bf16(c2' + c3' f), c' = c 2^-64: P f and P f^2 are
-   exact scalings, so one rounding at the end. Fit c1 first, then c2, c3 to its rounding (0.69140625, 0.2412109375,
-   0.0625; c1 rounded last: 0.72 ULP).
+1. `A = y + 192` in an accumulator (a preceding MAC chain can fold this into its initial constant);
+   `v = bf16(A) = 192 + round(y)` for `|y| < 64`; `f = bf16(A - v)`, `|f| <= 1/2` (exact for bf16 `y`; an fp32 `y` loses
+   `f`'s low bits, adding +0.17 ULP).
+2. `P = vexp2(v - 128) = 2^(n + 64)` exactly (non-negative inputs only, as noted above); the `2^-64` factor is folded
+   into the constants.
+3. `y = bf16(P * 2^-64 + bf16(P f) * c1' + bf16(P f^2) * hi')`, where `hi' = bf16(c2' + c3' f)` and `c' = c * 2^-64`.
+   `P f` and `P f^2` are exact scalings, leaving only one rounding at the end. Fit `c1` first, then fit `c2` and `c3`
+   against the rounded `c1` (`0.69140625`, `0.2412109375`, `0.0625`; rounding `c1` last degrades error to 0.72 ULP).
 
-Max 0.585 ULP, 99.80% correctly rounded over the bf16 y in [-63, 63); II 10 per 32 lanes (its 10 MACs: the vec
-bound), ~370 cycles per 1024 on the NPU, bit-exact against its numpy emulation. A quadratic (hi' constant: c1 0.703125, c2 0.2412109375)
-saves 2 MACs: max 0.85 ULP, mean 0.26 (the cubic's 0.56 / 0.21). `km.exp2`'s fp32 cubic: 0.4 ULP, ~880 cycles, not
-pipelined; a gather-LUT exp would cost a SiLU table's ~850 and 3 KB.
+Max error 0.585 ULP, 99.80% correctly rounded over bf16 `y` in `[-63, 63)`; II 10 per 32 lanes (10 MACs, vec-bound),
+~370 cycles per 1024 elements on the NPU, bit-exact against its numpy emulation. A quadratic (constant `hi'`:
+`c1 = 0.703125`, `c2 = 0.2412109375`) saves 2 MACs: max 0.85 ULP, mean 0.26 (vs. 0.56 / 0.21 for the cubic). For
+comparison, `km.exp2`'s fp32 cubic achieves 0.4 ULP at ~880 cycles unpipelined, and a gather-LUT exp would cost ~850
+cycles and 3 KB like the SiLU table.
 
 ### Softmax in the MMUL panel layout (decode attention)
 
-- Keep scores as 8x8 accumulator panels (lane 8q + k).
-- Row max by `shuffle_down_rotate` 1, 2, 4 and max.
-- A per-query integer reference max from the first KV chunk (+1), P = 2^(s - m) with the clamp
-  above, and no O rescaling.
-- Not with attention sinks past the first chunk: MiniCPM-V's ViT scores reach 71 log2 units above its first 32 keys'
-  maximum (P saturates at 2^63; embeddings' KL 0.0090 -> 0.0074 once raised). Check each later group against m + 16
-  in bf16 and rescale o and l on the rare raise (the vision overlay's `ops.Attention(raise_max=)`, the qwen35 prefill attention).
-  Holding m from the first keys broke the 35B-A3B's sub-step core on a chat at 32K: garbage tokens in steps of 2 and more, with
-  raw essays clean at every threshold (their first keys are text like the rest; a chat's are its system prompt). Keep the
-  rescale unless the prompts tested have a chat's first keys; compare a real generation's text with and without drafts.
-- Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise
-  bf16 rounding can put the largest argument above 0.
+- Keep scores as 8x8 accumulator panels (lane `8q + k`).
+- Compute row max using `shuffle_down_rotate` by 1, 2, and 4 with max.
+- Take a per-query integer reference max from the first KV chunk (+1), compute `P = 2^(s - m)` with the clamp above,
+  and skip `O` rescaling.
+- This breaks if attention sinks appear after the first chunk: in MiniCPM-V's ViT, later scores exceed the first 32
+  keys' max by 71 log2 units (saturating `P` at `2^63`; updating the max drops embedding KL from 0.0090 to 0.0074).
+  Check each later group against `m + 16` in bf16 and rescale `O` and `l` on the rare updates
+  (`ops.Attention(raise_max=)` in the vision overlay, and qwen35 prefill attention). Holding `m` fixed from the first
+  chunk broke the 35B-A3B sub-step core on 32K chat prompts (producing garbage tokens at step >= 2), even though raw
+  essays stayed clean at every threshold (essay prefixes look like normal text, whereas chat prefixes are system
+  prompts). Keep rescaling enabled unless you have specifically tested on chat prompts, and inspect actual generated
+  text with and without drafts.
+- Take the max of the raw inputs and scale it with the same multiply as the elements; otherwise bf16 rounding can push
+  the largest argument above 0.
 
-### SiLU through the gather LUT (`km.act(km.SILU)`: the GDN prefill's)
+### SiLU through the gather LUT (`km.act(km.SILU)`: GDN prefill)
 
-- silu(x) = relu(x) + g(|x|), g(t) = silu(-t) on [0, 24] in segments of 1/4, a quadratic per segment in the offset r
-  from its centre (c0 fp32, c1, c2 bf16: one 64-bit entry; minimax on the segment's bf16 points, in result ULPs).
-- Range reduction in bf16: v = bf16(t + 32) rounds t to the grid ([32, 56] is a binade of ULP 1/4), r = (32 - v) + t
-  exactly ((32 - v) first, or tiny t lose their bits), the table offset is vfloor(64 v).
-- Max 0.59 ULP, 99.84% correctly rounded, ~2000 cycles per 4096 elements on the NPU; the vtanh / vexp2 form below:
-  6.6 ULP (at x = -2.2), 2682 cycles. Its emulation in numpy is bit-exact (`emulate` in `tests/operators/elementwise.py`).
-- What set the II (~550 variants): register pressure, not slots. In one loop the
-  constant vectors (1, 24, the abs mask, 0, the lanes' table pointers) took 5 of the 12 x registers, and the
-  post-pipeliner's allocation failed (II 23-30 at ResMII 12-15; constants parked in lf / bm registers and moved back
-  every iteration). Fission: t = min(|x|, 24) in a loop of its own (II 2), the table pass reads it in place (II 14,
-  bound 9; post-RA only: 21, its register allocation fails below; a full table's pass: II 12 post-RA only, 27 pipelined
-  first). Shuffle the coefficients into 32 lanes (`T256_2x2_lo / hi` of two `T16_16x4_lo`), not `concat` of 256-bit
-  halves (moves).
+- `silu(x) = relu(x) + g(|x|)`, where `g(t) = silu(-t)` on `[0, 24]` is divided into 1/4-wide segments, each
+  approximated by a quadratic in the offset `r` from its center (`c0` in fp32, `c1` and `c2` in bf16, packed into one
+  64-bit entry; minimax over the segment's bf16 points in result ULPs).
+- Range reduction in bf16: `v = bf16(t + 32)` rounds `t` to the grid (`[32, 56]` is a binade with ULP 1/4),
+  `r = (32 - v) + t` is exact (compute `32 - v` first, or small `t` values lose their low bits), and the table offset
+  is `vfloor(64 v)`.
+- Max error 0.59 ULP, 99.84% correctly rounded, ~2000 cycles per 4096 elements on the NPU (compared to 6.6 ULP at
+  `x = -2.2` and 2682 cycles for the `vtanh` / `vexp2` version below). Emulation in numpy is bit-exact (`emulate` in
+  `tests/operators/elementwise.py`).
+- II was limited by register pressure rather than functional slots (~550 variants tested). In a single loop, constant
+  vectors (`1`, `24`, the abs mask, `0`, and the lane table pointers) took 5 of the 12 `x` registers, causing
+  post-pipeliner register allocation to fail (II 23-30 vs. ResMII 12-15, spilling constants to `lf` / `bm` registers and
+  moving them back every iteration). Splitting the loop fixes this: compute `t = min(|x|, 24)` in a separate loop
+  (II 2), then run the table pass in-place (II 14 vs. bound 9; post-RA scheduling gets II 21 because regalloc fails below
+  that, while a full-table pass gets II 12 post-RA vs. 27 if pipelined first). Shuffle coefficients into 32 lanes using
+  `T256_2x2_lo / hi` on two `T16_16x4_lo` results rather than concatenating 256-bit halves (which inserts extra moves).
 
-### Sigmoid through the gather LUT (`km.SIGMOID`: the qwen35 attention prep's gate)
+### Sigmoid through the gather LUT (`km.SIGMOID`: qwen35 attention prep gate)
 
-No odd symmetry to fold: `ActTable(full=True)` tabulates f itself over [-t_max, t_max] (here 16), the range
-reduction as SiLU's with x + 48 in one binade of ULP 1/4 (129 segments), beyond it clamped: within 0.54 bf16 ULP,
-99.9% correctly rounded (`test_sigmoid_lut`); 1718 instead of 10273 cycles per 8 tokens of 256 gates (an fp32 exp2
-and reciprocal).
+No odd symmetry to fold: `ActTable(full=True)` tabulates `f` directly over `[-t_max, t_max]` (16 here), using the same
+range reduction as SiLU with `x + 48` in a binade of ULP 1/4 (129 segments) and clamping outside that range. Error is
+within 0.54 bf16 ULP with 99.9% correctly rounded (`test_sigmoid_lut`); runs in 1718 cycles instead of 10273 cycles per
+8 tokens of 256 gates (fp32 `exp2` + reciprocal).
 
-### SiLU (GemmQ's gate/up epilogue: the vtanh form + a small-|x| fit, `km.silu_tanh`)
+### SiLU (GemmQ's gate/up epilogue: `vtanh` + small-|x| fit, `km.silu_tanh`)
 
-- vtanh form (`al::tanh_acc` / `al::exp2_acc`): u (1 + tanh(u)), u = x / 2. Below x = -3,
-  u 2^(x log2e) (1 + |t|): the exp2 tail avoids cancellation against vtanh's saturation. II 10 per
-  32 lanes.
-- `silu_small` fixes |x| < 2.5 (vtanh's small-argument error cost 2.6x the first-token KL) with a
-  bf16 fit u + s (P0 + P1 s + P2 s²), s = u². It runs as a **second loop** in place (fission): one
-  loop with both was not pipelined (48-59 cycles per 32).
-- Too coarse for a recurrent state: in a 128-token GDN state it put 2.6x the exact SiLU's error
-  (6.7e-3 vs 2.6e-3; the vexp2 tail from -2.5 on: 3.4x). The exact identity a (1 + t) for x >= 0,
-  a e^x (1 - t) for x < 0 (1 + t = e^x (1 - t): no cancellation), e^x in a loop of its own (below),
-  the `silu_tanh` fit below |x| = 2.5: 1.2x, 3.2K cycles per 8 tokens x 288 values. The table SiLU
-  (above) has the exact SiLU's error and is faster (the 27B scan 4.57 vs 4.84 ms per layer, GdnOut
-  0.72 vs 0.89). Its quadratic unrounded (`km.act(f32=True)`, ~0.09 bf16 ULP of the exact value) is the best SiLU for a
-  fp32 consumer at any speed: max rel. error 7e-4 against `km.silu`'s 3.9e-3, ~1 cycle per element against 16.
+- `vtanh` form (`al::tanh_acc` / `al::exp2_acc`): `u (1 + tanh(u))`, where `u = x / 2`. Below `x = -3`, switch to
+  `u * 2^(x log2e) * (1 + |t|)`; the `exp2` tail avoids cancellation against `vtanh`'s saturation. II 10 per 32 lanes.
+- `silu_small` fixes `|x| < 2.5` (where `vtanh` error increased first-token KL by 2.6x) using a bf16 fit
+  `u + s * (P0 + P1 s + P2 s²)` with `s = u²`. Run it as a **second in-place loop**; combining both into one loop
+  prevents pipelining (48-59 cycles per 32 lanes).
+- This form is too coarse for a recurrent state: on a 128-token GDN state it produced 2.6x the error of exact SiLU
+  (6.7e-3 vs 2.6e-3; starting the `vexp2` tail at `-2.5` raised that to 3.4x). Using the identity `a (1 + t)` for
+  `x >= 0` and `a e^x (1 - t)` for `x < 0` (since `1 + t = e^x (1 - t)`, avoiding cancellation), with `e^x` in a
+  separate loop (below) and the `silu_tanh` fit for `|x| < 2.5`, drops this to 1.2x at 3.2K cycles per 8 tokens x 288
+  values. The LUT SiLU above matches exact SiLU's error and is faster (27B scan: 4.57 vs 4.84 ms/layer; GdnOut: 0.72 vs
+  0.89 ms). For fp32 consumers, the unrounded quadratic (`km.act(f32=True)`, ~0.09 bf16 ULP) is the best option at any
+  speed: 7e-4 max relative error vs. 3.9e-3 for `km.silu`, at ~1 cycle/element vs. 16.
 
 ### e^x of fp32 x in a pipelined loop
 
-``km.exp``'s fp32 form (``km.exp2``'s of ``al::log2e<32>(x)``; of a bf16 x two products: ``km.exp(arg="bfloat16")``) does
-not pipeline; ``al::log2e`` is ~2^-16 relative, so e^x this
-way is off by ~1.6e-5 |x| (2^-9.5 at |x| = 87: ``km.expneg``) (86 bundles per 32 lanes: its fp32 vector ops). x log2 e as
-two bf16 products (log2 e hi + lo) into an accumulator, the 1.5·2^23 split, 2^f by a quadratic in bf16 MACs (minimax
-on [-0.5, 0.5]: 0.27%, ~0.7 bf16 ULP; the cubic 0.014%), the exponent added as integers: II 15 per 32 (1131 vs 6238
-cycles per 2304 values; the cubic 1997). In the GDN state the quadratic's error is invisible (3.14e-3 vs 3.08e-3).
+The fp32 version of `km.exp` (which applies `km.exp2` to `al::log2e<32>(x)`, or uses two products for bf16 inputs via
+`km.exp(arg="bfloat16")`) does not pipeline (86 bundles per 32 lanes due to fp32 vector ops). Because `al::log2e` has
+~2^-16 relative error, `e^x` drifts by `~1.6e-5 * |x|` (reaching `2^-9.5` at `|x| = 87` in `km.expneg`). Instead, compute
+`x log2 e` as two bf16 products (`log2 e` hi + lo) into an accumulator, apply the `1.5 * 2^23` split, evaluate `2^f`
+with a quadratic in bf16 MACs (minimax on `[-0.5, 0.5]`: 0.27% error, ~0.7 bf16 ULP; cubic gets 0.014%), and add the
+exponent as integers. This pipelines at II 15 per 32 lanes (1131 vs 6238 cycles per 2304 values; 1997 cycles for the
+cubic). On the GDN state, the quadratic's error is negligible (3.14e-3 vs 3.08e-3).
 
 ### tanh of fp32 x at fp32 precision, batched (Inkling's decode blend, `decode/design.cc.jinja` `htanh`)
 
-sign (1 - e) / (1 + e), e = e^-2|x| through ``km.exp``'s fp32 form and ``km.recip``'s Newton steps: as 16-lane calls
-29 cycles a value (each call one latency-bound chain). Batched per 288 values and split into passes through L1 (the
-reduction, each Taylor step, the reciprocal's guess, each Newton step, the quotient), 32 lanes a step: 15.6. No pass
-pipelines (each fp32 chain is a recurrence of its whole length: a Newton step's RecMII 51 at ResMII 10); what overlaps
-them is unrolling a pass by 3 (independent chains in one body: 491 -> 241 cycles), as far as code and stack allow
-(unrolled, the quotient pass spilled into a 1.6 KB frame).
+Computed as `sign * (1 - e) / (1 + e)` with `e = e^-2|x|` using `km.exp`'s fp32 form and `km.recip`'s Newton steps.
+Called 16 lanes at a time, each call is a single latency-bound chain taking 29 cycles per value. Batching 288 values
+and splitting into L1 passes (range reduction, each Taylor step, reciprocal initial guess, each Newton step, and
+quotient) at 32 lanes per step cuts this to 15.6 cycles per value. Individual passes do not pipeline because each fp32
+chain is a full-length recurrence (e.g., RecMII 51 vs. ResMII 10 on a Newton step). To overlap chains, unroll each pass
+by 3 (491 -> 241 cycles), limited by code size and stack space (unrolling the quotient pass spilled into a 1.6 KB stack
+frame).
 
-### GELU through the gather LUT (`km.GELU`: the Gemma prefill's gate/up epilogue and per-layer-input op)
+### GELU through the gather LUT (`km.GELU`: Gemma prefill gate/up epilogue and per-layer-input op)
 
-The SiLU table's scheme (`kmath.ActTable`: f(x) = relu(x) + g(min(|x|, t_max)) for f(x) - f(-x) = x) with 65
-segments of 1/8 over [0, 8]: within 0.59 bf16 ULP from x = -4 on, 1.42 in [-6, -4) (absolute 1.4e-7; the tail decays
-faster than a quadratic per segment follows, so `floor` sets an absolute error target there), ~2.2 KB of table, as
-a worker `Buffer` argument (`km.act(table_arg=True)`: SKILL.md section 2). `walk=(2, 128)` reads a GEMM epilogue's
-gate halves of a gate/up C tile in place, `walk=(1, 64)` the PLE's slots; the vision overlay feeds a GELU table on SiLU's grid 2 |x|
-(`scale=2`, `clamp`). The clamp pass is a noinline function of its own; `inline=True` puts it into the caller, which
-only the PLE takes (its call cost 7 cycles; inlined, the GEMM epilogue and the vision overlay's row loops spill more). The decode
-overlay's GELU (`decode/design.cc.jinja`) is `km.act(km.GELU)`,
-32 values at a time: 2.4x faster than the tanh form through `vtanh` (a bf16 fit below |w| = 1.25, e^(2w) (1 + |tanh w|)
-for w < 0), which is within 1.7 ULP at ~7 cycles per element.
+Uses the SiLU table scheme (`kmath.ActTable`: `f(x) = relu(x) + g(min(|x|, t_max))` for functions satisfying
+`f(x) - f(-x) = x`) with 65 segments of width `1/8` over `[0, 8]`. Error is within 0.59 bf16 ULP for `x >= -4` and
+1.42 ULP in `[-6, -4)` (1.4e-7 absolute; because the tail decays faster than a per-segment quadratic can track, `floor`
+sets an absolute error target there). The table takes ~2.2 KB and is passed as a worker `Buffer` argument
+(`km.act(table_arg=True)`: SKILL.md section 2). `walk=(2, 128)` reads the gate halves of a GEMM epilogue's gate/up C
+tile in place; `walk=(1, 64)` processes the PLE slots; the vision overlay runs a GELU table on SiLU's grid using
+`2|x|` (`scale=2`, `clamp`). The clamp pass defaults to a separate noinline function. Setting `inline=True` avoids the
+7-cycle call overhead—which helps the PLE—but increases register spills in the GEMM epilogue and vision overlay row
+loops. The decode overlay's GELU (`decode/design.cc.jinja`) uses `km.act(km.GELU)`, 32 values at a time: 2.4x faster
+than the `vtanh` form (bf16 fit below `|w| = 1.25`, `e^(2w) (1 + |tanh w|)` for `w < 0`), which gets 1.7 ULP at ~7
+cycles per element.
 
 ## Block float (bfp16ebs8)
 
-- **Layout**: 8 values share one 8-bit exponent, 9 bytes per block. `sizeof(bfp16ebs8)` is 9;
-  `sizeof(uint4)` is 1. Never do pointer arithmetic on `bfp16ebs8 *` or `uint4 *`: offset a
-  `uint8_t *` and cast at the stream constructor.
-- **Loads**: 576-bit blocks load only as FIFO pops (`vlda / vldb.pop.576`). Each input stream holds
-  one of the 2 `lf` registers, so at most two input streams are live at once.
-- **Fills and seeks**: aie_api's stream fills once per 8 pops, anchored at pop 0. A `seek(p)`
-  with `p % 8 != 0` returns garbage later. Create streams inside the iteration, or keep a
-  persistent one and `seek` by multiples of 8 (`seek` zeroes the count). A stream carried across
-  loop iterations without that fills before every pop.
-- **Output streams**: `push` = push + flush. Create them per iteration.
-- **Unsigned mantissas**: unsigned-mantissa MMUL mode (`sgn_x = sgn_y = 0`) makes an 8-bit
-  unsigned significand exact.
-- **Precision**: 7 bits relative to the block's maximum: ~1-2% relative error per operand on real
-  Q / K / P / V. For bf16-level products split each operand into bfp16 hi + lo and issue 3 MMULs
-  (hh + hl + lh). The exact split is on the MMUL with a -I panel (restructurings.md R4).
-- **Idempotence**: conversion is not idempotent. A -128 mantissa keeps its exponent; converting
-  the value again raises it. Host models insert the kernel's blocks; they do not re-round values.
-- **Exact integers**: integers in [-128, 127] are exact with exponent byte 133 (a scale of 1), which `bfp16.blocks`
-  does not pick for a block holding -128 (`artlite.vision.layout.int_panels`). MiniCPM-V's encoder takes the 8-bit pixels so,
-  as p - 128, with the normalization folded into the patch embedding's weights and its offset on a constant input in
-  a block of its own: no rounding of the input, and cheaper host packing than float panels.
-- **Host packing**: round to nearest even when packing on the host (`bfp16.blocks`), not truncate
-  (as mlir-aie's `floatToBfp16` helper does): a Llama Q4_0 prefill's KL 0.00085 vs 0.00145 truncated.
+- **Layout**: 8 values share one 8-bit exponent (9 bytes per block). `sizeof(bfp16ebs8)` is 9; `sizeof(uint4)` is 1.
+  Never do pointer arithmetic on `bfp16ebs8 *` or `uint4 *`; offset a `uint8_t *` and cast when constructing the stream.
+- **Loads**: 576-bit blocks load only via FIFO pops (`vlda / vldb.pop.576`). Each input stream occupies one of the 2
+  `lf` registers, so at most two input streams can be live at once.
+- **Fills and seeks**: `aie_api`'s stream refills once every 8 pops, anchored at pop 0. Calling `seek(p)` with
+  `p % 8 != 0` returns garbage later. Either create streams inside the loop iteration, or keep a persistent stream and
+  `seek` by multiples of 8 (`seek` resets the counter). Otherwise a stream carried across loop iterations refills before
+  every pop.
+- **Output streams**: `push` performs a push + flush. Create output streams per iteration.
+- **Unsigned mantissas**: unsigned-mantissa MMUL mode (`sgn_x = sgn_y = 0`) represents an 8-bit unsigned significand
+  exact.
+- **Precision**: 7 bits relative to the block maximum (~1-2% relative error per operand on real Q / K / P / V). For
+  bf16-level accuracy, split each operand into bfp16 hi + lo and issue 3 MMULs (`hh + hl + lh`). Exact splitting on the
+  MMUL uses a `-I` panel (`restructurings.md` R4).
+- **Idempotence**: conversion is not idempotent. A `-128` mantissa keeps its exponent, and converting the value again
+  raises the exponent. Host models should insert the kernel's blocks directly rather than re-rounding values.
+- **Exact integers**: integers in `[-128, 127]` are represented exactly with exponent byte 133 (scale 1), though
+  `bfp16.blocks` avoids this exponent if a block contains `-128` (use `artlite.vision.layout.int_panels` instead).
+  MiniCPM-V's encoder uses this to pass 8-bit pixels directly as `(p - 128)`, folding normalization into the patch
+  embedding weights and placing the offset in a dedicated constant-input block—avoiding input rounding and making host
+  packing cheaper than float panels.
+- **Host packing**: use round-to-nearest-even when packing on the host (`bfp16.blocks`), not truncation (as
+  mlir-aie's `floatToBfp16` helper does): on a Llama Q4_0 prefill, nearest-even gets KL 0.00085 vs 0.00145 for
+  truncation.
 
 ## Rounding
 
-- The default rounding mode is floor. Set `aie::set_rounding(aie::rounding_mode::conv_even)` in
-  every kernel entry that rounds. The mode is per-core state that survives across kernels.
-- A kernel that relies on another kernel having set the mode truncates every tile when that kernel
-  is absent (a GEMM: KL 0.0008 -> 0.038).
-- Floor rounding also biases bf16 write-backs (~6% at large K).
+- The default rounding mode is floor. Set `aie::set_rounding(aie::rounding_mode::conv_even)` at the entry of every
+  kernel that performs rounding; the mode is per-core state that persists across kernels.
+- Any kernel that relies on a previous kernel to set the mode will silently truncate every tile when that earlier
+  kernel is absent (on a GEMM, KL jumps from 0.0008 to 0.038).
+- Floor rounding also introduces bias on bf16 write-backs (~6% at large K).
 
 ## Model-level accuracy rules (found on Gemma 4)
 
-- A scale that multiplies a whole vector (1 / rms) goes in as bf16 hi + lo (`al::bf16_hilo`),
-  never rounded to bf16.
-- Cached K: one 7-bit bfp16 block per 8 dims shifts a position's scores coherently, and the softmax turns that into an
-  output error on short vectors (Gemma's, Llama's K keep hi + lo blocks). At head_dim 256 it averages out: qwen35's K is
-  one block per 8 dims. Qwen3.8-27B, K hi alone against hi + lo: 512 teacher-forced tokens KL 0.0029 / 0.0030, agreement
-  0.953 / 0.951 (llama.cpp prompt vs decode 0.0031, 0.957); 128 steps after a prefill of 4096 KL 0.0040 / 0.0032,
-  agreement 0.961 / 0.945. Judge on hundreds of tokens: its first 128 alone read 0.938 / 0.969. V tolerates single blocks.
-- GEMM inputs as single bfp16 panels are acceptable: simulated KL 0.00059 vs 0.00042 with hi / lo.
-- Judge by KL over several prompts or rounding variants. Single short runs vary up to 40x with
+- Any scale factor that multiplies an entire vector (such as `1 / rms`) must be passed as bf16 hi + lo
+  (`al::bf16_hilo`), never rounded to a single bf16.
+- Cached K: using one 7-bit bfp16 block per 8 dims shifts a position's scores coherently, which softmax turns into
+  output error on short vectors (Gemma and Llama keep hi + lo blocks for K). At `head_dim` 256 this averages out, so
+  qwen35 uses one block per 8 dims for K. On Qwen3.8-27B, K hi alone vs. hi + lo gives: 512 teacher-forced tokens KL
+  0.0029 / 0.0030, agreement 0.953 / 0.951 (llama.cpp prompt vs. decode: 0.0031, 0.957); 128 steps after a 4096-token
+  prefill gives KL 0.0040 / 0.0032, agreement 0.961 / 0.945. Evaluate over several hundred tokens; looking only at the
+  first 128 gave noisy agreement numbers (0.938 / 0.969). V tolerates single blocks.
+- Single bfp16 panels are acceptable for GEMM inputs: simulated KL is 0.00059 vs 0.00042 with hi + lo.
+- Judge accuracy by KL across multiple prompts or rounding variants; single short runs can vary by up to 40x due to
   rounding luck.
-- **Flash attention: P = 2^(s - m) as bfp16 hi + lo panels**, like Q and K. Single bfp16 P blocks (8 positions
-  share an exponent: the small weights of a block lose their bits) doubled the Gemma prefill's cache error at the
-  last own-cache layer (K 5.4 -> 3.7%, V 8.0 -> 5.2% vs fp32) and its KL (0.00068 -> 0.00046); with hi + lo P an
-  attention's error is its output's own bfp16 rounding (the Llama path's 1.13-1.39x of it with single P, qwen35's 1.5-3x:
-  ``prefill.attn.Shape.pp``, ``attn_prefill``'s ``pp``). In a DMA-bound attention the second MMUL per record costs
-  nothing measurable (Qwen3 0.6B's shape at 512 tokens: +1.3%); where the cores bind it does (Llama 3B's 2048-token
-  chunk at p0 8K: 14.5 -> 17.6 ms per layer, +50% of a record's MMULs). Give the lo products their own accumulator chain
-  when one chain would serialize (QB = 1). A decode step's Q and P as single panels of 8 rows (qwen35's designs of 8
-  slots, where hi + lo do not fit): Qwen3.8-27B's teacher-forced KL 0.0022-0.0023, llama.cpp's prompt vs decode 0.0022:
-  no cost there.
-- **hi + lo weights** where a GEMM is sensitive and cheap: `artlite.vision.ops.Gemm(hilo=)` doubles K (the hi k-tiles, then
-  the lo ones on the A panels walked again). MiniCPM-V's encoder takes them at its patch embedding and its final
-  merger (a quarter of its weights' error between them); any other layer's weights held 1-3% each and did not pay.
-- **A GEMM's bf16 C tile between k-tiles** (`gemm/mac.py`: C stored as bf16 after every 64 k) rounds the running sum
-  K / 64 times; the error grows with the number of roundings and the partial sums' size. Splitting K into parts
-  that each emit a bf16 C, summed in fp32 by the consumer (a residual add), cuts it (Gemma's down, K = 10240, in 4
-  parts: `prefill.gemm.plan_phase(k_part=)`). K = 128 per round trip instead of 64 did not help measurably.
-- **Q4_0 weights as bfp16 panels** (GemmQd's dequant: q d per element, 8 k sharing an exponent) round the fp16 scale
-  d into the 8-bit mantissas: ~0.5% per weight. Exact-integer panels (the decode's GEMV) avoid it but need the
-  scale applied per group after the MMUL, which the prefill's MAC loop has no accumulators for.
-- In the Gemma prefill these three (single bfp16 inputs, bfp16 weights, the bf16 C tile) cost about equally
-  (each alone ~2-3% at layer 23 vs fp32); removing any one barely moved the sum. Fix the outlier first (P above).
+- **Flash attention: store `P = 2^(s - m)` as bfp16 hi + lo panels**, like Q and K. Single bfp16 P blocks (where 8
+  positions share an exponent and small weights lose precision) doubled Gemma prefill's cache error at the last
+  own-cache layer (K: 5.4% vs 3.7%, V: 8.0% vs 5.2% against fp32) and raised its KL (0.00068 vs 0.00046). With hi + lo
+  P, attention error drops down to the bfp16 rounding error of the output itself (single P inflates error by 1.13-1.39x
+  on the Llama path and 1.5-3x on qwen35: `prefill.attn.Shape.pp`, `attn_prefill`'s `pp`). In DMA-bound attention, the
+  extra MMUL per record adds negligible overhead (Qwen3 0.6B at 512 tokens: +1.3%); when compute-bound, it does
+  (Llama 3B's 2048-token chunk at p0 8K goes from 14.5 to 17.6 ms/layer, adding 50% more MMULs per record). Use a
+  separate accumulator chain for the lo products when sharing one would serialize (`QB = 1`). Using single 8-row panels
+  for Q and P during decode works without accuracy loss when hi + lo won't fit (e.g., qwen35's 8-slot designs:
+  Qwen3.8-27B teacher-forced KL is 0.0022-0.0023, matching llama.cpp's 0.0022 prompt-vs-decode baseline).
+- **hi + lo weights** where a GEMM is sensitive and cheap: `artlite.vision.ops.Gemm(hilo=)` doubles K (running the hi
+  k-tiles, then the lo ones while re-walking the A panels). MiniCPM-V's encoder uses hi + lo weights only at the patch
+  embedding and final merger (which together account for a quarter of the total weight error); other layers contributed
+  1-3% each and weren't worth the extra compute.
+- **A GEMM's bf16 C tile between k-tiles** (`gemm/mac.py`: storing C as bf16 every 64 k) rounds the running sum `K / 64`
+  times, with error growing with the number of roundings and the magnitude of the partial sums. Splitting K into parts
+  that each emit a bf16 C—summed in fp32 by the consumer (e.g., a residual add)—cuts this error (Gemma's down
+  projection, `K = 10240`, split into 4 parts via `prefill.gemm.plan_phase(k_part=)`). Increasing the round-trip interval
+  from `K = 64` to `128` did not help measurably.
+- **Q4_0 weights as bfp16 panels** (GemmQd's dequant: `q * d` per element, 8 `k` sharing an exponent) round the fp16
+  scale `d` into 8-bit mantissas, adding ~0.5% error per weight. Exact-integer panels (used in decode GEMV) avoid this,
+  but require applying the scale per group after the MMUL—which the prefill MAC loop lacks spare accumulators to do.
+- In Gemma prefill, these three sources (single bfp16 inputs, bfp16 weights, and the bf16 C tile) contribute roughly
+  equally (~2-3% each at layer 23 vs fp32), so removing any single one barely changes the total. Fix the outlier (`P`
+  above) first.
 
 ## Precision studies: simulate the rounding points
 
-Before changing kernels for accuracy, rank the candidates on the CPU: subclass the fp32 reference model and apply
-the kernels' rounding points where they happen (one flag per rounding point: GEMM inputs as bfp16 / hi + lo,
-weights as bfp16 panels, bf16 outputs, the C tile per k-tile, K parts, P and V blocks in the attention).
+Before changing kernels for accuracy, rank candidates on the CPU: subclass the fp32 reference model and insert the
+kernel rounding points where they occur (one flag per rounding point: GEMM inputs as bfp16 / hi + lo, weights as bfp16
+panels, bf16 outputs, the C tile per k-tile, K parts, and P/V blocks in attention).
 
-- Measure what the acceptance test measures: the per-layer cache error against the fp32 caches, and KL of
-  teacher-forced tokens after the prompt.
-- Average over several prompts: one prompt's error at the last layers varies by ~+-30% with the rounding luck,
-  and a 64-token KL mean is dominated by its few largest tokens (max 0.014 at mean 0.0006).
-- Rank rounding points one at a time in the exact model (only that point rounded). In the model with every rounding,
-  any change re-draws all later roundings, so one run of it measures that noise: in MiniCPM-V's encoder every early
-  site moved the KL by the same ~0.01. The one-site errors add up (as squares) where the full model's do not.
-- A few fragile tokens can hold most of an output's squared error (MiniCPM-V's ViT: the worst 1% held 67-80%,
-  single tokens changed by 57-99% by any small change): rank by the median per-token error. The model can make them,
-  not a rounding point or an op (the vision ViTs: a late FFN half switching on a massive activation, ``artlite.vision.vit``'s
-  Precision; llama.cpp errs on the same tokens). Tell that from a kernel's error: read the NPU's residual after every
-  layer (a dispatch per layer), run each layer alone from the float64 input against the CPU at its rounding points,
-  and compare llama.cpp's own error per token.
-- llama.cpp's CPU takes Q4_K weights' activations as Q8, so any change of the input re-draws that rounding: a KL
-  floor (~0.005 on MiniCPM-V 1B over 96 tokens). Its F32 requant (`llama-quantize --allow-requantize IN OUT F32`)
-  has none.
-- Average the KL over realizations: a tiny dither (1e-6 relative, or single bf16 ulps in 0.1% of an input) re-draws
-  every later rounding; 10-20 per config resolve ~5%. Report a prompt whose KL hinges on one near-tie token apart
-  (MiniCPM-V: a month read from small print): the model's other biases set its sign, so it moved one way in the CPU
-  model and the other on the NPU while the remaining prompts agreed.
-- Check the model against the NPU per layer. Where they diverge, a rounding point is missing from the model (the
-  attention's P was: the simulation matched the NPU through layer 17 and fell short after it until P was modeled).
-- `bfp16.values` emulates the conversion; insert blocks where the kernel converts, never re-round (above).
+- Measure what the acceptance test measures: per-layer cache error against the fp32 caches, and KL of teacher-forced
+  tokens after the prompt.
+- Average over several prompts: a single prompt's error at the final layers varies by ~+-30% due to rounding luck, and a
+  64-token KL mean can be dominated by a few outlier tokens (e.g., max 0.014 at mean 0.0006).
+- Rank rounding points one at a time against the exact fp32 model. If you toggle a single site inside the fully
+  quantized model, that change cascades and re-rolls all downstream rounding decisions—so a single run mostly measures
+  noise (in MiniCPM-V's encoder, toggling any early site shifted KL by the same ~0.01). Single-site errors also combine
+  cleanly in quadrature, unlike perturbations in the full model.
+- A few sensitive tokens can dominate squared error (in MiniCPM-V's ViT, the worst 1% of tokens accounted for 67-80%
+  of the error and shifted by 57-99% under tiny changes), so rank variants by median per-token error instead. These
+  outliers can come from the model itself rather than a specific op or rounding point (e.g., an FFN half switching on a
+  massive activation in vision ViTs—see `artlite.vision.vit`'s `Precision`; llama.cpp fails on the same tokens). To
+  separate model sensitivity from kernel bugs: dump the NPU residual after each layer, run each layer in isolation from
+  float64 inputs on CPU with matching rounding points, and compare per-token error against llama.cpp.
+- llama.cpp's CPU path quantizes Q4_K weights' activations to Q8, so any change to the input re-rolls that rounding,
+  creating a KL floor (~0.005 on MiniCPM-V 1B over 96 tokens). Its F32 requant
+  (`llama-quantize --allow-requantize IN OUT F32`) avoids this floor.
+- Average KL over multiple noise realizations: adding a tiny dither (`1e-6` relative, or single bf16 ULPs on 0.1% of an
+  input) re-rolls all downstream rounding; 10-20 runs per config resolve ~5% differences. Report prompts separately when
+  their KL hinges on a single near-tie token (e.g., reading a month from small print in MiniCPM-V): minor numerical
+  biases tip the tie one way on CPU and the other on the NPU, even when all other prompts agree.
+- Check the simulated model against the NPU layer by layer. Whenever they diverge, a rounding point is missing from the
+  simulation (this is how attention's `P` was found: the simulation matched the NPU through layer 17 and drifted after
+  that until `P` was modeled).
+- `bfp16.values` emulates the conversion; insert blocks where the kernel converts and never re-round (see above).

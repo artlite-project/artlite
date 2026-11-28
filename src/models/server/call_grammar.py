@@ -30,9 +30,9 @@ response format, the value is a text block; ``tool_choice`` none: thought and te
 A Qwen or GLM-4.5 value is the raw text of a parameter whose schema allows only strings (its ``enum``, ``const``,
 ``pattern``, ``minLength``, ``maxLength`` held; up to the closing tag, which it cannot contain, Qwen's newline before it
 optional: the parser ends the value at the first one, as vLLM's ``qwen3_xml``), else the schema's JSON
-(Qwen's booleans also ``True`` / ``False``: the parser maps them); a Gemma value is its own syntax, numbers, booleans
-and null its JSON. A function's schema compiles exactly when the tool is ``strict`` (a keyword not held: an error that
-names it), else leniently; an object that declares properties takes no others unless ``additionalProperties`` says so
+(Qwen's booleans also ``True`` / ``False``: the parser maps them); a Gemma value uses Gemma's syntax, except numbers,
+booleans and null, which use their JSON. A function's schema compiles exactly when the tool is ``strict`` (a keyword
+not held: an error that names it), else leniently; an object that declares properties takes no others unless ``additionalProperties`` says so
 (extra Qwen / GLM parameters, extra Gemma keys at the end).
 
 A custom tool (``tools.Custom``) is a function of one string parameter ``input``, written as any string parameter of the
@@ -116,7 +116,7 @@ def _ref(root: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _with_defs(root: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
-    """A subschema that compiles on its own: the root's definitions with it (its local ``$ref``)."""
+    """A self-contained subschema: the subschema with the root's definitions (for its local ``$ref``)."""
     defs = {k: root[k] for k in ("$defs", "definitions") if isinstance(root.get(k), dict) and k not in schema}
     return {**defs, **schema}
 
@@ -359,7 +359,7 @@ def _inkling(g: Grammar, calls: Calls, bodies: list[str], response: Constraint |
 
 class _Gemma:
     """Gemma 4's value syntax of a schema (``tools._GemmaValue``: the template's ``format_argument``): rules per
-    subschema, local references as rules of their own (recursion)."""
+    subschema, local references as separate rules (for recursion)."""
 
     def __init__(self, t: Tool):
         self.t, self.g = t, t.g

@@ -46,7 +46,7 @@ def constraint_of(body: Mapping[str, Any], *, route: str = "chat") -> tuple[Cons
     if _set(rf):
         if not isinstance(rf, Mapping):
             raise bad_request("response_format must be an object")
-        # (json_object without its own schema: the top-level json_schema's, llama-server's)
+        # (a json_object without its own schema takes the top-level json_schema's, as llama-server does)
         if rf.get("type") not in (None, "", "text") and not (rf.get("type") == "json_object" and
                                                           not _set(rf.get("schema")) and "json_schema" in given):
             given.append("response_format")

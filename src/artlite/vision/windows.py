@@ -17,13 +17,13 @@ tile (token panel 2 (band % 4) + p) for the merger's MLP, its weights streamed o
 
 Programs (``WindowEncoder``): per nb a program of pieces, one dispatch each (built on first use, ``program``): nb 1 one
 piece (the patch embedding, every layer, the merger); larger images the patch embedding, pieces of layers, the merger.
-A video's pair of frames (one temporal patch: the patch embedding's two kernels on its two frames) runs a program of
-its own patch embedding, its other pieces the image program's of that nb. Two pairs of one size run as one where that
-takes fewer bands (``Layout.two``: a pair a half, nb bands of 64 windows each; the attention's per-image key masks over
-the joint sequence instead of its dense form, so at most 4 bands; the conv's edge masks each pair's own): the same
-program, other inputs, each pair's embeddings bit for bit its own run's (a long video's pairs of up to 64 tokens: a
-band for two). ``stream`` runs a sequence of images or pairs with the host's part of each (its inputs, the last one's
-embeddings) on a thread while the NPU runs the one before.
+A video's pair of frames (one temporal patch: the patch embedding's two kernels on its two frames) runs a program with
+a separate patch embedding; its other pieces are the image program's for that nb. Two pairs of one size run as one
+where that takes fewer bands (``Layout.two``: each pair takes a half, nb bands of 64 windows each; the attention uses
+per-image key masks over the joint sequence instead of its dense form, so at most 4 bands; the conv's edge masks are
+each pair's own): the same program with other inputs, and each pair's embeddings match its separate run bit for bit
+(a long video's pairs of up to 64 tokens: a band for two). ``stream`` runs a sequence of images or pairs with the
+host's part of each (its inputs, the last one's embeddings) on a thread while the NPU runs the one before.
 A piece of layers is built once from a layer s and run at layer at (its layers' kinds those from s: ``kinds``) by
 rewriting its shim addresses for layer at's images (``VisionDevice.refs`` / ``resolve``, ``Names.rename``: the
 residual's ping-pong images swapped at an odd distance). Shim addresses a piece's fills take per image size (tagged:
@@ -62,8 +62,8 @@ WIN = 128  # (windows of a band: 8 columns x 2 halves x 8 lanes)
 GW_MAX = 1024  # (an image's windows per row at most: 4096 merged tokens at transformers' aspect bound of 200)
 MARGIN = GW_MAX + 2  # (windows of the conv input's margins)
 TOKEN_PX = 32  # (a merged token's pixels per side: patches of 16, merged 2 x 2)
-PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx) of 3 x 16 x 16; the constant input 1, a bfp16 block of
-# its own; the panels' K: whole k-tiles)
+PIX, ONE, KP = 768, 768, 832  # (a patch's inputs (c, ky, kx) of 3 x 16 x 16; the constant input 1, in a dedicated
+# bfp16 block; the panels' K: whole k-tiles)
 PIECE_BAND_LAYERS = 16  # (a piece's band-layers at most: its build time)
 PIECE_MS = 500.0  # (a dispatch's estimated time at most)
 
@@ -308,8 +308,8 @@ class WindowEncoder:
     (``inputs``: patch panels, the size's rows: ``size_inputs``), runs the pieces and reads the embeddings. A subclass
     gives the network: ``patch_embed`` (``pair=True``: a video's pair of frames, where the network takes videos),
     ``layers``, ``final``, ``size_inputs``, ``layers_per_piece``, ``kinds`` (the layers' kinds: a piece of layers runs
-    where the kinds are its own), ``pixel_panels`` (an image's pixels or a pair's), ``shift`` (a tagged address's bytes
-    for an image), ``layout`` (an image's: a network that pads its pixels or adds a class token)."""
+    where the layers' kinds match its own), ``pixel_panels`` (an image's pixels or a pair's), ``shift`` (a tagged
+    address's bytes for an image), ``layout`` (an image's: a network that pads its pixels or adds a class token)."""
 
     PATCH = 16
 
@@ -581,7 +581,8 @@ def windows_of(nb: int, b: int, c: int, p: int) -> np.ndarray:
 def dw_masks(gh: int, gw: int, nb: int, b: int, two: bool = False) -> np.ndarray:
     """Band b's depthwise conv masks: per column [row 4][half 2][class 4][tap 9][2] uint32 (the 4 core rows' copies;
     per tap of class q = (py, px) the lanes 8 j + c of its half's windows j whose neighbour patch is inside the image:
-    bits 0..31 windows 0..3, the second word 4..7). two: an image a half (``Layout.two``): its own windows."""
+    bits 0..31 windows 0..3, the second word 4..7). two: each image takes a half (``Layout.two``), with the masks of
+    its own windows."""
     out = np.zeros((COLS, 4, 2, 4, 9, 2), np.uint32)
     ph, pw = 2 * gh, 2 * gw
     for c in range(COLS):

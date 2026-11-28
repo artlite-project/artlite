@@ -100,8 +100,8 @@ def _qwen(path: str, mtp: bool = False) -> AppBuild:
 
 def _qwen_drafts(path: str, dflash: bool) -> AppBuild:
     """A dense qwen35 file with an MTP block (Qwen3.8 27B: a design of 8 slots, the one-pass attention) as its app
-    builds it: its own block as the drafter, or (``dflash``) its DFlash2 drafter's file (``model_config.qwen_dflash_of``:
-    the app's default where there is one) on a design of its own beside the model's."""
+    builds it: the file's own block as the drafter, or (``dflash``) its DFlash2 drafter's file
+    (``model_config.qwen_dflash_of``, the app's default where there is one) on a separate design beside the model's."""
     from artlite.decode.dflash.overlay import DFlashOverlay
     from artlite.model_config import QwenConfig
     from models.qwen35.draft import QwenDraft

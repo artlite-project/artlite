@@ -25,7 +25,7 @@ Memory-tile DMA (AM029 MEMORY_TILE_MODULE; the words aiecc writes for its runtim
 - 48 BDs of 8 words at 0xA0000 + 32 bd, by channel parity (even channels BDs 0-23, odd 24-47; a next-BD id is
   absolute); 6 S2MM and 6 MM2S channels, control at 0xA0600 + 8 c (S2MM) / 0xA0630 + 8 c (MM2S), the start queue at
   + 4 (``mem_push``: BD | (repeat - 1) << 16 | token << 31);
-- a BD's base is a word address in the tile's 1.5 MB view: the west neighbour's memory from 0, its own from
+- a BD's base is a word address in the tile's 1.5 MB view: the west neighbour's memory from 0, the tile's own from
   ``MEM_OWN``, the east neighbour's from ``MEM_EAST`` (channels 0-3 only); lock ids likewise: west 0-63, own 64-127,
   east 128-191 (``mem_lock``); 4 dimensions (d0..d2 with wraps, d3 a stride) and an iteration;
 - a BD's lock acquire is "greater or equal" (subtracting the value) or "equal"; a release needs no acquire (aiecc's
@@ -352,8 +352,8 @@ def bd_offsets(nbytes: int, dims: tuple[int, int, int, int] | None = None) -> np
 
 def device_address(buffer: object, offset: int = 0, context: object = None) -> int:
     """The address the shim DMA uses for byte ``offset`` of a host buffer (an ``artlite``
-    Buffer or Tensor) in the hardware context ``context`` (on XRT an instruction buffer has its own
-    address in each: ``backend``; None: any context of the process)."""
+    Buffer or Tensor) in the hardware context ``context`` (on XRT an instruction buffer has a separate
+    address in each context: ``backend``; None: any context of the process)."""
     raw = getattr(buffer, "_raw", buffer)
     return (raw.paddr if context is None else raw.paddr_in(context)) + offset + DDR_AIE_ADDR_OFFSET
 

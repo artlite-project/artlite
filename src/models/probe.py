@@ -4,8 +4,8 @@ it, the dispatch round trip, the DDR read and write rates of the shim DMA channe
 small-row gathers (``artlite.probe``). About a minute, no model file. A report on another machine pastes its
 output: model numbers alone cannot tell a slower clock from a narrower memory path.
 
-``--pages``: a second table instead, of what the NPU's address translation costs rows on pages of their own
-(``PAGE_CASES``): how many pages its translation cache holds, for reads and writes, per channel or for all; the
+``--pages``: a second table instead, of what the NPU's address translation costs rows that each sit on a separate
+page (``PAGE_CASES``): how many pages its translation cache holds, for reads and writes, per channel or for all; the
 rate of translations with one to 16 channels; page-table locality; rows that share a page; long rows.
 
 ``--kinds -m FILE``: a model's prompt chunk by operator kind instead (``kinds``): each kind's items alone, their time
@@ -38,7 +38,7 @@ from .hostenv import stale_install, windows_power_mode, xrt_smi
 
 MB = 1 << 20
 GB = 1 << 30
-CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a region of its own)
+CHANNEL_BYTES = 32 * MB  # (per channel and task execution: a separate region)
 POWER_MODES = ("default", "low", "medium", "high", "turbo")
 
 
@@ -113,7 +113,7 @@ def first(n: int) -> list[tuple[int, int]]:
 
 def cycle(n: int, chans: list[tuple[int, int]], *, stride: int = PAGE, region: int = CHANNEL_BYTES,
           name: str = "", mixed: bool = False) -> PageCase:
-    """256 B rows, each on a page of its own: a channel's n pages ``stride`` apart in turn (rows ``stride`` + 256 B
+    """256 B rows, each on a separate page: a channel's n pages ``stride`` apart in turn (rows ``stride`` + 256 B
     apart: a channel's rows on all DRAM channels), 16 times, each time 256 B further into them (channel i from
     (i * 256) mod 4 KB on). Up to 1023 pages the 16 turns are a task (a BD dimension's 1023 rows), from 1024 on each a
     repeat of the task: groups of 512 pages, the iteration 256 B on."""
@@ -262,12 +262,12 @@ def page_rates(op: DmaProbeOperator, *, seconds: float) -> tuple[dict[str, list[
 
 def npu_addresses(dev: OverlayDevice, name: str) -> str:
     """Whether the NPU reaches buffer ``name`` at its host address: the IOMMU walks the process's page tables (Linux),
-    whose page sizes are the NPU's translations; or at an address of its own: a mapping the driver or the OS builds,
-    whose page size it chooses."""
+    whose page sizes are the NPU's translations; or at a different address, through a mapping the driver or the OS
+    builds, whose page size it chooses."""
     npu, host = dev.address(name) - txn.DDR_AIE_ADDR_OFFSET, dev.view(name).ctypes.data
     if npu == host:
         return "the NPU reaches them at their host addresses"
-    return f"the NPU reaches them at addresses of their own (0x{npu:x} for host 0x{host:x})"
+    return f"the NPU reaches them at different addresses (0x{npu:x} for host 0x{host:x})"
 
 
 def _rate(x: float) -> str:
@@ -291,7 +291,7 @@ def _power() -> str:
 
 
 def host_pages() -> str:
-    """The page size of the host buffers the NPU reads and writes (a DMA row on a page of its own costs a translation:
+    """The page size of the host buffers the NPU reads and writes (a DMA row alone on a page costs a translation:
     with 4 KB pages 128-byte rows write at a fifth of the rate, ``docs/probe.md``)."""
     if platform.system() == "Windows":
         return _large_pages()
@@ -375,7 +375,7 @@ def pages(seconds: float) -> tuple[list[str], list[tuple[str, str]]]:
             xrt_smi("configure", "--pmode", "default")
     lines = ["NPU power mode: default -> performance for these rows (default again after)"] if raised else []
     lines.append(f"the rows' buffers: {host_pages()}; {where}")
-    lines.append("M rows a second, read / write; rows of 256 B, each on a page of its own, a channel's pages 4 KB apart "
+    lines.append("M rows a second, read / write; rows of 256 B, each on a separate page, a channel's pages 4 KB apart "
                  "(the rows 4 KB + 256 B) and visited in turn, unless the row says otherwise; rows sharing a page 256 B "
                  "apart (docs/probe.md)")
     return lines, [(CLOCK, f"{mhz:.0f}"), *((name, " / ".join(_rate(r) for r in v)) for name, v in rates.items())]
@@ -384,7 +384,8 @@ def pages(seconds: float) -> tuple[list[str], list[tuple[str, str]]]:
 def kinds(path: str, *, tokens: int, seconds: float) -> tuple[list[str], list[tuple[str, int, str, str, str]]]:
     """``--kinds``: (lines before the table, its rows (kind, items, ms a chunk, PROCHOT share, the same unpaced)) of the
     model file's prompt chunk of ``tokens`` tokens (its largest chunk size up to it): the whole program, then each
-    operator kind's items as a program of their own (wrong results, a configuration per design change), each looped for ``seconds`` after as long idle. A paced kind (``prefill.pace``'s classes) also unpaced."""
+    operator kind's items as a separate program (with wrong results and a configuration per design change), each
+    looped for ``seconds`` after as long idle. A paced kind (``prefill.pace``'s classes) also runs unpaced."""
     from artlite.gemm.pacing import PACE, PACE_CLASSES
     from artlite.prefill import pace as pacing
 
@@ -406,7 +407,7 @@ def kinds(path: str, *, tokens: int, seconds: float) -> tuple[list[str], list[tu
         """An operator's kind: a GEMM by its pace class (role and tile kind), format and shape; one with a mode by it
         (an attention's kind and window); else its class."""
         mode = getattr(op, "mode", None)
-        if (label := getattr(op, "kind_label", None)) is not None:  # (its own: e.g. a rotation's K and copies)
+        if (label := getattr(op, "kind_label", None)) is not None:  # (the operator's label: a rotation's K and copies)
             return f"{type(op).__name__} {label}"
         if hasattr(op, "fmt") and hasattr(op, "K"):
             role = f"{PACE_CLASSES[op.pace]} " if getattr(op, "pace", None) is not None else ""
@@ -462,7 +463,7 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="artlite-probe", description=__doc__.split("\n\n")[0])
     p.add_argument("--seconds", type=float, default=1.0, help="seconds of dispatches per measurement (default: 1)")
     p.add_argument("--pages", action="store_true",
-                   help="instead: what the NPU's address translation costs rows on pages of their own (~2 minutes)")
+                   help="instead: what the NPU's address translation costs rows on separate pages (~2 minutes)")
     p.add_argument("--diagnose", action="store_true",
                    help="instead: everything that can make Artlite slower here, measured and recorded (~5 minutes; "
                         "Linux: as root, sudo $(which artlite-probe) --diagnose); prints a report and writes a JSON "
