@@ -226,19 +226,16 @@ def out_width(proj: int) -> int:
     return -(-proj // 320) * 320
 
 
-def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> None:
-    """The final LayerNorm of the residual after nl layers and the merger's MLP: per band LayerNorm (``md.norm``; else
-    the residual's bfp16 panels: a copy op) -> panels drained to DDR in the merged layout of its quad (<p>.mg.q:
-    [column][kb 4 C / 8][token panel 8][72 B]; band b's patch s, image p at kb C / 8 s + kb, token panel 2 (b % 4) +
-    p); per quad its tile of 64 merged tokens: mm.0 + GELU (erf) in chunks to DDR (<p>.hid.q), mm.2 in chunks -> the
-    embeddings' C tiles (<p>.out.q: [column][out_width / 80] [ct_bytes(64)]). w: "post_g", "post_b" (with the norm),
-    "up", "up_b", "down", "down_b"."""
+def merged_panels(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> None:
+    """The residual after nl layers as the merged tokens' panels in DDR: per band its final LayerNorm (``md.norm``:
+    w's "post_g", "post_b"; else the residual's bfp16 panels: a copy op) -> panels drained in the merged layout of its
+    quad (<p>.mg.q: [column][kb 4 C / 8][token panel 8][72 B]; band b's patch s, image p at kb C / 8 s + kb, token
+    panel 2 (b % 4) + p): a quad's tile of 64 merged tokens a column, each its 4 patches' channels."""
     from .vit import Bands  # (the ViT's banded residual)
-    C, MERGED, FUP = md.C, md.merged, md.FUP
-    lv, l1 = vit_level(nb), vit_level(1)
+    C, MERGED = md.C, md.merged
+    lv = vit_level(nb)
     x = Bands(lv, nm.x(nl), C)
-    pn, mgb, hid = lv.pn(C), l1.pn(MERGED), l1.pn(FUP)
-    outw = w["down"].shape[0]
+    pn, mgb = lv.pn(C), vit_level(1).pn(MERGED)
     walk = dims((18, 1), (2, 18), (C // 8, 144), (4, 36))  # (stream order: s, kb, p, a panel's 18 words)
     for b in range(nb):
         xb, rec = x.load(bd, b)
@@ -253,6 +250,18 @@ def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> Non
         bd.op(bd.drain(f"{nm.p}.mg.{b // 4}", mgb, mem=n.addr, nbytes=pn, off=2 * (b % 4) * L.PANEL,
                    mdims=walk, sdims=(36, MERGED // 8, 144, 144 * MERGED // 8)), {})
         free(bd, n)
+
+
+def merger(bd: Builder, w: dict, nm: Names, nb: int, nl: int, md: Merger) -> None:
+    """The final LayerNorm of the residual after nl layers and the merger's MLP: the merged tokens' panels
+    (``merged_panels``); per quad its tile of 64 merged tokens: mm.0 + GELU (erf) in chunks to DDR (<p>.hid.q), mm.2 in
+    chunks -> the embeddings' C tiles (<p>.out.q: [column][out_width / 80] [ct_bytes(64)]). w: "post_g", "post_b" (with
+    the norm), "up", "up_b", "down", "down_b"."""
+    MERGED, FUP = md.merged, md.FUP
+    l1 = vit_level(1)
+    mgb, hid = l1.pn(MERGED), l1.pn(FUP)
+    outw = w["down"].shape[0]
+    merged_panels(bd, w, nm, nb, nl, md)
     for qd in range(-(-nb // 4)):
         mg = alloc(bd, l1, MERGED, "pn")
         spare = bd.mem.alloc(D.A_OBJ)  # (the GEMM's A walk reads past its panels' end)

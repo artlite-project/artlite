@@ -83,7 +83,7 @@ class OverlayModel(SpeculativeMixin, NpuModel):
     # a model's attributes by what its lanes do with them (``_open_lanes`` refuses one on neither list): one object or
     # value for all of them (the device's side, the model's options) ...
     LANE_SHARED: ClassVar[tuple[str, ...]] = ("overlay", "prefill", "cfg", "eos_token_ids", "generates", "_w_out", "_pool",
-                                              "_lanes", "_rounds", "DRAFTS", "lookup", "softcap", "drafter")
+                                              "_lanes", "_rounds", "DRAFTS", "lookup", "context", "softcap", "drafter")
     # ... or each lane's own, from the class's defaults on (a sequence's state, its generations' counters, the drafter's
     # calibration, the planner)
     LANE_OWN: ClassVar[tuple[str, ...]] = (

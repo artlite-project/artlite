@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile, bpe_tokenizer_json, unpermute_rows
-from artlite.hf_model import HfModel, is_checkpoint, open_weights
-from artlite.model_config import checkpoint
+from artlite.hf_model import HfModel, has_vision_tower, is_checkpoint, open_mmproj, open_weights
+from artlite.model_config import AudioConfig, LlamaConfig, checkpoint
 from models import architecture, open_model
 from models.llama.tokenizer import LLAMA3_PATTERN
 from models.templating import render_chat
@@ -94,6 +94,39 @@ def test_tokenizer(case: str) -> None:
     for text in [*TEXTS, essays()[:400_000]]:
         assert encode(text) == ref.encode(text).tolist(), text[:80]
     assert render_chat(hf, MESSAGES) == render_chat(gg, MESSAGES)
+
+
+def test_moss() -> None:
+    """MOSS-Transcribe-Diarize's checkpoint (llama.cpp converts none): its language model as architecture ``moss`` with
+    Qwen3's keys and tensor names, the output weight the tokens' embedding, the audio span's keys of its processor;
+    its audio tower as an mmproj of gguf-py's Whisper encoder names, a conv's filters in the file's order."""
+    path = checkpoint("moss-transcribe-diarize")
+    require(path)
+    hf = HfModel(path)
+    assert hf.arch == architecture(path) == "moss" and not has_vision_tower(path)
+    cfg = LlamaConfig.from_gguf(hf)
+    assert (cfg.num_hidden_layers, cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+            cfg.qk_norm) == (28, 1024, 16, 8, 128, True)
+    assert (hf.meta["moss.audio.tokens_per_second"], hf.meta["moss.audio.time_marker_seconds"]) == (12.5, 5)
+    assert all(n.startswith(("blk.", "token_embd.", "output")) for n in hf.tensor_info) and len(hf.tensor_info) == 311
+    assert hf.tensor_info["output.weight"] == hf.tensor_info["token_embd.weight"]
+    assert np.shares_memory(hf.tensor("output.weight").raw, hf.tensor("token_embd.weight").raw)
+    assert "<|audio_pad|>" in render_chat(hf, [{"role": "user", "content": [{"type": "audio", "audio": ""}]}])
+    mm = open_mmproj(path)
+    a = AudioConfig.from_gguf(mm)
+    assert (a.projector, a.hidden, a.ffn, a.layers, a.heads, a.mel_bins, a.projection_dim) == \
+        ("moss", 1024, 4096, 24, 16, 80, 1024)
+    assert abs(a.eps - 1e-5) < 1e-12 and mm.meta["clip.audio.projector.stack_factor"] == 4
+    assert mm.meta["clip.audio.max_pos_emb"] == 1500 and abs(mm.meta["clip.audio.projector.layer_norm_epsilon"] - 1e-6) < 1e-12
+    names = set(mm.tensor_info)
+    per_layer = {f"a.blk.5.{t}.{k}" for t in ("attn_q", "attn_v", "attn_out", "ffn_up", "ffn_down", "ln1", "ln2")
+                 for k in ("weight", "bias")} | {"a.blk.5.attn_k.weight"}
+    assert per_layer <= names and "a.blk.5.attn_k.bias" not in names and len(names) == 24 * 15 + 13
+    assert {"a.conv1d.1.weight", "a.conv1d.2.bias", "a.position_embd.weight", "a.post_ln.weight", "mm.a.mlp.0.weight",
+            "mm.a.mlp.2.bias", "mm.a.mlp.3.weight"} <= names
+    assert mm.tensor_info["a.conv1d.2.weight"][:2] == ((3, 1024, 1024), "BF16")
+    w = hf.hf_f32("model.whisper_encoder.conv1.weight")  # ((out, in, taps): a filter's elements in the file's order)
+    assert np.array_equal(mm.tensor("a.conv1d.1.weight").dequantize().reshape(w.shape), w)
 
 
 @pytest.mark.slow

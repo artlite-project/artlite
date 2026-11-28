@@ -87,6 +87,8 @@ class Model:
     chat_template: str | None = None  # a Jinja chat template in place of the file's (``open_model``'s); None: the file's
     generates = True  # False: a readout model's file (``readouts.readout_model``): no LM head on the NPU, no text
     parallel = False  # ``load`` takes ``sequences``: the NPU holds several sequences, a lane each (``NpuModel.lanes``)
+    transcript_tokens = (64, 8)  # a transcription's tokens at most by default: this many, and these per second of audio
+    media: tuple[str, ...] = ()  # what the file takes with no mmproj (a tower of its own: "audio"), for a server's listing
     gguf: GGUFFile  # the model file
     cfg: Any  # its configuration (``artlite.model_config``)
     tokenizer: Tokenizer
@@ -114,6 +116,23 @@ class Model:
         ``{"type": "text", "text": ...}``, ``{"type": "image", "image": a file, its bytes or a PIL image}`` (a model
         with ``vision``: its prompt then a sequence of ids and embedding rows; the encoder runs on the NPU)."""
         raise NotImplementedError
+
+    def transcription(self, clips: Sequence[dict[str, object]], *, language: str = "", prompt: str = ""
+                      ) -> list[list[dict[str, object]]]:
+        """The conversations (``chat``'s messages) that transcribe ``clips`` (a message's audio parts), each answered by
+        a transcript: the model's own ASR prompt, as llama.cpp keeps one per model (``common_chat_get_asr_prompt``);
+        here its default, the clips after "Transcribe audio to text". ``language``: a code or a name ("": the model
+        finds it); ``prompt``: a text that guides the transcript (OpenAI's ``prompt``). ValueError: no speech
+        encoder."""
+        if self.audio is None:
+            raise ValueError(f"{self.name}: no transcription (audio needs a speech encoder)")
+        text = (prompt + "\n" if prompt else "") + "Transcribe audio to text"
+        return [[{"role": "user", "content": [{"type": "text", "text": text}, *clips]}]]
+
+    def transcript(self, text: str) -> tuple[str, list[dict[str, object]]]:
+        """A transcription's answer as its words alone and its segments (``{"start", "end", "speaker", "text"}``:
+        seconds, a speaker's tag), where the model writes them (else the answer, no segments)."""
+        return text, []
 
     def image_tokens(self, image: object) -> Tokens:
         """An image (a file, its bytes or a PIL image) as the model reads it where a prompt's text has ``MEDIA_MARKER``

@@ -4,7 +4,8 @@ Q3_K_M, Q2_K; BF16 tensors as BFP16 tiles).
 A dispatch runs up to 4 consecutive tokens through every layer and the LM head on one stream of the weights
 (``models.llama.overlay.LlamaOverlay``): the projections on the main cores and their helpers (the MMUL
 against exact-integer weight panels), the attention and its KV cache on the attention cores. The host reads the tokens'
-embedding rows from the mapped file and samples from the logits.
+embedding rows from the mapped file (a ``sequence.Sequence``'s given rows in their place: a media encoder's, where a
+model has one) and samples from the logits.
 
 A prompt runs in chunks of up to 4096 tokens (8B: 2048) through the prefill
 (``models.llama.prefill.LlamaPrefill``: layer-major, control code assembled per chunk from one library ELF;
@@ -37,6 +38,7 @@ from ..lanes import alone
 from ..model import Model
 from ..overlay_model import OverlayModel
 from ..sampling import Sampling
+from ..sequence import Sequence, embedding_rows
 from .image import LlamaImage
 from .overlay import LlamaOverlay, check_formats
 from .prefill import SIZES, LlamaPrefill
@@ -86,11 +88,11 @@ class NpuLlama(OverlayModel):
         self.overlay.reset()
         self.position = 0
 
-    def _step_inputs(self, tokens: list[int]) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
+        return (embedding_rows(self.gguf, tokens, self.cfg.hidden_size),)
 
-    def _chunk_inputs(self, tokens: list[int], *, first: bool) -> tuple:
-        return (self.gguf.rows("token_embd.weight", tokens),)
+    def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
+        return (embedding_rows(self.gguf, tokens, self.cfg.hidden_size),)
 
     def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(the LM head alone on the chunk's last output row)"""

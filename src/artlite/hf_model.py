@@ -14,11 +14,14 @@ the converter interleaves them and the weight images undo it, ``gguf_model.unper
 
 Supported: ``Qwen3ForCausalLM`` (``qwen3``), ``LlamaForCausalLM`` (``llama``), ``Qwen3_5ForConditionalGeneration`` /
 ``Qwen3_5ForCausalLM`` (``qwen35``; its MTP block as the nextn layer), ``Qwen3_5MoeForConditionalGeneration``
-(``qwen35moe``), ``Gemma4ForConditionalGeneration`` / ``Gemma4ForCausalLM`` (``gemma4``).
+(``qwen35moe``), ``Gemma4ForConditionalGeneration`` / ``Gemma4ForCausalLM`` (``gemma4``),
+``MossTranscribeDiarizeForConditionalGeneration`` (``moss``).
 
 A checkpoint's vision tower opens as the mmproj file the converter makes of it (``open_mmproj``, ``HfModel(mmproj=)``;
 ``--mmproj`` the checkpoint directory): Qwen3.5's / 3.6's (``model.visual.*``, ``conversion/qwen3vl.py``'s
-``Qwen3VLVisionModel``: projector ``qwen3vl_merger``, the patch embedding's Conv3D as its two temporal kernels).
+``Qwen3VLVisionModel``: projector ``qwen3vl_merger``, the patch embedding's Conv3D as its two temporal kernels). MOSS-Transcribe-Diarize's audio tower
+opens likewise (``model.whisper_encoder.*``, ``model.vq_adaptor.*``: a Whisper encoder's mmproj as the converter writes
+ultravox's, projector ``moss``), its language model as architecture ``moss`` (``_Moss``).
 """
 
 import dataclasses
@@ -33,7 +36,7 @@ from dataclasses import dataclass
 import gguf
 import numpy as np
 
-from . import paro
+from . import paro, transcribe_cpp
 from .gguf_model import GGUFFile, QTensor
 
 # safetensors dtypes -> (GGUF type, numpy dtype of the raw view)
@@ -49,13 +52,21 @@ def is_checkpoint(path: str) -> bool:
 
 
 def open_weights(path: str) -> GGUFFile:
-    """A model file: a GGUF file, or a checkpoint directory as its virtual GGUF file (``HfModel``)."""
-    return HfModel(path) if os.path.isdir(path) else GGUFFile(path)
+    """A model file: a GGUF file (a transcribe.cpp file: its language model, ``transcribe_cpp``), or a checkpoint
+    directory as its virtual GGUF file (``HfModel``)."""
+    if os.path.isdir(path):
+        return HfModel(path)
+    g = GGUFFile(path)
+    return transcribe_cpp.language_model(g) if transcribe_cpp.is_stt(g) else g
 
 
 def open_mmproj(path: str) -> GGUFFile:
-    """An mmproj file: a GGUF file, or a checkpoint directory's vision tower as its virtual mmproj (``HfModel(mmproj=)``)."""
-    return HfModel(path, mmproj=True) if os.path.isdir(path) else GGUFFile(path)
+    """An mmproj file: a GGUF file (a transcribe.cpp file: its audio tower), or a checkpoint directory's vision or
+    audio tower as its virtual mmproj (``HfModel(mmproj=)``)."""
+    if os.path.isdir(path):
+        return HfModel(path, mmproj=True)
+    g = GGUFFile(path)
+    return transcribe_cpp.tower(g) if transcribe_cpp.is_stt(g) else g
 
 
 def has_vision_tower(path: str) -> bool:
@@ -65,7 +76,7 @@ def has_vision_tower(path: str) -> bool:
             cfg = json.load(f)
     except OSError:
         return False
-    return bool(cfg.get("vision_config")) and (cfg.get("architectures") or [""])[0] in _VISION
+    return bool(cfg.get("vision_config")) and (cfg.get("architectures") or [""])[0] in _TOWERS
 
 
 def model_files(path: str) -> list[str]:
@@ -110,7 +121,7 @@ class HfModel(GGUFFile):
     unpermuted = True  # (a Llama's Q / K rows in rotate-half order: module docstring)
 
     def __init__(self, path: str, *, mmproj: bool = False):
-        """``mmproj``: the checkpoint's vision tower as its mmproj (module docstring)."""
+        """``mmproj``: the checkpoint's vision or audio tower as its mmproj (module docstring)."""
         self.path = path
         with open(os.path.join(path, "config.json")) as f:
             self.config = json.load(f)
@@ -123,9 +134,9 @@ class HfModel(GGUFFile):
                                           f"unquantized and ParoQuant checkpoints)")
             self.paro_bits, self.paro_group = paro.check_config(path, qc)
         hf_arch = (self.config.get("architectures") or [""])[0]
-        table = _VISION if mmproj else _ADAPTERS
+        table = _TOWERS if mmproj else _ADAPTERS
         if hf_arch not in table:
-            raise NotImplementedError(f"{path}: Hugging Face architecture {hf_arch!r} is not supported{' (a vision tower)' if mmproj else ''} "
+            raise NotImplementedError(f"{path}: Hugging Face architecture {hf_arch!r} is not supported{' (a tower)' if mmproj else ''} "
                                       f"(supported: {', '.join(table)})")
         self._shards: list[tuple[str, np.memmap]] = []
         self._hf: dict[str, _Entry] = {}
@@ -657,6 +668,29 @@ class _Qwen3(_Adapter):
     arch, model_arch, pre, split = "qwen3", gguf.MODEL_ARCH.QWEN3, "qwen2", _QWEN2_SPLIT
 
 
+class _Moss(_Qwen3):
+    """MossTranscribeDiarizeForConditionalGeneration's language model (``model.language_model.*``: a Qwen3, its output
+    weight the tokens' embedding; the checkpoint has no ``lm_head.weight``) as architecture ``moss``, transcribe.cpp's
+    name for the model: Qwen3's keys and tensors, and the prompt's audio span from processor_config.json
+    (``moss.audio.tokens_per_second``, ``moss.audio.time_marker_seconds``: 0, no markers). The audio tower is the
+    mmproj's (``_MossAudio``)."""
+
+    arch = "moss"
+
+    def params(self, w: gguf.GGUFWriter) -> None:
+        super().params(w)
+        with open(os.path.join(self.hf.path, "processor_config.json")) as f:
+            pc = json.load(f)
+        self.key(w, "audio.tokens_per_second", float(pc["audio_tokens_per_second"]))
+        self.key(w, "audio.time_marker_seconds", int(pc["time_marker_every_seconds"]) * bool(pc["enable_time_marker"]))
+
+    def filter(self, name: str) -> str | None:
+        return super().filter(name) if name.startswith("model.language_model.") else None
+
+    def extra(self) -> list[tuple[str, _Entry]]:
+        return [("output.weight", self.hf._hf["model.language_model.embed_tokens.weight"])]
+
+
 class _Llama(_Adapter):
     """LlamaForCausalLM (LlamaModel): ``vocab_size`` and ``rope.dimension_count`` keys, the llama3 RoPE factors as
     ``rope_freqs``."""
@@ -923,6 +957,7 @@ _ADAPTERS: dict[str, type[_Adapter]] = {
     "Qwen3_5MoeForCausalLM": _Qwen35Moe,
     "Gemma4ForConditionalGeneration": _Gemma4,
     "Gemma4ForCausalLM": _Gemma4,
+    "MossTranscribeDiarizeForConditionalGeneration": _Moss,
 }
 
 
@@ -1004,9 +1039,59 @@ class _Qwen3VLVision(_Adapter):
         return [(g, self.transform(name, n, e))]
 
 
-_VISION: dict[str, type[_Adapter]] = {
+class _MossAudio(_Adapter):
+    """MOSS-Transcribe-Diarize's audio tower as its mmproj: a Whisper encoder (``model.whisper_encoder.*``) by gguf-py's
+    mmproj map as the converter names ultravox's (``conversion/ultravox.py``: ``a.conv1d.{1,2}``, ``a.position_embd``,
+    ``a.blk.<i>.*``, ``a.post_ln``) and the VQ adaptor (``model.vq_adaptor.layers.{0,2}``: its linears, ``.3``: its
+    LayerNorm) as ``mm.a.mlp.{0,2,3}``; the ``clip.audio`` keys of both (projector ``moss``; the adaptor's rows of
+    ``stack_factor`` encoder rows each, its LayerNorm's eps the language model's ``rms_norm_eps``)."""
+
+    arch = "clip"
+    model_arch = gguf.MODEL_ARCH.MMPROJ
+
+    def __init__(self, hf: HfModel):
+        self.hf, self.hp = hf, hf.hparams
+        self.a = a = dict(hf.config.get("audio_config") or {})
+        if a.get("model_type") != "whisper":
+            raise NotImplementedError(f"{hf.path}: an audio tower of type {a.get('model_type')!r} (a Whisper encoder runs)")
+        self.block_count = int(a["encoder_layers"])
+        self.names = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def write_metadata(self, w: gguf.GGUFWriter) -> None:
+        a = self.a
+        w.add_type(gguf.GGUFType.MMPROJ)
+        w.add_clip_has_audio_encoder(True)
+        w.add_clip_audio_projector_type("moss")
+        w.add_audio_projection_dim(int(self.hp["hidden_size"]))  # (the language model's width)
+        w.add_audio_embedding_length(int(a["d_model"]))
+        w.add_audio_feed_forward_length(int(a["encoder_ffn_dim"]))
+        w.add_audio_block_count(self.block_count)
+        w.add_audio_head_count(int(a["encoder_attention_heads"]))
+        w.add_audio_attention_layernorm_eps(1e-5)  # (WhisperEncoder's nn.LayerNorm: no config field)
+        w.add_audio_num_mel_bins(int(a["num_mel_bins"]))
+        w.add_audio_max_pos_emb(int(a["max_source_positions"]))
+        w.add_audio_stack_factor(int(self.hf.config["audio_merge_size"]))
+        w.add_float32("clip.audio.projector.layer_norm_epsilon", float(self.hp.get("rms_norm_eps", 1e-6)))
+        w.add_string("clip.audio.activation", str(a.get("activation_function", "gelu")))
+
+    def tensors(self, name: str) -> list[tuple[str, _Entry]]:
+        if name.startswith("model.whisper_encoder."):
+            n = "audio_tower." + name.removeprefix("model.whisper_encoder.")
+        elif name.startswith("model.vq_adaptor.layers."):
+            n = "audio.multi_modal_projector.linear_" + name.removeprefix("model.vq_adaptor.layers.")
+        else:
+            return []
+        g = self.gguf_name(n)
+        if g is None:
+            raise NotImplementedError(f"{self.hf.path}: no mmproj name for {name}")
+        return [(g, self.transform(name, n, self.hf._hf[name]))]
+
+
+# a checkpoint's media tower as its mmproj (``HfModel(mmproj=True)``)
+_TOWERS: dict[str, type[_Adapter]] = {
     "Qwen3_5ForConditionalGeneration": _Qwen3VLVision,
     "Qwen3_5MoeForConditionalGeneration": _Qwen3VLVision,
+    "MossTranscribeDiarizeForConditionalGeneration": _MossAudio,
 }
 
 

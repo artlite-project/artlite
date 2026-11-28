@@ -60,7 +60,7 @@ def video_bytes(part: dict[str, Any]) -> bytes:
 
 def audio_clip(part: dict[str, Any]) -> bytes:
     """An ``input_audio`` part's clip (base64 data) or an ``audio_url`` part's (a data URI)."""
-    from ..lfm3a.host import part_audio  # (numpy only: the model's host side)
+    from ..audio import part_audio  # (numpy only)
     try:
         return part_audio(part)
     except ValueError as e:

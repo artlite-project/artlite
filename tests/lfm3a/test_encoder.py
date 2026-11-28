@@ -6,6 +6,7 @@ a longer clip (no state left over). A 14 s clip's rows are gated by test_live.py
 import numpy as np
 import pytest
 
+from models.audio import load_audio
 from models.lfm3a import host as A
 
 from ..model_files import require
@@ -29,7 +30,7 @@ def enc() -> R.Encoder:
 def test_band(audio: object, enc: R.Encoder) -> None:
     """One band: each row within ~3% of float64 (median; the bfp16 operands of the GEMMs, the residual's bf16), every
     row within 5%."""
-    x = A.load_audio(clip("6930-75918-0012"))
+    x = load_audio(clip("6930-75918-0012"))
     got = audio.embeddings(x)
     want = enc.forward(A.log_mel(x).astype(np.float64)).numpy()
     assert got.shape == want.shape
@@ -40,13 +41,13 @@ def test_band(audio: object, enc: R.Encoder) -> None:
 def test_bands(audio: object, enc: R.Encoder) -> None:
     """The chapter's 21 utterances as one clip (2236 rows: 5 bands, the state carried): each row as one band's. A clip
     encoded again (the kept embeddings bypassed), also after a longer one, gives the same bytes."""
-    x = np.concatenate([A.load_audio(clip(f"6930-75918-{i:04d}")) for i in range(21)])
+    x = np.concatenate([load_audio(clip(f"6930-75918-{i:04d}")) for i in range(21)])
     got = audio.embeddings(x)
     want = enc.forward(A.log_mel(x).astype(np.float64)).numpy()
     assert got.shape == want.shape == (A.rows(A.frames(len(x))), 2048)
     r = rel_rows(got, want)
     assert np.median(r) < 0.03 and np.percentile(r, 90) < 0.04 and r.max() < 0.06, (np.median(r), r.max())
-    short, long = A.load_audio(clip("6930-75918-0012")), A.load_audio(clip("6930-75918-0001"))
+    short, long = load_audio(clip("6930-75918-0012")), load_audio(clip("6930-75918-0001"))
     e = audio.encoder
     again = e(A.log_mel(short))
     e(A.log_mel(long))

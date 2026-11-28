@@ -6,7 +6,8 @@ to the sequence's start; ``next``: the position of the text after it. Text from 
 indices; an image's take fewer positions than tokens (``models.minicpmv.host``, ``models.qwen3vl.host``). Sequences
 concatenate (``+``, a list of token ids as text; many at once: ``join``) and slice like lists (a slice's positions relative to its first
 token's T, so that the slices of a sequence run one after another as the whole), so the model's prompt path runs them
-in chunks and steps as token lists. ``splice``: a text's tokens with sequences where it has a marker; ``load_image``: an
+in chunks and steps as token lists (``embedding_rows``: a chunk's or a step's inputs). ``splice``: a text's tokens
+with sequences where it has a marker; ``load_image``: an
 image file as the vision encoders take it (``data_bytes``: a data URL's).
 """
 
@@ -17,6 +18,7 @@ import io
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -92,6 +94,20 @@ class Sequence:
 def token_ids(tokens: list[int] | np.ndarray | Sequence) -> list[int] | np.ndarray:
     """A prompt's token ids: a ``Sequence``'s (``MEDIA`` where an embedding row stands for the token), or the ids given."""
     return tokens.ids if isinstance(tokens, Sequence) else tokens
+
+
+def embedding_rows(gguf: Any, tokens: list[int] | np.ndarray | Sequence, hidden: int) -> np.ndarray:
+    """The tokens' embedding rows (n, hidden) float32: their ids' rows of the model file's ``token_embd.weight``, a
+    ``Sequence``'s given rows where it has them."""
+    if not isinstance(tokens, Sequence):
+        return gguf.rows("token_embd.weight", tokens)
+    x = np.empty((len(tokens), hidden), np.float32)
+    t = ~tokens.given
+    if t.any():
+        x[t] = gguf.rows("token_embd.weight", tokens.ids[t])
+    if tokens.given.any():
+        x[tokens.given] = tokens.rows
+    return x
 
 
 def splice(text: str, marker: str, items: list[Sequence], encode: Callable[[str], list[int]]) -> list[int] | Sequence:

@@ -71,7 +71,7 @@ from ..qwen3vl import host as qwen3vl_host
 from ..qwen3vl import npu as qwen3vl_npu
 from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Mask, Penalties, Probs, Sampling
-from ..sequence import Sequence, token_ids
+from ..sequence import Sequence, embedding_rows, token_ids
 from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .draft import HeadTable, QwenDraft, draft_formats, draft_gate_up
@@ -269,16 +269,8 @@ class NpuQwen(OverlayModel):
             self.mtp.set_state(state)
 
     def _rows(self, tokens: list[int] | Sequence) -> np.ndarray:
-        """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
-        if not isinstance(tokens, Sequence):
-            return self.gguf.rows("token_embd.weight", tokens)
-        x = np.empty((len(tokens), self.cfg.hidden_size), np.float32)
-        t = ~tokens.given
-        if t.any():
-            x[t] = self.gguf.rows("token_embd.weight", tokens.ids[t])
-        if tokens.given.any():
-            x[tokens.given] = tokens.rows
-        return x
+        """The tokens' embeddings (n, hidden) fp32 (``sequence.embedding_rows``)."""
+        return embedding_rows(self.gguf, tokens, self.cfg.hidden_size)
 
     def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
         return (self._rows(tokens),)

@@ -50,7 +50,7 @@ def fetch_librispeech(dest: str = os.path.join(HERE, "librispeech")) -> None:
     import miniaudio
     import numpy as np
 
-    from models.lfm3a.host import wav_bytes
+    from models.audio import wav_bytes
 
     trans = os.path.join(dest, "6930-75918.trans.txt")
     if os.path.exists(trans) and len([f for f in os.listdir(dest) if f.endswith(".wav")]) == LIBRISPEECH_CLIPS:

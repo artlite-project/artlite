@@ -23,6 +23,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from artlite.decode.model import HostRecords
+from models.lfm3a.host import asr_system
 from models.model import Blocks, Capabilities, Model
 from models.npu_model import Checkpoint, NpuModel
 from models.readouts import Readouts
@@ -206,8 +207,13 @@ class FakeVideo(FakeVision):
 
 
 class FakeAudio(FakeVision):
-    """A model with a speech encoder (``FakeEncoder``: a clip's bytes as two rows) and no vision encoder, and live ASR's
-    template (``FakeLive``)."""
+    """A model with a speech encoder (``FakeEncoder``: a clip's bytes as two rows) and no vision encoder, LFM3-Audio's
+    ASR prompt (``Lfm.transcription``'s) and live ASR's template (``FakeLive``)."""
+
+    def transcription(self, clips: list[dict[str, object]], *, language: str = "", prompt: str = ""
+                      ) -> list[list[dict[str, object]]]:
+        text = [{"type": "text", "text": prompt}] if prompt else []
+        return [[{"role": "system", "content": asr_system(language)}, {"role": "user", "content": [*text, *clips]}]]
 
     def __init__(self) -> None:
         super().__init__()

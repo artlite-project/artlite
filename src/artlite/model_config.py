@@ -143,6 +143,12 @@ def lfm3vl_mmproj(quant: str = "BF16") -> str:
     return os.path.join(MODELS_DIR, "LiquidAI", "LFM3-VL-2B-GGUF", f"mmproj-LFM3-VL-2B-{quant}.gguf")
 
 
+def moss_gguf(quant: str = "Q4_K_M") -> str:
+    """A transcribe.cpp GGUF file of MOSS-Transcribe-Diarize (handy-computer's: the whole model in one file,
+    ``artlite.transcribe_cpp``): ``Q4_K_M``, ``Q5_K_M``, ``Q8_0``, ``BF16``."""
+    return os.path.join(MODELS_DIR, "handy-computer", "moss-transcribe-diarize-gguf", f"MOSS-Transcribe-Diarize-{quant}.gguf")
+
+
 def lfm3a_gguf(quant: str = "Q4_K_M") -> str:
     """A language model file of LiquidAI's LFM3-Audio-2B GGUF repository (GGUF architecture ``lfm3``: LFM3-1.7B's shapes,
     weights of its own): ``Q4_K_M`` (the card's), ``Q4_0``, ``Q8_0``."""
@@ -370,7 +376,8 @@ HF_CHECKPOINTS = {"qwen3-0.6B": "Qwen/Qwen3-0.6B", "qwen3.5-0.8B": "Qwen/Qwen3.5
                   "qwen3.8-27B-paro-int5": "Launch80/Qwen3.8-27B-PARO-int5",
                   "qwen3.6-35B-A3B-paro": "z-lab/Qwen3.6-35B-A3B-PARO", "gemma-4-E2B": "google/gemma-4-E2B-it",
                   "gemma-4-E2B-paro": "z-lab/gemma-4-E2B-it-PARO", "gemma-4-E4B-paro": "z-lab/gemma-4-E4B-it-PARO",
-                  "llama-8B-paro": "z-lab/Llama-3.1-8B-Instruct-PARO"}
+                  "llama-8B-paro": "z-lab/Llama-3.1-8B-Instruct-PARO",
+                  "moss-transcribe-diarize": "OpenMOSS-Team/MOSS-Transcribe-Diarize"}
 
 
 def checkpoint(name: str) -> str:
@@ -413,7 +420,7 @@ class LlamaConfig:
     neox: bool = False
     qk_norm: bool = False
 
-    ARCHS: ClassVar[tuple[str, ...]] = ("llama", "qwen3", "vllm-decision2")
+    ARCHS: ClassVar[tuple[str, ...]] = ("llama", "qwen3", "vllm-decision2", "moss")
     # (llama.cpp's end-of-generation tokens: Llama 3's, Qwen3's)
     EOG: ClassVar[tuple[str, ...]] = ("<|end_of_text|>", "<|eom_id|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>")
 

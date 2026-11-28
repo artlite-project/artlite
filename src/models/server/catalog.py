@@ -374,7 +374,8 @@ class Catalog:
                 entry.mmproj = entry.path  # (its own tower)
             else:
                 entry.mmproj = self._encoder(entry, encoders.get(os.path.dirname(entry.path), []))
-            entry.media = self._media(entry.mmproj) if entry.mmproj else []
+            # (an encoder file's, else what the model's own files take: a tower of its own)
+            entry.media = self._media(entry.mmproj) if entry.mmproj else self._own_media(entry)
             entry.options = opts
             entry.load_s = float(self._cache.get(os.path.realpath(entry.path), {}).get("load_s", 0.0))
         if self._dirty:
@@ -431,6 +432,13 @@ class Catalog:
         fit = [p for p, h in encoders if ({h["projector"], h["audio"]} & set(projectors))
                and h["projection_dim"] in (0, entry.header["n_embd"])]
         return min(fit, key=lambda p: (len(os.path.basename(p)), p)) if fit else None
+
+    @staticmethod
+    def _own_media(entry: Entry) -> list[str]:
+        try:
+            return list(model_class(entry.header["arch"]).media)
+        except NotImplementedError:
+            return []
 
     def _media(self, mmproj: str) -> list[str]:
         """What an encoder file takes and gives: ``image``, ``audio``, ``video`` (an LFM3-VL tower), ``speech`` (a speech

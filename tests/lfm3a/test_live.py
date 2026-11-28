@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from artlite.model_config import lfm3a_gguf
+from models.audio import SR, load_audio
 from models.lfm3a import host as A
 from models.lfm3a.live import CHUNK_ROWS, Stream
 
@@ -46,9 +47,9 @@ def stream_rows(st: Stream, x: np.ndarray, piece: int, *, between: object = None
 def test_stream(audio: object, name: str) -> None:
     """A clip's rows as a stream of 0.1 s pieces: the clip's at once, but for the rows of the 8-key blocks a chunk's
     end cuts (their V^T's bfp16 rounding: ~2% from the clip's), as far from float64 as the clip's."""
-    x = A.load_audio(clip(name))
+    x = load_audio(clip(name))
     whole = audio.encoder(A.log_mel(x))
-    got = stream_rows(Stream(audio.encoder), x, A.SR // 10)
+    got = stream_rows(Stream(audio.encoder), x, SR // 10)
     assert got.shape == whole.shape
     r = rel_rows(got, whole)
     cut = np.zeros(len(r), bool)  # (the rows of the chunks' ends' blocks: every other chunk of 12 ends inside one)
@@ -66,11 +67,11 @@ def test_stream(audio: object, name: str) -> None:
 def test_stream_bands(audio: object) -> None:
     """The chapter (179 s: 5 bands) in pieces of 1 s, with a clip encoded after every 25th chunk (the stream's state
     restored): the same rows as without; the clip's at once (``test_stream``)."""
-    x = np.concatenate([A.load_audio(clip(f"6930-75918-{i:04d}")) for i in range(21)])
-    short = A.load_audio(clip("6930-75918-0012"))
+    x = np.concatenate([load_audio(clip(f"6930-75918-{i:04d}")) for i in range(21)])
+    short = load_audio(clip("6930-75918-0012"))
     whole = audio.encoder(A.log_mel(x))
     st = Stream(audio.encoder)
-    got = stream_rows(st, x, A.SR)
+    got = stream_rows(st, x, SR)
     assert got.shape == whole.shape and st.band == 4
     r = rel_rows(got, whole)
     print(f"stream vs whole: {np.count_nonzero(r)} of {len(r)} rows differ, max {r.max():.4f}")
@@ -82,7 +83,7 @@ def test_stream_bands(audio: object) -> None:
         if n[0] % 25 == 0:
             audio.encoder(A.log_mel(short))
 
-    assert np.array_equal(stream_rows(st, x, A.SR, between=between), got)
+    assert np.array_equal(stream_rows(st, x, SR, between=between), got)
 
 
 def words_wer(want: str, got: str) -> float:
@@ -106,9 +107,9 @@ def test_live() -> None:
     app = Lfm(lfm3a_gguf(), mmproj=MMPROJ)
     asr = LiveAsr(app, app.load(capacity=2048), app.audio.encoder)
     for name, want in LIVE.items():
-        x = A.load_audio(clip(name))
+        x = load_audio(clip(name))
         asr.start()
-        text = "".join(asr.push(x[i:i + A.SR // 10]) for i in range(0, len(x), A.SR // 10)) + asr.end()
+        text = "".join(asr.push(x[i:i + SR // 10]) for i in range(0, len(x), SR // 10)) + asr.end()
         print(f"{name}: {text!r}")
         assert words_wer(want, text) <= 0.05
 

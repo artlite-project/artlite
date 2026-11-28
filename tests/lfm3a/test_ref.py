@@ -12,6 +12,8 @@ import torch
 
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import AudioConfig
+from models import audio
+from models.audio import N_FFT, SR, load_audio, mel_filters
 from models.lfm3a import host as A
 from models.tokenizer import BpeTokenizer
 
@@ -39,10 +41,10 @@ def test_wav_formats(tmp_path: object) -> None:
     """Every WAV format this parses gives the clip's samples (within its precision); stereo: the channels' mean; other
     rates and containers through miniaudio."""
     import struct
-    x = A.load_audio(clip())
+    x = load_audio(clip())
     pcm16 = np.round(x * 32768).astype(np.int64)
 
-    def wav(tag: int, ch: int, bits: int, raw: bytes, rate: int = A.SR) -> bytes:
+    def wav(tag: int, ch: int, bits: int, raw: bytes, rate: int = SR) -> bytes:
         fmt = struct.pack("<HHIIHH", tag, ch, rate, rate * ch * bits // 8, ch * bits // 8, bits)
         if tag == 0xFFFE:  # (EXTENSIBLE: cbSize, valid bits, channel mask, the subformat GUID)
             fmt = struct.pack("<HHIIHH", tag, ch, rate, rate * ch * bits // 8, ch * bits // 8, bits) + \
@@ -60,23 +62,23 @@ def test_wav_formats(tmp_path: object) -> None:
         "stereo": (wav(1, 2, 16, np.stack([pcm16, pcm16], 1).astype("<i2").tobytes()), 0),
     }
     for name, (data, tol) in cases.items():
-        y = A.load_audio(data)
+        y = load_audio(data)
         assert y.shape == x.shape and np.abs(y - x).max() <= tol + 1e-7, name
-    assert np.array_equal(A._miniaudio(cases["pcm16"][0]), x)  # (miniaudio's samples of a 16 kHz WAV: the same)
-    y = A.load_audio(wav(1, 1, 16, pcm16[::2].astype("<i2").tobytes(), rate=8000))  # (resampled to 16 kHz)
+    assert np.array_equal(audio._miniaudio(cases["pcm16"][0]), x)  # (miniaudio's samples of a 16 kHz WAV: the same)
+    y = load_audio(wav(1, 1, 16, pcm16[::2].astype("<i2").tobytes(), rate=8000))  # (resampled to 16 kHz)
     assert abs(len(y) - len(x)) <= 2
 
 
 def test_mel_hf() -> None:
     """log_mel (float32, float64) against transformers' Lfm3AudioFeatureExtractor path (torch.stft, periodic Hann,
     not centred; the filter bank ``mel_filters``)."""
-    x = A.load_audio(clip())
+    x = load_audio(clip())
     n = len(x)
     xp = torch.zeros(A.padded_length(n), dtype=torch.float64)
     xp[:n] = torch.from_numpy(x.astype(np.float64))
-    spec = torch.stft(xp, n_fft=A.N_FFT, hop_length=A.HOP, win_length=A.N_FFT,
-                      window=torch.hann_window(A.N_FFT, dtype=torch.float64), center=False, return_complex=True)
-    hf = ((torch.from_numpy(A.mel_filters()) @ spec.abs().square()).log10().clamp(min=-12) + 4) / 4
+    spec = torch.stft(xp, n_fft=N_FFT, hop_length=A.HOP, win_length=N_FFT,
+                      window=torch.hann_window(N_FFT, dtype=torch.float64), center=False, return_complex=True)
+    hf = ((torch.from_numpy(mel_filters(A.N_MEL)) @ spec.abs().square()).log10().clamp(min=-12) + 4) / 4
     assert hf.shape[1] == A.frames(n)
     assert np.abs(A.log_mel(x, dtype=np.float64) - hf.numpy()).max() < 1e-9
     assert np.abs(A.log_mel(x) - hf.numpy()).max() < 2e-4
@@ -86,7 +88,7 @@ def test_mel_llama() -> None:
     """log_mel against llama.cpp's (the encoder's inp_raw): within float32 rounding (its own FFT, float32 throughout)."""
     path = clip()
     g = golden(path)
-    mel = A.log_mel(A.load_audio(path))
+    mel = A.log_mel(load_audio(path))
     ref = g.tensor("inp_raw", 0).reshape(mel.shape)
     assert np.abs(mel - ref).max() < 3e-4
     assert g.chunks[1]["audio"] == A.rows(mel.shape[1])  # (the clip's rows: llama.cpp's audio chunk's tokens)
@@ -126,7 +128,7 @@ def test_stream() -> None:
     """A clip in chunks of 12 rows (live ASR's) and with a remainder: the rows of the clip at once."""
     require(MODEL, MMPROJ)
     enc = R.Encoder(MMPROJ)
-    mel = A.log_mel(A.load_audio(clip("6930-75918-0012")), dtype=np.float64)
+    mel = A.log_mel(load_audio(clip("6930-75918-0012")), dtype=np.float64)
     whole = enc.forward(mel).numpy()
     for step in (96, 100):
         st = R.Stream(enc)

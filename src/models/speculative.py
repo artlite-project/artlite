@@ -21,7 +21,7 @@ class SpeculativeMixin:
     """The multi-token steps of a model on its decode overlay (``overlay``: ``artlite.decode.model.ModelOverlay``).
 
     ``generate`` runs a generation in rounds: a step of the sampled token and up to ``DRAFTS`` draft tokens - the
-    context's (``lookup``: ``drafts.Lookup``) or a drafter's (multi-token prediction: ``_mtp``), as ``planner``
+    context's (``lookup``: ``drafts.Lookup``, or the model's ``context``) or a drafter's (multi-token prediction: ``_mtp``), as ``planner``
     chooses -, and as long as the token the model's logits give after a token is the draft that ran behind it, the
     draft's logits are valid too. A model with a drafter or lazy states supplies the round's step (``_verify``) and
     what follows its kept tokens (``_kept``).
@@ -58,6 +58,7 @@ class SpeculativeMixin:
     _rounds_of: object = None  # (the running generation's: ``_abandon``)
     carry: tuple[int, ...] = ()  # tokens kept, not run yet: a won sibling, which the next round's step runs before its token
     lookup = True  # drafts from the context
+    context = Lookup  # ... as this makes them of a generation's prompt ids (a model's own: a ``Lookup`` of its texts' form)
     drafter: Any = None  # a multi-token-prediction drafter
     t_draft = 0.0  # seconds in the drafter's steps
     blocks = 0  # dispatches of a block drafter (its drafts of a round in one)
@@ -212,7 +213,7 @@ class SpeculativeMixin:
         # (a grammar's mask: its forced tokens drafts of their own, the others cut where it refuses them, its masks
         # computed while the step runs)
         forced, valid, ahead = (getattr(mask, k, None) for k in ("forced", "valid_prefix", "prefetch"))
-        ctx = Lookup(token_ids(prompt)) if self.lookup and most > 0 else None
+        ctx = self.context(token_ids(prompt)) if self.lookup and most > 0 else None
         if ctx is not None:
             ctx.extend([token])
         self._begin()

@@ -879,9 +879,10 @@ def test_images_refused(fake: tuple) -> None:
 
 def test_audio() -> None:
     """A model with a speech encoder: input_audio parts and audio_url data URIs in chat (the encoder on the NPU
-    worker), /v1/audio/transcriptions (json, text, a stream: llama-server's shapes; the ASR system message, no
-    thought), the openai client's transcriptions; audio in /props and /v1/models; audio output refused."""
-    from models.lfm3a.host import wav_bytes
+    worker), /v1/audio/transcriptions (json, text, a stream: llama-server's shapes; the model's ASR prompt, no
+    thought; verbose_json / diarized_json: the transcript's words and segments), the openai client's transcriptions;
+    audio in /props and /v1/models; audio output refused."""
+    from models.audio import wav_bytes
 
     model, npu, engine = make(audio=True)
     clip = wav_bytes(np.linspace(-0.5, 0.5, 1600))
@@ -913,6 +914,22 @@ def test_audio() -> None:
         evs = [e for e in events(r) if isinstance(e, dict)]
         assert [e["delta"] for e in evs if e["type"] == "transcript.text.delta"] == ["a", " b"]
         assert evs[-1]["type"] == "transcript.text.done" and evs[-1]["text"] == "a b"
+        npu.replies = [["[0.5][S01]", " hi", "[1.5]"]]  # (a transcript of segments: ``Model.transcript``)
+        model.transcript = lambda text: ("hi", [{"start": 0.5, "end": 1.5, "speaker": "S01", "text": "hi"}])
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", clip)},
+                        data={"response_format": "diarized_json", "prompt": "names"})
+        j = r.json()
+        assert r.status_code == 200 and (j["task"], j["duration"], j["text"]) == ("transcribe", 0.1, "hi")
+        assert j["segments"] == [{"id": 0, "start": 0.5, "end": 1.5, "speaker": "S01", "text": "hi"}]
+        assert j["usage"]["output_tokens"] == 4 and model.rendered[0][1]["content"][0] == {"type": "text", "text": "names"}
+        del model.transcript
+        npu.replies = [["plain"]]
+        r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", clip)}, data={"response_format": "verbose_json"})
+        assert r.json()["text"] == "plain" and r.json()["segments"] == []
+        for data, what in (({"response_format": "srt"}, "response_format"),
+                           ({"response_format": "verbose_json", "stream": "true"}, "does not stream")):
+            r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", clip)}, data=data)
+            assert r.status_code == 400 and what in r.json()["error"]["message"]
         assert client.post("/v1/audio/transcriptions", data={"language": "en"}).status_code == 400
         r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"not audio")})
         assert r.status_code == 400 and "decode" in r.json()["error"]["message"]

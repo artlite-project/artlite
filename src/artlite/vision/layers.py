@@ -92,14 +92,16 @@ def gelu_table(table: kmath.ActTable = kmath.GELU) -> np.ndarray:
 
 def gemm(bd: Builder, x: Tensor, w: np.ndarray, b: np.ndarray | None, *, name: str, out: Tensor,
          res: Tensor | None = None, stats: tuple[int, int] | None = None, kind: str = "bf16", ln: bool = False,
-         split: int = 1, extra: dict | None = None, band: int = 0, hilo: bool = False) -> int:
-    """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu"), + res;
-    out's GroupNorm records for ``stats``; ln: LayerNorm records, returns their memtile address (the caller frees
-    ``ln_rec`` bytes after the apply). split: ops of npass / split passes (a lock counts a GEMM's sends to 63).
-    extra: col ops (fills / drains) merged into the first op. hilo: hi + lo weights (``ops.Gemm``)."""
+         split: int = 1, extra: dict | None = None, band: int = 0, hilo: bool = False, act: str = "gelu") -> int:
+    """A GEMM (1x1 conv / linear) of the panels x into out (C tiles; panels: kind "bfp16" / "vt" / "geglu" / "gelu",
+    the last two's activation ``act``), + res; out's GroupNorm records for ``stats``; ln: LayerNorm records, returns
+    their memtile address (the caller frees ``ln_rec`` bytes after the apply). split: ops of npass / split passes (a
+    lock counts a GEMM's sends to 63). extra: col ops (fills / drains) merged into the first op. hilo: hi + lo weights
+    (``ops.Gemm``)."""
     lv = out.lv
     kw = {"m": lv.m, "ntile": lv.ntile, "K": x.C, "N": w.shape[0], "x": x.addr, "y": out.addr, "out": kind,
-          "res": res.addr if res else None, "x_np": x.np, "y_np": out.np if kind != "bf16" else None, "hilo": hilo}
+          "res": res.addr if res else None, "x_np": x.np, "y_np": out.np if kind != "bf16" else None, "hilo": hilo,
+          "act": act}
     rec = bd.mem.alloc(ln_rec(lv) if ln else 4 * D.OCH, top=not ln) if stats or ln else 0  # (LN: its apply's walk reads on)
     if stats:
         kw.update(stats="gn", rec=rec, gsize=stats[0], ch_off=stats[1])

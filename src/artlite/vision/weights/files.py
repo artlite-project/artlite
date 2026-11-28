@@ -72,24 +72,32 @@ def sources(w: object) -> dict[str, Source]:
 _GGUF_KINDS = KINDS[:4]
 
 
-def gguf_matrix(g: GGUFFile, name: str) -> Wt:
-    """A GGUF tensor as a matrix (rows, cols) of its file: F32, F16, BF16 or Q8_0 (the overlay's GEMMs read bfp16, so a
-    4-bit matrix would grow on every load: refused)."""
+def gguf_matrix(g: GGUFFile, name: str, rows: int = 0, *, dequantize: bool = False) -> Wt:
+    """A GGUF tensor as a matrix (rows, cols) of its file: F32, F16, BF16 or Q8_0, read in place. The overlay's GEMMs
+    read bfp16, so a matrix of fewer bits grows on every load: refused, unless ``dequantize`` (a file whose tower has
+    no 8-bit form: its matrix as float32 values in memory, dequantized at every load). ``rows``: the matrix's rows,
+    where a tensor of more dims is not (its rows, the last dim): a conv's (N, C, k) as its N filters of C k elements
+    (not Q8_0's blocks)."""
     t = g.tensor(name)
     sname = f"{os.path.basename(g.path)}:{name}"
+    n, k = (rows, t.rows * t.cols // rows) if rows else (t.rows, t.cols)
     if t.qtype not in _GGUF_KINDS:
-        raise NotImplementedError(f"{g.path}: {name} is {t.qtype}: the NPU's media encoders take mmproj files of Q8_0, "
-                                  f"BF16, F16 or F32 weights (use the model's Q8_0 mmproj)")
+        if not dequantize:
+            raise NotImplementedError(f"{g.path}: {name} is {t.qtype}: the NPU's media encoders take mmproj files of "
+                                      f"Q8_0, BF16, F16 or F32 weights (use the model's Q8_0 mmproj)")
+        v = np.ascontiguousarray(g.rows(name, np.arange(t.rows)), np.float32).reshape(n, k)
+        return Wt.of(Source(sname, "F32", n, k, v.view(np.uint8)))
     raw = t.raw if t.raw.dtype == np.uint8 else np.ascontiguousarray(t.raw).view(np.uint8)
-    return Wt.of(Source(sname, t.qtype, t.rows, t.cols, raw.reshape(t.rows, -1), g.tensor_file(name)))
+    assert n * k == t.rows * t.cols and (n == t.rows or t.qtype != "Q8_0"), (name, rows, t.rows, t.cols, t.qtype)
+    return Wt.of(Source(sname, t.qtype, n, k, raw.reshape(n, -1), g.tensor_file(name)))
 
 
-def gguf_getter(g: GGUFFile) -> Callable[[str], Wt | np.ndarray]:
-    """A GGUF file's tensors by name: matrices (2 dims and more: ``gguf_matrix``) and vectors as float32 (1, cols)
-    arrays."""
-    def get(name: str) -> Wt | np.ndarray:
+def gguf_getter(g: GGUFFile, *, dequantize: bool = False) -> Callable[..., Wt | np.ndarray]:
+    """A GGUF file's tensors by name: matrices (2 dims and more: ``gguf_matrix``, its ``rows`` and ``dequantize``) and
+    vectors as float32 (1, cols) arrays."""
+    def get(name: str, rows: int = 0) -> Wt | np.ndarray:
         if len(g.tensor_info[name][0]) > 1:
-            return gguf_matrix(g, name)
+            return gguf_matrix(g, name, rows, dequantize=dequantize)
         t = g.tensor(name)
         return t.dequantize().reshape(1, t.cols)
     return get

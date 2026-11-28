@@ -1,6 +1,7 @@
 """Audio input: OpenAI's transcriptions (``/v1/audio/transcriptions``, llama-server's) and the offline transcript of a
 clip as its pieces come (``transcribe``: the realtime transcription sessions of a model without live ASR). Both are chat
-requests with the model's ASR prompt (the system message of LFM3-Audio's card). The speech output: ``speech``."""
+requests with the model's ASR prompt (``Model.transcription``: the system message of LFM3-Audio's card,
+MOSS-Transcribe-Diarize's instruction). The speech output: ``speech``."""
 
 from __future__ import annotations
 
@@ -19,7 +20,20 @@ from .errors import bad_request, not_supported
 from .schemas import chat_request
 from .streaming import Format, collect, events_of, stream_response, usage
 
-TRANSCRIPT_TOKENS = (64, 8)  # a transcription's tokens at most by default: 64 + 8 per second of audio
+FORMATS = ("json", "text", "verbose_json", "diarized_json")  # (``response_format``: the last two with segments)
+
+
+def transcript_tokens(model: Any, samples: int) -> int:
+    """A transcription's tokens at most by default (``Model.transcript_tokens``: a transcript that loops ends) for a
+    clip of ``samples`` 16 kHz samples."""
+    from ..audio import SR  # (numpy only)
+    base, rate = model.transcript_tokens
+    return base + rate * samples // SR
+
+
+def clip_part(data: bytes) -> dict[str, Any]:
+    """An audio file's bytes as a chat message's ``input_audio`` part."""
+    return {"type": "input_audio", "input_audio": {"data": base64.b64encode(data).decode(), "format": "wav"}}
 
 
 def asr_usage(done: dict[str, Any]) -> dict[str, Any]:
@@ -50,12 +64,12 @@ class TranscriptFormat(Format):
 
 async def transcribe(ctx: ApiContext, x: np.ndarray, language: str) -> AsyncIterator[str]:
     """A clip's transcript (16 kHz samples; the transcriptions' chat request: the ASR prompt) as its pieces come."""
-    from ..lfm3a.host import SR, asr_system, wav_bytes  # (numpy only)
-    clip = {"type": "input_audio", "input_audio": {"data": base64.b64encode(wav_bytes(x)).decode(), "format": "wav"}}
+    from ..audio import wav_bytes  # (numpy only)
+    model = ctx.engine.model
     _, events = await ctx.start(chat_request({
-        "messages": [{"role": "system", "content": asr_system(language)}, {"role": "user", "content": [clip]}],
+        "messages": model.transcription([clip_part(wav_bytes(x))], language=language)[0],
         "stream": True, "chat_template_kwargs": {"enable_thinking": False},
-        "max_tokens": TRANSCRIPT_TOKENS[0] + TRANSCRIPT_TOKENS[1] * len(x) // SR}))
+        "max_tokens": transcript_tokens(model, len(x))}))
     async for kind, data in events_of(events, 0):
         if kind == "delta":
             for k, v in data["parts"]:
@@ -73,11 +87,13 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
     @api.post("/audio/transcriptions")
     async def transcriptions(request: Request) -> Any:
         """OpenAI's transcriptions (llama-server's): a multipart form's ``file`` (an audio file), ``language``,
-        ``prompt`` (text before the clip in the user message), ``response_format`` (json, text), ``temperature``,
-        ``max_tokens`` (default ``TRANSCRIPT_TOKENS``: a clip of minutes can loop), ``stream``; the model's ASR prompt
-        (the system message of LFM3-Audio's card) as a chat request.
+        ``prompt`` (LFM3-Audio: text before the clip in the user message; MOSS-Transcribe-Diarize: its hotwords),
+        ``response_format`` (``FORMATS``), ``temperature``, ``max_tokens`` (default ``transcript_tokens``: a clip of
+        minutes can loop), ``stream``; the model's ASR prompt (``Model.transcription``) as a chat request.
         The answer: ``{"type": "transcript.text.done", "text", "usage"}`` (stream: ``transcript.text.delta`` events
-        first), or the text."""
+        first), or the text; verbose_json / diarized_json: ``{"task", "duration", "text", "segments", "usage"}``, the
+        transcript's words alone and its segments ``{"id", "start", "end", "speaker", "text"}`` (a model whose
+        transcripts have them: ``Model.transcript``; no stream)."""
         if engine.model.audio is None:
             raise not_supported("The current model does not support audio input.")
         try:
@@ -90,22 +106,23 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
         data = await f.read()
         get = lambda k, d="": str(form.get(k) or d)
         fmt = get("response_format", "json")
-        if fmt not in ("json", "text"):
-            raise bad_request(f"response_format {fmt!r}: json or text")
-        from ..lfm3a.host import SR, asr_system, load_audio  # (numpy only)
-        user = ([{"type": "text", "text": get("prompt")}] if get("prompt") else []) + \
-            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(data).decode(), "format": "wav"}}]
-        body: dict[str, Any] = {"messages": [{"role": "system", "content": asr_system(get("language"))},
-                                             {"role": "user", "content": user}],
-                                "stream": get("stream", "false").lower() == "true",
-                                "chat_template_kwargs": {"enable_thinking": False}}
+        if fmt not in FORMATS:
+            raise bad_request(f"response_format {fmt!r}: {', '.join(FORMATS)}")
+        from ..audio import SR, load_audio  # (numpy only)
+        model = engine.model
+        stream, parsed = get("stream", "false").lower() == "true", fmt in ("verbose_json", "diarized_json")
+        if stream and parsed:
+            raise bad_request(f"response_format {fmt} does not stream (json and text do)")
         try:
+            body: dict[str, Any] = {
+                "messages": model.transcription([clip_part(data)], language=get("language"), prompt=get("prompt"))[0],
+                "stream": stream, "chat_template_kwargs": {"enable_thinking": False}}
             for k, cast in (("temperature", float), ("max_tokens", int), ("seed", int)):
                 if form.get(k) not in (None, ""):
                     body[k] = cast(form.get(k))
-            if "max_tokens" not in body:  # (a transcript that loops ends: 8 tokens a second of audio, ~2x speech's)
-                body["max_tokens"] = TRANSCRIPT_TOKENS[0] + TRANSCRIPT_TOKENS[1] * len(
-                    await run_in_threadpool(load_audio, data)) // SR
+            samples = len(await run_in_threadpool(load_audio, data)) if parsed or "max_tokens" not in body else 0
+            if "max_tokens" not in body:  # (a transcript that loops ends)
+                body["max_tokens"] = transcript_tokens(model, samples)
         except ValueError as e:
             raise bad_request(str(e)) from None
         req = chat_request(body)
@@ -115,5 +132,9 @@ def add_routes(api: APIRouter, ctx: ApiContext) -> None:
             text = blocks.text("text") or ""
             if fmt == "text":
                 return PlainTextResponse(text)
+            if parsed:
+                words, segs = model.transcript(text)
+                return {"task": "transcribe", "duration": samples / SR, "text": words,
+                        "segments": [{"id": i, **seg} for i, seg in enumerate(segs)], "usage": asr_usage(done)}
             return {"type": "transcript.text.done", "text": text, "usage": asr_usage(done)}
         return await stream_response(j, events, ctx.ping_of(req), TranscriptFormat())

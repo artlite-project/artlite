@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from artlite.gguf_model import GGUFFile
+from models.audio import load_audio
 from models.lfm.lfm import Lfm
 from models.lfm3a import host as A
 from models.lfm3a import speech as S
@@ -74,7 +75,7 @@ def test_tts(app: tuple[Lfm, object]) -> None:
 
 def _to16k(y: np.ndarray) -> np.ndarray:
     """24 kHz samples at 16 kHz (``host.load_audio``'s resampler: a WAV through miniaudio)."""
-    return A.load_audio(S.wav(y))
+    return load_audio(S.wav(y))
 
 
 def test_voice_reply(app: tuple[Lfm, object]) -> None:

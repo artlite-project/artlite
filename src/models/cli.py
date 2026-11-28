@@ -10,8 +10,9 @@ options follow llama.cpp's ``llama-cli`` where it has an equivalent, the image o
 
 Text: the prompt goes through the model's chat template (``--raw``: as it is), with ``--image``, ``--video`` and
 ``--audio`` files (a model with a vision or speech encoder: ``--mmproj``) as llama.cpp's ``llama-mtmd-cli`` places them
-(``--audio`` alone: a transcription, the system message llama.cpp's ASR prompt for ``--language``); tokens are then
-sampled until an end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed
+(``--audio`` alone: a transcription with the model's own ASR prompt, ``Model.transcription``: LFM3-Audio's system
+message for ``--language``, MOSS-Transcribe-Diarize's instruction and a transcript per file); tokens are then sampled
+until an end-of-sequence token, ``-n`` tokens or a full KV cache. The text streams to stdout, the load and speed
 report to stderr. Images: the PNG goes to ``-o``, the load time and each phase's time to stderr. Speech (``--tts``:
 LFM3-Audio's or LFM3-Omni's model with its mmproj, as llama.cpp's ``llama-tts``): the WAV goes to ``-o`` (default
 output.wav), the frames, the speech's length and the times to stderr.
@@ -31,9 +32,9 @@ import numpy as np
 from artlite.model_config import MODELS_DIR, model_path
 
 from . import is_diffusers, open_model, open_pipeline, structured
+from .audio import N_FFT, SR, load_audio
 from .detokenizer import StreamDecoder
 from .hostenv import memory_note, performance_mode, stale_install
-from .lfm3a.host import asr_system
 from .model import MEDIA_MARKER, Model, media_parts
 from .npu_model import NpuModel, auto_capacity
 from .sampling import seed
@@ -263,7 +264,7 @@ def voice_reply(args: argparse.Namespace, options: dict[str, object]) -> None:
 def live(args: argparse.Namespace, options: dict[str, object]) -> None:
     """``--live``: each --audio file as a stream (``models.lfm3a.live``), pushed 0.1 s at a time; the text to stdout,
     the chunks' times to stderr."""
-    from .lfm3a.host import HOP, N_FFT, SR, STRIDE, load_audio
+    from .lfm3a.host import HOP, STRIDE
     from .lfm3a.live import CHUNK_ROWS, LiveAsr
 
     row = STRIDE * HOP  # (samples of a row)
@@ -342,10 +343,18 @@ def main(argv: list[str] | None = None) -> None:
                                       f"without text generation (artlite-server's routes read it out)")
         if "reasoning_effort" in variables:  # (the template's spelling of a level: ``Model.efforts``)
             variables["reasoning_effort"] = model.efforts.get(variables["reasoning_effort"], variables["reasoning_effort"])
-        asr = bool(args.audio) and not args.video and args.prompt is None and not args.file
-        system = args.system_prompt or (asr_system(args.language) if asr else None)
-        ids = model.prompt(text, system=system, raw=args.raw, think=args.think, images=args.image, audio=args.audio,
-                           videos=args.video, variables=variables)
+        budget = max(args.n_predict, 0)
+        if args.audio and not (args.image or args.video or args.system_prompt) and args.prompt is None and not args.file:
+            # (a transcription: the model's ASR prompt; room for its transcripts where -n gives none)
+            clips = [load_audio(a) for a in args.audio]
+            turns = model.transcription(media_parts(audio=clips), language=args.language)
+            prompts = [model.chat(m, think=args.think, variables=variables) for m in turns]
+            base, rate = model.transcript_tokens
+            budget = budget or base + rate * max(len(c) for c in clips) // SR
+        else:
+            prompts = [model.prompt(text, system=args.system_prompt, raw=args.raw, think=args.think, images=args.image,
+                                    audio=args.audio, videos=args.video, variables=variables)]
+        ids = prompts[0]
         # (as the prompt says where the template decided: its inline tags over --think)
         think = args.think if args.raw else structured.prompt_thinks(model.tokenizer, token_ids(ids), model.reasoning,
                                                                      args.think, blocks=model.blocks)
@@ -379,9 +388,10 @@ def main(argv: list[str] | None = None) -> None:
     if model.audio is not None and args.audio:
         a = model.audio
         sys.stderr.write(f"{len(args.audio)} audio clip(s) through the encoder in {a.t_encode:.2f} s\n")
-    capacity = args.ctx_size or auto_capacity(len(ids) + max(args.n_predict, 0))
-    if len(ids) >= capacity:
-        fail(f"a prompt of {len(ids)} tokens does not fit a KV cache of {capacity} positions")
+    longest = max(len(p) for p in prompts)
+    capacity = args.ctx_size or auto_capacity(longest + budget)
+    if longest >= capacity:
+        fail(f"a prompt of {longest} tokens does not fit a KV cache of {capacity} positions")
     try:
         npu = model.load(capacity=capacity, prefill=not args.no_prefill)
     except NotImplementedError as e:
@@ -389,25 +399,30 @@ def main(argv: list[str] | None = None) -> None:
     npu.lookup = not args.no_lookup
     if args.spec_draft_n_max is not None:
         npu.DRAFTS = min(npu.DRAFTS, args.spec_draft_n_max)
-    npu.prepare(len(ids))
-    loaded(args, model, npu, t0, f"{len(ids)} prompt tokens")
-    out = StreamDecoder(model.tokenizer)
-    t0 = time.perf_counter()
-    logits = npu.forward(ids)
-    t1 = time.perf_counter()
-    npu_s, host_s, passes = npu.t_npu, npu.t_host, npu.dispatches
-    n = 0
-    for token in npu.generate(logits, args.n_predict, sampling, ids, mask):
-        n += 1
-        if token not in model.eos_token_ids:
-            print(out.feed(token), end="", flush=True)
-    t2 = time.perf_counter()
-    passes = max(npu.dispatches - passes, 1)
-    host = f", {(npu.t_host - host_s) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > host_s else ""
-    sys.stderr.write(f"\n\nprompt: {len(ids)} tokens in {t1 - t0:.2f} s ({len(ids) / (t1 - t0):.1f} tokens/s); "
-                     f"generation: {n} tokens in {t2 - t1:.2f} s ({n / max(t2 - t1, 1e-9):.2f} tokens/s): {passes} "
-                     f"dispatches of {(npu.t_npu - npu_s) / passes * 1e3:.1f} ms{host}"
-                     f"{'; ' + npu.stats() if npu.stats() else ''}\n")
+    npu.prepare(longest)
+    loaded(args, model, npu, t0, " + ".join(str(len(p)) for p in prompts) + " prompt tokens")
+    for k, ids in enumerate(prompts):  # (a transcription's conversations one after another, each from an empty cache)
+        if k:
+            npu.reset()
+        out = StreamDecoder(model.tokenizer)
+        t0 = time.perf_counter()
+        logits = npu.forward(ids)
+        t1 = time.perf_counter()
+        npu_s, host_s, passes = npu.t_npu, npu.t_host, npu.dispatches
+        n = 0
+        for token in npu.generate(logits, args.n_predict, sampling, ids, mask):
+            n += 1
+            if token not in model.eos_token_ids:
+                print(out.feed(token), end="", flush=True)
+        t2 = time.perf_counter()
+        passes = max(npu.dispatches - passes, 1)
+        host = f", {(npu.t_host - host_s) / passes * 1e3:.1f} ms of host inputs each" if npu.t_host > host_s else ""
+        if len(prompts) > 1:  # (a transcript a line)
+            print(flush=True)
+        sys.stderr.write(f"\n\nprompt: {len(ids)} tokens in {t1 - t0:.2f} s ({len(ids) / (t1 - t0):.1f} tokens/s); "
+                         f"generation: {n} tokens in {t2 - t1:.2f} s ({n / max(t2 - t1, 1e-9):.2f} tokens/s): {passes} "
+                         f"dispatches of {(npu.t_npu - npu_s) / passes * 1e3:.1f} ms{host}"
+                         f"{'; ' + npu.stats() if npu.stats() else ''}\n")
 
 
 if __name__ == "__main__":

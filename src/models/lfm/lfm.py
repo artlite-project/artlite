@@ -26,6 +26,7 @@ import dataclasses
 import hashlib
 from collections import OrderedDict
 from collections.abc import Iterator
+from collections.abc import Sequence as Seq
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -38,6 +39,7 @@ from artlite.overlay import WeightBuffer
 from artlite.vision.shell import shared_device
 
 from .. import video
+from ..audio import AUDIO_PARTS, part_audio
 from ..lanes import alone
 from ..lfm3a import host as a_host
 from ..lfm3a import npu as a_npu
@@ -48,7 +50,7 @@ from ..model import Capabilities, Model, check_tower
 from ..overlay_model import OverlayModel
 from ..readouts import READOUT_VOCAB, readout_model
 from ..sampling import Mask, Sampling
-from ..sequence import Sequence, splice_media
+from ..sequence import Sequence, embedding_rows, splice_media
 from ..templating import TEMPLATE_KEY, file_template, render_template
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .image import LfmImage
@@ -109,18 +111,6 @@ class NpuLfm(OverlayModel):
         self.overlay.reset()
         self.position = 0
 
-    def _rows(self, tokens: list[int] | Sequence) -> np.ndarray:
-        """The tokens' embeddings (n, hidden) fp32: their ids' rows, a sequence's given rows."""
-        if not isinstance(tokens, Sequence):
-            return self.gguf.rows("token_embd.weight", tokens)
-        x = np.empty((len(tokens), self.cfg.hidden_size), np.float32)
-        t = ~tokens.given
-        if t.any():
-            x[t] = self.gguf.rows("token_embd.weight", tokens.ids[t])
-        if tokens.given.any():
-            x[tokens.given] = tokens.rows
-        return x
-
     @alone
     def audio_step(self, row: np.ndarray, *, logits: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
         """An embedding row (hidden,) at the next position (a speech frame's feedback: ``models.lfm3a.speech``), in a
@@ -146,10 +136,10 @@ class NpuLfm(OverlayModel):
         return self._normed(u[None])[0]
 
     def _step_inputs(self, tokens: list[int] | Sequence) -> tuple:
-        return (self._rows(tokens),)
+        return (embedding_rows(self.gguf, tokens, self.cfg.hidden_size),)
 
     def _chunk_inputs(self, tokens: list[int] | Sequence, *, first: bool) -> tuple:
-        return (self._rows(tokens),)
+        return (embedding_rows(self.gguf, tokens, self.cfg.hidden_size),)
 
     def _chunk_logits(self, token: int, n: int) -> np.ndarray:
         """(the LM head alone on the chunk's last output row)"""
@@ -327,6 +317,14 @@ class Lfm(Model):
         self.vision_ran()
         return self.tokenizer.encode(start) + seq + self.tokenizer.encode(end)
 
+    def transcription(self, clips: Seq[dict[str, object]], *, language: str = "", prompt: str = ""
+                      ) -> list[list[dict[str, object]]]:
+        """(LFM3-Audio's card: the ASR system message, the clips in one user message after ``prompt``)"""
+        if self.audio is None:
+            raise ValueError(f"{self.name}: no transcription (audio needs its speech encoder: an mmproj file)")
+        text = [{"type": "text", "text": prompt}] if prompt else []
+        return [[{"role": "system", "content": a_host.asr_system(language)}, {"role": "user", "content": [*text, *clips]}]]
+
     def audio_stream(self) -> object:
         """A stream's rows on the speech encoder as its samples arrive (``models.lfm3a.live.Stream``)."""
         from ..lfm3a import live
@@ -338,7 +336,7 @@ class Lfm(Model):
         text = self.chat_text(messages, think=think, tools=tools, preserve=preserve, variables=variables)
         parts = [p for m in messages if isinstance(m.get("content"), list) for p in m["content"] if isinstance(p, dict)]
         images = [p["image"] for p in parts if p.get("type") == "image"]
-        clips = [a_host.part_audio(p) for p in parts if p.get("type") in a_host.AUDIO_PARTS]
+        clips = [part_audio(p) for p in parts if p.get("type") in AUDIO_PARTS]
         videos = [p["video"] for p in parts if p.get("type") == "video"]
         frames = [p["row"] for p in parts if p.get("type") == "audio_out" and "row" in p]  # (a spoken reply as said)
         if not images and not clips and not videos and not frames:

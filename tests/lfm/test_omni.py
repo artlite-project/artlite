@@ -24,6 +24,7 @@ import pytest
 from artlite.gguf_model import GGUFFile
 from artlite.model_config import ClipConfig, LfmConfig, lfm3omni_gguf, lfm3omni_mmproj, lfm3vl_gguf, lfm3vl_mmproj
 from models import video as VD
+from models.audio import load_audio
 from models.lfm.lfm import Lfm
 from models.lfm3a import host as A
 from models.lfm3a import speech as S
@@ -72,7 +73,7 @@ class _Audio:
         return np.zeros((A.rows(A.frames(len(x))), self.hidden), np.float32)
 
     def sequence(self, clip: str | np.ndarray) -> Sequence:
-        x = clip if isinstance(clip, np.ndarray) else A.load_audio(clip)
+        x = clip if isinstance(clip, np.ndarray) else load_audio(clip)
         return A.clip_sequence(self.embeddings(x))
 
 
@@ -194,7 +195,7 @@ def _float64_rows(gold: object, media: list[dict], files: list[str]) -> np.ndarr
             raw = [np.load(os.path.join(gold.path, n)) for n in sorted(os.listdir(gold.path)) if n.startswith("inp_raw.")]
             rows.append(VR.Encoder(MMPROJ).forward(next(r for r in raw if r.ndim == 3 and r.shape[0] == 3)).numpy())
         else:
-            rows.append(AR.Encoder(MMPROJ).forward(A.log_mel(A.load_audio(f))).numpy())
+            rows.append(AR.Encoder(MMPROJ).forward(A.log_mel(load_audio(f))).numpy())
     return np.concatenate(rows).astype(np.float32)
 
 
@@ -318,7 +319,7 @@ def test_tts(app: tuple[Lfm, object]) -> None:
 def _asr(m: Lfm, npu: object, y: np.ndarray) -> str:
     """The model's own transcript of 24 kHz speech (the offline ASR prompt)."""
     msgs = [{"role": "system", "content": A.asr_system("en")},
-            {"role": "user", "content": [{"type": "audio", "audio": A.load_audio(S.wav(y))}]}]
+            {"role": "user", "content": [{"type": "audio", "audio": load_audio(S.wav(y))}]}]
     npu.reset()
     prompt = m.chat(msgs)
     return m.tokenizer.decode([t for t in npu.generate(npu.forward(prompt), 200, m.sampling(), prompt)
@@ -338,7 +339,7 @@ def test_realtime_conversation(app: tuple[Lfm, object], question: str) -> None:
     from models.server.conversation import Conversation
     from models.server.engine import Engine
     m, npu = app
-    x = A.load_audio(question)
+    x = load_audio(question)
     example = os.path.join(os.path.dirname(ASTRONAUT), "sd15-example.jpg")  # (another astronaut on another horse)
     other = m.chat([{"role": "user", "content": " ".join(["Tell me about the sea."] * 120)}])
 

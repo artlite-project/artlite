@@ -1,4 +1,4 @@
-"""LFM3-Audio's speech on the NPU for the lfm3 language models (``NpuAudio``): a clip's samples (``host.load_audio``), its
+"""LFM3-Audio's speech on the NPU for the lfm3 language models (``NpuAudio``): a clip's samples (``models.audio.load_audio``), its
 log-mel spectrogram (``host.log_mel``), its rows' embeddings (``models.lfm3a.encoder.Encoder``: on the vision overlay in
 a hardware context of its own, band by band; with LFM3-Omni's mmproj on the one its vision tower shares,
 ``artlite.vision.shell.shared_device``) and its tokens (``host.clip_sequence``); and, where the mmproj holds the speech
@@ -21,6 +21,7 @@ from artlite.vision.shell import MediaEncoder, digest, require_dims, require_pro
 from artlite.vision.vit import kinds_of
 from artlite.vision.weights import gguf_getter
 
+from ..audio import load_audio
 from ..sequence import Sequence
 from . import codec as CD
 from . import depth as DP
@@ -99,5 +100,5 @@ class NpuAudio(MediaEncoder):
 
     def sequence(self, clip: str | bytes | np.ndarray) -> Sequence:
         """A clip (a file, its bytes or 16 kHz samples) as the language model's tokens."""
-        x = clip if isinstance(clip, np.ndarray) else host.load_audio(clip)
+        x = clip if isinstance(clip, np.ndarray) else load_audio(clip)
         return host.clip_sequence(self.embeddings(x))

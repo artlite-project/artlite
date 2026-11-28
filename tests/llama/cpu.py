@@ -1,13 +1,16 @@
 """Llama and Qwen3 on the CPU in fp32: the reference of the NPU path (tests/llama/test_npu.py), on a GGUF file's
 dequantized tensors (GGUF names; Q / K rows in rotate-half order, as ``LlamaImage`` lays them out: the same model;
 Qwen3's q / k RMS norms with their weights per dim). ``logits(seq, rows)`` runs the tokens from position 0 in chunks
-through a KV cache and returns the logits of the positions ``rows``; ``outputs(seq, rows)`` their output-normed last
+through a KV cache (ids, or a ``models.sequence.Sequence``: a media encoder's rows among them) and returns the logits
+of the positions ``rows``; ``outputs(seq, rows)`` their output-normed last
 hidden rows (the readouts: embeddings, rerank, decisions)."""
 
+import numpy as np
 import torch
 
 from artlite.gguf_model import GGUFFile, unpermute_rows
 from artlite.model_config import LlamaConfig
+from models.sequence import Sequence
 
 
 class LlamaCpu:
@@ -52,13 +55,21 @@ class LlamaCpu:
         x1, x2 = x[..., :h], x[..., h:]
         return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], -1)
 
+    def _rows(self, seq: list[int] | Sequence) -> torch.Tensor:
+        """The tokens' embedding rows: their ids', a ``Sequence``'s given rows where it has them."""
+        if not isinstance(seq, Sequence):
+            return self.emb[torch.tensor(seq)]
+        x = self.emb[torch.from_numpy(np.maximum(seq.ids, 0))]
+        x[torch.from_numpy(seq.given)] = torch.from_numpy(seq.rows)
+        return x
+
     @torch.no_grad()
-    def logits(self, seq: list[int], rows: slice, *, chunk: int = 1024) -> torch.Tensor:
+    def logits(self, seq: list[int] | Sequence, rows: slice, *, chunk: int = 1024) -> torch.Tensor:
         """The fp32 logits (n, vocab) of the positions ``rows`` of the tokens seq (from position 0)."""
         return self.outputs(seq, rows, chunk=chunk) @ self.out.T
 
     @torch.no_grad()
-    def outputs(self, seq: list[int], rows: slice | list[int], *, chunk: int = 1024) -> torch.Tensor:
+    def outputs(self, seq: list[int] | Sequence, rows: slice | list[int], *, chunk: int = 1024) -> torch.Tensor:
         """The fp32 output-normed last hidden rows (n, hidden) of the positions ``rows`` of the tokens seq."""
         cfg = self.cfg
         nh, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
@@ -71,7 +82,7 @@ class LlamaCpu:
         for p0 in range(0, P, chunk):
             T = min(chunk, P - p0)
             pos = torch.arange(p0, p0 + T)
-            x = self.emb[torch.tensor(seq[p0:p0 + T])]
+            x = self._rows(seq[p0:p0 + T])
             mask = torch.arange(p0 + T)[None, :] <= pos[:, None]
             for L, lw in enumerate(self.layers):
                 y = self._rms(x, lw["an"]) @ lw["qkv"].T

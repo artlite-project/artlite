@@ -28,7 +28,7 @@ from websockets.sync.client import connect as ws_connect
 
 from artlite import settings
 from artlite.model_config import checkpoint
-from models.lfm3a.host import wav_bytes
+from models.audio import wav_bytes
 from models.server import catalog as catalog_module
 from models.server import ui
 from models.server.catalog import Catalog, read_preset, render
@@ -177,6 +177,21 @@ def test_catalog_checkpoint_tower(tmp_path: object) -> None:
     os.symlink(src, d / "z-lab" / "Qwen3.5-0.8B-PARO")
     e = catalog_of(str(d), tmp_path).scan()["z-lab/Qwen3.5-0.8B-PARO"]
     assert e.mmproj == e.path and e.media == ["image"]
+
+
+def test_catalog_own_tower(tmp_path: object) -> None:
+    """A model whose files hold its encoder (MOSS-Transcribe-Diarize's checkpoint directory: its audio tower): audio in
+    its listing, no encoder file."""
+    src = checkpoint("moss-transcribe-diarize")
+    require(src)
+    d = tmp_path / "models"
+    (d / "OpenMOSS-Team").mkdir(parents=True)
+    os.symlink(src, d / "OpenMOSS-Team" / "MOSS-Transcribe-Diarize")
+    cat = catalog_of(str(d), tmp_path)
+    cat.entries = cat.scan()
+    e = cat.entries["OpenMOSS-Team/MOSS-Transcribe-Diarize"]
+    assert e.header["arch"] == "moss" and e.mmproj is None and e.media == ["audio"]
+    assert Router(cat, spare=False).listing()["data"][0]["architecture"]["input_modalities"] == ["text", "audio"]
 
 
 def test_catalog(models_dir: str, tmp_path: object, monkeypatch: pytest.MonkeyPatch,
