@@ -20,7 +20,7 @@ model's head plane (Q8_0H: its LM region, read in place in the model's weight bu
 
 then "jh" (``output_norm``): the columns of ``joint_proj`` that the block's rows enter (its h part, 512 .. 2815: rows
 96 c ..; BF16 as BFP16 tiles), and "lm_norm": the LM phase's norm-weight objects (``output_norm``; its tiles: the
-model's); then per layer "ikv" (``blk.L.dflare_norm``: an injection's input, the taps' mix of the layer): "k", "v"
+model's); then per layer "ikv" (``ctx_norm``: an injection's input, the taps' mix of the layer): "k", "v"
 (``attn_k_ctx`` / ``attn_v_ctx`` rows 128 c ..)."""
 
 from dataclasses import replace
@@ -31,7 +31,7 @@ from artlite.decode.attn import Attn
 from artlite.decode.attn_operator import AttentionDecodeOperator
 from artlite.decode.image import NormedImage, column_rows, gate_up_rows
 from artlite.decode.protocol import MAX_K
-from artlite.gguf_model import GGUFFile, QTensor
+from artlite.gguf_model import GGUFFile, QTensor, tensor_f32
 from artlite.model_config import InklingDSparkConfig
 from artlite.operators.design import COLS
 
@@ -40,6 +40,30 @@ from .image import KC
 
 DOWN_K = 3072  # (a down region's K: the K group of a phase, ``decode`` MAX_K)
 RANK_PARTS = 2  # (``joint_proj``'s columns before the h part: the state's and the previous token's, rank each)
+
+
+def ctx_norm(cfg: InklingDSparkConfig, L: int) -> str:
+    """The norm weight of layer L's mix of the taps (L = ``cfg.layers``: the Markov head's), in the file's form."""
+    if cfg.mainline:
+        return f"blk.{L}.ctx_norm.weight" if L < cfg.layers else "markov_ctx_norm.weight"
+    return f"blk.{L}.dflare_norm.weight" if L < cfg.layers else "dspark_norm.weight"
+
+
+def mix_weights(gguf: GGUFFile, cfg: InklingDSparkConfig) -> np.ndarray:
+    """The taps' weights of each layer's mix, then the Markov head's (layers + 1, taps) fp32: the file's (mainline), or
+    the softmax of ``dspark_fuse``'s rows."""
+    if cfg.mainline:
+        return np.stack([tensor_f32(gguf, f"blk.{L}.ctx_mix.weight") for L in range(cfg.layers)] +
+                        [tensor_f32(gguf, "markov_ctx_mix.weight")])
+    f = tensor_f32(gguf, "dspark_fuse.weight").reshape(cfg.layers + 1, len(cfg.taps)).astype(np.float64)
+    e = np.exp(f - f.max(1, keepdims=True))
+    return (e / e.sum(1, keepdims=True)).astype(np.float32)
+
+
+def mask_rows(gguf: GGUFFile, cfg: InklingDSparkConfig) -> np.ndarray:
+    """The block's rows after the anchor (block - 1, hidden) fp32 (unsloth's form: one ``mask_embd`` for all)."""
+    m = tensor_f32(gguf, "mask_embd.weight").reshape(-1, cfg.hidden)
+    return np.ascontiguousarray(np.broadcast_to(m, (cfg.block - 1, cfg.hidden)))
 
 
 class DSparkDecodeOperator(AttentionDecodeOperator):
@@ -117,7 +141,7 @@ class DSparkImage(NormedImage):
     def norms(self, L: int, name: str) -> tuple[str | None, None]:
         if L < 0:
             return "output_norm.weight", None
-        return {"qkv": f"blk.{L}.attn_norm.weight", "ikv": f"blk.{L}.dflare_norm.weight",
+        return {"qkv": f"blk.{L}.attn_norm.weight", "ikv": ctx_norm(self.cfg, L),
                 "gate_up": f"blk.{L}.ffn_norm.weight"}[name], None
 
     def data_objects(self, layer: int, name: str) -> np.ndarray:
@@ -126,4 +150,4 @@ class DSparkImage(NormedImage):
         return super().data_objects(layer, name)
 
 
-__all__ = ["DOWN_K", "DSparkDecodeOperator", "DSparkImage"]
+__all__ = ["DOWN_K", "DSparkDecodeOperator", "DSparkImage", "ctx_norm", "mask_rows", "mix_weights"]

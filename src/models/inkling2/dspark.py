@@ -8,11 +8,11 @@ A step of the drafter's overlay (``DSparkOverlay``) is one of two kinds:
 
 - an injection (``inject``: ``step`` without logits): S <= 4 positions of the model's sequence from their taps (the
   residual entering the model's visits ``cfg.taps``, the last one its final normed state: ``InklingOverlay.tap_rows``,
-  ``Screen.input``), mixed per layer on the host (``mixes``: the softmax of ``dspark_fuse``'s row; a few K flops a row,
-  beside the screen's own work on the same states), the states 1 + L of the state array: per layer "ikv" (normed by its
-  ``dflare_norm``: K_ctx, V_ctx) and the attention cores' records of the positions (K RMS-normed by ``attn_k_ctx_norm``
+  ``Screen.input``), mixed per layer on the host (``mixes``: ``dspark_image.mix_weights``; a few K flops a row, beside
+  the screen's own work on the same states), the states 1 + L of the state array: per layer "ikv" (normed by its
+  ``ctx_norm``: K_ctx, V_ctx) and the attention cores' records of the positions (K RMS-normed by ``attn_k_ctx_norm``
   and rotated; o into a sink);
-- a block (``block``: ``step`` with logits): 4 rows [the anchor's normed embedding, ``mask_embd`` x 3] at P .. P + 3
+- a block (``block``: ``step`` with logits): 4 rows [the anchor's normed embedding, the mask rows 0 .. 2] at P .. P + 3
   (state 0: the residual, fp32 in DDR and the helpers' memory), per layer qkv (``attn_norm``), the attention (q / k
   RMS-normed by ``attn_q_norm`` / ``attn_k_norm``, rotated; the block mask: every row the window's positions before P on a
   local layer, all of them on the full one, and the block whole), o (cur += its rows: the F_INK step without a conv),
@@ -32,8 +32,9 @@ needs all its rows at once; its cache range to the last position's group, ``rang
 
 The Markov chain (``MarkovChain``) runs on the host over each row's candidates: the top 64 of the block's screened logits
 and the top 64 of them plus ``head . b_ho`` (a static bias per token, ``static_bias``), each candidate's logit exact
-(``Screen.exact`` of h_i + W_ho latent + b_ho: the base logit and the bias in one row product); S5's measurement: the
-same drafts as the whole vocabulary's (2.18 vs 2.20 accepted of 7)."""
+(unsloth's form: ``Screen.exact`` of h_i + W_ho latent + b_ho, the base logit and the bias in one row product; the
+mainline form: ``Screen.exact`` of h_i plus the candidate's ``markov_w2`` row times the latent and its bias); S5's
+measurement: the same drafts as the whole vocabulary's (2.18 vs 2.20 accepted of 7)."""
 
 import math
 
@@ -72,7 +73,7 @@ from artlite.model_config import InklingDSparkConfig
 from artlite.operators.design import COLS
 from artlite.overlay import OverlayDevice, Sequence
 
-from .dspark_image import DOWN_K, DSparkDecodeOperator, DSparkImage
+from .dspark_image import DOWN_K, DSparkDecodeOperator, DSparkImage, ctx_norm, mask_rows, mix_weights
 
 INJ = 10  # an injection's layer index: L + INJ (module docstring)
 WRAP = 32  # groups of a local layer's ring past that many groups of capacity (its window's 16, a block's 2 and more)
@@ -99,7 +100,7 @@ class DSparkOverlay(AttentionOverlay):
         tc = target.cfg
         if ((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim) != (tc.hidden_size, tc.num_attention_heads,
                                                                      tc.num_key_value_heads, tc.head_dim)
-                or cfg.vocab_padded != tc.vocab_padded or cfg.taps[-1] != len(tc.visits)):
+                or cfg.vocab_size != tc.vocab_size or cfg.taps[-1] != len(tc.visits)):
             raise ValueError(f"{gguf.path}: the drafter of another model than {target.gguf.path}")
         image = DSparkImage(gguf, cfg, tile_bytes=target.T)
         image.vocab = target.vocab
@@ -129,12 +130,9 @@ class DSparkOverlay(AttentionOverlay):
             {L + INJ: CacheUse(kind=kinds[L], source=L + INJ, ring=L) for L in self.layers}
         self.period = 1
         self.inv_freq = 1.0 / np.power(np.float64(cfg.rope_base), np.arange(0, self.hd, 2) / self.hd)
-        f = tensor_f32(gguf, "dspark_fuse.weight").reshape(cfg.layers + 1, len(cfg.taps)).astype(np.float64)
-        e = np.exp(f - f.max(1, keepdims=True))
-        self.alpha = (e / e.sum(1, keepdims=True)).astype(np.float32)  # (the taps' mix per layer, then the Markov head's)
-        self.mix_norms = np.stack([tensor_f32(gguf, f"blk.{L}.dflare_norm.weight") for L in self.layers] +
-                                  [tensor_f32(gguf, "dspark_norm.weight")])
-        self.mask = tensor_f32(gguf, "mask_embd.weight")
+        self.alpha = mix_weights(gguf, cfg)  # (the taps' mix per layer, then the Markov head's)
+        self.mix_norms = np.stack([tensor_f32(gguf, ctx_norm(cfg, L)) for L in range(cfg.layers + 1)])
+        self.mask = mask_rows(gguf, cfg)[:SLOTS - 1]
         self.w_out = tensor_f32(gguf, "output_norm.weight")
         self.screen: Screen | None = None
         if target.screen is not None:  # (the head's exact rows: the model's, against the drafter's output norm)
@@ -459,7 +457,7 @@ class DSparkOverlay(AttentionOverlay):
 
     def block(self, anchor: np.ndarray, P: int) -> None:
         """A block at P (the anchor's normed embedding (hidden,) fp32, then the mask rows): its logits and jh."""
-        x = np.stack([anchor, *[self.mask] * (SLOTS - 1)]).astype(np.float32)
+        x = np.concatenate([np.asarray(anchor, np.float32)[None], self.mask])
         if self._metas_s != (SLOTS, self.start):
             self._metas(SLOTS)
         self.write_states(x[None], 0)
@@ -467,7 +465,7 @@ class DSparkOverlay(AttentionOverlay):
 
     def mixes(self, taps: np.ndarray) -> np.ndarray:
         """The taps' mixes (layers + 1, S, hidden) fp32: per layer its injection's input (unnormed: its phase norms it),
-        then the Markov head's f_rnn (normed by ``dspark_norm``)."""
+        then the Markov head's f_rnn (normed by its ``ctx_norm``)."""
         x = np.einsum("lt,sth->lsh", self.alpha, taps.astype(np.float32))
         f = x[-1].astype(np.float64)
         x[-1] = (f / np.sqrt((f * f).mean(-1, keepdims=True) + self.cfg.rms_norm_eps) * self.mix_norms[-1]).astype(np.float32)
@@ -498,7 +496,11 @@ class DSparkOverlay(AttentionOverlay):
         return self._npu_logits(SLOTS)
 
     def static_bias(self) -> None:
-        """``head . b_ho`` per token (``MarkovChain``'s candidates), from the head's exact rows."""
+        """``head . b_ho`` per token (``MarkovChain``'s candidates): the mainline form's ``markov_w2`` bias, else from
+        the head's exact rows."""
+        if self.cfg.mainline:
+            self.fb = tensor_f32(self.gguf, "markov_w2.bias")
+            return
         b = tensor_f32(self.gguf, "dspark_hidden_out.bias")
         self.fb = self.screen.exact(np.arange(self.cfg.vocab_size), b) if self.screen is not None else None
 
@@ -519,15 +521,19 @@ class MarkovChain:
         self.ws, self.wp, self.wf = (np.ascontiguousarray(wj[:, :R]), np.ascontiguousarray(wj[:, R:2 * R]),
                                      np.ascontiguousarray(wj[:, 2 * R + H:]))
         self.bj = tensor_f32(gguf, "joint_proj.bias")
-        t = gguf.tensor("dspark_hidden_out.weight")
-        self.who = np.asarray(t.raw).view(bfloat16).reshape(t.rows, t.cols).astype(np.float32)
-        self.bho = tensor_f32(gguf, "dspark_hidden_out.bias")
+        self.who = self.bho = None  # (unsloth's form: the latent's projection into the hidden; mainline: markov_w2)
+        if not cfg.mainline:
+            t = gguf.tensor("dspark_hidden_out.weight")
+            self.who = np.asarray(t.raw).view(bfloat16).reshape(t.rows, t.cols).astype(np.float32)
+            self.bho = tensor_f32(gguf, "dspark_hidden_out.bias")
         self.gguf, self.cfg, self.screen, self.fb = gguf, cfg, screen, fb
         self.chains: list[float] = []  # (``walk``: per draft its chain's probability)
 
     def resident(self) -> None:
-        """markov_w1's pages read ahead (a row per draft)."""
+        """markov_w1's pages read ahead (a row per draft; markov_w2's: a row per candidate)."""
         self.gguf.willneed("markov_w1.weight")
+        if self.cfg.mainline:
+            self.gguf.willneed("markov_w2.weight")
 
     def walk(self, screened: np.ndarray, h: np.ndarray, jh: np.ndarray, f_rnn: np.ndarray, anchor: int, n: int,
              stop: set[int] | frozenset[int] = frozenset()) -> list[int]:
@@ -544,10 +550,14 @@ class MarkovChain:
             raw = ctx[i] + self.ws @ state + self.wp @ w1
             gate = 1 / (1 + np.exp(-raw[:R]))
             state = (gate * state + (1 - gate) * np.tanh(raw[R:2 * R])).astype(np.float32)
-            g = (h[i + 1] + self.who @ np.tanh(raw[2 * R:]) + self.bho).astype(np.float32)
+            lat = np.tanh(raw[2 * R:])
             est = screened[i + 1, :nv].astype(np.float32) * sc.scale[:nv]
             c = np.union1d(_native.top_logits(est, self.CAND)[1], _native.top_logits(est + self.fb, self.CAND)[1])
-            col = sc.exact(c.astype(np.int64), g)
+            if self.who is not None:  # (unsloth's form: the latent's projection added to the head's input)
+                col = sc.exact(c.astype(np.int64), (h[i + 1] + self.who @ lat + self.bho).astype(np.float32))
+            else:  # (mainline: the candidates' markov_w2 rows, its bias fb)
+                w2 = self.gguf.rows("markov_w2.weight", c, prefetch=False)
+                col = sc.exact(c.astype(np.int64), h[i + 1]) + w2 @ lat + self.fb[c]
             if cap:
                 col = np.tanh(col / cap) * cap
             a = int(np.argmax(col))

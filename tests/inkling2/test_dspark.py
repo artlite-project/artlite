@@ -6,16 +6,20 @@
   rows' normed states, ``joint_proj``'s h part, the head plane's screened logits and their argmax), the reference's
   block of 4 rows;
 - greedy rounds with drafts: the same text as without them (two chat prompts, 96 tokens), drafts accepted.
+
+Each with the drafter's file in either form (``InklingDSparkConfig``: mainline, unsloth's), where the models directory
+has it (unsloth's repository: the root's ``dspark-Inkling-2-Mini-Q8_0.gguf`` and its ``_Old`` copy).
 """
 
 import dataclasses
+import os
 
 import numpy as np
 import pytest
 import torch
 
 from artlite.gguf_model import GGUFFile
-from artlite.model_config import inkling_dspark_of, inkling_gguf
+from artlite.model_config import InklingDSparkConfig, inkling_dspark_of, inkling_gguf
 from models.inkling2.inkling import Inkling, NpuInkling
 from models.sampling import Sampling
 
@@ -29,12 +33,24 @@ from .test_npu import TEXT_PROMPTS
 pytestmark = pytest.mark.slow  # the whole GGUF model
 
 
-def _paths() -> tuple[str, str]:
+FORMS = ("mainline", "unsloth")
+
+
+def _paths(form: str = "") -> tuple[str, str]:
+    """The model and its drafter (``form``: the first ``dspark-*.gguf`` beside the drafter that the model takes whose
+    form it is)."""
     path = inkling_gguf()
     require(path)
     dpath = inkling_dspark_of(path)
     if dpath is None:
         pytest.skip(f"no DSpark drafter beside {path}")
+    if form:
+        d = os.path.dirname(dpath)
+        files = [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.startswith("dspark-") and f.endswith(".gguf")]
+        dpath = next((f for f in files if InklingDSparkConfig.from_gguf(GGUFFile(f)).mainline == (form == "mainline")),
+                     None)
+        if dpath is None:
+            pytest.skip(f"no DSpark drafter of the {form} form beside {path}")
     return path, dpath
 
 
@@ -43,10 +59,11 @@ def _rel(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.sqrt(((a - b) ** 2).sum() / (b ** 2).sum()))
 
 
-@pytest.fixture(scope="module")
-def run() -> tuple[NpuInkling, list[int], np.ndarray]:
-    """The model with its drafter, an essay's first 44 tokens as decode steps and their taps (the model's steps')."""
-    path, dpath = _paths()
+@pytest.fixture(scope="module", params=FORMS)
+def run(request: pytest.FixtureRequest) -> tuple[NpuInkling, list[int], np.ndarray]:
+    """The model with its drafter (of each form), an essay's first 44 tokens as decode steps and their taps (the model's
+    steps')."""
+    path, dpath = _paths(request.param)
     m = NpuInkling(GGUFFile(path), capacity=2048, dspark=dpath)
     toks = llama_tokenize(path, essay("founders.txt"))[:45]
     rows = []
@@ -70,7 +87,7 @@ def test_taps(run: tuple[NpuInkling, list[int], np.ndarray]) -> None:
 def test_block(run: tuple[NpuInkling, list[int], np.ndarray]) -> None:
     """Injections of 44 positions in steps of 4, a block at 44: against the reference on the same taps."""
     m, toks, taps = run
-    path, dpath = _paths()
+    path, dpath = _paths()[0], m.dspark.gguf.path
     d = m.dspark
     d.reset()
     for q in range(0, 44, 4):

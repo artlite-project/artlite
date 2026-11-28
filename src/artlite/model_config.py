@@ -318,20 +318,22 @@ def flint_gguf(quant: str = "int4") -> str:
     return os.path.join(MODELS_DIR, FLINT_FILES[quant])
 
 
-# (unsloth's repository: its root files the ``inkling2`` layout, ``Mainline_Support/``'s ``inkling2_loop``)
+# (unsloth's repository: its root and ``Mainline_Support/`` files the ``inkling2_loop`` layout, ``Old_Support/``'s
+# ``inkling2``)
 INKLING_REPO = "unsloth/Inkling-2-Mini-GGUF"
 
 
 def inkling_gguf(quant: str = "UD-Q4_K_XL") -> str:
     """An Inkling 2 Mini file of unsloth's repository (``quant``: "UD-Q4_K_XL", "UD-IQ1_S", ...), in its root: either
-    layout (``InklingConfig``; the ``Mainline_Support/`` files, renamed to .gguf, too)."""
+    layout (``InklingConfig``; the ``Old_Support/`` files, renamed to .gguf, too)."""
     return os.path.join(MODELS_DIR, INKLING_REPO, f"Inkling-2-Mini-{quant}.gguf")
 
 
 def _inkling_dirs(model: str) -> list[str]:
-    """(where an Inkling file's companions are: its directory, and the repository's root above ``Mainline_Support``)"""
+    """(where an Inkling file's companions are: its directory, and the repository's root above ``Mainline_Support`` or
+    ``Old_Support``)"""
     d = os.path.dirname(os.path.abspath(model))
-    return [d] + ([os.path.dirname(d)] if os.path.basename(d) == "Mainline_Support" else [])
+    return [d] + ([os.path.dirname(d)] if os.path.basename(d) in ("Mainline_Support", "Old_Support") else [])
 
 
 def inkling_dspark_of(model: str) -> str | None:
@@ -909,9 +911,9 @@ class Visit:
 
 @dataclass(frozen=True)
 class InklingConfig:
-    """Architecture of Thinking Machines' Inkling 2 (GGUF ``inkling2_loop``: ggml-org's and unsloth's
-    ``Mainline_Support`` files; unsloth's root files, ``inkling2`` with ``num_loops``, map onto it: ``layout``), from
-    the metadata of its GGUF file (llama.cpp's ``src/models/inkling2.cpp``, ``inkling2-loop.cpp``).
+    """Architecture of Thinking Machines' Inkling 2 (GGUF ``inkling2_loop``: ggml-org's and unsloth's root and
+    ``Mainline_Support`` files; unsloth's ``Old_Support`` files, ``inkling2`` with ``num_loops``, map onto it:
+    ``layout``), from the metadata of its GGUF file (llama.cpp's ``src/models/inkling2.cpp``, ``inkling2-loop.cpp``).
 
     ``num_hidden_layers`` physical layers in blocks of ``block_size``; the loop core (layers ``core_start`` ..
     ``core_end`` - 1) runs ``passes`` times: a token visits the prelude, the core ``passes`` times, the coda
@@ -1348,10 +1350,16 @@ class InklingDSparkConfig:
     dense layers of ``hidden`` (SiLU GLU of ``ffn``; ``heads`` query heads over ``kv_heads`` KV heads of ``head_dim``,
     q / k RMS-normed per head, NeoX RoPE of base ``rope_base`` on all dims), each a ``local`` one (its keys the
     ``window`` positions before a block's anchor) or a full one (all of them), a block of ``block`` rows (the anchor's
-    normed embedding, then ``mask_embd``) that sees its keys and itself whole; ``taps``: the model's visits whose
+    normed embedding, then the mask rows) that sees its keys and itself whole; ``taps``: the model's visits whose
     residual feeds its cache (``Visit.index``; ``len(visits)``: the final normed state), mixed per layer and for the
-    Markov head by the rows of ``dspark_fuse``; the Markov head's ``rank``; its logits softcapped at ``softcap`` over
-    the head's ``vocab_padded`` rows, of which the first ``vocab_size`` are tokens."""
+    Markov head; the Markov head's ``rank``; its logits softcapped at ``softcap`` over the ``vocab_size`` tokens.
+
+    The file has one of two forms of the same weights. Unsloth's: the taps' mixes as the softmax of ``dspark_fuse``'s
+    rows, one ``mask_embd``, ``dspark_hidden_out`` (the Markov head's latent into the hidden, then the model's head),
+    ``markov_w1`` with the head's padding rows. ``mainline`` (llama.cpp's, ``has_markov_context``): the mixes' weights
+    themselves (``blk.L.ctx_mix``, ``markov_ctx_mix``), a mask row per block row, ``markov_w2`` (the model's head folded
+    with ``dspark_hidden_out``: a row per token, and its bias), ``markov_w1`` of the tokens' rows, and its
+    ``sliding_window`` counts the anchor too (llama.cpp's window)."""
 
     layers: int
     hidden: int
@@ -1364,11 +1372,11 @@ class InklingDSparkConfig:
     local: tuple[bool, ...]
     taps: tuple[int, ...]
     vocab_size: int
-    vocab_padded: int
     rank: int
     rms_norm_eps: float
     rope_base: float
     softcap: float
+    mainline: bool
 
     @property
     def hidden_size(self) -> int:
@@ -1376,21 +1384,25 @@ class InklingDSparkConfig:
 
     @classmethod
     def from_gguf(cls, gguf: Any) -> InklingDSparkConfig:
-        """From an ``artlite.gguf_model.GGUFFile``."""
+        """From an ``artlite.gguf_model.GGUFFile`` (either form)."""
         assert gguf.arch == "dflash" and "joint_proj.weight" in gguf, f"{gguf.path}: not an Inkling DSpark drafter"
         m = gguf.arch_meta
         n = int(m("block_count"))
+        mainline = bool(m("has_markov_context", False))
+        weights = ("blk.0.ctx_mix.weight", "markov_ctx_mix.weight", "markov_w2.weight") if mainline else \
+            ("dspark_fuse.weight", "dspark_hidden_out.weight")
         assert not m("sample_from_anchor", False) and not m("has_confidence_head", False) and \
-            not m("attention.causal", False), f"{gguf.path}: another DSpark form"
+            not m("attention.causal", False) and all(w in gguf for w in weights), f"{gguf.path}: another DSpark form"
+        w1 = gguf.tensor("markov_w1.weight")  # (rows: tokens, padded in unsloth's form; columns: the rank)
         return cls(layers=n, hidden=int(m("embedding_length")), ffn=int(m("feed_forward_length")),
                    heads=int(m("attention.head_count")), kv_heads=int(m("attention.head_count_kv")),
                    head_dim=int(m("attention.key_length")), block=int(m("block_size")),
-                   window=int(m("attention.sliding_window")),
+                   window=int(m("attention.sliding_window")) - mainline,
                    local=tuple(bool(x) for x in m("attention.sliding_window_pattern")),
-                   taps=tuple(int(x) for x in m("target_layers")), vocab_size=int(m("vocab_size_unpadded")),
-                   vocab_padded=int(m("vocab_size")), rank=int(m("dspark.markov_rank")),
+                   taps=tuple(int(x) for x in m("target_layers")),
+                   vocab_size=w1.rows if mainline else int(m("vocab_size_unpadded")), rank=w1.cols,
                    rms_norm_eps=float(m("attention.layer_norm_rms_epsilon")), rope_base=float(m("rope.freq_base")),
-                   softcap=float(m("final_logit_softcapping", 0.0)))
+                   softcap=float(m("final_logit_softcapping", 0.0)), mainline=mainline)
 
     def rope_theta(self, positions: np.ndarray | range | list) -> np.ndarray:
         """(n, head_dim / 2) float32 angles of positions (``DFlashConfig.rope_theta``'s)."""

@@ -18,13 +18,15 @@ $ARTLITE_MODELS_DIR/unsloth/Inkling-2-Mini-GGUF/        unsloth/Inkling-2-Mini-G
     mmproj-F16.gguf                                     (its vision encoder: optional, for images)
 ```
 
-Either layout of a file: the repository's root (`inkling2`) or its `Mainline_Support/` directory (mainline llama.cpp's
-`inkling2_loop`, the `.gguf_file` renamed to `.gguf`).
+Either layout of a file: mainline llama.cpp's `inkling2_loop` (the repository's root, and its `Mainline_Support/`
+directory) or unsloth's looped `inkling2` (its `Old_Support/` directory; a `.gguf_file` there renamed to `.gguf`).
 
 The drafter is the first `dspark-*.gguf` beside the model file (or in the repository's root, or a `dspark/` directory
 there; Q8_0 first) whose vocabulary and hidden size are the model's; `--spec-type none` runs without it,
-`-md FILE` names another (its drafts come from the screened LM head: with `ARTLITE_LM_SCREEN=0` it is left out). The
-models directory: [Installation](../install.md#models-directory).
+`-md FILE` names another (its drafts come from the screened LM head: with `ARTLITE_LM_SCREEN=0` it is left out). Its
+file in either form: mainline llama.cpp's (the root's `dspark-Inkling-2-Mini-Q8_0.gguf`) or unsloth's
+(`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, `dspark/dspark-Inkling-2-Mini-BF16.gguf`), the same weights.
+The models directory: [Installation](../install.md#models-directory).
 
 ## Thinking and tools
 

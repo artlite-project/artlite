@@ -4,14 +4,15 @@ the model's (its embedding and ``token_embd_norm``, its LM head).
 
 ``Drafter`` holds per layer the K / V of the positions it was given: ``inject`` takes the model's taps of positions
 (``taps``: (n, 4, hidden), the residual entering the visits ``cfg.taps`` and the final normed state; ``ref.Model``'s:
-``model_taps``), mixes them per layer (``context``: the softmax of ``dspark_fuse``'s row, RMS-normed with the layer's
-``dflare_norm``) and stores K (``attn_k_ctx``, per head RMS-normed with ``attn_k_ctx_norm``, rotated) and V
-(``attn_v_ctx``). ``block`` runs a block at P: rows [the anchor's normed embedding, ``mask_embd`` x 7] at P .. P + 7
+``model_taps``), mixes them per layer (``context``: ``dspark_image.mix_weights``, RMS-normed with the layer's
+``ctx_norm``) and stores K (``attn_k_ctx``, per head RMS-normed with ``attn_k_ctx_norm``, rotated) and V
+(``attn_v_ctx``). ``block`` runs a block at P: rows [the anchor's normed embedding, the 7 mask rows] at P .. P + 7
 through the layers (keys: the local layers' ``window`` positions before P, the full layer's all of them, and the block
 whole), normed by ``output_norm``: the rows' states and their base logits (the model's head). ``drafts`` runs the
 Markov head over rows 1 .. 7 (row i guesses position P + i): a gated recurrent state from the anchor on, each step's
-logits the base ones plus the head of ``dspark_hidden_out``'s projection of its latent, softcapped; greedy over the
-whole vocabulary, or (``top``) over the base logits' top candidates of each row.
+logits the base ones plus the head of ``dspark_hidden_out``'s projection of its latent (the mainline form:
+``markov_w2``'s), softcapped; greedy over the whole vocabulary, or (``top``) over the base logits' top candidates of
+each row.
 """
 
 import numpy as np
@@ -19,6 +20,7 @@ import torch
 
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import InklingConfig, InklingDSparkConfig
+from models.inkling2.dspark_image import ctx_norm, mask_rows, mix_weights
 
 from .ref import Model, State, VisitCache, rms
 
@@ -56,9 +58,8 @@ class Drafter:
         self.cfg = cfg = InklingDSparkConfig.from_gguf(dg)
         self.tcfg = InklingConfig.from_gguf(tg)
         self._w: dict[str, Tensor] = {}
-        f = torch.from_numpy(tensor_f32(dg, "dspark_fuse.weight")).reshape(cfg.layers + 1, len(cfg.taps))
-        self.alpha = torch.softmax(f.double(), -1).float()
-        self.mask = self.vec("mask_embd.weight")
+        self.alpha = torch.from_numpy(mix_weights(dg, cfg))
+        self.mask = torch.from_numpy(mask_rows(dg, cfg).copy())
         self.head: Tensor | None = None  # (the model's LM head (vocab_size, H), read at the first block)
         self.fold: tuple[Tensor, Tensor] | None = None  # (head @ W_ho, head @ b_ho: ``drafts``)
         self.reset()
@@ -88,10 +89,9 @@ class Drafter:
 
     def context(self, taps: Tensor, row: int) -> Tensor:
         """Mix ``row`` of the taps (n, taps, H) -> (n, H): RMS-normed sum alpha_j tap_j times the row's norm weight (a
-        layer's ``dflare_norm``; the Markov head's, row ``layers``: ``dspark_norm``)."""
+        layer's ``ctx_norm``; the Markov head's, row ``layers``)."""
         x = torch.einsum("ntd,t->nd", taps, self.alpha[row])
-        name = f"blk.{row}.dflare_norm.weight" if row < self.cfg.layers else "dspark_norm.weight"
-        return rms(x, self.cfg.rms_norm_eps) * self.vec(name)
+        return rms(x, self.cfg.rms_norm_eps) * self.vec(ctx_norm(self.cfg, row))
 
     def ctx_kv(self, L: int, taps: Tensor, p0: int) -> tuple[Tensor, Tensor]:
         """Layer L's K and V (n, kv heads, head_dim) of positions p0 .. from their taps (n, taps, H)."""
@@ -159,7 +159,7 @@ class Drafter:
     def block(self, anchor: int, P: int) -> tuple[Tensor, Tensor]:
         """A block at P: its rows' states (B, H) (normed by ``output_norm``) and base logits (B, vocab_size) fp32."""
         with torch.no_grad():
-            x = torch.stack([self.embed(anchor), *[self.mask] * (self.cfg.block - 1)])
+            x = torch.cat([self.embed(anchor)[None], self.mask[:self.cfg.block - 1]])
             for L in range(self.cfg.layers):
                 x = self.layer(L, x, P)
             h = rms(x, self.cfg.rms_norm_eps) * self.vec("output_norm.weight")
@@ -170,7 +170,10 @@ class Drafter:
     # ------------------------------------------------------------------
 
     def _fold(self) -> tuple[Tensor, Tensor]:
-        """head @ W_ho (vocab_size, rank) and head @ b_ho (vocab_size,), in fp64 (vLLM's fold)."""
+        """head @ W_ho (vocab_size, rank) and head @ b_ho (vocab_size,), in fp64 (vLLM's fold; the mainline form's
+        ``markov_w2`` and its bias)."""
+        if self.fold is None and self.cfg.mainline:
+            self.fold = self.w("markov_w2.weight"), self.vec("markov_w2.bias")
         if self.fold is None:
             W, bias = self.w("dspark_hidden_out.weight").double(), self.vec("dspark_hidden_out.bias").double()
             head = self._head()

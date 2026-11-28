@@ -139,8 +139,9 @@ def test_root_layout() -> None:
 
 
 def test_files(tmp_path: Path) -> None:
-    """The drafter and the vision tower beside the model, or in the repository's root above ``Mainline_Support`` (Q8_0 /
-    F16 first, ``dspark/`` after); a file that is not one (another projector, another vocabulary) is not taken."""
+    """The drafter and the vision tower beside the model, or in the repository's root above ``Mainline_Support`` or
+    ``Old_Support`` (Q8_0 / F16 first, ``dspark/`` after); a file that is not one (another projector, another
+    vocabulary) is not taken."""
     require(MODEL)
     d, mm = inkling_dspark_of(MODEL), inkling_mmproj_of(MODEL)
     assert os.path.basename(d) == "dspark-Inkling-2-Mini-Q8_0.gguf" and os.path.basename(mm) == "mmproj-F16.gguf"
