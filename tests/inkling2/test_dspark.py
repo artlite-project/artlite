@@ -24,7 +24,7 @@ from artlite.model_config import InklingDSparkConfig, inkling_dspark_of, inkling
 from models.inkling2.inkling import Inkling, NpuInkling
 from models.sampling import Sampling
 
-from ..common import essay
+from ..common import essay, essays
 from ..llama_cpp import llama_tokenize
 from ..model_files import require
 from .dspark_ref import Drafter, model_taps
@@ -159,7 +159,7 @@ def test_rounds(run: tuple[NpuInkling, list[int], np.ndarray], name: str) -> Non
 
 
 def test_prefill() -> None:
-    """A prompt through prefill chunks (the drafter's rows from the chunks' taps, ``InklingPrefill(taps=)``): its
+    """A prompt through prefill chunks (the drafter's records from the chunks' taps, ``InklingPrefill(dspark=)``): its
     records against the same prompt as decode steps', greedy rounds after it = no drafts."""
     path, dpath = _paths()
     toks = llama_tokenize(path, essay("founders.txt"))[:600]
@@ -183,6 +183,30 @@ def test_prefill() -> None:
         texts[drafts] = list(m.generate(logits, 96, Sampling(greedy=True), toks, drafts=drafts))
         print(f"drafts {drafts}: {m.drafted} drafted, {m.accepted} accepted")
     assert texts[3] == texts[0] and m.accepted > 0
+
+
+def test_prefill_ring() -> None:
+    """The drafter's records from prefill chunks on the model's sliding-window rings (40 groups: chunks at the wrap; its
+    local layers on the same ring) = on linear caches after the same chunks, bit for bit: the full layer's of every
+    position, the local layers' of the last window."""
+    path, dpath = _paths()
+    g = GGUFFile(path)
+    toks = llama_tokenize(path, essays())[:3000]
+    W, got = 40, {}
+    for wrap in (W, 0):
+        m = NpuInkling(g, capacity=4096, wrap=wrap, prefill=True, dspark=dpath)
+        chunks, fits, run = [], m.prefill.fits, m.prefill.run
+        m.prefill.fits = lambda T, p0, fits=fits: fits(T, p0) and (p0 // 64) % W + -(-T // 64) <= W  # (the ring's)
+        m.prefill.run = lambda e, p0, T=0, run=run, chunks=chunks: (chunks.append(p0), run(e, p0, T))[1]
+        m.prompt(toks)
+        m._inject()
+        d = m.dspark
+        assert d.next == len(toks) and (not wrap or any(p // 64 % W == 0 for p in chunks[1:])), (d.next, chunks)
+        got[wrap] = [d.read_kv(L, range(0 if not d.cfg.local[L] else len(toks) - d.cfg.window, len(toks)))
+                     for L in d.layers]
+        del m, d
+    for L, (a, b) in enumerate(zip(got[W], got[0], strict=True)):
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1]), L
 
 
 def test_checkpoint() -> None:

@@ -101,10 +101,11 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   step (the LM head's). The experts stream their weights once per chunk: long prompts run in chunks of 8192.
 
 - The DSpark drafter (`dspark.py`, `dspark_image.py`) runs in a separate design and hardware context, with 4 token slots
-  of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step and prompt
-  chunk leaves the model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state),
-  which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other two
-  to the last 1024). A round: one dispatch of the drafter, the injections of the positions since its last round and a
+  of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step leaves the
+  model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state), which the drafter's
+  injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other two to the last 1024); a
+  prompt chunk writes those K / V itself (the taps mixed on the host, the drafter's GEMMs and K / V prep in the chunk's
+  program). A round: one dispatch of the drafter, the injections of the positions since its last round and a
   block of 4 rows (the token, 3 mask rows) through its layers and the model's screened LM head, while the host patches
   the model's step of the round; its Markov head on the host over each row's candidates (their logits exact from the
   file's rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs
@@ -143,8 +144,9 @@ With the DSpark drafter (greedy, 128 tokens after ten chat prompts through the p
 12.1 -> 14.8 tokens/s, an essay's continuation 1.19x, JSON 1.07x, math 1.02x, the other prompts (chat, SQL, a story,
 explanations) 0.98 - 1.01x, where the planner leaves the drafter out after its first rounds; a 32K essay summary 9.8
 -> 9.7 tokens/s. The drafter's work a round ~18 - 25 ms (its block, the head's plane, its Markov head on the host); a
-prompt's drafter rows ~1 ms per 4 tokens (a 1K prompt 2.1 -> 2.4 s, 8K 12.8 -> 15.1 s, 32K +7.8 s). Its drafts accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies):
-code 1.8, math 2.0, prose 2.2, chat 1.0.
+prompt's drafter records ~1% of its time (pp8192 636 against 644 tokens/s; at 1K within the noise). Its drafts
+accepted, teacher-forced on the model's own greedy text (of the 3 a round verifies): code 1.8, math 2.0, prose 2.2, chat
+1.0.
 
 Accuracy against llama.cpp's CPU runs of the same file:
 

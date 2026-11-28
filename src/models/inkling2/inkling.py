@@ -48,7 +48,7 @@ from ..spec_options import drafter_type
 from ..tokenizer import BpeTokenizer, chat_prompt
 from .dspark import DSparkOverlay, MarkovChain
 from .overlay import InklingOverlay
-from .prefill import InklingPrefill
+from .prefill import SUB, InklingPrefill
 
 
 class NpuInkling(OverlayModel):
@@ -92,7 +92,9 @@ class NpuInkling(OverlayModel):
         self.overlay = InklingOverlay(gguf, max_positions=capacity, kv_k=kv_k, wrap=wrap, sequences=sequences, taps=taps)
         if dg is not None and self.overlay.screen is None:  # (its Markov head walks the screened head's candidates)
             raise ValueError("the DSpark drafter drafts from the screened LM head (ARTLITE_LM_SCREEN is off)")
-        self.dspark = DSparkOverlay(self.overlay, dg) if dg is not None else None
+        # (with the prefill: its chunks write the drafter's records, in caches of the model's ring)
+        rings = {"wrap": wrap, "pad": InklingPrefill.MAX_T - SUB} if prefill else {}
+        self.dspark = DSparkOverlay(self.overlay, dg, **rings) if dg is not None else None
         self.drafter = self.dspark
         self.chain: MarkovChain | None = None
         self._pend: dict[int, np.ndarray] = {}  # (position -> its taps (taps, hidden) fp32: ``_rows_of``)
@@ -103,7 +105,7 @@ class NpuInkling(OverlayModel):
         self.cfg = self.overlay.cfg
         self.eos_token_ids = self.cfg.eos_token_ids
         self.softcap = self.cfg.softcap
-        self.prefill = InklingPrefill(self.overlay, taps=taps if dg is not None else ()) if prefill else None
+        self.prefill = InklingPrefill(self.overlay, dspark=self.dspark) if prefill else None
         self._tn = np.asarray(gguf.tensor("token_embd_norm.weight").dequantize(), np.float32).reshape(-1)
         self._open(threads=threads)
         self._w_out = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
@@ -322,15 +324,16 @@ class NpuInkling(OverlayModel):
         return (self._inputs(tokens),)
 
     def _prefill_run(self, args: tuple, T: int, n: int, sets: Sequence[int] | None = None) -> None:
-        """(a drafter's: the chunk's taps wait for it, injected after the chunk)"""
-        p0 = self.position
+        """(the drafter's waiting rows before the chunk injected; the chunk writes its records of the chunk's positions,
+        its last position's taps wait for the next round's f_rnn)"""
+        p0, d = self.position, self.dspark
+        if d is not None and d.next < p0:
+            self._inject(p0)
         super()._prefill_run(args, T, n, sets)
-        if self.dspark is not None:
-            self.dspark.dev.stale = True
-        if self.dspark is not None and self.DRAFTS > 0 and self.prefill.taps_out is not None:
-            for i, row in enumerate(self.prefill.taps_out):
-                self._pend[p0 + i] = row
-            self._inject(p0 + n)
+        if d is not None:
+            if d.next == p0:  # (the drafter follows the sequence)
+                d.next = p0 + n
+            self._pend = {p0 + n - 1: self.prefill.last_tap}
 
     def _chunk_inputs(self, tokens: list[int] | Tokens, *, first: bool) -> tuple:
         """(the chunk's first visit's inputs (n, hidden): ``_inputs``)"""

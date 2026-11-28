@@ -203,7 +203,7 @@ class PrepOperator(ArtcOperator):
                                   stack_size=self.STACK, dynamic_objfifo_lowering=True, while_true=False))
         n_cs, n_kv, n_qs = self.n_cs, self.n_kv, self.n_qs
         uw, qw = s.qunit // 2, s.qh * s.qunit // 2  # (bf16: a Q unit, a column's units of a token group)
-        hb, g2, o2, ow = self.kv_bytes // 2, s.group // 2, s.a_bytes // 2, s.used // 2
+        hb, g2, o2, ow, k0b = self.kv_bytes // 2, s.group // 2, s.a_bytes // 2, s.used // 2, self.kv0 // 2
 
         n_nw = self.nw_bytes(hd) // 2
 
@@ -229,7 +229,7 @@ class PrepOperator(ArtcOperator):
                 oh[c].drain(QS, TensorAccessPattern((n_qs,), c * n_tg * qw, [1, n_tg, s.qh, uw], [0, qw, uw, 1]),
                             group=tg, wait=True)
                 # per group its objects' records (rows of 576 elements: a shim BD's inner dimension <= 1023 words)
-                gh[c].drain(KV, TensorAccessPattern((n_kv,), c * hb, [n_grp, s.objects, ow // 576, 576],
+                gh[c].drain(KV, TensorAccessPattern((n_kv,), c * hb + k0b, [n_grp, s.objects, ow // 576, 576],
                                                     [g2, o2, 576, 1]), offset_parameter=p_kv, group=tg, wait=True)
             tg.finish()
 

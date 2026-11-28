@@ -94,7 +94,9 @@ INK_OBJ = {"o": ("inko", "inkoq")} | {f"down{g}": (f"inkd{g}", f"inkdq{g}") for 
 
 class DSparkOverlay(AttentionOverlay):
     """The DSpark drafter ``gguf`` of the model on overlay ``target`` (``InklingOverlay``; module docstring): ``load``
-    after the target's (its device and weight buffer); ``inject``, ``block`` and ``round`` run steps."""
+    after the target's (its device and weight buffer); ``inject``, ``block`` and ``round`` run steps. ``wrap``: the local
+    layers' ring (groups; default ``WRAP``; the model's prefill writes the records of its chunks: its ring,
+    ``prefill.InklingPrefill``); ``pad``: positions the caches' buffer extends past them (the prefill's slices)."""
 
     CONFIG, IMAGE = InklingDSparkConfig, DSparkImage
     CHAIN = 1
@@ -102,7 +104,7 @@ class DSparkOverlay(AttentionOverlay):
     upto = 0  # (tests: a block's first phases only)
     _injecting = False  # (an injection's step: ``ranges``)
 
-    def __init__(self, target: object, gguf: GGUFFile, *, wrap: int | None = None):
+    def __init__(self, target: object, gguf: GGUFFile, *, wrap: int | None = None, pad: int = 0):
         cfg = InklingDSparkConfig.from_gguf(gguf)
         tc = target.cfg
         if ((cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim) != (tc.hidden_size, tc.num_attention_heads,
@@ -144,6 +146,7 @@ class DSparkOverlay(AttentionOverlay):
         self.screen: Screen | None = None
         if target.screen is not None:  # (the head's exact rows: the model's, against the drafter's output norm)
             self.screen = target.screen
+        self.pad = pad
         self._plan()
 
     # ------------------------------------------------------------------
@@ -193,7 +196,7 @@ class DSparkOverlay(AttentionOverlay):
         self.zero = take("ACT", XB)  # (an F_INK step's history object: plain, unread)
         self.junk = take("ACT", (3 + SLOTS) * 4 * self.H // COLS + 512)  # (its window's and partial sums' drains)
         self.jh = take("ACT", COLS * SLOTS * 2 * 2 * C_LEN)  # ([column][C object 2][slot] of C_LEN bf16)
-        self._plan_caches(self.layers, pad=0)
+        self._plan_caches(self.layers, pad=self.pad // self.pg * self.G * self.T)
         self._sizes()
 
     def state_bytes(self, sp: int) -> int:

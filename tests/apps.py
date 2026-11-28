@@ -187,18 +187,19 @@ def _spark(path: str) -> AppBuild:
 
 def _inkling(path: str) -> AppBuild:
     """Inkling 2's whole step and its prefill (the sliding-window caches linear: ``NpuInkling(prefill=True)``), with its
-    DSpark drafter (``inkling_dspark_of``: the app's default) where its file is: the steps' and the chunks' taps, the
-    drafter's design."""
+    DSpark drafter (``inkling_dspark_of``: the app's default) where its file is: the steps' taps, the chunks' drafter
+    records, the drafter's design."""
     from models.inkling2.dspark import DSparkOverlay
     from models.inkling2.overlay import InklingOverlay
-    from models.inkling2.prefill import InklingPrefill
+    from models.inkling2.prefill import SUB, InklingPrefill
 
     file = inkling_dspark_of(path)
     dg = GGUFFile(file) if file is not None else None
     taps = InklingDSparkConfig.from_gguf(dg).taps[:-1] if dg is not None else ()
     ov = InklingOverlay(GGUFFile(path), max_positions=4096, wrap=0, taps=taps)
-    pf = InklingPrefill(ov, taps=taps)
-    return _built([ov.op, pf.lib, *([DSparkOverlay(ov, dg).op] if dg is not None else [])], pf, ov)
+    ds = DSparkOverlay(ov, dg, wrap=0, pad=InklingPrefill.MAX_T - SUB) if dg is not None else None
+    pf = InklingPrefill(ov, dspark=ds)
+    return _built([ov.op, pf.lib, *([ds.op] if ds is not None else [])], pf, ov)
 
 
 def _sd15(path: str) -> AppBuild:
