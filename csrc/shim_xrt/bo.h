@@ -91,7 +91,8 @@ struct bo {
   // buffer, device2host back.
   void sync(direction dir, size_t size, size_t offset);
   void sync(direction dir);
-  // host2device of 64-byte lines (their byte offsets): a data buffer's line by line, an instruction buffer's span.
+  // host2device of 64-byte lines (their byte offsets): a data buffer's line by line, an instruction buffer's span (a
+  // transaction's patched BD words: its DDR patches, ``ddr_patched``, stay as they were).
   void sync_lines(const int64_t* offsets, size_t count);
   properties get_properties() const;
   // The address the NPU's DMA uses for the first byte (XRT's, not the host's). It exists once the buffer has an XRT

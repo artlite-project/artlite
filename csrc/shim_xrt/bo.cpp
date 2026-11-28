@@ -194,8 +194,12 @@ void bo::sync_lines(const int64_t* offsets, size_t count) {
   const auto [lo, hi] = std::minmax_element(offsets, offsets + count);
   if (*lo < 0 || static_cast<uint64_t>(*hi) >= m_size)
     throw std::out_of_range("bo::sync_lines: a line outside the buffer");
-  if (m_kind == kind::instructions) {  // (one copy of the lines' span)
-    sync(direction::host2device, std::min<size_t>(*hi - *lo + 64, m_size - *lo), static_cast<size_t>(*lo));
+  if (m_kind == kind::instructions) {  // (one copy of the lines' span; a step's patched BD words leave its DDR
+    // patches as they were: ``ddr_patched`` keeps its answer, which a submit asks every step)
+    std::lock_guard guard(m_lock);
+    m_dirty_lo = std::min(m_dirty_lo, static_cast<size_t>(*lo));
+    m_dirty_hi = std::max(m_dirty_hi, std::min<size_t>(static_cast<size_t>(*hi) + 64, m_size));
+    if (m_xrt) flush();
     return;
   }
   artlite::memory::flush_line_offsets(m_host, offsets, count);
