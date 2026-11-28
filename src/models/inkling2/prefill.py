@@ -3,9 +3,17 @@
 continues from what the chunk leaves; the prompt's last token runs as a decode step (``ChunkPrefill.plan``).
 
 The residual stream (fp32 token rows, the prefill's buffers): E (the normed embedding), P (the prelude's output), M0 /
-X0 and M1 / X1 (a pass's mid-core block state and output: the next pass's bank, alternating), CD (the coda's cur). A
-visit's states for its mixes are the block states before it and cur (``ref.Model.walk``'s order of buffers: a block
-visit's input becomes a block state, its output starts a new cur; a pass restarts from P and the prelude's blocks).
+X0 and M1 / X1 (a pass's mid-core block state and output: the next pass's bank, alternating; the coda's cur the M of the
+pass that is not the last's). A visit's states for its mixes are the block states before it and cur (``ref.Model.walk``'s
+order of buffers: a block visit's input becomes a block state, its output starts a new cur; a pass restarts from P and
+the prelude's blocks).
+
+The temporaries that are never alive at once share one buffer (TMP, ``POOLS``): the experts' outputs (Y01, Y2: within
+a visit's MoE, after its gathered norm), a visit's attention side (its inputs' rows and panels, the GEMMs' outputs, the
+attention's, the controllers'; dead once the gathered norm read the FFN's input) and the drafter's (at the chunk's end).
+Not the buffers the host writes before the chunk (FCS) or reads while it writes another (XF), nor those whose zeros
+the bind writes once (QS, DS). A pooled buffer's stale rows can hold any bits: the combine's padding tokens read a
+row of the chunk's own experts (``moe.InkMoE.host_route``).
 
 Per visit v of physical layer L (``prefill.ink_stream``, ``prefill.attn``, ``prefill.gemm``), in sub-chunks of ``SUB``
 tokens where the operator works row by row:
@@ -47,7 +55,7 @@ from artlite.gguf_model import tensor_f32
 from artlite.model_config import InklingConfig
 from artlite.moe.expert_gemm import CHUNK
 from artlite.operators.design import COLS
-from artlite.operators.util import arg_bytes
+from artlite.operators.util import arg_bytes, rup
 from artlite.prefill import attn as PA
 from artlite.prefill import gemm as PG
 from artlite.prefill.attn.ink import RING_BYTES, InkPrepOperator, ink_shape
@@ -61,6 +69,11 @@ from .moe import InkMoE
 from .overlay import HIST_ROWS, KV_PAD, InklingOverlay
 
 SUB = 256  # tokens per sub-chunk (the row operators' and GEMMs' T)
+# (TMP's groups of buffers, each group from TMP's start: the experts' outputs, a visit's attention side, the drafter's)
+POOLS = (("Y01", "Y2"),
+         ("EB", "XM0", "XM1", "XM2", "MS", "XC0", "XC1", "XC2", "XN0", "XN1", "XN2", "DP", "GA", "GB", "GQ", "GK", "GV",
+          "A", "Y", "XR"),
+         ("FMX", "DXN", "DG", "DQS"))
 SMALL = (64, 128)  # chunk sizes with dedicated operators
 ATTN_T = 2048  # an attention item's tokens at most (its 64 passes of 32 queries; a larger chunk's in parts)
 # chunk sizes (the experts' weights once per chunk: a chunk of 8192 tokens moves 0.61 of a 2048-token one's expert chunks
@@ -160,9 +173,9 @@ class InklingPrefill(ChunkPrefill):
             if x.loop >= 1:
                 bank = [f"M{(x.loop - 1) % 2}", f"X{(x.loop - 1) % 2}"]
             new = None
-            if x.block:
+            if x.block:  # (the coda's: the pass buffers that the last pass did not use)
                 new = "P" if x.layer == 0 else f"M{x.loop % 2}" if x.layer == cfg.core_start else \
-                    f"X{x.loop % 2}" if x.layer == mid else "CD"
+                    f"X{x.loop % 2}" if x.layer == mid else f"M{cfg.passes % 2}" if cfg.passes else "CD"
             out[v] = SimpleNamespace(blocks=list(blocks), cur=cur, new=new, bank=bank)
             if x.block:
                 blocks.append(cur)
@@ -282,7 +295,7 @@ class InklingPrefill(ChunkPrefill):
         lq = next(p.layout for (_, n), p in o.plans.items() if n == "q")
         lk = max((p.layout for (_, n), p in o.plans.items() if n == "k"), key=lambda lay: lay.N)
         lv = max((p.layout for (_, n), p in o.plans.items() if n == "v"), key=lambda lay: lay.N)
-        self.rb = {s: 4 * H for s in ("E", "P", "M0", "X0", "M1", "X1", "CD")}
+        self.rb = {s: 4 * H for s in {n for w in self.walk.values() for n in (w.cur, w.new) if n}}  # (the states)
         self.rb |= {"EB": 2 * H, "XM0": 2 * H, "XM1": 2 * H, "XM2": 2 * H, "MS": 2 * H, "XC0": 2 * H, "XC1": 2 * H,
                     "XC2": 2 * H, "XN0": 9 * H // 8, "XN1": 9 * H // 8, "XN2": 9 * H // 8, "DP": 9 * H // 8,
                     "GQ": 2 * lq.N, "GK": 2 * lk.N, "GV": 2 * lv.N, "A": 9 * COLS * 3 * 128 // 8,
@@ -297,6 +310,7 @@ class InklingPrefill(ChunkPrefill):
         if self.ds is not None:  # (FMX: per drafter layer its mix's rows, bf16)
             self.rb |= {"DXN": 9 * H // 8, "DG": max(2 * p.layout.N for p in self.dsz[t].plans.values())}
             self.fmx_l = (self.sizes[-1] + 64) * 2 * H
+        self._pool()
         # static: per physical layer its norm weights (NP: [attn or q, k, v inputs, ones, ffn] x H bf16), its queries (QR: the
         # attention's 3 rows (one used by a sliding-window layer), the FFN's, the 4 messages' x H fp32), its prep's PRM,
         # its E table (EB), its post convs' taps (TP: [2][COLS][4][C] bf16); TAU per position
@@ -306,6 +320,32 @@ class InklingPrefill(ChunkPrefill):
         self.np_w, self.qr_w, self.prm_w = 5 * 2 * H, 8 * 4 * H, 2 * COLS * prep.prm_w
         self.e_w = {k: 2 * self._attns(k, self.sizes[-1])[0].n_e for k in self.kinds}
         self.tp_w = 2 * 2 * COLS * 4 * (H // COLS)
+
+    def _pool(self) -> None:
+        """The pooled buffers' offsets in TMP (``pool``; module docstring): each group of ``POOLS`` from TMP's start, a
+        buffer 4 KB aligned at its largest (a token buffer: the largest chunk and the GEMMs' padding rows)."""
+        size = {name: (self.sizes[-1] + 64) * r for name, r in self.rb.items()} | (self.moe.fixed() if self.moe else {})
+        if self.ds is not None:
+            size |= {"FMX": len(self.ds.layers) * self.fmx_l,
+                     "DQS": max(arg_bytes(pr, 2) for d in self.dsz.values() for pr in d.prep.values())}
+        self.pool: dict[str, int] = {}
+        self.pool_bytes = 0
+        for group in POOLS:
+            o = 0
+            for name in (n for n in group if n in size):
+                self.pool[name] = o
+                o = rup(o + size[name], 4096)
+            self.pool_bytes = max(self.pool_bytes, o)
+
+    def _sl(self, buf: str, off: int, op: object, *, i: int) -> str:
+        """(a pooled buffer's slices: TMP's)"""
+        if buf in self.pool:
+            buf, off = "TMP", self.pool[buf] + off
+        return ChunkPrefill._sl(buf, off, op, i=i)
+
+    def _buf(self, name: str) -> tuple[str, int]:
+        """A buffer's device buffer and byte offset (a pooled one's: TMP's)."""
+        return ("TMP", self.pool[name]) if name in self.pool else (name, 0)
 
     def _np(self, L: int, j: int) -> str:
         o = self.phys[L] * self.np_w + j * 2 * self.H
@@ -507,10 +547,12 @@ class InklingPrefill(ChunkPrefill):
         if self.taps:
             own["QO"] = max(own.get("QO", 0), 4 * self.H)
         if self.ds is not None:
-            nd, pr = len(self.ds.layers), next(iter(self.dsz[max(self.dsz)].prep.values()))
-            own |= {"FMX": nd * self.fmx_l, "DNP": nd * 2 * self.H, "DNW": nd * pr.nw_bytes(self.ds.hd)}
+            nd = len(self.ds.layers)
+            own |= {"DNP": nd * 2 * self.H, "DNW": nd * PA.PrepOperator.nw_bytes(self.ds.hd)}
         for name, b in (self.moe.fixed() if self.moe else {}).items():
-            own[name] = max(own.get(name, 0), b)
+            if name not in self.pool:
+                own[name] = max(own.get(name, 0), b)
+        own["TMP"] = max(own.get("TMP", 0), self.pool_bytes)
 
     def _bind(self) -> None:
         """The norm weights (NP), queries (QR), the preps' constants (PRM), the E tables (EB), the post convs' taps (TP),
@@ -593,10 +635,10 @@ class InklingPrefill(ChunkPrefill):
     @staticmethod
     def ring(max_positions: int) -> int:
         """The sliding-window caches' ring (groups; 0: linear) of an overlay of ``max_positions`` that a prefill runs on:
-        two of the largest chunk (chunks of it start at its multiples, each within one turn: ``fits``), linear where the
-        capacity holds no more (33K positions: 3.4 GB of caches and conv state against 5.8 GB linear; 132K: 6.2 GB against
-        22.6)."""
-        w = 2 * SIZES[-1] // CG
+        the largest chunk (chunks of it start at its multiples, each within one turn: ``fits``; a chunk's padding records
+        clear of the window before its end, ``run``), linear where the capacity holds no more (33K positions: 2.2 GB of
+        caches and conv state against 3.4 GB on a ring of two chunks, 5.8 GB linear; 132K: 5.0 GB against 6.2, 22.6)."""
+        w = SIZES[-1] // CG
         return w if -(-max_positions // CG) > w else 0
 
     def params(self, T: int, p0: int, n: int) -> dict[str, int]:
@@ -620,17 +662,20 @@ class InklingPrefill(ChunkPrefill):
         ov, dev = self.ov, self.ov.dev
         n = e.shape[0]
         T = self._size(n, p0, T)
+        # (the padding's records, past the chunk's last valid position, out of the ring slots of the window before it)
+        assert not self.wrap or T - n <= (self.wrap - 2) * self.shape.pg - self.cfg.sliding_window, (T, n, self.wrap)
         H = self.H
         if "E" in self.own:  # (the mixes' state 0; a slice of visit 0 alone reads only EB)
             ev = dev.view("E")[:4 * T * H].view(np.float32).reshape(T, H)
             ev[:n], ev[n:] = e, 0
             dev.flush("E", 0, 4 * T * H)
-        eb = dev.view("EB")[:2 * T * H].view(bfloat16).reshape(T, H)
+        name, o = self._buf("EB")
+        eb = dev.view(name)[o:o + 2 * T * H].view(bfloat16).reshape(T, H)
         eb[:n], eb[n:] = e.astype(bfloat16), 0
-        dev.flush("EB", 0, 2 * T * H)
+        dev.flush(name, o, 2 * T * H)
         ov.mirror(p0)  # (a ring's window before the chunk across its wrap: the guard)
         hooks = {i: functools.partial(self.moe.host_route, self.vis[v].layer, n=n, T=T, t=self._t(T), xf=xf, dev=dev,
-                                      lib=self.lib) for v, i, xf in self._marks.get(T, ())}
+                                      lib=self.lib, buf=self._buf) for v, i, xf in self._marks.get(T, ())}
         if self.ds is not None:  # (cur when a tap visit starts: after the piece before it; the mixes after XF's)
             self._taps = np.empty((len(self.taps), n, H), np.float32)
             for j, v in enumerate(self.taps):
@@ -662,7 +707,8 @@ class InklingPrefill(ChunkPrefill):
         dev, H, ds = self.ov.dev, self.H, self.ds
         dev.fetch("XF", 0, 2 * n * H)
         xf = dev.view("XF")[:2 * n * H].view(bfloat16).reshape(n, H)
-        fmx = dev.view("FMX")[:len(ds.layers) * self.fmx_l].view(bfloat16).reshape(len(ds.layers), -1, H)
+        name, o = self._buf("FMX")
+        fmx = dev.view(name)[o:o + len(ds.layers) * self.fmx_l].view(bfloat16).reshape(len(ds.layers), -1, H)
         alpha, k = ds.alpha[:len(ds.layers)], len(self.taps)
         for a in range(0, n, rows):
             b = min(n, a + rows)
@@ -677,7 +723,7 @@ class InklingPrefill(ChunkPrefill):
                 self.last_tap = np.concatenate([self._taps[:, n - 1], fin[-1:]])
         fmx[:, n:T] = 0
         for i in range(len(ds.layers)):
-            dev.flush("FMX", i * self.fmx_l, 2 * T * H)
+            dev.flush(name, o + i * self.fmx_l, 2 * T * H)
 
     def state(self, name: str, i: int, n: int) -> np.ndarray:
         """Rows i .. i + n - 1 (n, hidden) fp32 of a state buffer the last chunk left."""

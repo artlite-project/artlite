@@ -21,6 +21,8 @@ panels of rms(x) ffn_norm; XF: the FFN's input x as bf16 rows):
 The buffers are the chunk's, shared by the visits (one visit's block in flight). ``cap``: chunks per column at most
 (a chunk of ``max(sizes)`` tokens: ceil((E + max_t k / CHUNK) / COLS))."""
 
+from collections.abc import Callable
+
 import numpy as np
 
 from artlite import txn
@@ -172,15 +174,18 @@ class InkMoE:
             out.append(dev.view(name)[:n * rb].view(np.float32).reshape(n, COLS, lay.pitch // 2)[:, :, o:o + per])
         return (out[0] + out[1]).reshape(n, self.E)
 
-    def host_route(self, L: int, *, n: int, T: int, t: int, xf: str, dev: object, lib: object) -> MP.Plan:
+    def host_route(self, L: int, *, n: int, T: int, t: int, xf: str, dev: object, lib: object,
+                   buf: Callable[[str], tuple[str, int]] | None = None) -> MP.Plan:
         """Route the n valid tokens of a chunk of T from layer L's logits (LG) and write the block's work (module
-        docstring's step 2): the gathered norm reads XF's rows (``xf``: its buffer)."""
+        docstring's step 2): the gathered norm reads XF's rows (``xf``: its buffer). ``buf``: a buffer name's device
+        buffer and offset (the prefill's pooled buffers)."""
         bias, dsc, gsc = self.tab[L]
         ids, wts = top_k_bias(self.logits(L, n=n, t=t, dev=dev), self.K, bias, dsc)
         plan = MP.Plan.of(ids.astype(np.int32), cap=self.cap, E=self.E)
 
         def addr(name: str, off: int = 0) -> int:
-            return txn.device_address(dev.buffers[name], off, lib._ctx)
+            b, o = buf(name) if buf is not None else (name, 0)
+            return txn.device_address(dev.buffers[b], o + off, lib._ctx)
 
         g = self.gnorm
         px = addr(xf) + 2 * self.H * np.arange(T, dtype=np.int64)
@@ -207,8 +212,8 @@ class InkMoE:
                             out=[v[c * w:(c + 1) * w] for c in range(COLS)])
             for c, x in enumerate(res):  # (its words, and the marker panel at the column's end)
                 dirty += [(name, 4 * c * w, 4 * len(x)), (name, 4 * ((c + 1) * w - MARKER), 4 * MARKER)]
-        pos = np.zeros((T, self.K), np.int64)
-        pos[:n] = plan.pos
+        pos = np.full((T, self.K), plan.pos[0, 0], np.int64)  # (the padding tokens: a row the chunk's experts write,
+        pos[:n] = plan.pos  # weighted zero: a pooled buffer's other rows hold any bits, NaN among them)
         rows = np.concatenate([addr("Y01") + 2 * u["dn01"].y_offset(pos), addr("Y2") + 2 * u["dn2"].y_offset(pos)], 1)
         cb = self.comb[(T, u["dn01"].y_layout, u["dn2"].y_layout)]
         v = dev.view("CBC").view(np.uint32)

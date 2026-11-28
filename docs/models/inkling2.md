@@ -118,11 +118,13 @@ size: 17.15 GB, UD-Q4_K_M's 16.22 GB (a K of 2304 as two chunks of 1024 and a qu
 UD-Q4_K_M's Q5_K gate / up, 14% over the file's bytes: a quarter chunk's 4 tiles of 13 rows hold 3 windows of 8 gate
 and 8 up rows); nothing is written to disk. A decode step streams 1.09 GB of dense weights and the 8 experts of each
 visit (1.86 GB of expert tiles a token, UD-Q4_K_M's 1.80 GB). The
-sliding-window visits' caches are rings past 16K positions of capacity (16384 positions, two of the prefill's largest
-chunks): they, the full visits' caches and the convs' state take 3.4 GB at 33K positions (each sequence of `-np` its
-own), 6.2 GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The convs' state holds the last
-positions only, so a conversation goes back only to a checkpoint (artlite-server takes them). The drafter: 0.30 GB of
-weights, 36 MB of caches at 4K positions (~140 MB at 33K). With `-np` above 1 the drafter is not loaded.
+sliding-window visits' caches are rings past 8K positions of capacity (8192 positions, the prefill's largest chunk):
+they, the full visits' caches and the convs' state take 2.2 GB at 33K positions (each sequence of `-np` its own), 5.0
+GB at 132K. Without the prefill the rings hold 2048 positions (1.38 GB at 33K). The prefill's own buffers take 1.9 GB
+(its temporaries that are never alive at once share one buffer). The convs' state holds the last positions only, so a
+conversation goes back only to a checkpoint (artlite-server takes them). The drafter: 0.30 GB of weights, 53 MB of
+caches at 4K positions, 184 MB at 33K (with the prefill its sliding-window layers take the model's ring; without it 36
+and 138 MB). With `-np` above 1 the drafter is not loaded.
 
 ## Speed and accuracy (Strix Halo)
 

@@ -150,12 +150,18 @@ def test_moe_block() -> None:
     ov.load()
     pf = InklingPrefill(ov, sizes=(256,), ffn=True).compile().bind()
     ov.reset()
+    dev, rows, route = ov.dev, {}, pf.moe.host_route
+
+    def host_route(L: int, **kw: object) -> object:  # (the FFN's input as the gathered norm reads it: the experts'
+        name, o = pf._buf(kw["xf"])  # outputs share its buffer after it, ``prefill.POOLS``)
+        dev.fetch(name, o, 2 * n * H)
+        rows["XM0"] = dev.view(name)[o:o + 2 * n * H].view(bfloat16).astype(np.float64).reshape(n, H)
+        return route(L, **kw)
+
+    pf.moe.host_route = host_route
     pf.run(x.numpy(), 0, 256)
-    dev = ov.dev
-    rows = {}
-    for name in ("XM0", "DL"):
-        dev.fetch(name, 0, 2 * n * H)
-        rows[name] = dev.view(name)[:2 * n * H].view(bfloat16).astype(np.float64).reshape(n, H)
+    dev.fetch("DL", 0, 2 * n * H)
+    rows["DL"] = dev.view("DL")[:2 * n * H].view(bfloat16).astype(np.float64).reshape(n, H)
     e_in = rel(rows["XM0"], m.out[("ffn_in", 0)].numpy())
     lg = pf.moe.logits(0, n=n, t=256, dev=dev)
     e_lg = rel(lg, m.out[("ffn_moe_logits", 0)].numpy())
