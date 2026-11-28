@@ -22,9 +22,9 @@ mismatch, import failure). Report its output to the user; do not retry blindly.
 
 ## After a successful update
 
-- No cache clearing is needed: RTC cache keys include the `mlir_aie` / `llvm_aie` versions, so kernels recompile
-  automatically. Old `rtc_*` directories in `~/.cache/artlite/` simply become orphaned; delete them to reclaim disk
-  space if desired.
+- No cache clearing is needed: the new wheels get a new toolchain directory in the cache (`tc-<id>/`, named by the
+  wheels' contents), so kernels recompile automatically. `artlite-cache clean --other-toolchains` removes the old
+  wheels' directories.
 - `requires-python` in `pyproject.toml` ends below the first Python version without an `mlir_aie` wheel (uv picks the
   newest allowed Python). Raise it when the new wheels add a Python version, then run `uv lock`.
 - Run the survey: `python -m tests.schedule_ledger record` builds every app's designs with the new wheels (~50 minutes

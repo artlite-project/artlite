@@ -12,7 +12,8 @@
 - **An operator**: run `ARTLITE_MEASURE_II=1 python -c "from artlite.operators import X; X(...).compile()"`, or the
   operator's pytest with the variable set; `ARTLITE_IGNORE_CACHE=1` forces a rebuild. The report gives, per function,
   stack and code size; per loop, the scheduler, II, NS, ZOL, iterations, cost with calls, resource bound, and spills;
-  and the paths of the `.cc`, `.s`, annotated `.s`, and remarks YAML in `~/.cache/artlite/rtc_<hash>/`.
+  and the paths of the `.cc`, `.s`, annotated `.s`, and remarks YAML in `rtc_<hash>/` of the cache
+  (`artlite-cache path`).
 - **A standalone `.cc`** starting with `#include "operators.h"`: call `artlite.measure_ii.measure(path)` (pass
   `clang_cmd` when the operator adds flags).
 - The fields, the printed lines, and which II numbers are real are described in the **measure-ii** skill. In short:

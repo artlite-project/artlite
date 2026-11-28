@@ -1,47 +1,89 @@
-"""The builds (operators/build.py): one cache key per spec, artifacts published whole (no NPU, no toolchain run: the
-tools are replaced by fakes)."""
+"""The builds (operators/build.py): one content-only cache key per spec, artifacts published whole (no NPU, no
+toolchain run: the tools are replaced by fakes)."""
 
 import dataclasses
+import json
 import os
-from importlib.metadata import version
+import time
 
 import pytest
 
+from artlite import cache
 from artlite.operators import build, toolchain
 from artlite.operators.build import IN_PROGRESS, BuildKind, BuildSpec
 
 RTC = BuildSpec(kind=BuildKind.RTC, label="T", source="void f() {}\n", mlir="module {}\n")
 FUSED = BuildSpec(kind=BuildKind.FUSED, label="F", source="void f() {}\n", mlir="module {}\n", expand_load_pdis=True)
-PCH = "/cache/operators/abc.pch"
 
 
-def test_key_fields() -> None:
+@pytest.fixture
+def compiler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compile command whose paths are the only thing a test changes (no toolchain needed)."""
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/venv/clang++", "-O2", "-I/checkout/include"])
+
+
+def test_key_fields(compiler: None) -> None:
     """Every field of a spec that reaches the build is in its key (a field that changed what is built without changing
     the key would serve a stale build)."""
     changes = {
         "source": "void g() {}\n", "mlir": "module { }\n", "clang_flags": ("-DX=1",), "aiecc_flags": ("--x",),
-        "profile_key": ("counters",), "expand_load_pdis": not FUSED.expand_load_pdis,
+        "profile_key": ("counters",),
     }
     for spec in (RTC, FUSED):
-        base = spec.cache_key(PCH)
-        assert spec.cache_key(PCH) == base and spec.cache_key("/cache/operators/other.pch") != base
-        for name, value in changes.items():
-            if (spec.kind, name) in ((BuildKind.FUSED, "profile_key"), (BuildKind.RTC, "expand_load_pdis")):
-                continue  # (a fused design is not profiled; the rtc build has no PDI expansion)
-            assert dataclasses.replace(spec, **{name: value}).cache_key(PCH) != base, (spec.kind, name)
-    assert dataclasses.replace(RTC, label="U").cache_key(PCH) == RTC.cache_key(PCH)  # (the label names, not builds)
-    assert dataclasses.replace(RTC, indirect_calls=(("a", "b"),)).cache_key(PCH) == RTC.cache_key(PCH)  # (a check's)
+        base = spec.cache_key()
+        assert spec.cache_key() == base
+        for name, value in {**changes, "expand_load_pdis": not spec.expand_load_pdis}.items():
+            assert dataclasses.replace(spec, **{name: value}).cache_key() != base, (spec.kind, name)
+    assert RTC.cache_key() != dataclasses.replace(FUSED, expand_load_pdis=False).cache_key()  # (the kinds' outputs)
+    assert dataclasses.replace(RTC, label="U").cache_key() == RTC.cache_key()  # (the label names, not builds)
+    assert dataclasses.replace(RTC, indirect_calls=(("a", "b"),)).cache_key() == RTC.cache_key()  # (a check's)
 
 
-def test_keys_unchanged() -> None:
-    """The key lists of the spec kinds: the builds a cache holds stay found (a change here rebuilds every design)."""
-    flags = toolchain.CORE_LLC_FLAGS
-    assert RTC.cache_key(PCH) == toolchain.cache_key(RTC.source, RTC.mlir, PCH, None, flags)
-    assert FUSED.cache_key(PCH) == toolchain.cache_key(FUSED.source, FUSED.mlir, PCH, version("mlir_aie"),
-                                                       version("llvm_aie"), True, flags)
-    rtc = dataclasses.replace(RTC, clang_flags=("-DX",), aiecc_flags=("--y",), profile_key=("p",))
-    assert rtc.cache_key(PCH) == toolchain.cache_key(rtc.source, "-DX", rtc.mlir, PCH, ("p",), flags, "--y")
-    assert RTC.cache_key(PCH) == "38bc0566d75549e2"  # (the key of the formula before the spec owned it)
+def test_key_is_content_only(compiler: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key holds no paths and no modification times: another checkout or venv with the same headers, a moved cache
+    or a reinstalled toolchain finds the same builds; the headers' contents and the flags count."""
+    base = RTC.cache_key()
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/other/clang++", "-O2", "-I/elsewhere/include"])
+    monkeypatch.setattr(cache, "ROOT", "/moved")
+    assert RTC.cache_key() == base
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/other/clang++", "-O3", "-I/elsewhere/include"])
+    assert RTC.cache_key() != base
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/venv/clang++", "-O2", "-I/checkout/include"])
+    monkeypatch.setattr(build, "headers_key", lambda: "other headers")
+    assert RTC.cache_key() != base
+
+
+class _Dist:
+    def __init__(self, version: str, record: str) -> None:
+        self.version, self._record = version, record
+
+    def read_text(self, name: str) -> str | None:
+        return self._record if name == "RECORD" else None
+
+
+def test_toolchain_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The toolchain's directory is named by the wheels' versions and files: not by the venv (entry scripts, the
+    installer's files), so a reinstall or another venv finds it; a wheel with other files gets another."""
+    record = ("llvm-aie/bin/clang++,sha256=AAA,221704\n../../../bin/aiecc,sha256=VENV1,314\n"
+              "x.dist-info/INSTALLER,sha256=uv,2\nx.dist-info/RECORD,,\nmod/__pycache__/a.pyc,,\n")
+    dists = {"llvm_aie": _Dist("22.0", record), "mlir_aie": _Dist("1.4", record)}
+    monkeypatch.setattr(cache.metadata, "distribution", lambda name: dists[name])
+
+    def tc_id() -> str:
+        cache._toolchain.cache_clear()
+        return cache.toolchain_id()
+
+    try:
+        base = tc_id()
+        dists["mlir_aie"] = _Dist("1.4", record.replace("VENV1", "VENV2").replace("uv", "pip"))
+        assert tc_id() == base
+        dists["mlir_aie"] = _Dist("1.4", record.replace("AAA", "BBB"))
+        assert tc_id() != base
+        dists["mlir_aie"] = _Dist("1.5", record)
+        assert tc_id() != base
+    finally:
+        cache._toolchain.cache_clear()
+    assert cache.record_files(record) == ["llvm-aie/bin/clang++,sha256=AAA,221704"]
 
 
 class FakeTools:
@@ -85,8 +127,7 @@ def tools(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> FakeTools:
     for name, value in {"aiecc": lambda: str(tool), "clangpp": lambda: str(tool), "peano_dir": lambda: "/peano",
                         "clang_cmd_common": lambda: ["clang++"], "run": fake.run, "run_aiecc": fake.run_aiecc}.items():
         monkeypatch.setattr(toolchain, name, value)
-    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path / "cache"))
-    os.makedirs(tmp_path / "cache")
+    monkeypatch.setattr(cache, "ROOT", str(tmp_path / "cache"))
     monkeypatch.setenv("ARTLITE_SKIP_CHECKS", "1")
     monkeypatch.setenv("ARTLITE_IGNORE_CACHE", "0")
     return fake
@@ -102,6 +143,28 @@ def test_build_caches(tools: FakeTools) -> None:
         assert not os.path.exists(os.path.join(work, IN_PROGRESS)), spec.kind
         assert build.build(spec) == work and tools.aiecc_runs == 1
         assert all(os.path.exists(os.path.join(work, f)) for f in outputs)
+        assert os.path.dirname(work) == cache.toolchain_dir().rstrip(os.sep)
+
+
+def test_build_entry(tools: FakeTools, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A build directory says what it holds (``entry.json``), a hit records its use, and aiecc's unstamped copy of a
+    full ELF is not kept."""
+    def run_aiecc(cmd: list[str], *, cwd: str, link_files: object) -> None:
+        FakeTools.run_aiecc(tools, cmd, cwd=cwd, link_files=link_files)
+        os.makedirs(os.path.join(cwd, "design.mlir.prj"), exist_ok=True)
+        for name in ("F.elf", "design.mlir.prj/F.elf.unstamped"):
+            open(os.path.join(cwd, name), "w").close()
+
+    monkeypatch.setattr(toolchain, "run_aiecc", run_aiecc)
+    work = build.build(FUSED)
+    entry = os.path.join(work, cache.ENTRY_JSON)
+    with open(entry) as f:
+        assert {k: v for k, v in json.load(f).items() if k != "created"} == {"kind": "fused", "label": "F"}
+    assert not os.path.exists(os.path.join(work, "design.mlir.prj", "F.elf.unstamped"))
+    old = time.time() - 2 * cache.TOUCH_S
+    os.utime(entry, (old, old))
+    build.build(FUSED)
+    assert os.path.getmtime(entry) > old + cache.TOUCH_S
 
 
 def test_killed_clang_leaves_no_object(tools: FakeTools, tmp_path: object) -> None:
@@ -110,8 +173,8 @@ def test_killed_clang_leaves_no_object(tools: FakeTools, tmp_path: object) -> No
     tools.kill = "clang"
     with pytest.raises(KeyboardInterrupt):
         build.build(RTC)
-    (work,) = [d for d in os.listdir(tmp_path / "cache") if d.startswith("rtc_") and not d.endswith(".lock")]
-    files = os.listdir(tmp_path / "cache" / work)
+    (work,) = [d for d in os.listdir(cache.toolchain_dir()) if d.startswith("rtc_")]
+    files = os.listdir(cache.toolchain_dir(work))
     assert "kernel.o" not in files and not [f for f in files if f.endswith((".tmp.o", ".tmp.su"))], files
     tools.kill = None
     assert os.path.exists(os.path.join(build.build(RTC), "kernel.o"))
@@ -136,7 +199,7 @@ def test_killed_pch_is_built_again(tools: FakeTools, tmp_path: object) -> None:
     tools.kill = "clang"
     with pytest.raises(KeyboardInterrupt):
         build.compile_pch(clang_cmd=["clang++"])
-    pchs = os.listdir(tmp_path / "cache" / "operators")
+    pchs = os.listdir(cache.toolchain_dir("pch"))
     assert not [f for f in pchs if f.endswith(".pch") and not f.endswith(".tmp.pch")], pchs
     tools.kill = None
     assert os.path.exists(build.compile_pch(clang_cmd=["clang++"]))

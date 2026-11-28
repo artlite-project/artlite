@@ -231,7 +231,7 @@ tested without an NPU with the host DMA model ``tests/dma_model.py`` (``tests/ge
 
 `ArtcOperator.compile()` (`src/artlite/operators/build.py`) builds two
 artifacts that Artlite loads directly, cached per content hash in
-`~/.cache/artlite/rtc_<hash>/`:
+`~/.cache/artlite/tc-<toolchain>/rtc_<hash>/` (`artlite-cache path` prints the directory):
 
 - **PDI binary** (`main.pdi`) - the device image (CDOs wrapped by bootgen)
 - **NPU instructions** (`insts.bin`) - shim DMA programming (uint32 arrays)
@@ -256,8 +256,9 @@ operators, or of two configurations of one, is one function; a section lists wha
 (`tests/csrc/CMakeLists.txt`) runs the same `aiecc` step through its `add_aie_target()` function.
 
 The first run of a model compiles its designs, from seconds to a few minutes per model (Stable Diffusion's UNet
-program: about 2 minutes); later runs load them from the cache (`ARTLITE_CACHE_DIR` moves it). Uncached designs
-build in parallel, `ARTLITE_COMPILE_JOBS` at a time (default: the CPU count).
+program: about 2 minutes); later runs load them from the cache (`ARTLITE_CACHE_DIR` moves it; its layout and
+`artlite-cache`: [Installation](install.md#build-cache)). Uncached designs build in parallel, `ARTLITE_COMPILE_JOBS` at a
+time (default: the CPU count).
 
 The map of the code: [Code map](code-map.md).
 

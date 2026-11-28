@@ -46,6 +46,7 @@ artlite-cli = "models.cli:main"
 artlite-bench = "models.bench:main"
 artlite-server = "models.server.main:main"
 artlite-probe = "models.probe:main"
+artlite-cache = "models.cache:main"
 
 [dependency-groups]
 dev = [

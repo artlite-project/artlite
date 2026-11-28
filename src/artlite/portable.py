@@ -22,12 +22,14 @@ WAKE_DISPATCHES = 2 if WINDOWS else 1
 if WINDOWS:
     import msvcrt
 
-    def _lock(fd: int) -> None:
+    def _lock(fd: int, wait: bool = True) -> bool:
         while True:  # (LK_LOCK would retry once a second and give up after 10)
             try:
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                return
+                return True
             except OSError:
+                if not wait:
+                    return False
                 time.sleep(0.02)
 
     def _unlock(fd: int) -> None:
@@ -36,26 +38,44 @@ if WINDOWS:
 else:
     import fcntl
 
-    def _lock(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    def _lock(fd: int, wait: bool = True) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
 
     def _unlock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-@contextlib.contextmanager
-def file_lock(path: str) -> Iterator[None]:
-    """An exclusive lock between processes and threads (each holder opens the file itself): flock, on Windows a lock of
-    the file's first byte (its position, which stays 0)."""
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+def _same_file(fd: int, path: str) -> bool:
     try:
-        _lock(fd)
+        return os.path.samestat(os.fstat(fd), os.stat(path))
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def file_lock(path: str, *, wait: bool = True) -> Iterator[bool]:
+    """An exclusive lock between processes and threads (each holder opens the file itself): flock, on Windows a lock of
+    the file's first byte (its position, which stays 0). The lock is taken only while ``path`` still names the locked
+    file, so a holder may delete the file (``artlite.cache``'s cleaning): a waiter then opens the new one. Yields
+    whether it holds the lock: ``wait=False`` gives up at once when another holder has it (False)."""
+    while True:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
         try:
-            yield
+            if not _lock(fd, wait):
+                yield False
+                return
+            try:
+                if _same_file(fd, path):
+                    yield True
+                    return
+            finally:
+                _unlock(fd)
         finally:
-            _unlock(fd)
-    finally:
-        os.close(fd)
+            os.close(fd)
 
 
 def group_options() -> dict[str, Any]:

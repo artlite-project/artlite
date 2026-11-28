@@ -80,6 +80,7 @@ artlite-bench -m <org>/<repo>/<file>.gguf -p 512,4096 -n 128        # its speeds
 artlite-server -m <org>/<repo>/<file>.gguf                          # OpenAI API + web chat on :8080, as llama-server (NPU)
 artlite-server                                                      # router mode: the models dir's models, one process each
 artlite-probe                                                       # NPU clock, dispatch, DRAM rates: docs/probe.md
+artlite-cache [list | clean -n]                                     # the build cache: sizes, cleaning (no NPU)
 pytest tests/<package>/test_<module>.py -k <config-id>              # needs the NPU
 pytest tests -m smoke                                               # after a change: ~1 min with cached designs (NPU)
 ARTLITE_BACKEND=xrt pytest tests -m smoke                           # the same on the XRT backend (Windows' code path)
@@ -90,8 +91,8 @@ cmake -S . -B build-tests -DARTLITE_BUILD_TESTS=ON && cmake --build build-tests 
   && ctest --test-dir build-tests                                   # C++ runtime gtests (NPU)
 ```
 
-- Rebuild with `--no-deps`: without it uv reinstalls `llvm_aie`, and the new `clang++` timestamp invalidates every
-  cached design.
+- Rebuild with `--no-deps`: without it uv reinstalls `llvm_aie` every time (its wheel's tags). The cached designs
+  survive: the cache is keyed by the wheels' contents (`artlite/cache.py`).
 - `build/` is scikit-build's editable-install tree; configure standalone CMake builds elsewhere (`build-tests/`).
   libdrm and gtest are installed system-wide.
 - The toolchain is pinned in `pyproject.toml` (`mlir_aie`, `llvm_aie` = Peano). `aiecc` is on PATH; Peano's

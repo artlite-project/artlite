@@ -1,8 +1,12 @@
 """Builds: a rendered design (``BuildSpec``) into its cache directory, its artifacts published whole.
 
 ``build`` compiles the kernels (Peano: ``kernel.cc`` -> ``kernel.o``) and the design (``aiecc``: ``design.mlir`` ->
-``main.pdi`` + ``insts.bin``, or a fused design's full ELF) into ``CACHE_DIR/<kind>_<key>/``, ``BuildSpec.cache_key``
-the only key. Builds of one key serialize on a lock file (the later ones find the cache); distinct keys run in parallel.
+``main.pdi`` + ``insts.bin``, or a fused design's full ELF) into ``<kind>_<key>/`` of the toolchain's cache directory
+(``artlite.cache``), ``BuildSpec.cache_key`` the only key. The key holds only contents: the source, the design, the
+compile flags without paths and the headers' contents (``compile_key``), so a reinstalled toolchain, another checkout
+with the same headers or a moved cache finds the same builds (the toolchain itself is the directory's). Builds of one
+key serialize on a lock file (the later ones find the cache); distinct keys run in parallel. A build directory's
+``entry.json`` says what it holds and, by its modification time, when it was last used.
 
 An artifact a later build takes for cached is never a partial one:
 
@@ -13,20 +17,20 @@ An artifact a later build takes for cached is never a partial one:
   killed, leaves it).
 """
 
+import contextlib
+import functools
 import glob
 import os
 import shutil
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib.metadata import version
 
-from .. import portable, profiling, settings
+from .. import cache, profiling, settings
 from . import checks, toolchain
-from .toolchain import AIE_TARGET, CACHE_DIR, CORE_LLC_FLAGS, INCLUDE_DIR, OPERATORS_H
+from .toolchain import AIE_TARGET, CORE_LLC_FLAGS, INCLUDE_DIR, OPERATORS_H
 
-IN_PROGRESS = ".building"
+IN_PROGRESS = cache.IN_PROGRESS
 
 
 class BuildKind(StrEnum):
@@ -69,15 +73,27 @@ class BuildSpec:
         """The files of the build directory the build makes."""
         return ("main.pdi", "insts.bin") if self.kind is BuildKind.RTC else (f"{self.label}.elf",)
 
-    def cache_key(self, pch_path: str) -> str:
-        """The build's key: everything its artifacts depend on (``pch_path``: the precompiled header, a key of the
-        compile command and the headers). A fused design's key also covers the compiler and aiecc flags (both empty in
-        every design today, so the keys of the existing builds are unchanged)."""
-        if self.kind is BuildKind.FUSED:
-            return toolchain.cache_key(self.source, self.mlir, pch_path, version("mlir_aie"), version("llvm_aie"),
-                                       self.expand_load_pdis, CORE_LLC_FLAGS, *self.clang_flags, *self.aiecc_flags)
-        return toolchain.cache_key(self.source, *self.clang_flags, self.mlir, pch_path, self.profile_key,
-                                   CORE_LLC_FLAGS, *self.aiecc_flags)
+    def cache_key(self) -> str:
+        """The build's key: everything its artifacts depend on besides the toolchain (its cache directory's)."""
+        return toolchain.cache_key(self.kind.value, self.source, self.mlir, compile_key(self.clang_cmd),
+                                   self.profile_key, self.expand_load_pdis, CORE_LLC_FLAGS, self.aiecc_flags)
+
+
+@functools.cache
+def headers_key() -> str:
+    """A key of the kernels' headers (``include/*.h``: names and contents)."""
+    parts = []
+    for path in sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h"))):
+        with open(path, "rb") as f:
+            parts += [os.path.basename(path), f.read()]
+    return toolchain.cache_key(*parts)
+
+
+def compile_key(clang_cmd: Sequence[str]) -> str:
+    """What a kernel compile command gives besides its source, without paths: its flags (not the compiler's path and
+    the include directories: the toolchain's cache directory and ``headers_key`` cover what they hold) and the headers'
+    contents."""
+    return toolchain.cache_key(*(a for a in clang_cmd[1:] if not a.startswith("-I")), headers_key())
 
 
 def buildable(spec: BuildSpec) -> bool:
@@ -88,9 +104,11 @@ def buildable(spec: BuildSpec) -> bool:
 
 
 def compile_pch(*, clang_cmd: list[str]) -> str:
-    """The precompiled header of ``operators.h`` for ``clang_cmd`` (built once per key and header contents)."""
-    operators_pch_dir = os.path.join(CACHE_DIR, "operators")
-    os.makedirs(operators_pch_dir, exist_ok=True)
+    """The precompiled header of ``operators.h`` for ``clang_cmd`` (built once per command and headers). Its key keeps
+    the command's paths and the headers' modification times: clang takes a precompiled header only where its input
+    files have the path, size and time it was built from."""
+    pch_dir = cache.toolchain_dir("pch")
+    os.makedirs(pch_dir, exist_ok=True)
 
     # -mllvm codegen args are rejected by the c++-header action; they don't
     # affect the PCH contents, so drop them (only) from the PCH compile.
@@ -102,36 +120,25 @@ def compile_pch(*, clang_cmd: list[str]) -> str:
             continue
         pch_cmd.append(arg)
 
-    aiecc_mtime = os.path.getmtime(toolchain.aiecc())
-    clangpp_mtime = os.path.getmtime(toolchain.clangpp())
     # operators.h and the headers it includes (kernel_lib.h): contents and modification times
-    headers = sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h")))
-    header_keys = []
-    for path in headers:
-        with open(path, "rb") as f:
-            header_keys += [os.path.basename(path), f.read(), os.path.getmtime(path)]
-    pch_hash = toolchain.cache_key(
-        *clang_cmd,
-        *header_keys,
-        version("mlir_aie"),
-        version("llvm_aie"),
-        aiecc_mtime,
-        clangpp_mtime,
-    )
-    operators_pch_path = os.path.join(operators_pch_dir, f"{pch_hash}.pch")
+    mtimes = [os.path.getmtime(p) for p in sorted(glob.glob(os.path.join(INCLUDE_DIR, "*.h")))]
+    pch_hash = toolchain.cache_key(*clang_cmd, headers_key(), mtimes)
+    pch_path = os.path.join(pch_dir, f"{pch_hash}.pch")
     # Lock around the exists-check AND the write: a fast-path read of a
     # partially-written .pch from a parallel process crashes clang.
-    with portable.file_lock(operators_pch_path + ".lock"):
-        if not os.path.exists(operators_pch_path):
-            tmp = os.path.join(operators_pch_dir, f"{pch_hash}.tmp.pch")
+    with cache.lock(f"pch_{pch_hash}"):
+        if os.path.exists(pch_path):
+            cache.touch(pch_path)
+        else:
+            tmp = os.path.join(pch_dir, f"{pch_hash}.tmp.pch")
             try:
                 toolchain.run([*pch_cmd, "-x", "c++-header", OPERATORS_H, "-o", tmp])
-                os.replace(tmp, operators_pch_path)
+                os.replace(tmp, pch_path)
             finally:
                 if os.path.exists(tmp):
                     os.remove(tmp)
 
-    return operators_pch_path
+    return pch_path
 
 
 def compile_kernel(
@@ -188,13 +195,21 @@ def _kernel_and_checks(spec: BuildSpec, *, work_dir: str, pch_path: str, ignore_
                  obj_path=os.path.join(work_dir, "kernel.o") if spec.source else None, indirect=spec.indirect_calls)
 
 
-@contextmanager
+@contextlib.contextmanager
 def _in_progress(work_dir: str) -> Iterator[None]:
     """``IN_PROGRESS`` in ``work_dir`` while the body runs; removed only when it succeeds."""
     with open(os.path.join(work_dir, IN_PROGRESS), "w"):
         pass
     yield
     os.remove(os.path.join(work_dir, IN_PROGRESS))
+
+
+def _drop_copies(spec: BuildSpec, work_dir: str) -> None:
+    """Remove aiecc's copies of the outputs from the project directory: a full ELF's ``<name>.elf.unstamped`` is the
+    ELF before its stamp (the same bytes but 3, without the 38 KB stamp at its end), 16% of a cache of prefill ELFs."""
+    for name in spec.outputs:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(work_dir, "design.mlir.prj", f"{name}.unstamped"))
 
 
 def _write_design(spec: BuildSpec, mlir_path: str, work_dir: str) -> None:
@@ -242,15 +257,15 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
     if not buildable(spec):
         raise RuntimeError(f"{spec.label}: rendered with profiling {spec.profile_key}, this process has "
                            f"{profile_key(profiling.get_config())}")
-    key = spec.cache_key(pch_path)
-    name = f"{spec.kind.value}_{key}"
-    work_dir = os.path.join(CACHE_DIR, name)
-    os.makedirs(work_dir, exist_ok=True)
+    name = f"{spec.kind.value}_{spec.cache_key()}"
+    work_dir = cache.toolchain_dir(name)
     mlir_path = os.path.join(work_dir, "design.mlir")
 
     # Under a per-key lock: concurrent compilation of an identical operator (same cache dir) from parallel
-    # tests/processes otherwise produces corrupted kernel.o / design.mlir.prj artifacts.
-    with portable.file_lock(os.path.join(CACHE_DIR, f"{name}.lock")):
+    # tests/processes otherwise produces corrupted kernel.o / design.mlir.prj artifacts. (The directory is made under
+    # it: a cleaning removes directories under their locks.)
+    with cache.lock(name):
+        os.makedirs(work_dir, exist_ok=True)
         redo = (ignore_cache or os.path.exists(os.path.join(work_dir, IN_PROGRESS))
                 or not all(os.path.exists(os.path.join(work_dir, f)) for f in spec.outputs))
         if redo:
@@ -259,7 +274,11 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
                 cmd = _aiecc_cmd(spec, aiecc_jobs=aiecc_jobs, work_dir=work_dir, mlir_path=mlir_path)
                 toolchain.run_aiecc(cmd, cwd=work_dir, link_files=lambda: _kernel_and_checks(
                     spec, work_dir=work_dir, pch_path=pch_path, ignore_cache=ignore_cache, measure=measure))
+                _drop_copies(spec, work_dir)
+            cache.write_entry(work_dir, spec.kind.value, spec.label)
+            cache.note_build()
         else:
+            cache.touch_entry(work_dir)
             if spec.kind is BuildKind.FUSED or not os.path.exists(mlir_path):
                 _write_design(spec, mlir_path, work_dir)
             if spec.source:

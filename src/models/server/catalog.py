@@ -39,10 +39,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from artlite import cache as cache_dir
 from artlite import settings
 from artlite.formats import has_tile_format
 from artlite.hf_model import has_vision_tower, is_checkpoint, open_weights
-from artlite.operators.toolchain import CACHE_DIR
 
 from .. import ARCHITECTURES, model_class
 from .cli_options import FILES, MODEL, ROUTER, env_name
@@ -222,13 +222,15 @@ def render(options: dict[str, Any], parser: argparse.ArgumentParser) -> list[str
 class Catalog:
     """The models of a directory (``models_dir``) and a preset file (``preset``): ``scan`` reads them (a thread's
     work: it reads files), ``find`` resolves a name. ``options``: the command line's options of the models' servers
-    (dest -> value), over a preset's; ``cache``: the cache directory."""
+    (dest -> value), over a preset's; ``cache``: the directory of the model index (default: the cache's
+    ``common/server``)."""
 
     def __init__(self, models_dir: str, *, parser: argparse.ArgumentParser, preset: str | None = None,
-                 options: dict[str, Any] | None = None, cache: str = CACHE_DIR):
+                 options: dict[str, Any] | None = None, cache: str | None = None):
         self.models_dir = os.path.abspath(models_dir)
         self.parser, self.preset, self.options = parser, preset, dict(options or {})
-        self.cache_file = os.path.join(cache, "server", "models.json")
+        self.cache_file = (os.path.join(cache, "models.json") if cache is not None
+                           else cache_dir.adopt(cache_dir.common("server", "models.json"), "server", "models.json"))
         self.entries: dict[str, Entry] = {}
         self._names: dict[str, Entry] = {}
         self._cache: dict[str, Any] = {}

@@ -2,18 +2,20 @@
 
 ``compile()`` / ``compile_all`` must render an operator (``build_spec``: Python and aie.iron) to find its build's
 cache key, and for a FusedOperator of many designs that costs seconds even when everything is built (the 27B qwen35
-prefill ELFs: 11.7 s). The manifest (``CACHE_DIR/render/<key>.json``) maps a key of what a render depends on to the
-build directory it produced:
+prefill ELFs: 11.7 s). The manifest (``render/<key>.json`` in the toolchain's cache directory, ``artlite.cache``)
+maps a key of what a render depends on to the build directory it produced:
 
 - an ArtcOperator: its class (module, qualified name) and constructor arguments (``ArtcOperator.__new__`` records
   them), its clang flags;
 - a fused ELF (``FusedOperator``, ``Library``): its operators' keys, the runlist (which operator object, buffer
   names) and what else its render depends on (``render_args``);
 - a hash of the artlite and models packages' sources (and of the files defining the classes involved, for classes
-  defined outside them, with the user-code files their modules import from), the toolchain's versions and
-  modification times (as the builds' keys).
+  defined outside them, with the user-code files their modules import from) and the Python version. (The toolchain is
+  the directory's.)
 
-A hit attaches the build directory (when its artifacts are there: a fused ELF's ``artifacts``).
+A hit attaches the build directory (when its artifacts are there: a fused ELF's ``artifacts``) and records a use of
+both. An entry also holds its render's identity, the key without the sources' hash (``identity``): the cache's cleaning
+takes a build whose every entry has a more recently used one of the same identity for superseded.
 Rendered every time (no key): an argument the key cannot describe (a function, an object without plain data, an
 array above 16 MB), a method replaced on the instance or on a class by a function from another module (variant
 builds, experiments), profiling, a switch that changes what a build gives (``settings.BUILD_SWITCHES``:
@@ -33,15 +35,12 @@ import os
 import sys
 import threading
 import types
-from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from .. import profiling, settings
-from . import toolchain
+from .. import cache, profiling, settings
 from .base import ArtcOperator
-from .toolchain import CACHE_DIR
 
 if TYPE_CHECKING:
     from .fused.elf import FusedElf
@@ -196,21 +195,24 @@ def _fused_key(f: FusedElf) -> str | None:
     return "fused_" + hashlib.sha256(repr(desc).encode()).hexdigest()[:32]
 
 
-def _key(op: ArtcOperator | FusedElf) -> str | None:
-    """The manifest key of a render, None: render it."""
+def identity(op: ArtcOperator | FusedElf) -> str | None:
+    """The identity of a render: what it is made of without the code that renders it (the key without the sources'
+    hash), None: rendered every time."""
     if profiling.get_config() is not None or any(s.get() for s in settings.BUILD_SWITCHES):
         return None
-    k = _op_key(op) if isinstance(op, ArtcOperator) else _fused_key(op)
+    return _op_key(op) if isinstance(op, ArtcOperator) else _fused_key(op)
+
+
+def _key(op: ArtcOperator | FusedElf) -> str | None:
+    """The manifest key of a render, None: render it."""
+    k = identity(op)
     if k is None:
         return None
-    # (the builds' keys: also the tools' modification times, a reinstalled or locally built toolchain)
-    versions = (_sources(), version("mlir_aie"), version("llvm_aie"), os.path.getmtime(toolchain.aiecc()),
-                os.path.getmtime(toolchain.clangpp()), sys.version_info[:2])
-    return hashlib.sha256(repr((k, versions)).encode()).hexdigest()[:32]
+    return hashlib.sha256(repr((k, _sources(), sys.version_info[:2])).encode()).hexdigest()[:32]
 
 
 def _path(key: str) -> str:
-    return os.path.join(CACHE_DIR, "render", f"{key}.json")
+    return cache.toolchain_dir("render", f"{key}.json")
 
 
 def lookup(op: ArtcOperator | FusedElf) -> str | None:
@@ -218,15 +220,18 @@ def lookup(op: ArtcOperator | FusedElf) -> str | None:
     key = _key(op)
     if key is None:
         return None
+    path = _path(key)
     try:
-        with open(_path(key)) as f:
+        with open(path) as f:
             entry = json.load(f)
-    except (OSError, ValueError):
+        work_dir = cache.toolchain_dir(entry["work_dir"])
+    except (OSError, ValueError, KeyError, TypeError):
         return None
-    work_dir = os.path.join(CACHE_DIR, entry["work_dir"])
     artifacts = ("main.pdi", "insts.bin") if isinstance(op, ArtcOperator) else op.artifacts
     if not all(os.path.exists(os.path.join(work_dir, n)) for n in artifacts):
         return None
+    cache.touch(path)
+    cache.touch_entry(work_dir)
     return work_dir
 
 
@@ -235,7 +240,8 @@ def store(op: ArtcOperator | FusedElf, work_dir: str) -> None:
     key = _key(op)
     if key is None:
         return
-    entry: dict[str, Any] = {"work_dir": os.path.relpath(work_dir, CACHE_DIR)}
+    entry: dict[str, Any] = {"work_dir": os.path.relpath(work_dir, cache.toolchain_dir()), "identity": identity(op),
+                             "label": type(op).__name__ if isinstance(op, ArtcOperator) else op.name}
     path = _path(key)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"

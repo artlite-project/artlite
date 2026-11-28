@@ -190,7 +190,7 @@ def fake_vision(cache: str | None = None) -> Iterator[_Log]:
             for name in ("load_state", "save_state"):
                 stack.enter_context(mock.patch.object(shell, name, lambda *a, **kw: None))
         else:
-            stack.enter_context(mock.patch.object(state, "CACHE_DIR", cache))
+            stack.enter_context(mock.patch.object(state, "root", lambda: cache))
         yield log
 
 

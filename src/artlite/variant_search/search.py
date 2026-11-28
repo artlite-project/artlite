@@ -107,7 +107,7 @@ def search(
     totals: other functions reported by their cycles per call (e.g. the kernel entry point).
     The post-pipeliner trace (debug llvm-aie) is taken for variants with an unpipelined one-block target loop, or
     for all with why. A patch that does not apply raises ValueError before anything compiles."""
-    from ..operators.toolchain import CACHE_DIR
+    from .. import cache
 
     functions = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in functions]
     totals = [re.sub(r"_[0-9a-f]{8}$", "", f) for f in totals]
@@ -117,7 +117,7 @@ def search(
     rendered = [render_variant(factory, kwargs, variant, functions=functions) for variant in variants]
     builds = [(r.source, r.clang_cmd) for r in rendered]
     key = hashlib.sha256(repr((factory_label(factory, kwargs), builds)).encode()).hexdigest()[:12]
-    out = Path(out_dir) if out_dir is not None else Path(CACHE_DIR) / "variant_search" / key
+    out = Path(out_dir) if out_dir is not None else Path(cache.toolchain_dir("variant_search", key))
     results = []
     by_source: dict[tuple[str, tuple[str, ...]], VariantResult] = {}
     for variant, item in zip(variants, rendered):

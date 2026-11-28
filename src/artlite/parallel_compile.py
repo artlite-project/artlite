@@ -5,8 +5,8 @@ Compiling an operator has two parts:
 - **rendering** (``build_spec()``): Python builds the kernel source and the MLIR design. aie.iron is
   not thread-safe, so this runs in the calling thread. The result is a ``BuildSpec`` of plain
   strings (picklable, hashable).
-- **building** (``operators.build.build``): clang++ and aiecc subprocesses write
-  ``CACHE_DIR/<kind>_<key>/``. Concurrent builds of one key wait for each other on a lock file and
+- **building** (``operators.build.build``): clang++ and aiecc subprocesses write ``<kind>_<key>/`` in the
+  toolchain's cache directory (``artlite.cache``). Concurrent builds of one key wait for each other on a lock file and
   then find the cache, so a build may run in any thread or process.
 
 This module runs the builds on one process-wide pool of ``jobs()`` threads (``ARTLITE_COMPILE_JOBS``,

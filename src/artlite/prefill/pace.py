@@ -3,7 +3,7 @@ laptops asserts PROCHOT while those GEMMs run at full rate, and the whole SoC th
 Point laptop's Q4_K GEMMs 2.3x slower, on any power source), while at a lower duty they run unthrottled.
 
 ``resolve`` finds a prefill's ``PACE`` word by timing, once per machine, power source, platform profile and library
-(``CACHE``). Every pace class runs alone at level 0 and at the ``PROBE`` levels: a throttle is a class's own (that
+(``_path``). Every pace class runs alone at level 0 and at the ``PROBE`` levels: a throttle is a class's own (that
 laptop's Q4_K GEMMs trip it, the Q6_K ones beside them do not, and pacing hardly changes their time), so no class stands
 for the others, not even one with the most work (Llama 3.1 8B Q4_K_M's Q6_K down and Qwen3.8 27B Q4_K_M's Q6_K qkv take
 as long as their Q4_K gate / up). A class with a paced level clearly faster than level 0 (``GAIN``) is throttled: it
@@ -41,13 +41,11 @@ from typing import Any
 
 import numpy as np
 
-from .. import _native, settings
+from .. import _native, cache, settings
 from ..gemm.pacing import PACE, PACE_CLASSES, PACE_IDLE, pace_levels, pace_word
 from ..operators.fused.layout import parse_name
-from ..operators.toolchain import CACHE_DIR
 from ..operators.util import arg_bytes
 
-CACHE = os.path.join(CACHE_DIR, "pace.json")
 VERSION = 3  # (of the calibration: a cached entry of another version calibrates again)
 T_MAX = 1024  # tokens of the chunk whose GEMMs calibrate (the largest size up to it)
 ITEMS = 4  # items of a class (more where it has more distinct GEMMs: one of each)
@@ -106,9 +104,14 @@ def machine_key() -> str:
     return "|".join(parts)
 
 
+def _path() -> str:
+    """The calibrations' file (``common/pace.json`` of the cache)."""
+    return cache.adopt(cache.common("pace.json"), "pace.json")
+
+
 def _cache() -> dict[str, Any]:
     try:
-        with open(CACHE) as f:
+        with open(_path()) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -117,11 +120,11 @@ def _cache() -> dict[str, Any]:
 def _store(key: str, entry: dict[str, Any]) -> None:
     data = _cache()
     data[key] = entry
-    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    tmp = f"{CACHE}.{os.getpid()}"
+    path = _path()
+    tmp = f"{path}.{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
-    os.replace(tmp, CACHE)
+    os.replace(tmp, path)
 
 
 def search(classes: list[int], measure: Callable[[list[int] | None, int], float],

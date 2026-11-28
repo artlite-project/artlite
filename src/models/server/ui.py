@@ -28,7 +28,7 @@ from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-from artlite.operators.toolchain import CACHE_DIR
+from artlite import cache as cache_dir
 
 TAG = "b12588"
 SHA256 = "071451d62e20fc4479b58e481fc5f9892dcb71d495dcc00c788040e632e803f6"
@@ -39,11 +39,14 @@ UNCACHED = ("index.html", "service-worker.js", "sw.js", "build.json", "_app/vers
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 
-def fetch(*, tag: str = TAG, sha256: str = SHA256, cache: str = CACHE_DIR, timeout: float = 60.0) -> str:
+def fetch(*, tag: str = TAG, sha256: str = SHA256, cache: str | None = None, timeout: float = 60.0) -> str:
     """The directory of the pinned UI build: the cached copy, else downloaded, verified and unpacked. OSError (or
-    ValueError: a wrong checksum) when it cannot be fetched."""
-    out = os.path.join(cache, "ui", tag)
+    ValueError: a wrong checksum) when it cannot be fetched. ``cache``: the directory of the UI builds (default: the
+    cache's ``common/ui``)."""
+    out = (os.path.join(cache, tag) if cache is not None
+           else cache_dir.adopt(cache_dir.common("ui", tag), "ui", tag))
     if os.path.isfile(os.path.join(out, "index.html")):
+        cache_dir.touch(os.path.join(out, "index.html"))
         return out
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with tempfile.TemporaryDirectory(dir=os.path.dirname(out)) as tmp:
@@ -59,7 +62,7 @@ def fetch(*, tag: str = TAG, sha256: str = SHA256, cache: str = CACHE_DIR, timeo
             t.extractall(files, filter="data")
         if not os.path.isfile(os.path.join(files, "index.html")):
             raise ValueError(f"the UI archive of {tag} has no index.html")
-        shutil.rmtree(out, ignore_errors=True)
+        cache_dir.discard(out)
         os.replace(files, out)
     return out
 

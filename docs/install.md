@@ -64,7 +64,8 @@ uv sync
 uv pip install --no-build-isolation --no-deps -ve .   # the rebuild
 ```
 
-- `--no-deps`: without it uv reinstalls `llvm_aie`, and the new `clang++` timestamp invalidates every cached design.
+- `--no-deps`: without it uv reinstalls `llvm_aie` every time (its wheel's tags make uv take it for outdated). The
+  cached designs survive a reinstall: the cache is keyed by the wheels' contents ([Build cache](#build-cache)).
 - `--no-build-isolation`: builds against the venv's nanobind, so its headers stay for IDEs (an isolated build
   removes them afterwards).
 
@@ -156,10 +157,43 @@ Which files run: [Models](models/README.md).
 
 ## Build cache
 
-The first run of a model compiles its NPU designs into `~/.cache/artlite` (`ARTLITE_CACHE_DIR`), keyed by their
-content: later runs load them. Stable Diffusion's UNet and VAE decoder and the vision encoders (MiniCPM-V's, Qwen3-VL's) also
+The first run of a model compiles its NPU designs into the build cache, `~/.cache/artlite` (`ARTLITE_CACHE_DIR` moves
+it); later runs load them. Stable Diffusion's UNet and VAE decoder and the vision encoders (MiniCPM-V's, Qwen3-VL's) also
 keep their built dispatches there (15-60 MB per model, the latest build only). No weights are cached: every load converts
-them from the model's files. The cache only grows; deleting it is safe (the next runs rebuild what they need).
+them from the model's files.
+
+The cache holds a directory per toolchain, `tc-<id>/`, named by the contents of the installed llvm-aie and mlir-aie
+wheels, and `common/` for what no toolchain builds (math tables, the server's model index and web UI, the prefill's
+pace calibration). A design's build is keyed by its content only, so reinstalling the same wheels or moving the cache
+keeps every build. Each build directory also keeps its intermediate files (`kernel.cc`, `design.mlir`, aiecc's
+`design.mlir.prj/`) for debugging.
+
+`artlite-cache` shows and cleans the cache:
+
+| command | what it does |
+|---|---|
+| `artlite-cache` | each toolchain directory (wheel versions, size, last use) and what a cleaning would remove |
+| `artlite-cache list [--kind K] [--sort size]` | one line per entry: last use, size, kind, label (an ELF's or operator's name), path |
+| `artlite-cache clean [-n]` | runs the automatic cleaning's rules now (below); `-n` only prints what would go |
+| `artlite-cache clean --unused-for 2d` | also entries not used during the last two days (`30m`, `12h`, `1d`, `2w`) |
+| `artlite-cache clean --superseded-for 2h` | superseded entries once unused for two hours |
+| `artlite-cache clean --other-toolchains` | every toolchain directory except the current venv's |
+| `artlite-cache clean --max-size 20G` | then the least recently used entries until the cache fits (never one used in the last hour) |
+| `artlite-cache clean --legacy` | the files of the layout before toolchain directories, now |
+| `artlite-cache clean --all` | everything Artlite owns, the pace calibration and the server's model index included |
+| `artlite-cache path` | the current toolchain's directory |
+
+A process that built a design cleans the cache when it exits, at most once a day, in a separate low-priority process.
+It removes superseded entries (an older version of a design that was built again since, after an Artlite update, an
+edit or a new toolchain) once they have not been used for a day, and every entry not used for 30 days.
+`ARTLITE_CACHE_GC` changes the rules: `off`, or the rules to replace (`superseded=4h,unused=2w,size=30G`; `size` also
+removes the least recently used entries while the cache is larger). `artlite-cache` shows the last automatic cleaning.
+
+A cleaning removes only Artlite's own entries, so the cache may share its directory with other files. It touches only
+directories named `tc-<id>` or `common` that hold Artlite's `CACHEDIR.TAG` (which also makes backup tools skip them),
+and in them only the names of Artlite's entries. It never follows or removes a link, and it leaves an entry whose
+build is running. `artlite-cache` opens no NPU context; only `--all`, `--unused-for 0` and `--other-toolchains`
+(another venv's Artlite may be running) can remove designs a running process uses.
 
 ## Troubleshooting
 

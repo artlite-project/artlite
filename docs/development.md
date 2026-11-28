@@ -70,8 +70,9 @@ How they compile and load: [Design](design.md#kernel-compilation-pipeline); wher
 - Every compile runs `operators/checks.py`: each core's deepest kernel call against its Worker `stack_size`, kernel
   signatures against the design, rounding kernels that do not set the rounding mode, runtime-library arithmetic
   (`ARTLITE_SKIP_CHECKS=1` skips them).
-- Builds are cached per content hash in `~/.cache/artlite/rtc_<hash>/` (inspect the artifacts there;
-  `ARTLITE_CACHE_DIR` moves it, `ARTLITE_IGNORE_CACHE=1` rebuilds). A render manifest (`render_cache.py`, keyed by
+- Builds are cached per content hash in `rtc_<hash>/` of the toolchain's cache directory (`artlite-cache path`;
+  inspect the artifacts there; `ARTLITE_CACHE_DIR` moves the cache, `ARTLITE_IGNORE_CACHE=1` rebuilds; the layout,
+  last use and cleaning: `artlite/cache.py`). A render manifest (`render_cache.py`, keyed by
   class, constructor arguments and the sources' hash) skips rendering cached designs; a module global changed at
   runtime is not in that key, so a monkeypatched test needs distinct operator names.
 - First use (`op.device` or the first dispatch) opens a HW context and uploads the program. `dispatch(*buffers)`
@@ -166,6 +167,7 @@ table is the registry's (`tests/test_settings.py` compares it).
 | `ARTLITE_MODELS_DIR` | the models directory. Read at import. | ~/.artlite/models |
 | `ARTLITE_LLAMA_CPP_DIR` | the llama.cpp CPU build the reference tests load. Read at import. | /src/llama.cpp |
 | `ARTLITE_CACHE_DIR` | the build cache. Read at import. | ~/.cache/artlite |
+| `ARTLITE_CACHE_GC` | the build cache's automatic cleaning, after a process that built something, once a day: `auto` (`superseded=1d,unused=30d`), `off`, or rules that replace some of these (`superseded=4h,size=30G`; also `legacy`, `interval`); `artlite-cache clean` applies them too. | auto |
 | `ARTLITE_BACKEND` | the NPU backend: `xdna` (the amdxdna driver) or `xrt` (XRT). Read at import. | the platform's own (xdna on Linux, xrt on Windows) |
 | `ARTLITE_COMPILE_JOBS` | concurrent design builds (1: serial). | the CPU count |
 | `ARTLITE_IGNORE_CACHE` | rebuild every design instead of loading it from the cache. | off; `1` turns it on |

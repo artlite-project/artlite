@@ -1,21 +1,20 @@
 """A model's built state on the vision overlay's design, cached in a directory per model file: the device's layout, what its
 builds wrote besides the weights (commands, norm parameters, tables), the weight jobs and the models' own state (its
 transactions with their shim addresses as relocations). Restored, a load skips the builds and packs the weights from the
-model's files (``weights.Slots``), as a build does; the cache never holds a copy of the weights."""
+model's files (``weights.Slots``), as a build does; the cache never holds a copy of the weights. The entries live in
+the toolchain's cache directory (``artlite.cache``), so the key leaves the toolchain out."""
 
 from __future__ import annotations
 
 import hashlib
 import os
 import pickle
-import shutil
 from collections.abc import Callable, Mapping
-from importlib.metadata import version
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..operators.toolchain import CACHE_DIR
+from ..cache import discard, toolchain_dir, touch_entry, write_entry
 from .device import VisionDevice
 from .sources import SRC, source_files
 from .weights import Slots, Source
@@ -26,11 +25,16 @@ if TYPE_CHECKING:
 FORMAT = 1  # (the entry's layout: in its key and in its state's dict)
 
 
+def root() -> str:
+    """The directory of the vision states (in the toolchain's cache directory)."""
+    return toolchain_dir("vision")
+
+
 def state_dir(kind: str, path: str, modules: tuple[str, ...], files: list[str]) -> str:
-    """The cache directory of a model's built state: ``CACHE_DIR/kind/<path's digest>/<key>``, the key covering the
-    toolchain, the code that builds the images and transactions (the files ``sources.source_files(*modules)`` derives
-    from the modules' imports: the loader's modules, named by the caller) and the model's ``files`` (size and mtime)."""
-    h = hashlib.sha256(f"{FORMAT} {version('llvm-aie')}".encode())
+    """The cache directory of a model's built state: ``vision/kind/<path's digest>/<key>``, the key covering the code
+    that builds the images and transactions (the files ``sources.source_files(*modules)`` derives from the modules'
+    imports: the loader's modules, named by the caller) and the model's ``files`` (size and mtime)."""
+    h = hashlib.sha256(f"{FORMAT}".encode())
     for f in source_files(*modules):
         h.update(os.path.relpath(f, SRC).encode())
         with open(f, "rb") as fh:
@@ -38,7 +42,7 @@ def state_dir(kind: str, path: str, modules: tuple[str, ...], files: list[str]) 
     for f in files:
         st = os.stat(f)
         h.update(f"{os.path.basename(f)} {st.st_size} {st.st_mtime_ns}".encode())
-    return os.path.join(CACHE_DIR, kind, hashlib.sha256(os.path.abspath(path).encode()).hexdigest()[:12], h.hexdigest()[:16])
+    return os.path.join(root(), kind, hashlib.sha256(os.path.abspath(path).encode()).hexdigest()[:12], h.hexdigest()[:16])
 
 
 def load_state(cache: str, sources: Mapping[str, Source], *,
@@ -62,6 +66,7 @@ def load_state(cache: str, sources: Mapping[str, Source], *,
     for name, off, data in st["writes"]:
         npu.write(name, np.frombuffer(data, np.uint8), off)
     npu.pack_behind(lambda: [Slots.restore(npu, t, r) for t, r in zip(st["slots"], res, strict=True)])
+    touch_entry(cache)
     return npu, st["state"]
 
 
@@ -83,7 +88,8 @@ def save_state(cache: str, npu: VisionDevice, built: list[Built], state: dict) -
     os.makedirs(tmp)
     with open(os.path.join(tmp, "state.pkl"), "wb") as f:
         pickle.dump(st, f, protocol=pickle.HIGHEST_PROTOCOL)
+    write_entry(tmp, "vision", os.path.basename(os.path.dirname(root)))
     for e in os.listdir(root):
         if e != os.path.basename(tmp):
-            shutil.rmtree(os.path.join(root, e), ignore_errors=True)
+            discard(os.path.join(root, e))
     os.replace(tmp, cache)

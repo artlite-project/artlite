@@ -30,9 +30,9 @@ Keys: a function by (section, name), a core row by (design, entry, row): the sam
 do not change) and across a change of shared kernel code (names lose their hashes, sections keep their arguments). A
 name with other code under one key in one app (arguments the detail does not show) keeps its hash.
 
-Measurements are cached (``CACHE_DIR/ledger``) by translation unit, compile command, precompiled header (the headers'
-key), toolchain versions, measure_ii's sources and this module's extraction; core rows by build directory (named by
-content). A warm ledger costs the apps' construction (their builds cached).
+Measurements are cached (``ledger/`` in the toolchain's cache directory, ``artlite.cache``) by translation unit, compile
+command without paths and headers (``build.compile_key``), measure_ii's sources and this module's extraction; core rows
+by build directory (named by content). A warm ledger costs the apps' construction (their builds cached).
 
 Weights (``rank``, ``chunk_weights``): a prefill chunk's items are static (``runlists``), and each item's design runs
 one pass of its cores' main loops, whose bounds and branches are constants or arithmetic on the chunk's scratchpad
@@ -60,12 +60,11 @@ import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from importlib.metadata import version
 from typing import Any
 
 import pytest
 
-from artlite import parallel_compile
+from artlite import cache, parallel_compile
 from artlite.elf_parser import SHF_EXECINSTR, read_object
 from artlite.measure_ii import call_cycles, count_slots, measure
 from artlite.measure_ii.demangle import demangle_short
@@ -78,7 +77,6 @@ from .apps import APPS, AppBuild
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASELINE = os.path.join(HERE, "schedule_ledger.jsonl")
-CACHE = os.path.join(toolchain.CACHE_DIR, "ledger")
 LOW = 256  # bytes of free program memory below which a core row is listed first (a loop newly pipelined: +80..288 B)
 _HASHED = re.compile(r"\b[A-Za-z_]\w*_[0-9a-f]{8}\b")  # (a kernel name: ``kernel_source``)
 _HASH = re.compile(r"(?<=\w)_[0-9a-f]{8}(?![0-9a-f])")
@@ -86,6 +84,13 @@ _ELFS = re.compile(r"elfs_(?:op(\d+)_\w+?|main)_core_(\d+)_(\d+)$")
 _SHARED = "// shared with an earlier section:"
 
 Key = tuple  # ("fn", section, name) | ("core", design, entry, row)
+
+
+def _cache(*parts: str) -> str:
+    """A path in the ledger's cache (``ledger/`` of the toolchain's cache directory), its directory made."""
+    path = cache.toolchain_dir("ledger", *parts)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
 
 
 def section_id(label: str, detail: str) -> str:
@@ -208,14 +213,14 @@ _EXTRACTION = (Section, sections, _place, _calls, extract)
 
 def measured(source: str, clang_cmd: list[str]) -> dict:
     """``extract`` of a translation unit compiled with ``clang_cmd`` (cached)."""
-    pch = build.compile_pch(clang_cmd=clang_cmd)
-    key = toolchain.cache_key(source, *clang_cmd, os.path.basename(pch), version("llvm_aie"), version("mlir_aie"),
-                              _tool_hash())
-    path = os.path.join(CACHE, f"tu_{key}.json")
+    key = toolchain.cache_key(source, build.compile_key(clang_cmd), _tool_hash())
+    path = _cache(f"tu_{key}.json")
     if os.path.exists(path):
+        cache.touch(path)
         with open(path) as f:
             return json.load(f)
-    work = os.path.join(CACHE, "work", key)
+    build.compile_pch(clang_cmd=clang_cmd)
+    work = _cache("work", key)
     os.makedirs(work, exist_ok=True)
     src = os.path.join(work, "kernel.cc")
     with open(src, "w") as f:
@@ -232,8 +237,9 @@ def measured(source: str, clang_cmd: list[str]) -> dict:
 def core_bytes(work_dir: str) -> dict[tuple[int, int, int], int]:
     """Per core ELF of a build ((entry, column, row); entry -1: an operator's own design) the end of its code in program
     memory (cached by the build directory, named by its content)."""
-    path = os.path.join(CACHE, f"cores_{os.path.basename(work_dir.rstrip(os.sep))}.json")
+    path = _cache(f"cores_{os.path.basename(work_dir.rstrip(os.sep))}.json")
     if os.path.exists(path):
+        cache.touch(path)
         with open(path) as f:
             return {tuple(k): v for k, v in json.load(f)}
     prj = os.path.join(work_dir, "design.mlir.prj")
@@ -246,7 +252,6 @@ def core_bytes(work_dir: str) -> dict[tuple[int, int, int], int]:
         end = max((s.addr + len(s.data) for s in obj.sections if s.flags & SHF_EXECINSTR and s.addr < PM_BYTES),
                   default=0)
         out[(int(m.group(1)) if m.group(1) else -1, int(m.group(2)), int(m.group(3)))] = end
-    os.makedirs(CACHE, exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump([[list(k), v] for k, v in out.items()], f)

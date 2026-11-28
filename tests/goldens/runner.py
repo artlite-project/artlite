@@ -1,8 +1,8 @@
 """What every llama.cpp golden shares: a dump tool compiled on first use against the llama.cpp tree of
-``model_config.LLAMA_CPP_DIR`` (into the artlite cache, named by a hash of its source and of the libraries it links), and
-a run's output folder cached under ``tests/refs/<model>/<prefix>_<hash>_<hash>/`` (``--refresh-refs`` recomputes): the
-hashes of a key (the model files' identity, the inputs) and of the tool's source and the libraries; a run writes into a
-temporary folder that replaces the cached one (and its earlier versions) only when it succeeded."""
+``model_config.LLAMA_CPP_DIR`` (into the cache's ``common/goldens``, named by a hash of its source and of the libraries it
+links), and a run's output folder cached under ``tests/refs/<model>/<prefix>_<hash>_<hash>/`` (``--refresh-refs``
+recomputes): the hashes of a key (the model files' identity, the inputs) and of the tool's source and the libraries; a
+run writes into a temporary folder that replaces the cached one (and its earlier versions) only when it succeeded."""
 
 import hashlib
 import os
@@ -11,8 +11,8 @@ import subprocess
 import tempfile
 from collections.abc import Callable
 
+from artlite import cache
 from artlite.model_config import LLAMA_CPP_DIR
-from artlite.operators.toolchain import CACHE_DIR
 
 from .. import common
 from ..llama_cpp import lib_identity, llama_cpp_bin
@@ -24,9 +24,11 @@ def build_tool(name: str, src: str, *, mtmd: bool = False) -> str:
     ident = lib_identity() + (lib_identity("libmtmd.so") if mtmd else "")
     with open(src, "rb") as f:
         key = hashlib.sha256(f.read() + ident.encode()).hexdigest()[:16]
-    path = os.path.join(CACHE_DIR, f"{name}_{key}")
-    if not os.path.exists(path):
-        os.makedirs(CACHE_DIR, exist_ok=True)
+    path = cache.common("goldens", f"{name}_{key}")
+    if os.path.exists(path):
+        cache.touch(path)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         bindir = os.path.dirname(llama_cpp_bin("libllama.so"))
         tmp = f"{path}.{os.getpid()}.tmp"
         cmd = ["g++", "-O2", "-std=c++17", "-Wno-deprecated-declarations"]

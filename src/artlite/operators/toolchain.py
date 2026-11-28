@@ -23,8 +23,6 @@ PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # (th
 INCLUDE_DIR = os.path.join(PACKAGE_DIR, "include")  # the kernels' headers
 OPERATORS_H = os.path.join(INCLUDE_DIR, "operators.h")
 
-CACHE_DIR = settings.CACHE_DIR.get()
-
 # AIE target triple for Peano cross-compiler: aie2p = AIE-ML v2 (NPU2: Strix Point, Strix Halo, Krackan)
 AIE_TARGET = "aie2p-none-unknown-elf"
 

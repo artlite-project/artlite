@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..toolchain import CACHE_DIR
+from ... import cache
 
 
 def _bf16(x: object) -> np.ndarray:
@@ -123,8 +123,9 @@ class ActTable:
         code = [inspect.getsource(f) for f in (self.f64, ActTable._fit, ActTable.reduce, _minimax, _round_bf16, _bf16, _f32,
                                                bf16_values, ulp_bf16)]
         key = hashlib.sha256(repr((self.name, self.seg, self.m, self.t_max, self.floor, self.full, code)).encode()).hexdigest()[:16]
-        path = os.path.join(CACHE_DIR, "kmath", f"{self.name}_{key}.npy")
+        path = cache.common("kmath", f"{self.name}_{key}.npy")
         if os.path.exists(path):
+            cache.touch(path)
             return np.load(path)
         coef = self._fit()
         os.makedirs(os.path.dirname(path), exist_ok=True)

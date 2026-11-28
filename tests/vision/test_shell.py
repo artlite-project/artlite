@@ -125,7 +125,7 @@ def test_state_key_changes_with_a_source(tmp_path: str, monkeypatch: pytest.Monk
     files = [str(tmp_path / "model.gguf")]
     with open(files[0], "wb") as f:
         f.write(b"x")
-    monkeypatch.setattr(state, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(state, "root", lambda: str(tmp_path))
     key = state.state_dir("k", files[0], ("models.sd15.npu",), files)
     assert key == state.state_dir("k", files[0], ("models.sd15.npu",), files)
     assert key != state.state_dir("k", files[0], ("models.qwen3vl.npu",), files)  # (other modules: other sources)
