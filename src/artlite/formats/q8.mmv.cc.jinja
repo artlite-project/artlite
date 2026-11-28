@@ -56,7 +56,7 @@ __attribute__((noinline)) void {{ p }}_q80_d(const uint8_t *__restrict u, bfloat
 __attribute__((noinline)) void {{ p }}_q80_sc4(const bfloat16 *__restrict c, const bfloat16 *__restrict tab, float *__restrict y)
 {
     aie::accum<accfloat, {{ L }}> Y(aie::load_v<{{ L }}>(y));
-    AIE_PREPARE_FOR_POSTPIPELINING
+    AIE_LOOP_UNROLL_FULL  // (as a pipelined loop: 36 cycles a call, 128 B more)
     for (int i = 0; i < 4; i++)
         Y = aie::mac(Y, aie::load_v<{{ L }}>(c + {{ L }} * i), aie::load_v<8>(tab + 8 * i).template grow_replicate<{{ L }}>());
     aie::store_v(y, Y.template to_vector<float>());

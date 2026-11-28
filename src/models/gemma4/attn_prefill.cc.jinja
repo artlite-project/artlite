@@ -137,9 +137,14 @@ void {{ p }}_qsel(const bfloat16 *__restrict a, const bfloat16 *__restrict b, bf
 {
     if (i != me)
         return;
-    for (int j = 0; j < {{ ND * 72 // 2 }}; j += 32) {
-        aie::store_v(q + j, aie::load_v<32>(a + j));
-        aie::store_v(q + {{ ND * 72 // 2 }} + j, aie::load_v<32>(b + j));
+    bfloat16 *__restrict qb = q + {{ ND * 72 // 2 }};
+    for (int j = 0; j < {{ ND * 72 // 2 }}; j += 32) {  // (walked pointers: II 2; an index shared by the four: II 10)
+        aie::store_v(q, aie::load_v<32>(a));
+        aie::store_v(qb, aie::load_v<32>(b));
+        q += 32;
+        qb += 32;
+        a += 32;
+        b += 32;
     }
 }
 

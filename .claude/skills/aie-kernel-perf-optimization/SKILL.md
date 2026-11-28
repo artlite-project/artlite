@@ -162,7 +162,8 @@ Pick one based on the symptom; `restructurings.md` has each case study with its 
   128-bit repeats with `grow_replicate` (not `concat` chains, which cost a `vshift` each), assemble vectors from
   128-bit pieces with `al::concat` / `al::gather` (not `aie::concat` / `insert`), and transpose bytes before the
   arithmetic (II 46 -> 40; a Q4_K header 2246 -> 920 cycles).
-- **R8 Pointer walks instead of index math** (`add_3d_ptr` walks: II 46 -> 30 with no `alu` ops), and small scalar
+- **R8 Pointer walks instead of index math** (`add_3d_ptr` walks: II 46 -> 30 with no `alu` ops), nests flattened into
+  one walked loop (1227 -> 810 cycles), one walked pointer per stream of a 1-D loop (II 10 -> 2), and small scalar
   gathers unrolled to constant offsets (4660 -> 281 cycles).
 - **R9 Batch small calls and fill the lanes**: do scalar-like math once for all panels, run independent small
   reductions in one call, handle two heads per call, process two blocks per iteration of a RecMII-bound loop, and run

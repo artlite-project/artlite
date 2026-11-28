@@ -1352,6 +1352,7 @@ static __attribute__((noinline)) void {{ p }}_wsc(const bfp16ebs8 *__restrict q,
 // summed by rows
 static __attribute__((noinline)) void {{ p }}_wdg(const float *__restrict sc, float *__restrict dd) {
   const aie::vector<float, 32> z = aie::zeros<float, 32>();
+  AIE_LOOP_UNROLL(2)  // (both halves of a tile per iteration, their masks constants: 1748 cycles a call, rolled 1901)
   for (int t = 0; t < 32; t++) {  // (half t % 2 of tile t / 2: rows 4 (t % 2) .., their diagonal lanes 9 r + 4 (t % 2))
     const aie::mask<32> dg = aie::mask<32>::from_uint32(t & 1 ? 0x80402010u : 0x08040201u);
     const aie::vector<float, 32> v = aie::select(z, aie::load_v<32>(sc + 32 * t), dg);

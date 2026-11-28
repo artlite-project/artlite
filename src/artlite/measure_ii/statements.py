@@ -89,6 +89,20 @@ def read_statements(loops: list[SourceLoop], *, source: Path) -> None:
 
 
 def _source_path(path: str, *, source: Path) -> Path:
-    """A DebugLoc file: the measured source when it names it relatively (as the compile command did)."""
+    """A DebugLoc file: the measured source when it names it relatively (as the compile command did). Clang writes a
+    file under its working directory relative to it: a header of the precompiled header (shared, built from whichever
+    directory came first: ``Artlite/src/artlite/include/kernel_lib.h``) resolves against the directories around the
+    source and Artlite's headers."""
     candidate = Path(path)
-    return source if candidate.name == source.name and not candidate.is_absolute() else candidate
+    if candidate.is_absolute():
+        return candidate
+    if candidate.name == source.name:
+        return source
+    if not candidate.exists():
+        for base in (*source.resolve().parents, *_INCLUDE.parents):
+            if (base / candidate).is_file():
+                return base / candidate
+    return candidate
+
+
+_INCLUDE = Path(__file__).resolve().parents[1] / "include"

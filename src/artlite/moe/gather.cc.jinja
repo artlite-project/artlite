@@ -129,15 +129,14 @@ void {{ p }}_cs(const bfloat16 *__restrict obj, float *__restrict acc)
     const bfloat16 wl = (bfloat16)(w - (float)wh);
     const aie::vector<bfloat16, 32> h = aie::broadcast<bfloat16, 32>(wh), l = aie::broadcast<bfloat16, 32>(wl);
     float *__restrict pa = acc;
-    for (int b = 0; b < {{ COLS }}; b++) {
-        const bfloat16 *__restrict pd = obj + {{ DP }} * b;
-        AIE_PREPARE_FOR_POSTPIPELINING
-        for (int j = 0; j < {{ E // COLS // 32 }}; j++) {
-            const aie::vector<bfloat16, 32> d = aie::load_v<32>(pd);
-            pd += 32;
-            aie::store_v(pa, aie::mac(aie::mul(d, h), d, l).template to_vector<float>());
-            pa += 32;
-        }
+    const bfloat16 *__restrict pd = obj;
+    dims_2d_t wd = dims_2d_from_steps({{ E // COLS // 32 }}, 32, {{ DP }});  // (one loop: 288 cycles at E 2048; the block nest 424)
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int j = 0; j < {{ E // 32 }}; j++) {
+        const aie::vector<bfloat16, 32> d = aie::load_v<32>(pd);
+        pd = add_2d_ptr(pd, wd);
+        aie::store_v(pa, aie::mac(aie::mul(d, h), d, l).template to_vector<float>());
+        pa += 32;
     }
 }
 

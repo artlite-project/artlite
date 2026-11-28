@@ -73,9 +73,12 @@ void {{ p }}_pack(const bfloat16 *__restrict acc, bfloat16 *c, int32_t pass)
     const unsigned up = 2 * (32 - cr);  // (bytes: the own columns move cr lanes up)
     const int ks = std::min(sh, {{ n_c - 32 }});  // (the carry's 4 items within the row: its columns are)
     const unsigned kb = 2 * (sh - ks);
+    const bfloat16 __aie_dm_resource_a *__restrict sw = (const bfloat16 __aie_dm_resource_a *)acc;
+    dims_2d_t ds = dims_2d_from_steps(8, 8, {{ 8 * n }});  // (the token's sub-block row: [band][row])
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int t = 0; t < {{ m }}; t++) {
-        const bfloat16 __aie_dm_resource_a *s = (const bfloat16 __aie_dm_resource_a *)acc + (t / 8) * {{ 8 * n }} + (t % 8) * 8;
+        const bfloat16 __aie_dm_resource_a *s = sw;
+        sw = add_2d_ptr(sw, ds);
         bfloat16 *row = c + t * {{ n_c }};
         // (own columns 32 j.. : 8-column items of the token's sub-block row; zeros past the MAC tile)
 {% for j in range(nv) %}
@@ -130,31 +133,36 @@ void {{ p }}_pack2(const bfloat16 *__restrict a0, const bfloat16 *__restrict a1,
     const aie::vector<bfloat16, 32> z = aie::zeros<bfloat16, 32>();
 {% endif %}
     bfloat16 *__restrict dst = c;
-    for (int rb = 0; rb < {{ m // 8 }}; rb++)
-        for (int rr = 0; rr < 8; rr++) {
-            const bfloat16 *__restrict s0 = a0 + rb * {{ 8 * n }} + rr * 8;
-            const bfloat16 *__restrict s1 = a1 + rb * {{ 8 * n }} + rr * 8;
+    // (one loop over the rows, the MAC tiles walked [band][row] in 2-D: 1040 cycles a call at m = 64, n = 64; the
+    // (band, row) nest: 1195)
+    const bfloat16 *__restrict w0 = a0, *__restrict w1 = a1;
+    dims_2d_t d0 = dims_2d_from_steps(8, 8, {{ 8 * n }}), d1 = d0;
+    for (int r = 0; r < {{ m }}; r++) {
+        const bfloat16 *__restrict s0 = w0;
+        const bfloat16 *__restrict s1 = w1;
+        w0 = add_2d_ptr(w0, d0);
+        w1 = add_2d_ptr(w1, d1);
 {% if pack_plan.halves %}
 {% for sl in (0, 1) %}
-            const aie::vector<bfloat16, 32> h{{ sl }}0 = al::concat({% for j in range(4) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
-            const aie::vector<bfloat16, 32> h{{ sl }}1 = al::concat({% for j in range(4, 8) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+        const aie::vector<bfloat16, 32> h{{ sl }}0 = al::concat({% for j in range(4) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
+        const aie::vector<bfloat16, 32> h{{ sl }}1 = al::concat({% for j in range(4, 8) %}{{ "aie::load_v<8>(s%d + %d)" % (sl, 64 * j) if j < n // 8 else "z8" }}{{ ", " if not loop.last }}{% endfor %});
 {% endfor %}
 {% endif %}
 {% for item in pack_plan.items %}
 {% if item | length == 1 and item[0][1] % 8 == 0 and 0 <= item[0][1] <= n - 8 %}
-            aie::store_v(dst + {{ 8 * loop.index0 }}, aie::load_v<8>(s{{ item[0][0] }} + {{ item[0][1] // 8 * 64 }}));
+        aie::store_v(dst + {{ 8 * loop.index0 }}, aie::load_v<8>(s{{ item[0][0] }} + {{ item[0][1] // 8 * 64 }}));
 {% else %}
-            {
-                aie::vector<bfloat16, 32> v = {{ window(item[0][0], item[0][1]) }};
+        {
+            aie::vector<bfloat16, 32> v = {{ window(item[0][0], item[0][1]) }};
 {% for s_, w, lanes in item[1:] %}
-                v = aie::select(v, {{ window(s_, w) }}, aie::mask<32>::from_uint32({{ "0x%Xu" % lanes }}));
+            v = aie::select(v, {{ window(s_, w) }}, aie::mask<32>::from_uint32({{ "0x%Xu" % lanes }}));
 {% endfor %}
-                aie::store_v(dst + {{ 8 * loop.index0 }}, v.extract<8>(0));
-            }
+            aie::store_v(dst + {{ 8 * loop.index0 }}, v.extract<8>(0));
+        }
 {% endif %}
 {% endfor %}
-            dst += {{ n_c }};
-        }
+        dst += {{ n_c }};
+    }
 }
 
 {% endif %}

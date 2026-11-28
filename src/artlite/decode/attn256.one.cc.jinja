@@ -166,7 +166,7 @@ __attribute__((noinline, minsize)) void {{ p }}_kpan(const bfloat16 *__restrict 
 }
 
 // A position's V (src: 256 bf16) into its row of a record's rows (dst: the row's first 8 values)
-__attribute__((noinline, minsize)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bfloat16 *__restrict src)
+__attribute__((noinline)) void {{ p }}_rowput(bfloat16 *__restrict dst, const bfloat16 *__restrict src)
 {
     al::v_put(dst, src, {{ ND }});
 }

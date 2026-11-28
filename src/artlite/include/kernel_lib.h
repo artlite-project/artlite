@@ -645,11 +645,11 @@ template <int ND = 0, int MIN = 32>
     if constexpr (ND > 0) {
         for (int db = 0; db < ND; db++)
             aie::store_v(dst + 64 * db, aie::load_v<8>(src + 8 * db));
-    } else {
+    } else {  // (walked pointers: II 1; an index shared by both: II 4. Under minsize the walked loop is not pipelined)
         AIE_PREPARE_FOR_POSTPIPELINING
         AIE_LOOP_MIN_ITERATION_COUNT(MIN)
-        for (int db = 0; db < nd; db++)
-            aie::store_v(dst + 64 * db, aie::load_v<8>(src + 8 * db));
+        for (int db = 0; db < nd; db++, dst += 64, src += 8)
+            aie::store_v(dst, aie::load_v<8>(src));
     }
 }
 

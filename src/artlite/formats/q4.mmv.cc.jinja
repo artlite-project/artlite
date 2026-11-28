@@ -8,14 +8,15 @@ __attribute__((noinline)) void {{ p }}_q40_tr(const uint8_t *__restrict src, uin
 {
     const uint8_t *s = src;
     uint8_t *d = dst;
+    // (walked in 3-D: II 9; the step chosen from t: II 13)
+    dims_3d_t ws = dims_3d_from_steps(4, 32, 2, 1024, {{ 128 * R40 }}), wd = ws;
     AIE_PREPARE_FOR_POSTPIPELINING
     for (int t = 0; t < {{ 8 * NSB }}; t++) {  // (sb, g, s): 1 KB blocks [row 8][128 B], chunk s at 32 s
         v16int32 o0, o1, o2, o3;
         {{ p }}_tr8<128>(s, o0, o1, o2, o3);
         {{ p }}_put8<128>(d, o0, o1, o2, o3);
-        const int step = (t & 3) != 3 ? 32 : ((t & 7) != 7 ? 1024 - 96 : {{ 128 * R40 - 1024 - 96 }});
-        s += step;
-        d += step;
+        s = add_3d_byte(s, ws);
+        d = add_3d_byte(d, wd);
     }
 }
 

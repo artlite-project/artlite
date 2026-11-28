@@ -177,20 +177,23 @@ __attribute__((noinline)) void {{ p }}_out(const float *__restrict u, uint8_t *_
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     bfloat16 *__restrict ob = (bfloat16 *)o;
-    AIE_LOOP_NO_UNROLL
-    for (int tg = 0; tg < {{ TOK // 8 }}; tg++)
-        for (int kb = 0; kb < 16; kb++) {  // rows 8 kb .. (tokens 8 tg ..) -> [token][channel], 8 channels a token
-            const float *__restrict q = u + {{ 8 * TOK }} * kb + 8 * tg;
-            const aie::vector<float, 64> v = aie::concat(
-                aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + {{ TOK }}), aie::load_v<8>(q + {{ 2 * TOK }}),
-                            aie::load_v<8>(q + {{ 3 * TOK }})),
-                aie::concat(aie::load_v<8>(q + {{ 4 * TOK }}), aie::load_v<8>(q + {{ 5 * TOK }}), aie::load_v<8>(q + {{ 6 * TOK }}),
-                            aie::load_v<8>(q + {{ 7 * TOK }})));
-            const aie::vector<bfloat16, 64> t = aie::transpose(aie::accum<accfloat, 64>(v).template to_vector<bfloat16>(), 8, 8);
-            AIE_LOOP_UNROLL_FULL
-            for (int r = 0; r < 8; r++)
-                aie::store_v(ob + 128 * (8 * tg + r) + 8 * kb, t.template extract<8>(r));
-        }
+    const float *__restrict q = u;
+    dims_2d_t wq = dims_2d_from_steps(16, {{ 8 * TOK }}, 8), wb = dims_2d_from_steps(16, 8, 1024);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < {{ 2 * TOK }}; i++) {  // (tg, kb) = (i / 16, i % 16), walked in 2-D: rows 8 kb .. (tokens 8 tg ..) ->
+        // [token][channel], 8 channels a token
+        const aie::vector<float, 64> v = aie::concat(
+            aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + {{ TOK }}), aie::load_v<8>(q + {{ 2 * TOK }}),
+                        aie::load_v<8>(q + {{ 3 * TOK }})),
+            aie::concat(aie::load_v<8>(q + {{ 4 * TOK }}), aie::load_v<8>(q + {{ 5 * TOK }}), aie::load_v<8>(q + {{ 6 * TOK }}),
+                        aie::load_v<8>(q + {{ 7 * TOK }})));
+        const aie::vector<bfloat16, 64> t = aie::transpose(aie::accum<accfloat, 64>(v).template to_vector<bfloat16>(), 8, 8);
+        AIE_LOOP_UNROLL_FULL
+        for (int r = 0; r < 8; r++)
+            aie::store_v(ob + 128 * r, t.template extract<8>(r));
+        q = add_2d_ptr(q, wq);
+        ob = add_2d_ptr(ob, wb);
+    }
 }
 {% elif hilo %}
 // u's rows in position order -> the item's panels at o, [token group {{ TOK // 8 }}][hi | lo][channel block 16]: x' as
@@ -226,21 +229,23 @@ __attribute__((noinline)) void {{ p }}_out(const float *__restrict u, uint8_t *_
 {
     aie::set_rounding(aie::rounding_mode::conv_even);
     al::BOut<> oo((bfp16ebs8 *)o);
-    AIE_LOOP_NO_UNROLL
-    for (int tg = 0; tg < {{ TOK // 8 }}; tg++)
-        for (int kb = 0; kb < 16; kb++) {  // rows 8 kb .. (tokens 8 tg ..) -> [token][channel] as hi + lo, a panel
-            const float *__restrict q = u + {{ 8 * TOK }} * kb + 8 * tg;
-            const aie::vector<float, 64> v = aie::concat(
-                aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + {{ TOK }}), aie::load_v<8>(q + {{ 2 * TOK }}),
-                            aie::load_v<8>(q + {{ 3 * TOK }})),
-                aie::concat(aie::load_v<8>(q + {{ 4 * TOK }}), aie::load_v<8>(q + {{ 5 * TOK }}), aie::load_v<8>(q + {{ 6 * TOK }}),
-                            aie::load_v<8>(q + {{ 7 * TOK }})));
-            aie::vector<bfloat16, 64> hi, lo;
-            al::split2<64>(v, hi, lo);
-            const aie::accum<accfloat, 64> t = aie::mac(aie::mul(aie::transpose(hi, 8, 8), aie::broadcast<bfloat16, 64>(1.0f)),
-                                                        aie::transpose(lo, 8, 8), aie::broadcast<bfloat16, 64>(1.0f));
-            oo.push(t.template to_vector<bfp16ebs8>());
-        }
+    const float *__restrict q = u;
+    dims_2d_t wq = dims_2d_from_steps(16, {{ 8 * TOK }}, 8);  // (one loop, walked in 2-D: 740 cycles at 32 tokens; the nest 879)
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int i = 0; i < {{ 2 * TOK }}; i++) {  // (tg, kb) = (i / 16, i % 16): rows 8 kb .. (tokens 8 tg ..) -> [token][channel]
+        // as hi + lo, a panel
+        const aie::vector<float, 64> v = aie::concat(
+            aie::concat(aie::load_v<8>(q), aie::load_v<8>(q + {{ TOK }}), aie::load_v<8>(q + {{ 2 * TOK }}),
+                        aie::load_v<8>(q + {{ 3 * TOK }})),
+            aie::concat(aie::load_v<8>(q + {{ 4 * TOK }}), aie::load_v<8>(q + {{ 5 * TOK }}), aie::load_v<8>(q + {{ 6 * TOK }}),
+                        aie::load_v<8>(q + {{ 7 * TOK }})));
+        aie::vector<bfloat16, 64> hi, lo;
+        al::split2<64>(v, hi, lo);
+        const aie::accum<accfloat, 64> t = aie::mac(aie::mul(aie::transpose(hi, 8, 8), aie::broadcast<bfloat16, 64>(1.0f)),
+                                                    aie::transpose(lo, 8, 8), aie::broadcast<bfloat16, 64>(1.0f));
+        oo.push(t.template to_vector<bfp16ebs8>());
+        q = add_2d_ptr(q, wq);
+    }
 }
 {% endif %}
 

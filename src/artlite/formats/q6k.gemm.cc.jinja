@@ -47,25 +47,31 @@ void {{ p }}_hdr_sb(const uint32_t *__restrict hb, bfloat16 *__restrict ws, int3
     aie::set_rounding(aie::rounding_mode::conv_even);
     const float *__restrict dv = (const float *)(ws + {{ 16 * n }}) + sb * {{ n }};
     const uint32_t *__restrict sc = hb + ({{ 2 * (hj_sc0 - hp0) }} + 2 * (sb >> 1)) * {{ n }} + 2 * (sb & 1) * {{ hs }};
-    AIE_LOOP_NO_UNROLL
-    for (int g = 0; g < {{ n }}; g += 16) {
-        const aie::vector<bfloat16, 16> d16 = aie::accum<accfloat, 16>(aie::load_v<16>(dv + g)).template to_vector<bfloat16>();
-        AIE_LOOP_NO_UNROLL
-        for (int hw = 0; hw < 4; hw++) {  // (h, wi) = (hw / 2, hw % 2)
-            const int h = hw >> 1, wi = hw & 1;
-            // the 4 sc bytes (i = 4 wi ..) of word (2 (sb % 2) + h, wi) of 16 rows
-            const aie::vector<int8, 64> by = aie::load_v<16>(sc + h * {{ hs }} + wi * {{ n }} + g).template cast_to<int8>();
-            const aie::vector<int8, 32> lo = aie::filter_even(by, 2), hi = aie::filter_odd(by, 2);  // bytes 0 1, 2 3
-            // i = 4 wi + k: k-tile kt = i / 2 = 2 wi + k / 2, word ii = k % 2 -> ws + (kt 4 + h 2 + ii) n
-            bfloat16 *__restrict o = ws + (8 * wi + 2 * h) * {{ n }} + g;
+    // (one loop over (g, h, wi), d16 converted again per (h, wi), the pointers walked in 2-D / 3-D: 810 cycles a call
+    // at n = 112; the (g, hw) nest with h, wi decoded from hw: 1227, the inner loop pipelined at II 38 with spills)
+    const float *__restrict pv = dv;
+    const uint32_t *__restrict ps = sc;
+    bfloat16 *__restrict po = ws;
+    dims_2d_t wv = dims_2d_from_steps(4, 0, 16);
+    dims_3d_t wsc = dims_3d_from_steps(2, {{ n }}, 2, {{ hs }}, 16);
+    dims_3d_t wo = dims_3d_from_steps(2, {{ 8 * n }}, 2, {{ 2 * n }}, 16);
+    AIE_PREPARE_FOR_POSTPIPELINING
+    for (int it = 0; it < {{ n // 4 }}; it++) {  // (rows g, h, wi) = (16 (it / 4) .., it / 2 % 2, it % 2)
+        const aie::vector<bfloat16, 16> d16 = aie::accum<accfloat, 16>(aie::load_v<16>(pv)).template to_vector<bfloat16>();
+        // the 4 sc bytes (i = 4 wi ..) of word (2 (sb % 2) + h, wi) of 16 rows
+        const aie::vector<int8, 64> by = aie::load_v<16>(ps).template cast_to<int8>();
+        const aie::vector<int8, 32> lo = aie::filter_even(by, 2), hi = aie::filter_odd(by, 2);  // bytes 0 1, 2 3
+        // i = 4 wi + k: k-tile kt = i / 2 = 2 wi + k / 2, word ii = k % 2 -> ws + (kt 4 + h 2 + ii) n + g
 {% for k in range(4) %}
-            {
-                const aie::vector<int8, 16> v = {{ "aie::filter_even" if k % 2 == 0 else "aie::filter_odd" }}({{ "lo" if k < 2 else "hi" }}, 1);
-                const aie::vector<bfloat16, 16> f = aie::to_float<bfloat16>(v.template grow<32>()).template extract<16>(0);
-                aie::store_v(o + {{ ((k // 2) * 4 + k % 2) * n }}, aie::mul(f, d16).template to_vector<bfloat16>());
-            }
-{% endfor %}
+        {
+            const aie::vector<int8, 16> v = {{ "aie::filter_even" if k % 2 == 0 else "aie::filter_odd" }}({{ "lo" if k < 2 else "hi" }}, 1);
+            const aie::vector<bfloat16, 16> f = aie::to_float<bfloat16>(v.template grow<32>()).template extract<16>(0);
+            aie::store_v(po + {{ ((k // 2) * 4 + k % 2) * n }}, aie::mul(f, d16).template to_vector<bfloat16>());
         }
+{% endfor %}
+        pv = add_2d_ptr(pv, wv);
+        ps = add_3d_ptr(ps, wsc);
+        po = add_3d_ptr(po, wo);
     }
 }
 

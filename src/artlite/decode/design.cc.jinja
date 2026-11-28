@@ -1550,15 +1550,17 @@ __attribute__((noinline{{ ", minsize" if SLOTS == 8 else "" }})) void {{ p }}_rr
     {{ rotf }}(u, b0, b0, b1, b1, b0, b1, ro);
 {% endif %}
     aie::set_rounding(aie::rounding_mode::conv_even);
+    bfloat16 *d = o{{ " + %d * h" % (4 * C_LEN) if SLOTS == 8 else "" }};
+    dims_2d_t wd = dims_2d_from_steps(8, 8, {{ C_LEN }} * S);  // (channels 8 (q & 7) of object q >> 3: II 6; from q: II 10)
     AIE_LOOP_NO_UNROLL
     for (int q = 0; q < 16; q++) {
         const aie::vector<bfloat16, 32> t =
             aie::transpose(aie::accum<accfloat, 32>(aie::load_v<32>(u + 32 * q)).template to_vector<bfloat16>(), 8, 4);
-        bfloat16 *d = o + {{ C_LEN }} * S * (q >> 3) + 8 * (q & 7){{ " + %d * h" % (4 * C_LEN) if SLOTS == 8 else "" }};
         aie::store_v(d, t.template extract<8>(0));
         aie::store_v(d + {{ C_LEN }}, t.template extract<8>(1));
         aie::store_v(d + {{ 2 * C_LEN }}, t.template extract<8>(2));
         aie::store_v(d + {{ 3 * C_LEN }}, t.template extract<8>(3));
+        d = add_2d_ptr(d, wd);
     }
 }
 

@@ -172,7 +172,18 @@ was only 30 (variant_search's `port` column, `machine-model.md` "Shared ports").
   `add_3d_ptr` / `add_3d_byte` with `dims_3d_from_steps(2, step_h, 2, step_word, step_block)` after each iteration need
   no alu ops and reach II 30 (mv-bound): 1001 -> 639 cycles per k-tile. In GdnOut, a per-row scale used for 4
   consecutive blocks and a 4-block weight cycled per row (bf16 `[hi 32 | lo 32]` entries) use
-  `dims_2d_from_steps(4, 0, 64)` and `(4, 64, 0)`.
+  `dims_2d_from_steps(4, 0, 64)` and `(4, 64, 0)`. Step chains such as `s += (t & 3) != 3 ? 32 : ...` are walks too:
+  the decode Q4_0 / Q4_1 code transposes went from II 13 to 9 with `add_3d_byte`.
+- **Flatten a nest into one walked loop**: an outer loop around a short pipelined inner loop pays the inner loop's
+  prologue and epilogue on every outer iteration (and an inner loop that decodes its indices adds alu ops). One loop over
+  the whole nest, with every pointer walked in 2-D / 3-D and the outer loop's values reloaded per iteration
+  (`dims_2d_from_steps(4, 0, 16)` repeats a scale for 4 iterations), pipelines once: Q6_K's GemmQd `_hdr_sb` took 810
+  instead of 1227 cycles (its spills gone), GemmQd's `pack2` 1040 instead of 1195, LFM3's conv group 3213 instead of
+  4624, the MoE combine 288 instead of 424 (its nest walked memory linearly). Flattening with index math does not work
+  (`rejected.md`).
+- **Walk each pointer of a 1-D loop instead of sharing an index**: a copy indexed `q + j`, `a + j` ran at II 10 (Gemma's
+  prefill Q selection: II 2 walked, 737 -> 164 cycles), and `dst + 64 db`, `src + 8 db` at II 4 (`al::v_put`: II 1).
+  Under `minsize` the walked loop is not pipelined (139 -> 460 cycles), so `v_put`'s callers are not `minsize`.
 - **Unroll small scalar gathers to constant offsets**: Q6_K's `_hdr_d` gathers 44 (row, super-block) `d` values per
   tile. With index math in a rolled loop it ran at II 17 per value; unrolled (one load per word, its two halves stored
   to two places, the padding zeroed by vector stores first) it takes 281 instead of 4660 cycles per K chunk.

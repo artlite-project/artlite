@@ -8,6 +8,8 @@ tool.
 | idea | result |
 |---|---|
 | Flatten a 2-level loop nest with div / mod or shift / mask index math | not pipelined, or RecMII 41-50 with spills |
+| Walks for cheap index math in an mv-bound loop (sd15 `exp40`: `i & 1`, `i >> 1`; the GDN scan's V^T blocks) | II 15 -> 17, 21 -> 20: no gain |
+| Flatten the GDN conv's (column block, token) nest, the 8 tap vectors reloaded per token | II 13 (bound 8): 444 vs. 431 cycles |
 | Flatten with `add_2d_ptr/byte` iterators for separate stream bases | 8 spills (the pointers plus iterator state exceed the `p` / `d` registers). What works instead: persistent streams rewound by `stream.seek(dims_2d_t&)`, or two plain pointers walking a 3-D pattern instead of index math (`restructurings.md` R8) |
 | Reorder a 4-accumulator MMUL loop "two accumulators at a time", or skew the chains by k-steps | ResMII 36, II 42-61; the k-step-major order reaches II 32 once the post-RA rules hold |
 | 4-k-step groups holding B panels in registers | spills (12 `ex`) |
