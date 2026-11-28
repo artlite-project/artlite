@@ -1,4 +1,5 @@
-"""The cache directory (``ARTLITE_CACHE_DIR``, default ``~/.cache/artlite``): its layout and the last use of its entries.
+"""The cache directory (``ARTLITE_CACHE_DIR``, default ``~/.cache/artlite``): its layout, the last use of its entries,
+their cleaning and packing.
 
 The root may be shared with other files, because a user may point the variable at any directory. So Artlite writes only
 two kinds of directories there, and marks each with a ``CACHEDIR.TAG`` that carries Artlite's line (``owned``):
@@ -23,9 +24,11 @@ Cleaning (``clean``, ``artlite-cache clean``) removes entries by the rules of a 
 (an older version of a design whose identity was built again since, ``_superseded``) or unused for a while, of the
 layout before the owned directories (the ``legacy`` kinds, whose state ``adopt_legacy`` moves into ``common/`` first),
 of other toolchains, the least recently used above a size; always the trash, and leftovers of killed writers and failed
-builds an hour old. A process that built something starts the automatic cleaning at its exit, once a day per cache
-(``note_build``: a detached child at the lowest priority, ``ARTLITE_CACHE_GC`` its policy, ``common/gc.json`` its
-last run). What a cleaning may touch is the table ``KINDS``, and nothing else:
+builds an hour old. It also packs the intermediates of builds unused for a while (``pack``: the files ``cold_files``
+names, which the runtime never reads, into the build's ``temps.tar.xz``; ``unpack`` restores them). A process that
+built something starts the automatic cleaning at its exit, once a day per cache (``note_build``: a detached child at the
+lowest priority, ``ARTLITE_CACHE_GC`` its policy, ``common/gc.json`` its last run). What a cleaning may touch is the
+table ``KINDS``, and nothing else:
 
 - at the root, only ``tc-<id>`` and ``common`` directories with Artlite's tag, and the legacy kinds' exact names;
 - below an owned directory, only names that match a kind's components (whole-name regular expressions);
@@ -47,6 +50,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -187,7 +192,7 @@ def adopt(path: str, *legacy: str) -> str:
 
 
 def _write_text(path: str, text: str) -> None:
-    tmp = f"{path}.{os.getpid()}.tmp"
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"  # (the build pool's threads may write one tag at once)
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
@@ -242,7 +247,7 @@ KINDS = (
     Kind("temp", "tc", ("vision", r"[a-z0-9_]+", rf"{_H}{{12}}", rf"{_H}{{16}}\.\d+"), True, role="temp"),
     Kind("temp", "tc", ("ledger", r"\w+\.json\.\d+\.tmp"), role="temp"),
     Kind("temp", "tc", ("ledger", "work", rf"{_H}{{16}}"), True, role="temp"),
-    Kind("temp", "tc", (r"(CACHEDIR\.TAG|toolchain\.json)\.\d+\.tmp",), role="temp"),
+    Kind("temp", "tc", (r"(CACHEDIR\.TAG|toolchain\.json)\.\d+\.\d+\.tmp",), role="temp"),
     Kind("lock", "tc", ("locks", r"[\w.-]+\.lock"), lock="locks/{name}", role="temp"),
     Kind("trash", "tc", ("trash", r".+"), None, role="trash"),
     # common
@@ -255,7 +260,7 @@ KINDS = (
     Kind("temp", "common", ("goldens", rf"\w+_{_H}{{16}}\.\d+\.tmp"), role="temp"),
     Kind("temp", "common", ("ui", r"tmp\w{8}"), True, role="temp"),
     Kind("temp", "common", ("server", r"\.models\.\w+"), role="temp"),
-    Kind("temp", "common", (r"(pace\.json\.\d+|(CACHEDIR\.TAG|gc\.json)\.\d+\.tmp)",), role="temp"),
+    Kind("temp", "common", (r"(pace\.json\.\d+|(CACHEDIR\.TAG|gc\.json)\.\d+\.\d+\.tmp)",), role="temp"),
     Kind("trash", "common", ("trash", r".+"), None, role="trash"),
     # the legacy layout, at the root
     Kind("rtc", "legacy", (rf"rtc_{_H}{{16}}",), True, lock="{name}.lock"),
@@ -382,7 +387,7 @@ def _is_link(e: os.DirEntry) -> bool:
     return e.is_symlink() or e.is_junction()
 
 
-def _walk(base: str, dev: int, kind: Kind, scan: Scan, parts: tuple[str, ...] | None = None,
+def _walk(base: str, kind: Kind, scan: Scan, *, dev: int, parts: tuple[str, ...] | None = None,
           top: str | None = None) -> None:
     """The entries of ``kind`` below ``base`` (``parts``: the components left, ``top``: the directory scanned)."""
     parts = kind.parts if parts is None else parts
@@ -409,7 +414,7 @@ def _walk(base: str, dev: int, kind: Kind, scan: Scan, parts: tuple[str, ...] | 
             is_dir = stat.S_ISDIR(st.st_mode)
             if len(parts) > 1:
                 if is_dir:
-                    _walk(base, dev, kind, scan, parts[1:], e.path)
+                    _walk(base, kind, scan, dev=dev, parts=parts[1:], top=e.path)
                 continue
             if kind.directory is not None and is_dir != kind.directory:
                 continue
@@ -446,14 +451,14 @@ def scan(root: str | None = None) -> Scan:
     for owned in out.owned:
         kinds = [k for k in KINDS if k.where == owned.where]
         for kind in kinds:
-            _walk(owned.path, dev, kind, out)
+            _walk(owned.path, kind, out, dev=dev)
         firsts = [re.compile(k.parts[0]) for k in kinds]
         with contextlib.suppress(OSError):
             out.unknown += sorted(os.path.join(owned.path, n) for n in os.listdir(owned.path)
                                   if n not in _STRUCTURE[owned.where] and not any(p.fullmatch(n) for p in firsts))
     for kind in KINDS:
         if kind.where == "legacy":
-            _walk(root, dev, kind, out)
+            _walk(root, kind, out, dev=dev)
     return out
 
 
@@ -492,12 +497,14 @@ class Policy:
     """What a cleaning removes besides trash and leftovers: superseded entries not used for ``superseded`` seconds
     (``superseded``), entries unused for ``unused`` seconds, the legacy layout's entries unchanged for ``legacy``
     seconds, the other toolchains' directories (``other_toolchains``), the least recently used entries while the cache
-    is above ``size`` bytes, or everything Artlite owns (``all``). A None rule is off. ``interval``: how often a
-    process that built something starts the automatic cleaning (None: never)."""
+    is above ``size`` bytes, or everything Artlite owns (``all``). Builds not used for ``pack`` seconds get their
+    intermediate files packed (``pack``). A None rule is off. ``interval``: how often a process that built something
+    starts the automatic cleaning (None: never)."""
 
     superseded: float | None = DAY
     unused: float | None = 30 * DAY
     legacy: float | None = DAY
+    pack: float | None = DAY
     size: int | None = None
     interval: float | None = DAY
     other_toolchains: bool = False
@@ -514,12 +521,13 @@ class Policy:
         parts = [f"superseded={d(self.superseded)}", f"unused={d(self.unused)}"]
         if self.legacy != self.superseded:
             parts.append(f"legacy={d(self.legacy)}")
+        parts.append(f"pack={d(self.pack)}")
         if self.size is not None:
             parts.append(f"size={self.size >> 20}M")
         return ",".join(parts)
 
 
-_RULES = ("superseded", "unused", "legacy", "interval")
+_RULES = ("superseded", "unused", "legacy", "pack", "interval")
 
 
 def parse_policy(text: str) -> Policy | None:
@@ -627,6 +635,7 @@ class Report:
     """What a cleaning did: entries and bytes removed per reason, the entries left (path, why), errors."""
 
     removed: dict[str, list[int]] = field(default_factory=dict)  # reason -> [entries, bytes]
+    packed: list[int] = field(default_factory=lambda: [0, 0])  # [entries, bytes freed]
     left: list[tuple[str, str]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
@@ -641,7 +650,8 @@ class Report:
         return sum(b for _, b in self.removed.values())
 
     def to_json(self) -> dict:
-        return {"when": self.when, "removed": self.removed, "left": len(self.left), "errors": self.errors[:20]}
+        return {"when": self.when, "removed": self.removed, "packed": self.packed, "left": len(self.left),
+                "errors": self.errors[:20]}
 
 
 _counter = itertools.count()
@@ -747,9 +757,11 @@ def adopt_legacy() -> None:
     adopt(common("server", "models.json"), "server", "models.json")
     legacy_ui = os.path.join(ROOT, "ui")
     if os.path.isdir(legacy_ui) and not os.path.islink(legacy_ui):
-        for e in os.scandir(legacy_ui):
-            if re.fullmatch(r"(?!tmp)[\w.-]+", e.name) and e.is_dir(follow_symlinks=False) and not _is_link(e):
-                adopt(common("ui", e.name), "ui", e.name)
+        with os.scandir(legacy_ui) as it:
+            names = [e.name for e in it if re.fullmatch(r"(?!tmp)[\w.-]+", e.name) and not _is_link(e)
+                     and e.is_dir(follow_symlinks=False)]
+        for name in names:
+            adopt(common("ui", name), "ui", name)
 
 
 @contextlib.contextmanager
@@ -764,15 +776,135 @@ def _clean(policy: Policy, *, dry_run: bool) -> Report:
         adopt_legacy()
     found = scan()
     report.skipped = found.skipped
+    gone = set()
     for e, reason in select(found, policy, now=report.when):
         size = e.size
         if dry_run or _remove(e, found, report):
+            gone.add(e.path)
             n = report.removed.setdefault(reason, [0, 0])
             n[0] += 1
             n[1] += size
+    if policy.pack is not None:
+        _pack_cold(found, policy.pack, report, dry_run=dry_run, skip=gone)
     if not dry_run:
         _tidy(found, policy)
     return report
+
+
+# ---------------------------------------------------------------------------
+# Packing a build's intermediate files
+# ---------------------------------------------------------------------------
+
+TEMPS = "temps.tar.xz"
+# The files of a build directory the runtime never reads: the design's text and aiecc's intermediates. Paging reads the
+# main cores' ELFs (elfs_main_*) and link scripts (ldScripts_main_*), the configuration checks cdo_main, the census
+# and the frames objects_*, profiling input_with_addresses.mlir: those, and any name not listed here, stay plain.
+_COLD = re.compile(r"design\.mlir")
+_COLD_PRJ = re.compile(r"(peano-compat|peano-opted)_.+\.ll|canonical_[0-9A-F]+(\.ll)?|probe(Elfs|Scripts)_.+"
+                       r"|ldScripts_op\d+_.+|cdo_(op\d+_.+|empty_\d+|closing)|(op\d+_\w+|empty_\d+|closing)\.pdi"
+                       r"|bif_.+\.bif")
+
+
+def cold_files(directory: str) -> list[str]:
+    """The intermediate files present in a build directory (paths relative to it), which packing archives."""
+    def names(top: str, pattern: re.Pattern) -> list[str]:
+        if not os.path.isdir(top) or os.path.islink(top):
+            return []
+        with os.scandir(top) as it:
+            return sorted(e.name for e in it if pattern.fullmatch(e.name) and not _is_link(e))
+    prj = "design.mlir.prj"
+    return names(directory, _COLD) + [f"{prj}/{n}" for n in names(os.path.join(directory, prj), _COLD_PRJ)]
+
+
+def _cold_size(directory: str) -> int:
+    return sum(disk_usage(os.path.join(directory, n)) for n in cold_files(directory))
+
+
+def is_build_dir(path: str) -> bool:
+    """Whether ``path`` is a build directory (``rtc_<key>``, ``fused_<key>``) of a toolchain's directory."""
+    return bool(re.fullmatch(rf"(rtc|fused)_{_H}{{16}}", os.path.basename(path))) and \
+        bool(re.fullmatch(rf"{TC_PREFIX}{_H}{{12}}", os.path.basename(os.path.dirname(path)))) and \
+        os.path.isdir(path) and not os.path.islink(path)
+
+
+def _entry_lock(directory: str) -> str:
+    """The build lock of a build directory of a toolchain's directory (``build``'s)."""
+    return os.path.join(os.path.dirname(directory), "locks", f"{os.path.basename(directory)}.lock")
+
+
+def pack(directory: str, errors: list[str]) -> int:
+    """Pack a build directory's intermediate files into ``TEMPS`` (lzma preset 0: the never-read files of a prefill
+    ELF's build 65x at ~290 MB/s) and delete them; returns the bytes freed. The archive is written under a temporary
+    name and renamed before anything is deleted, so a killed packing leaves the plain files, or both: where the archive
+    exists its files are deleted (``build`` removes the archive of a directory it builds again, so the plain files are
+    then the same)."""
+    archive = os.path.join(directory, TEMPS)
+    for name in os.listdir(directory):
+        if re.fullmatch(re.escape(TEMPS) + r"\.\d+\.tmp", name):
+            os.remove(os.path.join(directory, name))
+    names = cold_files(directory)
+    if not names:
+        return 0
+    before = sum(disk_usage(os.path.join(directory, n)) for n in names)
+    if not os.path.exists(archive):
+        tmp = f"{archive}.{os.getpid()}.tmp"
+        with tarfile.open(tmp, "w:xz", preset=0) as t:
+            for n in names:
+                t.add(os.path.join(directory, n), arcname=n)
+        os.replace(tmp, archive)
+        before -= disk_usage(archive)
+    for n in names:
+        _delete(os.path.join(directory, n), errors)
+    return max(before, 0)
+
+
+def _pack_entry(e: Entry, report: Report) -> int:
+    """``pack`` a scanned build entry under its build lock (taken without waiting: a build runs, nothing packed)."""
+    lock = e.lock_path
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    with portable.file_lock(lock, wait=False) as held:
+        if not held or os.path.islink(e.path) or not os.path.isdir(e.path):
+            return 0
+        try:
+            return pack(e.path, report.errors)
+        except (OSError, tarfile.TarError) as exc:
+            report.errors.append(f"{e.path}: {exc}")
+            return 0
+
+
+def _pack_cold(found: Scan, after: float, report: Report, *, dry_run: bool, skip: set[str] | None = None) -> None:
+    """Pack the builds not used for ``after`` seconds (not those in ``skip``, nor failed ones)."""
+    for e in found.entries:
+        if (e.kind.where == "tc" and e.kind.name in ("rtc", "fused") and e.used <= report.when - after
+                and not e.failed and e.path not in (skip or ())):
+            freed = _cold_size(e.path) if dry_run else _pack_entry(e, report)
+            if freed:
+                report.packed[0] += 1
+                report.packed[1] += freed
+
+
+def pack_all(after: float, *, dry_run: bool = False) -> Report:
+    """Pack the intermediate files of the builds not used for ``after`` seconds (``dry_run``: only count them)."""
+    report = Report(when=time.time())
+    _pack_cold(scan(), after, report, dry_run=dry_run)
+    return report
+
+
+def unpack(directory: str) -> bool:
+    """Restore a build directory's packed intermediate files in place (under its build lock) and remove the archive;
+    False when nothing is packed."""
+    archive = os.path.join(directory, TEMPS)
+    if not os.path.exists(archive):
+        return False
+    lock = _entry_lock(directory)
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    with portable.file_lock(lock):
+        if not os.path.exists(archive):
+            return False
+        with tarfile.open(archive, "r:xz") as t:
+            t.extractall(directory, filter="data")
+        os.remove(archive)
+    return True
 
 
 def clean(policy: Policy, *, dry_run: bool = False, wait: bool = True) -> Report | None:

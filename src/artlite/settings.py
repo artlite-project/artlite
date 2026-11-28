@@ -184,8 +184,9 @@ CACHE_DIR = _declare(
 CACHE_GC = _declare(
     "CACHE_GC", "string", "auto",
     "the build cache's automatic cleaning, after a process that built something, once a day: ``auto`` "
-    "(``superseded=1d,unused=30d``), ``off``, or rules that replace some of these (``superseded=4h,size=30G``; "
-    "also ``legacy``, ``interval``); ``artlite-cache clean`` applies them too", _text_or("auto"))
+    "(``superseded=1d,unused=30d,pack=1d``), ``off``, or rules that replace some of these "
+    "(``superseded=4h,pack=off,size=30G``; also ``legacy``, ``interval``); ``artlite-cache clean`` applies them too",
+    _text_or("auto"))
 BACKEND = _declare(
     "BACKEND", "choice", "the platform's own (xdna on Linux, xrt on Windows)",
     "the NPU backend: ``xdna`` (the amdxdna driver) or ``xrt`` (XRT)",

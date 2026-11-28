@@ -16,10 +16,20 @@ RTC = BuildSpec(kind=BuildKind.RTC, label="T", source="void f() {}\n", mlir="mod
 FUSED = BuildSpec(kind=BuildKind.FUSED, label="F", source="void f() {}\n", mlir="module {}\n", expand_load_pdis=True)
 
 
+def _toolchain_at(monkeypatch: pytest.MonkeyPatch, venv: str, checkout: str, *, flag: str = "-O2") -> None:
+    """A toolchain installed in ``venv`` and Artlite checked out at ``checkout`` (no toolchain needed)."""
+    monkeypatch.setattr(toolchain, "peano_dir", lambda: f"{venv}/llvm-aie")
+    monkeypatch.setattr(toolchain, "mlir_aie_dir", lambda: f"{venv}/mlir_aie")
+    monkeypatch.setattr(toolchain, "INCLUDE_DIR", f"{checkout}/include")
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: [
+        f"{venv}/llvm-aie/bin/clang++", flag, f"-I{checkout}/include", f"-I{venv}/mlir_aie/include"])
+
+
 @pytest.fixture
 def compiler(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A compile command whose paths are the only thing a test changes (no toolchain needed)."""
-    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/venv/clang++", "-O2", "-I/checkout/include"])
+    """A compile command whose paths are the only thing a test changes."""
+    monkeypatch.setattr(build, "headers_key", lambda: "headers")
+    _toolchain_at(monkeypatch, "/venv", "/checkout")
 
 
 def test_key_fields(compiler: None) -> None:
@@ -40,15 +50,22 @@ def test_key_fields(compiler: None) -> None:
 
 
 def test_key_is_content_only(compiler: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The key holds no paths and no modification times: another checkout or venv with the same headers, a moved cache
-    or a reinstalled toolchain finds the same builds; the headers' contents and the flags count."""
+    """The key holds no paths the cache covers otherwise and no modification times: another checkout or venv with the
+    same headers, a moved cache or a reinstalled toolchain finds the same builds; the headers' contents and the flags
+    count, and so does another compiler or include directory (by path: a prototype llvm-aie's builds stay apart)."""
     base = RTC.cache_key()
-    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/other/clang++", "-O2", "-I/elsewhere/include"])
+    _toolchain_at(monkeypatch, "/other-venv", "/elsewhere")
     monkeypatch.setattr(cache, "ROOT", "/moved")
     assert RTC.cache_key() == base
-    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/other/clang++", "-O3", "-I/elsewhere/include"])
+    _toolchain_at(monkeypatch, "/other-venv", "/elsewhere", flag="-O3")
     assert RTC.cache_key() != base
-    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/venv/clang++", "-O2", "-I/checkout/include"])
+    _toolchain_at(monkeypatch, "/venv", "/checkout")
+    assert RTC.cache_key() == base
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/proto/bin/clang++", "-O2"])
+    other = RTC.cache_key()
+    monkeypatch.setattr(toolchain, "clang_cmd_common", lambda: ["/venv/llvm-aie/bin/clang++", "-O2", "-I/exp/inc"])
+    assert len({base, other, RTC.cache_key()}) == 3
+    _toolchain_at(monkeypatch, "/venv", "/checkout")
     monkeypatch.setattr(build, "headers_key", lambda: "other headers")
     assert RTC.cache_key() != base
 
@@ -165,6 +182,15 @@ def test_build_entry(tools: FakeTools, monkeypatch: pytest.MonkeyPatch) -> None:
     os.utime(entry, (old, old))
     build.build(FUSED)
     assert os.path.getmtime(entry) > old + cache.TOUCH_S
+
+
+def test_rebuild_drops_packed_temps(tools: FakeTools, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A directory built again loses the archive of its earlier build's intermediates (``cache.pack``)."""
+    work = build.build(RTC)
+    open(os.path.join(work, cache.TEMPS), "w").close()
+    monkeypatch.setenv("ARTLITE_IGNORE_CACHE", "1")
+    build.build(RTC)
+    assert not os.path.exists(os.path.join(work, cache.TEMPS))
 
 
 def test_killed_clang_leaves_no_object(tools: FakeTools, tmp_path: object) -> None:

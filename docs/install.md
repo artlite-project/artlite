@@ -166,7 +166,8 @@ The cache holds a directory per toolchain, `tc-<id>/`, named by the contents of 
 wheels, and `common/` for what no toolchain builds (math tables, the server's model index and web UI, the prefill's
 pace calibration). A design's build is keyed by its content only, so reinstalling the same wheels or moving the cache
 keeps every build. Each build directory also keeps its intermediate files (`kernel.cc`, `design.mlir`, aiecc's
-`design.mlir.prj/`) for debugging.
+`design.mlir.prj/`) for debugging; once a build has not been used for a day, the intermediates the runtime never reads
+are packed into its `temps.tar.xz` (a prefill program's 65x smaller), and `artlite-cache unpack DIR` restores them.
 
 `artlite-cache` shows and cleans the cache:
 
@@ -181,13 +182,16 @@ keeps every build. Each build directory also keeps its intermediate files (`kern
 | `artlite-cache clean --max-size 20G` | then the least recently used entries until the cache fits (never one used in the last hour) |
 | `artlite-cache clean --legacy` | the files of the layout before toolchain directories, now |
 | `artlite-cache clean --all` | everything Artlite owns, the pace calibration and the server's model index included |
+| `artlite-cache pack [--unused-for 0]` | packs the intermediate files of builds not used for a day (`0`: of every build) |
+| `artlite-cache unpack DIR` | restores a build directory's packed intermediate files |
 | `artlite-cache path` | the current toolchain's directory |
 
 A process that built a design cleans the cache when it exits, at most once a day, in a separate low-priority process.
 It removes superseded entries (an older version of a design that was built again since, after an Artlite update, an
-edit or a new toolchain) once they have not been used for a day, and every entry not used for 30 days.
-`ARTLITE_CACHE_GC` changes the rules: `off`, or the rules to replace (`superseded=4h,unused=2w,size=30G`; `size` also
-removes the least recently used entries while the cache is larger). `artlite-cache` shows the last automatic cleaning.
+edit or a new toolchain) once they have not been used for a day, and every entry not used for 30 days, and packs the
+intermediates of builds not used for a day. `ARTLITE_CACHE_GC` changes the rules: `off`, or the rules to replace
+(`superseded=4h,unused=2w,pack=off,size=30G`; `size` also removes the least recently used entries while the cache is
+larger). `artlite-cache` shows the last automatic cleaning.
 
 A cleaning removes only Artlite's own entries, so the cache may share its directory with other files. It touches only
 directories named `tc-<id>` or `common` that hold Artlite's `CACHEDIR.TAG` (which also makes backup tools skip them),

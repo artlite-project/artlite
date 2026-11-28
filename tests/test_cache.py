@@ -1,6 +1,6 @@
-"""The cache directory (artlite/cache.py) and ``artlite-cache`` (models/cache.py): the owned directories, what a cleaning
-removes, and what it never touches (files that are not Artlite's, links and what they point at, entries a build holds).
-No NPU, no toolchain run: every cache is a temporary root."""
+"""The cache directory (artlite/cache.py) and ``artlite-cache`` (models/cache.py): the owned directories, what a
+cleaning removes, and what it never touches (files that are not Artlite's, links and what they point at, entries a
+build holds); packing. No NPU, no toolchain run: every cache is a temporary root."""
 
 import os
 import threading
@@ -111,7 +111,8 @@ def test_clean_spares_what_is_not_artlite(root: str, tmp_path: object) -> None:
         report = cache.clean(policy)
         assert all(os.path.exists(p) for p in keep), [p for p in keep if not os.path.exists(p)]
         assert all(os.path.islink(p) for p in links)
-        assert _tree(outside) >= {"precious.txt", "models.json", f"rtc_{HEX16}", os.path.join(f"rtc_{HEX16}", "main.pdi")}
+        assert _tree(outside) >= {"precious.txt", "models.json", f"rtc_{HEX16}",
+                                  os.path.join(f"rtc_{HEX16}", "main.pdi")}
         assert not os.path.exists(victim) and not report.errors
     found = cache.scan()
     assert {os.path.basename(p) for p, _ in found.skipped} >= {f"rtc_{HEX16}", "server", "tc-0123456789ab"}
@@ -269,7 +270,7 @@ def test_command(root: str, capsys: pytest.CaptureFixture) -> None:
     assert cli.main(["path"]) == 0 and capsys.readouterr().out.strip() == cache.toolchain_dir()
 
 
-def _manifest(base: str, key: str, identity: str, work: str, age: float) -> str:
+def _manifest(base: str, key: str, *, identity: str, work: str, age: float) -> str:
     return _file(os.path.join(base, "render", f"{key * 32}.json"),
                  f'{{"work_dir": "{work}", "identity": "{identity}", "label": "L"}}', age=age)
 
@@ -283,21 +284,21 @@ def test_superseded(root: str) -> None:
     alone = _build("rtc_" + "3" * 16, age=2 * cache.DAY)
     shared = _build("fused_" + "4" * 16, age=2 * cache.DAY)
     today = _build("rtc_" + "5" * 16, age=cache.TEMP_S)
-    m_old = _manifest(tc, "a", "A", os.path.basename(old), 2 * cache.DAY)
-    m_new = _manifest(tc, "b", "A", os.path.basename(new), 0)
-    m_alone = _manifest(tc, "c", "B", os.path.basename(alone), 2 * cache.DAY)
-    _manifest(tc, "d", "C", os.path.basename(shared), 2 * cache.DAY)  # (C's winner and D's loser name it)
-    _manifest(tc, "e", "D", os.path.basename(shared), 3 * cache.DAY)
-    _manifest(tc, "f", "D", os.path.basename(today), cache.TEMP_S)
-    m_today = _manifest(tc, "0", "E", os.path.basename(today), cache.TEMP_S)  # (a loser used today: kept)
-    _manifest(tc, "9", "E", os.path.basename(new), 0)
-    dangling = _manifest(tc, "7", "F", "rtc_" + "8" * 16, 2 * cache.TEMP_S)
+    m_old = _manifest(tc, "a", identity="A", work=os.path.basename(old), age=2 * cache.DAY)
+    m_new = _manifest(tc, "b", identity="A", work=os.path.basename(new), age=0)
+    m_alone = _manifest(tc, "c", identity="B", work=os.path.basename(alone), age=2 * cache.DAY)
+    _manifest(tc, "d", identity="C", work=os.path.basename(shared), age=2 * cache.DAY)  # (C's winner, D's loser)
+    _manifest(tc, "e", identity="D", work=os.path.basename(shared), age=3 * cache.DAY)
+    _manifest(tc, "f", identity="D", work=os.path.basename(today), age=cache.TEMP_S)
+    m_today = _manifest(tc, "0", identity="E", work=os.path.basename(today), age=cache.TEMP_S)  # (a loser, used today)
+    _manifest(tc, "9", identity="E", work=os.path.basename(new), age=0)
+    dangling = _manifest(tc, "7", identity="F", work="rtc_" + "8" * 16, age=2 * cache.TEMP_S)
     pch = _file(os.path.join(tc, "pch", f"{HEX16}.pch"), age=2 * cache.DAY)
     other = os.path.join(root, "tc-fedcba987654")
     _file(os.path.join(other, cache.MARKER), cache.TAG)
     _file(os.path.join(other, cache.TOOLCHAIN_JSON), "{}")
     other_build = _file(os.path.join(other, "fused_" + "6" * 16, cache.ENTRY_JSON), "{}", age=2 * cache.DAY)
-    _manifest(other, "6", "A", "fused_" + "6" * 16, 2 * cache.DAY)
+    _manifest(other, "6", identity="A", work="fused_" + "6" * 16, age=2 * cache.DAY)
     report = cache.clean(cache.Policy())
     gone = (old, m_old, dangling, pch, os.path.dirname(other_build))
     assert not any(os.path.exists(p) for p in gone), [p for p in gone if os.path.exists(p)]
@@ -341,3 +342,82 @@ def test_automatic_cleaning(root: str, monkeypatch: pytest.MonkeyPatch) -> None:
     os.remove(cache.common("gc.json"))
     cache._start_auto()
     assert cache.auto() is None and len(started) == 1
+
+
+COLD = {"design.mlir": "module {}",
+        "design.mlir.prj/peano-compat_op1_X_core_0_2.ll": "ll",
+        "design.mlir.prj/probeElfs_op1_X_core_0_2/probeElfs_op1_X_core_0_2.elf": "probe",
+        "design.mlir.prj/canonical_0A1B/x.ll": "canonical",
+        "design.mlir.prj/cdo_op1_X/aie_cdo.bin": "cdo",
+        "design.mlir.prj/ldScripts_op1_X_core_0_2.ld.script": "ld"}
+PLAIN = {"kernel.cc": "src", "kernel.o": "obj",
+         "design.mlir.prj/cdo_main/main_aie_cdo_init.bin": "init",  # (the configuration's checks)
+         "design.mlir.prj/elfs_main_core_0_2/elfs_main_core_0_2.elf": "elf",  # (paging)
+         "design.mlir.prj/ldScripts_main_core_0_2.ld.script": "ld main",  # (paging)
+         "design.mlir.prj/objects_main_core_0_2/a.o": "o",  # (the census, the frames)
+         "design.mlir.prj/pages_ab.npz": "npz",
+         "design.mlir.prj/input_with_addresses.mlir": "m",  # (profiling)
+         "design.mlir.prj/notes.txt": "unknown"}  # (a name packing does not know stays)
+
+
+def _prj_build(name: str, age: float) -> str:
+    path = _build(name, age=age)
+    for rel, text in {**COLD, **PLAIN}.items():
+        _file(os.path.join(path, rel), text)
+    _age(os.path.join(path, cache.ENTRY_JSON), age)
+    return path
+
+
+def _contents(path: str) -> dict[str, str]:
+    out = {}
+    for top, _, files in os.walk(path):
+        for n in files:
+            rel = os.path.relpath(os.path.join(top, n), path).replace(os.sep, "/")
+            if rel not in (cache.ENTRY_JSON, cache.TEMPS, "main.pdi"):
+                with open(os.path.join(top, n)) as f:
+                    out[rel] = f.read()
+    return out
+
+
+def test_pack(root: str) -> None:
+    """A build unused for a day keeps only what the runtime reads plain; its intermediates are restored as they were.
+    A recent build, and one whose build lock is held, stay plain."""
+    path = _prj_build("fused_" + "1" * 16, 2 * cache.DAY)
+    recent = _prj_build("rtc_" + "2" * 16, 0)
+    held = _prj_build("rtc_" + "3" * 16, 2 * cache.DAY)
+    with cache.lock(os.path.basename(held)):
+        report = cache.clean(cache.Policy())
+    assert report.packed[0] == 1 and _contents(path) == PLAIN and os.path.exists(os.path.join(path, cache.TEMPS))
+    assert _contents(recent) == _contents(held) == {**COLD, **PLAIN}
+    assert cache.unpack(path) and _contents(path) == {**COLD, **PLAIN}
+    assert not os.path.exists(os.path.join(path, cache.TEMPS)) and not cache.unpack(path)
+    assert cache.clean(cache.Policy(pack=None)).packed == [0, 0]
+
+
+def test_pack_after_a_crash(root: str) -> None:
+    """A killed packing leaves the plain files (and a partial archive), or the archive and some plain files: the next
+    packing finishes either."""
+    path = _prj_build("fused_" + "1" * 16, 0)
+    errors: list[str] = []
+    assert cache.pack(path, errors) > 0 and not errors
+    archive = os.path.join(path, cache.TEMPS)
+    with open(archive, "rb") as f:
+        data = f.read()
+    _file(os.path.join(path, "design.mlir"), "module {}")
+    _file(os.path.join(path, f"{cache.TEMPS}.123.tmp"), "partial")
+    cache.pack(path, errors)
+    with open(archive, "rb") as f:
+        assert f.read() == data
+    assert _contents(path) == PLAIN and os.listdir(path).count(f"{cache.TEMPS}.123.tmp") == 0
+    cache.unpack(path)
+    assert _contents(path) == {**COLD, **PLAIN}
+
+
+def test_pack_command(root: str, capsys: pytest.CaptureFixture) -> None:
+    path = _prj_build("fused_" + "1" * 16, 0)
+    assert cli.main(["pack", "-n"]) == 0 and "of 0 builds" in capsys.readouterr().out
+    assert cli.main(["pack", "--unused-for", "0"]) == 0 and "of 1 builds" in capsys.readouterr().out
+    assert cli.main(["list"]) == 0 and "(packed)" in capsys.readouterr().out
+    assert cli.main(["unpack", os.path.join(path, "design.mlir.prj")]) == 0
+    assert _contents(path) == {**COLD, **PLAIN}
+    assert cli.main(["unpack", root]) == 2

@@ -85,6 +85,8 @@ def list_entries(args: argparse.Namespace) -> int:
     print(f"{'LAST USE':12} {'SIZE':>10}  {'KIND':14} {'LABEL':24} PATH")
     for e in entries:
         label = e.kind.name if e.kind.where != "legacy" else f"{e.kind.name} (legacy)"
+        if os.path.exists(os.path.join(e.path, cache.TEMPS)):
+            label += " (packed)"
         print(f"{ago(e.used, now):12} {human_size(e.size):>10}  {label:14} {e.info().get('label', '')!s:24} "
               f"{_rel(e.path)}")
     return 0
@@ -111,6 +113,9 @@ def clean(args: argparse.Namespace) -> int:
     verb = "would remove" if args.dry_run else "removed"
     reasons = ", ".join(f"{reason} {n}" for reason, (n, _) in sorted(report.removed.items()))
     print(f"{verb} {report.entries} entries ({human_size(report.bytes)}){': ' + reasons if reasons else ''}")
+    if report.packed[0]:
+        print(f"{'would pack' if args.dry_run else 'packed'} the intermediate files of {report.packed[0]} builds "
+              f"({human_size(report.packed[1])} {'to free' if args.dry_run else 'freed'})")
     for path, why in report.left:
         print(f"left: {_rel(path)} ({why})")
     for path, why in report.skipped:
@@ -118,6 +123,39 @@ def clean(args: argparse.Namespace) -> int:
     for err in report.errors:
         print(f"error: {err}", file=sys.stderr)
     return 1 if report.errors else 0
+
+
+def pack(args: argparse.Namespace) -> int:
+    try:
+        after = cache.parse_duration(args.unused_for) if args.unused_for is not None else cache.policy().pack
+    except ValueError as e:
+        print(f"artlite-cache: {e}", file=sys.stderr)
+        return 2
+    if after is None:
+        print("packing is off (ARTLITE_CACHE_GC pack=off); --unused-for D packs anyway", file=sys.stderr)
+        return 0
+    report = cache.pack_all(after, dry_run=args.dry_run)
+    print(f"{'would pack' if args.dry_run else 'packed'} the intermediate files of {report.packed[0]} builds "
+          f"({human_size(report.packed[1])} {'to free' if args.dry_run else 'freed'})")
+    for err in report.errors:
+        print(f"error: {err}", file=sys.stderr)
+    return 1 if report.errors else 0
+
+
+def unpack(args: argparse.Namespace) -> int:
+    status = 0
+    for p in args.paths:
+        directory = os.path.abspath(p)
+        while directory != os.path.dirname(directory) and not cache.is_build_dir(directory):
+            directory = os.path.dirname(directory)
+        if not cache.is_build_dir(directory):
+            print(f"artlite-cache: {p}: not in a build directory (rtc_<key>/, fused_<key>/)", file=sys.stderr)
+            status = 2
+        elif cache.unpack(directory):
+            print(f"unpacked {_rel(directory)}")
+        else:
+            print(f"{_rel(directory)}: nothing packed")
+    return status
 
 
 def path(args: argparse.Namespace) -> int:
@@ -148,10 +186,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--all", action="store_true",
                    help="every entry Artlite owns, also state (pace calibrations, the server's model index) and "
                         "designs a running process uses")
+    p = sub.add_parser("pack", help="pack the intermediate files of builds not used for a day (ARTLITE_CACHE_GC "
+                                    "pack=); the automatic cleaning does it too")
+    p.add_argument("-n", "--dry-run", action="store_true", help="only print what would be packed")
+    p.add_argument("--unused-for", metavar="D", help="builds not used during the last D (0: every build)")
+    p = sub.add_parser("unpack", help="restore a build's packed intermediate files (kernel sources stay plain)")
+    p.add_argument("paths", nargs="+", metavar="PATH", help="a build directory, or a path inside one")
     p = sub.add_parser("path", help="print this toolchain's cache directory")
     p.add_argument("--common", action="store_true", help="print the directory of what no toolchain builds")
     args = parser.parse_args(argv)
-    return {"list": list_entries, "clean": clean, "path": path}.get(args.command, status)(args)
+    return {"list": list_entries, "clean": clean, "pack": pack, "unpack": unpack, "path": path}.get(
+        args.command, status)(args)
 
 
 if __name__ == "__main__":

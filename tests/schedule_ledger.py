@@ -613,6 +613,7 @@ def chunk_weights(b: AppBuild, tokens: int) -> ChunkWeights:
     params = {**params, PACE: 0}
     lib = pf.lib
     work_dir = os.path.dirname(lib.elf_path)
+    cache.unpack(work_dir)
     with open(os.path.join(work_dir, "design.mlir")) as f:
         mlir = f.read()
     with open(os.path.join(work_dir, "kernel.cc")) as f:

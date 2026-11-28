@@ -342,7 +342,8 @@ offsets), see aie2p-coding section 8. For speed:
   of entries is no alternative: aiecc's time grows superlinearly, to 14 min for 1216 entries.)
 - **Count a layer-major program's design switches.** Every change of design is a ConfigureOp (above): the Gemma prefill
   switches design 12 times per layer (a 1152-token chunk has 279 configurations, which take 23 ms in total, 7%). The
-  per-design PDIs of a library ELF are in its cache dir (`design.mlir.prj/op<N>_<Class>.pdi`).
+  per-design PDIs of a library ELF are in its cache dir (`design.mlir.prj/op<N>_<Class>.pdi`; packed once the build is
+  a day unused: `artlite-cache unpack DIR`).
 - **Static buffers are rewritten on every reconfiguration** (`.bss` zero-fill and tables travel in the PDI): with
   blockwrites (~1.5 µs per KB; an overlay, a `FusedOperator`), 8 KB x 8 cores adds 80 µs; a library sends them in its
   control packets (`fused.ctrlpkt`: a GDN operator's SiLU table copies, 100 KB on 32 cores, ~150 -> ~5 µs). Use worker

@@ -89,11 +89,23 @@ def headers_key() -> str:
     return toolchain.cache_key(*parts)
 
 
+def _covered(arg: str) -> bool:
+    """Whether a compile command's ``arg`` is a path whose contents the cache covers otherwise: the toolchain's clang++
+    and mlir-aie include directories (its cache directory's), the kernels' headers (``headers_key``)."""
+    def inside(path: str, top: str) -> bool:
+        return os.path.realpath(path).startswith(os.path.join(os.path.realpath(top), ""))
+    if arg.startswith("-I"):
+        return os.path.realpath(arg[2:]) == os.path.realpath(toolchain.INCLUDE_DIR) or \
+            inside(arg[2:], toolchain.mlir_aie_dir())
+    return inside(arg, toolchain.peano_dir())
+
+
 def compile_key(clang_cmd: Sequence[str]) -> str:
-    """What a kernel compile command gives besides its source, without paths: its flags (not the compiler's path and
-    the include directories: the toolchain's cache directory and ``headers_key`` cover what they hold) and the headers'
-    contents."""
-    return toolchain.cache_key(*(a for a in clang_cmd[1:] if not a.startswith("-I")), headers_key())
+    """What a kernel compile command gives besides its source, without the paths the cache covers otherwise
+    (``_covered``): its flags and the headers' contents. Another compiler or include directory (a prototype llvm-aie, an
+    experiment's headers) stays in the key by its path, so its builds never mix with the toolchain's."""
+    return toolchain.cache_key(*(a for i, a in enumerate(clang_cmd) if not ((i == 0 or a.startswith("-I"))
+                                                                            and _covered(a))), headers_key())
 
 
 def buildable(spec: BuildSpec) -> bool:
@@ -269,6 +281,8 @@ def build(spec: BuildSpec, *, aiecc_jobs: int | None = None, measure: bool = Tru
         redo = (ignore_cache or os.path.exists(os.path.join(work_dir, IN_PROGRESS))
                 or not all(os.path.exists(os.path.join(work_dir, f)) for f in spec.outputs))
         if redo:
+            with contextlib.suppress(FileNotFoundError):  # (a packed earlier build's intermediates)
+                os.remove(os.path.join(work_dir, cache.TEMPS))
             with _in_progress(work_dir):
                 _write_design(spec, mlir_path, work_dir)
                 cmd = _aiecc_cmd(spec, aiecc_jobs=aiecc_jobs, work_dir=work_dir, mlir_path=mlir_path)
