@@ -104,12 +104,13 @@ and the MoE layers of `artlite.moe` with an expert's units of 512 and 128 channe
   of the same decode overlay, the attention cores with q / k norms, RoPE and a non-causal block. Each step and prompt
   chunk leaves the model's taps of its positions (the residual entering visits 5, 23, 41 and the final normed state),
   which the drafter's injections turn into the K / V of its 3 layers (layer 1 attends to every position, the other two
-  to the last 1024). A round: the injections, a block of 4 rows (the token, 3 mask rows) through its layers and the
-  model's screened LM head, its Markov head on the host over each row's candidates (their logits exact from the file's
-  rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs ~1.35,
-  1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to different experts), so drafting pays off only when
-  the drafter guesses well: the rounds' planner leaves the drafter out when its rounds give fewer tokens per second than
-  steps of one.
+  to the last 1024). A round: one dispatch of the drafter, the injections of the positions since its last round and a
+  block of 4 rows (the token, 3 mask rows) through its layers and the model's screened LM head, while the host patches
+  the model's step of the round; its Markov head on the host over each row's candidates (their logits exact from the
+  file's rows), then the model's step of the token and the drafts that pay at its step times. A step of S tokens costs
+  ~1.35, 1.6, 1.8 times a step of one for S = 2, 3, 4 (each token routes to different experts), so drafting pays off
+  only when the drafter guesses well: the rounds' planner leaves the drafter out when its rounds give fewer tokens per
+  second than steps of one.
 
 Memory: the weights the NPU streams are re-laid-out into device buffers at load, in memory, at their quantization's
 size: 17.15 GB, UD-Q4_K_M's 16.22 GB (a K of 2304 as two chunks of 1024 and a quarter of one, nothing padded but

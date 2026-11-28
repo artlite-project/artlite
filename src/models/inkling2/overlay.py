@@ -56,6 +56,7 @@ before (S3's next pieces: the whole step with the output's mix and the LM head).
 
 import math
 import os
+from types import SimpleNamespace
 from typing import Self
 
 import numpy as np
@@ -292,6 +293,8 @@ class InklingOverlay(AttentionOverlay):
         self._hbase = [-3] * sequences  # (per sequence: its history windows' first position)
         self._sa_sp = 0  # (the packed slots of the state array's layout whose padding is zero: ``write_states``)
         self._eskip: dict[tuple[int, int], tuple] = {}  # ((visit, slot) -> its raw K / V objects' EGRP words: ``_set_parts``)
+        self._q_out = (np.asarray(gguf.tensor("output_res_query.weight").dequantize(), np.float64).reshape(-1)
+                       if self.lm_ok else None)  # (the output mix's query: ``_lm_x``)
         if self.lm_ok and img.screen:  # (the screened head's host side: the exact logits of its candidates)
             norm = np.asarray(gguf.tensor("output_norm.weight").dequantize(), np.float32).reshape(-1)
             self.screen = Screen(gguf, img.lm, norm, cfg.rms_norm_eps, min(self.vocab, cfg.vocab_size))
@@ -900,6 +903,7 @@ class InklingOverlay(AttentionOverlay):
                    if self._eskip.get((v, s)) != skips.get((self.uses[v].kind, s), (0, 0))]
         if ahead and changed:
             return False
+        self._counts = counts, pos  # (``_patch_more``'s)
         if not super()._set_parts(st, parts, ahead):
             return False
         act = self.dev.view("ACT")
@@ -911,31 +915,48 @@ class InklingOverlay(AttentionOverlay):
                 m[M_EGRP], m[M_EGA], m[M_ETAIL] = ne, self.G, nt
                 self.dev.flush("ACT", off, 4 * META)
             self._eskip[(v, s)] = (ne, nt)
-        at, addr, nb = [], [], []
-        rows = []  # (per part: its sequence's KV and the window's rows of positions p - 3 ..)
-        for q in parts:
-            a = q.position - 3 - self._hbase[q.seq]
-            assert 0 <= a <= HIST_ROWS - 4, (q, self._hbase[q.seq])
-            rows.append((self.seq_name("KV", q.seq), a))
-        for x, v, i, c, q in st.__dict__.get("hfills", ()):
-            at.append(x)
-            buf, a = rows[q]
-            addr.append(self.dev.address(buf, self.hist[(v, i)] + c * self.HIST + a * 4 * self.h8, own=True) - (XB - XPAY))
-            nb.append(XB)
-        for x, L, u in st.__dict__.get("efills", ()):
-            use = self.uses[L]
-            a, n = self._kind_subs(st.subs, use.kind)[u]
-            p = pos[a]
-            g0, ng, ne = counts[(use.kind, a, n)]
-            ge = g0 + ng - ne  # (the first group with an E object)
-            j0 = (INK_ED0 - (p + n - 1 - self.pg * ge)) & ~1  # (its window's first entry of E_rev: even, word-aligned)
-            at.append(x)
-            addr.append(self.dev.address("ACT", self.rel[self.layer(L)]) + 2 * j0)
-            nb.append(ne * XB)
-        if at:
-            self._bd_words(st.tr.words, np.array(at, np.int64), np.array(addr, np.int64), np.array(nb, np.int64))
-            st.tr.flush()
         return True
+
+    def _ink_fills(self, st: StepPlan) -> SimpleNamespace:
+        """st's history fills (per BD: its first word, the byte offset from its part's window row less the object's
+        header, the part) and E fills (its first word, the address of its visit's E table, cache kind, sub-step), as
+        arrays (built once per step plan)."""
+        if "ink" not in st.__dict__:
+            hf, ef = st.__dict__.get("hfills", ()), st.__dict__.get("efills", ())
+            st.ink = SimpleNamespace(
+                h_at=np.array([x for x, *_ in hf], np.int64),
+                h_off=np.array([self.hist[(v, i)] + c * self.HIST - (XB - XPAY) for _, v, i, c, _ in hf], np.int64),
+                h_part=np.array([q for *_, q in hf], np.int64),
+                e_at=np.array([x for x, *_ in ef], np.int64),
+                e_rel=np.array([self.dev.address("ACT", self.rel[self.layer(L)]) for _, L, _ in ef], np.int64),
+                e_kind=np.array([self.uses[L].kind for _, L, _ in ef], np.int64),
+                e_sub=np.array([u for *_, u in ef], np.int64))
+        return st.ink
+
+    def _more_bds(self, st: StepPlan) -> np.ndarray:
+        f = self._ink_fills(st)
+        return np.concatenate([f.h_at, f.e_at])
+
+    def _patch_more(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
+        """(the history fills: per part its sequence's windows from the row of position p - 3; the E fills: per visit
+        and sub-step its E table's window and count, ``_set_parts``)"""
+        f, (counts, pos) = self._ink_fills(st), self._counts
+        if f.h_at.size:
+            row = np.empty(len(parts), np.int64)  # (per part: its window's row of position p - 3 in its KV)
+            for j, q in enumerate(parts):
+                a = q.position - 3 - self._hbase[q.seq]
+                assert 0 <= a <= HIST_ROWS - 4, (q, self._hbase[q.seq])
+                row[j] = self.dev.address(self.seq_name("KV", q.seq), own=True) + a * 4 * self.h8
+            self._bd_words(st.tr.words, f.h_at, row[f.h_part] + f.h_off, np.full(f.h_at.size, XB, np.int64))
+        if f.e_at.size:
+            j0, ne = np.zeros((2, len(self.kinds), SLOTS), np.int64)
+            for k in range(len(self.kinds)):
+                for u, (a, n) in enumerate(self._kind_subs(st.subs, k)):
+                    g0, ng, e = counts[(k, a, n)]
+                    # (the first group with an E object; its window's first entry of E_rev: even, word-aligned)
+                    j0[k, u] = (INK_ED0 - (pos[a] + n - 1 - self.pg * (g0 + ng - e))) & ~1
+                    ne[k, u] = e
+            self._bd_words(st.tr.words, f.e_at, f.e_rel + 2 * j0[f.e_kind, f.e_sub], XB * ne[f.e_kind, f.e_sub])
 
     def _token_words(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
         """(the A objects the main cores skip after a sub-step's last raw K / V object: its raw ring and its range's groups
@@ -1035,10 +1056,9 @@ class InklingOverlay(AttentionOverlay):
         """(the screened head's input: the output's mix of the last visit's states, from the state array; the head norms
         it, ``Screen.input``)"""
         n = self._mix(-1, "lm")[3][2]
-        x = np.stack([self.state(b, S) for b in range(n)]).astype(np.float64)  # (n, S, H)
-        q = np.asarray(self.gguf.tensor("output_res_query.weight").dequantize(), np.float64).reshape(-1)
+        x = self.states(n, S).astype(np.float64)  # (n, S, H)
         xs = x / np.sqrt((x * x).mean(-1, keepdims=True) + InklingConfig.MIX_EPS)
-        sc = xs @ q / np.sqrt(self.H)
+        sc = xs @ self._q_out / np.sqrt(self.H)
         w = np.exp(sc - sc.max(0))
         return np.einsum("ns,nsh->sh", w / w.sum(0), xs).astype(np.float32)
 
@@ -1049,14 +1069,23 @@ class InklingOverlay(AttentionOverlay):
         x = self.dev.view("ACT")[self.sa + b * ST:self.sa + (b + 1) * ST].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
         return x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H).copy()
 
+    def states(self, n: int, S: int) -> np.ndarray:
+        """States 0 .. n - 1 of the last step's state array (n, S, hidden) fp32 (one fetch)."""
+        sp, ST = packed_slots(S), self.state_bytes(packed_slots(S))
+        self.dev.fetch("ACT", self.sa, n * ST)
+        x = self.dev.view("ACT")[self.sa:self.sa + n * ST].view(np.float32).reshape(n, self.state_k(sp) // 8, sp, 8)
+        return x[:, :self.H // 8, :S].transpose(0, 2, 1, 3).reshape(n, S, self.H)
+
     def tap_rows(self, S: int) -> np.ndarray:
         """The taps of the last step's slots (S, taps, hidden) fp32 (``taps``: the residual entering each tap visit)."""
         sp, ST = packed_slots(S), self.state_bytes(SLOTS)
         n = self.state_bytes(sp)
-        out = np.empty((S, len(self.taps), self.H), np.float32)
-        for t in range(len(self.taps)):
+        k = len(self.taps)
+        out = np.empty((S, k, self.H), np.float32)
+        if k:
+            self.dev.fetch("ACT", self.tap_off, (k - 1) * ST + n)
+        for t in range(k):
             off = self.tap_off + t * ST
-            self.dev.fetch("ACT", off, n)
             x = self.dev.view("ACT")[off:off + n].view(np.float32).reshape(self.state_k(sp) // 8, sp, 8)
             out[:, t] = x[:self.H // 8, :S].transpose(1, 0, 2).reshape(S, self.H)
         return out

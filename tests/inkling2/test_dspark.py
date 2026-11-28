@@ -5,6 +5,7 @@
 - injections of an essay's taps (the K / V records of every layer against the reference's) and a block after them (its
   rows' normed states, ``joint_proj``'s h part, the head plane's screened logits and their argmax), the reference's
   block of 4 rows;
+- a round's one dispatch: the injection and the block's two, bit for bit;
 - greedy rounds with drafts: the same text as without them (two chat prompts, 96 tokens), drafts accepted.
 
 Each with the drafter's file in either form (``InklingDSparkConfig``: mainline, unsloth's), where the models directory
@@ -111,6 +112,33 @@ def test_block(run: tuple[NpuInkling, list[int], np.ndarray]) -> None:
     print(f"h {eh:.2e}, jh {ej:.2e}, screened logits {es:.2e}")
     assert eh < 2e-2 and ej < 3e-2 and es < 0.1  # (the plane: the high nibbles of the codes)
     assert (sc[1:].argmax(1) == base.numpy()[1:].argmax(1)).all()
+
+
+def test_round(run: tuple[NpuInkling, list[int], np.ndarray]) -> None:
+    """A round's one dispatch (``DSparkOverlay.round``: the injection of S positions, then the block) = the injection and
+    the block as two dispatches, bit for bit: the records, the block's rows, jh and screened logits."""
+    m, toks, taps = run
+    d = m.dspark
+    anchor = m._step_inputs([toks[44]])[0][0]
+    for S in (1, 3, 4):
+        got = []
+        for one in (False, True):
+            d.reset()
+            d.dev.stale = True
+            q = 0
+            while q < 44 - S:
+                n = min(4, 44 - S - q)
+                d.inject(taps[q:q + n], q)
+                q += n
+            if one:
+                d.round(taps[q:44], q, anchor)
+            else:
+                d.inject(taps[q:44], q)
+                d.block(anchor, 44)
+            got.append([*(x for L in range(d.cfg.layers) for x in d.read_kv(L, range(48))), d.h(), d.jh_rows(),
+                        d.screened().astype(np.float32)])
+        assert d.next == 44
+        assert all(np.array_equal(a, b) for a, b in zip(*got, strict=True)), S
 
 
 @pytest.mark.parametrize("name", ["code", "math"])

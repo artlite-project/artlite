@@ -570,10 +570,11 @@ class AttentionOverlay(ModelOverlay):
         positions, or after a prefill for a sequence's first sub-step's first the record's V panels: of a layer with its
         own cache, the others from the ring) and the F_ATT objects' M_ATREC. ``words``: the token objects' (per cache
         kind and sub-step its first position, slots and sequence); ``kv0``: per sequence the address of its KV.
-        ``ahead``: False when M_ATREC changes (the running step reads those objects)."""
+        ``ahead``: False when M_ATREC changes (the running step reads those objects). Only the layers of st's tails: a
+        transaction of two step plans (a drafter's injection and block) patches each plan's own."""
         tt, T, pu = st.patch.tails, self.T, words.pu
         seq, _, head = slots_of(parts)
-        modes = {q.seq: self._ring_modes(q.seq) for q in parts}
+        modes = {q.seq: {L: md for L, md in self._ring_modes(q.seq).items() if L in tt.layers} for q in parts}
         seq += [seq[-1]] * (SLOTS - len(seq))  # (a slot past the step's: as the last part's)
         head += [False] * (SLOTS - len(head))
         wanted = [(L, a, m if head[a] or self.uses[L].source != L else 0)
@@ -644,8 +645,25 @@ class AttentionOverlay(ModelOverlay):
         r = words.ro[t.recs.kind, t.recs.sub, t.recs.i]
         base = np.take_along_axis(t.recs.base, r[:, :1], 1)[:, 0]
         self._bd_words(st.tr.words, t.recs.at, kv0[words.su[t.recs.kind, t.recs.sub]] + base + r[:, 1], r[:, 2])
-        st.tr.flush()
+        self._patch_more(st, parts)
+        st.tr.flush_lines(self._patch_lines(st))
         return True
+
+    def _patch_more(self, st: StepPlan, parts: tuple[Part, ...]) -> None:
+        """A model's further BDs of a step (``_more_bds``: their words), patched before the step's lines are flushed."""
+
+    def _more_bds(self, st: StepPlan) -> np.ndarray:
+        """The first words of the BDs that ``_patch_more`` patches in st's transaction (int64)."""
+        return np.empty(0, np.int64)
+
+    def _patch_lines(self, st: StepPlan) -> np.ndarray:
+        """The byte offsets of the cache lines of st's transaction that a patch rewrites (a BD's 3 words each; the
+        transaction's megabytes otherwise go to the device at every step: on XRT a copy)."""
+        if st.lines is None:
+            t = st.patch
+            at = np.concatenate([t.fills.at, t.parts.at, t.tails.at, t.recs.at, self._more_bds(st)]).astype(np.int64)
+            st.lines = np.unique((4 * (at[:, None] + np.arange(3))) & ~63)
+        return st.lines
 
     # ------------------------------------------------------------------
     # Readbacks

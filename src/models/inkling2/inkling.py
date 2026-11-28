@@ -31,6 +31,7 @@ import numpy as np
 from artlite import settings
 from artlite.decode.kv import kv_precision
 from artlite.decode.protocol import SLOTS
+from artlite.decode.screen import Screened
 from artlite.gguf_model import GGUFFile
 from artlite.hf_model import open_mmproj
 from artlite.model_config import ClipConfig, InklingConfig, InklingDSparkConfig, inkling_dspark_of
@@ -59,18 +60,21 @@ class NpuInkling(OverlayModel):
 
     The drafter's caches follow the model's positions: each step's taps (``InklingOverlay.tap_rows``, and the final
     normed state, the screen's input) wait on the host (``_pend``, per position) until the drafter's next dispatch, its
-    injections before a round's block; a round's step keeps its kept rows' taps (``_kept``). A round: the injections,
-    the block at the position, the Markov chain's drafts on the host (``dspark.MarkovChain``), the step of the token and
-    the drafts the planner keeps (``SpeculativeMixin``)."""
+    injections before a round's block; a round's step keeps its kept rows' taps (``_kept``). A round: one dispatch of
+    the drafter (``DSparkOverlay.round``: the waiting rows' injection and the block at the position; more than 4 rows,
+    the earlier ones injected before it), while which the host patches the model's step of the round (as many tokens as
+    the last round's step: ``patch_ahead``) and the Markov chain's round term; the chain's drafts on the host
+    (``dspark.MarkovChain``), the step of the token and the drafts the planner keeps (``SpeculativeMixin``)."""
 
     recurrent = True  # (the K / V convs' rings and the post convs' history windows: the last positions only)
     last_step = True  # (the prefill has no LM head)
     LANE_SHARED = (*OverlayModel.LANE_SHARED, "gguf", "_tn", "dspark", "chain")
-    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist")
+    LANE_OWN = (*OverlayModel.LANE_OWN, "_pend", "_shadow", "_hist", "_round_s")
     # (the drafter's rows and drafts (``__init__``); the lanes of several sequences, which have no drafter, read these)
     _pend: Mapping[int, np.ndarray] = MappingProxyType({})
     _shadow: list[tuple[int, list[int], list[float]]] | tuple[()] = ()
     _hist: Mapping[int, int] = MappingProxyType({})
+    _round_s = 1  # (the last round's step: its tokens, ``_mtp``'s guess of the next one's)
     STEP_COST = (1.0, 1.35, 1.61, 1.79)  # (steps of S on essay tokens: each slot's own experts)
     PLANNER = {"ewma_rate": 0.2}  # noqa: RUF012  (the drafter's edge is small: ``drafts.Planner``)
 
@@ -114,6 +118,19 @@ class NpuInkling(OverlayModel):
             self.chain = MarkovChain(d.gguf, d.cfg, d.screen, d.fb)
             self.chain.resident()
 
+    def _prepare_steps(self) -> None:
+        """(and the drafter's: its rounds' transactions)"""
+        super()._prepare_steps()
+        if self.dspark is not None:
+            self.dspark.prepare_rounds()
+
+    @alone
+    def prepare(self, prompt_len: int) -> None:
+        """(and the drafter's hardware context)"""
+        super().prepare(prompt_len)
+        if self.dspark is not None:
+            self.dspark.dev.open()
+
     @property
     def capacity(self) -> int:
         return self.overlay.max_positions
@@ -145,11 +162,15 @@ class NpuInkling(OverlayModel):
     # The drafter's rows
     # ------------------------------------------------------------------
 
-    def _rows_of(self, S: int) -> np.ndarray:
-        """The last step's taps (S, taps, hidden) fp32: the tap visits' residuals, then the final normed states."""
+    def _rows_of(self, S: int, logits: object = None) -> np.ndarray:
+        """The last step's taps (S, taps, hidden) fp32: the tap visits' residuals, then the final normed states (the
+        head's inputs: its ``logits``' rows' where it has them, ``Screened``)."""
         ov = self.overlay
-        x = ov._lm_x(S)
-        fin = np.stack([ov.screen.input(x[s]) for s in range(S)])
+        if isinstance(logits, Screened):
+            fin = np.stack([logits[s]._input() for s in range(S)])
+        else:
+            x = ov._lm_x(S)
+            fin = np.stack([ov.screen.input(x[s]) for s in range(S)])
         return np.concatenate([ov.tap_rows(S), fin[:, None]], 1)
 
     @alone
@@ -160,7 +181,7 @@ class NpuInkling(OverlayModel):
         if self.dspark is not None:
             self.dspark.dev.stale = True  # (another hardware context ran: the drafter's code pages again)
             if self.DRAFTS > 0:
-                for i, row in enumerate(self._rows_of(len(tokens))):
+                for i, row in enumerate(self._rows_of(len(tokens), out)):
                     self._pend[p + i] = row
         return out
 
@@ -190,7 +211,7 @@ class NpuInkling(OverlayModel):
     def _begin(self) -> None:
         """(a generation's rounds: no drafts of an earlier one to check)"""
         super()._begin()
-        self._shadow, self._hist = [], {}
+        self._shadow, self._hist, self._round_s = [], {}, 1
 
     def _calibrate(self, kept: int) -> None:
         """(a round's: from its drafts before ``_keep`` cut them, as the tokens come, ``_kept``)"""
@@ -215,25 +236,43 @@ class NpuInkling(OverlayModel):
         self.stale()
 
     def _mtp(self, token: int, k: int, penalties: Penalties) -> list[int]:
-        """A round's drafts after ``token`` (the next position's): the waiting rows injected, the block at the position,
-        the Markov chain's drafts (up to k)."""
+        """A round's drafts after ``token`` (the next position's): one dispatch of the drafter (the waiting rows of the
+        last 4 positions injected and the block at the position: ``DSparkOverlay.round``; the earlier rows injected
+        before it), meanwhile the model's step of the round patched (``patch_ahead``) and the chain's round term; the
+        Markov chain's drafts (up to k)."""
         t0 = time.perf_counter()
         d, P = self.dspark, self.position
-        self._inject()
+        if P - d.next > SLOTS:
+            self._inject(P - SLOTS)
+        q = d.next
         last = self._pend.get(P - 1)
-        if last is None or d.next != P:  # (the drafter does not follow the sequence: no drafts)
-            self._chains = ()
+        if last is None or not 0 <= P - q <= SLOTS or any(i not in self._pend for i in range(q, P)):
+            self._chains = ()  # (the drafter does not follow the sequence: no drafts)
             return []
+        anchor = self._step_inputs([token])[0][0]
         f_rnn = d.mixes(last[None])[-1, 0]
-        self._dispatch(lambda: d.block(self._step_inputs([token])[0][0], P))
+        ctx: list[np.ndarray] = []
+
+        def meanwhile() -> None:
+            self.overlay.patch_ahead(self._round_s, P)  # (the round's step: as long as the last one's, a guess)
+            ctx.append(self.chain.context(f_rnn))
+
+        if P > q:
+            rows = np.stack([self._pend[i] for i in range(q, P)])
+            self._dispatch(lambda: d.round(rows, q, anchor, meanwhile=meanwhile))
+            for i in range(q, P - 1):
+                del self._pend[i]
+        else:
+            self._dispatch(lambda: d.block(anchor, P, meanwhile=meanwhile))
         self.stale()
-        out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), f_rnn, token, min(k, SLOTS - 1), set(self.eos_token_ids))
+        out = self.chain.walk(d.screened(), d.h(), d.jh_rows(), ctx[0], token, min(k, SLOTS - 1), set(self.eos_token_ids))
         chains = list(self.chain.chains)  # (the drafts that pay at the model's step times: ``SpeculativeMixin._keep``;
         # an MoE's slots each route to different experts)
         if out:
             self._shadow.append((P + 1, list(out), chains))
         out = out[:next((i for i in range(len(out)) if not self._keep(chains[i], i)), len(out))]
         self._chains = tuple(chains[:len(out)])
+        self._round_s = 1 + len(out)
         self._row_time(time.perf_counter() - t0)
         self.t_draft += time.perf_counter() - t0
         self.drafted += len(out)

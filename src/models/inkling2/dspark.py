@@ -20,6 +20,11 @@ A step of the drafter's overlay (``DSparkOverlay``) is one of two kinds:
   the Markov head's per-row term) and lm (``output_norm``: the model's head plane, its screened logits). The block's
   records at P .. P + 3 stay in the caches until the next injection writes the kept positions over them.
 
+A round's dispatch (``round``) is both: the injection of the positions before P, then the block at P, in one transaction
+(``_round_plans``: two step plans, the block's token objects the second set); the state array holds state 0 (the block's
+rows, laid out for 4 slots) first, then the injection's states laid out for its own slots (``_state_at``), and the
+phases' metadata objects are those of an injection of S slots and the block of 4 (``_meta_writes``).
+
 A block of 4 rows (the trained block is 8: [anchor, mask x 7]) is the drafts a round verifies (3: the model's steps of
 4); its drafts 1 .. 3 are those of the block of 8 (S5's measurement: 1.84 vs 1.79 accepted on code, 0.96 vs 0.97 on
 chat).
@@ -37,6 +42,8 @@ mainline form: ``Screen.exact`` of h_i plus the candidate's ``markov_w2`` row ti
 measurement: the same drafts as the whole vocabulary's (2.18 vs 2.20 accepted of 7)."""
 
 import math
+import time
+from collections.abc import Callable
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -71,7 +78,7 @@ from artlite.decode.vring import tails
 from artlite.gguf_model import GGUFFile, tensor_f32
 from artlite.model_config import InklingDSparkConfig
 from artlite.operators.design import COLS
-from artlite.overlay import OverlayDevice, Sequence
+from artlite.overlay import OverlayDevice, Sequence, Transaction
 
 from .dspark_image import DOWN_K, DSparkDecodeOperator, DSparkImage, ctx_norm, mask_rows, mix_weights
 
@@ -87,7 +94,7 @@ INK_OBJ = {"o": ("inko", "inkoq")} | {f"down{g}": (f"inkd{g}", f"inkdq{g}") for 
 
 class DSparkOverlay(AttentionOverlay):
     """The DSpark drafter ``gguf`` of the model on overlay ``target`` (``InklingOverlay``; module docstring): ``load``
-    after the target's (its device and weight buffer); ``inject`` and ``block`` run steps."""
+    after the target's (its device and weight buffer); ``inject``, ``block`` and ``round`` run steps."""
 
     CONFIG, IMAGE = InklingDSparkConfig, DSparkImage
     CHAIN = 1
@@ -166,7 +173,8 @@ class DSparkOverlay(AttentionOverlay):
         """Byte offsets in ACT and KV."""
         self._layout = dict.fromkeys(("ACT", "KV"), 0)
         take = self._take
-        self.toks = (take("ACT", len(self.kinds) * SLOTS * XB),)
+        # (the token objects; a round's block after its injection: the second set)
+        self.toks = tuple(take("ACT", len(self.kinds) * SLOTS * XB) for _ in range(2))
         self.loadr = take("ACT", COLS * SLOTS * XB)
         self.sa = take("ACT", XB + STATES * self.state_bytes(SLOTS)) + XB  # ([state][k block][slot sp][8] fp32)
         self.meta = {}
@@ -191,6 +199,11 @@ class DSparkOverlay(AttentionOverlay):
     def state_bytes(self, sp: int) -> int:
         """A state's bytes in the state array of a step of sp packed slots (``InklingOverlay.state_bytes``)."""
         return -(-4 * sp * self.H // XPAY) * XPAY
+
+    def _state_at(self, i: int, S: int) -> int:
+        """State i's offset in ACT (module docstring): state 0 (a block's rows, 4 slots) first, then the injection's
+        states 1 + L of a step of S slots."""
+        return self.sa if i == 0 else self.sa + self.state_bytes(SLOTS) + (i - 1) * self.state_bytes(packed_slots(S))
 
     def kv_base(self, L: int, h: int) -> int:
         return super().kv_base(L % INJ, h)
@@ -267,20 +280,21 @@ class DSparkOverlay(AttentionOverlay):
     # ------------------------------------------------------------------
 
     def _meta_writes(self, S: int) -> list[tuple[int, np.ndarray]]:
-        """(the GEMV phases on states: one state, coefficient 1; o, down's: F_INK, plain)"""
+        """(an injection of S slots and the block of 4: the GEMV phases on states: one state, coefficient 1; o, down's:
+        F_INK, plain)"""
         out = []
-        ranges = self.state_bytes(packed_slots(S)) // XPAY
         for (L, name), off in self.meta.items():
-            gr = self._groups(L, name, S)
+            n = S if name == "ikv" else SLOTS
+            gr = self._groups(L, name, n)
             assert len(gr) == 1, (L, name)
             m = gr[0].meta.copy()
             m[0] |= F_STATES
-            m[M_NR], m[M_NX], m[M_CSET] = 1, ranges, -1
+            m[M_NR], m[M_NX], m[M_CSET] = 1, self.state_bytes(packed_slots(n)) // XPAY, -1
             out.append((off, m.view(np.uint8)))
         for L in self.layers:
             for name in ("o", *(f"down{g}" for g in range(N_DOWN))):
                 rg = self.inp[(L, name)][0]
-                gr = self._groups(L, name, S)
+                gr = self._groups(L, name, SLOTS)
                 assert len(gr) == 1
                 m = gr[0].meta.copy()
                 m[M_INKN] = 1 << 12  # (cur: state 0; one queries object)
@@ -290,6 +304,54 @@ class DSparkOverlay(AttentionOverlay):
     def _build(self, S: int, lm: bool, subs: tuple, b: int) -> StepPlan:
         self._lm = lm
         return super()._build(S, lm, subs, b)
+
+    def _round_plans(self, S: int) -> tuple[StepPlan, StepPlan]:
+        """The step plans of a round's dispatch (module docstring): an injection of S slots (the first token objects),
+        then the block (the second ones), one transaction (built at its first use)."""
+        key = ("round", S)
+        if key not in self._steps:
+            self._ran_keys.discard(key)
+            self._steps[key] = self._build_round(S)
+        return self._steps[key]
+
+    def _build_round(self, S: int) -> tuple[StepPlan, StepPlan]:
+        """(``AttentionOverlay._build`` of the injection's phases and the block's: the block's token objects and helper
+        rows once the injection's records are in DDR)"""
+        dev = self.dev
+        seq = Sequence(self.op, inputs=("X",))
+        inj = StepPlan(S, self.subs(0, S), tok=self.toks[0])
+        blk = StepPlan(SLOTS, self.subs(0, SLOTS), tok=self.toks[1])
+        ph = self.phases(False) + self.phases(True)
+        n = len(self.phases(False))
+
+        def run(i: int) -> list[tuple[int, str]]:
+            return ph[i:next((k for k in range(i, len(ph)) if ph[k][1] in self.OPS), len(ph))]
+
+        for c in range(COLS):
+            seq.fill("X", c, dev.address("ACT", inj.tok), self._tok_bytes)
+        for i, (L, name) in enumerate(ph):
+            st = inj if i < n else blk
+            if i == n:
+                seq.sync()
+                for c in range(COLS):
+                    seq.fill("X", c, dev.address("ACT", blk.tok), self._tok_bytes)
+                AttentionOverlay._fill_loadr(self, seq, SLOTS)
+            if name in self.OPS:
+                self._operator(seq, st, L, name, run(i + 1))
+                continue
+            self._weights_first(seq, ph, i, run)
+            self._gemv(seq, st, (L, name))
+        seq.sync(fills=True)
+        inj.tr = blk.tr = Transaction(dev, seq.words())
+        return inj, blk
+
+    def prepare_rounds(self) -> None:
+        """The transactions of every round's dispatch, the block's alone and the injections' alone (a round builds them
+        at its first use: in the time the drafter's planner measures)."""
+        for S in range(1, SLOTS + 1):
+            self._round_plans(S)
+            self.prepare(S, logits=False)
+        self.prepare(SLOTS, logits=True)
 
     def _fill_loadr(self, seq: Sequence, S: int) -> None:
         """(a block's: its rows as state 0 of the helpers)"""
@@ -335,10 +397,10 @@ class DSparkOverlay(AttentionOverlay):
         ST = self.state_bytes(sp)
         seq.sync()
         if phase in self.meta:
-            first = 1 + L - INJ if name == "ikv" else 0
+            o = self._state_at(1 + L - INJ if name == "ikv" else 0, S)
             for c in range(COLS):
                 seq.fill("X", c, dev.address("ACT", self.meta[phase]), XB)
-                seq.fill("X", c, dev.address("ACT", self.sa + first * ST - (XB - XPAY)), XB, (XB // 8, 2, XB // 8, ST // 4),
+                seq.fill("X", c, dev.address("ACT", o - (XB - XPAY)), XB, (XB // 8, 2, XB // 8, ST // 4),
                          repeat=ST // XPAY, iteration=(XPAY // 4, ST // XPAY))
         else:
             self._inputs(seq, self.inp[phase][0], S)
@@ -427,19 +489,23 @@ class DSparkOverlay(AttentionOverlay):
     # ------------------------------------------------------------------
 
     def write_states(self, x: np.ndarray, first: int) -> None:
-        """States first .. first + n - 1 of the state array (n, S, hidden) fp32 (zero past the hidden); state 0 (a
-        block's rows) also as the helpers' F_LOADR objects."""
+        """States first .. first + n - 1 of the state array (n, S, hidden) fp32 (zero past the hidden; ``_state_at``);
+        state 0 (a block's rows) also as the helpers' F_LOADR objects."""
         n, S, H = x.shape
         sp, act = packed_slots(S), self.dev.view("ACT")
         ST = self.state_bytes(sp)
         for b in range(n):
             xs = np.zeros((ST // (4 * 8 * sp), sp, 8), np.float32)
             xs[:H // 8, :S] = x[b].reshape(S, H // 8, 8).transpose(1, 0, 2)
-            o = self.sa + (first + b) * ST
+            o = self._state_at(first + b, S)
             act[o:o + ST] = xs.reshape(-1).view(np.uint8)
             self.dev.flush("ACT", o, ST)
         if first == 0:
             self._write_loadr(x[0])
+
+    def _rows(self, anchor: np.ndarray) -> np.ndarray:
+        """A block's rows (1, 4, hidden) fp32: the anchor's normed embedding (hidden,), then the mask rows."""
+        return np.concatenate([np.asarray(anchor, np.float32)[None], self.mask])[None]
 
     def inject(self, taps: np.ndarray, q: int) -> None:
         """The positions q .. q + S - 1 of the selected sequence from their taps (S, taps, hidden) fp32 (S <= 4)."""
@@ -455,13 +521,51 @@ class DSparkOverlay(AttentionOverlay):
             self._injecting = False
         self.next = q + S
 
-    def block(self, anchor: np.ndarray, P: int) -> None:
-        """A block at P (the anchor's normed embedding (hidden,) fp32, then the mask rows): its logits and jh."""
-        x = np.concatenate([np.asarray(anchor, np.float32)[None], self.mask])
-        if self._metas_s != (SLOTS, self.start):
+    def block(self, anchor: np.ndarray, P: int, *, meanwhile: Callable[[], None] | None = None) -> None:
+        """A block at P (the anchor's normed embedding (hidden,) fp32, then the mask rows): its logits and jh.
+        ``meanwhile``: host work while it runs (the model's next step patched ahead)."""
+        if not self._metas_s[0]:  # (the block's are those of every S: ``_meta_writes``)
             self._metas(SLOTS)
-        self.write_states(x[None], 0)
-        self._run(SLOTS, P, True)
+        self.write_states(self._rows(anchor), 0)
+        self._run(SLOTS, P, True, meanwhile=meanwhile)
+
+    def round(self, taps: np.ndarray, q: int, anchor: np.ndarray, *,
+              meanwhile: Callable[[], None] | None = None) -> None:
+        """A round's dispatch (module docstring): the positions q .. q + S - 1 from their taps (S, taps, hidden) fp32
+        (S <= 4: ``inject``), then the block at q + S (``block``), in one transaction. ``meanwhile``: host work while
+        it runs."""
+        S = taps.shape[0]
+        P = q + S
+        assert 1 <= S <= SLOTS and q == self.next, (S, q, self.next)
+        if self._metas_s != (S, self.start):
+            self._metas(S)
+        self.write_states(self.mixes(taps)[:len(self.layers)], 1)
+        self.write_states(self._rows(anchor), 0)
+        self._clear_pads(self._sp(SLOTS))
+        key = ("round", S)
+        before, t = self._once_t, time.perf_counter()
+        inj, blk = self._round_plans(S)
+        self._injecting = True
+        try:
+            self._set_position(inj, q)
+        finally:
+            self._injecting = False
+        self._ran(q, S)  # (the block's patch: the rings with the injection's records)
+        self._set_position(blk, P)
+        # (one-time work: as ``_run``'s)
+        self.once_s = before + (time.perf_counter() - t if key not in self._ran_keys else self._once_t - before)
+        self._once_t = 0.0
+        self._ran_keys.add(key)
+        self.ready()
+        self.dev.submit(blk.tr)
+        try:
+            self._ran(P, SLOTS)
+            if meanwhile is not None:
+                meanwhile()
+        finally:
+            self.dev.wait()
+        self._last_s = SLOTS
+        self.next = P
 
     def mixes(self, taps: np.ndarray) -> np.ndarray:
         """The taps' mixes (layers + 1, S, hidden) fp32: per layer its injection's input (unnormed: its phase norms it),
@@ -535,14 +639,21 @@ class MarkovChain:
         if self.cfg.mainline:
             self.gguf.willneed("markov_w2.weight")
 
-    def walk(self, screened: np.ndarray, h: np.ndarray, jh: np.ndarray, f_rnn: np.ndarray, anchor: int, n: int,
+    def context(self, f_rnn: np.ndarray) -> np.ndarray:
+        """The round's term of every draft (3 rank,) fp32 (the bias and ``joint_proj``'s f columns times f_rnn, the
+        round's last committed position's context: ``DSparkOverlay.mixes``), while the block runs. Not a BLAS matmul:
+        its threads, asleep while the host waits for the NPU, took up to ~5 ms to wake for it (``vecdot``: 0.25 ms)."""
+        return self.bj + np.vecdot(self.wf, f_rnn)
+
+    def walk(self, screened: np.ndarray, h: np.ndarray, jh: np.ndarray, fc: np.ndarray, anchor: int, n: int,
              stop: set[int] | frozenset[int] = frozenset()) -> list[int]:
         """Up to n drafts after the anchor token, ending with a token of ``stop``: screened (rows, vocab) the block's
         screened logits, h (rows, hidden) its rows normed, jh (rows, 3 rank) their jh outputs (row i + 1 guesses draft
-        i); ``chains``: per draft the probability of its chain (each draft's softmax over its candidates, softcapped)."""
+        i), fc the round's ``context``; ``chains``: per draft the probability of its chain (each draft's softmax over
+        its candidates, softcapped)."""
         R, cap, sc = self.cfg.rank, self.cfg.softcap, self.screen
         nv = len(self.fb)
-        ctx = self.bj + jh[1:n + 1] + self.wf @ f_rnn
+        ctx = fc + jh[1:n + 1]
         state, prev = np.zeros(R, np.float32), anchor
         out, self.chains, chain = [], [], 1.0
         for i in range(n):

@@ -24,7 +24,7 @@ import inspect
 import math
 import mmap
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
@@ -745,11 +745,13 @@ class ModelOverlay:
         """One-time work of the next step since ``t0`` (``time.perf_counter``): left out of its time (``once_s``)."""
         self._once_t += time.perf_counter() - t0
 
-    def _run(self, S: int, position: int | tuple[Part, ...], logits: bool) -> np.ndarray | None:
+    def _run(self, S: int, position: int | tuple[Part, ...], logits: bool, *,
+             meanwhile: Callable[[], None] | None = None) -> np.ndarray | None:
         """Dispatch the step of S slots at ``position`` (its inputs written; several sequences' slots: its parts, the
         slots in their order): its transaction (built at its first use), patched (or patched ahead, while the previous
         step ran: ``AHEAD``); then, while it runs, the next step's (S slots at position + S, each part's after its
-        own, the same logits: a decode's next step) into the other buffer; the logits (``_logits``) or None."""
+        own, the same logits: a decode's next step) into the other buffer, and ``meanwhile`` (host work: a drafter's
+        dispatch patches its model's next step, ``patch_ahead``); the logits (``_logits``) or None."""
         parts = tuple(position) if isinstance(position, (tuple, list)) else None
         if parts is not None:
             if not self.SEQ:
@@ -803,6 +805,8 @@ class ModelOverlay:
                 if patch(nxt, nxt_at, ahead=True):
                     self._ahead = AheadStep(nkey._replace(b=0), nxt_at, state(nxt_at, ahead=True), nxt, 1 - b)
                 self._once_t = 0.0  # (while the step runs: none of the next step's time)
+            if meanwhile is not None:
+                meanwhile()
         finally:
             self.dev.wait()
         self._last_s = S

@@ -79,7 +79,8 @@ class Rec(NamedTuple):
 @dataclass
 class StepPlan:
     """The transaction of a step of S slots (its attentions' sub-steps: ``subs``) and its words that follow the
-    position. ``tok``: its token objects' offset in ACT."""
+    position. ``tok``: its token objects' offset in ACT; ``lines``: the transaction's cache lines a patch rewrites
+    (``AttentionOverlay._patch_lines``)."""
 
     S: int
     subs: tuple
@@ -90,6 +91,7 @@ class StepPlan:
     recs: list[Rec] = field(default_factory=list)
     part_bds: list[PartBD] = field(default_factory=list)
     patch: "PatchTables | None" = None
+    lines: "np.ndarray | None" = None
 
 
 @dataclass(frozen=True)
