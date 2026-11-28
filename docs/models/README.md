@@ -2,7 +2,8 @@
 
 How each model runs on the NPU, its files and its measurements: [Llama 3](llama3.md), [Qwen3](qwen3.md),
 [Gemma 4](gemma4.md), [Qwen3.5 / 3.6 / 3.8 (and Qwen3.6 35B-A3B), MiniCPM-V 4.7](qwen35.md), [LFM3 (and LFM3-VL-2B, LFM3-Audio-2B, LFM3-Omni-2B, d1-2B, d1-Omni-2B)](lfm3.md),
-[Spark-X2.6 4B, 1.7B](spark.md), [Flint](flint.md), [Inkling 2 Mini](inkling2.md), [Stable Diffusion 1.5](sd15.md).
+[Spark-X2.6 4B, 1.7B](spark.md), [Flint](flint.md), [Inkling 2 Mini](inkling2.md),
+[MOSS-Transcribe-Diarize](moss.md), [Stable Diffusion 1.5](sd15.md).
 
 Model files are found by path, or relative to the models directory (`ARTLITE_MODELS_DIR`, default
 `~/.artlite/models`) as `<account>/<repository>/<file>`: [Installation](../install.md#models-directory). A GGUF file's
@@ -11,9 +12,11 @@ architecture, tokenizer and chat template come from its metadata.
 A Hugging Face checkpoint directory (`config.json`, safetensors, `tokenizer.json`) is a model file too: `-m
 <account>/<repository>` opens it as llama.cpp would open the GGUF its converter makes of it (the same metadata,
 vocabulary, chat template and weights, read from the safetensors at every load: no converted copy). Supported:
-`Qwen3ForCausalLM`, `LlamaForCausalLM`, `Qwen3_5ForConditionalGeneration` (its MTP block as the drafter); BF16, F16 or F32
+`Qwen3ForCausalLM`, `LlamaForCausalLM`, `Qwen3_5ForConditionalGeneration` (its MTP block as the drafter),
+`MossTranscribeDiarizeForConditionalGeneration` (speech: [MOSS-Transcribe-Diarize](moss.md)); BF16, F16 or F32
 weights run as BFP16 tiles, as a BF16 GGUF does. Tested: Qwen/Qwen3-0.6B, Qwen/Qwen3.5-0.8B,
-lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGUFs).
+lmstudio-community/Llama-3.2-1B-Instruct (the same logits as their converted GGUFs), OpenMOSS-Team/MOSS-Transcribe-Diarize
+(its audio tower as the mmproj, [transcription](moss.md)).
 
 ParoQuant (PARO) checkpoints, int4 or int5 (`int5-bitplane`) with groups of 128 (`quantization_config.quant_method`
 `paroquant`), run as checkpoint directories of `Qwen3ForCausalLM`, `LlamaForCausalLM`,
@@ -89,6 +92,7 @@ chunk is compute bound.
 | | ✅ LFM3-Audio-2B (speech in: [transcription, live transcription](lfm3.md#lfm3-audio-2b-speech); speech out: [text to speech, spoken replies](lfm3.md#speech-output)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | LiquidAI Q8_0 |
 | | ✅ LFM3-Omni-2B ([images, videos with their sound, speech in and out](lfm3.md#lfm3-omni-2b-images-videos-speech)) | LiquidAI Q4_K_M, Q4_0, its mmproj Q8_0 | LiquidAI Q8_0 |
 | | ✅ d1-Omni-2B (decision model: [`/v1/systemone`](../server.md#decisions); audio clips, spoken questions) | LiquidAI Q8_0, its mmproj Q8_0 | |
+| moss | ✅ MOSS-Transcribe-Diarize 0.9B ([transcription with timestamps and speakers](moss.md)) | OpenMOSS-Team's checkpoint directory (BF16); handy-computer's transcribe.cpp GGUF Q4_K_M | handy-computer's Q5_K_M, Q8_0 |
 | spark2_5 | ✅ Spark-X2.6 4B | XHToken Q4_K_M, Q8_0, with its DSpark drafter; bartowski Q4_K_M, Q4_0 | Spark-X2.5 4B |
 | | ✅ Spark-X2.6 1.7B | XHToken Q4_K_M, Q8_0, with its DSpark drafter | |
 | flint | ✅ Flint (40B MoE, ~2.5B active) | RecursiveSI int4 (Q4_1 pairs, packed as Q4_1_64), with incoai's DFlash2 drafter (Q4_K_M) | unsloth UD-Q4_K_XL |

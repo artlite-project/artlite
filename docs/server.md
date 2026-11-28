@@ -35,7 +35,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | a reranker's scores of documents (with `--rerank`) |
 | `/classify` | a classifier's label probabilities (vLLM's shape; with `--rerank`) |
 | `/v1/systemone` | a decision model's answers to questions about a state ([below](#decisions)) |
-| `/v1/audio/transcriptions`, `/audio/transcriptions` | a transcription of an audio file (LFM3-Audio: [below](#speech)) |
+| `/v1/audio/transcriptions`, `/audio/transcriptions` | a transcription of an audio file (LFM3-Audio, MOSS-Transcribe-Diarize: [below](#speech)) |
 | `/v1/realtime` | live transcription (`?intent=transcription`) and voice conversations over a websocket (OpenAI's realtime API, as llama-server: [below](#speech)) |
 | `/tts`, `/v1/audio/speech`, `/audio/speech` | text to speech (llama-server's and OpenAI's; LFM3-Audio: [below](#speech)) |
 
@@ -393,14 +393,18 @@ the next one). A choice's `confidence` is its probability and a score is the med
 
 LFM3-Audio-2B and LFM3-Omni-2B started with their mmproj (`--mmproj
 LiquidAI/LFM3-Audio-2B-GGUF/mmproj-LFM3-Audio-2B-Q8_0.gguf`, `.../mmproj-LFM3-Omni-2B-Q8_0.gguf`; the router pairs it
-with the model of its directory) take audio as llama-server does ([the models](models/lfm3.md#lfm3-audio-2b-speech)):
+with the model of its directory) take audio as llama-server does ([the models](models/lfm3.md#lfm3-audio-2b-speech)),
+and MOSS-Transcribe-Diarize as it is (its files hold its tower: [the model](models/moss.md)):
 
 - `/v1/audio/transcriptions` (and `/audio/transcriptions`): OpenAI's multipart form, `file` (WAV, MP3, FLAC, Ogg
-  Vorbis), `language` (a code or a name; without it the model tells), `prompt` (text before the audio in the user
-  message), `response_format` (`json`, `text`), `temperature`, `max_tokens` (default 64 + 8 per second of audio: a clip
-  of minutes can loop), `stream` (`transcript.text.delta` events, then `transcript.text.done`). The request is a chat
-  of the model card's ASR prompt ("Perform ASR in English."). The `openai` package's `audio.transcriptions.create`
-  works unchanged.
+  Vorbis), `language` (a code or a name; without it the model tells), `prompt` (LFM3-Audio: text before the audio
+  in the user message; MOSS-Transcribe-Diarize: its hotwords), `response_format` (`json`, `text`; `verbose_json`,
+  `diarized_json`: `{"task", "duration", "text", "segments", "usage"}`, the words alone and, where the model writes
+  them, the segments `{"id", "start", "end", "speaker", "text"}`), `temperature`, `max_tokens` (default 64 + 8 per
+  second of audio, MOSS-Transcribe-Diarize 128 + 16: a clip of minutes can loop), `stream` (`transcript.text.delta`
+  events, then `transcript.text.done`; json and text). The request is a chat of the model's ASR prompt (LFM3-Audio's
+  card: "Perform ASR in English."; MOSS-Transcribe-Diarize's instruction after the clip). The `openai` package's
+  `audio.transcriptions.create` works unchanged.
 - Chat messages take `input_audio` parts (`{"data": base64, "format": "wav"}`) and `audio_url` parts of data URIs, as
   images: the encoder runs on the NPU worker between requests, a clip's rows kept for a conversation's next turns.
 - `/v1/realtime?intent=transcription`: transcription over a websocket, llama-server's events. LFM3-Omni (no live ASR
